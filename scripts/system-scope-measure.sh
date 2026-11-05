@@ -8,9 +8,9 @@
 #
 # Method: the gated two-phase workload (system-scope-workload.c) maps the
 # provider and opens a session, waits for attach (the harness holds the go
-# file until the discovery marker lands on stderr AND the observer's first
-# live frame lands on stdout — the in-observer attach-end signal), then
-# fires exactly N C_GenerateRandom calls. A /proc sampler
+# file until the discovery marker AND the attach-complete line land on
+# stderr — the in-observer attach-end signal), then fires exactly N
+# C_GenerateRandom calls. A /proc sampler
 # (system-scope-sample.py, under sudo) records CPU/RSS/fds at 20 Hz; a
 # timestamp pipe (system-scope-ts.py) dates stderr markers;
 # system-scope-measure.py joins the observer report + traces + workload
@@ -21,13 +21,17 @@
 #   [--pace-us US] [--seed N] [--ring-bytes B] [--drain-interval-ms MS]
 #   [--sink file|discard|slow-pipe] [--sink-rate-kbps KBPS]
 #   [--work DIR] [--profile release|debug] [--binary PATH] [--no-build]
+#   [--detailed-profile default|wide-detailed-2112]
+#   [--detailed-resources-calculator PATH]
+# The optional calculator is the matching compiled detailed-resources example.
+# Its component payload model is recorded separately from sampled RSS/fds.
 #
 # both = metrics+profile (Task 1.4 shape); all adds trace. The sink selects
-# the observer's stdout destination: file (default, kept for the attach
-# gate), discard (/dev/null: no sink backpressure), slow-pipe (a throttled
-# FIFO reader: explicit downstream backpressure). Non-file sinks and trace
-# mode use the weaker marker+settle attach gate (no first-frame signal);
-# the gate used is recorded per condition and validated post-hoc.
+# the observer's stdout destination: file (default), discard (/dev/null: no
+# sink backpressure), slow-pipe (a throttled FIFO reader: explicit
+# downstream backpressure). Non-file sinks and trace mode use the weaker
+# marker+settle attach gate (no attach-complete signal); the gate used is
+# recorded per condition and validated post-hoc.
 set -eu
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -48,8 +52,12 @@ WORK=/var/tmp/p11scope-system-scope-measure
 PROFILE=release
 BINARY=
 NO_BUILD=0
-SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
+# Probed at startup via release-matrix-contract.py --select-module (Debian
+# and Fedora layouts); SOURCE_MODULE in the environment overrides the probe.
+SOURCE_MODULE=${SOURCE_MODULE:-}
 MODULE=
+DETAILED_PROFILE=
+DETAILED_CALCULATOR=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -67,7 +75,9 @@ while [ "$#" -gt 0 ]; do
         --profile) PROFILE=$2; shift 2 ;;
         --binary) BINARY=$2; shift 2 ;;
         --no-build) NO_BUILD=1; shift ;;
-        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+        --detailed-profile) DETAILED_PROFILE=$2; shift 2 ;;
+        --detailed-resources-calculator) DETAILED_CALCULATOR=$2; shift 2 ;;
+        -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -76,6 +86,21 @@ case "$MODE" in metrics|profile|trace|both|all) ;; *) echo "bad --mode: $MODE" >
 case "$SINK" in file|discard|slow-pipe) ;; *) echo "bad --sink: $SINK" >&2; exit 2 ;; esac
 case "$PROFILE" in release|debug) ;; *) echo "bad --profile: $PROFILE" >&2; exit 2 ;; esac
 case "$WORK" in /*) ;; *) WORK="$PWD/$WORK" ;; esac
+case "$DETAILED_PROFILE" in ''|default|wide-detailed-2112) ;; *) echo "bad --detailed-profile: $DETAILED_PROFILE" >&2; exit 2 ;; esac
+if { [ -n "$DETAILED_PROFILE" ] && [ -z "$DETAILED_CALCULATOR" ]; } ||
+   { [ -z "$DETAILED_PROFILE" ] && [ -n "$DETAILED_CALCULATOR" ]; }; then
+    echo "--detailed-profile and --detailed-resources-calculator must be supplied together" >&2
+    exit 2
+fi
+
+# This preflight runs before any owned workload or privileged observer launch.
+# It performs no builds and refuses absent/mismatched/malformed compiled facts.
+if [ -n "$DETAILED_PROFILE" ]; then
+    python3 -I scripts/system-scope-measure.py --prepare-detailed-resources \
+        --detailed-profile "$DETAILED_PROFILE" \
+        --detailed-resources-calculator "$DETAILED_CALCULATOR" \
+        --out "$WORK/detailed-resources.json"
+fi
 
 WPID=
 WPID_STARTTIME=
@@ -137,6 +162,10 @@ command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; 
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 command -v timeout >/dev/null || { echo "timeout required"; exit 1; }
 sudo -n true || { echo "passwordless sudo required"; exit 1; }
+if [ -z "$SOURCE_MODULE" ]; then
+    SOURCE_MODULE=$(python3 -I scripts/release-matrix-contract.py --select-module) \
+        || { echo "no usable SoftHSM module (tried Debian/Fedora layouts)"; exit 1; }
+fi
 test -f "$SOURCE_MODULE" || { echo "SoftHSM2 not installed at $SOURCE_MODULE"; exit 1; }
 export TMPDIR=/var/tmp/p11scope-ws-tmp
 mkdir -p "$TMPDIR" "$WORK"
@@ -160,10 +189,14 @@ echo "=== build ==="
 gcc -O0 -o "$WORK/workload" scripts/system-scope-workload.c -ldl
 if [ -z "$BINARY" ]; then
     if [ "$NO_BUILD" -eq 0 ]; then
+        set --
+        if [ "$DETAILED_PROFILE" = wide-detailed-2112 ]; then
+            set -- --features wide-detailed-2112
+        fi
         if [ "$PROFILE" = release ]; then
-            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover "$@"
         else
-            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline -p p11scope -p p11scope-discover
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline -p p11scope -p p11scope-discover "$@"
         fi
     fi
     BINARY="$PWD/target/$PROFILE/p11scope"
@@ -222,6 +255,7 @@ mono_ns() {
 KERNEL=$(uname -r)
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
 NCPU=$(nproc)
+POSSIBLE_CPUS=$(python3 -I scripts/system-scope-measure.py --possible-cpu-count 2>/dev/null) || POSSIBLE_CPUS=null
 
 # wait_file <path> <timeout_s> — poll for a file to appear.
 wait_file() {
@@ -289,14 +323,23 @@ collect_receipt() {
 
 # wait_attach <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold the go file
 # until discovery is done (marker on the timestamped stderr passthrough)
-# AND the capture loop is live: the observer renders its first live frame
-# to stdout on tick one (last_frame starts a full drain interval in the
-# past), strictly after the attach session completes, so the frame's
-# "probes attached" line is an in-observer attach-end signal. An fd
+# AND the attach session is complete: the observer prints
+# "p11scope: capturing: N probe(s) attached; stop with Ctrl-C" on stderr
+# once probes are attached and the capture loop starts (capture_ready_line
+# in src/run.rs — "the one readiness line ... scripts and supervisors
+# wait for this line"), so that line is the in-observer attach-end signal.
+# The 0801e79c "p11scope: attached N probe(s)" line is dead: merge
+# 79a54f53 dropped it as a duplicate of the capturing line, so gating on
+# it waits forever. The old first-live-frame stdout signal died with M-10
+# (7eb86f0d made live frames terminal-only) while the harness captures
+# observer stdout to a file, so a frame gate could never fire. An fd
 # plateau is NOT the gate — under load attach stalls for seconds mid-ramp
 # and a plateau detector fires early, releasing the workload burst into a
-# half-attached observer (observed once: 1/20000 calls). Returns 2 if the
-# observer is terminal and 3 if its exact identity cannot be inspected.
+# half-attached observer (observed once: 1/20000 calls). A zero-probe
+# capturing line still fires the gate (unlike bench-overhead.sh's
+# zero-probe refusal): readiness means the attach session completed, and
+# post-hoc counts prove the window. Returns 2 if the observer is terminal
+# and 3 if its exact identity cannot be inspected.
 wait_attach() {
     end=$(( $(date +%s) + $4 ))
     while :; do
@@ -305,7 +348,7 @@ wait_attach() {
         case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null \
-            && grep -q "probes attached" "$1/observer.stdout" 2>/dev/null; then
+            && grep -q -E "p11scope: capturing: [0-9]+ probe\(s\) attached" "$1/stderr.txt" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
@@ -314,9 +357,9 @@ wait_attach() {
 
 # wait_marker <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold until the
 # discovery marker lands on stderr. Weaker than wait_attach (no
-# in-observer attach-end signal): used only where no first live frame
-# exists (trace mode) or the frame is not kept (discard/slow-pipe sinks).
-# Settles after the marker; post-hoc counts prove the window.
+# in-observer attach-end signal): used only for trace mode and the
+# discard sink. Settles after the marker; post-hoc counts prove the
+# window.
 wait_marker() {
     end=$(( $(date +%s) + $4 ))
     while :; do
@@ -535,10 +578,10 @@ out.close()
     SMPID_RECEIPT=$OWNED_RECEIPT
     owned_verify_launch "$SMPID" "$SMPID_STARTTIME" "$SMPID_RECEIPT" || exit 1
 
-    # Attach gate: the first live frame (profile/metrics to a kept sink)
-    # is an in-observer attach-end signal; everywhere else (trace has no
-    # frames; discard keeps nothing) fall back to marker+settle and let
-    # post-hoc counts prove the window. The gate used is recorded.
+    # Attach gate: the stderr attach-complete line (profile/metrics to a
+    # kept sink) is the in-observer attach-end signal; everywhere else
+    # fall back to marker+settle and let post-hoc counts prove the
+    # window. The gate used is recorded.
     GATE=frame
     if [ "$mode" != trace ] && [ "$SINK" != discard ]; then
         if wait_attach "$dir" "$STARGET_PID" "$STARGET_STARTTIME" 600; then
@@ -750,7 +793,7 @@ out.close()
   "observer_source_revision": null,
   "observer_argv": $OBS_ARGV_JSON, "workload_argv": $WORKLOAD_ARGV_JSON,
   "mapping_gate": "$([ "$MAP_EARLY" -eq 1 ] && echo pre-observer || echo post-attach)"},
- "host": {"kernel": "$KERNEL", "cpu": "$CPU", "ncpu": $NCPU, "loadavg": "$LOADAVG"},
+ "host": {"kernel": "$KERNEL", "cpu": "$CPU", "ncpu": $NCPU, "possible_cpus": $POSSIBLE_CPUS, "loadavg": "$LOADAVG"},
  "timing": {"t_spawn_mono_ns": $T_SPAWN, "t_initial_go_mono_ns": $T_INITIAL_GO,
   "t_mapping_ready_mono_ns": $T_MAPPING_READY, "t_receipt_ready_mono_ns": $T_RECEIPT_READY,
   "t_go_mono_ns": $T_GO, "t_exit_mono_ns": $T_EXIT},
@@ -758,7 +801,7 @@ out.close()
   "stderr_ts": "$dir/stderr-ts.jsonl", "stderr": "$dir/stderr.txt",
   "workload_log": "$dir/workload.log", "mapping_receipt": "$dir/workload-mapping-receipt.json"}}
 EOF
-    python3 -I - "$dir/meta.json" "$dir/receipt-metadata.json" <<'PY'
+    python3 -I - "$dir/meta.json" "$dir/receipt-metadata.json" "$DETAILED_PROFILE" "$WORK/detailed-resources.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -768,6 +811,13 @@ receipt_path = Path(sys.argv[2])
 meta = json.loads(meta_path.read_text(encoding="utf-8"))
 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
 meta["condition"].update(receipt)
+if sys.argv[3]:
+    prepared = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+    if prepared["possible_cpus"] != meta["host"]["possible_cpus"]:
+        raise ValueError("detailed resources: possible CPU metadata changed")
+    meta["condition"]["detailed_profile"] = sys.argv[3]
+    meta["condition"]["detailed_resource_calculator"] = prepared["calculator"]
+    meta["detailed_resources"] = prepared["detailed_resources"]
 meta_path.write_text(json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
 PY
     python3 -I scripts/system-scope-measure.py --meta "$dir/meta.json" \

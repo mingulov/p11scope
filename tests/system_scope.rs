@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod support;
 
+use support::DieWithParent as _;
+
 fn tmp(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -69,6 +71,7 @@ fn spawn_loaded(driver: &Path, provider: &Path) -> support::ChildGuard {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -92,12 +95,17 @@ fn spawn_loaded(driver: &Path, provider: &Path) -> support::ChildGuard {
 
 fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: hints,
+        exclude_modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::System,
         metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,
@@ -142,7 +150,7 @@ fn system_scope_parses_for_profile_and_trace() {
 #[test]
 fn system_scope_is_one_of_three_and_mutually_exclusive() {
     assert!(
-        matches!(parse(argv(&["profile"])), Err(CliError::Usage(message))
+        matches!(parse(argv(&["profile"])), Err(CliError::Usage { message, .. })
             if message.contains("exactly one of --pid, --cgroup, or --system"))
     );
     for extra in [
@@ -153,21 +161,21 @@ fn system_scope_is_one_of_three_and_mutually_exclusive() {
         let mut words = vec!["profile", "--system"];
         words.extend(extra.clone());
         assert!(
-            matches!(parse(argv(&words)), Err(CliError::Usage(message))
+            matches!(parse(argv(&words)), Err(CliError::Usage { message, .. })
                 if message.contains("mutually exclusive")),
             "{words:?}"
         );
         let mut words = vec!["trace", "--system"];
         words.extend(extra);
         assert!(
-            matches!(parse(argv(&words)), Err(CliError::Usage(message))
+            matches!(parse(argv(&words)), Err(CliError::Usage { message, .. })
                 if message.contains("mutually exclusive")),
             "{words:?}"
         );
     }
     assert!(matches!(
         parse(argv(&["run", "--system", "--", "/bin/true"])),
-        Err(CliError::Usage(message)) if message.contains("run has no --pid, --cgroup, or --system")
+        Err(CliError::Usage { message, .. }) if message.contains("run has no --pid, --cgroup, or --system")
     ));
 }
 
@@ -298,6 +306,7 @@ fn spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> support::ChildGua
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -520,6 +529,7 @@ fn system_scope_restricted_procfs_cross_uid_cell() {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

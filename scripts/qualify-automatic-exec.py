@@ -1,0 +1,8734 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Installed automatic exec/scope recovery acceptance (H6 slice 4).
+
+Runs the required --cells against an explicitly staged observer binary plus
+owned disk fixtures (never tmpfs: the Btrfs mapping-domain identity path is
+part of the check), driving only public trace / profile / metrics /
+inventory --capture native commands (H3 inventory --manifest only for the
+S1-bearing legs), and judges every leg with an independent driver ledger
+that never derives expectations from p11scope.
+
+Cells: pid-leader, pid-reexec, pid-nonleader-cold, pid-failed-exec,
+leader-exit-exec, rapid-chain, cgroup-reentry, system-mixed.
+
+Workloads (all owned, all on disk under the case directory):
+  caller.c    SoftHSM interactive caller (leader/reexec/rapid/cgroup legs)
+  detailed-nonleader-exec.c  LP64 synthetic provider, exec inside the probed
+              frame (cold nonleader / failed / leader-exit legs)
+  inventory-ledger.c  opt-in bounded H6 phases, with legacy workloads preserved
+
+Oracle reuse: trace rows and COUNT/EVIDENCE parsing reuse
+scripts/cgroup-trace-oracle.py verbatim (ROW, parse_trace). The H6
+evaluation below reuses that spine and N3's error taxonomy where the
+rules are compatible; every H6 delta is marked H6-DELTA with a reason.
+Harness reuse: owned process/cgroup/file-pin/reader primitives are
+imported from scripts/qualify-cgroup-trace.py (same revision); the H6
+drivers add workload-B byte-protocol and inventory-ledger gate handling.
+
+No product source is touched by this script. A red leg is either a
+harness/setup failure (fix the cell) or product behavior that must be
+reported BLOCKED-with-evidence, never fixed here.
+
+Live use requires the separately granted privileged lane: run as root
+with an ordinary workload uid/gid. Only owned fixtures, processes,
+cgroups and temp files are created; every owned resource is cleaned up
+and cleanup receipts are recorded in summary.json.
+"""
+
+import argparse
+from collections import Counter, defaultdict, deque
+from collections.abc import Mapping
+from contextlib import contextmanager
+from functools import wraps
+from contextvars import ContextVar
+import ctypes
+import errno
+import codecs
+import copy
+import pty
+import threading
+import hashlib
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import runpy
+import shutil
+import stat
+import signal
+import select
+import subprocess
+import sys
+import time
+import uuid
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+
+N3HARNESS = runpy.run_path(str(ROOT / "scripts/qualify-cgroup-trace.py"))
+N3ORACLE = runpy.run_path(str(ROOT / "scripts/cgroup-trace-oracle.py"))
+INITIAL_EXEC = runpy.run_path(str(ROOT / "scripts/h6-initial-exec.py"))
+ROW = N3ORACLE["ROW"]
+N3_PARSE_TRACE = N3ORACLE["parse_trace"]
+IMAGE_FIELDS = ("image", "pid", "start_time", "path", "dev", "ino", "mtime_ns",
+                "pid_namespace", "time_namespace")
+VA_REUSE_TARGETS = ("C_GetFunctionList", "C_Initialize", "C_Finalize", "C_GetInfo", "C_GetSlotList",
+                    "C_OpenSession", "C_CloseSession", "C_GetSessionInfo", "C_GenerateRandom")
+
+CELLS = ("pid-leader", "pid-reexec", "pid-nonleader-cold", "pid-failed-exec",
+         "leader-exit-exec", "rapid-chain", "cgroup-reentry", "system-mixed")
+BACKENDS = ("singles", "multi")
+# Completion requires every recovery/control leg run by each selected cell.
+# Worker capability is an independent informational population, not one of
+# these required positives.
+REQUIRED_LEGS = {
+    "pid-leader": ("trace", "profile", "metrics"),
+    "pid-reexec": ("trace", "profile", "metrics"),
+    "pid-nonleader-cold": ("trace", "profile", "metrics"),
+    "pid-failed-exec": ("trace",),
+    "leader-exit-exec": ("trace",),
+    "rapid-chain": ("trace", "reuse", "group-death"),
+    "cgroup-reentry": ("trace", "replacement", "stop-before", "stop-during", "inventory"),
+    "system-mixed": ("inventory",),
+}
+CANARIES = ("H6_PRIVATE_BUFFER_44c1d7", "H6_PRIVATE_ENV_9e02b4", "H6_PRIVATE_ARG_71f5aa")
+
+# Fixture RV values to presented CKR names (workload-B uses RV 0 and 5 only).
+RV_NAMES = {0: "CKR_OK", 5: "CKR_GENERAL_ERROR"}
+
+
+def monotonic_ns():
+    return time.monotonic_ns()
+
+
+OBSERVER_STOP_SECONDS = 60
+INVENTORY_STOP_SECONDS = 30
+CLEANUP_SECONDS = 5
+ACTIVE_LEG = ContextVar("h6_owned_leg_budget", default=None)
+
+
+class LegBudget:
+    """Absolute monotonic limits; revisiting a phase never buys more time."""
+    def __init__(self, inventory=False, clock=None, budgets=None, leg_seconds=None):
+        self.clock = clock or monotonic_ns
+        # Setup includes token init (30), manifest generation (180), and the
+        # Inventory first pass (120). Their individual limits stay unchanged.
+        self.budgets = {"setup": 330, "successor-recovery": 90 if inventory else 15,
+                        "fixed-measurement": 180 if inventory else 60,
+                        "normal-stop": INVENTORY_STOP_SECONDS if inventory else OBSERVER_STOP_SECONDS,
+                        "cleanup": CLEANUP_SECONDS}
+        self.budgets.update(budgets or {})
+        if any(not 0 < value < float("inf") for value in self.budgets.values()):
+            raise ValueError("phase budgets must be positive and finite")
+        # The rapid chain has at most three distinct successors. Every other
+        # phase has one deadline, including cleanup after forced cancellation.
+        total = sum(self.budgets.values()) + 2 * self.budgets["successor-recovery"]
+        seconds = total if leg_seconds is None else leg_seconds
+        if not 0 < seconds < float("inf"):
+            raise ValueError("leg budget must be positive and finite")
+        self.started_ns = self.clock()
+        self.deadline_ns = self.started_ns + int(seconds * 1e9)
+        self.deadlines = {}
+        self.enter("setup")
+
+    def enter(self, phase, key=0):
+        if phase != "cleanup":
+            self.remaining()  # Expired work cannot dispatch by changing phase.
+        identity = (phase, key)
+        if identity not in self.deadlines:
+            if phase == "successor-recovery" and sum(
+                    name == phase for name, _key in self.deadlines) >= 3:
+                raise TimeoutError("successor recovery phase budget exhausted")
+            self.deadlines[identity] = min(self.deadline_ns,
+                self.clock() + int(self.budgets[phase] * 1e9))
+        self.phase, self.phase_deadline_ns = phase, self.deadlines[identity]
+        self.remaining()
+
+    def remaining(self, seconds=None):
+        deadline = min(self.deadline_ns, getattr(self, "phase_deadline_ns", self.deadline_ns))
+        left = (deadline - self.clock()) / 1e9
+        if left <= 0:
+            raise TimeoutError(f"{getattr(self, 'phase', 'leg')} deadline exhausted")
+        return left if seconds is None else min(seconds, left)
+
+
+def enter_phase(name, key=0):
+    if budget := ACTIVE_LEG.get():
+        budget.enter(name, key)
+
+
+def remaining_seconds(seconds):
+    if not 0 < seconds < float("inf"):
+        raise TimeoutError("finite wait budget exhausted")
+    budget = ACTIVE_LEG.get()
+    return budget.remaining(seconds) if budget else seconds
+
+
+def wait_deadline(seconds):
+    return monotonic_ns() + int(remaining_seconds(seconds) * 1e9)
+
+
+def remaining_until(deadline):
+    return remaining_seconds((deadline - monotonic_ns()) / 1e9)
+
+
+def check_dispatch():
+    if budget := ACTIVE_LEG.get():
+        budget.remaining()
+
+
+def wait_process(child, seconds):
+    return child.wait(timeout=remaining_seconds(seconds))
+
+
+def pause_until(deadline, interval):
+    time.sleep(min(interval, remaining_until(deadline)))
+
+
+def transport_poll_seconds(reader):
+    # A transport spans phases; only the absolute leg caps its background
+    # polling. Foreground proof/ack waits additionally enforce their phase.
+    if reader.budget is None:
+        return 0.2
+    remaining = (reader.budget.deadline_ns - reader.budget.clock()) / 1e9
+    if remaining <= 0:
+        raise TimeoutError("owned transport leg deadline exhausted")
+    return min(0.2, remaining)
+
+
+def stop_errors(receipt):
+    errors = []
+    if receipt.get("forced_cleanup"):
+        errors.append("observer required forced cleanup after its normal stop deadline")
+    if "stop_latency_seconds" in receipt and not (
+            0 <= receipt["stop_latency_seconds"] <= receipt.get("stop_limit_seconds", 5)):
+        errors.append("observer exceeded its declared normal stop limit")
+    return errors
+
+
+def expected_reuse_errors(receipt, ledger):
+    errors = []
+    reuse_expected = receipt.get("reuse_expected", {})
+    if not isinstance(reuse_expected, Mapping):
+        raise TypeError("reuse_expected must be a mapping")
+    for kind in ("session", "va", "token"):
+        if not reuse_expected.get(kind):
+            continue
+        info = receipt.get(f"{kind}_reuse", {})
+        if not isinstance(info, Mapping):
+            raise TypeError(f"{kind}_reuse must be a mapping when reuse is required")
+        if not info.get("observed") or kind == "va" and not va_reuse_from(ledger)["observed"]:
+            errors.append(f"expected {kind} reuse across exec is not demonstrated by the ledger")
+    return errors
+
+
+def stop_receipt(owned, latency, limit=OBSERVER_STOP_SECONDS):
+    return getattr(owned, "stop_receipt", {
+        "stop_latency_seconds": latency, "stop_limit_seconds": limit})
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# H6 oracle: trace legs
+#
+# Spine reused from scripts/cgroup-trace-oracle.py (ROW/parse_trace verbatim;
+# check sequence and error taxonomy mirrored). H6-DELTA marks every rule that
+# differs, with the reason. Deltas: scope-kind-aware in-scope selection (pid
+# cells ignore caller scope labels); measured/warmup gates (required); order
+# -matched attribution per (pid,tid,fn) when lossless+exact (rapid-chain
+# reused keys); explicit duplicate-return, manual-rebind, pid-purity,
+# abandoned-accounting and session/VA/token-reuse checks; nonzero-RV
+# ledgers (workload-B fails every other call by design); no first-proved /
+# cold-proved / short / sparse / run special cases (no such H6 cells).
+# ---------------------------------------------------------------------------
+
+def _without_sink(value):
+    value = dict(value)
+    if "scheduling" in value:
+        scheduling = dict(value["scheduling"])
+        for field in ("sink_stall_ms", "sink_timeouts", "sink_dropped_bytes"):
+            scheduling.pop(field, None)
+        value["scheduling"] = scheduling
+    return value
+
+
+def _single_pid_provider_domain(ev, receipt, ledger, capture, mode):
+    """Bind the recovered category to controlled H6 invocation/held-object facts.
+
+    The trace footer has no structured scope. Its binding comes from the actual
+    submitted argv, held-FD calibration, owned image births and independent target
+    mappings. These unsigned records do not authenticate a rewritten document or
+    identify which missing return crossed the categorical coverage episode.
+    """
+    try:
+        if receipt["scope_kind"] != "pid" or receipt["cell"] not in (
+                "pid-leader", "pid-reexec", "pid-nonleader-cold", "pid-failed-exec", "leader-exit-exec"):
+            return False
+        pid = receipt["pid"]
+        if type(pid) is not int or pid <= 0 or receipt["owned_pids"] != [pid]:
+            return False
+        pin = receipt["provider_before"]
+        mapping = pin["mapping"]
+        if (pin != receipt["provider_after"] or not pin["path"].startswith("/")
+                or not isinstance(pin["dev"], list) or len(pin["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in pin["dev"])
+                or type(pin["ino"]) is not int or pin["ino"] <= 0
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])
+                or mapping["dev"] != pin["dev"] or mapping["ino"] != pin["ino"]
+                or mapping["file_offset"] != 0 or mapping["permissions"] != "r--p"
+                or type(mapping["length"]) is not int or mapping["length"] <= 0):
+            return False
+        # fstat's file_identity.dev deliberately is not the /proc/maps domain.
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        def matches(record):
+            return isinstance(record, dict) and all(record.get(key) == value for key, value in identity.items())
+        argv = receipt["observer_argv"]
+        if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
+                or mode not in ("trace", "profile", "metrics")
+                or (capture is None) != (mode == "trace")
+                or mode not in REQUIRED_LEGS[receipt["cell"]] or receipt["requested_backend"] not in BACKENDS
+                or receipt["leg"] != f"{mode}/{receipt['requested_backend']}"
+                or argv[1] != ("trace" if mode == "trace" else "profile")
+                or not argv[0].startswith("/")
+                or any(flag in argv for flag in ("--system", "--cgroup"))
+                or any(arg.startswith(("--pid=", "--cgroup=", "--module=")) for arg in argv)
+                or any(argv.count(flag) != 1 for flag in ("--pid", "--module", "--attach-backend"))
+                or argv[argv.index("--pid") + 1] != str(pid)
+                or argv[argv.index("--module") + 1] != pin["path"]
+                or argv[argv.index("--attach-backend") + 1] != receipt["requested_backend"]
+                or (mode != "trace" and (argv.count("--mode") != 1
+                    or argv[argv.index("--mode") + 1] != mode))):
+            return False
+        images = receipt["images"]
+        ledger_images = [row for row in ledger if row["kind"] == "image"]
+        by_image = {row["image"]: row for row in images}
+        if (not images or len(by_image) != len(images) or len(ledger_images) != len(images)
+                or any(any(field not in row for field in IMAGE_FIELDS) for row in images + ledger_images)
+                or {row["image"] for row in ledger_images} != set(by_image)
+                or len({row["start_time"] for row in images}) != 1
+                or any(row["pid"] != pid or type(row["start_time"]) is not int or row["start_time"] <= 0
+                    or not row["path"].startswith("/")
+                    or any(type(row[field]) is not int or row[field] <= 0
+                           for field in ("ino", "mtime_ns", "pid_namespace", "time_namespace"))
+                    or row["pid_namespace"] != receipt["pid_namespace"]
+                    or row["time_namespace"] != receipt["time_namespace"] for row in images)
+                or any(any(row.get(field) != by_image[row["image"]].get(field) for field in IMAGE_FIELDS)
+                    for row in ledger_images)):
+            return False
+        targets = [row for row in ledger if row["kind"] == "target"]
+        if (not targets or {row["image"] for row in targets} != set(by_image)
+                or any(row["dev"] != pin["dev"] or row["ino"] != pin["ino"]
+                    or type(row["file_offset"]) is not int or row["file_offset"] < 0 for row in targets)):
+            return False
+        target_keys = {(row["image"], row["fn"]) for row in targets}
+        if any((row["image"], row["fn"]) not in target_keys for row in ledger if row["kind"] == "call"):
+            return False
+        backend = ev["attach_backend"]
+        if (ev["authority"] != "hash-pinned" or backend["fallback"] is not None
+                or backend["selection"] != receipt["requested_backend"]
+                or backend["scope_filter"] not in ("perf-task+bpf", "kernel-pid+bpf")):
+            return False
+        providers = ev["discovery"]
+        if not isinstance(providers, list) or len(providers) != 1 or not matches(providers[0]):
+            return False
+        objects = providers[0]["objects"]
+        if not isinstance(objects, list) or not objects or any(not matches(item) for item in objects):
+            return False
+        physical = {(tuple(item["dev"]), item["ino"], item["sha256"]) for item in objects}
+        if len(physical) != 1:
+            return False
+        if mode != "trace" and (capture["scope"] != "pid" or capture["mode"] != mode
+                or len(capture["modules"]) != 1 or not matches(capture["modules"][0])):
+            return False
+        return True
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def _single_cgroup_provider_domain(ev, receipt, ledger, capture, mode):
+    """Bind only R1's recovered global category to its held root and provider.
+
+    The categorical footer does not locate individual missed calls. The owned
+    invocation, two original images, held provider calibration and target ledger
+    restrict which controlled domain it can explain; deficits remain explicit.
+    """
+    try:
+        if (mode != "trace" or capture is not None or receipt["scope_kind"] != "cgroup"
+                or receipt["cell"] != "cgroup-reentry" or cgroup_operator_path_errors(receipt)
+                or receipt["requested_backend"] not in BACKENDS
+                or receipt["leg"] != f"trace/{receipt['requested_backend']}"):
+            return False
+        images = receipt["images"]
+        by_image = {row["image"]: row for row in images}
+        actual_images = [row for row in ledger if row["kind"] == "image"]
+        if len(images) != 2 or set(by_image) != {0, 1} or len(actual_images) != 2:
+            return False
+        pid = images[0]["pid"]
+        if (type(pid) is not int or pid <= 0 or receipt["owned_pids"] != [pid]
+                or {row["image"] for row in actual_images} != {0, 1}
+                or len({row["start_time"] for row in images}) != 1
+                or any(any(field not in row for field in IMAGE_FIELDS) for row in images + actual_images)
+                or any(row["pid"] != pid or not row["path"].startswith("/")
+                    or any(type(row[field]) is not int or row[field] <= 0
+                           for field in ("start_time", "ino", "mtime_ns", "pid_namespace", "time_namespace"))
+                    or row["pid_namespace"] != receipt["pid_namespace"]
+                    or row["time_namespace"] != receipt["time_namespace"] for row in images)
+                or any(any(row[field] != by_image[row["image"]][field] for field in IMAGE_FIELDS)
+                       for row in actual_images)):
+            return False
+        pin = receipt["provider_before"]
+        mapping = pin["mapping"]
+        if (pin != receipt["provider_after"] or not pin["path"].startswith("/")
+                or not isinstance(pin["dev"], list) or len(pin["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in pin["dev"])
+                or type(pin["ino"]) is not int or pin["ino"] <= 0
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])
+                or mapping["dev"] != pin["dev"] or mapping["ino"] != pin["ino"]
+                or mapping["file_offset"] != 0 or mapping["permissions"] != "r--p"
+                or type(mapping["length"]) is not int or mapping["length"] <= 0):
+            return False
+        argv = receipt["observer_argv"]
+        if (not isinstance(argv, list) or len(argv) != 12 or not all(isinstance(arg, str) for arg in argv)
+                or not argv[0].startswith("/") or not argv[-1].startswith("/")
+                or argv != [argv[0], "trace", "--cgroup", receipt["operator_path"]["initial"]["path"],
+                    "--module", pin["path"], "--attach-backend", receipt["requested_backend"],
+                    "--duration", "240s", "-o", argv[-1]]):
+            return False
+        backend = ev["attach_backend"]
+        if (ev["authority"] != "hash-pinned" or backend["fallback"] is not None
+                or backend["scope_filter"] is not None or backend["selection"] != receipt["requested_backend"]
+                or type(ev["attach_gap_ms"]) is not int or ev["attach_gap_ms"] <= 0):
+            return False
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        def matches(row):
+            return isinstance(row, dict) and all(row.get(key) == value for key, value in identity.items())
+        providers = ev["discovery"]
+        if not isinstance(providers, list) or len(providers) != 1 or not matches(providers[0]):
+            return False
+        objects = providers[0]["objects"]
+        if not isinstance(objects, list) or not objects or any(not matches(row) for row in objects):
+            return False
+        targets = [row for row in ledger if row["kind"] == "target"]
+        if (not targets or {row["image"] for row in targets} != {0, 1}
+                or any(row["dev"] != pin["dev"] or row["ino"] != pin["ino"]
+                    or type(row["file_offset"]) is not int or row["file_offset"] < 0 for row in targets)):
+            return False
+        keys = {(row["image"], row["fn"]) for row in targets}
+        return all(row["pid"] == pid and (row["image"], row["fn"]) in keys
+                   for row in ledger if row["kind"] == "call")
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None, *, mode=None):
+    if not missing:
+        return []
+    observation = ev.get("gap_classes", {}).get("observation", {})
+    # Link-loss counts from an independently abandoned frame alone say
+    # nothing about unobserved successor calls. Do not fabricate native loss
+    # or broaden a count-only attribution verdict into an observation gap.
+    relevant = (ev.get("unprotected_live_windows", 0) > 0
+                and "unprotected_live_windows" in observation.get("causes", []))
+    if not relevant and "skipped" in observation.get("causes", []):
+        recovered = {"name": "discovery subject", "reason": "static probes detached and exact pairs reattached"}
+        relevant = (recovered in ev.get("skipped", [])
+                    and (_single_pid_provider_domain(ev, receipt, ledger, capture, mode)
+                         or _single_cgroup_provider_domain(ev, receipt, ledger, capture, mode)))
+    if (ev.get("completeness") != "PARTIAL" or ev.get("verdict_detail") != "concrete_gap"
+            or observation.get("status") != "lossy" or not relevant):
+        return ["early deficit lacks relevant real product concrete-gap/PARTIAL evidence"]
+    return []
+
+
+def _trace_successor_populations(trace, rows, in_window, receipt, images, recovery_indices=None):
+    """Match exact stable groups; never kth-match an early missing prefix.
+
+    Saved public stream cursors partition sequential owned image generations.
+    The fixture is idle before each exec; completed stable groups are drained
+    before a later exec. Keys also carry image and measured/early phase class.
+    """
+    errors, hints, matches = [], {}, {}
+    proofs = receipt.get("successor_ready", [])
+    positions = [index for index, line in enumerate(trace.splitlines()) if ROW.fullmatch(line)]
+    boundaries = sorted((proof["output_cursor"], proof["image"]) for proof in proofs)
+    for proof in proofs:
+        index = proof["proof_cursor"] - 1
+        lines = trace.splitlines()
+        match = ROW.fullmatch(lines[index]) if 0 <= index < len(lines) else None
+        image = images[proof["image"]]
+        if (proof["proof_kind"] != "trace-row" or not match
+                or int(match["pid"]) != image["pid"] or match["fn"] != proof["marker_fn"]
+                or not match["path"] or json.loads(match["path"]) != image["path"]
+                or json.loads(match["label"]) != Path(image["path"]).name):
+            errors.append("successor proof does not identify a fresh correctly named public marker row")
+    if len(proofs) > 1:
+        if receipt.get("trace_generation_guards") is not True or len({proof["marker_fn"] for proof in proofs}) != len(proofs):
+            errors.append("reused successor generations lack distinguishable public marker guards")
+        lines = trace.splitlines()
+        for transition in receipt.get("exec_transitions", []):
+            proof = next(proof for proof in proofs if proof["image"] == transition["to_image"])
+            previous = images[transition["from_image"]]
+            drained = [phase for phase in receipt.get("phases", [])
+                       if phase["image"] == previous["image"] and "output_end" in phase]
+            if not drained:
+                errors.append("reused successor generation lacks a drained prior public phase boundary")
+            for phase in drained:
+                cursor, end = phase["output_cursor"], phase["output_end"]
+                observed = [match for line in lines[cursor:end] if (match := ROW.fullmatch(line))
+                            and int(match["pid"]) == previous["pid"] and match["fn"] == phase["fn"]]
+                if (not 0 <= cursor < end <= proof["output_cursor"] or len(observed) != phase["count"]
+                        or any(not match["path"] or json.loads(match["path"]) != previous["path"] for match in observed)):
+                    errors.append("prior public phase drain guard disagrees with its independent population/image")
+    wants = defaultdict(list)
+    got = defaultdict(list)
+    for call in in_window:
+        proof = next((proof for proof in proofs if proof["image"] == call["image"]), None)
+        group = "measured" if proof and call["t0"] >= proof["observed_ns"] else "early"
+        wants[call["image"], call["pid"], call["tid"], call["fn"], group].append(call)
+    initial_image = min(images)
+    for index, row in enumerate(rows):
+        image_id = initial_image
+        for cursor, candidate in boundaries:
+            if positions[index] >= cursor:
+                image_id = candidate
+        candidates = {call["image"] for call in in_window
+                      if (call["pid"], call["tid"], call["fn"]) == (row["pid"], row["tid"], row["fn"])}
+        if len(candidates) == 1:
+            image_id = next(iter(candidates))
+        hints[index] = image_id
+        group = "early"
+        # A saved, validated readiness cursor separates shared warm/measured
+        # function keys. Never use rendered timestamps as workload time.
+        image_proof = next((proof for proof in proofs if proof["image"] == image_id), None)
+        if image_proof and positions[index] >= image_proof["proof_cursor"]:
+            key = image_id, row["pid"], row["tid"], row["fn"], "measured"
+            if key in wants:
+                group = "measured"
+        got[image_id, row["pid"], row["tid"], row["fn"], group].append((index, row))
+    early_expected = early_named = early_unknown = missing = 0
+    for key in wants.keys() | got.keys():
+        expected, observed = wants[key], got[key]
+        if len(observed) > len(expected):
+            errors.append("duplicate return or outside-scope or foreign count in guarded public population")
+        if key[-1] == "measured":
+            if len(observed) != len(expected):
+                if recovery_indices is not None:
+                    recovery_indices.add(len(errors))
+                errors.append("stable measured population disagrees with its fixed ledger")
+            if any(row["path"] is None for _, row in observed):
+                if recovery_indices is not None:
+                    recovery_indices.add(len(errors))
+                errors.append("stable measured positive contains unknown executable rows")
+            # Only an exact group permits order-matching provider return codes.
+            if len(expected) == len(observed):
+                for (index, _), call in zip(observed, expected):
+                    matches[index] = call
+        else:
+            early_expected += len(expected)
+            early_named += sum(row["path"] is not None for _, row in observed)
+            early_unknown += sum(row["path"] is None for _, row in observed)
+            missing += max(0, len(expected) - len(observed))
+            # An exact early group can compare RV order; a deficit only
+            # compares its multiset upper bound, never assigns kth calls.
+            allowed = Counter(RV_NAMES[call["rv"]] for call in expected)
+            actual_rvs = Counter(row["rv"] for _, row in observed)
+            if any(actual_rvs[rv] > allowed[rv] for rv in actual_rvs):
+                errors.append("early provider returns exceed independently ledgered RV population")
+            if len(expected) == len(observed):
+                for (index, _), call in zip(observed, expected):
+                    matches[index] = call
+    return matches, hints, {"expected": early_expected, "observed_named": early_named,
+                           "observed_unknown": early_unknown, "deficit": missing}, errors
+
+
+def worker_early_population(rows, receipt, images, hints):
+    """Count only the original exact worker, independently of successor rows."""
+    worker = (receipt.get("b_setup", {}).get("worker_identity") or {}).get("tid")
+    observed = [row for index, row in enumerate(rows)
+                if (row["pid"], row["tid"], row["fn"], hints.get(index)) ==
+                   (receipt["pid"], worker, "C_Initialize", 0)]
+    named = sum(row["path"] is not None for row in observed)
+    errors = []
+    if not worker or worker == receipt["pid"] or len(observed) > 11:
+        errors.append("capability rows lack the exact worker or exceed its eleven calls")
+    if any(row["path"] is not None and (row["path"] != images[0]["path"]
+            or row["label"] != Path(images[0]["path"]).name) for row in observed):
+        errors.append("capability row falsely names the original worker image")
+    rvs = Counter(row["rv"] for row in observed)
+    if any(count > {"CKR_OK": 6, "CKR_GENERAL_ERROR": 5}.get(rv, 0) for rv, count in rvs.items()):
+        errors.append("capability returns exceed the independent six successes/five errors")
+    return {"expected": 11, "observed_named": named, "observed_unknown": len(observed) - named,
+            "deficit": max(0, 11 - len(observed)), "errors": errors}
+
+
+def initial_ready_errors(trace, ledger, receipt):
+    """Initial rapid/reuse admission is separate from every successor proof."""
+    if receipt.get("cell") != "rapid-chain" or not receipt.get("leg", "").startswith(("trace/", "reuse/")):
+        return []
+    try:
+        proof = receipt["initial_ready"]
+        image = next(row for row in receipt["images"] if row["image"] == 0)
+        attempts = proof["attempts"]
+        if type(attempts) is not int or not 1 <= attempts <= 20:
+            raise ValueError("initial attempt count exceeds its fixed bound")
+        phases = [f"initial-0-{seq}" for seq in range(1, attempts + 1)]
+        calls = [row for row in ledger if row.get("kind") == "call"
+                 and row.get("phase", "").startswith("initial-0-")]
+        fixed = [phase for phase in receipt["phases"] if phase["phase"] in ("warm", "measured")]
+        first_fixed = min(phase["t0"] for phase in fixed)
+        lines = trace.splitlines()
+        cursor, end = proof["output_cursor"], proof["proof_cursor"]
+        marker = ROW.fullmatch(lines[end - 1]) if 0 <= cursor < end <= len(lines) else None
+        provider = {key: receipt["provider_before"][key] for key in ("path", "dev", "ino", "sha256")}
+        if (proof["image"] != 0 or proof["pid"] != image["pid"] or proof["proof_kind"] != "trace-row"
+                or proof["marker_fn"] != "C_GetInfo" or proof["budget_phase"] != "setup"
+                or proof["provider"] != provider or proof["max_attempts"] != 20 or proof["phases"] != phases
+                or len(calls) != attempts or {row["phase"] for row in calls} != set(phases)
+                or not set(phases).issubset(receipt["warmup"]["phases"])
+                or not receipt["observer_ready_ns"] <= proof["started_ns"] <= proof["observed_ns"]
+                   <= first_fixed <= receipt["observer_stopped_ns"]
+                or not proof["observed_ns"] <= proof["deadline_ns"]
+                   <= min(proof["setup_deadline_ns"], proof["leg_deadline_ns"])
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 15_000_000_000
+                or any((row["image"], row["pid"], row["tid"], row["fn"], row["rv"], row["scope"]) !=
+                       (0, image["pid"], image["pid"], "C_GetInfo", 0, "selected") or not
+                       proof["started_ns"] <= row["t0"] <= row["t1"] <= proof["observed_ns"] for row in calls)
+                or not marker or (int(marker["pid"]), int(marker["tid"]), marker["fn"], marker["rv"]) !=
+                   (image["pid"], image["pid"], "C_GetInfo", "CKR_OK") or not marker["path"]
+                or json.loads(marker["path"]) != image["path"]
+                or json.loads(marker["label"]) != Path(image["path"]).name
+                or any(row and int(row["pid"]) == image["pid"] and row["fn"] == "C_GenerateRandom"
+                       for line in lines[:end] if (row := ROW.fullmatch(line)))
+                or any(end > successor["output_cursor"] for successor in receipt.get("successor_ready", []))):
+            raise ValueError("initial public marker/time/owned subject/provider disagrees")
+        return []
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError, StopIteration) as error:
+        return [f"invalid bounded initial public readiness proof: {error}"]
+
+
+def cgroup_operator_path_errors(receipt):
+    """R1 proves pathname changes around one retained physical cgroup root."""
+    if receipt.get("cell") != "cgroup-reentry" or not receipt.get("leg", "").startswith("trace/"):
+        return []
+    try:
+        proof = receipt["operator_path"]
+        if proof["operation"] != "operator-path-ancestor-rename-and-alias-replacement":
+            raise ValueError("wrong operator-path operation")
+        ns = proof["namespace"]
+        names = {"mnt", "pid", "time", "user", "cgroup"}
+        if (set(ns["before"]) != names or set(ns["after"]) != names
+                or any(type(value) is not int or value <= 0 for state in (ns["before"], ns["after"])
+                       for value in state.values())
+                or ns["before"]["mnt"] == ns["after"]["mnt"]
+                or any(ns["before"][name] != ns["after"][name] for name in names - {"mnt"})
+                or ns["after"]["pid"] != receipt["pid_namespace"]
+                or ns["after"]["time"] != receipt["time_namespace"]
+                or ns["private"] is not True or ns["shared_or_slave"] != 0
+                or type(ns["mountinfo_entries"]) is not int or ns["mountinfo_entries"] <= 0):
+            raise ValueError("namespace or recursive private propagation proof disagrees")
+        selected, outside = proof["selected"], proof["outside"]
+        def identity(row):
+            if (any(type(row[key]) is not int or row[key] <= 0 for key in ("dev", "ino", "magic"))
+                    or row["magic"] != 0x63677270):
+                raise ValueError("missing real held cgroup2 identity")
+            return row["dev"], row["ino"]
+        original_key, outside_key = identity(selected), identity(outside)
+        if original_key == outside_key:
+            raise ValueError("outside is the selected physical cgroup")
+        selected_path, outside_path = Path(selected["path"]), Path(outside["path"])
+        for native in (selected_path, outside_path):
+            native.relative_to("/sys/fs/cgroup")
+        if selected_path.parent != outside_path.parent:
+            raise ValueError("canonical cgroups are not the owned sibling pair")
+        initial, renamed, replacement, held = (proof[key] for key in
+            ("initial", "renamed", "replacement", "held_after_replacement"))
+        operator = Path(initial["path"])
+        if (not operator.is_absolute() or operator.name != "root" or operator.parent.name != "current"
+                or operator.parent.parent.name != "scope-path"
+                or Path(renamed["path"]) != operator.parent.parent / "retained/root"
+                or replacement["path"] != initial["path"] or held["path"] != renamed["path"]):
+            raise ValueError("operator ancestor rename/replacement paths disagree")
+        for row, expected in ((initial, original_key), (renamed, original_key),
+                              (replacement, outside_key), (held, original_key)):
+            if (identity(row) != expected or type(row["mount_id"]) is not int or row["mount_id"] <= 0
+                    or row["mount_namespace"] != ns["after"]["mnt"] or row["filesystem"] != "cgroup2"):
+                raise ValueError("operator path or held FD has the wrong physical/mount identity")
+        if not initial["mount_id"] == renamed["mount_id"] == held["mount_id"] != replacement["mount_id"]:
+            raise ValueError("original mount was not retained independently of replacement")
+        phases = receipt["phases"]
+        fixed = [("warm", 0, "C_GenerateRandom", 5, "selected"),
+                 ("aside", 0, "C_GetInfo", 3, "outside"),
+                 ("outside-b", 1, "C_GetInfo", 3, "outside"),
+                 ("measured", 1, "C_GetSessionInfo", 10, "selected"),
+                 ("still", 1, "C_GetSessionInfo", 3, "selected"),
+                 ("renamed", 1, "C_GetSessionInfo", 3, "selected"),
+                 ("operator-outside", 1, "C_GetInfo", 3, "outside")]
+        controlled = {}
+        for label, image, fn, count, scope in fixed:
+            matches = [phase for phase in phases if phase["phase"] == label]
+            if len(matches) != 1 or any(matches[0][key] != value for key, value in
+                    (("image", image), ("fn", fn), ("count", count), ("scope", scope))):
+                raise ValueError("fixed R1 phase population changed: " + label)
+            controlled[label] = matches[0]
+        still, stable, negative = (controlled[key] for key in ("still", "renamed", "operator-outside"))
+        actual_selected = "/" + str(selected_path.relative_to("/sys/fs/cgroup"))
+        actual_outside = "/" + str(outside_path.relative_to("/sys/fs/cgroup"))
+        if (any(phase["actual_cgroup"] != actual_selected for phase in (still, stable))
+                or negative["actual_cgroup"] != actual_outside):
+            raise ValueError("rename/replacement phases lack canonical actual membership")
+        stamps = [ns["prepared_ns"], proof["probe_ns"], initial["t"], receipt["observer_started_ns"],
+                  controlled["measured"]["t1"], renamed["t"], still["t0"], still["t1"], replacement["t"],
+                  held["t"], stable["t0"], stable["t1"], proof["outside_move_ns"],
+                  negative["t0"], negative["t1"], receipt["observer_stopped_ns"]]
+        if (any(type(stamp) is not int or stamp <= 0 for stamp in stamps)
+                or any(a > b for a, b in zip(stamps, stamps[1:]))):
+            raise ValueError("operator-path preflight/rename/replacement/membership chronology disagrees")
+        intervals = receipt["scope_intervals"]
+        if len(intervals) != 2 or intervals[-1]["t1"] != proof["outside_move_ns"]:
+            raise ValueError("selected scope interval extends past the actual outside move")
+        successor, = receipt["successor_ready"]
+        if (successor["image"] != 1 or successor["marker_fn"] != "C_GenerateRandom"
+                or successor["max_attempts"] != 20 or not 1 <= successor["attempts"] <= 20
+                or not 0 < successor["deadline_ns"] - successor["started_ns"] <= 15_000_000_000):
+            raise ValueError("R1 needs its disjoint real successor marker inside the original 20/15 bound")
+        # No selected C_GetInfo population may absorb an outside negative.
+        adaptive = [phase for phase in phases if phase["phase"] not in controlled]
+        if (len(adaptive) != successor["attempts"]
+                or [phase["phase"] for phase in adaptive] != successor["phases"]
+                or any((phase["image"], phase["fn"], phase["count"], phase["scope"]) !=
+                       (1, "C_GenerateRandom", 1, "selected") for phase in adaptive)):
+            raise ValueError("R1 adaptive population differs from its independently ledgered marker attempts")
+        return []
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+        return [f"invalid held-root operator-path control: {error}"]
+
+
+def cgroup_trace_boundary_errors(trace, receipt):
+    """Keep same-function generations and the final negative independently bounded."""
+    if receipt.get("cell") != "cgroup-reentry" or not receipt.get("leg", "").startswith("trace/"):
+        return []
+    try:
+        lines = trace.splitlines()
+        images = {image["image"]: image for image in receipt["images"]}
+        phases = {phase["phase"]: phase for phase in receipt["phases"]}
+        successor, = receipt["successor_ready"]
+        warm, tail = phases["warm"], receipt["cgroup_positive_tail"]
+        for boundary, image, fn, count, named in ((warm, images[0], "C_GenerateRandom", 5, False),
+                                                 (tail, images[1], "C_GetSessionInfo", 16, True)):
+            start, end = boundary["output_cursor"], boundary["output_end"]
+            if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(lines):
+                raise ValueError("invalid public population cursor")
+            rows = [match for line in lines[start:end] if (match := ROW.fullmatch(line))
+                    and int(match["pid"]) == image["pid"] and match["fn"] == fn]
+            if len(rows) != count or any(int(row["tid"]) != image["pid"] or row["rv"] != "CKR_OK"
+                    or (not row["path"] and named) or row["path"] and
+                    (json.loads(row["path"]) != image["path"]
+                     or json.loads(row["label"]) != Path(image["path"]).name) for row in rows):
+                raise ValueError("public fixed population was not completely drained with its original image")
+        if (warm["output_end"] > successor["output_cursor"]
+                or not warm["t1"] <= warm["output_observed_ns"] <= phases["aside"]["t0"]
+                or tail["output_cursor"] != successor["proof_cursor"]
+                or not phases["renamed"]["t1"] <= tail["observed_ns"] <= receipt["operator_path"]["outside_move_ns"]
+                or any(ROW.fullmatch(line) for line in lines[tail["output_end"]:])):
+            raise ValueError("outside control crossed an undrained public population boundary")
+        return []
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+        return [f"invalid cgroup public population boundary: {error}"]
+
+
+def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
+    rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
+    # Default every finding to capture integrity. Only the specific recovery
+    # and unobserved-mode2-entry checks below classify their own findings.
+    non_integrity_indices = set()
+    successor_recovery_errors, expected_mode2_abandonment_errors = [], []
+    def recovery_errors(values, *, abandonment=False):
+        for error in values:
+            non_integrity_indices.add(len(errors))
+            errors.append(error)
+            (expected_mode2_abandonment_errors if abandonment else successor_recovery_errors).append(error)
+    errors.extend(stop_errors(receipt))
+    errors.extend(cgroup_operator_path_errors(receipt))
+    errors.extend(cgroup_trace_boundary_errors(trace, receipt))
+    if (receipt.get("b_setup") or {}).get("mode") == "3":
+        errors.extend(held_entry_errors(trace, ledger, receipt))
+    if receipt.get("expect_empty"):
+        if rows:
+            errors.append("stop-before-collection leg captured rows")
+        if counts and any([counts[0].get("stats_entered", -1) != 0,
+                           counts[0].get("stats_returned", -1) != 0,
+                           counts[0].get("raw_calls", -1) != 0]):
+            errors.append("stop-before-collection leg reports nonzero terminal counts")
+        if evidence:
+            ev = evidence[0]
+            if any(ev.get(field, 0) != 0 for field in
+                   ("event_loss", "start_insert_failures", "unmatched_returns",
+                    "rv_update_failures", "cgroup_scope_failures",
+                    "process_tracking_failures", "process_tracking_evictions")):
+                errors.append("empty leg reports event/identity loss")
+            if (ev.get("attach_backend") or {}).get("fallback") is not None:
+                errors.append("capture installed a fallback link: no global fallback allowed")
+        else:
+            errors.append("missing terminal evidence record")
+        if receipt.get("observer_rc") != 0:
+            errors.append("observer did not exit successfully")
+        if not 0 <= receipt.get("stop_latency_seconds", -1) <= receipt.get("stop_limit_seconds", 5):
+            errors.append("stop exceeded the bounded cell limit")
+        return {"pass": not errors, "status": "pass" if not errors else "fail",
+                "cell": receipt.get("cell"), "leg": receipt.get("leg"),
+                "calls": len(rows), "named": 0, "unknown": 0, "false_names": 0,
+                "physical_entered": 0, "api_returned": 0, "completed_operations": 0,
+                "errors": errors, "capture_integrity_errors": list(errors),
+                "successor_recovery_errors": [], "expected_mode2_abandonment_errors": []}
+    if file_trace is not None:
+        other_rows, other_counts, other_evidence, other_errors = N3_PARSE_TRACE(file_trace)
+        errors.extend(other_errors)
+        if (rows, counts) != (other_rows, other_counts):
+            errors.append("stdout/file event or count disagreement")
+        if [_without_sink(v) for v in evidence] != [_without_sink(v) for v in other_evidence]:
+            errors.append("stdout/file terminal evidence disagreement")
+        if any(ev.get("scheduling", {}).get(field, 0) for ev in evidence + other_evidence
+               for field in ("sink_timeouts", "sink_dropped_bytes")):
+            errors.append("capture lost output in this no-loss parity cell")
+    # H6-DELTA: backend refusal is a recorded negative, never recovery.
+    if receipt.get("backend_refused"):
+        return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"), "calls": len(rows), "named": 0,
+                "unknown": 0, "false_names": 0,
+                "negative_reason": receipt["backend_refused"],
+                "errors": ["backend refused: %s" % (receipt["backend_refused"],)]}
+    for canary in receipt.get("privacy_canaries", []):
+        if not canary or any(canary in output for output in
+                             (trace, file_trace or "", receipt.get("observer_stderr", ""))):
+            errors.append("private fixture canary appears in capture output")
+    # H6-DELTA: group-death legs. The caller is SIGKILLed as a whole
+    # group, so its reaped rc is -SIGKILL, never 0; death is proven by
+    # the harness via waitpid plus /proc disappearance, never from
+    # p11scope output. The exact per-key population agreement below is
+    # then the no-post-death-rows proof.
+    death = receipt.get("group_death")
+    if death is None:
+        if receipt.get("observer_rc") != 0 or receipt.get("caller_rc") != 0:
+            errors.append("observer or caller did not exit successfully")
+    else:
+        errors.extend(_check_group_death_proof(death, receipt))
+    if not 0 <= receipt.get("stop_latency_seconds", -1) <= receipt.get("stop_limit_seconds", 5):
+        errors.append("normal stop exceeded the bounded cell limit")
+    before, after = receipt["provider_before"], receipt["provider_after"]
+    if (before != after or before["dev"] != before["mapping"]["dev"]
+            or before["ino"] != before["mapping"]["ino"]):
+        errors.append("held provider pin changed or lacks the independent mapped-device anchor")
+    if not re.fullmatch(r"[0-9a-f]{64}", before["sha256"]):
+        errors.append("invalid held provider digest")
+    # H6-DELTA: manual rebind can never satisfy automatic acceptance.
+    if receipt.get("manual_rebind"):
+        errors.append("manual rebind cannot satisfy automatic acceptance")
+    if any(row.get("kind") == "rebind" for row in ledger):
+        errors.append("fixture-issued rebind present: not an automatic recovery proof")
+
+    images = {row["image"]: row for row in ledger if row["kind"] == "image"}
+    trusted_images = {row["image"]: row for row in receipt["images"]}
+    if len(images) != sum(row["kind"] == "image" for row in ledger):
+        errors.append("duplicate caller image generation")
+    if set(images) != set(trusted_images):
+        errors.append("independent image receipts do not cover every caller image")
+    for image_id, image in images.items():
+        trusted = trusted_images.get(image_id, {})
+        if any(image.get(field) != trusted.get(field) for field in IMAGE_FIELDS):
+            errors.append("caller image disagrees with independently held executable/birth receipt")
+        if any(image[field] != receipt[field] for field in ("pid_namespace", "time_namespace")):
+            errors.append("caller and observer clock/PID namespace disagree")
+        if not image["path"].startswith("/") or any(image[field] <= 0 for field in
+                ("pid", "start_time", "ino", "mtime_ns", "pid_namespace", "time_namespace")):
+            errors.append("incomplete caller image identity")
+    targets = {(row["image"], row["fn"]): row for row in ledger if row["kind"] == "target"}
+    calls = [row for row in ledger if row["kind"] == "call"]
+    # H6-DELTA: exec-transition scope is controller-declared per transition
+    # (N3 hardcodes 'outside'); pid/system cells record the label only.
+    transitions = {}
+    for transition in receipt.get("exec_transitions", []):
+        previous, successor = images[transition["from_image"]], images[transition["to_image"]]
+        requests = [row for row in ledger if row["kind"] == "exec"
+                    and row["image"] == previous["image"]]
+        if len(requests) != 1 or requests[0] != transition["request"]:
+            errors.append("exec request disagrees with independently controlled transition")
+            continue
+        request = requests[0]
+        mode = transition["mode"]
+        scope_ok = True
+        if receipt.get("scope_kind") == "cgroup":
+            scope_ok = request["scope"] == transition.get("scope", "outside")
+        if (mode not in ("leader", "nonleader") or request["mode"] != mode
+                or request["pid"] != previous["pid"] or request["start_time"] != previous["start_time"]
+                or request["tid"] <= 0 or (request["tid"] == request["pid"]) != (mode == "leader")
+                or not scope_ok or request["path"] != successor["path"]
+                or not transition["t0"] <= request["t"] < successor["t"] <= transition["t1"]
+                or previous["pid"] != successor["pid"] or previous["start_time"] != successor["start_time"]
+                or (previous["path"] == successor["path"]) != transition["same_path"]
+                or any(call["scope"] == "selected" and call["t0"] < successor["t"]
+                       for call in calls if call["image"] == successor["image"])):
+            errors.append("exec transition lacks authentic generation/leader/birth/scope evidence")
+        else:
+            transitions[successor["image"]] = transition
+    if "phases" in receipt:
+        phase_calls = [call for call in calls if call["phase"] not in ("setup", "teardown")]
+        phase_keys = set()
+        for phase in receipt["phases"]:
+            key = phase["image"], phase["fn"], phase["phase"]
+            if key in phase_keys:
+                errors.append("duplicate controller phase")
+            phase_keys.add(key)
+            population = [call for call in phase_calls
+                          if (call["image"], call["fn"], call["phase"]) == key]
+            if len(population) != phase["count"] or any(
+                    call["scope"] != phase["scope"] or not phase["t0"] <= call["t0"] <= call["t1"] <= phase["t1"]
+                    for call in population):
+                errors.append("fixture phase disagrees with independently issued command/membership interval")
+            if "gap_ms" in phase:
+                ordered = sorted(population, key=lambda call: call["t0"])
+                gap = phase["gap_ms"] * 1_000_000
+                if not 0 <= phase["gap_ms"] <= 61000 or any(
+                        later["t0"] - earlier["t1"] < gap
+                        for earlier, later in zip(ordered, ordered[1:])):
+                    errors.append("real spaced-call gap is shorter than the independent command")
+        if any((call["image"], call["fn"], call["phase"]) not in phase_keys for call in phase_calls):
+            errors.append("fixture call has no independently issued workload phase")
+    start, ready, stop = (receipt[field] for field in
+                          ("observer_started_ns", "observer_ready_ns", "observer_stopped_ns"))
+    if not receipt["scope_created_ns"] < start <= ready < stop:
+        errors.append("invalid independent observer interval")
+    # H6-DELTA: measured/warmup gates. The measured phase is required,
+    # nonempty, and after public readiness; warm-up is explicitly bounded
+    # and reported, never discarded from coverage.
+    measured_calls, warmup_calls, gate_errors = _check_measured_warmup(
+        calls, receipt, ready, stop, start)
+    errors.extend(gate_errors)
+    errors.extend(initial_ready_errors(trace, ledger, receipt))
+    for call in calls:
+        image = images[call["image"]]
+        target = targets.get((call["image"], call["fn"]))
+        if (not target or target["dev"] != before["dev"] or target["ino"] != before["ino"]
+                or target["file_offset"] < 0):
+            errors.append(f"call lacks a matching physical provider target: {call['fn']}")
+        if call["pid"] != image["pid"] or call["t1"] < call["t0"]:
+            errors.append("call identity/interval disagrees with its caller image")
+        # H6-DELTA: nonzero RVs are legal when the ledger declares them;
+        # the row RV must match the ledger RV exactly (checked below).
+        if call["rv"] not in RV_NAMES:
+            errors.append(f"ledger call carries an unmapped return value: {call['fn']} rv={call['rv']}")
+    scope_kind = receipt.get("scope_kind", "pid")
+    owned_pids = set(receipt.get("owned_pids", []))
+    in_window, pre_ready, post_stop, out_of_scope, boundary_errors = _select_in_window(
+        calls, receipt, ready, stop)
+    errors.extend(boundary_errors)
+    # H6-DELTA: group-death legs ledger nothing at or after the
+    # independently proven death; any post-death row then fails the
+    # exact population agreement below as a duplicate/foreign count.
+    if death is not None and isinstance(death.get("death_ns"), int):
+        if any(call["t1"] >= death["death_ns"] for call in in_window):
+            errors.append("group-death leg ledgered a call at or after the proven death")
+    mandatory: Counter = Counter()
+    expected_images: dict = defaultdict(set)
+    expected_calls: dict = defaultdict(deque)
+    for call in in_window:
+        key = (call["pid"], call["tid"], call["fn"])
+        expected_images[key].add(images[call["image"]]["image"])
+        mandatory[key] += 1
+    if not mandatory:
+        errors.append("no independently ledgered calls after capture readiness")
+    # Calls outside the capture window or scope must never surface as rows:
+    # exact per-key population agreement enforces this (below). Ledger
+    # sequence (not dict equality) breaks timestamp ties: normalized
+    # window-bound calls are often identical dicts.
+    for _, call in sorted(enumerate(in_window), key=lambda pair: (pair[1]["t0"], pair[0])):
+        expected_calls[call["pid"], call["tid"], call["fn"]].append(call)
+    actual = Counter((row["pid"], row["tid"], row["fn"]) for row in rows)
+    early_coverage = None
+    row_image_hints = {}
+    ambiguous_keys = [key for key, ids in expected_images.items() if len(ids) != 1]
+    order_match = {}
+    if receipt.get("successor_ready"):
+        population_recovery_indices = set()
+        order_match, row_image_hints, early_coverage, population_errors = _trace_successor_populations(
+            trace, rows, in_window, receipt, images, population_recovery_indices)
+        for index, error in enumerate(population_errors):
+            if index in population_recovery_indices:
+                recovery_errors([error])
+            else:
+                errors.append(error)
+        # The combined early population includes successor attempts. The
+        # capability independently judges its original worker prefix gap.
+        recovery_errors(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"],
+                                         receipt, ledger, mode="trace"))
+        ambiguous_keys = []  # Independently guarded by public stream cursors.
+    else:
+        for key in sorted(actual.keys() | mandatory.keys()):
+            if mandatory[key] == 0 and actual[key] > 0:
+                errors.append(
+                    f"outside-scope or foreign count: captured {actual[key]} rows for no "
+                    f"ledgered in-scope call: {key}")
+            elif actual[key] > mandatory[key]:
+                errors.append(
+                    f"duplicate return: captured {actual[key]} rows for {mandatory[key]} "
+                    f"ledgered calls: {key}")
+            elif actual[key] < mandatory[key]:
+                errors.append(
+                    f"captured provider-call population disagrees with ledger: {key}: "
+                    f"ledger {mandatory[key]} captured {actual[key]}")
+        # H6-DELTA: order-matched attribution. When lossless and per-key exact,
+        # the k-th row of a key is the k-th ledger call: reused keys across
+        # generations (rapid-chain) attribute by order. Under loss or mismatch
+        # there is no attribution: reused keys are ambiguous (fail, like N3).
+        lossless = bool(evidence) and all(
+            evidence[0].get(field, 0) == 0
+            for field in ("event_loss", "start_insert_failures", "unmatched_returns",
+                          "rv_update_failures", "cgroup_scope_failures",
+                          "process_tracking_failures", "process_tracking_evictions"))
+        exact = all(actual[key] == mandatory[key] for key in actual.keys() | mandatory.keys())
+        order_match: dict = {}
+        ambiguous_keys = [key for key, ids in expected_images.items() if len(ids) != 1]
+        if lossless and exact and mandatory:
+            per_key_rows: dict = defaultdict(list)
+            for index, row in enumerate(rows):
+                per_key_rows[row["pid"], row["tid"], row["fn"]].append((index, row))
+            for key, ledgered in expected_calls.items():
+                for (index, _), call in zip(sorted(per_key_rows.get(key, [])), list(ledgered)):
+                    order_match[index] = call
+        elif ambiguous_keys:
+            errors.append("ambiguous image generation for a reused key under loss; "
+                          "a stronger oracle is required")
+    # H6-DELTA: pid/system purity (no global fallback links).
+    if scope_kind == "pid":
+        for row in rows:
+            if row["pid"] != receipt.get("pid"):
+                errors.append("pid capture published a foreign pid: no global fallback allowed")
+                break
+        for row in rows:
+            if row["tid"] not in receipt.get("known_tids", [row["tid"]]):
+                errors.append("pid capture published an unknown tid")
+                break
+    else:
+        for row in rows:
+            if row["pid"] not in owned_pids:
+                errors.append("capture published a row for an unowned pid")
+                break
+    named = unknown = false_names = 0
+    populations = {image["path"]: {"named": 0, "unknown": 0} for image in images.values()}
+    generations: dict = {image_id: {"named": 0, "unknown": 0} for image_id in images}
+    phase_populations: dict = defaultdict(Counter)
+    first_rows: dict = {}
+    for index, row in enumerate(rows):
+        key = row["pid"], row["tid"], row["fn"]
+        matched = order_match.get(index)
+        if matched is not None:
+            want_rv = RV_NAMES.get(matched["rv"])
+            if want_rv is None or row["rv"] != want_rv:
+                errors.append("capture disagrees with ledgered provider return value")
+        if row["path"] is None:
+            unknown += 1
+        else:
+            named += 1
+            if matched is not None:
+                image = images[matched["image"]]
+                if row["path"] != image["path"] or row["label"] != Path(image["path"]).name:
+                    false_names += 1
+            else:
+                ids = {row_image_hints[index]} if index in row_image_hints else expected_images.get(key, set())
+                if (len(ids) != 1 or row["path"] != images[next(iter(ids))]["path"]
+                        or row["label"] != Path(row["path"]).name):
+                    false_names += 1
+        ids = ({matched["image"]} if matched is not None else
+               {row_image_hints[index]} if index in row_image_hints else expected_images.get(key, set()))
+        if len(ids) == 1:
+            image_id = next(iter(ids))
+            field = "named" if row["path"] else "unknown"
+            populations[images[image_id]["path"]][field] += 1
+            generations[image_id][field] += 1
+            first_rows.setdefault(image_id, (index, row))
+            if matched is not None:
+                phase_populations[matched["phase"]][field] += 1
+            elif not early_coverage and expected_calls[key]:
+                phase_populations[expected_calls[key].popleft()["phase"]][field] += 1
+    if false_names:
+        errors.append("capture published an executable other than the independently observed image")
+    if receipt.get("require_named") and not named:
+        errors.append("required stable positive contains no named event")
+    for image_id in receipt.get("require_named_images", []):
+        if not generations[image_id]["named"]:
+            errors.append("required image contains no independently correct named event")
+    if receipt.get("cell") == "rapid-chain" and receipt.get("leg", "").startswith("reuse/"):
+        # The separate initial marker proves admission, but cannot provide any
+        # of this fresh host's five required named measured returns.
+        if len(measured_calls) != 5 or any(
+                (call["image"], call["fn"], call["rv"], call["phase"]) !=
+                (0, "C_GenerateRandom", 0, "measured") for call in measured_calls):
+            errors.append("reuse measured phase differs from its fixed five calls/function/RV")
+        measured_names = phase_populations.get("measured", {})
+        if measured_names.get("named", 0) != 5 or measured_names.get("unknown", 0):
+            errors.append("reuse measured returns lack five correct fresh held executable names")
+    for image_id in receipt.get("first_unknown_images", []):
+        image_calls = [call for call in in_window if call["image"] == image_id]
+        if (not image_calls or image_id not in transitions
+                or any(call["scope"] == "selected" and call["t0"] < ready
+                       for call in calls if call["image"] == image_id)):
+            errors.append("first image CALL lacks independently proved fresh scoped generation")
+        else:
+            first = min(image_calls, key=lambda call: call["t0"])
+            entry = first_rows.get(image_id)
+            if entry is None or (entry[1]["pid"], entry[1]["tid"], entry[1]["fn"]) != (
+                    first["pid"], first["tid"], first["fn"]):
+                errors.append("first image event disagrees with the earliest independent scoped call")
+            elif entry[1]["path"] is not None:
+                errors.append("fresh image first scoped CALL was named without a possible upper witness")
+    # H6-DELTA: abandoned in-flight accounting. Physical entries, API
+    # returns, completed operations, named calls and unknowns are distinct
+    # units: entries minus returns must equal the ledgered abandoned count.
+    abandoned = receipt.get("abandoned_expected", 0)
+    entered = len(rows) + abandoned
+    capability_early = (worker_early_population(rows, receipt, images, row_image_hints)
+                        if receipt.get("cell") == "leader-exit-exec" else None)
+    unobserved_mode2_entry = bool(
+        abandoned == 1 and (receipt.get("b_setup") or {}).get("mode") == "2"
+        and capability_early and capability_early["observed_named"] == capability_early["observed_unknown"] == 0
+        and len(counts) == len(evidence) == 1 and evidence[0].get("in_flight_at_end") == 0
+        and all(type(counts[0].get(field)) is int and counts[0][field] == len(rows)
+                for field in ("stats_entered", "stats_returned", "raw_calls"))
+        and worker_perf_prefix_gap(evidence[0], receipt))
+    if counts and any([counts[0].get("stats_entered") != entered,
+                       counts[0].get("stats_returned") != len(rows),
+                       counts[0].get("raw_calls") != len(rows)]):
+        error = "terminal counts disagree with independently accounted physical entries/returns/completions"
+        if unobserved_mode2_entry:
+            recovery_errors([error], abandonment=True)
+        else:
+            errors.append(error)
+    elif counts and (counts[0].get("stats_entered", 0) - counts[0].get("stats_returned", 0)) != abandoned:
+        errors.append("terminal entry/return gap disagrees with the ledgered abandoned in-flight count")
+    # H6-DELTA: reuse legs. Expected-but-unobserved reuse fails the cell;
+    # observed reuse additionally requires order-attributed non-completion
+    # of old operations (post-exec rows match post-exec calls only, above).
+    errors.extend(expected_reuse_errors(receipt, ledger))
+    if evidence:
+        ev = evidence[0]
+        if ev.get("privacy_mode") != "allowlisted" or ev.get("trace_truncated") is not False:
+            errors.append("capture privacy policy/truncation differs from the requested policy")
+        if any(ev.get(field, 0) != 0 for field in
+               ("event_loss", "start_insert_failures", "unmatched_returns", "rv_update_failures",
+                "cgroup_scope_failures", "process_tracking_failures", "process_tracking_evictions")):
+            errors.append("capture reports event/identity loss in this no-loss cell")
+        if ev.get("final_drain") is False and ev.get("completeness") == "COMPLETE":
+            errors.append("capture claims complete without its final drain proof")
+        if ev.get("in_flight_at_end", 0) != abandoned:
+            error = "terminal in-flight disagrees with the ledgered abandoned in-flight count"
+            if unobserved_mode2_entry:
+                recovery_errors([error], abandonment=True)
+            else:
+                errors.append(error)
+        backend = ev.get("attach_backend", {})
+        if backend.get("fallback") is not None:
+            errors.append("capture installed a fallback link: no global fallback allowed")
+        if receipt.get("requested_backend") and backend.get("selection") != receipt["requested_backend"]:
+            errors.append("capture backend differs from the requested backend")
+    else:
+        errors.append("missing terminal evidence record")
+    return {"pass": not errors, "status": "pass" if not errors else "fail",
+            "cell": receipt.get("cell"), "leg": receipt.get("leg"),
+            "calls": len(rows), "named": named, "unknown": unknown, "false_names": false_names,
+            "named_share": named / len(rows) if rows else None,
+            "unknown_share": unknown / len(rows) if rows else None,
+            "physical_entered": entered, "api_returned": len(rows),
+            "expected_api_returns": len(in_window), "early_coverage": early_coverage,
+            "completed_operations": len(rows), "abandoned": abandoned,
+            "pre_ready_calls": pre_ready, "post_stop_calls": post_stop,
+            "out_of_scope_calls": out_of_scope,
+            "measured_calls": len(measured_calls), "warmup_calls": len(warmup_calls),
+            "order_matched": len(order_match), "ambiguous_keys": len(ambiguous_keys),
+            "link_losses": evidence[0].get("task_uprobe_link_losses") if evidence else None,
+            "image_populations": populations, "image_generation_populations": generations,
+            "phase_populations": {key: dict(value) for key, value in phase_populations.items()},
+            "capability_early_coverage": capability_early,
+            "mandatory_calls": sum(mandatory.values()), "counts": counts,
+            "evidence": evidence, "errors": errors,
+            "capture_integrity_errors": [error for index, error in enumerate(errors) if index not in non_integrity_indices],
+            "successor_recovery_errors": successor_recovery_errors,
+            "expected_mode2_abandonment_errors": expected_mode2_abandonment_errors}
+
+
+def _check_group_death_proof(death, receipt):
+    """Group-death-ends-capture gate (brief line 101, death half).
+
+    All inputs are harness receipts (waitpid, /proc, monotonic clock),
+    never p11scope output. Returns a list of error strings.
+    """
+    errors = []
+    if receipt.get("observer_rc") != 0:
+        errors.append("observer did not exit successfully")
+    if death.get("observer_self_ended") is not True or death.get("controller_stop") is not None:
+        errors.append("observer did not end capture autonomously after group death")
+    if receipt.get("caller_rc") != -signal.SIGKILL:
+        errors.append("group-death caller was not reaped as whole-group SIGKILLed")
+    if death.get("kill") != "SIGKILL/killpg":
+        errors.append("group death was not a whole-group SIGKILL via killpg")
+    if not isinstance(death.get("group_size_before"), int) or death["group_size_before"] < 1:
+        errors.append("group-death leg lacks a live-group pre-kill receipt")
+    if death.get("reaped") is not True or death.get("proc_gone") is not True:
+        errors.append("group death is not proven by waitpid plus /proc disappearance")
+    if death.get("manufactured_reuse") is not False:
+        errors.append("numeric PID reuse must never be manufactured via sysctl")
+    if not death.get("replacement_leg"):
+        errors.append("group-death leg names no independently admitted replacement control")
+    ready, stop = receipt.get("observer_ready_ns"), receipt.get("observer_stopped_ns")
+    kill_ns, death_ns = death.get("kill_ns"), death.get("death_ns")
+    exited_ns = death.get("observer_exited_ns")
+    exit_limit_ns = death.get("observer_exit_limit_ns")
+    if not (isinstance(exited_ns, int) and isinstance(kill_ns, int)
+            and isinstance(stop, int) and kill_ns < exited_ns == stop):
+        errors.append("group-death observer exit timestamp is missing or outside its natural exit")
+    if not (isinstance(exit_limit_ns, int) and 0 < exit_limit_ns <= GROUP_DEATH_EXIT_LIMIT_NS):
+        errors.append("group-death observer exit deadline is missing or unbounded")
+    elif (isinstance(exited_ns, int) and isinstance(death_ns, int)
+          and exited_ns - death_ns > exit_limit_ns):
+        errors.append("group-death observer exceeded its autonomous exit deadline")
+    if not (isinstance(kill_ns, int) and isinstance(death_ns, int)
+            and isinstance(ready, int) and isinstance(stop, int)
+            and ready < kill_ns <= death_ns < stop):
+        errors.append("group-death kill/death stamps are not inside the observer interval")
+    else:
+        min_dwell = death.get("min_dwell_ns", 0)
+        checked_ns = death.get("post_death_checked_ns")
+        if (not isinstance(min_dwell, int) or not isinstance(checked_ns, int)
+                or checked_ns < stop or checked_ns - death_ns < min_dwell):
+            errors.append("post-death dwell is too short to prove capture ended")
+    return errors
+
+
+def _check_measured_warmup(calls, receipt, ready, stop, start, capture_kind="public"):
+    """Shared measured/warmup gate. Returns (measured_calls, warmup_calls, errors)."""
+    errors = []
+    measured = receipt.get("measured")
+    if (not measured or not measured.get("label") or measured.get("expected_calls", 0) <= 0
+            or not ready <= measured["t0"] <= measured["t1"] <= stop):
+        errors.append("missing measured phase: require a fixed nonempty phase after public readiness")
+        measured_calls = []
+    else:
+        measured_calls = [call for call in calls if call["phase"] in measured.get("phases", [])]
+        if len(measured_calls) != measured["expected_calls"] or any(
+                not measured["t0"] <= call["t0"] <= call["t1"] <= measured["t1"]
+                for call in measured_calls):
+            errors.append("measured phase disagrees with its fixed ledger population/window")
+    warmup = receipt.get("warmup")
+    warmup_ok = (
+        warmup
+        and warmup.get("label")
+        and measured
+        and start <= warmup["t0"] <= warmup["t1"] <= measured["t0"]
+    )
+    if not warmup_ok:
+        errors.append("missing warm-up window: warm-up must be explicitly separated and bounded")
+        warmup_calls = []
+    else:
+        warmup_calls = [call for call in calls if call["phase"] in warmup.get("phases", [])]
+        if len(warmup_calls) != warmup.get("expected_calls", 0) or any(
+                not warmup["t0"] <= call["t0"] <= call["t1"] <= warmup["t1"]
+                for call in warmup_calls):
+            errors.append("warm-up phase disagrees with its declared ledger population/window")
+    # Inventory retains its existing admission/ptrace contract. This policy
+    # is explicit at its call site; it is not provider readiness qualification.
+    if capture_kind == "inventory-admission":
+        return measured_calls, warmup_calls, errors
+    transitions = receipt.get("exec_transitions", [])
+    if not transitions:
+        if receipt.get("successor_policy") != "no-transition":
+            errors.append("no-transition control lacks its explicit successor exemption")
+        if receipt.get("successor_ready"):
+            errors.append("no-transition control carries a successor proof")
+        return measured_calls, warmup_calls, errors
+    proofs = receipt.get("successor_ready", [])
+    expected_images = {transition["to_image"] for transition in transitions}
+    if (receipt.get("successor_policy") != "public-successor"
+            or len(proofs) != len(expected_images)
+            or {proof.get("image") for proof in proofs} != expected_images):
+        errors.append("missing current-image public successor readiness proof")
+        return measured_calls, warmup_calls, errors
+    for proof in proofs:
+        attempts = [call for call in warmup_calls
+                    if call["image"] == proof["image"] and call["phase"] in proof.get("phases", [])]
+        image = next((image for image in receipt["images"] if image["image"] == proof["image"]), None)
+        if image is None:
+            errors.append("successor proof lacks an independent current-image receipt")
+            continue
+        if (proof.get("proof_kind") not in ("trace-row", "live-counter")
+                or not 1 <= proof.get("attempts", 0) == len(attempts) <= proof.get("max_attempts", 0) <= 40
+                or not image.get("t", start) <= proof["started_ns"] <= proof["observed_ns"] <= proof["deadline_ns"]
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 20_000_000_000
+                or not 0 <= proof["output_cursor"] < proof["proof_cursor"]
+                or any(call["fn"] != proof["marker_fn"] or not
+                       proof["started_ns"] <= call["t0"] <= call["t1"] <= proof["observed_ns"]
+                       for call in attempts)
+                or any(call["t0"] < proof["observed_ns"] for call in measured_calls
+                       if call["image"] == proof["image"])):
+            errors.append("invalid bounded successor warm-up/proof or measurement before successor readiness")
+    return measured_calls, warmup_calls, errors
+
+
+def _select_in_window(calls, receipt, ready, stop):
+    """Shared scope-kind-aware in-window selection.
+
+    Returns (in_window, pre_ready, post_stop, out_of_scope, boundary_errors).
+    """
+    scope_kind = receipt.get("scope_kind", "pid")
+    owned_pids = set(receipt.get("owned_pids", []))
+    intervals = receipt.get("scope_intervals", [])
+    in_window = []
+    pre_ready = post_stop = out_of_scope = 0
+    boundary_errors = []
+    for call in calls:
+        in_scope = True
+        if scope_kind == "pid":
+            if call["pid"] != receipt.get("pid"):
+                in_scope = False
+        elif scope_kind == "cgroup":
+            if call["scope"] != "selected":
+                in_scope = False
+            elif not any(iv["pid"] == call["pid"] and iv["membership"] == "selected"
+                         and iv["t0"] <= call["t0"] <= call["t1"] <= iv["t1"] for iv in intervals):
+                in_scope = False
+        else:
+            if call["pid"] not in owned_pids:
+                in_scope = False
+        if not in_scope:
+            out_of_scope += 1
+            continue
+        if call["t1"] < ready:
+            pre_ready += 1
+            continue
+        if call["t0"] >= stop:
+            post_stop += 1
+            continue
+        if not (call["t0"] >= ready and call["t1"] < stop):
+            boundary_errors.append("provider call overlaps an unresolved observer boundary")
+            continue
+        in_window.append(call)
+    return in_window, pre_ready, post_stop, out_of_scope, boundary_errors
+
+
+def evaluate_trace_h6(trace, ledger, receipt, file_trace=None):
+    """Judge one H6 trace leg. Never raises on evidence input."""
+    try:
+        return _evaluate_trace_h6(trace, ledger, receipt, file_trace)
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        errors = [f"invalid independent evidence: {error}"]
+        return {"pass": False, "status": "fail", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"), "named": 0, "unknown": 0, "false_names": 0,
+                "errors": errors, "capture_integrity_errors": list(errors),
+                "successor_recovery_errors": [], "expected_mode2_abandonment_errors": []}
+
+
+# ---------------------------------------------------------------------------
+# H6 oracle: profile / metrics legs (aggregate JSON + stdout parity)
+# ---------------------------------------------------------------------------
+
+def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
+    errors = stop_errors(receipt)
+    if receipt.get("backend_refused"):
+        return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"), "negative_reason": receipt["backend_refused"],
+                "errors": ["backend refused: %s" % (receipt["backend_refused"],)]}
+    errors.extend(expected_reuse_errors(receipt, ledger))
+    want_schema = ("p11scope/observed-profile/v3-metrics" if mode == "metrics"
+                   else "p11scope/observed-profile/v3")
+    if doc.get("schema") != want_schema or doc.get("lane") != mode:
+        errors.append("aggregate schema/lane differs from the requested mode")
+    capture = doc.get("capture", {})
+    if capture.get("mode") != mode or capture.get("scope") != receipt.get("scope_kind"):
+        errors.append("aggregate capture mode/scope differs from the requested leg")
+    want_privacy = "aggregate-only" if mode == "metrics" else "allowlisted"
+    if capture.get("privacy_mode") != want_privacy:
+        errors.append("aggregate privacy mode differs from the requested policy")
+    if mode == "metrics" and set(doc.keys()) != {"capture", "evidence", "functions", "lane", "schema"}:
+        errors.append("metrics surface carries non-aggregate sections")
+    modules = capture.get("modules", [])
+    pin = receipt["provider_before"]
+    if (len(modules) != 1 or modules[0].get("path") != pin.get("path")
+            or modules[0].get("ino") != pin.get("ino")
+            or modules[0].get("sha256") != pin.get("sha256")):
+        errors.append("aggregate module identity disagrees with the held provider pin")
+    if receipt.get("manual_rebind"):
+        errors.append("manual rebind cannot satisfy automatic acceptance")
+    if any(row.get("kind") == "rebind" for row in ledger):
+        errors.append("fixture-issued rebind present: not an automatic recovery proof")
+    calls = [row for row in ledger if row["kind"] == "call"]
+    start, ready, stop = (receipt[field] for field in
+                          ("observer_started_ns", "observer_ready_ns", "observer_stopped_ns"))
+    measured_calls, warmup_calls, gate_errors = _check_measured_warmup(
+        calls, receipt, ready, stop, start)
+    errors.extend(gate_errors)
+    in_window, pre_ready, post_stop, out_of_scope, boundary_errors = _select_in_window(
+        calls, receipt, ready, stop)
+    errors.extend(boundary_errors)
+    if not in_window:
+        errors.append("no independently ledgered calls after capture readiness")
+    # Ledger expectations per function: completed == returned, errors ==
+    # returned-nonzero, in-flight == abandoned. Abandoned frames are not
+    # ledger call records; the receipt attributes them per function.
+    abandoned_by_fn: Counter = Counter(receipt.get("abandoned_by_fn", {}))
+    expect_completed: Counter = Counter()
+    expect_errors: Counter = Counter()
+    for call in in_window:
+        expect_completed[call["fn"]] += 1
+        if call["rv"] != 0:
+            expect_errors[call["fn"]] += 1
+    got_completed: Counter = Counter()
+    got_errors: Counter = Counter()
+    got_in_flight: Counter = Counter()
+    named_calls = unknown_calls = 0
+    for function in doc.get("functions", []):
+        names = function.get("names", [])
+        label = names[0] if len(names) == 1 else "|".join(names)
+        if label == "unknown":
+            unknown_calls += function.get("calls", 0)
+            if function.get("calls", 0) or function.get("errors", 0) or function.get("in_flight", 0):
+                errors.append("unverified function claims completed calls")
+            continue
+        named_calls += function.get("calls", 0)
+        got_completed[label] += function.get("calls", 0)
+        got_errors[label] += function.get("errors", 0)
+        got_in_flight[label] += function.get("in_flight", 0)
+    early_coverage = None
+    if receipt.get("successor_ready"):
+        frames = parse_live_frames(stdout_text)
+        proofs = receipt["successor_ready"]
+        for proof in proofs:
+            if (proof["proof_kind"] != "live-counter" or proof.get("baseline") not in frames
+                    or proof.get("snapshot") not in frames
+                    or proof["baseline"]["cursor"] != proof["output_cursor"]
+                    or proof["snapshot"]["cursor"] != proof["proof_cursor"]
+                    or proof["snapshot"]["start_cursor"] < proof["output_cursor"]
+                    or proof["snapshot"]["functions"].get(proof["marker_fn"], {}).get("calls", 0)
+                    <= proof["baseline"]["functions"].get(proof["marker_fn"], {}).get("calls", 0)):
+                errors.append("successor proof lacks a fresh same-observer complete counter snapshot")
+        snapshot = proofs[-1].get("snapshot", {}).get("functions", {})
+        expected_measured = Counter(call["fn"] for call in measured_calls)
+        expected_measured_errors = Counter(call["fn"] for call in measured_calls if call["rv"])
+        if any(proof["marker_fn"] in expected_measured for proof in proofs):
+            errors.append("aggregate warm and measured functions overlap without an observed complete boundary")
+        # A returned warm call can reach a later redraw than the readiness
+        # marker. Warm/measurement functions are deliberately distinct: only
+        # measured functions use exact observed snapshot deltas. All final
+        # observed returns of other functions remain in the early population.
+        stable_completed = Counter({fn: got_completed[fn] - snapshot.get(fn, {}).get("calls", 0)
+                                    for fn in expected_measured})
+        stable_errors = Counter({fn: got_errors[fn] - snapshot.get(fn, {}).get("errors", 0)
+                                 for fn in expected_measured})
+        if stable_completed != expected_measured or stable_errors != expected_measured_errors:
+            errors.append("stable measured aggregate population disagrees with its fixed ledger")
+        early_expected = Counter(call["fn"] for call in in_window if call not in measured_calls)
+        early_functions = set(early_expected) | set(got_completed) | set(snapshot)
+        early_observed = Counter({fn: snapshot.get(fn, {}).get("calls", 0) if fn in expected_measured
+                                  else got_completed[fn] for fn in early_functions})
+        early_errors = Counter({fn: snapshot.get(fn, {}).get("errors", 0) if fn in expected_measured
+                                else got_errors[fn] for fn in early_functions})
+        if any(not 0 <= early_observed[fn] <= early_expected[fn] for fn in early_functions):
+            errors.append("duplicate return or outside-scope early aggregate population")
+        for proof in proofs:
+            before, after = proof["baseline"]["functions"], proof["snapshot"]["functions"]
+            if any(not before.get(fn, {}).get(field, 0) <= after.get(fn, {}).get(field, 0) <= terminal[fn]
+                   for fn in set(before) | set(after)
+                   for field, terminal in (("calls", got_completed), ("errors", got_errors))):
+                errors.append("aggregate cumulative counters regress across readiness/final frames")
+        early_allowed_errors = Counter(call["fn"] for call in in_window
+                                       if call not in measured_calls and call["rv"])
+        for fn in early_functions:
+            expected, failed = early_expected[fn], early_allowed_errors[fn]
+            observed = early_observed[fn]
+            observed_errors = early_errors[fn]
+            # A deficit may omit successes or failures, but it cannot turn
+            # an independently failed return into a captured success.
+            if not max(0, observed - (expected - failed)) <= observed_errors <= min(failed, observed):
+                errors.append(f"early aggregate returned RV population is infeasible: function {fn}")
+        missing = sum(max(0, early_expected[fn] - early_observed[fn]) for fn in early_expected)
+        early_coverage = {"expected": sum(early_expected.values()),
+                          "observed_named": sum(early_observed.values()), "observed_unknown": 0,
+                          "deficit": missing}
+        errors.extend(_early_gap_errors(doc.get("evidence", {}), missing, receipt, ledger, capture, mode=mode))
+    else:
+        for fn in sorted(set(expect_completed) | set(got_completed)):
+            if got_completed[fn] > expect_completed[fn]:
+                errors.append(
+                    f"duplicate return: function {fn}: captured {got_completed[fn]} completed "
+                    f"for {expect_completed[fn]} ledgered calls")
+            elif got_completed[fn] < expect_completed[fn]:
+                errors.append(
+                    f"aggregate population disagrees with ledger: function {fn}: "
+                    f"ledger {expect_completed[fn]} captured {got_completed[fn]}")
+        for fn in sorted(set(expect_errors) | set(got_errors)):
+            if got_errors[fn] != expect_errors[fn]:
+                errors.append(
+                    f"aggregate returned-error population disagrees with ledger: function {fn}: "
+                    f"ledger {expect_errors[fn]} captured {got_errors[fn]}")
+    for fn in sorted(set(abandoned_by_fn) | set(got_in_flight)):
+        if got_in_flight[fn] != abandoned_by_fn[fn]:
+            errors.append(
+                f"aggregate in-flight disagrees with the ledgered abandoned count: function {fn}: "
+                f"ledger {abandoned_by_fn[fn]} captured {got_in_flight[fn]}")
+    total_completed = sum(got_completed.values())
+    total_errors = sum(got_errors.values())
+    total_in_flight = sum(got_in_flight.values())
+    if receipt.get("successor_ready"):
+        frames = parse_live_frames(stdout_text)
+        match_totals = frames[-1]["totals"] if frames else None
+        if frames and frames[-1]["functions"] != {
+                fn: {"calls": got_completed[fn], "errors": got_errors[fn], "in_flight": got_in_flight[fn]}
+                for fn in got_completed if got_completed[fn] or got_in_flight[fn]}:
+            errors.append("aggregate last complete frame disagrees with JSON function counters")
+    else:
+        matches = list(LIVE_TOTALS.finditer(stdout_text))
+        match_totals = [int(v) for v in matches[-1].groups()] if matches else None
+    if match_totals != [total_completed, total_errors, total_in_flight]:
+        errors.append("aggregate stdout totals disagree with the JSON document")
+    abandoned = sum(abandoned_by_fn.values())
+    if receipt.get("abandoned_expected", 0) != abandoned:
+        errors.append("receipt abandoned count disagrees with its per-function attribution")
+    ev = doc.get("evidence", {})
+    if any(ev.get(field, 0) != 0 for field in
+           ("event_loss", "start_insert_failures", "unmatched_returns", "rv_update_failures",
+            "cgroup_scope_failures", "process_tracking_failures", "process_tracking_evictions")):
+        errors.append("aggregate capture reports event/identity loss in this no-loss cell")
+    if ev.get("attach_failures"):
+        errors.append("aggregate capture reports attach failures")
+    if (ev.get("attach_backend") or {}).get("fallback") is not None:
+        errors.append("capture installed a fallback link: no global fallback allowed")
+    reported = (ev.get("attach_backend") or {}).get("selection")
+    if receipt.get("requested_backend") and reported is not None \
+            and reported != receipt["requested_backend"]:
+        errors.append("capture backend differs from the requested backend")
+    if receipt.get("observer_rc") != 0 or receipt.get("caller_rc") != 0:
+        errors.append("observer or caller did not exit successfully")
+    return {"pass": not errors, "status": "pass" if not errors else "fail",
+            "cell": receipt.get("cell"), "leg": receipt.get("leg"),
+            "completed_calls": total_completed, "returned_errors": total_errors,
+            "in_flight": total_in_flight, "abandoned": abandoned,
+            "named_calls": named_calls, "unknown_calls": unknown_calls,
+            "physical_entered": total_completed + abandoned,
+            "api_returned": total_completed, "expected_api_returns": len(in_window),
+            "early_coverage": early_coverage,
+            "pre_ready_calls": pre_ready, "post_stop_calls": post_stop,
+            "out_of_scope_calls": out_of_scope,
+            "measured_calls": len(measured_calls), "warmup_calls": len(warmup_calls),
+            "per_function": {fn: {"completed": got_completed[fn], "errors": got_errors[fn],
+                                  "in_flight": got_in_flight[fn]}
+                             for fn in sorted(set(got_completed) | set(got_errors))},
+            "errors": errors}
+
+
+def evaluate_profile_h6(doc, stdout_text, ledger, receipt):
+    """Judge one H6 profile leg. Never raises on evidence input."""
+    try:
+        return _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, "profile")
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        return {"pass": False, "status": "fail", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"),
+                "errors": [f"invalid independent evidence: {error}"]}
+
+
+def evaluate_metrics_h6(doc, stdout_text, ledger, receipt):
+    """Judge one H6 metrics leg. Never raises on evidence input."""
+    try:
+        return _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, "metrics")
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        return {"pass": False, "status": "fail", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"),
+                "errors": [f"invalid independent evidence: {error}"]}
+
+
+# ---------------------------------------------------------------------------
+# H6 oracle: inventory legs (native snapshot + event log vs ledger batches)
+# ---------------------------------------------------------------------------
+
+INV_LINE = re.compile(r"^(IDENT|MAPPED|LEDGER|HELD|RETURNED|ZOMBIE|EXEC|DONE|READY|H6_READY|ACK) (.+)$")
+INV_KV = re.compile(r"(\S+?)=(\S+)")
+
+
+def parse_inv_ledger(text):
+    """Parse inventory-ledger stdout into typed batches. Never raises."""
+    out = {"idents": [], "mapped": [], "batches": [], "held": [], "returned": [],
+           "zombie": [], "execs": [], "dones": [], "readys": [], "unflushed": 0,
+           "acks": [], "controls": [], "strange": []}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("LEDGER_UNFLUSHED"):
+            out["unflushed"] += 1
+            continue
+        match = INV_LINE.match(line)
+        if not match:
+            out["strange"].append(line[:120])
+            continue
+        kind, rest = match.groups()
+        fields = dict(INV_KV.findall(rest))
+        try:
+            if kind == "IDENT":
+                out["idents"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
+                                      "start": int(fields["start"]), "gen": int(fields["gen"]),
+                                      "exe": fields["exe"]})
+            elif kind == "MAPPED":
+                out["mapped"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
+                                      "start": int(fields["start"]), "gen": int(fields["gen"]),
+                                      "exe": fields["exe"], "module": fields["module"],
+                                      "ino": int(fields["ino"])})
+            elif kind == "LEDGER":
+                out["batches"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
+                                       "start": int(fields["start"]), "gen": int(fields["gen"]),
+                                       "exe": fields["exe"], "module": fields["module"],
+                                       "fn": fields["fn"], "mech": fields["mech"],
+                                       "n": int(fields["n"]), "bad": int(fields["bad"]),
+                                       "phase": fields["phase"], "t0": int(fields["t0"]),
+                                       "t1": int(fields["t1"])})
+            elif kind == "HELD":
+                out["held"].append(fields)
+            elif kind == "RETURNED":
+                out["returned"].append(fields)
+            elif kind == "ZOMBIE":
+                out["zombie"].append(fields)
+            elif kind == "EXEC":
+                out["execs"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
+                                     "start": int(fields["start"]), "gen": int(fields["gen"]),
+                                     "exe": fields["exe"], "how": fields["how"],
+                                     "next": fields["next"]})
+            elif kind == "DONE":
+                out["dones"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
+                                     "start": int(fields["start"]), "gen": int(fields["gen"]),
+                                     "exe": fields["exe"], "status": fields["status"]})
+            elif kind == "READY":
+                out["readys"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
+                                      "start": int(fields["start"]), "gen": int(fields["gen"]),
+                                      "exe": fields["exe"]})
+            elif kind in ("H6_READY", "ACK"):
+                row = {key: fields[key] for key in ("cell", "exe")}
+                row.update({key: int(fields[key]) for key in ("pid", "start", "gen", "seq", "deadline")})
+                if kind == "H6_READY":
+                    row["t"] = int(fields["t"])
+                    out["controls"].append(row)
+                else:
+                    row.update({key: int(fields[key]) for key in ("attempt", "t0", "t1", "idle")})
+                    row.update(command=fields["command"], rv=int(fields["rv"], 0))
+                    out["acks"].append(row)
+        except (KeyError, ValueError):
+            out["strange"].append(line[:120])
+    return out
+
+
+def attach_side_entered(batches, phases=None):
+    """Attach-side entered totals per (pid, gen, module): table calls only.
+
+    The dlsym C_GetFunctionList entry is not a function-table call and is
+    excluded (same rule the C8 oracle applies).
+    """
+    totals: Counter = Counter()
+    bad: Counter = Counter()
+    for batch in batches:
+        if phases is not None and batch["phase"] not in phases:
+            continue
+        if batch["fn"] == "C_GetFunctionList":
+            continue
+        key = (batch["pid"], batch["gen"], batch["module"])
+        totals[key] += batch["n"]
+        bad[key] += batch["bad"]
+    return totals, bad
+
+
+def normalize_inv_calls(batches):
+    """Expand ledger batches to N3-schema individual call records.
+
+    Batches carry window [t0, t1] bounds shared by their calls; phases are
+    suffixed with :genN so measured/warmup gates can select generations.
+    Failed calls get rv=-1 (failed, exact value unledgered by the driver).
+    tid is the caller's pid (single-threaded driver; leader-exit worker
+    activity is out of scope for the H6 inventory legs).
+    """
+    calls = []
+    for batch in batches:
+        if batch["fn"] == "C_GetFunctionList":
+            continue
+        phase = inventory_phase_name(batch)
+        for index in range(batch["n"]):
+            calls.append({"kind": "call", "image": batch["gen"], "pid": batch["pid"],
+                          "tid": batch["pid"], "fn": batch["fn"],
+                          "rv": -1 if index < batch["bad"] else 0, "phase": phase,
+                          "scope": "selected", "sess": 0,
+                          "t0": batch["t0"], "t1": batch["t1"]})
+    return calls
+
+
+def inventory_phase_name(batch):
+    prefix = f"{batch['cell']}:" if batch["phase"].startswith("h6-") else ""
+    return f"{prefix}{batch['phase']}:gen{batch['gen']}"
+
+
+def coverage_of(edge):
+    """entries.coverage per the inventory/v1 contract (C8 reads it the same way)."""
+    return (edge.get("entries") or {}).get("coverage") or {}
+
+
+# S1 attribution classes from src/kinds.rs at this source revision:
+# transition::INITIALIZE (Init), direct != NONE (single-call operations),
+# and Finish transitions (FINISH_WITH_OUTPUT / FINISH_ALWAYS /
+# FINISH_ON_SUCCESS). Init and direct calls record mechanism claims
+# OK-only with no error count (record_init_mechanism); operational calls
+# attribute calls+errors (attribute_op_call); bad direct calls establish
+# nothing (apply_direct returns early); bad FINISH_ON_SUCCESS retains its
+# machine without an end state. Bad BUFFER_TOO_SMALL finishes also retain;
+# the H6 fixtures use sized single-shot buffers, so any such live row fails
+# loudly for investigation instead of silently matching.
+S1_INIT_FNS = frozenset({
+    "C_EncryptInit", "C_DecryptInit", "C_DigestInit", "C_SignInit",
+    "C_SignRecoverInit", "C_VerifyInit", "C_VerifyRecoverInit",
+    "C_MessageEncryptInit", "C_MessageDecryptInit", "C_MessageSignInit",
+    "C_MessageVerifyInit", "C_VerifySignatureInit"})
+S1_DIRECT_FNS = frozenset({
+    "C_GenerateKey", "C_GenerateKeyPair", "C_WrapKey", "C_UnwrapKey",
+    "C_DeriveKey", "C_EncapsulateKey", "C_DecapsulateKey",
+    "C_WrapKeyAuthenticated", "C_UnwrapKeyAuthenticated"})
+S1_FINISH_FNS = frozenset({
+    "C_Encrypt", "C_Decrypt", "C_Digest", "C_Sign", "C_SignRecover",
+    "C_VerifyRecover", "C_EncryptFinal", "C_DecryptFinal", "C_DigestFinal",
+    "C_SignFinal", "C_Verify", "C_VerifyFinal", "C_VerifySignature",
+    "C_VerifySignatureFinal", "C_MessageEncryptFinal", "C_MessageDecryptFinal",
+    "C_MessageSignFinal", "C_MessageVerifyFinal"})
+S1_RETAIN_ON_FAILURE_FNS = frozenset({
+    "C_MessageEncryptFinal", "C_MessageDecryptFinal", "C_MessageSignFinal",
+    "C_MessageVerifyFinal"})
+S1_COUNT_ONLY_FNS = frozenset({
+    "C_Initialize", "C_GetInfo", "C_GetFunctionList", "C_GetSlotList",
+    "C_GetInterfaceList", "C_GetInterface", "C_GetSlotInfo", "C_GetTokenInfo",
+    "C_GetMechanismList", "C_GetMechanismInfo", "C_InitToken"})
+
+
+def mechanism_row_id(row):
+    """Production mechanism row id: mechanism_hex when a dict, else str."""
+    if isinstance(row, dict):
+        if row.get("mechanism_hex"):
+            return row["mechanism_hex"]
+        value = row.get("mechanism")
+        if isinstance(value, int):
+            return f"0x{value:x}"
+        return str(value)
+    return str(row)
+
+
+def ledger_s1_totals(batches, started_ns):
+    """Per-(pid, gen, module) S1 ledger totals over in-capture phases.
+
+    Legacy gen0 setup precedes the observer (same guard as counted_totals).
+    Opt-in h6-setup is independently ledgered after observer startup.
+    Returns (mech_calls, mech_errors, op_completed, op_failed, op_calls,
+    entered) keyed by (pid, gen, module[, mech]); op totals assume the
+    H6 workload shape (single-shot, Init-before-op, no competing Inits).
+    """
+    mech_calls: Counter = Counter()
+    mech_errors: Counter = Counter()
+    op_completed: Counter = Counter()
+    op_failed: Counter = Counter()
+    op_calls: Counter = Counter()
+    entered: Counter = Counter()
+    for batch in batches:
+        if batch["fn"] == "C_GetFunctionList":
+            continue
+        if batch["gen"] == 0 and batch["phase"] == "setup":
+            if batch["t1"] >= started_ns:
+                raise SetupError("gen0 setup overlaps the observer lifetime: "
+                                 "the gated start is broken")
+            continue
+        key = (batch["pid"], batch["gen"], batch["module"])
+        fn, mech, n, bad = batch["fn"], batch["mech"], batch["n"], batch["bad"]
+        entered[key] += n
+        if fn not in S1_COUNT_ONLY_FNS:
+            op_calls[key] += n
+        if mech == "-":
+            continue
+        mkey = key + (mech,)
+        if fn in S1_INIT_FNS or fn in S1_DIRECT_FNS:
+            mech_calls[mkey] += n - bad
+        else:
+            mech_calls[mkey] += n
+            mech_errors[mkey] += bad
+        if fn in S1_DIRECT_FNS or fn in S1_FINISH_FNS:
+            op_completed[key] += n - bad
+        if fn in S1_FINISH_FNS and fn not in S1_RETAIN_ON_FAILURE_FNS:
+            op_failed[key] += bad
+    return mech_calls, mech_errors, op_completed, op_failed, op_calls, entered
+
+
+def inventory_held_provider_module(doc, provider):
+    """Resolve the independently calibrated maps identity before path/content checks."""
+    if not isinstance(provider, dict) or not isinstance(provider.get("mapping"), dict):
+        raise SetupError("held provider mapping identity is not an object")
+    mapping = provider["mapping"]
+    device, inode = mapping.get("dev"), mapping.get("ino")
+    if (not isinstance(device, list) or len(device) != 2
+            or any(type(part) is not int or part < 0 for part in device)
+            or type(inode) is not int or inode <= 0
+            or provider.get("dev") != device or provider.get("ino") != inode):
+        raise SetupError("held provider mapping identity is unavailable or inconsistent")
+    candidates = []
+    for module in doc.get("modules", []):
+        identity = module.get("identity")
+        if identity is None:
+            identity = {}
+        if not isinstance(identity, dict):
+            raise SetupError("inventory module identity is not an object")
+        mapped = identity.get("device")
+        if mapped is None:
+            mapped = {}
+        if not isinstance(mapped, dict):
+            raise SetupError("inventory module device is not an object")
+        actual = [mapped.get("major"), mapped.get("minor")]
+        if (all(type(part) is int for part in actual) and actual == device
+                and type(identity.get("inode")) is int and identity["inode"] == inode):
+            candidates.append(module)
+    if len(candidates) != 1:
+        raise SetupError("module identity is absent or ambiguous for the held provider file")
+    module = candidates[0]
+    paths = module.get("paths")
+    if (not isinstance(paths, list) or any(not isinstance(path, str) for path in paths)
+            or provider["path"] not in paths
+            or not provider.get("sha256")
+            or module["identity"].get("sha256") != provider["sha256"]):
+        raise SetupError("module identity/path disagrees with the held provider file")
+    return module
+
+
+def _evaluate_inventory_h6(doc, ledgers, receipt):
+    if receipt.get("inventory_control"):
+        return evaluate_controlled_inventory_h6(doc, ledgers, receipt)
+    errors = stop_errors(receipt)
+    if receipt.get("backend_refused"):
+        return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"), "negative_reason": receipt["backend_refused"],
+                "errors": ["backend refused: %s" % (receipt["backend_refused"],)]}
+    if doc.get("schema") != "p11scope/inventory/v1":
+        errors.append("inventory schema differs from the native snapshot contract")
+    if doc.get("scope") != receipt.get("scope_label"):
+        errors.append("inventory scope differs from the requested leg")
+    if receipt.get("manual_rebind"):
+        errors.append("manual rebind cannot satisfy automatic acceptance")
+    for cell, parsed in ledgers.items():
+        if parsed["unflushed"] or parsed["strange"]:
+            errors.append(f"ledger {cell} has unflushed or unparsable records")
+        if any(done["status"] != "ok" for done in parsed["dones"]):
+            errors.append(f"ledger {cell} reports a failed generation")
+    # Normalized gates over every owned batch population.
+    calls = []
+    for parsed in ledgers.values():
+        calls.extend(normalize_inv_calls(parsed["batches"]))
+    start, ready, stop = (receipt[field] for field in
+                          ("observer_started_ns", "observer_ready_ns", "observer_stopped_ns"))
+    measured_calls, warmup_calls, gate_errors = _check_measured_warmup(
+        calls, receipt, ready, stop, start, capture_kind="inventory-admission")
+    errors.extend(gate_errors)
+    in_window, pre_ready, post_stop, out_of_scope, boundary_errors = _select_in_window(
+        calls, receipt, ready, stop)
+    errors.extend(boundary_errors)
+    callers = {caller["id"]: caller for caller in doc.get("callers", [])}
+    module_by_provider = {name: inventory_held_provider_module(doc, provider)
+                          for name, provider in receipt["providers"].items()}
+    owned_ids: set = set()
+    per_pid: dict = {}
+    for pid_text, want in receipt.get("expected_incarnations", {}).items():
+        pid = int(pid_text)
+        gens = {int(gen): spec for gen, spec in want["gens"].items()}
+        rows = sorted((caller for caller in doc.get("callers", []) if caller.get("pid") == pid),
+                      key=lambda caller: caller.get("incarnation", -1))
+        per_pid[pid] = {"incarnations": len(rows), "exes": [],
+                        "lifecycles": [], "edges": []}
+        if [caller.get("incarnation") for caller in rows] != sorted(gens):
+            errors.append(f"pid {pid}: incarnation population disagrees with the exec ledger")
+        for caller in rows:
+            owned_ids.add(caller["id"])
+            gen = caller.get("incarnation")
+            exe = ((caller.get("image") or {}).get("exe") or {}).get("path")
+            per_pid[pid]["exes"].append(exe)
+            per_pid[pid]["lifecycles"].append(caller.get("lifecycle"))
+            want_gen = gens.get(gen, {})
+            if exe != want_gen.get("exe"):
+                errors.append(f"pid {pid} gen {gen}: executable disagrees with the exec ledger")
+            if bool(caller.get("retired")) != bool(want_gen.get("retired", False)):
+                errors.append(f"pid {pid} gen {gen}: retirement disagrees with the exec ledger")
+    # Expected physical edges: counted + exact, or absent/zero for outside.
+    # Edge keys are "pid:gen:module" strings (JSON-safe receipts).
+    physical_entered = 0
+    physical_counted = 0
+    for key, want in receipt.get("expected_edges", {}).items():
+        pid_text, gen_text, module_key = key.split(":")
+        pid, gen = int(pid_text), int(gen_text)
+        module = module_by_provider[module_key]
+        caller_id = next((caller["id"] for caller in doc.get("callers", [])
+                          if caller.get("pid") == pid and caller.get("incarnation") == gen), None)
+        edge = next((edge for edge in doc.get("edges", [])
+                     if edge.get("caller") == caller_id
+                     and module is not None and edge.get("module") == module.get("id")), None)
+        per_pid.setdefault(pid, {}).setdefault("edges", []).append(
+            {"gen": gen, "module": module_key,
+             "count": ((edge.get("entries") or {}).get("count") if edge else None),
+             "state": (coverage_of(edge).get("state") if edge else "absent")})
+        if want.get("zero_ok"):
+            if edge is not None and (edge.get("entries") or {}).get("count", 0) != 0:
+                errors.append(f"pid {pid} gen {gen} {module_key}: mapping-only control "
+                              f"reports usage")
+        elif want.get("counted"):
+            physical_entered += want["count"]
+            if edge is None or coverage_of(edge).get("state") != "counted":
+                errors.append(f"pid {pid} gen {gen} {module_key}: usage never admitted "
+                              f"(expected {want['count']} counted entries)")
+            else:
+                got = (edge.get("entries") or {}).get("count")
+                physical_counted += got or 0
+                if got != want["count"]:
+                    errors.append(f"pid {pid} gen {gen} {module_key}: counted entries disagree "
+                                  f"with the ledger: ledger {want['count']} captured {got}")
+                if coverage_of(edge).get("lossy"):
+                    errors.append(f"pid {pid} gen {gen} {module_key}: counted edge is lossy")
+        else:
+            if edge is not None and (edge.get("entries") or {}).get("count", 0) != 0:
+                errors.append(f"pid {pid} gen {gen} {module_key}: outside-scope calls entered "
+                              f"the scoped totals")
+    # Foreign callers (unidentifiable producer): refusal means no counted
+    # usage on any of their edges; mapping-only rows may exist.
+    foreign_ids = {caller["id"] for caller in doc.get("callers", [])
+                   if caller.get("pid") in set(receipt.get("foreign_pids", []))}
+    for edge in doc.get("edges", []):
+        if edge.get("caller") in foreign_ids and (
+                edge.get("entries") or {}).get("count", 0) != 0:
+            errors.append("foreign producer calls entered the scoped totals")
+            break
+    # No unexpected edges may reference owned callers (outside never in totals).
+    expected_pairs = set()
+    for key in receipt.get("expected_edges", {}):
+        pid_text, gen_text, module_key = key.split(":")
+        pid, gen = int(pid_text), int(gen_text)
+        module = module_by_provider[module_key]
+        caller_id = next((caller["id"] for caller in doc.get("callers", [])
+                          if caller.get("pid") == pid and caller.get("incarnation") == gen), None)
+        if caller_id is not None and module is not None:
+            expected_pairs.add((caller_id, module.get("id")))
+    for edge in doc.get("edges", []):
+        if edge.get("caller") in foreign_ids:
+            continue
+        if edge.get("caller") in owned_ids and (edge.get("caller"), edge.get("module")) \
+                not in expected_pairs:
+            errors.append("unexpected edge references an owned caller")
+            break
+    # Failed returns are reported separately from successes, always.
+    failed_ledgered = sum(1 for call in in_window if call["rv"] != 0)
+    # S1 legs: nonempty + ledger-matched when expected; honest-withheld else.
+    instances = doc.get("instances", [])
+    semantic_edges = doc.get("semantic_edges", [])
+    s1 = {"instances": len(instances), "semantic_edges": len(semantic_edges),
+          "withheld": [], "matched": [], "completed_total": 0,
+          "failed_total": 0, "measured_completed": 0}
+    if receipt.get("s1_expected"):
+        if not instances and not semantic_edges:
+            errors.append("S1 unavailable: no instance or semantic rows for the attested leg")
+        all_batches = [batch for parsed in ledgers.values()
+                       for batch in parsed["batches"]]
+        mech_calls, mech_errors, op_completed, op_failed, op_calls, entered = \
+            ledger_s1_totals(all_batches, receipt["observer_started_ns"])
+        path_by_module = {module.get("id"): list(module.get("paths", []))
+                          for module in doc.get("modules", [])}
+        count_only_ids = set()
+        for module_key in receipt.get("count_only_providers", []):
+            module = module_by_provider[module_key]
+            if module is not None:
+                count_only_ids.add(module.get("id"))
+
+        def edge_group(edge):
+            caller = callers.get(edge.get("caller"), {})
+            paths = path_by_module.get(edge.get("module"), [])
+            path = next((p for p in paths
+                         if (caller.get("pid"), caller.get("incarnation"), p) in entered
+                         or (caller.get("pid"), caller.get("incarnation"), p) in op_calls), None)
+            if path is None and paths:
+                path = paths[0]
+            return caller.get("pid"), caller.get("incarnation"), path
+
+        measured_gens = set()
+        for phase in (receipt.get("measured") or {}).get("phases", []):
+            if ":gen" in phase:
+                try:
+                    measured_gens.add(int(phase.split(":gen")[1]))
+                except ValueError:
+                    pass
+        measured_batches = [batch for batch in all_batches
+                            if inventory_phase_name(batch) in
+                            receipt.get("measured", {}).get("phases", [])]
+        measured_s1 = ledger_s1_totals(measured_batches, start)
+        measured_keys = set(measured_s1[5])
+        for edge in doc.get("edges", []):
+            if edge.get("caller") not in owned_ids:
+                continue
+            pid, gen, module_path = edge_group(edge)
+            key = (pid, gen, module_path)
+            rows = edge.get("mechanisms") or []
+            if not rows:
+                s1["withheld"].append(edge.get("caller"))
+                continue
+            want_ids = {mech for (p, g, m, mech) in mech_calls if (p, g, m) == key}
+            want_ids |= {mech for (p, g, m, mech) in mech_errors if (p, g, m) == key}
+            got_ids = {mechanism_row_id(row) for row in rows}
+            if got_ids - want_ids:
+                errors.append(f"pid {pid} gen {gen}: S1 mechanism outside the "
+                              f"ledgered mechanism set: {sorted(got_ids - want_ids)}")
+            elif want_ids - got_ids:
+                errors.append(f"pid {pid} gen {gen}: S1 unattributed ledgered "
+                              f"mechanism: {sorted(want_ids - got_ids)}")
+            else:
+                for row in rows:
+                    ident = mechanism_row_id(row)
+                    if row.get("calls") != mech_calls.get(key + (ident,), 0):
+                        errors.append(
+                            f"pid {pid} gen {gen} {ident}: S1 mechanism call total "
+                            f"disagrees with the ledger: ledger "
+                            f"{mech_calls.get(key + (ident,), 0)} captured {row.get('calls')}")
+                    if row.get("errors") != mech_errors.get(key + (ident,), 0):
+                        errors.append(
+                            f"pid {pid} gen {gen} {ident}: S1 mechanism error total "
+                            f"disagrees with the ledger: ledger "
+                            f"{mech_errors.get(key + (ident,), 0)} captured {row.get('errors')}")
+                s1["matched"].append(edge.get("caller"))
+            ops = edge.get("operations")
+            counted = coverage_of(edge).get("state") == "counted"
+            if counted and edge.get("module") not in count_only_ids:
+                if ops is None:
+                    errors.append(f"pid {pid} gen {gen}: S1 operations withheld "
+                                  f"although a manifest attests the leg")
+                    continue
+                completed, failed = ops.get("completed"), ops.get("failed")
+                if not isinstance(completed, int) or not isinstance(failed, int):
+                    errors.append(f"pid {pid} gen {gen}: S1 operations lack "
+                                  f"completed/failed totals")
+                    continue
+                if completed != op_completed.get(key, 0):
+                    errors.append(
+                        f"pid {pid} gen {gen}: S1 completed operations disagree "
+                        f"with the ledger: ledger {op_completed.get(key, 0)} "
+                        f"captured {completed}")
+                if failed != op_failed.get(key, 0):
+                    errors.append(
+                        f"pid {pid} gen {gen}: S1 failed operations disagree "
+                        f"with the ledger: ledger {op_failed.get(key, 0)} "
+                        f"captured {failed}")
+                if ops.get("calls") != op_calls.get(key, 0):
+                    errors.append(
+                        f"pid {pid} gen {gen}: S1 authorized calls disagree "
+                        f"with the ledger: ledger {op_calls.get(key, 0)} "
+                        f"captured {ops.get('calls')}")
+                s1["completed_total"] += completed
+                s1["failed_total"] += failed
+                if not measured_gens or gen in measured_gens:
+                    s1["measured_completed"] += completed
+                if key in measured_keys:
+                    if min(completed, measured_s1[2].get(key, 0)) < 10:
+                        errors.append(f"pid {pid} gen {gen}: S1 measured image completes "
+                                      "fewer than 10 successful operations")
+                    if not any(batch["bad"] > 0 for batch in measured_batches
+                               if (batch["pid"], batch["gen"], batch["module"]) == key):
+                        errors.append(f"pid {pid} gen {gen}: measured image lacks a "
+                                      "separate ledgered failed return")
+        if s1["withheld"] and not s1["matched"]:
+            errors.append("S1 withheld for every owned edge although a manifest attests the leg")
+        if s1["measured_completed"] < 10:
+            errors.append(f"S1 measured image completes fewer than 10 successful "
+                          f"operations: {s1['measured_completed']}")
+        # Semantic rows group by (caller, module) exactly like edges: a stale
+        # incarnation carrying successor counts fails its own group.
+        api_by_group: Counter = Counter()
+        for row in semantic_edges:
+            caller = callers.get(row.get("caller"), {})
+            paths = path_by_module.get(row.get("module"), [])
+            module_path = paths[0] if paths else None
+            group = (caller.get("pid"), caller.get("incarnation"), module_path)
+            api = (row.get("api_returns") or {}).get("count")
+            if not isinstance(api, int):
+                errors.append("S1 semantic row lacks an api_returns count")
+                continue
+            api_by_group[group] += api
+            if (row.get("api_returns") or {}).get("historical_only_returns"):
+                errors.append("S1 semantic row carries historical-only returns "
+                              "although every call post-dates admission")
+            sub = row.get("operations")
+            if sub is not None:
+                sub_completed, sub_failed = sub.get("completed"), sub.get("failed")
+                if not isinstance(sub_completed, int) or not isinstance(sub_failed, int):
+                    errors.append("S1 semantic row lacks completed/failed totals")
+                elif sub_completed + sub_failed > api:
+                    errors.append("S1 semantic row ends more operations than it returns")
+        for group, total in api_by_group.items():
+            if total != entered.get(group, 0):
+                errors.append(f"pid {group[0]} gen {group[1]}: S1 semantic returns "
+                              f"disagree with the ledger: ledger {entered.get(group, 0)} "
+                              f"captured {total}")
+        for instance in instances:
+            ref = instance.get("caller")
+            if ref not in callers:
+                errors.append("S1 instance references an unknown caller")
+            elif callers[ref].get("pid") not in receipt.get("owned_pids", []):
+                errors.append("S1 instance references an unowned caller")
+    else:
+        for edge in doc.get("edges", []):
+            if edge.get("caller") not in owned_ids:
+                continue
+            semantics = edge.get("semantics")
+            if not (semantics is None or str(semantics).startswith("unknown")):
+                errors.append("non-attested leg publishes semantic rows")
+                break
+            if edge.get("mechanisms") is not None or edge.get("operations") is not None:
+                errors.append("non-attested leg publishes mechanism/operation rows")
+                break
+    # Count-only providers: physical counts without semantic rows.
+    for module_key in receipt.get("count_only_providers", []):
+        module = module_by_provider[module_key]
+        if module is None:
+            continue
+        for edge in doc.get("edges", []):
+            if edge.get("module") != module.get("id") or edge.get("caller") not in owned_ids:
+                continue
+            if edge.get("mechanisms") is not None or edge.get("operations") is not None:
+                errors.append(f"count-only provider {module_key} publishes semantic rows")
+            semantics = edge.get("semantics")
+            if semantics is not None and not str(semantics).startswith("unknown"):
+                errors.append(f"count-only provider {module_key} publishes semantic rows")
+    # These disclosures need their full controlled scope/ledger proof below;
+    # a subject-only allowlist can never authorize them.
+    allowed_gaps = (set(receipt.get("allowed_gap_subjects", []))
+                    - CGROUP_DISCLOSURE_SUBJECTS - SYSTEM_DISCLOSURE_SUBJECTS - SEMANTIC_EARLY_SUBJECTS)
+    allow_path_gaps = receipt.get("allow_path_gaps", False)
+    gaps = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
+    for subject, _ in gaps:
+        if subject in allowed_gaps:
+            continue
+        if allow_path_gaps and isinstance(subject, str) and subject.startswith("/"):
+            continue
+        errors.append(f"unexpected inventory gap: {subject}")
+    witnesses = (doc.get("observation") or {}).get("native_witnesses", {})
+    attach = (doc.get("observation") or {}).get("attach", {})
+    if attach.get("fallback") is not None:
+        errors.append("capture installed a fallback link: no global fallback allowed")
+    if receipt.get("requested_backend") and attach.get("selection") != receipt["requested_backend"]:
+        errors.append("capture backend differs from the requested backend")
+    for cell, ending in receipt.get("cell_endings", {}).items():
+        if ending.get("how") == "exited" and ending.get("rc") != 0:
+            errors.append(f"ledger {cell} exited unsuccessfully")
+    if receipt.get("observer_rc") != 0:
+        errors.append("observer did not exit successfully")
+    return {"pass": not errors, "status": "pass" if not errors else "fail",
+            "cell": receipt.get("cell"), "leg": receipt.get("leg"),
+            "physical_entered": physical_entered, "physical_counted": physical_counted,
+            "completed_operations": s1["completed_total"] if receipt.get("s1_expected") else None,
+            "failed_ledgered": failed_ledgered,
+            "named_incarnations": sum(len(v.get("exes", [])) for v in per_pid.values()),
+            "unbound_witnesses": witnesses.get("unbound"),
+            "pre_ready_calls": pre_ready, "post_stop_calls": post_stop,
+            "out_of_scope_calls": out_of_scope,
+            "measured_calls": len(measured_calls), "warmup_calls": len(warmup_calls),
+            "per_pid": per_pid, "s1": s1, "gaps": gaps,
+            "errors": errors}
+
+
+def evaluate_inventory_h6(doc, ledgers, receipt):
+    """Judge one H6 inventory leg. Never raises on evidence input."""
+    try:
+        return _evaluate_inventory_h6(doc, ledgers, receipt)
+    except (KeyError, TypeError, ValueError, IndexError, SetupError) as error:
+        return {"pass": False, "status": "fail", "cell": receipt.get("cell"),
+                "leg": receipt.get("leg"),
+                "errors": [f"invalid independent evidence: {error}"]}
+
+
+def inventory_semantic_authority_errors(row, *, final=False, historical_limit=0):
+    """Initial API materialization and retained positive S1 have distinct public shapes."""
+    api, errors = row.get("api_returns") or {}, []
+    if (api.get("saturated") is not False or type(api.get("historical_only_returns")) is not int
+            or not 0 <= api["historical_only_returns"] <= historical_limit):
+        errors.append("Inventory semantic history has saturated or historical-only API authority")
+    count, label = api.get("count"), row.get("semantics")
+    details = row.get("mechanisms") is not None or row.get("operations") is not None
+    if final or details:
+        if type(count) is not int or count <= 0 or label != "observed":
+            errors.append("Inventory semantic history lacks retained positive S1 authority")
+    elif count is None:
+        if label != "unknown (no calls observed)":
+            errors.append("Inventory initial no-call API authority is inconsistent")
+    elif type(count) is not int or count <= 0 or label != "unknown (no operation evidence)":
+        errors.append("Inventory early API authority is inconsistent with its absent S1 details")
+    return errors
+
+
+def inventory_exec_retirement(record, caller):
+    """Recognize both producer shapes, with explicit retired identity context."""
+    event = record["event"]
+    if record["kind"] != "caller_event":
+        return None
+    subject = ("old" if event.get("event") == "exec_retired" else
+               "caller" if event.get("event") == "retired" else None)
+    if subject is None or event.get(subject) != caller:
+        return None
+    context = r5_admitted_subject(event, subject)
+    if context.get("id") != caller or context.get("lifecycle") != "exec_retired":
+        raise SetupError("Inventory old caller lacks explicit exec retirement identity")
+    return subject
+
+
+def inventory_instance_history_errors(records, instance_id, caller, module, receipt,
+                                      *, recovery=None, historical_limit=0, historical_after=None):
+    """Replay complete retained history; stop loss belongs only to the terminal interval."""
+    errors = []
+    passes = [row for row in records if row["kind"] == "pass_committed"]
+    finals = [row for row in passes if row["event"].get("final") is True]
+    ordinary = [row for row in passes if not row["event"].get("final")]
+    if (len(finals) != 1 or not ordinary or finals[0] != passes[-1]
+            or finals[0]["event"].get("pass") != ordinary[-1]["event"].get("pass")
+            or not ordinary[-1]["at_ns"] <= finals[0]["at_ns"] <= records[-1]["at_ns"]
+            <= receipt["observer_stopped_ns"]):
+        return ["Inventory normal stop lacks its exact terminal commit position"]
+    terminal_floor = ordinary[-1]["seq"]
+    retired_at = next((row["seq"] for row in records if inventory_exec_retirement(row, caller)), None)
+    instances, semantics, previous = [], [], {}
+    authority_ended, loss_seen, loss_reasons = False, False, set()
+    for record in records:
+        row, kind = record["event"], record["kind"]
+        if not ((kind == "instance_observed" and row.get("id") == instance_id)
+                or (kind == "semantic_edge_observed" and row.get("instance") == instance_id)):
+            continue
+        if row.get("caller") != caller or row.get("module") != module:
+            errors.append("Inventory semantic history changes instance/caller/module identity")
+        (instances if kind == "instance_observed" else semantics).append(record)
+        terminal = terminal_floor < record["seq"] and record["at_ns"] <= records[-1]["at_ns"]
+        retired = retired_at is not None and retired_at < record["seq"]
+        if kind == "instance_observed":
+            state, reason = row.get("state"), row.get("reason")
+            if inventory_recovered_quiet_instance(record, recovery):
+                continue  # Registrations can refresh the inherited no-call prefix.
+            if (state, reason) == ("observed", None):
+                if authority_ended:
+                    errors.append("Inventory instance history revived lost authority")
+                continue
+            authority_ended = True
+            if (state == "retired" and reason == "instance_retired" and retired
+                    or state == "uncertain" and reason == "semantic_loss" and terminal and not retired):
+                continue
+            errors.append("Inventory instance history gained earlier or unexplained lost authority")
+        else:
+            limit = historical_limit if retired and historical_after is not None and record["seq"] > historical_after else 0
+            errors.extend(inventory_semantic_authority_errors(row, historical_limit=limit))
+            api, ops = row.get("api_returns") or {}, row.get("operations")
+            counters = {"api": api.get("count"), "historical": api.get("historical_only_returns")}
+            if ops is not None:
+                counters.update({f"operation:{key}": ops.get(key) for key in
+                                 ("calls", "completed", "failed", "unknown", "orphans", "dropped")})
+            for mech in row.get("mechanisms") or []:
+                ident = mechanism_row_id(mech)
+                for field in ("calls", "errors"):
+                    key = f"mechanism:{ident}:{field}"
+                    if key in counters:
+                        errors.append("Inventory semantic history duplicates mechanism identity")
+                    counters[key] = mech.get(field)
+            if set(previous) - set(counters):
+                errors.append("Inventory semantic history erased positive counter fields")
+            had_returns = "api" in previous
+            for key, value in counters.items():
+                if value is None and key == "api" and not had_returns:
+                    continue
+                if type(value) is not int or value < previous.get(key, 0):
+                    errors.append("Inventory semantic history erased or regressed positive counters")
+                else:
+                    previous[key] = value
+            coverage = row.get("coverage") or {}
+            reasons = coverage.get("reasons")
+            if not isinstance(reasons, list) or reasons != sorted(set(reasons)):
+                errors.append("Inventory semantic history has invalid loss reasons")
+                continue
+            if (loss_seen and coverage.get("lossy") is not True) or loss_reasons - set(reasons):
+                errors.append("Inventory semantic history erased sticky loss disclosure")
+            if coverage.get("lossy") is True:
+                loss_seen = True
+                loss_reasons.update(set(reasons) - {"no_calls"})
+            if coverage.get("lossy") is False and not reasons:
+                continue
+            if (coverage.get("lossy") is False and reasons == ["no_calls"] and not had_returns
+                    and api.get("count") is None and api.get("saturated") is False
+                    and api.get("historical_only_returns") == 0
+                    and row.get("semantics") == "unknown (no calls observed)"
+                    and row.get("mechanisms") is None and ops is None):
+                continue
+            inherited = (recovery is not None and record["seq"] >= recovery["successor_semantic"]["seq"])
+            if inherited and not had_returns and inventory_inherited_no_calls(row):
+                continue
+            allowed = {"instance_retired", "image_retired", "semantic_loss"} if retired else (
+                {"semantic_loss"} if inherited else set())
+            stop = "capture_stopped" in reasons
+            if stop and terminal:
+                allowed |= {"capture_stopped", "semantic_loss"}
+            retirement_loss = retired and bool(set(reasons) & {"instance_retired", "image_retired"})
+            if (coverage.get("lossy") is not True or set(reasons) - allowed
+                    or not (stop and terminal and "semantic_loss" in reasons or retirement_loss
+                            or inherited and reasons == ["semantic_loss"])):
+                errors.append("Inventory semantic history gained earlier or unexplained loss")
+    if not instances or not semantics:
+        return errors + ["Inventory final semantic instance history is absent"]
+    final_instance, final_semantic = instances[-1]["event"], semantics[-1]["event"]
+    reasons = set((final_semantic.get("coverage") or {}).get("reasons") or [])
+    final_retired = (retired_at is not None and final_instance.get("state") == "retired"
+                     and final_instance.get("reason") == "instance_retired")
+    if (not {"capture_stopped", "semantic_loss"} <= reasons
+            or semantics[-1]["seq"] <= terminal_floor
+            or not final_retired and (instances[-1]["seq"] <= terminal_floor
+                or (final_instance.get("state"), final_instance.get("reason")) != ("uncertain", "semantic_loss"))):
+        errors.append("Inventory final instance lacks its supported capture-stopped transition")
+    return errors
+
+
+def inventory_sibling_current_totals(row):
+    """An observed quiet registration has zero materialized counters, not zero use."""
+    if row.get("api_returns") == {"unit": "api_returns", "count": None,
+                "saturated": False, "historical_only_returns": 0}:
+        if (row.get("coverage") == {"lossy": False, "reasons": ["no_calls"]}
+                and row.get("entries") == {"unit": "api_entries", "count": None, "observation": "unavailable"}
+                and row.get("semantics") == "unknown (no calls observed)"
+                and row.get("mechanisms") is None and row.get("operations") is None):
+            return {**{key: 0 for key in ("api", "calls", "completed", "failed", "unknown", "orphans", "dropped")},
+                    "mechanisms": {}}
+    totals = inventory_semantic_totals(row)
+    ops = row.get("operations") or {}
+    return totals if totals is not None and not ops.get("active") and ops.get("cancelled", 0) == 0 else None
+
+
+def inventory_sibling_boundary(records, image, provider, admission, marker, *, physical_hooks=None, started_ns=0):
+    """Retain actual completed MS/A rows while W1 is acknowledged idle."""
+    owner = SimpleNamespace(pid=image["pid"], identity={"start_time": image["start_time"]})
+    by_seq = {row["seq"]: row for row in records}
+    admitted = by_seq.get(admission["seq"])
+    first_pass = by_seq.get(admission["completed_pass"]["seq"])
+    if (admitted is None or first_pass is None or first_pass["kind"] != "pass_committed"
+            or not admitted["seq"] < first_pass["seq"] or r5_pass_receipt(first_pass) != admission["completed_pass"]
+            or admitted["kind"] != "caller_event" or admitted["event"].get("event") != "admitted"
+            or r5_caller_context(admitted["event"], owner, image)["id"] != admission["caller"]
+            or r5_caller_context(admitted["event"], owner, image)["incarnation"] != 0
+            or image["image"] != 0 or admission["incarnation"] != 0):
+        raise SetupError("System sibling baseline lacks its original admission/image")
+    ack = marker["ack"]
+    if (ack["command"] != "W" or ack["attempt"] != 1 or ack["seq"] != 1 or ack["gen"] != 0
+            or ack["pid"] != owner.pid or ack["start"] != image["start_time"] or ack["exe"] != image["path"]
+            or ack["idle"] != 1 or ack["rv"] != 0
+            or not first_pass["at_ns"] < marker["dispatch_ns"] <= ack["t0"] <= ack["t1"] < ack["deadline"]
+            or not marker["batches"] or any(row["pid"] != owner.pid or row["start"] != image["start_time"]
+                or row["gen"] != 0 or row["exe"] != image["path"]
+                or row["phase"] not in ("h6-setup", "h6-warm1")
+                or not ack["t0"] <= row["t0"] <= row["t1"] <= ack["t1"] for row in marker["batches"])):
+        raise SetupError("System sibling baseline lacks its exact W1 ledger/idle acknowledgment")
+    physical, instances, semantics, settled, emitted = None, {}, {}, None, Counter()
+    for row in records:
+        event, kind = row["event"], row["kind"]
+        if row["seq"] <= first_pass["seq"]:
+            continue
+        emission = {"edge_observed": "edge_events", "instance_observed": "instance_events",
+                    "semantic_edge_observed": "semantic_edge_events"}.get(kind)
+        if emission:
+            emitted[emission] += 1
+        if kind == "caller_event" and event.get("event") != "admitted" and (
+                event.get("caller") == admission["caller"] or event.get("old") == admission["caller"]):
+            raise SetupError("System sibling baseline crossed an image transition")
+        if kind == "edge_observed" and event.get("caller") == admission["caller"]:
+            if r5_caller_context(event, owner, image)["incarnation"] != 0:
+                raise SetupError("System sibling baseline changed incarnation")
+            module = r5_admitted_subject(event, "module")
+            if (module.get("status") == "observed" and module.get("id") == event["module"]
+                    and [module.get("device_major"), module.get("device_minor")] == provider["mapping"]["dev"]
+                    and module.get("inode") == provider["mapping"]["ino"]):
+                if physical is not None and physical["event"]["module"] != event["module"]:
+                    raise SetupError("System sibling baseline has ambiguous provider modules")
+                physical, settled = row, None
+        elif kind == "instance_observed" and event.get("caller") == admission["caller"]:
+            instances[event["id"]], settled = row, None
+        elif kind == "semantic_edge_observed" and event.get("caller") == admission["caller"]:
+            semantics[event["instance"]], settled = row, None
+        elif kind == "pass_committed" and not event.get("final"):
+            r5_pass_receipt(row)
+            deferred = [event.get(key) for key in
+                ("edge_events_deferred", "instance_events_deferred", "semantic_edge_events_deferred")]
+            written = [event.get(key) for key in ("edge_events", "instance_events", "semantic_edge_events")]
+            if (any(type(value) is not int or value < 0 for value in deferred + written)
+                    or any(event[key] < emitted[key] for key in emitted)
+                    or event["pass"] <= first_pass["event"]["pass"]):
+                raise SetupError("System sibling baseline lacks settled emitter accounting")
+            emitted.clear()
+            if not any(deferred) and row["at_ns"] >= ack["t1"]:
+                settled = row
+    if physical is None or settled is None:
+        return None
+    edge = physical["event"]
+    candidates = [row for row in instances.values() if row["event"].get("module") == edge["module"]]
+    if len(candidates) != 1:
+        return None
+    instance = candidates[0]
+    semantic = semantics.get(instance["event"]["id"])
+    if (semantic is None or semantic["event"].get("module") != edge["module"]
+            or (instance["event"].get("state"), instance["event"].get("reason")) != ("observed", None)
+            or any(row["seq"] >= settled["seq"] for row in (physical, instance, semantic))
+            or (edge.get("mapping") or {}).get("state") != "mapped"
+            or coverage_of(edge).get("state") != "counted" or coverage_of(edge).get("lossy")
+            or (edge.get("entries") or {}).get("saturated") is not False):
+        return None
+    key = owner.pid, 0, provider["path"]
+    expected = counted_totals(marker["batches"], started_ns, physical_hooks=physical_hooks).get(key, 0)
+    if type(edge["entries"].get("count")) is not int or edge["entries"]["count"] != expected:
+        return None
+    counts = inventory_sibling_current_totals(semantic["event"])
+    if counts is None or any(counts[name] != 0 for name in ("unknown", "orphans", "dropped")):
+        return None
+    return {"image": image, "provider": provider, "admission": admission, "marker": marker,
+        "physical": physical, "instance": instance, "semantic": semantic, "pass": settled,
+        "tuple": [image["start_time"], admission["caller"], 0, edge["module"], instance["event"]["id"]]}
+
+
+def inventory_sibling_s1_errors(doc, ledger, receipt, records):
+    """Judge attested MS history against MS's own in-capture ledger."""
+    errors, summaries = [], []
+    control = receipt["inventory_control"]
+    for ident in ledger["idents"]:
+        pid, gen = ident["pid"], ident["gen"]
+        callers = [row for row in doc["callers"] if row["pid"] == pid and row["incarnation"] == gen]
+        if (len(callers) != 1 or callers[0].get("start_time") != ident["start"]
+                or callers[0]["image"]["exe"]["path"] != ident["exe"]):
+            errors.append("SystemMixed sibling identity differs from its independent image ledger")
+            continue
+        caller = callers[0]["id"]
+        for name in control["sibling_providers"]:
+            if name in receipt.get("count_only_providers", []):
+                continue
+            path = receipt["providers"][name]["path"]
+            label = f"SystemMixed sibling pid {pid} gen {gen} {name}"
+            try:
+                module = inventory_held_provider_module(doc, receipt["providers"][name])["id"]
+            except SetupError as error:
+                errors.append(f"{label}: {error}")
+                continue
+            instances = [row for row in doc["instances"] if (row["caller"], row["module"]) == (caller, module)]
+            semantic = [row for row in doc["semantic_edges"] if (row["caller"], row["module"]) == (caller, module)]
+            physical = [row for row in doc["edges"] if (row["caller"], row["module"]) == (caller, module)]
+            if (len(instances) != 1 or len(semantic) != 1 or len(physical) != 1
+                    or semantic[0]["instance"] != instances[0]["id"]):
+                errors.append(f"{label}: duplicate, extra or orphan semantic instance population")
+                continue
+            population = [row for row in ledger["batches"] if row["pid"] == pid and row["gen"] == gen
+                and row["t0"] >= receipt["observer_started_ns"] and row["t1"] <= receipt["observer_stopped_ns"]]
+            saved = control.get("sibling_baseline")
+            if saved is None:
+                errors.append(f"{label}: original same-stream sibling baseline is absent")
+                continue
+            by_seq = {row["seq"]: row for row in records}
+            before = [row for row in records if row["seq"] <= saved["pass"]["seq"]]
+            baseline = inventory_sibling_boundary(before, saved["image"], saved["provider"],
+                saved["admission"], saved["marker"], physical_hooks=receipt.get("physical_hooks"),
+                started_ns=receipt["observer_started_ns"])
+            if (baseline is None or any(saved.get(key) != value for key, value in baseline.items())
+                    or any(by_seq.get(saved[field]["seq"]) != saved[field]
+                           for field in ("physical", "instance", "semantic", "pass"))
+                    or saved["provider"] != receipt["providers"][name]
+                    or saved["tuple"] != [ident["start"], caller, gen, module, instances[0]["id"]]
+                    or saved["image"]["pid"] != pid or saved["image"]["path"] != ident["exe"]
+                    or not saved["pass"]["at_ns"] <= saved["observed_ns"] < control["stages"][0]["t0"]
+                    or sum(row == saved["marker"]["ack"] for row in ledger["acks"]) != 1):
+                errors.append(f"{label}: original sibling baseline borrowed identity, stream or later work")
+                continue
+            early_batches = [row for row in population if row["phase"] in ("h6-setup", "h6-warm1")]
+            later = [row for row in population if row["phase"] not in ("h6-setup", "h6-warm1")]
+            if (early_batches != saved["marker"]["batches"] or any(row["t0"] <= saved["observed_ns"]
+                or row["phase"] not in ("h6-warm2", "h6-warm3", "h6-warm4") for row in later)):
+                errors.append(f"{label}: sibling population crossed its W1 baseline")
+                continue
+            prefix, key = ledger_s1_totals(early_batches, 0), (pid, gen, path)
+            observed = inventory_sibling_current_totals(saved["semantic"]["event"])
+            wanted_prefix = {"api": prefix[5].get(key, 0), "calls": prefix[4].get(key, 0),
+                "completed": prefix[2].get(key, 0), "failed": prefix[3].get(key, 0),
+                "unknown": 0, "orphans": 0, "dropped": 0}
+            if any(observed[field] > value for field, value in wanted_prefix.items()):
+                errors.append(f"{label}: sibling baseline exceeds its independent early ledger")
+            gaps = inventory_early_gaps(before, SimpleNamespace(pid=pid), saved["admission"], module,
+                min(row["t0"] for row in early_batches), saved["pass"]["at_ns"])
+            gaps = [row for row in gaps if row["event"].get("reason") == "before_semantic_boundary"
+                    and row["event"].get("subject") in SEMANTIC_EARLY_SUBJECTS]
+            if any(observed[field] < value for field, value in wanted_prefix.items()) and not gaps:
+                errors.append(f"{label}: sibling early deficit lacks an actual caller/module semantic boundary gap")
+            prefix_mechs = {mech: [value, prefix[1].get(key + (mech,), 0)] for (*group, mech), value
+                            in prefix[0].items() if tuple(group) == key}
+            if (any(observed["mechanisms"].get(mech, [0, 0])[i] < values[i]
+                    for mech, values in prefix_mechs.items() for i in (0, 1)) and not gaps):
+                errors.append(f"{label}: sibling early mechanism deficit lacks an actual semantic boundary gap")
+            for mech, values in observed["mechanisms"].items():
+                if any(value > want for value, want in zip(values, prefix_mechs.get(mech, [0, 0]))):
+                    errors.append(f"{label}: sibling baseline mechanism exceeds its early ledger")
+            totals = ledger_s1_totals(later, 0)
+            expected = {"calls": totals[4].get(key, 0), "completed": totals[2].get(key, 0),
+                "failed": totals[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
+            desired_mechs = {mech: [count, totals[1].get(key + (mech,), 0)]
+                for (*group, mech), count in totals[0].items() if tuple(group) == key}
+            # The physical projection judges legacy edge counts and identity;
+            # attested S1 history belongs only to the instance semantic edge.
+            for row in semantic:
+                ops = row.get("operations") or {}
+                actual = {name: ops.get(name) - observed[name] if type(ops.get(name)) is int else None
+                          for name in expected}
+                if (row.get("semantics") != "observed" or actual != expected
+                        or any(type(value) is not int for value in actual.values())
+                        or ops.get("cancelled", 0) != 0 or ops.get("active", [])):
+                    errors.append(f"{label}: S1 operation history disagrees with the sibling ledger")
+                mechs = row.get("mechanisms") or []
+                final_mechs = {mechanism_row_id(mech): [mech.get("calls"), mech.get("errors")] for mech in mechs}
+                wanted_mechs = {mech: [values[i] + observed["mechanisms"].get(mech, [0, 0])[i] for i in (0, 1)]
+                                for mech, values in desired_mechs.items()}
+                for mech, values in observed["mechanisms"].items():
+                    wanted_mechs.setdefault(mech, values)
+                if (len(final_mechs) != len(mechs) or final_mechs != wanted_mechs
+                        or any(type(value) is not int or value < 0
+                               for values in final_mechs.values() for value in values)):
+                    errors.append(f"{label}: S1 mechanism history disagrees with the sibling ledger")
+            api = semantic[0].get("api_returns") or {}
+            if (type(api.get("count")) is not int or api["count"] - observed["api"] != totals[5].get(key, 0)
+                    or api.get("saturated") is not False or api.get("historical_only_returns") != 0):
+                errors.append(f"{label}: S1 API returns disagree with the sibling ledger")
+            errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
+                records, instances[0]["id"], caller, module, receipt))
+            summaries.append({"tuple": [ident["start"], caller, gen, module, instances[0]["id"]],
+                "api_returns": api.get("count"),
+                "ledger_api_returns": wanted_prefix["api"] + totals[5].get(key, 0),
+                "operations": {name: wanted_prefix[name] + value for name, value in expected.items()},
+                "operations_observed": {name: ops.get(name) for name in expected},
+                "delta": {"expected": {"api": totals[5].get(key, 0), **expected},
+                          "observed": {"api": api.get("count", 0) - observed["api"], **actual}},
+                "early": {"expected": wanted_prefix, "observed": {key: observed[key] for key in wanted_prefix},
+                    "unobserved": {key: max(0, wanted_prefix[key] - observed[key]) for key in wanted_prefix},
+                    "mechanisms_expected": prefix_mechs, "mechanisms_observed": observed["mechanisms"],
+                    "mechanisms_unobserved": {mech: [max(0, values[i] - observed["mechanisms"].get(mech, [0, 0])[i])
+                        for i in (0, 1)] for mech, values in prefix_mechs.items()},
+                    "gaps": gaps}})
+    if not summaries:
+        errors.append("SystemMixed sibling attested semantic history is absent")
+    return errors, summaries
+
+
+CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred",
+                              "native owner activation unavailable", "semantic admission refused"}
+SYSTEM_DISCLOSURE_SUBJECTS = {"discovery capped", "capture discovery", "semantic admission refused",
+    "process maps sweep", "semantic input refused", "native capture retirement unsettled"}
+SEMANTIC_EARLY_SUBJECTS = {"physical provider use preceded first observed semantic registration",
+                         "initial semantic proof followed earlier physical provider use"}
+SYSTEM_SCAN_LIMIT = 256
+SYSTEM_EMPTY_MAPS_REFUSAL = (
+    "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot")
+SYSTEM_H6_LIMITATION = (
+    "System H6 qualifies only independently ledgered owned callers. Global discovery remains partial "
+    "and ambient usage remains unqualified; recognized disclosures are retained unresolved. "
+    "This does not prove a complete host census. Recovery refusal publication does not establish "
+    "occurrence times or caller attribution; these outcomes remain unattributed. "
+    "An unsettled terminal drain remains unqualified even after normal observer exit.")
+SYSTEM_UNSETTLED_RETIREMENT = (
+    "the probes did not detach within 10000 ms; the document was written while the Inventory probes may "
+    "still be attached, and they are reclaimed (blocking) after it")
+SCOPED_OWNER_DEFERRAL = (
+    "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; "
+    "sampled scan-pinned callers and retained native totals remain available")
+# Exact (subject, reason) pairs for the caller-less standing cgroup
+# disclosures. The deferral pair is recognized for old reports only;
+# current producers emit the unavailable pair on handle-less passes.
+CGROUP_DISCLOSURE_REASONS = {
+    "scoped native owner admission deferred": SCOPED_OWNER_DEFERRAL,
+    "native owner activation unavailable":
+        "no image acquisition handle is installed; scan-pinned fallback retained",
+}
+
+
+def inventory_target_preuse_disclosure(doc, ledgers, receipt, gap, publication, caller):
+    """A refused premapped target may later prove S1; its earlier gap stays visible."""
+    phases = [row for row in receipt["inventory_control"]["measurements"]
+              if row["proof"]["caller"] == caller["id"] and row["proof"]["incarnation"] == 0]
+    if len(phases) != 1 or caller["pid"] not in receipt["owned_pids"] or caller["incarnation"] != 0:
+        return False
+    proof = phases[0]["proof"]
+    image, provider, admission = proof["image"], proof["provider"], proof["admission"]
+    owner = SimpleNamespace(pid=caller["pid"], identity={"start_time": caller["start_time"]})
+    records = receipt["inventory_control"]["final_records"]
+    by_seq = {row["seq"]: row for row in records}
+    if (image["pid"] != owner.pid or image["start_time"] != owner.identity["start_time"]
+            or image.get("image") != 0 or admission["caller"] != caller["id"] or admission["incarnation"] != 0
+            or provider not in receipt["providers"].values() or not proof["markers"]):
+        return False
+    admitted = by_seq.get(admission["seq"])
+    completed = by_seq.get(admission["completed_pass"]["seq"])
+    if (admitted is None or admitted["kind"] != "caller_event" or admitted["event"].get("event") != "admitted"
+            or completed is None or completed["kind"] != "pass_committed"
+            or r5_pass_receipt(completed) != admission["completed_pass"]
+            or not admitted["seq"] < publication["seq"]):
+        return False
+    context = r5_caller_context(admitted["event"], owner, image)
+    caller_image = caller.get("image") or {}
+    if (context["id"] != caller["id"] or context["incarnation"] != 0 or context["authority"] != "scan_pinned"
+            or caller_image.get("authority") != "scan_pinned" or caller_image.get("exe") != context["executable"]):
+        return False
+    ids = [row for parsed in ledgers.values() for row in parsed["idents"]
+           if row["pid"] == owner.pid and row["gen"] == 0]
+    mapped = [row for parsed in ledgers.values() for row in parsed["mapped"]
+              if row["pid"] == owner.pid and row["gen"] == 0]
+    calls = [row for parsed in ledgers.values() for row in parsed["batches"]
+             if row["pid"] == owner.pid and row["gen"] == 0]
+    if (len(ids) != 1 or ids[0]["start"] != image["start_time"] or ids[0]["exe"] != image["path"]
+            or mapped != [{**ids[0], "module": provider["path"], "ino": provider["ino"]}] or not calls
+            or any(row["start"] != image["start_time"] or row["exe"] != image["path"]
+                   or row["module"] != provider["path"] for row in calls)):
+        return False
+    first = proof["markers"][0]
+    dispatch, ack = first["dispatch_ns"], first["ack"]
+    if (ack["command"] != "W" or ack["seq"] != 1 or ack["attempt"] != 1
+            or sum(row == ack for parsed in ledgers.values() for row in parsed["acks"]) != 1
+            or not completed["at_ns"] < dispatch <= ack["t0"] <= min(row["t0"] for row in calls)):
+        return False
+    # Power-of-two repeat publications cover all recordings up to their count.
+    # A later final flush cannot retrospectively prove a pre-use-only gap.
+    repeats, last_publication = 1, publication
+    for row in records:
+        if row["kind"] == "gap_repeated" and row["event"].get("index") == publication["event"]["index"]:
+            event = row["event"]
+            if (set(event) != {"index", "repeats"} or type(event["repeats"]) is not int
+                    or event["repeats"] <= repeats or row["seq"] <= last_publication["seq"]
+                    or not publication["at_ns"] <= row["at_ns"] < dispatch):
+                return False
+            repeats, last_publication = event["repeats"], row
+    if repeats != gap["repeats"] or not admitted["at_ns"] <= publication["at_ns"] < dispatch:
+        return False
+    prefix = [row for row in records if row["at_ns"] < dispatch and row["event"].get("caller") == caller["id"]]
+    if any(row["kind"] in ("instance_observed", "semantic_edge_observed") for row in prefix):
+        return False
+    edges = [row for row in prefix if row["kind"] == "edge_observed"]
+    scoped = False
+    for row in edges:
+        event, coverage = row["event"], coverage_of(row["event"])
+        entries = event.get("entries") or {}
+        module = (event.get("identity_context") or {}).get("module")
+        if (row["seq"] <= admitted["seq"] or r5_caller_context(event, owner, image) != context
+                or event.get("module") != proof["module"]
+                or module != {"id": proof["module"], "status": "observed", "path": provider["path"],
+                    "device_major": provider["dev"][0], "device_minor": provider["dev"][1], "inode": provider["ino"]}
+                or event.get("mapping", {}).get("state") != "mapped" or type(entries.get("count")) is not int
+                or entries["count"] != 0 or entries.get("in_flight") is not False or entries.get("saturated") is not False
+                or entries.get("first_seen_ns") is not None or entries.get("last_seen_ns") is not None
+                or coverage.get("state") != "unknown" or coverage.get("lossy") is not None
+                or coverage.get("reason") not in (("scope_membership_unproven",) if scoped else
+                                                  ("not_attached", "scope_membership_unproven"))
+                or event.get("mechanisms") is not None or event.get("operations") is not None
+                or event.get("semantics") != "unknown (semantic capture withheld)"):
+            return False
+        scoped = coverage["reason"] == "scope_membership_unproven"
+    return scoped and any(row["kind"] == "pass_committed" and not row["event"].get("final")
+        and row["seq"] > max(edges[-1]["seq"], last_publication["seq"])
+        and row["at_ns"] < dispatch for row in records)
+
+
+def inventory_system_owned_births(ledgers, receipt):
+    """The complete independent MX/MS/MF population, including the foreign control."""
+    if set(ledgers) != {"MX", "MS", "MF"}:
+        return None
+    births = set()
+    for name, generations in (("MX", {0, 1}), ("MS", {0}), ("MF", {0})):
+        ids = ledgers[name]["idents"]
+        if (len(ids) != len(generations) or {row["gen"] for row in ids} != generations
+                or any(row["cell"] != name or type(row["gen"]) is not int
+                       or type(row["pid"]) is not int or row["pid"] <= 0
+                       or type(row["start"]) is not int or row["start"] < 0 for row in ids)
+                or len({(row["pid"], row["start"]) for row in ids}) != 1):
+            return None
+        births.add((ids[0]["pid"], ids[0]["start"]))
+    owned = receipt.get("owned_pids", [])
+    if (len(births) != 3 or len({pid for pid, _ in births}) != 3
+            or len(owned) != 3 or len(set(owned)) != 3 or any(type(pid) is not int for pid in owned)
+            or set(owned) != {pid for pid, _ in births}):
+        return None
+    return births
+
+
+def inventory_system_ambient_caller(doc, records, gap, publication, owned_births):
+    """Public admission proves an unowned birth; it proves no absence of calls."""
+    callers = [row for row in doc.get("callers", []) if row["id"] == gap["caller"]]
+    if len(callers) != 1:
+        return None
+    caller = callers[0]
+    birth = caller["pid"], caller["start_time"]
+    if (type(birth[0]) is not int or birth[0] <= 0 or type(birth[1]) is not int or birth[1] < 0
+            or type(caller["incarnation"]) is not int or caller["incarnation"] < 0
+            or birth in owned_births or birth[0] in {pid for pid, _ in owned_births}):
+        return None
+    admissions = [row for row in records if row["kind"] == "caller_event"
+                  and row["event"].get("event") == "admitted"
+                  and row["event"].get("caller") == caller["id"]]
+    if len(admissions) != 1 or admissions[0]["seq"] >= publication["seq"]:
+        return None
+    context = admissions[0]["event"].get("identity_context") or {}
+    subject = context.get("caller") or {}
+    identity = {key: caller[key] for key in ("id", "pid", "start_time", "incarnation")}
+    if (context.get("version") != 1 or any(type(subject.get(key)) is not int
+            for key in ("pid", "start_time", "incarnation"))
+            or any(subject.get(key) != value for key, value in identity.items())
+            or subject.get("authority") != "scan_pinned"
+            or subject.get("status") not in ("observed", "unavailable")
+            or (caller.get("image") or {}).get("exe") != subject.get("executable")):
+        return None
+    # A later row cannot relabel this caller as another birth/incarnation.
+    for row in records:
+        current = ((row["event"].get("identity_context") or {}).get("caller") or {})
+        if current.get("id") == caller["id"] and any(
+                current.get(key) != value for key, value in identity.items()):
+            return None
+    return caller, identity
+
+
+def inventory_system_preuse_disclosure(doc, ledgers, receipt, gap, publication):
+    """A strictly pre-W owned refusal is retained, separate from later early loss."""
+    if gap["subject"] != "semantic admission refused" or gap["reason"] != "semantic_unavailable" or gap["pid"] is not None:
+        return False
+    records = receipt["inventory_control"]["final_records"]
+    callers = [row for row in doc["callers"] if row["id"] == gap["caller"]]
+    if len(callers) != 1 or callers[0]["incarnation"] != 0:
+        return False
+    caller = callers[0]
+    name = next((name for name in ("MX", "MS")
+                 if ledgers[name]["idents"][0]["pid"] == caller["pid"]), None)
+    if name is None:
+        return False  # MF never belongs to the controlled pre-use positive.
+    control = receipt["inventory_control"]
+    if name == "MX":
+        phases = [row for row in control["measurements"] if row["proof"]["caller"] == caller["id"]
+                  and row["proof"]["incarnation"] == 0]
+        if len(phases) != 1:
+            return False
+        proof = phases[0]["proof"]
+        image, admission, marker = proof["image"], proof["admission"], proof["markers"][0]
+        providers = [proof["provider"]]
+    else:
+        proof = control["sibling_baseline"]
+        image, admission, marker = proof["image"], proof["admission"], proof["marker"]
+        providers = [receipt["providers"][key] for key in control["sibling_providers"]]
+    owner = SimpleNamespace(pid=caller["pid"], identity={"start_time": caller["start_time"]})
+    by_seq = {row["seq"]: row for row in records}
+    admitted, completed = by_seq.get(admission["seq"]), by_seq.get(admission["completed_pass"]["seq"])
+    if (admitted is None or completed is None or admitted["kind"] != "caller_event"
+            or admitted["event"].get("event") != "admitted" or completed["kind"] != "pass_committed"
+            or r5_pass_receipt(completed) != admission["completed_pass"]
+            or image["pid"] != caller["pid"] or image["start_time"] != caller["start_time"]
+            or image["image"] != 0 or admission["caller"] != caller["id"] or admission["incarnation"] != 0):
+        return False
+    context = r5_caller_context(admitted["event"], owner, image)
+    if (context["incarnation"] != 0 or context["authority"] != "scan_pinned"
+            or caller["image"].get("authority") != "scan_pinned" or caller["image"].get("exe") != context["executable"]):
+        return False
+    ident = ledgers[name]["idents"][0]
+    mapped = [row for row in ledgers[name]["mapped"] if row["gen"] == 0]
+    expected = [{**ident, "module": pin["path"], "ino": pin["ino"]} for pin in providers]
+    if (ident["start"] != image["start_time"] or ident["gen"] != 0 or ident["exe"] != image["path"]
+            or sorted(mapped, key=lambda row: row["module"]) != sorted(expected, key=lambda row: row["module"])
+            or any(pin not in receipt["providers"].values() for pin in providers)):
+        return False
+    ack, dispatch = marker["ack"], marker["dispatch_ns"]
+    calls = [row for row in ledgers[name]["batches"] if row["gen"] == 0]
+    if (not calls or ack["command"] != "W" or ack["seq"] != 1 or ack["attempt"] != 1
+            or sum(row == ack for row in ledgers[name]["acks"]) != 1
+            or not admitted["seq"] < publication["seq"]
+            or not completed["at_ns"] < dispatch <= ack["t0"] <= min(row["t0"] for row in calls)
+            or not admitted["at_ns"] <= publication["at_ns"] < dispatch):
+        return False
+    repeat, previous = 1, publication["seq"]
+    for row in records:
+        if row["kind"] == "gap_repeated" and row["event"].get("index") == publication["event"]["index"]:
+            if (set(row["event"]) != {"index", "repeats"} or type(row["event"]["repeats"]) is not int
+                    or row["event"]["repeats"] <= repeat or row["seq"] <= previous or row["at_ns"] >= dispatch):
+                return False
+            repeat, previous = row["event"]["repeats"], row["seq"]
+    if repeat != gap["repeats"]:
+        return False
+    prefix = [row for row in records if row["at_ns"] < dispatch and row["event"].get("caller") == caller["id"]]
+    if any(row["kind"] in ("instance_observed", "semantic_edge_observed") for row in prefix):
+        return False
+    proved, last_prefix = {}, previous
+    for row in prefix:
+        if row["kind"] != "edge_observed":
+            continue
+        event, entries = row["event"], row["event"].get("entries") or {}
+        module = r5_admitted_subject(event, "module")
+        pins = [pin for pin in providers if module.get("path") == pin["path"]
+                and module.get("inode") == pin["mapping"]["ino"]
+                and [module.get("device_major"), module.get("device_minor")] == pin["mapping"]["dev"]]
+        coverage = coverage_of(event)
+        if (len(pins) != 1 or r5_caller_context(event, owner, image) != context
+                or module.get("id") != event.get("module") or module.get("status") != "observed"
+                or event.get("mapping", {}).get("state") != "mapped"
+                or type(entries.get("count")) is not int or entries["count"] != 0
+                or entries.get("saturated") is not False or entries.get("in_flight") is not False
+                or entries.get("first_seen_ns") is not None or entries.get("last_seen_ns") is not None
+                or event.get("mechanisms") is not None or event.get("operations") is not None
+                or event.get("semantics") != "unknown (semantic capture withheld)"
+                or (coverage.get("state"), coverage.get("reason"), coverage.get("lossy"))
+                    not in (("unknown", "not_attached", None), ("watched_no_use", None, None))):
+            return False
+        path, state = pins[0]["path"], coverage["state"]
+        if proved.get(path) == "watched_no_use" and state != "watched_no_use":
+            return False
+        proved[path], last_prefix = state, max(last_prefix, row["seq"])
+    return (proved == {pin["path"]: "watched_no_use" for pin in providers}
+        and any(row["kind"] == "pass_committed" and not row["event"].get("final")
+                and row["seq"] > last_prefix and row["at_ns"] < dispatch for row in records))
+
+
+def inventory_system_custody_publications(receipt, publications, completions, validated):
+    """Recognize recovery publication ordering, never attribute the refused outcomes."""
+    measurements = receipt["inventory_control"]["measurements"]
+    records = receipt["inventory_control"]["final_records"]
+    if len(measurements) != 2 or len(validated) != 2:
+        return False
+    previous, successor = measurements
+    old, new = previous["proof"], successor["proof"]
+    if (old["incarnation"] != 0 or new["incarnation"] != 1
+            or old["image"]["pid"] != new["image"]["pid"]
+            or old["image"]["start_time"] != new["image"]["start_time"]
+            or old["provider"] != new["provider"] or old["module"] != new["module"]
+            or old["caller"] == new["caller"] or old["instance"] == new["instance"]
+            or any(summary["tuple"] != [proof["image"]["start_time"], proof["caller"],
+                proof["incarnation"], proof["module"], proof["instance"]]
+                for summary, proof in zip(validated, (old, new)))):
+        return False
+    by_seq = {row["seq"]: row for row in records}
+    admitted = by_seq.get(new["admission"]["seq"])
+    if (admitted is None or admitted["kind"] != "caller_event"
+            or admitted["event"].get("event") not in ("admitted", "exec_retired")):
+        return False
+    owner = SimpleNamespace(pid=new["image"]["pid"], identity={"start_time": new["image"]["start_time"]})
+    subject = "new" if admitted["event"]["event"] == "exec_retired" else "caller"
+    context = r5_caller_context(admitted["event"], owner, new["image"], subject=subject)
+    if (context["id"], context["incarnation"]) != (new["caller"], 1):
+        return False
+    retired = [row for row in records if previous["end"]["pass"]["seq"] < row["seq"] <= admitted["seq"]
+               and inventory_exec_retirement(row, old["caller"])]
+    if len(retired) != 1:
+        return False
+    context = r5_caller_context(retired[0]["event"], owner, old["image"],
+        subject=inventory_exec_retirement(retired[0], old["caller"]), lifecycle="exec_retired")
+    if (context["id"], context["incarnation"]) != (old["caller"], 0):
+        return False
+    first = next((row for row in records if row["kind"] == "instance_observed"
+                  and row["event"].get("caller") == new["caller"]), None)
+    if (first is None or (first["event"].get("id"), first["event"].get("module"))
+            != (new["instance"], new["module"])
+            or not all(admitted["seq"] < row["seq"] < completion["seq"] < first["seq"]
+                       for row, completion in zip(publications, completions))):
+        return False
+    # The existing full evaluator independently replays both measured endpoints,
+    # the whole physical ledger, and sibling deltas. Borrow only its exact early
+    # boundary row, not a subject label or a guessed count of refused old calls.
+    return any(by_seq.get(row["seq"]) == row and admitted["seq"] < row["seq"] < first["seq"]
+        and row["event"].get("caller") == new["caller"] and row["event"].get("module") == new["module"]
+        and row["event"].get("subject") in SEMANTIC_EARLY_SUBJECTS
+        and row["event"].get("reason") == "before_semantic_boundary"
+        for row in validated[1]["early"]["gaps"])
+
+
+def inventory_system_disclosure(doc, ledgers, receipt, index, validated=()):
+    """Recognize exact bounded/ambient limitations without granting owned authority."""
+    gap = doc["gaps"][index]
+    records = receipt["inventory_control"]["final_records"]
+    observation = doc.get("observation") or {}
+    attach = observation.get("attach") or {}
+    if (receipt.get("cell") != "system-mixed" or receipt.get("scope_kind") != "system"
+            or receipt.get("scope_label") != "system" or doc.get("scope") != "system"
+            or records[0]["kind"] != "started" or records[0]["event"].get("scope") != "system"
+            or records[-1]["kind"] != "ended" or observation.get("lane") != "native"
+            or "scope_filter" not in attach or attach["scope_filter"] is not None
+            or doc.get("gaps_suppressed") != 0
+            or set(gap) != {"subject", "reason", "caller", "module", "pid", "budget", "repeats"}
+            or gap["module"] is not None or gap["budget"] is not None
+            or type(gap["repeats"]) is not int or type(observation.get("passes")) is not int
+            or not 1 <= gap["repeats"] <= 18446744073709551615
+            or gap["subject"] != "semantic input refused" and gap["repeats"] > observation["passes"]):
+        return False
+    births = inventory_system_owned_births(ledgers, receipt)
+    if births is None:
+        return False
+    publications = [row for row in records if row["kind"] == "gap_recorded"
+                    and row["event"].get("index") == index]
+    expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
+    if (len(publications) != 1 or publications[0]["event"] != expected
+            or type(publications[0]["event"]["index"]) is not int):
+        return False
+    publication = publications[0]
+    repeats = 1
+    updates = [publication]
+    for row in records:
+        if row["kind"] == "gap_repeated" and row["event"].get("index") == index:
+            count = row["event"].get("repeats")
+            if (row["seq"] <= updates[-1]["seq"] or type(row["event"]["index"]) is not int
+                    or set(row["event"]) != {"index", "repeats"}
+                    or type(count) is not int or not repeats < count <= gap["repeats"]):
+                return False
+            repeats = count
+            updates.append(row)
+    if repeats != gap["repeats"]:
+        return False
+    completing = next((row for row in records if row["kind"] == "pass_committed"
+                       and row["seq"] > publication["seq"]), None)
+    if gap["subject"] == "native capture retirement unsettled":
+        ordinary = [row for row in records if row["kind"] == "pass_committed" and not row["event"].get("final")]
+        finals = [row for row in records if row["kind"] == "pass_committed" and row["event"].get("final") is True]
+        semantic = observation.get("semantic_capture") or {}
+        return (gap["caller"] is None and gap["pid"] is None and gap["reason"] == SYSTEM_UNSETTLED_RETIREMENT
+            and gap["repeats"] == 1 and len(finals) == 1 and bool(ordinary) and completing == finals[0]
+            and ordinary[-1]["seq"] < publication["seq"] < finals[0]["seq"] < records[-1]["seq"]
+            and observation.get("retirement") == observation.get("settlement") == "unsettled"
+            and semantic.get("status") == "stopped" and type(semantic.get("final_drain")) is bool
+            and semantic.get("stop_quiescence") == "quiesced"
+            and receipt.get("observer_rc") == 0 and receipt.get("forced_cleanup") is False
+            and receipt.get("stop_limit_seconds") == INVENTORY_STOP_SECONDS
+            and type(receipt.get("stop_latency_seconds")) in (int, float)
+            and 0 <= receipt["stop_latency_seconds"] <= INVENTORY_STOP_SECONDS
+            and observation["passes"] == ordinary[-1]["event"]["pass"] + 1
+            and finals[0]["event"]["pass"] == ordinary[-1]["event"]["pass"]
+            and records[-1]["event"].get("passes") == observation["passes"]
+            and records[-1]["event"].get("gaps_suppressed") == finals[0]["event"].get("gaps_suppressed") == 0
+            and observation.get("ended_ns") == records[-1]["event"].get("ended_ns") == records[-1]["at_ns"]
+            and ordinary[-1]["at_ns"] <= publication["at_ns"] <= finals[0]["at_ns"]
+                <= records[-1]["at_ns"] <= receipt["observer_stopped_ns"])
+    if (completing is None or completing["event"].get("final")
+            or type(completing["event"].get("pass")) is not int
+            or not 0 <= completing["event"]["pass"] < observation["passes"]
+            or completing["event"].get("gaps_suppressed") != 0):
+        return False
+    if gap["subject"] in ("process maps sweep", "semantic input refused"):
+        completions = [next((row for row in records if row["kind"] == "pass_committed"
+                             and row["seq"] > update["seq"]), None) for update in updates]
+        if (gap["caller"] is not None or gap["pid"] is not None
+                or any(row is None or row["event"].get("final")
+                    or type(row["event"].get("pass")) is not int
+                    or not 0 <= row["event"]["pass"] < observation["passes"]
+                    or row["event"].get("gaps_suppressed") != 0 for row in completions)):
+            return False
+        if gap["subject"] == "semantic input refused":
+            return gap["reason"] == "custody" and inventory_system_custody_publications(
+                receipt, updates, completions, validated)
+        match = re.fullmatch(r"maps snapshots unavailable for ([1-9][0-9]*) of ([1-9][0-9]*) "
+                             r"attempted processes; provider presence remains unknown", gap["reason"])
+        if match is None:
+            return False
+        unavailable, attempted = map(int, match.groups())
+        if not 0 < unavailable <= attempted <= 18446744073709551615:
+            return False
+        for completion in completions:
+            previous = max((row["seq"] for row in records if row["kind"] == "pass_committed"
+                            and row["seq"] < completion["seq"]), default=-1)
+            for row in records:
+                if (row["kind"] not in ("gap_recorded", "gap_repeated")
+                        or not previous < row["seq"] < completion["seq"]):
+                    continue
+                other = doc["gaps"][row["event"]["index"]]
+                if other["subject"] != "discovery capped":
+                    continue
+                if not inventory_system_disclosure(doc, ledgers, receipt, row["event"]["index"]):
+                    return False
+                total = re.match(r"([0-9]+) processes in scope;", other["reason"])
+                missing = re.search(r"; ([0-9]+) processes past the cap had no maps snapshot$", other["reason"])
+                if int(total[1]) != attempted or int(missing[1] if missing else 0) > unavailable:
+                    return False
+        return True
+    if gap["subject"] == "discovery capped":
+        if gap["caller"] is not None or gap["pid"] is not None:
+            return False
+        matched = re.fullmatch(
+            r"([0-9]+) processes in scope; ([0-9]+) deep-scanned by provider rarity \(limit ([0-9]+)\); "
+            r"([0-9]+) attributed to pinned provider objects by exact maps identity; "
+            r"([0-9]+) processes map ([0-9]+) shared objects no deep scan examined and may use undiscovered providers"
+            r"(?:; ([0-9]+) processes past the cap had no maps snapshot)?", gap["reason"])
+        if matched is None:
+            return False
+        total, deep, limit, mapped, unseen, objects, unavailable = (
+            int(value or 0) for value in matched.groups())
+        return (all(0 <= value <= 18446744073709551615 for value in
+                    (total, deep, limit, mapped, unseen, objects, unavailable))
+            and type(receipt.get("system_scan_limit")) is int
+            and limit == receipt["system_scan_limit"] == SYSTEM_SCAN_LIMIT
+            and total > limit and deep <= limit and deep + mapped <= total
+            # A maps-matched member may also map unexamined shared objects.
+            and 0 < unseen + unavailable <= total - deep
+            and mapped + unavailable <= total - deep
+            and (objects > 0 if unseen > 0 else objects == 0)
+            and type(completing["event"].get("scanned")) is int
+            and type(completing["event"].get("maps_matched")) is int
+            and completing["event"].get("scanned") == deep + mapped
+            and completing["event"].get("maps_matched") == mapped)
+    if inventory_system_preuse_disclosure(doc, ledgers, receipt, gap, publication):
+        return True
+    ambient = inventory_system_ambient_caller(doc, records, gap, publication, births)
+    if ambient is None:
+        return False
+    caller, identity = ambient
+    if gap["subject"] == "capture discovery":
+        return (gap["reason"] == SYSTEM_EMPTY_MAPS_REFUSAL and type(gap["pid"]) is int
+                and gap["pid"] == caller["pid"])
+    if (gap["subject"] != "semantic admission refused" or gap["pid"] is not None
+            or gap["reason"] not in ("semantic_unavailable", "provider_mapping_unproven")):
+        return False
+    for row in records:
+        if (row["kind"] != "edge_observed" or row["seq"] >= publication["seq"]
+                or row["event"].get("caller") != caller["id"]):
+            continue
+        edge = row["event"]
+        context = edge.get("identity_context") or {}
+        module = context.get("module") or {}
+        modules = [item for item in doc["modules"] if item["id"] == edge["module"]]
+        if len(modules) != 1:
+            continue
+        physical = modules[0].get("identity") or {}
+        device = physical.get("device") or {}
+        if (context.get("version") == 1 and module.get("id") == edge["module"]
+                and module.get("status") == "observed"
+                and module.get("inode") == physical.get("inode")
+                and module.get("device_major") == device.get("major")
+                and module.get("device_minor") == device.get("minor")
+                and module.get("path") in modules[0].get("paths", [])
+                and all((context.get("caller") or {}).get(key) == value for key, value in identity.items())
+                and (edge.get("mapping") or {}).get("state") == "mapped"):
+            return True
+    return False
+
+
+def inventory_semantic_early_disclosure(doc, records, index, validated):
+    """Only the exact gap used by a verified early boundary is recognized."""
+    gap = doc["gaps"][index]
+    if (set(gap) != {"caller", "module", "pid", "budget", "subject", "reason", "repeats"}
+            or gap["subject"] not in SEMANTIC_EARLY_SUBJECTS or gap["reason"] != "before_semantic_boundary"
+            or gap["caller"] is None or gap["module"] is None or gap["pid"] is not None
+            or gap["budget"] is not None or type(gap["repeats"]) is not int or gap["repeats"] != 1):
+        return False
+    expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
+    published = [row for row in records if row["kind"] == "gap_recorded" and row["event"].get("index") == index]
+    return (len(published) == 1 and published[0]["event"] == expected and published[0] in validated
+            and not any(row["kind"] == "gap_repeated" and row["event"].get("index") == index for row in records))
+
+
+def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
+    """Recognize retained limitations, without granting positive capture authority.
+
+    The unavailable subject is the coordinated standing disclosure for
+    handle-less cgroup passes (exact subject and reason, no caller,
+    module, pid or budget, one publication, repeats bounded by the
+    pass count). Recognition never widens to refusal or suspend
+    disclosures, and the pass-capability allowlist cannot bypass it:
+    recognized subjects are stripped from the allowed set first, so a
+    malformed standing gap is an unexpected inventory gap even when
+    its subject is named in the allowlist.
+    """
+    gap = doc["gaps"][index]
+    records = receipt["inventory_control"]["final_records"]
+    observation = doc.get("observation") or {}
+    if (doc.get("scope") != "cgroup" or receipt.get("scope_kind") != "cgroup"
+            or receipt.get("scope_label") != "cgroup" or observation.get("lane") != "native"
+            or (observation.get("attach") or {}).get("scope_filter") != "bpf-cgroup"
+            or records[0]["kind"] != "started" or records[0]["event"].get("scope") != "cgroup"
+            or doc.get("gaps_suppressed") != 0
+            or set(gap) != {"subject", "reason", "caller", "module", "pid", "budget", "repeats"}
+            or gap["module"] is not None or gap["pid"] is not None or gap["budget"] is not None
+            or type(gap["repeats"]) is not int or type(observation.get("passes")) is not int
+            or not 1 <= gap["repeats"] <= observation["passes"]):
+        return False
+    publication = [row for row in records if row["kind"] == "gap_recorded"
+                   and row["event"].get("index") == index]
+    expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
+    if len(publication) != 1 or publication[0]["event"] != expected:
+        return False
+    if gap["subject"] in CGROUP_DISCLOSURE_REASONS:
+        return gap["caller"] is None and gap["reason"] == CGROUP_DISCLOSURE_REASONS[gap["subject"]]
+    if gap["subject"] != "semantic admission refused" or gap["reason"] != "semantic_unavailable":
+        return False
+    callers = [row for row in doc["callers"] if row["id"] == gap["caller"]]
+    if len(callers) != 1:
+        return False
+    caller = callers[0]
+    try:
+        if inventory_target_preuse_disclosure(doc, ledgers, receipt, gap, publication[0], caller):
+            return True
+    except (KeyError, TypeError, ValueError, SetupError):
+        return False
+    pid, gen = caller["pid"], caller["incarnation"]
+    image = caller.get("image") or {}
+    candidates = [parsed for parsed in ledgers.values() if len(parsed["idents"]) == 1
+                  and parsed["idents"][0]["pid"] == pid]
+    if (pid not in receipt["owned_pids"] or len(candidates) != 1 or gen != 0
+            or caller.get("retired") is not False or caller.get("lifecycle") != "mapped"
+            or image.get("authority") != "scan_pinned"):
+        return False
+    parsed, ident = candidates[0], candidates[0]["idents"][0]
+    if (ident["start"] != caller["start_time"] or ident["gen"] != gen
+            or ident["exe"] != (image.get("exe") or {}).get("path")
+            or any(parsed[key] for key in ("batches", "held", "returned", "zombie", "execs",
+                                          "acks", "controls", "strange", "unflushed"))
+            or any(row["pid"] == pid for ledger in ledgers.values() for row in ledger["batches"])
+            or len(parsed["mapped"]) != 1 or parsed["readys"] != [ident]
+            or parsed["dones"] != [{**ident, "status": "ok"}]):
+        return False
+    mapped = parsed["mapped"][0]
+    if any(mapped.get(key) != value for key, value in ident.items()):
+        return False
+    providers = [(key, row) for key, row in receipt["providers"].items()
+                 if row["path"] == mapped["module"] and row["ino"] == mapped["ino"]]
+    if len(providers) != 1:
+        return False
+    name, provider = providers[0]
+    try:
+        module = inventory_held_provider_module(doc, provider)
+    except SetupError:
+        return False
+    if (receipt["expected_edges"].get(f"{pid}:{gen}:{name}") != {"zero_ok": True}
+            or receipt["expected_incarnations"].get(str(pid)) != {
+                "gens": {str(gen): {"exe": ident["exe"], "retired": False}}}
+            or not any(row["pid"] == pid and row["membership"] == "selected"
+                and row["t0"] <= receipt["observer_ready_ns"] <= receipt["observer_stopped_ns"] <= row["t1"]
+                for row in receipt.get("scope_intervals", []))):
+        return False
+    admissions = [row for row in records if row["kind"] == "caller_event"
+                  and row["event"].get("caller") == caller["id"]]
+    if len(admissions) != 1 or admissions[0]["event"].get("event") != "admitted":
+        return False
+    context = r5_admitted_subject(admissions[0]["event"])
+    if (admissions[0]["seq"] >= publication[0]["seq"] or context != {
+            "id": caller["id"], "pid": pid, "start_time": ident["start"], "incarnation": gen,
+            "authority": "scan_pinned", "lifecycle": "mapped", "status": "observed",
+            "executable": image["exe"]}
+            or any(row.get("caller") == caller["id"] for row in doc["instances"] + doc["semantic_edges"])
+            or any(row["kind"] in ("instance_observed", "semantic_edge_observed")
+                and row["event"].get("caller") == caller["id"] for row in records)):
+        return False
+    edges = [row for row in doc["edges"] if row["caller"] == caller["id"]]
+    history = [row for row in records if row["kind"] == "edge_observed"
+               and row["event"].get("caller") == caller["id"]]
+    scoped = [row["seq"] for row in history
+              if coverage_of(row["event"]).get("reason") == "scope_membership_unproven"]
+    if (len(edges) != 1 or not scoped
+            or coverage_of(edges[0]).get("reason") != "scope_membership_unproven"
+            or any(coverage_of(row["event"]).get("reason") != "scope_membership_unproven"
+                and not (coverage_of(row["event"]).get("reason") == "not_attached"
+                    and row["seq"] < min(scoped[0], publication[0]["seq"])) for row in history)):
+        return False
+    return all(
+        row["module"] == module["id"] and row.get("mapping", {}).get("state") == "mapped"
+        and row.get("entries", {}).get("count") == 0
+        and row["entries"].get("saturated") is False and row["entries"].get("in_flight") is False
+        and coverage_of(row).get("state") == "unknown"
+        and coverage_of(row).get("lossy") is None
+        and row.get("mechanisms") is None and row.get("operations") is None
+        and row.get("semantics") == "unknown (semantic capture withheld)"
+        for row in edges + [record["event"] for record in history])
+
+
+def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
+    """Fixed per-birth/caller/incarnation/module/instance measured exactness."""
+    control = receipt["inventory_control"]
+    records = control["final_records"]
+    errors, by_sequence = [], {}
+    last_time = 0
+    emitted = Counter()
+    for seq, record in enumerate(records):
+        if (record.get("schema") != "p11scope/inventory-events/v1" or record.get("seq") != seq
+                or type(record.get("at_ns")) is not int or record["at_ns"] < last_time
+                or record.get("kind") in ("rotated", "retention_evicted")):
+            raise SetupError("Inventory final stream changed schema, sequence or retained history")
+        last_time = record["at_ns"]
+        by_sequence[seq] = record
+        field = {"edge_observed": "edge_events", "instance_observed": "instance_events",
+                 "semantic_edge_observed": "semantic_edge_events"}.get(record["kind"])
+        if field:
+            emitted[field] += 1
+        elif record["kind"] in ("pass_committed", "ended"):
+            for field in ("edge_events", "instance_events", "semantic_edge_events"):
+                if type(record["event"].get(field)) is not int or record["event"][field] != emitted[field]:
+                    errors.append(f"Inventory {field} emitter accounting differs from the actual records")
+            if record["kind"] == "pass_committed":
+                for field in ("edge_events_deferred", "instance_events_deferred", "semantic_edge_events_deferred"):
+                    if type(record["event"].get(field)) is not int or record["event"][field] < 0:
+                        errors.append(f"Inventory {field} accounting is unavailable")
+            emitted.clear()
+    if not records or records[0]["kind"] != "started" or records[-1]["kind"] != "ended":
+        raise SetupError("Inventory final stream lacks its original start or exact end")
+    ending = records[-1]["event"]
+    for key in ("edges_unretained", "instances_unretained", "semantic_edges_unretained"):
+        if type(ending.get(key)) is not int or ending[key] != 0:
+            errors.append(f"Inventory final {key} prevents exact JSON/JSONL parity")
+    latest = {"edge_observed": {}, "instance_observed": {}, "semantic_edge_observed": {}}
+    for record in records:
+        if record["kind"] in latest:
+            row = record["event"]
+            key = (row["caller"], row["module"]) if record["kind"] == "edge_observed" else (
+                row["id"] if record["kind"] == "instance_observed" else row["instance"])
+            latest[record["kind"]][key] = row
+    for kind, field in (("edge_observed", "edges"), ("instance_observed", "instances"),
+                         ("semantic_edge_observed", "semantic_edges")):
+        expected = {}
+        for row in doc.get(field, []):
+            key = (row["caller"], row["module"]) if field == "edges" else (
+                row["id"] if field == "instances" else row["instance"])
+            if key in expected:
+                errors.append(f"Inventory duplicate final {field} identity")
+            expected[key] = row
+        if set(expected) != set(latest[kind]) or any(
+                {key: latest[kind][ident].get(key) for key in row} != row
+                for ident, row in expected.items() if ident in latest[kind]):
+            errors.append(f"Inventory exact final JSON/JSONL {field} parity differs")
+    measurements, summaries = control["measurements"], []
+    all_batches = [row for parsed in ledgers.values() for row in parsed["batches"]]
+    if receipt.get("scope_kind") == "cgroup":
+        intervals = receipt.get("scope_intervals", [])
+        for row in all_batches:
+            if (not inventory_physical_batch(row, receipt.get("physical_hooks"))
+                    or row["t0"] >= receipt["observer_stopped_ns"]
+                    or row["t1"] < receipt["observer_started_ns"]):
+                continue
+            if not any(interval["pid"] == row["pid"] and interval["membership"] == "selected"
+                       and interval["t0"] <= row["t0"] <= row["t1"] <= interval["t1"]
+                       for interval in intervals):
+                errors.append("Inventory outside-scope ledger work entered the controlled scoped population")
+                break
+    adjusted = {key: dict(value) for key, value in receipt["expected_edges"].items()}
+    expected_tuples, measured_completed, measured_failed = set(), 0, 0
+    for measurement_index, measurement in enumerate(measurements):
+        proof, marker = measurement["proof"], measurement["marker"]
+        image, provider, admission = proof["image"], proof["provider"], proof["admission"]
+        owner = SimpleNamespace(pid=image["pid"], identity={"start_time": image["start_time"]})
+        gen = admission["incarnation"]
+        label = f"pid {owner.pid} gen {gen}"
+        key = (owner.pid, gen, provider["path"])
+        population = [row for row in all_batches if (row["pid"], row["gen"], row["module"]) == key]
+        ids = [row for parsed in ledgers.values() for row in parsed["idents"]
+               if row["pid"] == owner.pid and row["gen"] == gen]
+        if len(ids) != 1 or ids[0]["start"] != image["start_time"] or ids[0]["exe"] != image["path"]:
+            errors.append(f"{label}: proof differs from original ledger birth/executable")
+        if not (1 <= proof["attempts"] == len(proof["markers"]) <= proof["max_attempts"] == 20
+                and proof["started_ns"] <= proof["observed_ns"] <= proof["deadline_ns"]
+                and 0 < proof["deadline_ns"] - proof["started_ns"] <= 90_000_000_000):
+            errors.append(f"{label}: readiness attempts or original recovery age are invalid")
+        for number, warm in enumerate(proof["markers"], 1):
+            ack = warm["ack"]
+            actual = [row for parsed in ledgers.values() for row in parsed["acks"] if row == ack]
+            if (len(actual) != 1 or ack["attempt"] != number or ack["gen"] != gen
+                    or ack["command"] != "W" or ack["idle"] != 1
+                    or not proof["started_ns"] <= ack["t0"] <= ack["t1"] <= proof["observed_ns"]):
+                errors.append(f"{label}: real warmup attempt/idle acknowledgment differs")
+        warm = proof["markers"][-1]
+        prefix = [row for row in population if row["t1"] <= warm["ack"]["t1"]]
+        baseline_record = proof["baseline"]["pass"]
+        baseline = inventory_boundary([row for row in records if row["seq"] <= baseline_record["seq"]],
+            owner, image, provider, admission, max(proof["cursor"]["seq"], admission["seq"]),
+            warm, prefix, physical_hooks=proof["physical_hooks"],
+            started_ns=proof["observer_started_ns"],
+            recovery_from=measurements[measurement_index - 1] if measurement_index else None)
+        if baseline is None or baseline != proof["baseline"]:
+            errors.append(f"{label}: fresh same-observer physical/instance/S1 baseline is unresolved")
+            continue
+        for field in ("physical", "instance", "semantic", "pass"):
+            raw = baseline[field]
+            if by_sequence.get(raw["seq"]) != raw:
+                errors.append(f"{label}: readiness borrowed another observer's {field} row")
+        matching_provider = next((name for name, pin in receipt["providers"].items() if pin == provider), None)
+        if matching_provider is None:
+            errors.append(f"{label}: provider proof differs from held-FD calibration")
+        else:
+            edge_key = f"{owner.pid}:{gen}:{matching_provider}"
+            if edge_key not in adjusted:
+                errors.append(f"{label}: required physical edge is absent")
+            else:
+                adjusted[edge_key]["count"] -= baseline["early"]["physical_missed"]
+        ack = marker["ack"]
+        matching_ack = [row for parsed in ledgers.values() for row in parsed["acks"] if row == ack]
+        if (len(matching_ack) != 1 or ack["command"] != "M" or ack["gen"] != gen
+                or ack["rv"] != 0xc0 or ack["idle"] != 1
+                or not proof["observed_ns"] <= marker["dispatch_ns"] <= ack["t0"] <= ack["t1"]
+                < ack["deadline"] <= receipt["observer_stopped_ns"] + 180_000_000_000):
+            errors.append(f"{label}: measurement before proof or invalid fixed-phase acknowledgment")
+        fixed = [row for row in population if row["phase"] in ("h6-measured", "h6-failed")]
+        if fixed != marker["batches"] or any(not ack["t0"] <= row["t0"] <= row["t1"] <= ack["t1"]
+                                             for row in fixed):
+            errors.append(f"{label}: fixed measured ledger differs from its actual phase")
+        wanted = ledger_s1_totals(fixed, 0)
+        if wanted[2].get(key, 0) < 10:
+            errors.append(f"{label}: S1 measured image completes fewer than 10 successful operations")
+        if not any(row["fn"] == "C_Verify" and row["bad"] == 1 and row["n"] == 1
+                   and row["phase"] == "h6-failed" for row in fixed):
+            errors.append(f"{label}: separate ledgered CKR_SIGNATURE_INVALID return is missing")
+        end_record = measurement["end"]["pass"]
+        end = inventory_boundary([row for row in records if row["seq"] <= end_record["seq"]],
+            owner, image, provider, admission, baseline_record["seq"], marker,
+            [row for row in population if row["t1"] <= ack["t1"]], prior=baseline,
+            physical_hooks=proof["physical_hooks"], started_ns=proof["observer_started_ns"])
+        if end is None or end != measurement["end"]:
+            errors.append(f"{label}: measured end lacks a corresponding observed idle boundary")
+            continue
+        stable = (image["start_time"], proof["caller"], gen, proof["module"], proof["instance"])
+        if stable in expected_tuples or end["instance"]["event"]["id"] != proof["instance"]:
+            errors.append(f"{label}: measured instance duplicates or changes authority")
+        expected_tuples.add(stable)
+        before, after = baseline["counts"], end["counts"]
+        delta = {name: after[name] - before[name] for name in
+                 ("physical", "api", "calls", "completed", "failed", "unknown", "orphans", "dropped")}
+        physical_wanted = counted_totals(fixed, receipt["observer_started_ns"],
+            receipt["observer_stopped_ns"], physical_hooks=proof["physical_hooks"]).get(key, 0)
+        desired = {"physical": physical_wanted, "api": wanted[5].get(key, 0),
+                   "calls": wanted[4].get(key, 0), "completed": wanted[2].get(key, 0),
+                   "failed": wanted[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
+        if delta != desired or delta["physical"] != 22:
+            errors.append(f"{label}: fixed physical/API/mechanism/operation delta disagrees with ledger")
+        mechanisms = set(before["mechanisms"]) | set(after["mechanisms"])
+        for mech in mechanisms:
+            prior, final = before["mechanisms"].get(mech, [0, 0]), after["mechanisms"].get(mech, [0, 0])
+            if [final[0] - prior[0], final[1] - prior[1]] != [
+                    wanted[0].get(key + (mech,), 0), wanted[1].get(key + (mech,), 0)]:
+                errors.append(f"{label} {mech}: fixed mechanism calls/errors disagree with ledger")
+        # The final sweep may retire the old instance or freeze the capture;
+        # neither may erase its historical positives or invent post-stop work.
+        tail = [row for row in population if ack["t1"] < row["t0"]
+                and row["t1"] <= receipt["observer_stopped_ns"]]
+        tail_totals = ledger_s1_totals(tail, 0)
+        historical_limit = 0
+        if gen == 0:
+            teardown = control["teardown"]
+            tmarker, tend = teardown["marker"], teardown["end"]
+            tack = tmarker["ack"]
+            actual_acks = [row for parsed in ledgers.values() for row in parsed["acks"] if row == tack]
+            functions = Counter(row["fn"] for row in tail)
+            if (functions != Counter({name: 1 for name in
+                    ("C_DestroyObject", "C_Logout", "C_CloseSession", "C_Finalize")})
+                    or tail != tmarker["batches"] or any(row["n"] != 1 or row["bad"] != 0
+                        or row["mech"] != "-" or row["phase"] != "h6-teardown"
+                        or not tack["t0"] <= row["t0"] <= row["t1"] <= tack["t1"] for row in tail)
+                    or len(actual_acks) != 1 or tack["command"] != "T" or tack["gen"] != gen
+                    or tack["rv"] != 0 or tack["idle"] != 1 or tack["deadline"] != ack["deadline"]
+                    or not end["pass"]["at_ns"] <= tmarker["dispatch_ns"] <= tack["t0"] <= tack["t1"] < tack["deadline"]):
+                errors.append(f"{label}: old teardown differs from its exact bounded four-call ledger")
+            else:
+                historical_limit = 4
+            replay = inventory_boundary([row for row in records if row["seq"] <= tend["pass"]["seq"]],
+                owner, image, provider, admission, end["pass"]["seq"], tmarker,
+                [row for row in population if row["t1"] <= tack["t1"]], prior=end,
+                physical_hooks=proof["physical_hooks"], started_ns=proof["observer_started_ns"])
+            checkpoint = receipt["freeze"]["checkpoint"]
+            xacks = [row for parsed in ledgers.values() for row in parsed["acks"]
+                if row["command"] == "X" and row["pid"] == owner.pid and row["gen"] == gen]
+            if (checkpoint != measurements[1]["proof"]["cursor"]
+                    or by_sequence.get(checkpoint["seq"], {}).get("at_ns") != checkpoint["at_ns"]
+                    or replay is None or replay != tend or not inventory_exact_idle_delta(end, replay,
+                    tail, owner.pid, gen, provider, proof["physical_hooks"], proof["observer_started_ns"])
+                    or len(xacks) != 1 or not tack["t1"] <= tend["pass"]["at_ns"] <= checkpoint["at_ns"]
+                    <= xacks[0]["t0"] or tend["pass"]["seq"] > checkpoint["seq"]
+                    or receipt.get("scope_kind") == "cgroup" and tend["pass"]["at_ns"] > receipt["scope_intervals"][0]["t1"]):
+                errors.append(f"{label}: original teardown was not published before checkpoint/move/exec")
+        final = latest["semantic_edge_observed"].get(proof["instance"])
+        final_instance = latest["instance_observed"].get(proof["instance"])
+        if (final is None or final_instance is None or final["caller"] != proof["caller"]
+                or final["module"] != proof["module"]):
+            errors.append(f"{label}: final historical semantic instance is missing")
+        else:
+            errors.extend(f"{label}: final {error}" for error in inventory_semantic_authority_errors(
+                final, final=True, historical_limit=historical_limit))
+            final_ops = final.get("operations") or {}
+            historical = (final.get("api_returns") or {}).get("historical_only_returns")
+            historical = historical if type(historical) is int and 0 <= historical <= historical_limit else 0
+            desired_final = {"api": after["api"] + tail_totals[5].get(key, 0),
+                "calls": after["calls"] + tail_totals[4].get(key, 0) - historical,
+                "completed": after["completed"] + tail_totals[2].get(key, 0),
+                "failed": after["failed"] + tail_totals[3].get(key, 0),
+                "unknown": after["unknown"], "orphans": after["orphans"], "dropped": after["dropped"]}
+            actual_final = {"api": (final.get("api_returns") or {}).get("count"),
+                            **{name: final_ops.get(name) for name in desired_final if name != "api"}}
+            if actual_final != desired_final:
+                errors.append(f"{label}: final historical API/operation totals changed after the measured boundary")
+            final_mechs = {mechanism_row_id(row): [row.get("calls"), row.get("errors")]
+                           for row in final.get("mechanisms") or []}
+            desired_mechs = {mech: [values[0] + tail_totals[0].get(key + (mech,), 0),
+                                    values[1] + tail_totals[1].get(key + (mech,), 0)]
+                             for mech, values in after["mechanisms"].items()}
+            if final_mechs != desired_mechs:
+                errors.append(f"{label}: final historical mechanism totals changed")
+            errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
+                records, proof["instance"], proof["caller"], proof["module"], receipt,
+                recovery=baseline.get("recovery"), historical_limit=historical_limit,
+                historical_after=end["pass"]["seq"]))
+        measured_completed += delta["completed"]
+        measured_failed += delta["failed"]
+        summaries.append({"tuple": list(stable), "early": baseline["early"], "measured": delta,
+                          "recovered_history": baseline.get("recovery")})
+    if not measurements or {row["proof"]["incarnation"] for row in measurements} != {0, 1}:
+        errors.append("Inventory required original/successor fixed measurements are missing")
+    sibling_s1 = []
+    if control.get("sibling"):
+        sibling = ledgers[control["sibling"]]["batches"]
+        sibling_errors, sibling_s1 = inventory_sibling_s1_errors(
+            doc, ledgers[control["sibling"]], receipt, records)
+        errors.extend(sibling_errors)
+        if {stage["label"] for stage in control["stages"]} != {"exec", "recovery", "measurement"}:
+            errors.append("SystemMixed actual target stage population is incomplete")
+        for stage in control["stages"]:
+            for module in control["sibling_providers"]:
+                path = receipt["providers"][module]["path"]
+                if not any(row["module"] == path and row["phase"].startswith("h6-warm")
+                           and row["n"] > 0 and row["t0"] < stage["t1"] and row["t1"] > stage["t0"]
+                           for row in sibling):
+                    errors.append(f"SystemMixed sibling {module} lacks real calls during {stage['label']}")
+    # Reuse the legacy physical/schema/scope/backend/cleanup judge on its
+    # physical projection; the actual S1 facts are independently judged above.
+    physical_doc = {**doc, "instances": [], "semantic_edges": [], "edges": [
+        {**row, "semantics": None, "mechanisms": None, "operations": None} for row in doc.get("edges", [])]}
+    # Validate against the original rows, before the physical-only projection
+    # removes S1. Keep every disclosure in the reported result.
+    physical_doc["gaps"], disclosures = [], []
+    early = [row for summary in summaries + sibling_s1 for row in summary["early"]["gaps"]]
+    for index, gap in enumerate(doc.get("gaps", [])):
+        if (gap.get("subject") in CGROUP_DISCLOSURE_SUBJECTS and inventory_cgroup_disclosure(
+                doc, ledgers, receipt, index)
+                or gap.get("subject") in SYSTEM_DISCLOSURE_SUBJECTS and inventory_system_disclosure(
+                    doc, ledgers, receipt, index, summaries)
+                or inventory_semantic_early_disclosure(doc, records, index, early)):
+            disclosures.append(gap)
+        else:
+            physical_doc["gaps"].append(gap)
+    physical_receipt = {**receipt, "s1_expected": False, "expected_edges": adjusted}
+    physical_receipt.pop("inventory_control")
+    physical_receipt["allowed_gap_subjects"] = sorted(set(receipt.get("allowed_gap_subjects", [])) | {
+        gap["event"]["subject"] for summary in summaries for gap in summary["early"]["gaps"]})
+    result = _evaluate_inventory_h6(physical_doc, ledgers, physical_receipt)
+    result["gaps"] = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
+    result["expected_disclosures"] = disclosures
+    if any(gap["subject"] == "native capture retirement unsettled" for gap in disclosures):
+        result["unresolved_observation"] = {key: doc["observation"][key]
+            for key in ("retirement", "settlement", "semantic_capture")}
+    post_stop = sum(row["n"] for row in all_batches if row["fn"] != "C_GetFunctionList"
+                    and row["t0"] >= receipt["observer_stopped_ns"])
+    if receipt.get("scope_kind") == "cgroup":
+        # Membership sampling ended at stop. Later controlled teardown is a
+        # separately ledgered post-stop population, with no scoped count claim.
+        result["out_of_scope_calls"] -= max(0, post_stop - result["post_stop_calls"])
+        result["post_stop_calls"] = post_stop
+    errors.extend(result["errors"])
+    count_only = {inventory_held_provider_module(doc, receipt["providers"][name])["id"]
+                  for name in receipt.get("count_only_providers", [])}
+    for row in doc.get("edges", []) + doc.get("semantic_edges", []):
+        if row.get("module") in count_only and (row.get("mechanisms") is not None
+                or row.get("operations") is not None or not str(row.get("semantics", "unknown")).startswith("unknown")
+                or (row.get("api_returns") or {}).get("count") is not None):
+            errors.append("SystemMixed count-only provider publishes semantic positives")
+    result.update({"pass": not errors, "status": "pass" if not errors else "fail", "errors": errors,
+        "completed_operations": measured_completed, "s1": {"measured_completed": measured_completed,
+            "measured_failed": measured_failed, "stable_instances": summaries,
+            "sibling_instances": sibling_s1,
+            "limitation": RECOVERED_HISTORY_LIMITATION + (
+                " " + SYSTEM_H6_LIMITATION if receipt.get("scope_kind") == "system" else ""),
+            "instances": len(doc.get("instances", [])), "semantic_edges": len(doc.get("semantic_edges", []))}})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# H6 harness: independent process evidence
+# ---------------------------------------------------------------------------
+
+OwnedProcess = N3HARNESS["OwnedProcess"]
+InitialExecProcess = INITIAL_EXEC["InitialExecProcess"]
+spawn_initial_exec = INITIAL_EXEC["spawn_initial_exec"]
+FilePin = N3HARNESS["FilePin"]
+fs_magic = N3HARNESS["fs_magic"]
+cleanup_processes = N3HARNESS["cleanup_processes"]
+cleanup_cgroups = N3HARNESS["cleanup_cgroups"]
+create_cgroup = N3HARNESS["create_cgroup"]
+cgroup_of = N3HARNESS["cgroup_of"]
+process_identity = N3HARNESS["process_identity"]
+wait_capture_started = N3HARNESS["wait_capture_started"]
+signal_cleanup = N3HARNESS["signal_cleanup"]
+cleanup_section = N3HARNESS["cleanup_section"]
+
+
+def spawn_owned(*args, **kwargs):
+    check_dispatch()
+    return N3HARNESS["spawn_owned"](*args, **kwargs)
+
+
+def n3_command(caller, reader, fn, count, delay, phase, scope, image=0,
+               group=None, phases=None, spaced=False, acknowledgement_seconds=10):
+    if phase == "measured":
+        enter_phase("fixed-measurement")
+    check_dispatch()
+    return N3HARNESS["command"](caller, reader, fn, count, delay, phase, scope,
+        image, group, phases, spaced, remaining_seconds(acknowledgement_seconds))
+
+
+class Reader(N3HARNESS["Reader"]):
+    """Private cancellable pipe reader; preserve the shared ledger interface."""
+    def __init__(self, stream, path):
+        self.stop = threading.Event()
+        self.budget = ACTIVE_LEG.get()
+        super().__init__(stream, path)
+
+    def _read(self):
+        try:
+            fd = self.stream.fileno()
+        except (OSError, ValueError):
+            # Finite in-memory controls keep the shared decode/error behavior.
+            return super()._read()
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        pending, total = "", 0
+        try:
+            with self.path.open("w", encoding="utf-8") as output:
+                def record(line):
+                    line = line.replace("\r\n", "\n")
+                    if len(line.encode()) > 65536:
+                        raise ValueError("owned output exceeds bounded fixture limit")
+                    self.lines.append(line)
+                    output.write(line)
+                    output.flush()
+                    if line.startswith("N3LEDGER "):
+                        self.records.append(json.loads(line[9:]))
+                    self.updates.put(None)
+                while not self.stop.is_set():
+                    if not select.select([fd], [], [], transport_poll_seconds(self))[0]:
+                        continue
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        pending += decoder.decode(b"", final=True)
+                        if pending and not self.errors:
+                            record(pending)
+                        break
+                    total += len(chunk)
+                    piece = decoder.decode(chunk)
+                    if total > 8 * 1024 * 1024 and not self.errors:
+                        self.errors.append("owned output exceeds bounded fixture limit")
+                    if self.errors:
+                        continue  # drain an over-limit child without retaining more output
+                    pending += piece
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        record(line + "\n")
+                    if len(pending.encode()) > 65536:
+                        raise ValueError("owned output exceeds bounded fixture limit")
+        except (ValueError, UnicodeError, OSError, TimeoutError) as error:
+            self.errors.append(str(error))
+        finally:
+            self.updates.put(None)
+
+    def finish(self):
+        try:
+            self.thread.join(timeout=remaining_seconds(3))
+        except TimeoutError:
+            self.errors.append("owned output deadline exhausted before reader cancellation")
+            self.stop.set()
+            self.thread.join(timeout=0)
+            raise
+        if self.thread.is_alive():
+            self.errors.append("owned output did not finish cleanly before reader cancellation")
+            self.stop.set()
+            self.thread.join(timeout=remaining_seconds(1))
+            raise ValueError("owned output did not finish cleanly before reader cancellation")
+        if self.errors:
+            raise ValueError("owned output did not finish cleanly: " + "; ".join(self.errors))
+        return "".join(self.lines)
+
+    def wait(self, predicate, seconds=10):
+        deadline = wait_deadline(seconds)
+        while True:
+            remaining = remaining_until(deadline)
+            if self.errors:
+                raise ValueError("; ".join(self.errors))
+            result = predicate(self)
+            if result:
+                remaining_until(deadline)
+                return result
+            if not self.thread.is_alive():
+                # The terminal ACK can arrive between the predicate and EOF check.
+                if self.errors:
+                    raise ValueError("; ".join(self.errors))
+                result = predicate(self)
+                if result:
+                    remaining_until(deadline)
+                    return result
+                raise TimeoutError("owned fixture/capture readiness acknowledgement missing")
+            try:
+                self.updates.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                pass
+
+
+def owned_reader(readers, reader_class, *args):
+    """Enroll before a constructor can start a thread and then fail."""
+    with cleanup_section():
+        reader = reader_class.__new__(reader_class)
+        reader.thread = None
+        if reader_class is PtyCapture:
+            reader.master = args[0]
+        else:
+            reader.stream = args[0]
+        readers.append(reader)
+        reader_class.__init__(reader, *args)
+    return reader
+
+
+def expect_line(reader, index, prefix, timeout):
+    """Wait for the next line with prefix; returns (line, next_index)."""
+    deadline = wait_deadline(timeout)
+    while True:
+        try:
+            remaining = remaining_until(deadline)
+        except TimeoutError as error:
+            raise TimeoutError(f"timed out waiting for {prefix}") from error
+        if reader.errors:
+            raise ValueError("; ".join(reader.errors))
+        while index < len(reader.lines):
+            line = reader.lines[index]
+            index += 1
+            if line.startswith(prefix):
+                remaining_until(deadline)
+                return line, index
+        if not reader.thread.is_alive():
+            # The reader may have appended its last line during the scan.
+            if index < len(reader.lines):
+                continue
+            if reader.errors:
+                raise ValueError("; ".join(reader.errors))
+            raise EOFError(f"stream ended waiting for {prefix}")
+        try:
+            reader.updates.get(timeout=min(remaining, 0.5))
+        except queue.Empty:
+            pass
+
+
+def proc_birth_ticks(pid):
+    """Process start_time ticks (field 22) from /proc, like the fixtures."""
+    with open(f"/proc/{pid}/stat") as handle:
+        text = handle.read()
+    fields = text[text.rindex(")") + 2:].split()
+    return int(fields[19])
+
+
+def proc_exe(pid):
+    return os.readlink(f"/proc/{pid}/exe")
+
+
+def proc_task_states(pid):
+    """{tid: state} for every thread of an owned process."""
+    states = {}
+    for tid in sorted(os.listdir(f"/proc/{pid}/task")):
+        with open(f"/proc/{pid}/task/{tid}/stat") as handle:
+            text = handle.read()
+        states[int(tid)] = text[text.rindex(")") + 2:].split()[0]
+    return states
+
+
+def proc_leader_identity(pid):
+    """Retained original leader fields that remain readable after thread exit."""
+    proc = Path("/proc") / str(pid)
+    text = (proc / "stat").read_text()
+    fields = text[text.rindex(")") + 2:].split()
+    return {"pid": int(text.split("(", 1)[0]), "state": fields[0],
+            "ppid": int(fields[1]), "start_time": int(fields[19]), "uid": proc.stat().st_uid}
+
+
+def proc_worker_identity(pid, tid):
+    """Birth and namespace identity of the exact task inside the owned group."""
+    task = Path("/proc") / str(pid) / "task" / str(tid)
+    text = (task / "stat").read_text()
+    fields = text[text.rindex(")") + 2:].split()
+    status = dict(line.split(":", 1) for line in (task / "status").read_text().splitlines())
+    identity = {"tid": int(text.split("(", 1)[0]), "tgid": int(status["Tgid"]),
+                "ppid": int(fields[1]), "start_time": int(fields[19]),
+                "uid": task.stat().st_uid,
+                "pid_namespace": (task / "ns/pid").stat().st_ino,
+                "time_namespace": (task / "ns/time").stat().st_ino}
+    if identity["tid"] != tid or identity["tgid"] != pid or identity["start_time"] <= 0:
+        raise SetupError("worker task is not the exact retained group member")
+    return identity
+
+
+def proc_provider_mapping(pid, provider_path):
+    """Executable mapping of provider_path: (start, file_offset, dev, ino)."""
+    with open(f"/proc/{pid}/maps") as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) < 6 or fields[-1] != provider_path or "x" not in fields[1]:
+                continue
+            start = int(fields[0].split("-")[0], 16)
+            offset = int(fields[2], 16)
+            major, minor = (int(v, 16) for v in fields[3].split(":"))
+            return start, offset, [major, minor], int(fields[4])
+    raise LookupError(f"no executable mapping of {provider_path} in {pid}")
+
+
+_libc = None
+
+
+def symbol_file_offset(library_path, symbol):
+    """File offset of an exported symbol via dlopen in this process.
+
+    The offset is file-structural (identical for every mapping of the
+    same bytes), so resolving it here instead of in the target loses
+    nothing and avoids an ELF parser.
+    """
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(None)
+        _libc.dlopen.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        _libc.dlopen.restype = ctypes.c_void_p
+        _libc.dlsym.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        _libc.dlsym.restype = ctypes.c_void_p
+    resolved = os.path.realpath(library_path)
+    handle = _libc.dlopen(resolved.encode(), 1)  # RTLD_LAZY; kept open: one handle per file
+    if not handle:
+        raise LookupError(f"cannot dlopen {library_path}")
+    address = _libc.dlsym(handle, symbol.encode())
+    if not address:
+        raise LookupError(f"no export {symbol} in {library_path}")
+    start, offset, _, _ = proc_provider_mapping(os.getpid(), resolved)
+    return address - start + offset
+
+
+class BDriver:
+    """One detailed-nonleader-exec fixture run (LP64 synthetic provider).
+
+    Drives the byte protocol with bounded acks and records independent
+    per-generation evidence (birth, exe, provider mapping, task states).
+    """
+
+    def __init__(self, owners, readers, leg_dir, before_pin, after_pin, provider_pin,
+                 uid, gid, env, mode, measured=25, delay_ms=300):
+        self.leg_dir = Path(leg_dir)
+        self.before_pin, self.after_pin, self.provider_pin = before_pin, after_pin, provider_pin
+        self.uid, self.gid, self.env = uid, gid, env
+        self.mode, self.measured, self.delay_ms = mode, measured, delay_ms
+        self.stamps: dict = {}
+        self.lines: dict = {}
+        self.tasks: dict = {}
+        self.index = 0
+        self.warm_calls = []
+        self.initial_calls = []
+        token = int.from_bytes(os.urandom(8), "little") | 1
+        absent = self.leg_dir / "must-not-exist"
+        argv = [str(before_pin.path), str(provider_pin.path), str(after_pin.path),
+               str(absent), str(os.getpid()), str(token), mode, str(measured), str(delay_ms)]
+        argv.append("0" if mode == "1" else "1")
+        budget = ACTIVE_LEG.get() or LegBudget()
+        argv.extend(str(value) for value in (
+            budget.deadline_ns, budget.deadlines["setup", 0],
+            int(budget.budgets["successor-recovery"] * 1000),
+            int(budget.budgets["fixed-measurement"] * 1000),
+            int((budget.budgets["normal-stop"] + budget.budgets["cleanup"]) * 1000)))
+        self.token = token
+        self.owned = spawn_owned(
+            owners, argv, uid, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env, user=uid, group=gid,
+            extra_groups=[], start_new_session=True)
+        self.stdout = owned_reader(readers, Reader, self.owned.popen.stdout, self.leg_dir / "b.stdout.txt")
+        self.stderr = owned_reader(readers, Reader, self.owned.popen.stderr, self.leg_dir / "b.stderr.txt")
+        self.pid = self.owned.pid
+        self.birth = self.owned.identity["start_time"]
+
+    def expect(self, prefix, timeout=10):
+        line, self.index = expect_line(self.stdout, self.index, prefix, timeout)
+        stamp = monotonic_ns()
+        self.lines[prefix] = line.rstrip("\n")
+        self.stamps[prefix] = stamp
+        return line.rstrip("\n")
+
+    def send(self, byte, name):
+        check_dispatch()
+        try:
+            self.owned.verify()
+        except FileNotFoundError:
+            # Linux removes the zombie leader's namespace links while its
+            # exact clone worker survives. Only the leader-exit modes use this
+            # fallback; the held group pidfd and original birth stay owned.
+            if getattr(self, "mode", None) not in ("2", "3") or not hasattr(self, "worker_identity"):
+                raise
+            self.verify_zombie_worker()
+        self.stamps[name] = monotonic_ns()  # lower bound before a fast child can read
+        if name == "B":
+            remaining_until(self.worker_barrier["deadline_ns"])
+            self.worker_barrier["released_ns"] = self.stamps[name]
+        check_dispatch()
+        self.owned.popen.stdin.write(byte)
+        self.owned.popen.stdin.flush()
+
+    def snapshot_tasks(self, name):
+        self.tasks[name] = proc_task_states(self.pid)
+        return self.tasks[name]
+
+    def ready(self):
+        """READY: fixture published its table and waits; observer may attach."""
+        line = self.expect("READY", timeout=10)
+        fields = line.split()
+        assert int(fields[1]) == self.pid and int(fields[5]) == self.token, line
+        self.owned.verify()
+        assert proc_exe(self.pid) == str(self.before_pin.path)
+        self.exe0 = proc_exe(self.pid)
+        self.maps0 = proc_provider_mapping(self.pid, str(self.provider_pin.path))
+        self.start0 = proc_birth_ticks(self.pid)
+        assert self.start0 == self.birth
+        return line
+
+    def start_worker(self):
+        if self.mode == "3" and not getattr(self, "initial_ready", None):
+            raise SetupError("held-entry worker lacks its original-image public provider proof")
+        deadline = wait_deadline(10) if self.mode == "2" else None
+        self.send("G", "G")
+        thread = self.expect("THREAD", timeout=remaining_until(deadline) if deadline else 10)
+        fields = thread.split()
+        self.worker_tid = int(fields[2])
+        assert self.worker_tid != self.pid
+        if self.mode == "3":
+            if len(fields) != 5 or [int(value) for value in fields[1:4]] != [self.pid, self.worker_tid, self.worker_tid]:
+                raise SetupError("THREAD does not identify the exact held-entry worker")
+            self.worker_identity = proc_worker_identity(self.pid, self.worker_tid)
+            self.owned.zombie_worker_verify = self.verify_zombie_worker
+        if self.mode == "2":
+            if len(fields) != 5 or [int(value) for value in fields[1:4]] != [self.pid, self.worker_tid, self.worker_tid]:
+                raise SetupError("THREAD does not identify the exact owned worker")
+            self.worker_identity = proc_worker_identity(self.pid, self.worker_tid)
+            self.owned.zombie_worker_verify = self.verify_zombie_worker
+            gone = self.expect("LEADER_EXIT", timeout=remaining_until(deadline))
+            waiting = self.expect("WORKER_WAIT", timeout=remaining_until(deadline))
+            if any(len(line.split()) != 4 or [int(value) for value in line.split()[1:3]] !=
+                   [self.pid, self.worker_tid] for line in (gone, waiting)):
+                raise SetupError("leader intent/worker barrier ack names the wrong retained task")
+            while True:
+                remaining_until(deadline)
+                states = self.verify_worker_group()
+                observed = monotonic_ns()
+                remaining_until(deadline)
+                if states.get(self.pid) == "Z":
+                    break
+                pause_until(deadline, 0.005)
+            self.worker_barrier = {"proof_kind": "zombie-leader-worker-gate",
+                "leader": dict(self.owned.identity), "worker": dict(self.worker_identity),
+                "tasks": states, "pidfd_live": True, "started_ns": self.stamps["G"],
+                "thread_ns": int(fields[-1]), "intent_ns": int(gone.split()[-1]),
+                "wait_ns": int(waiting.split()[-1]), "observed_ns": observed, "deadline_ns": deadline}
+            self.send("B", "B")
+            released = self.expect("WORKER_RELEASE", timeout=remaining_until(deadline))
+            parts = released.split()
+            if (len(parts) != 4 or [int(value) for value in parts[1:3]] != [self.pid, self.worker_tid]
+                    or not self.stamps["B"] <= int(parts[-1]) <= self.stamps["WORKER_RELEASE"]):
+                raise SetupError("worker release ack lacks the exact bounded released worker")
+            self.worker_barrier["worker_release_ns"] = int(parts[-1])
+        return thread
+
+    def verify_worker_group(self):
+        """Retain original group custody when only its recorded worker is live."""
+        states = self.snapshot_tasks("leader_exit")
+        original = self.owned.identity
+        leader = proc_leader_identity(self.pid)
+        if any(leader[key] != original[key] for key in ("pid", "ppid", "start_time", "uid")):
+            raise SetupError("leader is not the original retained process/birth/parent/uid")
+        worker = proc_worker_identity(self.pid, self.worker_tid)
+        if (worker != self.worker_identity or worker["tid"] == self.pid
+                or any(worker[key] != original[key] for key in
+                       ("ppid", "uid", "pid_namespace", "time_namespace"))):
+            raise SetupError("surviving worker birth/group/parent/uid/namespaces changed")
+        if states.get(self.worker_tid) not in ("R", "S", "D"):
+            raise SetupError("exact retained worker is absent or no longer live")
+        if states.get(self.pid) not in ("Z", "R", "S", "D"):
+            raise SetupError("original leader vanished or the group died")
+        if states[self.pid] != "Z":
+            try:
+                self.owned.verify()
+            except FileNotFoundError:
+                # The leader can exit between the live snapshot and ordinary
+                # verification. Confirm Z; never waive live-leader custody.
+                if proc_leader_identity(self.pid) != {**leader, "state": "Z"}:
+                    raise
+        elif leader["state"] != "Z":
+            raise SetupError("task snapshot disagrees with retained leader exit")
+        if self.owned.pidfd is None:
+            raise SetupError("original process pidfd was released")
+        poll = select.poll()
+        poll.register(self.owned.pidfd, select.POLLIN)
+        if poll.poll(0):
+            raise SetupError("retained group pidfd reports terminal group death")
+        return states
+
+    def verify_zombie_worker(self):
+        if self.verify_worker_group().get(self.pid) != "Z":
+            raise SetupError("worker custody lacks the original zombie leader")
+
+    def initial_warm_attempt(self, sequence, remaining):
+        phase = f"initial-0-{sequence}"
+        self.send("W", phase)
+        done = self.expect("INITIAL_WARM_DONE", timeout=remaining)
+        fields = [int(field) for field in done.split()[1:]]
+        if (fields[:4] != [self.pid, self.pid, sequence, 0]
+                or not self.stamps[phase] <= fields[4] <= fields[5] <= self.stamps["INITIAL_WARM_DONE"]):
+            raise SetupError("initial marker does not match its independently issued real call")
+        self.initial_calls.append({"kind": "call", "image": 0, "pid": self.pid, "tid": self.pid,
+            "fn": "C_GetInfo", "rv": 0, "phase": phase, "scope": "selected", "sess": 0,
+            "seq": sequence, "t0": fields[4], "t1": fields[5]})
+        return phase
+
+    def accept_initial_proof(self, capture, proof, ready):
+        self.owned.verify()
+        self.before_pin.verify()
+        self.provider_pin.verify()
+        index = proof["proof_cursor"] - 1
+        row = ROW.fullmatch(capture.lines[index].strip()) if 0 <= index < len(capture.lines) else None
+        if (proof["image"] != 0 or proof["proof_kind"] != "trace-row"
+                or proof["marker_fn"] != "C_GetInfo" or not row
+                or (int(row["pid"]), int(row["tid"]), row["fn"], row["rv"]) !=
+                   (self.pid, self.pid, "C_GetInfo", "CKR_OK")
+                or not row["path"] or json.loads(row["path"]) != self.exe0
+                or json.loads(row["label"]) != Path(self.exe0).name
+                or not ready <= proof["started_ns"] <= proof["observed_ns"] <= proof["deadline_ns"]
+                or not 1 <= proof["attempts"] == len(self.initial_calls) <= proof["max_attempts"] == 20
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 15_000_000_000):
+            raise SetupError("held-entry initial proof is not this observer's bounded original provider row")
+        self.initial_ready = proof
+
+    def release_held_leader(self):
+        """Permit exit only after the exact worker entered under a live leader."""
+        deadline = wait_deadline(10)
+        self.owned.verify()
+        self.before_pin.verify()
+        self.provider_pin.verify()
+        leader = proc_leader_identity(self.pid)
+        states = self.verify_worker_group()
+        body = [int(value) for value in self.lines["EXEC_BODY"].split()[1:]]
+        observed = monotonic_ns()
+        if (self.mode != "3" or states.get(self.pid) not in ("R", "S", "D")
+                or leader["state"] not in ("R", "S", "D")
+                or body[:3] != [self.pid, self.worker_tid, self.token]
+                or not self.initial_ready["observed_ns"] <= self.stamps["G"]
+                    <= int(self.lines["WORKER_DONE"].split()[-1]) <= body[-1] <= observed):
+            raise SetupError("held provider entry lacks a live original leader/current public readiness")
+        self.held_entry = {"proof_kind": "live-leader-held-provider-entry",
+            "leader": dict(self.owned.identity), "worker": dict(self.worker_identity),
+            "leader_before": leader, "tasks_before": states, "pidfd_live": True,
+            "entered_ns": body[-1], "observed_live_ns": observed, "deadline_ns": deadline,
+            "initial_ready": self.initial_ready, "provider": provider_receipt(self.provider_pin)}
+        self.send("E", "E")
+        released = self.expect("HELD_LEADER_RELEASE", timeout=remaining_until(deadline))
+        fields = [int(value) for value in released.split()[1:]]
+        if fields[:3] != body[:3] or not self.stamps["E"] <= fields[-1] <= self.stamps["HELD_LEADER_RELEASE"]:
+            raise SetupError("held-frame leader release ack differs from its independent E dispatch")
+        self.expect("LEADER_EXIT", timeout=remaining_until(deadline))
+        while True:
+            remaining_until(deadline)
+            states = self.verify_worker_group()
+            observed = monotonic_ns()
+            remaining_until(deadline)
+            if states.get(self.pid) == "Z":
+                break
+            pause_until(deadline, 0.005)
+        self.held_entry.update(released_ns=fields[-1], observed_zombie_ns=observed, tasks_after=states)
+        return self.held_entry
+
+    def pre_exec(self):
+        done = self.expect("WORKER_DONE", timeout=10)
+        fields = done.split()
+        assert [int(fields[3]), int(fields[4]), int(fields[5])] == [11, 6, 5], done
+        assert int(fields[2]) == self.worker_tid, done
+        if self.mode == "2" and int(fields[-1]) < self.worker_barrier["worker_release_ns"]:
+            raise SetupError("capability calls completed before the exact worker release")
+        self.expect("EXEC_BODY", timeout=10)
+        self.snapshot_tasks("exec_frame")
+        return done
+
+    def do_exec(self):
+        enter_phase("successor-recovery", key=1)
+        self.send("X", "X")
+        if self.mode == "1":
+            failed = self.expect("EXEC_FAILED", timeout=10)
+            assert int(failed.split()[3]) == 2, failed  # ENOENT, exact old return
+            return None
+        line = self.expect("NEW_READY", timeout=10)
+        fields = line.split()
+        assert int(fields[1]) == self.pid and int(fields[5]) == self.token, line
+        assert int(fields[1]) == int(fields[2]), line  # single thread, tid == pid
+        self.owned.verify()
+        assert proc_exe(self.pid) == str(self.after_pin.path)
+        self.exe1 = proc_exe(self.pid)
+        self.maps1 = proc_provider_mapping(self.pid, str(self.provider_pin.path))
+        assert proc_birth_ticks(self.pid) == self.birth
+        self.snapshot_tasks("post_exec")
+        return line
+
+    def warm_attempt(self, sequence, remaining):
+        phase = f"successor-1-{sequence}"
+        self.send("W", phase)
+        done = self.expect("WARM_DONE", timeout=remaining)
+        fields = [int(field) for field in done.split()[1:]]
+        if (fields[:4] != [self.pid, self.pid, sequence, 0]
+                or not self.stamps[phase] <= fields[4] <= fields[5] <= self.stamps["WARM_DONE"]):
+            raise SetupError("WARM_DONE does not match the independently issued real call")
+        self.warm_calls.append({"kind": "call", "image": 1, "pid": self.pid, "tid": self.pid,
+                                "fn": "C_GetInfo", "rv": fields[3], "phase": phase,
+                                "scope": "selected", "sess": 0, "seq": sequence,
+                                "t0": fields[4], "t1": fields[5]})
+        return phase
+
+    def post_exec(self):
+        enter_phase("fixed-measurement")
+        self.send("P", "P")
+        self.expect("POST_BODY", timeout=10)
+        self.send("R", "R")
+        done = self.expect("NEW_DONE", timeout=60)
+        fields = done.split()
+        total, ok, err = int(fields[3]), int(fields[4]), int(fields[5])
+        assert total == self.measured, done
+        assert ok + err == total and int(fields[6]) == self.token, done
+        return done
+
+    def post_fail(self):
+        enter_phase("fixed-measurement")
+        self.send("R", "Rpost")
+        done = self.expect("DONE", timeout=10)
+        fields = done.split()
+        assert [int(fields[3]), int(fields[4]), int(fields[5]), int(fields[6])] == [29, 15, 14, 5], done
+        return done
+
+    def finish(self):
+        enter_phase("cleanup")
+        self.send("F", "F")
+        rc = wait_process(self.owned.popen, 10)
+        assert rc == 0, rc
+        return rc
+
+    def b_setup_note(self):
+        return {"token": self.token, "mode": self.mode, "measured": self.measured,
+                "delay_ms": self.delay_ms, "tasks": self.tasks, "lines": self.lines,
+                "stamps": self.stamps, "worker_identity": getattr(self, "worker_identity", None),
+                "worker_barrier": getattr(self, "worker_barrier", None),
+                "held_entry": getattr(self, "held_entry", None)}
+
+    def normalize(self, file_offset):
+        """Translate receipts to N3LEDGER-schema records."""
+        pre_rvs = [0 if i % 2 == 0 else 5 for i in range(11)]
+        ledger = [
+            {"kind": "image", "image": 0, "pid": self.pid, "start_time": self.birth,
+             "path": self.exe0, "dev": self.before_pin.initial.st_dev,
+             "ino": self.before_pin.initial.st_ino,
+             "mtime_ns": self.before_pin.initial.st_mtime_ns,
+             "pid_namespace": self.owned.identity["pid_namespace"],
+             "time_namespace": self.owned.identity["time_namespace"],
+             "t": self.stamps["READY"]},
+            {"kind": "target", "image": 0, "fn": "C_Initialize",
+             "dev": self.maps0[2], "ino": self.maps0[3], "file_offset": file_offset,
+             "vaddr": self.maps0[0] + (file_offset - self.maps0[1])},
+        ]
+        for seq, rv in enumerate(pre_rvs):
+            ledger.append({"kind": "call", "image": 0, "pid": self.pid, "tid": self.worker_tid,
+                           "fn": "C_Initialize", "rv": rv, "phase": "pre", "scope": "selected",
+                           "sess": 0, "t0": self.stamps.get("B", self.stamps["G"]), "t1": self.stamps["WORKER_DONE"],
+                           "seq": seq})
+        if self.initial_calls:
+            ledger.append({"kind": "target", "image": 0, "fn": "C_GetInfo",
+                "dev": self.maps0[2], "ino": self.maps0[3],
+                "file_offset": symbol_file_offset(self.provider_pin.path, "C_GetInfo")})
+            ledger.extend(self.initial_calls)
+        failed = self.mode == "1"
+        if failed:
+            post_rvs = [5] + [0 if i % 2 == 0 else 5 for i in range(17)]
+            for seq, rv in enumerate(post_rvs):
+                ledger.append({"kind": "call", "image": 0, "pid": self.pid,
+                               "tid": self.worker_tid, "fn": "C_Initialize", "rv": rv,
+                               "phase": "post", "scope": "selected", "sess": 0,
+                               "t0": self.stamps["Rpost"], "t1": self.stamps["DONE"],
+                               "seq": 11 + seq})
+        else:
+            ledger.append({"kind": "exec", "image": 0, "pid": self.pid, "tid": self.worker_tid,
+                           "start_time": self.birth, "mode": "nonleader",
+                           "path": self.exe1, "scope": "selected", "t": self.stamps["EXEC_BODY"]})
+            ledger.append({"kind": "image", "image": 1, "pid": self.pid, "start_time": self.birth,
+                           "path": self.exe1, "dev": self.after_pin.initial.st_dev,
+                           "ino": self.after_pin.initial.st_ino,
+                           "mtime_ns": self.after_pin.initial.st_mtime_ns,
+                           "pid_namespace": self.owned.identity["pid_namespace"],
+                           "time_namespace": self.owned.identity["time_namespace"],
+                           "t": self.stamps["NEW_READY"]})
+            ledger.append({"kind": "target", "image": 1, "fn": "C_Initialize",
+                           "dev": self.maps1[2], "ino": self.maps1[3], "file_offset": file_offset,
+                           "vaddr": self.maps1[0] + (file_offset - self.maps1[1])})
+            if self.warm_calls:
+                offset = symbol_file_offset(self.provider_pin.path, "C_GetInfo")
+                ledger.append({"kind": "target", "image": 1, "fn": "C_GetInfo",
+                               "dev": self.maps1[2], "ino": self.maps1[3], "file_offset": offset,
+                               "vaddr": self.maps1[0] + (offset - self.maps1[1])})
+                ledger.extend(self.warm_calls)
+            post_rvs = [0] + [5 if i % 2 == 1 else 0 for i in range(1, self.measured)]
+            for seq, rv in enumerate(post_rvs):
+                ledger.append({"kind": "call", "image": 1, "pid": self.pid, "tid": self.pid,
+                               "fn": "C_Initialize", "rv": rv, "phase": "post",
+                               "scope": "selected", "sess": 0,
+                               "t0": self.stamps["R"], "t1": self.stamps["NEW_DONE"],
+                               "seq": seq})
+            ledger.append({"kind": "ack", "image": 0, "phase": "pre", "t": self.stamps["WORKER_DONE"]})
+            ledger.append({"kind": "ack", "image": 1, "phase": "post", "t": self.stamps["NEW_DONE"]})
+        return ledger
+
+
+class BackendRefused(Exception):
+    """The observer refused the requested backend (negative, not recovery)."""
+
+
+class SetupError(Exception):
+    """The harness could not establish the cell's preconditions."""
+
+
+B_CFLAGS = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-fno-builtin",
+            "-fno-stack-protector", "-fno-omit-frame-pointer"]
+CALLER_CFLAGS = ["-O2", "-Wall", "-Wextra", "-Werror"]
+LEDGER_CFLAGS = ["-O1", "-Wall", "-Wextra", "-Werror"]
+
+
+def compile_case_fixtures(bin_dir, owned_pins=None):
+    """Compile every H6 workload from repo fixtures into the case bin dir."""
+    bin_dir = Path(bin_dir)
+    bin_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    sources = {"exec": ROOT / "tests/fixtures/detailed-nonleader-exec.c",
+               "caller": ROOT / "tests/fixtures/cgroup-trace/caller.c",
+               "ledger": ROOT / "tests/fixtures/public-cli/inventory-ledger.c"}
+    for name, source in sources.items():
+        assert source.is_file(), source
+    jobs = [
+        (["cc", *B_CFLAGS, "-fPIC", "-shared", "-DDETAILED_EXEC_PROVIDER",
+          str(sources["exec"]), "-ldl", "-o", str(bin_dir / "provider.so")], "provider.so"),
+        (["cc", *B_CFLAGS, str(sources["exec"]), "-ldl", "-o", str(bin_dir / "before")], "before"),
+        (["cc", *B_CFLAGS, "-DDETAILED_EXEC_AFTER", str(sources["exec"]), "-ldl",
+          "-o", str(bin_dir / "after")], "after"),
+        (["cc", *CALLER_CFLAGS, str(sources["caller"]), "-ldl", "-lpthread",
+          "-o", str(bin_dir / "caller")], "caller"),
+        (["cc", *LEDGER_CFLAGS, str(sources["ledger"]), "-ldl", "-lpthread",
+          "-o", str(bin_dir / "ledger")], "ledger"),
+    ]
+    for argv, name in jobs:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            raise SetupError(f"fixture build failed for {name}: {proc.stderr[-2000:]}")
+    for name in ("provider.so", "before", "after", "caller", "ledger"):
+        (bin_dir / name).chmod(0o755)
+    pins = {}
+    for name in ("provider.so", "before", "after", "caller", "ledger"):
+        with cleanup_section():
+            pin = FilePin(bin_dir / name)
+            if owned_pins is not None:
+                owned_pins.append(pin)
+            pins[name] = pin
+    return pins
+
+
+def init_token(workload_dir, uid, gid, label):
+    """Create an owned SoftHSM token dir; returns the workload env."""
+    workload_dir = Path(workload_dir)
+    tokens = workload_dir / "tokens"
+    tokens.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chown(workload_dir, uid, gid)
+    os.chown(tokens, uid, gid)
+    config = workload_dir / "softhsm2.conf"
+    config.write_text(f"directories.tokendir = {tokens}\nobjectstore.backend = file\n"
+                      "log.level = ERROR\n")
+    config.chmod(0o644)
+    env = dict(os.environ, SOFTHSM2_CONF=str(config))
+    check_dispatch()
+    proc = subprocess.run(
+        ["softhsm2-util", "--init-token", "--free", "--label", label,
+         "--so-pin", "5678", "--pin", "1234"],
+        env=env, user=uid, group=gid, extra_groups=[], text=True,
+        capture_output=True, timeout=remaining_seconds(30))
+    if proc.returncode != 0:
+        raise SetupError(f"token init failed: {proc.stderr[-1000:]}")
+    return env
+
+
+def build_manifest(discover_pin, module_path, out_path, env, uid, gid):
+    """Run p11scope-discover as the workload user (executes provider code)."""
+    discover_pin.verify()
+    out_path = Path(out_path)
+    if out_path.exists():
+        raise SetupError(f"manifest path already exists: {out_path}")
+    check_dispatch()
+    proc = subprocess.run(
+        [str(discover_pin.path), "--module", str(module_path), "-o", str(out_path)],
+        env=env, user=uid, group=gid, extra_groups=[], text=True,
+        capture_output=True, timeout=remaining_seconds(180))
+    if proc.returncode != 0 or not out_path.is_file():
+        raise SetupError(f"manifest build failed: {proc.stderr[-1000:]}")
+    manifest = json.loads(out_path.read_text())
+    if manifest.get("schema") != "p11scope-manifest/5":
+        raise SetupError(f"manifest schema is not p11scope-manifest/5: "
+                         f"{manifest.get('schema')!r}")
+    if not manifest.get("objects"):
+        raise SetupError("manifest attests no module")
+    return manifest
+
+
+LIVE_PREFIX = "\x1b[2J\x1b[H"
+LIVE_TOTALS = re.compile(r"(\d+) completed calls; (\d+) returned errors; (\d+) entries without an observed return\.")
+LIVE_ROW = re.compile(r"(\S+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(\d+)")
+
+
+def parse_live_frames(text, final=True):
+    """Parse complete public LiveDisplay snapshots, never sum redraws.
+
+    Cursors are character offsets in the captured stream, not rendered wall
+    clocks. A frame commits only at its terminating Evidence line/newline.
+    """
+    if len(text.encode("utf-8")) > 8 * 1024 * 1024:
+        raise ValueError("owned PTY output exceeds bounded byte limit")
+    frames = []
+    offset = 0
+    while offset < len(text):
+        if not text.startswith(LIVE_PREFIX, offset):
+            if not final and LIVE_PREFIX.startswith(text[offset:]):
+                break
+            raise ValueError("malformed public live frame prefix")
+        next_frame = text.find(LIVE_PREFIX, offset + len(LIVE_PREFIX))
+        if next_frame < 0 and not final:
+            partial = text.rfind("\x1b", offset + len(LIVE_PREFIX))
+            if partial >= 0 and LIVE_PREFIX.startswith(text[partial:]):
+                next_frame = partial
+        end = next_frame if next_frame >= 0 else len(text)
+        frame = text[offset + len(LIVE_PREFIX):end].replace("\r\n", "\n")
+        if len(frame.encode("utf-8")) > 65536:
+            raise ValueError("public live frame exceeds bounded size")
+        lines = frame.splitlines(keepends=True)
+        terminated = bool(lines and lines[-1].startswith("Evidence: ") and lines[-1].endswith("\n"))
+        if not terminated:
+            if final or next_frame >= 0:
+                raise ValueError("incomplete public live frame")
+            break
+        if not lines[0].startswith("p11scope — ") or "\x1b" in frame:
+            raise ValueError("malformed public live frame")
+        totals = [LIVE_TOTALS.fullmatch(line.strip()) for line in lines]
+        totals = [match for match in totals if match]
+        headers = [index for index, line in enumerate(lines) if line.startswith("FUNCTION ")]
+        if len(totals) != 1 or len(headers) != 1:
+            raise ValueError("malformed public live summary/table")
+        functions = {}
+        for line in lines[headers[0] + 1:]:
+            if line.startswith("(~ = "):
+                break
+            match = LIVE_ROW.fullmatch(line.strip())
+            if not match:
+                raise ValueError("malformed public live function row")
+            row = dict(zip(("calls", "errors", "in_flight"),
+                           (int(match[2]), int(match[3]), int(match[4]))))
+            if row["errors"] > row["calls"]:
+                raise ValueError("public live slot errors exceed its completed calls")
+            # The producer emits active and retained SlotReports separately.
+            # Match the JSON judge's function-key sums within this frame only.
+            function = functions.setdefault(match[1], {key: 0 for key in row})
+            for key, value in row.items():
+                function[key] += value
+        total = [int(value) for value in totals[0].groups()]
+        if total != [sum(row[field] for row in functions.values())
+                     for field in ("calls", "errors", "in_flight")]:
+            raise ValueError("public live totals disagree with function rows")
+        frames.append({"cursor": end, "start_cursor": offset, "functions": functions,
+                       "totals": total, "evidence_line": lines[-1].strip()})
+        offset = end
+    return frames
+
+
+class PtyCapture:
+    """Own and drain one PTY master; Linux EIO after slave close is EOF."""
+    def __init__(self, master, path):
+        self.master, self.path = master, Path(path)
+        self.budget = ACTIVE_LEG.get()
+        self.lines, self.frames, self.errors = [], [], []
+        self.updates = queue.Queue()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        text = ""
+        total = 0
+        try:
+            with self.path.open("w", encoding="utf-8") as output:
+                while not self.stop.is_set():
+                    if not select.select([self.master], [], [], transport_poll_seconds(self))[0]:
+                        continue
+                    try:
+                        chunk = os.read(self.master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    piece = decoder.decode(chunk)
+                    total += len(chunk)
+                    if total > 8 * 1024 * 1024 and not self.errors:
+                        self.errors.append("owned PTY output exceeds bounded byte limit")
+                    if not self.errors:
+                        output.write(piece)
+                        output.flush()
+                        text += piece
+                        try:
+                            self.frames = parse_live_frames(text, final=False)
+                            self.lines = [text]
+                        except ValueError as error:
+                            self.errors.append(str(error))
+                    self.updates.put(None)
+                decoder.decode(b"", final=True)
+                if not self.errors:
+                    self.frames = parse_live_frames(text, final=True)
+        except (ValueError, UnicodeError, OSError, TimeoutError) as error:
+            self.errors.append(str(error))
+        finally:
+            os.close(self.master)
+            self.master = None
+            self.updates.put(None)
+
+    def finish(self, timeout=5):
+        try:
+            self.thread.join(remaining_seconds(timeout))
+        except TimeoutError:
+            self.errors.append("owned PTY deadline exhausted before reader cancellation")
+            self.stop.set()
+            self.thread.join(0)
+            raise
+        if self.thread.is_alive():
+            self.errors.append("owned PTY reader did not reach EOF")
+            self.stop.set()
+            self.thread.join(remaining_seconds(1))
+            raise TimeoutError("owned PTY reader did not reach EOF")
+        if self.errors:
+            raise ValueError("; ".join(self.errors))
+
+
+def _output_wait(capture, predicate, deadline_ns):
+    while True:
+        remaining = remaining_until(deadline_ns)
+        if capture.errors:
+            raise SetupError("; ".join(capture.errors))
+        result = predicate()
+        if result is not None:
+            remaining_until(deadline_ns)
+            return result
+        if not capture.thread.is_alive():
+            raise EOFError("observer stream ended before successor public proof")
+        try:
+            capture.updates.get(timeout=min(remaining, 0.2))
+        except queue.Empty:
+            pass
+
+
+def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
+                   max_attempts=20, timeout=15, output_cursor=None, initial=False):
+    """Bound real single-call attempts and require this observer's fresh proof.
+
+    attempt(seq, remaining_seconds) returns a distinct independently ledgered
+    phase. All calls/attempts remain in that ledger, including dark attempts.
+    Initial setup attempts also receive the absolute deadline, so held-object
+    preparation cannot authorize a later dispatch with an old relative wait.
+    """
+    if mode not in ("trace", "profile", "metrics") or not 1 <= max_attempts <= 40 or not 0 < timeout <= 20:
+        raise ValueError("invalid successor warm-up budget")
+    started = monotonic_ns()
+    initial_budget = ACTIVE_LEG.get() if initial else None
+    if initial:
+        if (initial_budget is None or initial_budget.phase != "setup" or image["image"] != 0
+                or mode != "trace" or max_attempts != 20 or timeout != 15):
+            raise ValueError("initial readiness requires the existing setup and fixed 20/15 bound")
+    else:
+        enter_phase("successor-recovery", key=image["image"])
+    deadline = min(wait_deadline(timeout), started + int(timeout * 1_000_000_000))
+    baseline = None
+    if mode == "trace":
+        cursor = len(capture.lines) if output_cursor is None else output_cursor
+    else:
+        baseline = _output_wait(capture, lambda: capture.frames[-1] if capture.frames else None, deadline)
+        cursor = baseline["cursor"]
+    phases = []
+    for seq in range(1, max_attempts + 1):
+        remaining = remaining_until(deadline)
+        phases.append(attempt(seq, remaining, deadline) if initial else attempt(seq, remaining))
+        remaining_until(deadline)
+        # Share the remaining absolute time across the real attempts still
+        # available. Preparation and ACK waits consume that same budget.
+        now = monotonic_ns()
+        attempt_deadline = min(deadline, now + (deadline - now) // (max_attempts - seq + 1))
+        def fresh_proof():
+            if mode == "trace":
+                for index in range(cursor, len(capture.lines)):
+                    match = ROW.fullmatch(capture.lines[index].strip())
+                    if (match and int(match["pid"]) == image["pid"]
+                            and (not initial or int(match["tid"]) == image["pid"])
+                            and match["fn"] == marker_fn and match["rv"] == "CKR_OK" and match["path"]
+                            and json.loads(match["path"]) == image["path"]
+                            and json.loads(match["label"]) == Path(image["path"]).name):
+                        return {"proof_cursor": index + 1}
+            else:
+                before = baseline["functions"].get(marker_fn, {}).get("calls", 0)
+                for frame in capture.frames:
+                    if (frame["start_cursor"] >= cursor
+                            and frame["functions"].get(marker_fn, {}).get("calls", 0) > before):
+                        return {"proof_cursor": frame["cursor"], "baseline": baseline,
+                                "snapshot": frame}
+            return None
+        try:
+            proof = _output_wait(capture, fresh_proof, attempt_deadline)
+        except TimeoutError:
+            continue
+        return {"image": image["image"], "started_ns": started, "observed_ns": monotonic_ns(),
+                "deadline_ns": deadline, "attempts": seq, "max_attempts": max_attempts,
+                "output_cursor": cursor, "proof_kind": "trace-row" if mode == "trace" else "live-counter",
+                "marker_fn": marker_fn, "phases": phases, **proof,
+                **({"budget_phase": "setup", "setup_deadline_ns": initial_budget.phase_deadline_ns,
+                    "leg_deadline_ns": initial_budget.deadline_ns} if initial else {})}
+    raise TimeoutError("successor warm-up attempt budget exhausted")
+
+
+def warm_caller(capture, caller, stdout, image, phases, mode="trace", group=None, output_cursor=None,
+                marker_fn="C_GetInfo"):
+    def attempt(seq, remaining):
+        phase = f"successor-{image['image']}-{seq}"
+        n3_command(caller, stdout, marker_fn, 1, 0, phase, "selected",
+                   image["image"], group, phases, acknowledgement_seconds=remaining)
+        return phase
+    return warm_successor(capture, image, attempt, mode, marker_fn=marker_fn, output_cursor=output_cursor)
+
+
+def warm_initial_caller(ctx, capture, caller, stdout, image, image_pin, provider_pin, phases):
+    """One independently held image/provider; no successor budget or old context."""
+    provider = None
+
+    def verify():
+        nonlocal provider
+        if (caller not in ctx.owners or caller.pidfd is None or caller.popen is None
+                or caller.popen.pid != caller.pid):
+            raise SetupError("initial caller lacks its enrolled original owner")
+        caller.verify()
+        image_pin.verify()
+        actual = image_pin.image_receipt(image, caller)
+        if any(actual[field] != image[field] for field in IMAGE_FIELDS):
+            raise SetupError("initial caller image changed from its independently held receipt")
+        current = provider_receipt(provider_pin)
+        if provider is not None and provider != current:
+            raise SetupError("initial held provider changed during readiness")
+        provider = current
+        targets = [row for row in stdout.records if row.get("kind") == "target"
+                   and row.get("image") == 0 and row.get("fn") == "C_GetInfo"]
+        if (len(targets) != 1 or targets[0]["dev"] != provider["dev"] or targets[0]["ino"] != provider["ino"]
+                or targets[0]["file_offset"] < 0 or targets[0].get("vaddr", 0) <= 0):
+            raise SetupError("initial marker lacks its independent held provider target")
+        with open(f"/proc/{caller.pid}/maps", encoding="utf-8") as stream:
+            text = stream.read(MAPPED_PROVIDER["MAX_MAPS_BYTES"] + 1)
+        if len(text) > MAPPED_PROVIDER["MAX_MAPS_BYTES"]:
+            raise SetupError("initial provider maps exceed the bounded limit")
+        mapped = False
+        for line in text.splitlines():
+            row = MAPPED_PROVIDER["MAPS_LINE"].fullmatch(line)
+            if row is None:
+                raise SetupError("malformed initial caller maps")
+            low, high = int(row[1], 16), int(row[2], 16)
+            target = targets[0]
+            if ("x" in row[3] and low <= target["vaddr"] < high
+                    and [int(row[5], 16), int(row[6], 16)] == provider["dev"]
+                    and int(row[7]) == provider["ino"]
+                    and target["vaddr"] - low + int(row[4], 16) == target["file_offset"]):
+                mapped = True
+        if not mapped:
+            raise SetupError("initial marker is not mapped from the independently held provider")
+        caller.verify()
+
+    def attempt(seq, _remaining, deadline):
+        verify()
+        phase = f"initial-0-{seq}"
+        n3_command(caller, stdout, "C_GetInfo", 1, 0, phase, "selected", 0, None, phases,
+                   acknowledgement_seconds=remaining_until(deadline))
+        verify()
+        return phase
+
+    proof = warm_successor(capture, image, attempt, initial=True)
+    verify()
+    remaining_until(proof["deadline_ns"])
+    if proof["observed_ns"] > proof["deadline_ns"]:
+        raise TimeoutError("initial public proof completed after its absolute deadline")
+    proof.update(pid=caller.pid, provider={key: provider[key] for key in ("path", "dev", "ino", "sha256")})
+    return proof
+
+
+def drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, phases, group=None):
+    cursor = len(capture.lines)
+    n3_command(caller, stdout, fn, count, delay, phase, "selected", image, group, phases)
+    deadline = wait_deadline(10)
+    def population():
+        matched = [match for line in capture.lines[cursor:]
+                   if (match := ROW.fullmatch(line.strip())) and int(match["pid"]) == caller.pid
+                   and match["fn"] == fn]
+        return len(matched) if len(matched) >= count else None
+    _output_wait(capture, population, deadline)
+    phases[-1].update(output_cursor=cursor, output_end=len(capture.lines))
+
+
+def wait_cgroup_trace_population(capture, image, fn, count, cursor, *, named):
+    """Drain an existing fixed population, without adding a call or phase budget."""
+    deadline = wait_deadline(10)
+    def population():
+        rows = [match for line in capture.lines[cursor:] if (match := ROW.fullmatch(line.strip()))
+                and int(match["pid"]) == image["pid"] and match["fn"] == fn]
+        if len(rows) < count:
+            return None
+        if len(rows) != count or any(int(row["tid"]) != image["pid"] or row["rv"] != "CKR_OK"
+                or (not row["path"] and named) or row["path"] and
+                (json.loads(row["path"]) != image["path"]
+                 or json.loads(row["label"]) != Path(image["path"]).name) for row in rows):
+            raise SetupError("cgroup fixed public population disagrees with its owned image/count")
+        return {"output_cursor": cursor, "output_end": len(capture.lines), "observed_ns": monotonic_ns()}
+    return _output_wait(capture, population, deadline)
+
+
+def warmup_receipt(phases, measured_t0):
+    early = [phase for phase in phases if phase["t1"] <= measured_t0]
+    return {"label": "early including successor attempts", "t0": min(phase["t0"] for phase in early),
+            "t1": max(phase["t1"] for phase in early), "expected_calls": sum(phase["count"] for phase in early),
+            "phases": [phase["phase"] for phase in early]}
+
+
+def spawn_observer(owners, readers, leg_dir, argv, env, live=False):
+    """Spawn an observer; returns (owned, capture, errors, started_ns)."""
+    started = monotonic_ns()
+    if live:
+        with cleanup_section():
+            master, slave = pty.openpty()
+            before = len(readers)
+            try:
+                capture = owned_reader(readers, PtyCapture, master, Path(leg_dir) / "observer.stdout.txt")
+                owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
+                                    stdout=slave, stderr=subprocess.PIPE,
+                                    text=True, env=env, start_new_session=True)
+            except BaseException:
+                if len(readers) == before:
+                    os.close(master)
+                raise
+            finally:
+                os.close(slave)
+    else:
+        owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, start_new_session=True)
+        capture = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / "observer.stdout.txt")
+    errors = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / "observer.stderr.txt")
+    return owned, capture, errors, started
+
+
+REFUSAL_MARKERS = re.compile(
+    r"refus|not supported|unsupported|requires .* kernel|EOPNOTSUPP|ENOSYS|"
+    r"backend .* unavailable|no .* backend", re.IGNORECASE)
+
+
+def observer_ready(owned, errors, backend, timeout=20, allow_empty=False):
+    """Wait for capturing; raises BackendRefused or SetupError."""
+    try:
+        wait_capture_started(errors, allow_empty=allow_empty, seconds=timeout)
+        return monotonic_ns()
+    except (TimeoutError, ValueError):
+        pass
+    rc = owned.popen.poll()
+    tail = "".join(errors.lines[-20:])
+    if rc is not None and rc != 0 and REFUSAL_MARKERS.search(tail):
+        raise BackendRefused(f"{backend}: {tail.strip()[-500:]}")
+    raise SetupError(f"observer never reached capturing (rc={rc}): {tail[-1000:]}")
+
+
+def stop_observer(owned, limit_seconds=OBSERVER_STOP_SECONDS):
+    """One declared normal-stop limit; forced cleanup can never pass."""
+    enter_phase("normal-stop")
+    begin = monotonic_ns()
+    deadline = wait_deadline(limit_seconds)
+    check_dispatch()
+    owned.send(signal.SIGINT)
+    forced, cleanup_latency = False, 0
+    try:
+        rc = wait_process(owned.popen, remaining_until(deadline))
+        normal_end = monotonic_ns()
+        forced = normal_end > deadline
+    except (subprocess.TimeoutExpired, TimeoutError):
+        forced = True
+        normal_end = monotonic_ns()
+    if forced:
+        enter_phase("cleanup")
+        cleanup_started = monotonic_ns()
+        owned.send(signal.SIGKILL)
+        rc = wait_process(owned.popen, CLEANUP_SECONDS)
+        cleanup_latency = (monotonic_ns() - cleanup_started) / 1e9
+    stopped = monotonic_ns()
+    latency = (normal_end - begin) / 1e9
+    owned.stop_receipt = {"stop_limit_seconds": limit_seconds, "stop_latency_seconds": latency,
+                          "forced_cleanup": forced, "cleanup_limit_seconds": CLEANUP_SECONDS,
+                          "cleanup_latency_seconds": cleanup_latency}
+    return rc, stopped, latency
+
+
+def spawn_caller(owners, readers, leg_dir, caller_pin, provider_pin, uid, gid, env,
+                 tag="caller", prefix=(), load_deadline_ns=None):
+    """Spawn the interactive SoftHSM caller; returns (owned, stdout, stderr)."""
+    argv = [*prefix, str(caller_pin.path), str(provider_pin.path), "0", "selected",
+            "--canary", CANARIES[2]]
+    if load_deadline_ns is not None:
+        argv += ["--h6-load-deadline", str(load_deadline_ns)]
+    owned = spawn_owned(
+        owners, argv, uid,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, user=uid, group=gid, extra_groups=[],
+        start_new_session=True)
+    stdout = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / f"{tag}.ledger.jsonl")
+    stderr = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / f"{tag}.stderr.txt")
+    return owned, stdout, stderr
+
+
+def initial_exec_cleanup_section(ctx):
+    """Charge the primitive's internal mandatory reap to the same five seconds."""
+    setup = True
+    @contextmanager
+    def section():
+        nonlocal setup
+        creating, setup = setup, False
+        with cleanup_section():
+            expired = None
+            if not creating:
+                try:
+                    ctx.budget.enter("cleanup")
+                except TimeoutError as error:
+                    expired = error
+            try:
+                yield  # An expired cleanup budget must still perform its mandatory reap.
+            finally:
+                if not creating:
+                    try:
+                        ctx.budget.remaining()
+                    except TimeoutError as error:
+                        expired = error
+                    if expired is not None:
+                        raise LegCleanupError(f"initial exec cleanup exceeded its unchanged five-second/leg limit: {expired}")
+    return section
+
+
+def spawn_initial_caller(ctx, leg_dir, caller_pin, provider_pin, env, deadline_ns, setarch_pin):
+    """Fork before readers, reserve tracer custody, then hold the real caller exec."""
+    argv = [str(caller_pin.path), str(provider_pin.path), "0", "selected",
+            "--canary", CANARIES[2], "--h6-load-deadline", str(deadline_ns)]
+    with cleanup_section():
+        caller = spawn_initial_exec(ctx.owners, argv, caller_pin=caller_pin, setarch_pin=setarch_pin,
+            uid=ctx.args.uid, gid=ctx.args.gid, env=env, deadline_ns=deadline_ns,
+            cleanup_section=initial_exec_cleanup_section(ctx))
+        try:
+            ctx.traced.append(caller)  # before acquisition or any stopped-image postcheck
+        except BaseException:
+            caller.close()
+            raise
+        held = caller.hold_caller_exec()
+        stopped = monotonic_ns()
+    stdout = owned_reader(ctx.readers, Reader, caller.popen.stdout, Path(leg_dir) / "caller.ledger.jsonl")
+    stderr = owned_reader(ctx.readers, Reader, caller.popen.stderr, Path(leg_dir) / "caller.stderr.txt")
+    return caller, stdout, stderr, {"held": dict(held), "stopped_ns": stopped,
+                                  "deadline_ns": deadline_ns, "control": "kernel-exec-stop"}
+
+
+LOADER_READY_LINE = re.compile(r"p11scope: loader readiness: (0|[1-9][0-9]{0,19}) active hook\(s\)")
+CAPTURE_READY_LINE = re.compile(r"p11scope: capturing: (0|[1-9][0-9]{0,19}) probe\(s\) attached; stop with Ctrl-C")
+
+
+def loader_ready_lines(lines):
+    loader = [(index, LOADER_READY_LINE.fullmatch(line.rstrip("\n")))
+              for index, line in enumerate(lines) if line.startswith("p11scope: loader readiness:")]
+    if len(loader) > 1 or any(match is None or match[1] != "1" for _index, match in loader):
+        raise SetupError("owned initial exec requires exactly one active loader hook readiness line")
+    capturing = [index for index, line in enumerate(lines) if CAPTURE_READY_LINE.fullmatch(line.rstrip("\n"))]
+    if capturing and (len(capturing) != 1 or not loader or capturing[0] != loader[0][0] + 1):
+        raise SetupError("owned initial exec loader readiness must immediately precede loop start")
+    return bool(loader), bool(capturing)
+
+
+def observer_initial_exec_ready(owned, errors, backend, caller, proof, argv):
+    """One actual PID hook plus loop-start text, only while this caller is held."""
+    deadline = proof["deadline_ns"]
+    if not caller.held or not caller.traced or owned.popen.args != argv or argv.count("--pid") != 1 or (
+            argv[argv.index("--pid") + 1] != str(caller.pid)):
+        raise SetupError("loader readiness is not bound to the owned held PID")
+    caller.verify()
+    owned.verify()
+    hook_ready = None
+    def ready():
+        nonlocal hook_ready
+        loader, capturing = loader_ready_lines(errors.lines)
+        if loader and hook_ready is None:
+            hook_ready = monotonic_ns()
+        if capturing:
+            loop_ready = monotonic_ns()
+            if not proof["stopped_ns"] < hook_ready <= loop_ready <= deadline:
+                raise SetupError("initial exec readiness clock order is invalid")
+            return {"active_loader_hooks": 1, "hook_ready_ns": hook_ready, "loop_ready_ns": loop_ready}
+    try:
+        result = _output_wait(errors, ready, deadline)
+    except (EOFError, TimeoutError):
+        rc = owned.popen.poll()  # the normal observer is never the traced caller
+        tail = "".join(errors.lines[-20:])
+        if rc is not None and rc != 0 and REFUSAL_MARKERS.search(tail):
+            raise BackendRefused(f"{backend}: {tail.strip()[-500:]}")
+        raise
+    caller.verify()
+    remaining_until(deadline)
+    return result
+
+
+def release_initial_exec_load(ctx, caller, stdout, caller_pin, provider_pin, proof):
+    """Detach, bind every real image field, then release the existing load0 latch."""
+    deadline = proof["deadline_ns"]
+    remaining_until(deadline)
+    caller_pin.verify()
+    provider_pin.verify()
+    if not 0 < proof["stopped_ns"] < proof["hook_ready_ns"] <= proof["loop_ready_ns"] <= monotonic_ns() <= deadline:
+        raise SetupError("initial exec readiness clock order is invalid before detach")
+    info = os.fstat(caller_pin.fd)
+    file_proof = dict(dev=info.st_dev, ino=info.st_ino, size=info.st_size,
+                      mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
+    if any(proof["held"].get(field) != value for field, value in file_proof.items()):
+        raise SetupError("held initial exec file metadata differs from the independent pin")
+    with cleanup_section():
+        try:
+            detached = caller.resume_detach()
+        finally:
+            if caller.detached or caller.reaped:
+                ctx.traced.remove(caller)
+    proof.update(detached)
+    ready_ns = proof["loop_ready_ns"]
+    if not (0 < proof["stopped_ns"] < proof["hook_ready_ns"] <= ready_ns <= proof["detach_entry_ns"]
+            <= proof["detach_return_ns"] <= monotonic_ns() <= deadline):
+        raise SetupError("initial exec detach/readiness clock order is invalid")
+    record = stdout.record("image", 0, seconds=min(10, remaining_until(deadline)))
+    image = caller_pin.image_receipt(record, caller)
+    held = {"image": 0, **proof["held"]}
+    if any(type(record.get(field)) is not type(held.get(field))
+           or record.get(field) != held.get(field) or image.get(field) != held.get(field)
+           for field in IMAGE_FIELDS):
+        raise SetupError("real initial image ledger differs from the held exec/file proof")
+    waiting = stdout.record("ack", 0, "load-wait", seconds=min(10, remaining_until(deadline)))
+    now = monotonic_ns()
+    if not proof["detach_entry_ns"] <= record["t"] <= waiting["t"] <= now < deadline:
+        raise SetupError("initial exec load-wait clock order is invalid")
+    caller.verify()
+    caller_pin.verify()
+    provider_pin.verify()
+    remaining_until(deadline)
+    released = monotonic_ns()
+    if not waiting["t"] < released <= deadline:
+        raise SetupError("initial exec load release clock order is invalid")
+    caller.popen.stdin.write("load 0\n")
+    caller.popen.stdin.flush()
+    ready = stdout.record("ready", 0, seconds=min(10, remaining_until(deadline)))
+    if not released <= ready["t"] <= deadline:
+        raise SetupError("initial exec provider-ready clock order is invalid")
+    remaining_until(deadline)
+    if any(value != image[field] for field, value in caller_pin.image_receipt(record, caller).items()
+           if field in IMAGE_FIELDS):
+        raise SetupError("initial image changed across provider load")
+    return image, {"deadline_ns": deadline, "waiting_ns": waiting["t"],
+                   "released_ns": released, "ready_ns": ready["t"]}
+
+
+def release_initial_load(caller, stdout, caller_pin, provider_pin, ready_ns, deadline_ns):
+    """Release only an owned initial image after public loop-start evidence."""
+    if not isinstance(ready_ns, int) or not 0 < ready_ns <= monotonic_ns():
+        raise SetupError("initial provider load lacks observer loop-start readiness")
+    remaining_until(deadline_ns)
+    caller_pin.verify()
+    provider_pin.verify()
+    caller_pin.image_receipt(stdout.record("image", 0), caller)
+    waiting = stdout.record("ack", 0, "load-wait")
+    if not waiting["t"] <= ready_ns:
+        raise SetupError("initial provider load wait did not precede observer readiness")
+    caller.verify()
+    remaining_until(deadline_ns)
+    released_ns = monotonic_ns()
+    caller.popen.stdin.write("load 0\n")
+    caller.popen.stdin.flush()
+    ready = stdout.record("ready", 0, seconds=min(10, remaining_until(deadline_ns)))
+    remaining_until(deadline_ns)
+    caller_pin.image_receipt(stdout.record("image", 0), caller)
+    return {"deadline_ns": deadline_ns, "released_ns": released_ns, "ready_ns": ready["t"]}
+
+
+def caller_exec(caller, stdout, images, method, target_pin):
+    """Drive one caller exec/thread-exec; returns (request, receipt, t0, t1)."""
+    if method not in ("exec", "thread-exec"):
+        raise SetupError(f"unknown exec method {method}")
+    enter_phase("successor-recovery", key=len(images))
+    check_dispatch()
+    caller.verify()
+    t0 = monotonic_ns()
+    caller.popen.stdin.write(f"{method} {target_pin.path}\n")
+    caller.popen.stdin.flush()
+    image_index = len(images)
+    stdout.record("ready", image_index)
+    record = stdout.record("image", image_index)
+    receipt = target_pin.image_receipt(record, caller)
+    images.append(receipt)
+    # The exec record carries the FROM image; the default image=0 would
+    # return the first transition's record forever on multi-exec chains.
+    request = stdout.record("exec", image_index - 1)
+    want_mode = "leader" if method == "exec" else "nonleader"
+    if request["path"] != str(target_pin.path) or request["mode"] != want_mode:
+        raise SetupError(f"exec record disagrees with the driven transition: "
+                         f"{request.get('path')} {request.get('mode')}")
+    return request, receipt, t0, monotonic_ns()
+
+
+def stop_caller(caller, stdout, image, timeout=10):
+    enter_phase("cleanup")
+    check_dispatch()
+    caller.verify()
+    caller.popen.stdin.write("stop\n")
+    caller.popen.stdin.flush()
+    stdout.record("ack", image, "done", seconds=timeout)
+    return wait_process(caller.popen, timeout)
+
+
+def spawn_ledger(owners, readers, leg_dir, argv, env, uid, gid, tag):
+    """Spawn an inventory-ledger cell; returns (owned, stdout, stderr)."""
+    owned = spawn_owned(
+        owners, argv, uid, stdin=subprocess.PIPE if "--h6-control" in argv else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=env, user=uid, group=gid,
+        extra_groups=[], start_new_session=True)
+    stdout = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / f"{tag}.out")
+    stderr = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / f"{tag}.err")
+    return owned, stdout, stderr
+
+
+def inventory_phase_deadline(phase, image=0):
+    enter_phase(phase, image if phase == "successor-recovery" else 0)
+    if budget := ACTIVE_LEG.get():
+        return min(budget.phase_deadline_ns, budget.deadline_ns)
+    return wait_deadline({"setup": 330, "successor-recovery": 90,
+                          "fixed-measurement": 180, "normal-stop": 30, "cleanup": 5}[phase])
+
+
+def inventory_control_args():
+    setup = inventory_phase_deadline("setup")
+    budget = ACTIVE_LEG.get()
+    leg = budget.deadline_ns if budget else setup + 365_000_000_000
+    return ["--h6-control", "--h6-deadline", str(setup), "--h6-leg-deadline", str(leg)]
+
+
+class InventoryController:
+    """Generation-bound commands to an owned, independently ledgered child."""
+    def __init__(self, owner, reader, executable):
+        self.owner, self.reader, self.executable = owner, reader, executable
+        self.image, self.sequence, self.attempts = 0, 0, 0
+        self.batch_cursor = 0
+
+    def ledger(self):
+        parsed = parse_inv_ledger("".join(self.reader.lines))
+        if parsed["strange"] or parsed["unflushed"] or any(
+                row["status"] != "ok" for row in parsed["dones"]):
+            raise SetupError("H6 controlled child has invalid or failed ledger records")
+        return parsed
+
+    def verify(self):
+        self.executable.verify()
+        return self.executable.image_receipt({"image": self.image}, self.owner)
+
+    def ready(self, deadline, *, image=None, executable=None):
+        if image is not None:
+            self.image, self.sequence, self.attempts = image, 0, 0
+            self.executable = executable
+        self.reader.wait(lambda _r: any(row["gen"] == self.image
+                         for row in self.ledger()["controls"]), remaining_until(deadline))
+        rows = [row for row in self.ledger()["controls"] if row["gen"] == self.image]
+        actual = self.verify()
+        if len(rows) != 1 or any(rows[0][key] != value for key, value in {
+                "pid": self.owner.pid, "start": actual["start_time"], "exe": actual["path"],
+                "seq": 0}.items()) or not 0 < rows[0]["t"] < rows[0]["deadline"]:
+            raise SetupError("H6 ready acknowledgment differs from the owned image")
+        remaining_until(deadline)
+        return rows[0]
+
+    def dispatch(self, command, deadline, attempt=0, *, proof_deadline=None):
+        remaining_until(deadline)
+        actual = self.verify()
+        if proof_deadline is not None:
+            remaining_until(proof_deadline)
+        remaining_until(deadline)
+        lower = monotonic_ns()
+        self.sequence += 1
+        self.owner.popen.stdin.write(
+            f"{command} {self.image} {self.sequence} {lower} {deadline} {attempt}\n")
+        self.owner.popen.stdin.flush()
+        return {"command": command, "deadline": deadline, "attempt": attempt,
+                "lower": lower, "image": actual}
+
+    def complete(self, pending):
+        command, deadline, attempt, lower, actual = (pending[key] for key in
+            ("command", "deadline", "attempt", "lower", "image"))
+        self.reader.wait(lambda _r: any(row["gen"] == self.image and row["seq"] == self.sequence
+                         for row in self.ledger()["acks"]), remaining_until(deadline))
+        parsed = self.ledger()
+        rows = [row for row in parsed["acks"] if row["gen"] == self.image and row["seq"] == self.sequence]
+        want = {"command": command, "pid": self.owner.pid, "start": actual["start_time"],
+                "gen": self.image, "exe": actual["path"], "attempt": attempt,
+                "deadline": deadline, "idle": 1, "rv": 0xc0 if command == "M" else 0}
+        if len(rows) != 1 or any(rows[0][key] != value for key, value in want.items()) or not (
+                lower <= rows[0]["t0"] <= rows[0]["t1"] < deadline):
+            raise SetupError("H6 command acknowledgment differs from its bounded dispatch")
+        batches = parsed["batches"][self.batch_cursor:]
+        self.batch_cursor = len(parsed["batches"])
+        if any(row["gen"] != self.image or row["pid"] != self.owner.pid
+               or row["start"] != actual["start_time"] or row["exe"] != actual["path"]
+               or not rows[0]["t0"] <= row["t0"] <= row["t1"] <= rows[0]["t1"] for row in batches):
+            raise SetupError("H6 phase ledger escaped its command/image bounds")
+        remaining_until(deadline)
+        if command == "W":
+            self.attempts = attempt
+        return {"ack": rows[0], "batches": batches, "dispatch_ns": lower}
+
+    def command(self, command, deadline, attempt=0, *, proof_deadline=None):
+        return self.complete(self.dispatch(command, deadline, attempt, proof_deadline=proof_deadline))
+
+    def warm(self, attempt, deadline):
+        return self.command("W", deadline, attempt)
+
+
+def wait_usage_armed(jsonl_path, wants, timeout=90):
+    """Wait until every wanted (pid, exe, modules) edge reads armed/counted.
+
+    wants: list of (pid, exe_path, module_count). Matches caller ids via
+    admitted caller_event identity, then edge_observed coverage states.
+    Returns the arming evidence; raises SetupError on timeout.
+    """
+    deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        try:
+            text = Path(jsonl_path).read_text()
+        except FileNotFoundError:
+            text = ""
+        ids: dict = {}
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("kind") != "caller_event":
+                continue
+            event = record.get("event", {})
+            if event.get("event") != "admitted":
+                continue
+            caller = ((event.get("identity_context") or {}).get("caller") or {})
+            for pid, exe, _ in wants:
+                if caller.get("pid") == pid and (
+                        caller.get("executable") or {}).get("path") == exe:
+                    ids.setdefault((pid, exe), set()).add(event.get("caller"))
+        armed: dict = {}
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("kind") != "edge_observed":
+                continue
+            event = record.get("event", {})
+            coverage = (event.get("entries") or {}).get("coverage", {}) or {}
+            if coverage.get("state") not in ("watched_no_use", "counted"):
+                continue
+            for pid, exe, _ in wants:
+                if event.get("caller") in ids.get((pid, exe), set()):
+                    armed.setdefault((pid, exe), set()).add(event.get("module"))
+        missing = [(pid, exe) for pid, exe, count in wants
+                   if len(armed.get((pid, exe), set())) < count]
+        if not missing:
+            return {f"{pid} {exe}": sorted(modules) for (pid, exe), modules in armed.items()}
+        if monotonic_ns() >= deadline:
+            raise SetupError(f"usage never armed for {missing}")
+        pause_until(deadline, 0.5)
+
+
+# ---------------------------------------------------------------------------
+# H6 harness: cells
+# ---------------------------------------------------------------------------
+
+MAPPED_PROVIDER = runpy.run_path(str(ROOT / "scripts/mapped-provider-pin.py"))
+PIN_FD = MAPPED_PROVIDER["pin_fd"]
+FILE_IDENTITY = MAPPED_PROVIDER["file_identity"]
+
+
+def provider_receipt(pin):
+    pin.verify()
+    cached = getattr(pin, "_h6_provider_receipt", None)
+    if cached is None:
+        # The helper independently obtains the maps-domain device by mapping
+        # this original held FD. Callers calibrate before starting the observer
+        # where possible; later receipts must not remap its watched provider.
+        mapped = PIN_FD(pin.fd)
+        pin.verify()
+        if (mapped["sha256"] != pin.digest
+                or mapped["file_identity"] != FILE_IDENTITY(pin.initial)):
+            raise ValueError("held provider mapping calibration changed")
+        cached = (pin.fd, dict(mapped, path=str(pin.path)))
+        pin._h6_provider_receipt = cached
+    elif pin.fd != cached[0]:
+        raise ValueError("held provider descriptor changed")
+    # FilePin.verify rechecks the original FD metadata and complete hash on
+    # every call. The nested mapping arrays must not escape cache ownership.
+    return copy.deepcopy(cached[1])
+
+
+def inventory_manifest_hooks(manifest, pin):
+    """Calibrate selected table hooks and the ledger's dlsym getter on one held FD."""
+    provider = provider_receipt(pin)
+    if not isinstance(manifest, dict) or manifest.get("schema") != "p11scope-manifest/5":
+        raise SetupError("Inventory physical hooks lack the selected manifest")
+    objects = [row for row in manifest.get("objects", []) if row.get("path") == provider["path"]]
+    provenance = [row for row in manifest.get("provenance_objects", []) if row.get("path") == provider["path"]]
+    if (len(objects) != 1 or len(provenance) != 1
+            or type(objects[0].get("id")) is not int
+            or any((row.get("identity") or {}).get("sha256") != provider["sha256"]
+                   for row in objects + provenance)
+            or [provenance[0].get("device_major"), provenance[0].get("device_minor")] != provider["dev"]
+            or provenance[0].get("inode") != provider["ino"]):
+        raise SetupError("Inventory manifest hooks disagree with the held provider identity")
+    functions = {}
+    for surface in manifest.get("surfaces", []):
+        if (surface.get("acquisition") or {}).get("status") != "ok":
+            continue
+        for row in surface.get("functions", []):
+            name, resolution = row.get("name"), row.get("resolution") or {}
+            belongs = (resolution.get("status") == "resolved"
+                       and type(resolution.get("object")) is int and resolution["object"] == objects[0]["id"]
+                       and type(resolution.get("file_offset")) is int and resolution["file_offset"] >= 0)
+            if name == "C_GetFunctionList" and not belongs:
+                raise SetupError("Inventory getter lacks a resolved hook on the held provider")
+            if not belongs:
+                continue
+            if not isinstance(name, str) or not name.startswith("C_") or (
+                    name in functions and functions[name] != resolution["file_offset"]):
+                raise SetupError("Inventory manifest physical functions are invalid or ambiguous")
+            functions[name] = resolution["file_offset"]
+    getter = functions.get("C_GetFunctionList")
+    if getter is None:
+        raise SetupError("Inventory manifest has no selected getter hook")
+    # Reuse the existing ELF reader through the held descriptor. This never
+    # dlopens provider code or reopens the provider by its pathname.
+    reader = runpy.run_path(str(ROOT / "scripts/check-live-discovery-evidence.py"))["elf_facts"]
+    try:
+        elf = reader(f"/proc/self/fd/{pin.fd}", ("C_GetFunctionList",))
+    except (RuntimeError, ValueError) as error:
+        raise SetupError("Inventory getter export cannot be calibrated from the held ELF") from error
+    if (elf["sha256"] != provider["sha256"]
+            or elf["symbols"]["C_GetFunctionList"]["file_offset"] != getter
+            or provider_receipt(pin) != provider):
+        raise SetupError("Inventory selected getter hook differs from its held ELF export")
+    return {provider["path"]: {"provider": provider, "functions": functions,
+                               "getter_export_offset": getter}}
+
+
+def inventory_physical_batch(batch, physical_hooks=None):
+    """Keep legacy getter exclusion unless its actual physical hook is proved."""
+    hooks = (physical_hooks or {}).get(batch["module"])
+    if hooks is None:
+        return batch["fn"] != "C_GetFunctionList"
+    if (hooks["provider"]["path"] != batch["module"]
+            or batch["fn"] not in hooks["functions"]):
+        raise SetupError("Inventory ledger function lacks selected physical hook membership")
+    if batch["fn"] == "C_GetFunctionList":
+        return (type(hooks.get("getter_export_offset")) is int
+                and hooks["getter_export_offset"] == hooks["functions"][batch["fn"]])
+    return True
+
+
+def session_reuse_from(ledger):
+    by_image = {}
+    for row in ledger:
+        if row.get("kind") == "call" and row.get("fn") == "C_OpenSession" \
+                and row.get("phase") == "setup":
+            by_image[row["image"]] = row.get("sess", 0)
+    gens = sorted(by_image)
+    if len(gens) < 2:
+        return {"observed": False, "gens": gens}
+    pre, post = by_image[gens[0]], by_image[gens[-1]]
+    return {"observed": bool(pre and pre == post), "pre": pre, "post": post,
+            "gens": gens, "all": [by_image[gen] for gen in gens]}
+
+
+def va_reuse_from(ledger):
+    by_image_fn = defaultdict(list)
+    for row in ledger:
+        if row.get("kind") == "target":
+            by_image_fn[row["image"]].append(row)
+    matches, valid = [], set(by_image_fn) == {0, 1}
+    for rows in by_image_fn.values():
+        valid &= len(rows) == 9 and {row["fn"] for row in rows} == set(VA_REUSE_TARGETS)
+    if valid:
+        before = {row["fn"]: row for row in by_image_fn[0]}
+        after = {row["fn"]: row for row in by_image_fn[1]}
+        fields = ("dev", "ino", "file_offset", "vaddr")
+        for fn in VA_REUSE_TARGETS:
+            a, b = before[fn], after[fn]
+            if (all(field in a and field in b and a[field] == b[field] for field in fields)
+                    and all(isinstance(row["dev"], list) and len(row["dev"]) == 2
+                            and all(type(value) is int and value >= 0 for value in row["dev"])
+                            and type(row["ino"]) is int and row["ino"] > 0
+                            and type(row["file_offset"]) is int and row["file_offset"] >= 0
+                            and type(row["vaddr"]) is int and row["vaddr"] > 0 for row in (a, b))):
+                matches.append({"fn": fn, "from": 0, "to": 1, **{field: a[field] for field in fields}})
+    physical = {(tuple(row["dev"]), row["ino"], row["file_offset"], row["vaddr"]) for row in matches}
+    return {"observed": valid and len(matches) == len(physical) == 9,
+            "required_targets": 9, "matches": matches}
+
+
+class Case:
+    def __init__(self, args):
+        self.args = args
+        self.out = Path(args.out)
+        self.owners: list = []
+        self.readers: list = []
+        self.groups: list = []
+        self.operator_paths: list = []
+        self.leg_pins: list = []
+        self.traced: list = []
+        self.scopes: list = []
+        self.completed_results: list = []
+        self.cleanup_errors: list = []
+        self.cleanup_failed = False
+        self.cleanup_totals = {"processes": 0, "readers": 0, "cgroups": 0, "pins": 0}
+        self.results: dict = {}
+        self.scope_created_ns = monotonic_ns()
+
+
+class LegCleanupError(RuntimeError):
+    """An owned cleanup failure stops the matrix, including after another error."""
+
+
+def reap_traced_child(owner):
+    """Use the held pidfd and a real terminal wait status, never Popen.poll."""
+    if isinstance(owner, InitialExecProcess):
+        owner.kill_and_reap()
+        check_dispatch()
+        return
+    # Popen can translate a ptrace stop into a negative return code. SIGKILL
+    # releases that stop; waitpid must still prove actual death and reap it.
+    try:
+        signal.pidfd_send_signal(owner.pidfd, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = wait_deadline(3)
+    while True:
+        try:
+            pid, status = os.waitpid(owner.pid, os.WNOHANG | 0x40000000)  # __WALL
+        except ChildProcessError:
+            if owner.popen.returncode is not None and not (Path("/proc") / str(owner.pid)).exists():
+                return
+            raise SetupError("traced owned child lacks a terminal reap proof")
+        if pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+            owner.popen.returncode = os.waitstatus_to_exitcode(status)
+            return
+        pause_until(deadline, 0.01)
+
+
+def terminate_owned(owner):
+    """Keep the shared custody checks, with this leg's remaining cleanup time."""
+    if isinstance(owner, InitialExecProcess):
+        owner.kill_and_reap()  # includes undetached/raw owners; never ordinary poll
+        return
+    if owner.popen.poll() is not None:
+        return
+    try:
+        owner.send(signal.SIGTERM)
+        try:
+            wait_process(owner.popen, 2)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            owner.send(signal.SIGKILL)
+            wait_process(owner.popen, 3)
+    except FileNotFoundError:
+        # An H6 mode2 leader loses namespace links before group death. Keep
+        # the same exact-worker custody rule as dispatch, then kill through
+        # its held group pidfd and reap within the existing cleanup allowance.
+        verify = getattr(owner, "zombie_worker_verify", None)
+        if verify is not None:
+            verify()
+            try:
+                signal.pidfd_send_signal(owner.pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # the verified group can die immediately before signal
+            wait_process(owner.popen, 3)
+    except ProcessLookupError:
+        pass
+
+
+def wait_terminal_child(owner):
+    """Confirm/reap after bounded termination, including an exit during send."""
+    if isinstance(owner, InitialExecProcess) and owner.reaped:
+        return
+    try:
+        pid, status = os.waitpid(owner.pid, os.WNOHANG | 0x40000000)  # __WALL
+    except ChildProcessError:
+        if isinstance(owner, InitialExecProcess):
+            raise SetupError("initial exec child lacks a delegated terminal reap proof")
+        if owner.popen.returncode is not None and not (Path("/proc") / str(owner.pid)).exists():
+            return  # a prior terminal Popen/raw wait already reaped this child
+        raise SetupError("owned child lacks a terminal reap proof")
+    if pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+        if isinstance(owner, InitialExecProcess):
+            owner._terminal(status)
+        else:
+            owner.popen.returncode = os.waitstatus_to_exitcode(status)
+        return
+    raise SetupError("owned child has no terminal status after bounded termination")
+
+
+def cleanup_leg_resources(ctx, close_pins=True):
+    if not any((ctx.owners, ctx.readers, ctx.groups, ctx.leg_pins, ctx.traced, getattr(ctx, "operator_paths", ()))):
+        return  # Completed scopes need no new budget, including the backstop.
+    # The final case backstop has no live leg context. It still gets one
+    # finite cleanup allowance, shared by every remaining child and reader.
+    # A workload-B terminal scope retains its already-started allowance.
+    token = None
+    if ACTIVE_LEG.get() is None:
+        retained = getattr(ctx, "terminal_budget", None)
+        token = ACTIVE_LEG.set(retained if retained is not None else LegBudget())
+    try:
+        return _cleanup_leg_resources(ctx, close_pins)
+    finally:
+        if token is not None:
+            ACTIVE_LEG.reset(token)
+
+
+def _cleanup_leg_resources(ctx, close_pins=True):
+    """Reap before settling readers/FDs and removing corresponding owned groups."""
+    case = getattr(ctx, "case", ctx)
+    failures = []
+    with cleanup_section():
+        owners, readers, groups = list(ctx.owners), list(ctx.readers), list(ctx.groups)
+        if owners or readers or getattr(ctx, "operator_paths", ()):
+            try:
+                enter_phase("cleanup")
+            except TimeoutError as error:
+                failures.append(f"cleanup budget: {error}")
+        case.cleanup_totals["readers"] += len(readers)
+        for owner in list(ctx.traced):
+            try:
+                reap_traced_child(owner)
+            except Exception as error:
+                failures.append(f"traced process {owner.pid}: {type(error).__name__}: {error}")
+        pending = []
+        for owner in owners:
+            try:
+                terminate_owned(owner)
+            except Exception as error:
+                failures.append(f"process {owner.pid}: {type(error).__name__}: {error}")
+            try:
+                wait_terminal_child(owner)
+            except Exception as error:
+                pending.append(owner)
+                failures.append(f"process reap {owner.pid}: {type(error).__name__}: {error}")
+        ctx.traced[:] = [owner for owner in ctx.traced if owner in pending]
+        for reader in readers:
+            try:
+                thread = getattr(reader, "thread", None)
+                if thread is not None and thread.ident is not None:
+                    reader.finish()
+                elif isinstance(reader, PtyCapture) and reader.master is not None:
+                    os.close(reader.master)
+                    reader.master = None
+            except Exception as error:
+                failures.append(f"reader: {type(error).__name__}: {error}")
+        for reader in readers:
+            stream = getattr(reader, "stream", None)
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except Exception as error:
+                    failures.append(f"reader stream: {type(error).__name__}: {error}")
+        for owner in owners:
+            process = owner.popen
+            for stream in (process.stdin, process.stdout, process.stderr) if process is not None else ():
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        failures.append(f"process stream: {type(error).__name__}: {error}")
+            if owner not in pending:
+                try:
+                    owner.close()
+                except Exception as error:
+                    failures.append(f"process FD: {type(error).__name__}: {error}")
+        if close_pins and ctx.leg_pins and any(
+                any((child.owners, child.readers, child.groups, child.traced))
+                for child in getattr(ctx, "pin_borrowers", ())):
+            close_pins = False
+            failures.append("shared image pins retained for unsettled owned child scope")
+        if close_pins:
+            for pin in reversed(ctx.leg_pins):
+                try:
+                    pin.close()
+                    pin.fd = None
+                    case.cleanup_totals["pins"] += 1
+                except Exception as error:
+                    failures.append(f"leg pin: {type(error).__name__}: {error}")
+            ctx.leg_pins.clear()
+        aliases = list(getattr(ctx, "operator_paths", ()))
+        unsettled_readers = any(getattr(reader, "thread", None) is not None and reader.thread.is_alive()
+                                for reader in readers)
+        retained_aliases = []
+        if aliases and (pending or unsettled_readers):
+            retained_aliases = aliases
+            failures.append("operator paths retained for unsettled owned child/reader")
+        else:
+            for alias in reversed(aliases):
+                try:
+                    alias.remove()
+                except Exception as error:
+                    retained_aliases.append(alias)
+                    failures.append(f"operator path: {type(error).__name__}: {error}")
+        if hasattr(ctx, "operator_paths"):
+            ctx.operator_paths[:] = [alias for alias in aliases if alias in retained_aliases]
+        if not pending and not retained_aliases:
+            for group in reversed(groups):
+                try:
+                    group.remove()
+                except Exception as error:
+                    failures.append(f"cgroup: {type(error).__name__}: {error}")
+            case.cleanup_totals["cgroups"] += len(groups)
+            ctx.groups.clear()
+        # Count released ownership once, even when a failed proof is retried.
+        case.cleanup_totals["processes"] += len(owners) - len(pending)
+        # Keep unproven children and their corresponding groups held for the
+        # final backstop; cleanup failure already prevents another live leg.
+        ctx.owners[:] = pending
+        ctx.readers[:] = [reader for reader in readers
+                         if getattr(reader, "thread", None) is not None and reader.thread.is_alive()]
+        try:
+            check_dispatch()  # mandatory kernel reaping never creates a late success
+        except TimeoutError as error:
+            failures.append(f"cleanup budget after resource settlement: {error}")
+        if failures:
+            case.cleanup_failed = True
+            case.cleanup_errors.extend(failures)
+            raise LegCleanupError("owned leg cleanup failed: " + "; ".join(failures))
+
+
+class LegContext:
+    """Private resource lists; case inputs and earlier results stay with the case."""
+    def __init__(self, parent):
+        self.parent, self.case = parent, getattr(parent, "case", parent)
+        self.owners, self.readers, self.groups, self.leg_pins, self.traced = [], [], [], [], []
+        self.operator_paths = []
+        self.case.scopes.append(self)
+
+    def __getattr__(self, name):
+        return getattr(self.parent, name)
+
+
+def stop_b_observer(ctx, owned):
+    """Retire B work once; normal stop and cleanup share one terminal cap."""
+    with cleanup_section():
+        if ctx.observer_stop_attempted:
+            raise SetupError("workload-B observer normal stop already attempted")
+        ctx.terminal_budget = LegBudget(clock=ctx.budget.clock,
+            leg_seconds=OBSERVER_STOP_SECONDS + CLEANUP_SECONDS)
+        ctx.terminal_token = ACTIVE_LEG.set(ctx.terminal_budget)
+        ctx.observer_stop_attempted = True
+        try:
+            ctx.observer_stop_result = stop_observer(owned)
+            rc, _stopped, latency = ctx.observer_stop_result
+            failures = stop_errors(stop_receipt(owned, latency))
+            if rc != 0:
+                failures.append(f"observer normal stop returned {rc}")
+            if failures:
+                raise LegCleanupError("observer normal stop failed: " + "; ".join(failures))
+        except BaseException as error:
+            ctx.observer_stop_error = error
+            raise
+        return ctx.observer_stop_result
+
+
+def finalize_b_observer(ctx):
+    """Recover only the observer enrolled by this scope's spawn operation."""
+    owned = ctx.observer_owned
+    if owned is None and ctx.observer_start is not None:
+        enrolled = ctx.owners[ctx.observer_start:]
+        if len(enrolled) > 1:
+            raise SetupError("workload-B observer enrollment is ambiguous")
+        owned = enrolled[0] if enrolled else None
+    if owned is None:
+        return
+    if owned not in ctx.owners or not isinstance(owned, (OwnedProcess, N3HARNESS["DirectChild"])):
+        raise SetupError("workload-B observer lacks enrolled direct-child ownership")
+    if not ctx.observer_stop_attempted and owned.popen.poll() is None:
+        stop_b_observer(ctx, owned)
+    if ctx.observer_stop_error is not None:
+        raise ctx.observer_stop_error
+
+
+def owned_leg(function=None, *, inventory=False, stop_b=False):
+    if function is None:
+        return lambda target: owned_leg(target, inventory=inventory, stop_b=stop_b)
+    @wraps(function)
+    def run(ctx, *args, **kwargs):
+        with cleanup_section():
+            scope = LegContext(ctx)
+            scope.budget = LegBudget(inventory=inventory)
+            scope.terminal_budget = scope.budget  # No cleanup backstop may renew its interval.
+            if stop_b:
+                scope.observer_start = scope.observer_owned = None
+                scope.observer_stop_attempted = False
+                scope.observer_stop_result = scope.terminal_token = None
+                scope.observer_stop_error = None
+        token = ACTIVE_LEG.set(scope.budget)
+        primary = None
+        try:
+            result = function(scope, *args, **kwargs)
+            return result
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                with cleanup_section():
+                    stop_error = None
+                    if stop_b:
+                        try:
+                            finalize_b_observer(scope)
+                        except BaseException as error:
+                            if error is not primary:
+                                stop_error = error  # An already-primary stop error is not a second failure.
+                            scope.case.cleanup_failed = True
+                            scope.case.cleanup_errors.append(
+                                f"observer normal stop: {type(error).__name__}: {error}")
+                    try:
+                        cleanup_leg_resources(scope)
+                    except LegCleanupError as error:
+                        if stop_error is not None:
+                            detail = f"observer normal stop {type(stop_error).__name__}: {stop_error}; {error}"
+                            if primary is not None:
+                                detail += f"; primary {type(primary).__name__}: {primary}"
+                            raise LegCleanupError(detail) from (primary or stop_error)
+                        if primary is not None:
+                            raise LegCleanupError(f"{error}; primary {type(primary).__name__}: {primary}") from primary
+                        raise
+                    if stop_error is not None:
+                        detail = f"observer normal stop {type(stop_error).__name__}: {stop_error}"
+                        if primary is not None:
+                            detail += f"; primary {type(primary).__name__}: {primary}"
+                        raise LegCleanupError(detail) from (primary or stop_error)
+                if primary is None and isinstance(result, dict):
+                    scope.case.completed_results.append(result)
+            finally:
+                if stop_b and scope.terminal_token is not None:
+                    ACTIVE_LEG.reset(scope.terminal_token)
+                ACTIVE_LEG.reset(token)
+    return run
+
+
+def leg_pin(ctx, path):
+    with cleanup_section():
+        pin = FilePin(path)
+        ctx.leg_pins.append(pin)
+    return pin
+
+
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+
+
+def finish_readers(readers):
+    for reader in readers:
+        reader.finish()
+
+
+@owned_leg
+def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, prefix=(), setarch_pin=None):
+    """One pid-scope caller leg: warm, exec, measured, stop, judge."""
+    leg_dir = Path(leg_dir)
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, f"h6-{cell}")
+    image_a = leg_dir / "caller-a"
+    shutil.copyfile(ctx.pins["caller"].path, image_a)
+    image_a.chmod(0o755)
+    pin_a = leg_pin(ctx, image_a)
+    if same_path:
+        pin_b, image_b = pin_a, image_a
+    else:
+        image_b = leg_dir / "caller-b"
+        shutil.copyfile(ctx.pins["caller"].path, image_b)
+        image_b.chmod(0o755)
+        pin_b = leg_pin(ctx, image_b)
+    provider = ctx.provider_pin
+    initial_load = cell == "pid-reexec"
+    initial_exec = None
+    if initial_load:
+        deadline = min(ctx.budget.deadline_ns, ctx.budget.phase_deadline_ns)
+        if prefix not in ((), ("setarch", "-R")):
+            raise SetupError("initial exec barrier permits only the pinned setarch -R chain")
+        if setarch_pin is None:
+            path = shutil.which("setarch")
+            if path is None:
+                raise SetupError("setarch is required for the VA-reuse reexec leg")
+            setarch_pin = leg_pin(ctx, Path(path).resolve(strict=True))
+        caller, stdout, _, initial_exec = spawn_initial_caller(ctx, leg_dir, pin_a, provider,
+                                                              env, deadline, setarch_pin)
+        images = []  # real image0 is emitted only after detach/main
+    else:
+        caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin_a, provider,
+                                         ctx.args.uid, ctx.args.gid, env, prefix=prefix)
+        stdout.record("ready", 0)
+        images = [pin_a.image_receipt(stdout.record("image", 0), caller)]
+    scope_args = ["--pid", str(caller.pid)]
+    module_args = ["--module", str(provider.path)]
+    backend_args = ["--attach-backend", backend]
+    provider_before = provider_receipt(provider)
+    if observer_kind == "trace":
+        argv = [str(ctx.binary.path), "trace", *scope_args, *module_args, *backend_args,
+               "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+    else:
+        mode = "metrics" if observer_kind == "metrics" else "profile"
+        argv = [str(ctx.binary.path), "profile", *scope_args, *module_args,
+               "--mode", mode, *backend_args, "--duration", "120s",
+               "-o", str(leg_dir / f"{observer_kind}.json")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
+    try:
+        if initial_load:
+            initial_exec.update(observer_initial_exec_ready(owned, errors, backend, caller, initial_exec, argv))
+            ready = initial_exec["loop_ready_ns"]
+        else:
+            ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        if initial_load:
+            caller.kill_and_reap()
+            ctx.traced.remove(caller)
+        else:
+            stop_caller(caller, stdout, 0)
+        receipt = {"cell": cell, "leg": f"{observer_kind}/{backend}",
+                   "backend_refused": str(refused)}
+        result = (evaluate_trace_h6("", [], receipt) if observer_kind == "trace"
+                  else evaluate_profile_h6({}, "", [], receipt))
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    load_receipt = None
+    if initial_load:
+        image, load_receipt = release_initial_exec_load(ctx, caller, stdout, pin_a, provider, initial_exec)
+        images.append(image)
+        load_receipt["proof"] = warm_caller(capture, caller, stdout, images[0], phases, observer_kind)
+    if observer_kind == "trace":
+        drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 3, 100, "warm", 0, phases)
+    else:
+        n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "warm", "selected", 0, None, phases)
+    output_cursor = len(capture.lines) if observer_kind == "trace" else None
+    request, _, t0, t1 = caller_exec(caller, stdout, images, "exec", pin_b)
+    transitions = [{"from_image": 0, "to_image": 1, "mode": "leader",
+                    "same_path": bool(same_path), "t0": t0, "t1": t1, "request": request}]
+    proof = warm_caller(capture, caller, stdout, images[-1], phases, observer_kind,
+                        output_cursor=output_cursor)
+    n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
+               1, None, phases)
+    obs_rc, stopped, latency = stop_observer(owned)
+    caller_rc = stop_caller(caller, stdout, 1)
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = next(p for p in phases if p["phase"] == "measured")
+    receipt = {
+        "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
+        "pid": caller.pid, "known_tids": [caller.pid], "owned_pids": [caller.pid],
+        "images": images, "observer_argv": list(argv), "provider_before": provider_before,
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "stable", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 10, "phases": ["measured"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": [proof],
+        "exec_transitions": transitions, "phases": phases,
+        "require_named": True, "require_named_images": [1], "first_unknown_images": [],
+        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {"session": True, "va": bool(same_path)},
+        "session_reuse": session_reuse_from(ledger), "va_reuse": va_reuse_from(ledger),
+        "requested_backend": backend,
+    }
+    if load_receipt is not None:
+        receipt["initial_load"] = load_receipt
+        receipt["initial_exec"] = initial_exec
+        loader_ready_lines(errors.lines)  # also reject a duplicate producer line arriving later
+    if observer_kind == "trace":
+        trace = "".join(capture.lines)
+        file_trace = (leg_dir / "trace.file.txt").read_text()
+        result = evaluate_trace_h6(trace, ledger, receipt, file_trace)
+    elif observer_kind == "profile":
+        doc = json.loads((leg_dir / "profile.json").read_text())
+        result = evaluate_profile_h6(doc, "".join(capture.lines), ledger, receipt)
+    else:
+        doc = json.loads((leg_dir / "metrics.json").read_text())
+        result = evaluate_metrics_h6(doc, "".join(capture.lines), ledger, receipt)
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+def run_pid_leader(ctx, cell_dir, backend):
+    return [run_pid_caller_leg(ctx, "pid-leader", backend, kind,
+                               Path(cell_dir) / backend / kind, same_path=False)
+            for kind in ("trace", "profile", "metrics")]
+
+
+def run_pid_reexec(ctx, cell_dir, backend):
+    path = shutil.which("setarch")
+    if not path:
+        raise SetupError("setarch is required for the VA-reuse reexec leg")
+    pin = leg_pin(ctx, Path(path).resolve(strict=True))
+    try:
+        return [run_pid_caller_leg(ctx, "pid-reexec", backend, kind,
+                                  Path(cell_dir) / backend / kind, same_path=True, setarch_pin=pin)
+                for kind in ("trace", "profile", "metrics")]
+    finally:
+        with cleanup_section():
+            pin.close()
+            ctx.leg_pins.remove(pin)
+
+
+@owned_leg(stop_b=True)
+def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, delay_ms=300):
+    """One workload-B leg: cold/failed/leader-exit exec under an observer."""
+    leg_dir = Path(leg_dir)
+    leg_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = dict(os.environ)
+    driver = BDriver(ctx.owners, ctx.readers, leg_dir, ctx.pins["before"],
+                     ctx.pins["after"], ctx.pins["provider.so"],
+                     ctx.args.uid, ctx.args.gid, env, mode, measured, delay_ms)
+    driver.ready()
+    provider = ctx.pins["provider.so"]
+    scope_args = ["--pid", str(driver.pid)]
+    module_args = ["--module", str(provider.path)]
+    backend_args = ["--attach-backend", backend]
+    provider_before = provider_receipt(provider)
+    if observer_kind == "trace":
+        argv = [str(ctx.binary.path), "trace", *scope_args, *module_args, *backend_args,
+               "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
+    else:
+        agg = "metrics" if observer_kind == "metrics" else "profile"
+        argv = [str(ctx.binary.path), "profile", *scope_args, *module_args,
+               "--mode", agg, *backend_args, "--duration", "180s",
+               "-o", str(leg_dir / f"{observer_kind}.json")]
+    ctx.observer_start = len(ctx.owners)
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
+    ctx.observer_owned = owned
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        driver.owned.popen.kill()
+        wait_process(driver.owned.popen, 5)
+        receipt = {"cell": cell, "leg": f"{observer_kind}/{backend}",
+                   "backend_refused": str(refused)}
+        result = (evaluate_trace_h6("", [], receipt) if observer_kind == "trace"
+                  else evaluate_profile_h6({}, "", [], receipt))
+        write_json(leg_dir / "result.json", result)
+        return result
+    if mode == "3":
+        if observer_kind != "trace":
+            raise SetupError("held-entry recovery requires its public trace readiness proof")
+        initial = warm_successor(capture, {"image": 0, "pid": driver.pid, "path": driver.exe0},
+                                 driver.initial_warm_attempt, output_cursor=len(capture.lines))
+        driver.accept_initial_proof(capture, initial, ready)
+    driver.start_worker()
+    driver.pre_exec()
+    if mode == "3":
+        driver.release_held_leader()
+    output_cursor = len(capture.lines) if observer_kind == "trace" else None
+    driver.do_exec()
+    failed = mode == "1"
+    if failed:
+        driver.post_fail()
+    else:
+        proof = warm_successor(capture, {"image": 1, "pid": driver.pid, "path": driver.exe1},
+                               driver.warm_attempt, observer_kind, output_cursor=output_cursor)
+        driver.post_exec()
+    obs_rc, stopped, latency = stop_b_observer(ctx, owned)
+    caller_rc = driver.finish()
+    finish_readers([driver.stdout, driver.stderr, capture, errors])
+    ledger = driver.normalize(ctx.b_file_offset)
+    pre_phase = {"image": 0, "fn": "C_Initialize", "phase": "pre", "scope": "selected",
+                 "count": 11, "t0": driver.stamps.get("B", driver.stamps["G"]), "t1": driver.stamps["WORKER_DONE"]}
+    if failed:
+        post_phase = {"image": 0, "fn": "C_Initialize", "phase": "post", "scope": "selected",
+                      "count": 18, "t0": driver.stamps["Rpost"], "t1": driver.stamps["DONE"]}
+        images = [{"kind": "image", "image": 0, "pid": driver.pid, "start_time": driver.birth,
+                   "path": driver.exe0, "dev": ctx.pins["before"].initial.st_dev,
+                   "ino": ctx.pins["before"].initial.st_ino,
+                   "mtime_ns": ctx.pins["before"].initial.st_mtime_ns,
+                   "pid_namespace": driver.owned.identity["pid_namespace"],
+                   "time_namespace": driver.owned.identity["time_namespace"]}]
+        transitions = []
+        require_named_images: list = []
+        require_named = False
+        abandoned = 0
+    else:
+        post_phase = {"image": 1, "fn": "C_Initialize", "phase": "post", "scope": "selected",
+                      "count": measured, "t0": driver.stamps["R"], "t1": driver.stamps["NEW_DONE"]}
+        images = [
+            {"kind": "image", "image": 0, "pid": driver.pid, "start_time": driver.birth,
+             "path": driver.exe0, "dev": ctx.pins["before"].initial.st_dev,
+             "ino": ctx.pins["before"].initial.st_ino,
+             "mtime_ns": ctx.pins["before"].initial.st_mtime_ns,
+             "pid_namespace": driver.owned.identity["pid_namespace"],
+             "time_namespace": driver.owned.identity["time_namespace"]},
+            {"kind": "image", "image": 1, "pid": driver.pid, "start_time": driver.birth,
+             "path": driver.exe1, "dev": ctx.pins["after"].initial.st_dev,
+             "ino": ctx.pins["after"].initial.st_ino,
+             "mtime_ns": ctx.pins["after"].initial.st_mtime_ns,
+             "pid_namespace": driver.owned.identity["pid_namespace"],
+             "time_namespace": driver.owned.identity["time_namespace"]},
+        ]
+        request = next(row for row in ledger if row["kind"] == "exec")
+        transitions = [{"from_image": 0, "to_image": 1, "mode": "nonleader",
+                        "same_path": False, "t0": driver.stamps["EXEC_BODY"],
+                        "t1": driver.stamps["NEW_READY"], "request": request}]
+        require_named_images = [1]
+        require_named = True
+        abandoned = 1
+    warm_phases = [{"image": 1, "fn": "C_GetInfo", "phase": call["phase"],
+                    "scope": "selected", "count": 1, "t0": call["t0"], "t1": call["t1"]}
+                   for call in driver.warm_calls]
+    initial_phases = [{"image": 0, "fn": "C_GetInfo", "phase": call["phase"],
+                       "scope": "selected", "count": 1, "t0": call["t0"], "t1": call["t1"]}
+                      for call in driver.initial_calls] if mode == "3" else []
+    phases = [*initial_phases, pre_phase, *warm_phases, post_phase]
+    receipt = {
+        "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
+        "pid": driver.pid, "known_tids": [driver.pid, driver.worker_tid],
+        "owned_pids": [driver.pid], "images": images,
+        "observer_argv": list(argv), "provider_before": provider_before,
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": driver.owned.identity["pid_namespace"],
+        "time_namespace": driver.owned.identity["time_namespace"],
+        "measured": {"label": "stable", "t0": post_phase["t0"], "t1": post_phase["t1"],
+                     "expected_calls": post_phase["count"], "phases": ["post"]},
+        "warmup": warmup_receipt(phases, post_phase["t0"]),
+        "successor_policy": "no-transition" if failed else "public-successor",
+        "successor_ready": [] if failed else [proof],
+        "exec_transitions": transitions, "phases": phases,
+        "require_named": require_named, "require_named_images": require_named_images,
+        "first_unknown_images": [],
+        "manual_rebind": False, "abandoned_expected": abandoned,
+        "abandoned_by_fn": {"C_Initialize": abandoned} if abandoned else {},
+        "reuse_expected": {"token": True},
+        "token_reuse": {"observed": True, "token": driver.token},
+        "requested_backend": backend, "b_setup": driver.b_setup_note(),
+    }
+    if observer_kind == "trace":
+        result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                                   (leg_dir / "trace.file.txt").read_text())
+    elif observer_kind == "profile":
+        doc = json.loads((leg_dir / "profile.json").read_text())
+        result = evaluate_profile_h6(doc, "".join(capture.lines), ledger, receipt)
+    else:
+        doc = json.loads((leg_dir / "metrics.json").read_text())
+        result = evaluate_metrics_h6(doc, "".join(capture.lines), ledger, receipt)
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+def run_pid_nonleader_cold(ctx, cell_dir, backend):
+    return [run_b_leg(ctx, "pid-nonleader-cold", backend, kind,
+                      Path(cell_dir) / backend / kind, "0")
+            for kind in ("trace", "profile", "metrics")]
+
+
+def run_pid_failed_exec(ctx, cell_dir, backend):
+    return [run_b_leg(ctx, "pid-failed-exec", backend, "trace",
+                      Path(cell_dir) / backend / "trace", "1")]
+
+
+def held_entry_errors(trace, ledger, receipt):
+    """Check the physical held entry without deriving it from native counters."""
+    try:
+        setup = receipt["b_setup"]
+        held = setup["held_entry"]
+        leader, worker = held["leader"], held["worker"]
+        pid, tid = receipt["pid"], worker["tid"]
+        image = next(row for row in receipt["images"] if row["image"] == 0)
+        before = {int(key): value for key, value in held["tasks_before"].items()}
+        after = {int(key): value for key, value in held["tasks_after"].items()}
+        current = held["leader_before"]
+        proof = held["initial_ready"]
+        lines, stamps = setup["lines"], setup["stamps"]
+        body, released, exited = (lines[key].split() for key in
+                                  ("EXEC_BODY", "HELD_LEADER_RELEASE", "LEADER_EXIT"))
+        if (setup["mode"] != "3" or held["proof_kind"] != "live-leader-held-provider-entry"
+                or leader["pid"] != pid or leader["start_time"] != image["start_time"]
+                or any(leader[key] != image[key] for key in ("pid_namespace", "time_namespace"))
+                or tid == pid or worker != setup["worker_identity"] or worker["tgid"] != pid
+                or worker["start_time"] <= 0 or set(receipt["known_tids"]) != {pid, tid}
+                or any(worker[key] != leader[key] for key in ("ppid", "uid", "pid_namespace", "time_namespace"))
+                or any(current[key] != leader[key] for key in ("pid", "ppid", "uid", "start_time"))
+                or current["state"] not in ("R", "S", "D") or held["pidfd_live"] is not True
+                or set(before) != {pid, tid} or set(after) != {pid, tid}
+                or before[pid] not in ("R", "S", "D") or before[tid] not in ("R", "S", "D")
+                or after[pid] != "Z" or after[tid] not in ("R", "S", "D")
+                or held["provider"] != receipt["provider_before"]
+                or receipt["provider_before"] != receipt["provider_after"]
+                or receipt["abandoned_expected"] != 1 or receipt["abandoned_by_fn"] != {"C_Initialize": 1}
+                or receipt["measured"]["expected_calls"] != 25):
+            raise ValueError("original live leader/exact held worker/provider identity disagrees")
+        if (body[0] != "EXEC_BODY" or released[0] != "HELD_LEADER_RELEASE" or exited[0] != "LEADER_EXIT"
+                or [int(value) for value in body[1:4]] != [pid, tid, setup["token"]]
+                or released[1:4] != body[1:4] or [int(value) for value in exited[1:3]] != [pid, tid]
+                or int(body[-1]) != held["entered_ns"] or int(released[-1]) != held["released_ns"]):
+            raise ValueError("held frame and leader release acknowledgements disagree")
+        times = [receipt["observer_ready_ns"], proof["started_ns"], proof["observed_ns"], stamps["G"],
+                 int(lines["THREAD"].split()[-1]), int(lines["WORKER_DONE"].split()[-1]),
+                 held["entered_ns"], held["observed_live_ns"], stamps["E"], held["released_ns"],
+                 int(exited[-1]), held["observed_zombie_ns"], stamps["X"],
+                 int(lines["NEW_READY"].split()[-1]), receipt["observer_stopped_ns"]]
+        if (any(type(value) is not int for value in times) or times != sorted(times)
+                or not held["observed_zombie_ns"] <= held["deadline_ns"]
+                or not 0 < held["deadline_ns"] - held["observed_live_ns"] <= 10_000_000_000):
+            raise ValueError("held entry/live-leader release/zombie/exec chronology disagrees")
+        initial_calls = [row for row in ledger if row["kind"] == "call" and row["phase"] in proof["phases"]]
+        if (proof["image"] != 0 or proof["proof_kind"] != "trace-row" or proof["marker_fn"] != "C_GetInfo"
+                or not 1 <= proof["attempts"] == len(initial_calls) <= proof["max_attempts"] == 20
+                or not proof["observed_ns"] <= proof["deadline_ns"]
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 15_000_000_000
+                or not 0 <= proof["output_cursor"] < proof["proof_cursor"]
+                or any((row["image"], row["pid"], row["tid"], row["fn"], row["rv"], row["scope"]) !=
+                       (0, pid, pid, "C_GetInfo", 0, "selected") or not
+                       proof["started_ns"] <= row["t0"] <= row["t1"] <= proof["observed_ns"]
+                       for row in initial_calls)):
+            raise ValueError("initial proof disagrees with its fixed real marker ledger")
+        stream = trace.splitlines()
+        index = proof["proof_cursor"] - 1
+        row = ROW.fullmatch(stream[index]) if 0 <= index < len(stream) else None
+        if (not row or (int(row["pid"]), int(row["tid"]), row["fn"], row["rv"]) !=
+                (pid, pid, "C_GetInfo", "CKR_OK") or not row["path"]
+                or json.loads(row["path"]) != image["path"] or json.loads(row["label"]) != Path(image["path"]).name):
+            raise ValueError("initial proof lacks this observer's correctly named original marker row")
+        return []
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError, StopIteration) as error:
+        return [f"held-entry recovery lacks independent live-entry/zombie proof: {error}"]
+
+
+def worker_perf_prefix_gap(ev, receipt):
+    """Exact mode2 prefix only: an exited perf target no longer covers its worker.
+
+    An informative capability additionally requires its independently
+    validated original-Z/exact-worker release proof. A generic link-loss
+    count, requested backend or later static detach cannot supply this proof;
+    the real Session filter and held provider must agree.
+    """
+    try:
+        observation = ev["gap_classes"]["observation"]
+        if (receipt["cell"] != "leader-exit-exec" or receipt["scope_kind"] != "pid"
+                or receipt["requested_backend"] != "singles"
+                or receipt["b_setup"]["mode"] != "2" or receipt["owned_pids"] != [receipt["pid"]]
+                or ev["attach_backend"] != {"selection": "singles", "fallback": None,
+                                           "scope_filter": "perf-task+bpf"}
+                or ev["completeness"] != "PARTIAL" or ev["verdict_detail"] != "concrete_gap"
+                or observation["status"] != "lossy" or "task_uprobe_link_losses" not in observation["causes"]
+                or type(ev["task_uprobe_link_losses"]) is not int or ev["task_uprobe_link_losses"] <= 0
+                or ev["authority"] != "hash-pinned"):
+            return False
+        pin = receipt["provider_before"]
+        mapping, physical = pin["mapping"], pin["file_identity"]
+        if (pin != receipt["provider_after"] or not pin["path"].startswith("/")
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])
+                or not isinstance(pin["dev"], list) or len(pin["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in pin["dev"])
+                or type(pin["ino"]) is not int or pin["ino"] <= 0
+                or mapping["dev"] != pin["dev"] or mapping["ino"] != pin["ino"]
+                or mapping["file_offset"] != 0 or mapping["permissions"] != "r--p"
+                or type(mapping["length"]) is not int or mapping["length"] <= 0
+                or physical["ino"] != pin["ino"]
+                or not isinstance(physical["dev"], list) or len(physical["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in physical["dev"])
+                or any(type(physical[key]) is not int or physical[key] <= 0
+                       for key in ("size", "mtime_ns", "ctime_ns"))):
+            return False
+        argv = receipt["observer_argv"]
+        if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
+                or not argv[0].startswith("/") or argv[1] != "trace"
+                or any(flag in argv for flag in ("--system", "--cgroup"))
+                or any(arg.startswith(("--pid=", "--cgroup=", "--module=")) for arg in argv)
+                or any(argv.count(flag) != 1 for flag in ("--pid", "--module", "--attach-backend"))
+                or argv[argv.index("--pid") + 1] != str(receipt["pid"])
+                or argv[argv.index("--module") + 1] != pin["path"]
+                or argv[argv.index("--attach-backend") + 1] != "singles"):
+            return False
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        def matches(record):
+            return isinstance(record, dict) and all(record.get(key) == value for key, value in identity.items())
+        discovered = ev["discovery"]
+        return (isinstance(discovered, list) and len(discovered) == 1 and matches(discovered[0])
+                and isinstance(discovered[0]["objects"], list) and bool(discovered[0]["objects"])
+                and all(matches(record) for record in discovered[0]["objects"]))
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def evaluate_worker_capability(result, receipt, backend):
+    """Independent worker-only early population; never a recovery positive."""
+    errors = []
+    capability = {"cell": "leader-exit-exec", "leg": f"capability-preexec/{backend}",
+                  "pass": False, "status": "error", "pre_exec_ledgered": 11,
+                  "note": "zombie-leader/live-worker activity; separate from post-exec recovery"}
+    try:
+        if (result.get("status") not in ("pass", "fail")
+                or result.get("pass") is not (result.get("status") == "pass")):
+            errors.append("failed/untested setup cannot demonstrate worker capability")
+        classified = [result[key] for key in ("capture_integrity_errors", "successor_recovery_errors",
+                                             "expected_mode2_abandonment_errors")]
+        if (any(not isinstance(group, list) or any(not isinstance(error, str) for error in group)
+                for group in [result["errors"], *classified])
+                or Counter(result["errors"]) != sum((Counter(group) for group in classified), Counter())):
+            errors.append("capability source trace findings lack complete integrity classification")
+        else:
+            errors.extend(classified[0])
+        if receipt["requested_backend"] != backend:
+            errors.append("capability receipt backend differs from the requested backend")
+        setup = receipt["b_setup"]
+        proof, worker = setup["worker_barrier"], setup["worker_identity"]
+        leader = proof["leader"]
+        pid, tid = receipt["pid"], worker["tid"]
+        image = next(row for row in receipt["images"] if row["image"] == 0)
+        tasks = {int(key): value for key, value in proof["tasks"].items()}
+        if (setup["mode"] != "2" or proof["proof_kind"] != "zombie-leader-worker-gate"
+                or proof["pidfd_live"] is not True or tasks.get(pid) != "Z"
+                or tasks.get(tid) not in ("R", "S", "D") or tid == pid
+                or set(receipt["known_tids"]) != {pid, tid}
+                or leader["pid"] != pid or leader["start_time"] != image["start_time"]
+                or worker != proof["worker"] or worker["tgid"] != pid or worker["start_time"] <= 0
+                or any(worker[key] != leader[key] for key in ("ppid", "uid", "pid_namespace", "time_namespace"))
+                or any(leader[key] != image[key] for key in ("pid_namespace", "time_namespace"))):
+            errors.append("capability lacks original zombie leader/exact live worker identity proof")
+        stamps, lines = setup["stamps"], setup["lines"]
+        times = [proof[key] for key in ("started_ns", "thread_ns", "intent_ns", "wait_ns",
+                                        "observed_ns", "released_ns", "worker_release_ns")]
+        if (not all(type(value) is int for value in times)
+                or not receipt["observer_ready_ns"] <= times[0]
+                or times != sorted(times) or not times[-1] <= stamps["WORKER_DONE"] <= receipt["observer_stopped_ns"]
+                or times[-1] >= proof["deadline_ns"]
+                or not 0 < proof["deadline_ns"] - times[0] <= 10_000_000_000
+                or stamps["G"] != times[0] or stamps["B"] != proof["released_ns"]):
+            errors.append("capability release lacks a fixed bounded proof before its calls")
+        for kind, key in (("THREAD", "thread_ns"), ("LEADER_EXIT", "intent_ns"),
+                          ("WORKER_WAIT", "wait_ns"), ("WORKER_RELEASE", "worker_release_ns")):
+            fields = lines[kind].split()
+            expected = [pid, tid, tid] if kind == "THREAD" else [pid, tid]
+            if (fields[0] != kind or [int(value) for value in fields[1:-1]] != expected
+                    or int(fields[-1]) != proof[key]):
+                errors.append(f"capability {kind} ack disagrees with its exact-worker barrier")
+        done = lines["WORKER_DONE"].split()
+        if (done[0] != "WORKER_DONE" or [int(value) for value in done[1:-1]] != [pid, tid, 11, 6, 5]
+                or not times[-1] <= int(done[-1]) <= stamps["WORKER_DONE"]):
+            errors.append("capability batch lacks its exact post-release worker completion")
+        pre = next(phase for phase in receipt["phases"] if phase["phase"] == "pre")
+        if pre["count"] != 11 or pre["t0"] != stamps["B"] or pre["t1"] != stamps["WORKER_DONE"]:
+            errors.append("capability phase includes time before the worker release")
+        # This population uses exact worker/function/generation keys, including
+        # disclosed missing prefixes, and never borrows a successor population.
+        population = result["capability_early_coverage"]
+        errors.extend(population["errors"])
+        named, unknown = population["observed_named"], population["observed_unknown"]
+        if any(type(value) is not int or value < 0 for value in (named, unknown)) or named + unknown > 11:
+            raise ValueError("capability captured population exceeds the independent eleven calls")
+        captured = named + unknown
+        early = {"expected": 11, "observed_named": named, "observed_unknown": unknown, "deficit": 11 - captured}
+        if any(population[key] != value for key, value in early.items()):
+            errors.append("capability population disagrees with its independent eleven-call prefix")
+        capability.update(pre_exec_captured=captured, early_coverage=early, task_states=tasks,
+                          worker_barrier=proof)
+        terminal = result["evidence"]
+        if len(terminal) != 1:
+            errors.append("capability lacks terminal capture evidence")
+        else:
+            ev = terminal[0]
+            attach = ev.get("attach_backend")
+            if not isinstance(attach, dict) or attach.get("selection") != backend:
+                errors.append("capability capture backend differs from the requested backend")
+            if isinstance(attach, dict) and attach.get("fallback") is not None:
+                errors.append("capability capture installed a fallback link: no global fallback allowed")
+            if (ev.get("privacy_mode") != "allowlisted" or ev.get("trace_truncated") is not False
+                    or any(ev.get(key, 0) for key in ("event_loss", "start_insert_failures", "unmatched_returns",
+                        "rv_update_failures", "process_tracking_failures", "process_tracking_evictions"))):
+                errors.append("capability capture reports truncation/policy or native event loss")
+            gap_errors = _early_gap_errors(ev, early["deficit"])
+            prefix_loss_proven = not errors and worker_perf_prefix_gap(ev, receipt)
+            if gap_errors and prefix_loss_proven:
+                gap_errors = []
+            errors.extend(gap_errors)
+            if classified[2] and not (captured == 0 and prefix_loss_proven):
+                errors.extend(classified[2])
+    except (KeyError, TypeError, ValueError, IndexError, StopIteration) as error:
+        errors.append(f"missing/invalid worker barrier evidence: {error}")
+    if not errors:
+        capability["pass"] = None
+        capability["status"] = "demonstrated" if captured else "limitation"
+    capability["errors"] = errors
+    return capability
+
+
+def run_leader_exit_exec(ctx, cell_dir, backend):
+    leg_dir = Path(cell_dir) / backend / "trace"
+    result = run_b_leg(ctx, "leader-exit-exec", backend, "trace", leg_dir, "3")
+    if result.get("pass") is False and result.get("status") == "negative":
+        return [result]  # observer refused before a worker/barrier receipt existed
+    capability_dir = Path(cell_dir) / backend / "capability-preexec"
+    source = run_b_leg(ctx, "leader-exit-exec", backend, "trace", capability_dir, "2")
+    if source.get("status") == "negative":
+        capability = {"cell": "leader-exit-exec", "leg": f"capability-preexec/{backend}",
+                      "pass": False, "status": "negative", "errors": source["errors"]}
+    else:
+        receipt = json.loads((capability_dir / "receipt.json").read_text())
+        capability = evaluate_worker_capability(source, receipt, backend)
+    write_json(capability_dir / "capability.json", capability)
+    return [result, capability]
+
+
+@owned_leg
+def run_rapid_chain(ctx, cell_dir, backend):
+    """Bounded 3-exec leader chain (A->B->A->B) plus reuse and group-death legs."""
+    children_start = len(ctx.case.scopes)
+    ctx.pin_borrowers = []
+    try:
+        leg_dir = Path(cell_dir) / backend / "trace"
+        (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+        env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-rapid")
+        pins = {}
+        for name in ("caller-a", "caller-b"):
+            path = leg_dir / name
+            shutil.copyfile(ctx.pins["caller"].path, path)
+            path.chmod(0o755)
+            pins[name] = leg_pin(ctx, path)
+        result, dead_pid = run_rapid_trace_leg(ctx, leg_dir, backend, env, pins)
+        ctx.case.completed_results.append(result)
+        if dead_pid is None:
+            return [result]
+        control = run_reuse_control(ctx, Path(cell_dir) / backend / "reuse", backend, env,
+                                    dead_pid, pins["caller-a"])
+        death = run_group_death_leg(ctx, Path(cell_dir) / backend / "group-death",
+                                    backend, env, pins["caller-a"])
+        return [result, control, death]
+    finally:
+        ctx.pin_borrowers[:] = [child for child in ctx.case.scopes[children_start:]
+                               if child.parent is ctx]
+        enter_phase("cleanup")  # One interval for the coordinator's held images.
+
+
+@owned_leg
+def run_rapid_trace_leg(ctx, leg_dir, backend, env, pins):
+    """Own the trace's terminal cleanup independently of its later controls."""
+    # Fixture setup belongs to the original coordinator. A new resource scope
+    # cannot grant the trace another setup or overall leg allowance.
+    ctx.budget.deadline_ns = min(ctx.budget.deadline_ns, ctx.parent.budget.deadline_ns)
+    setup = min(ctx.budget.phase_deadline_ns, ctx.parent.budget.deadlines["setup", 0])
+    ctx.budget.deadlines["setup", 0] = ctx.budget.phase_deadline_ns = setup
+    check_dispatch()
+    provider = ctx.provider_pin
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pins["caller-a"],
+                                     provider, ctx.args.uid, ctx.args.gid, env)
+    stdout.record("ready", 0)
+    images = [pins["caller-a"].image_receipt(stdout.record("image", 0), caller)]
+    argv = [str(ctx.binary.path), "trace", "--pid", str(caller.pid),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "rapid-chain", "leg": f"trace/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result, None
+    phases = []
+    # Sequential public stream boundaries distinguish reused function keys.
+    initial_ready = warm_initial_caller(ctx, capture, caller, stdout, images[0], pins["caller-a"], provider, phases)
+    drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 2, 50, "warm", 0, phases)
+    order = [("caller-b", 1, "gen1"), ("caller-a", 2, "gen2"), ("caller-b", 3, "measured")]
+    transitions, proofs = [], []
+    for name, image, phase in order:
+        output_cursor = len(capture.lines)
+        request, _, t0, t1 = caller_exec(caller, stdout, images, "exec", pins[name])
+        transitions.append({"from_image": image - 1, "to_image": image, "mode": "leader",
+                            "same_path": False, "t0": t0, "t1": t1, "request": request})
+        proofs.append(warm_caller(capture, caller, stdout, images[-1], phases,
+                                  output_cursor=output_cursor,
+                                  marker_fn={1: "C_GetInfo", 2: "C_GetSessionInfo",
+                                             3: "C_GenerateRandom"}[image]))
+        count = 10 if phase == "measured" else 2
+        delay = 200 if phase == "measured" else 50
+        fn = {1: "C_GenerateRandom", 2: "C_GetInfo", 3: "C_GetSessionInfo"}[image]
+        drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, phases)
+    obs_rc, stopped, latency = stop_observer(owned)
+    dead_pid = caller.pid
+    caller_rc = stop_caller(caller, stdout, 3)
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = next(p for p in phases if p["phase"] == "measured")
+    receipt = {
+        "cell": "rapid-chain", "leg": f"trace/{backend}", "scope_kind": "pid",
+        "pid": dead_pid, "known_tids": [dead_pid], "owned_pids": [dead_pid],
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "stable", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 10, "phases": ["measured"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": proofs, "trace_generation_guards": True,
+        "initial_ready": initial_ready,
+        "exec_transitions": transitions, "phases": phases,
+        "require_named": True, "require_named_images": [3],
+        "first_unknown_images": [],
+        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {"session": True},
+        "session_reuse": session_reuse_from(ledger),
+        "requested_backend": backend,
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result, dead_pid
+
+
+@owned_leg
+def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
+    """Fresh same-image host under --system: independent admission, no history."""
+    leg_dir = Path(leg_dir)
+    leg_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    provider = ctx.provider_pin
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, image_pin,
+                                     provider, ctx.args.uid, ctx.args.gid, env,
+                                     tag="host")
+    stdout.record("ready", 0)
+    images = [image_pin.image_receipt(stdout.record("image", 0), caller)]
+    assert caller.pid != dead_pid
+    argv = [str(ctx.binary.path), "trace", "--system",
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "rapid-chain", "leg": f"reuse/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    initial_ready = warm_initial_caller(ctx, capture, caller, stdout, images[0], image_pin, provider, phases)
+    n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "measured", "selected",
+               0, None, phases)
+    obs_rc, stopped, latency = stop_observer(owned)
+    caller_rc = stop_caller(caller, stdout, 0)
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = next(phase for phase in phases if phase["phase"] == "measured")
+    receipt = {
+        "cell": "rapid-chain", "leg": f"reuse/{backend}", "scope_kind": "system",
+        "owned_pids": [caller.pid], "dead_pid": dead_pid,
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "host", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 5, "phases": ["measured"]},
+        "warmup": warmup_receipt(phases, measured["t0"]), "initial_ready": initial_ready,
+        "exec_transitions": [], "phases": phases,
+        "require_named": True, "require_named_images": [0], "first_unknown_images": [],
+        "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {}, "requested_backend": backend,
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+GROUP_DEATH_DWELL_NS = 3_000_000_000
+GROUP_DEATH_MIN_DWELL_NS = 2_000_000_000
+GROUP_DEATH_EXIT_LIMIT_NS = 60_000_000_000
+
+
+def finish_group_death_observer(owned, death_ns, limit_seconds=60):
+    """Wait for natural exit; a bounded signal fallback is cleanup only."""
+    if owned.popen.poll() is not None:
+        raise SetupError("observer already exited at the group-death check; "
+                         "exit ordering is unproven")
+    enter_phase("normal-stop")
+    deadline = death_ns + int(limit_seconds * 1e9)
+    try:
+        rc = wait_process(owned.popen, remaining_until(deadline))
+    except (subprocess.TimeoutExpired, TimeoutError):
+        # The autonomous-exit allowance is exhausted. Any controller stop
+        # belongs to cleanup, with no second normal-stop allowance.
+        enter_phase("cleanup")
+        cleanup_started = monotonic_ns()
+        owned.send(signal.SIGINT)
+        try:
+            rc = wait_process(owned.popen, 2)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            owned.send(signal.SIGKILL)
+            rc = wait_process(owned.popen, 3)
+        stopped = monotonic_ns()
+        latency = (cleanup_started - death_ns) / 1e9
+        owned.stop_receipt = {"stop_limit_seconds": limit_seconds,
+            "stop_latency_seconds": latency, "forced_cleanup": True,
+            "cleanup_limit_seconds": CLEANUP_SECONDS,
+            "cleanup_latency_seconds": (stopped - cleanup_started) / 1e9}
+        return {"rc": rc, "stopped_ns": stopped, "latency_seconds": latency,
+                "self_ended": False, "exited_ns": None,
+                "controller_stop": "SIGINT/kill-fallback"}
+    exited = monotonic_ns()
+    return {"rc": rc, "stopped_ns": exited,
+            "latency_seconds": (exited - death_ns) / 1e9,
+            "self_ended": True, "exited_ns": exited, "controller_stop": None}
+
+
+@owned_leg
+def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
+    """Whole-group death ends --pid capture: no post-death rows.
+
+    Brief line 101, death half: drive a nonempty named pre-death phase
+    under --pid, SIGKILL the entire owned process group at once, prove
+    death via waitpid plus /proc disappearance, wait boundedly for the
+    observer to exit autonomously, then require only pre-death rows
+    through the post-death dwell. Numeric PID reuse is never manufactured
+    (no sysctl); the real independently admitted replacement is the
+    sibling reuse leg, named in the receipt.
+    """
+    leg_dir = Path(leg_dir)
+    leg_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    provider = ctx.provider_pin
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, image_pin,
+                                     provider, ctx.args.uid, ctx.args.gid, env,
+                                     tag="doomed")
+    stdout.record("ready", 0)
+    images = [image_pin.image_receipt(stdout.record("image", 0), caller)]
+    argv = [str(ctx.binary.path), "trace", "--pid", str(caller.pid),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "rapid-chain", "leg": f"group-death/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "measured", "selected",
+               0, None, phases)
+    # Whole-group kill: the caller is an owned session/group leader, so
+    # killpg reaches every thread at once; nothing survives to keep the
+    # PID capture alive. Liveness before and death after are proven by
+    # the harness (pidfd identity, waitpid, /proc), never by p11scope.
+    caller.verify()
+    if owned.popen.poll() is not None:
+        raise SetupError("observer exited before the whole-group kill")
+    group_size_before = len(list((Path("/proc") / str(caller.pid) / "task").iterdir()))
+    dead_pid = caller.pid
+    kill_ns = monotonic_ns()
+    os.killpg(caller.pid, signal.SIGKILL)
+    caller_rc = wait_process(caller.popen, 10)
+    proc_gone = not (Path("/proc") / str(dead_pid)).exists()
+    death_ns = monotonic_ns()
+    observer_finish = finish_group_death_observer(
+        owned, death_ns, limit_seconds=GROUP_DEATH_EXIT_LIMIT_NS / 1e9)
+    obs_rc, stopped, latency = (observer_finish["rc"], observer_finish["stopped_ns"],
+                               observer_finish["latency_seconds"])
+    deadline = death_ns + GROUP_DEATH_DWELL_NS
+    while monotonic_ns() < deadline:
+        pause_until(deadline, 0.05)
+    dwell_end = monotonic_ns()
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = phases[0]
+    receipt = {
+        "cell": "rapid-chain", "leg": f"group-death/{backend}", "scope_kind": "pid",
+        "pid": dead_pid, "known_tids": [dead_pid], "owned_pids": [dead_pid],
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "pre-death", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 5, "phases": ["measured"]},
+        "warmup": {"label": "none", "t0": measured["t0"], "t1": measured["t0"],
+                   "expected_calls": 0, "phases": []},
+        "exec_transitions": [], "phases": phases,
+        "require_named": True, "require_named_images": [0], "first_unknown_images": [],
+        "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {}, "requested_backend": backend,
+        "group_death": {
+            "kill": "SIGKILL/killpg", "group_size_before": group_size_before,
+            "kill_ns": kill_ns, "death_ns": death_ns,
+            "reaped": caller.popen.returncode is not None, "proc_gone": proc_gone,
+            "manufactured_reuse": False, "replacement_leg": f"reuse/{backend}",
+            "min_dwell_ns": GROUP_DEATH_MIN_DWELL_NS,
+            "post_death_checked_ns": dwell_end,
+            "observer_self_ended": observer_finish["self_ended"],
+            "observer_exited_ns": observer_finish["exited_ns"],
+            "observer_exit_limit_ns": GROUP_DEATH_EXIT_LIMIT_NS,
+            "controller_stop": observer_finish["controller_stop"],
+        },
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+@owned_leg
+def run_cgroup_r2(ctx, cell_dir, backend):
+    """Observed-dir replacement: the new dir is not silently re-admitted."""
+    leg_dir = Path(cell_dir) / backend / "replacement"
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-r2")
+    image = leg_dir / "caller-a"
+    shutil.copyfile(ctx.pins["caller"].path, image)
+    image.chmod(0o755)
+    pin = leg_pin(ctx, image)
+    provider = ctx.provider_pin
+    root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
+    selected, selected_w = create_tracked(ctx, root.path / "selected")
+    outside, _ = create_tracked(ctx, root.path / "outside")
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin,
+                                     provider, ctx.args.uid, ctx.args.gid, env)
+    stdout.record("ready", 0)
+    images = [pin.image_receipt(stdout.record("image", 0), caller)]
+    moves = []
+    move_and_verify(selected, caller, moves, "initial")
+    argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "cgroup-reentry", "leg": f"replacement/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    enter_phase("fixed-measurement")
+    n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "warm", "selected",
+               0, selected, phases)
+    t_out = monotonic_ns()
+    move_and_verify(outside, caller, moves, "exit-for-replacement")
+    selected, selected_w, old_ino, new_ino = replace_tracked(ctx, selected, selected_w)
+    moves.append({"t": monotonic_ns(), "cgroup": str(selected.path),
+                  "note": f"replaced old-ino={old_ino} new-ino={new_ino}"})
+    # The new dir is held and enrolled for cleanup, but the observer still
+    # owns its original scope identity and must refuse silent re-admission.
+    actual = move_and_verify(selected, caller, moves, "replacement-entry")
+    n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "replaced", "selected",
+               0, None, phases)
+    assert cgroup_of(caller.pid) == actual
+    obs_rc, stopped, latency = stop_observer(owned)
+    caller_rc = stop_caller(caller, stdout, 0)
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    # The leg adapter removes the enrolled replacement after reaping both
+    # children and closing their readers/FDs, including on oracle failure.
+    warmup = next(p for p in phases if p["phase"] == "warm")
+    receipt = {
+        "cell": "cgroup-reentry", "leg": f"replacement/{backend}", "scope_kind": "cgroup",
+        "owned_pids": [caller.pid],
+        "scope_intervals": [
+            {"pid": caller.pid, "membership": "selected", "t0": ready, "t1": t_out},
+        ],
+        "moves": moves, "replacement": {"old_ino": old_ino, "new_ino": new_ino},
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "pre-replacement stable", "t0": warmup["t0"], "t1": warmup["t1"],
+                     "expected_calls": 3, "phases": ["warm"]},
+        "warmup": {"label": "none", "t0": warmup["t0"], "t1": warmup["t0"],
+                   "expected_calls": 0, "phases": []},
+        "exec_transitions": [], "phases": phases,
+        "require_named": False, "require_named_images": [], "first_unknown_images": [],
+        "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {}, "requested_backend": backend,
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# H6 harness: exec-freeze (ptrace) until successor admission is observed
+# ---------------------------------------------------------------------------
+#
+# Inventory rule R-C51-1 (documented product behavior): a usage row recorded
+# before its caller's admission never binds, so a successor generation whose
+# first call precedes the post-exec admission pass reads
+# unknown/use_before_admission forever — never a positive. Exact
+# ledger-matched successor counts therefore require every successor call to
+# post-date the admission the observer itself publishes in its event log.
+# The harness freezes the owned successor at exec (PTRACE_O_TRACEEXEC stops
+# it before its first user instruction) and resumes it only after the
+# public caller_event/admitted record for the new image is observed. R5
+# instead re-enters its descendant while stopped, resumes, and requires a
+# fresh completing admission pass; its successor S1 warmup is a separate gate.
+# This is harness-side scheduling of an owned process: it never touches
+# observer links or BPF state, and the ledger's t0/t1 stay truthful.
+
+_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+_PTRACE_SEIZE = 0x4206
+_PTRACE_INTERRUPT = 0x4207
+_PTRACE_CONT = 7
+_PTRACE_DETACH = 17
+_PTRACE_O_TRACEEXEC = 0x10
+_PTRACE_O_EXITKILL = 1 << 20
+_PTRACE_EVENT_EXEC = 4
+_PTRACE_EVENT_STOP = 128
+
+
+def _ptrace(request, pid, addr=0, data=0):
+    ctypes.set_errno(0)
+    result = _LIBC.ptrace(ctypes.c_ulong(request), ctypes.c_ulong(pid),
+                          ctypes.c_void_p(addr), ctypes.c_void_p(data))
+    error = ctypes.get_errno()
+    if result == -1:
+        raise SetupError(f"ptrace {request:#x} on {pid} failed: {os.strerror(error)}")
+    return result
+
+
+def seize_until_exec(pid, ctx, owner):
+    """Seize an owned pid; its next exec trap-stops before user code."""
+    if owner.pid != pid or owner not in ctx.owners:
+        raise SetupError("ptrace target is not the leg's registered owned child")
+    with cleanup_section():
+        owner.verify()
+        # SEIZE installs options while running; SETOPTIONS requires a stop.
+        _ptrace(_PTRACE_SEIZE, pid, 0, _PTRACE_O_TRACEEXEC | _PTRACE_O_EXITKILL)
+        try:
+            ctx.traced.append(owner)
+        except BaseException:
+            reap_traced_child(owner)  # acquired tracing must never escape custody
+            raise
+
+
+def wait_exec_stop(pid, timeout=120, *, deadline=None):
+    """Wait for the TRACEEXEC trap-stop; returns the stop time (ns)."""
+    if deadline is None:
+        enter_phase("successor-recovery", key=pid)
+        deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        done_pid, status = os.waitpid(pid, os.WNOHANG)
+        if done_pid == pid:
+            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                raise SetupError(f"owned pid {pid} died while frozen for exec")
+            if os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP:
+                if (status >> 16) == _PTRACE_EVENT_EXEC:
+                    stopped = monotonic_ns()
+                    remaining_until(deadline)
+                    return stopped
+                remaining_until(deadline)
+                _ptrace(_PTRACE_CONT, pid)  # unrelated trap: resume
+        if monotonic_ns() >= deadline:
+            raise SetupError(f"owned pid {pid} never reached its exec stop")
+        pause_until(deadline, 0.01)
+
+
+def ptrace_continue(pid):
+    check_dispatch()
+    _ptrace(_PTRACE_CONT, pid)
+
+
+def ptrace_detach(pid, ctx):
+    """Detach after an actual ptrace-stop has been consumed by this tracer."""
+    with cleanup_section():
+        owners = [owner for owner in ctx.traced if owner.pid == pid]
+        if len(owners) != 1 or not any(candidate is owners[0] for candidate in ctx.owners):
+            raise SetupError("ptrace detach target is not the registered traced owned child")
+        owner = owners[0]
+        owner.verify()
+        check_dispatch()
+        _ptrace(_PTRACE_DETACH, pid)
+        ctx.traced[:] = [candidate for candidate in ctx.traced if candidate is not owner]
+
+
+def ptrace_detach_running(pid, ctx):
+    """Interrupt the still-seized idle caller within its existing cleanup bound."""
+    with cleanup_section():
+        enter_phase("cleanup")
+        deadline = wait_deadline(3)
+        owners = [owner for owner in ctx.traced if owner.pid == pid]
+        if len(owners) != 1 or not any(candidate is owners[0] for candidate in ctx.owners):
+            raise SetupError("ptrace detach target is not the registered traced owned child")
+        owner = owners[0]
+        owner.verify()
+        remaining_until(deadline)
+        _ptrace(_PTRACE_INTERRUPT, pid)
+        while True:
+            remaining_until(deadline)
+            waited, status = os.waitpid(pid, os.WNOHANG | 0x40000000)  # __WALL
+            if waited:
+                if waited != pid:
+                    raise SetupError("ptrace interrupt returned another child's wait status")
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    owner.popen.returncode = os.waitstatus_to_exitcode(status)
+                    raise SetupError("owned ptrace target died before detach")
+                if not (os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP
+                        and status >> 16 == _PTRACE_EVENT_STOP):
+                    raise SetupError("owned ptrace target reached an unexpected detach stop")
+                remaining_until(deadline)
+                ptrace_detach(pid, ctx)
+                return
+            pause_until(deadline, 0.01)
+
+
+def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
+    """Wait for caller_event/admitted for (pid, exe) in an inventory event log."""
+    deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        try:
+            text = Path(jsonl_path).read_text()
+        except FileNotFoundError:
+            text = ""
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("kind") != "caller_event":
+                continue
+            event = record.get("event", {})
+            if event.get("event") != "admitted":
+                continue
+            caller = ((event.get("identity_context") or {}).get("caller") or {})
+            if caller.get("pid") == pid and (
+                    caller.get("executable") or {}).get("path") == exe:
+                return {"caller": event.get("caller"),
+                        "incarnation": caller.get("incarnation"),
+                        "at_ns": record.get("at_ns")}
+        if monotonic_ns() >= deadline:
+            raise SetupError(f"caller ({pid}, {exe}) never admitted")
+        pause_until(deadline, 0.2)
+
+
+# Narrow R5 limits: the producer rotates at 1 MiB, bounds compact identity
+# context at 64 KiB, and caps edge/instance changed-row batches at 4096.
+# Allow a context plus 2 KiB of envelope and two batches in this small leg.
+# Larger unrelated rows/populations explicitly refuse this admission gate.
+R5_STREAM_BYTES = 1_048_576
+R5_LINE_BYTES = 65_536 + 2048
+R5_STREAM_RECORDS = 2 * 4096
+R5_READ_BYTES = 16_384
+
+
+def check_r5_work(deadline=None):
+    check_dispatch()
+    if deadline is not None:
+        remaining_until(deadline)
+
+
+class R5AdmissionCursor:
+    """Held, append-only stream boundary derived before the owned outside exec."""
+    def __init__(self, path, owner, original_executable):
+        self.path = Path(path)
+        self.owner, self.birth_identity = owner, dict(owner.identity)
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SetupError("R5 admission stream is not a regular file")
+            self.identity = info.st_dev, info.st_ino
+            self.observed_bytes, self.observed_digest = 0, hashlib.sha256(b"").digest()
+            original_executable.verify()
+            image = original_executable.image_receipt({"image": 0}, owner)
+            records, _complete = self.read()
+            self.started_ns = records[0]["event"]["started_ns"]
+            self.seq = records[-1]["seq"] if records else -1
+            self.at_ns = records[-1]["at_ns"] if records else 0
+            self.saved_bytes = self.complete_bytes
+            admitted, committed = None, None
+            for record in records:
+                check_r5_work()
+                event = record["event"]
+                if record["kind"] == "caller_event" and event.get("event") == "admitted":
+                    context = r5_admitted_subject(event)
+                    if context.get("pid") == owner.pid:
+                        caller = r5_caller_context(event, owner, image)
+                        admitted = {"caller": caller["id"], "incarnation": caller["incarnation"],
+                                    "subject": caller, "seq": record["seq"]}
+                        committed = None
+                elif record["kind"] == "pass_committed" and admitted is not None:
+                    committed = r5_pass_receipt(record)
+                elif record["kind"] == "caller_event" and admitted is not None and (
+                        event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):
+                    raise SetupError("R5 original caller was already retired")
+            if admitted is None or committed is None:
+                raise SetupError("R5 original caller lacks complete same-stream admission/pass")
+            self.retired_caller = admitted["caller"]
+            self.retired_incarnation = admitted["incarnation"]
+            self.retired_subject = admitted["subject"]
+            self.retired_admission_seq = admitted["seq"]
+            self.original_image, self.completed_pass = image, committed
+            self.saved_gaps = [record for record in records if record["kind"] == "gap_recorded"]
+        except BaseException:
+            self.close()
+            raise
+
+    def verify_stream(self):
+        held, current = os.fstat(self.fd), self.path.stat(follow_symlinks=False)
+        if (held.st_dev, held.st_ino) != self.identity or (
+                current.st_dev, current.st_ino) != self.identity or not stat.S_ISREG(current.st_mode):
+            raise SetupError("R5 admission stream rotated or was replaced")
+        if held.st_size > R5_STREAM_BYTES:
+            raise SetupError(f"R5 stream byte budget exceeded ({R5_STREAM_BYTES})")
+        if held.st_size < self.observed_bytes:
+            raise SetupError("R5 admission stream truncated observed history")
+        return held.st_size
+
+    def read(self, deadline=None, *, final=False, full=False):
+        check_r5_work(deadline)
+        size = self.verify_stream()  # before any data allocation
+        parse_start = 0 if full else getattr(self, "saved_bytes", 0)
+        seq = 0 if full else getattr(self, "seq", -1) + 1
+        last_time = 0 if full else getattr(self, "at_ns", 0)
+        records, pending = [], bytearray()
+        digest, prefix_digest = hashlib.sha256(), hashlib.sha256()
+        offset, complete_bytes = 0, parse_start
+        while offset < size:
+            check_r5_work(deadline)
+            chunk = os.pread(self.fd, min(R5_READ_BYTES, size - offset), offset)
+            check_r5_work(deadline)
+            if not chunk:
+                raise SetupError("R5 admission stream truncated during read")
+            digest.update(chunk)
+            check_r5_work(deadline)
+            prefix_size = min(len(chunk), max(0, self.observed_bytes - offset))
+            prefix_digest.update(memoryview(chunk)[:prefix_size])
+            check_r5_work(deadline)
+            index = max(0, parse_start - offset)
+            while index < len(chunk):
+                check_r5_work(deadline)
+                if seq >= R5_STREAM_RECORDS:
+                    raise SetupError(f"R5 stream record budget exceeded ({R5_STREAM_RECORDS})")
+                newline = chunk.find(b"\n", index)
+                end = len(chunk) if newline < 0 else newline
+                if len(pending) + end - index + (newline >= 0) > R5_LINE_BYTES:
+                    raise SetupError(f"R5 stream line byte budget exceeded ({R5_LINE_BYTES})")
+                pending.extend(memoryview(chunk)[index:end])
+                if newline < 0:
+                    break
+                try:
+                    record = json.loads(pending)
+                except (ValueError, UnicodeError) as error:
+                    raise SetupError("R5 admission stream has a malformed complete record") from error
+                check_r5_work(deadline)
+                if (not isinstance(record, dict) or record.get("schema") != "p11scope/inventory-events/v1"
+                        or type(record.get("seq")) is not int or record["seq"] != seq
+                        or type(record.get("at_ns")) is not int or record["at_ns"] < last_time
+                        or not isinstance(record.get("kind"), str) or not isinstance(record.get("event"), dict)):
+                    raise SetupError("R5 admission stream has unknown schema or invalid sequence/envelope")
+                if (seq == 0 and record["kind"] != "started") or (seq and record["kind"] == "started"):
+                    raise SetupError("R5 admission stream is not the original observer run")
+                if record["kind"] in ("rotated", "retention_evicted") or (
+                        record["kind"] == "ended" and not final):
+                    raise SetupError("R5 admission stream rotated, evicted history or ended")
+                if records and records[-1]["kind"] == "ended":
+                    raise SetupError("R5 admission stream continued after ended")
+                last_time = record["at_ns"]
+                records.append(record)
+                seq += 1
+                complete_bytes = offset + newline + 1
+                pending.clear()
+                index = newline + 1
+            offset += len(chunk)
+        if prefix_digest.digest() != self.observed_digest:
+            raise SetupError("R5 admission stream rewrote observed history")
+        self.verify_stream()  # rotation/oversize during the bounded read refuses
+        check_r5_work(deadline)
+        self.observed_bytes, self.observed_digest = size, digest.digest()
+        self.complete_bytes = complete_bytes
+        # Parse only the suffix after the saved complete cursor. Previously
+        # observed bytes, including partial tails, still receive append checks.
+        return records, not pending
+
+    def receipt(self):
+        return {"stream_identity": list(self.identity), "bytes": self.saved_bytes,
+                "seq": self.seq, "at_ns": self.at_ns,
+                "retired_caller": self.retired_caller, "retired_incarnation": self.retired_incarnation,
+                "retired_subject": self.retired_subject,
+                "original_image": self.original_image, "completed_pass": self.completed_pass}
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def r5_admitted_subject(event, subject="caller"):
+    context = event.get("identity_context")
+    if not isinstance(context, dict) or type(context.get("version")) is not int or context["version"] != 1:
+        raise SetupError("R5 caller lacks supported complete identity context")
+    caller = context.get(subject)
+    if not isinstance(caller, dict):
+        raise SetupError("R5 caller identity context is unavailable")
+    return caller
+
+
+def r5_caller_context(event, owner, image, *, subject="caller", lifecycle="mapped"):
+    caller = r5_admitted_subject(event, subject)
+    executable = caller.get("executable")
+    if (not isinstance(event.get(subject), str) or not re.fullmatch(r"c[0-9]+", event[subject])
+            or caller.get("id") != event[subject] or type(caller.get("pid")) is not int
+            or caller["pid"] != owner.pid or type(caller.get("start_time")) is not int
+            or caller["start_time"] != owner.identity["start_time"]
+            or type(caller.get("incarnation")) is not int or caller["incarnation"] < 0
+            or caller.get("authority") not in ("native_exact", "scan_pinned")
+            or caller.get("lifecycle") != lifecycle or caller.get("status") != "observed"
+            or not isinstance(executable, dict)):
+        raise SetupError("R5 caller context disagrees with owned birth/caller/incarnation")
+    expected = {"path": image["path"], "dev": image["dev"], "ino": image["ino"],
+                "mtime_secs": image["mtime_ns"] // 1_000_000_000,
+                "mtime_nanos": image["mtime_ns"] % 1_000_000_000}
+    if any(executable.get(key) != value or type(executable.get(key)) is not type(value)
+           for key, value in expected.items()):
+        raise SetupError("R5 caller executable differs from the held actual owned image")
+    return caller
+
+
+def r5_pass_receipt(record):
+    event = record["event"]
+    if type(event.get("pass")) is not int or event["pass"] < 0 or event.get("final", False) is not False:
+        raise SetupError("R5 admission lacks a live completing pass")
+    return {"seq": record["seq"], "at_ns": record["at_ns"], "pass": event["pass"]}
+
+
+def r5_admission_checkpoint(ctx, path, owner, original_executable):
+    with cleanup_section():
+        cursor = R5AdmissionCursor(path, owner, original_executable)
+        ctx.leg_pins.append(cursor)
+    return cursor
+
+
+def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_before_ns, timeout=90):
+    """Fresh identity admission only; provider/S1 readiness is a separate gate."""
+    if (Path(jsonl_path) != cursor.path or owner is not cursor.owner
+            or owner.identity != cursor.birth_identity):
+        raise SetupError("R5 admission wait changed the retained observer stream or original owner")
+    deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        executable.verify()
+        image = executable.image_receipt({"image": 1}, owner)
+        records, complete = cursor.read(deadline)
+        admitted, committed = None, None
+        for record in records:
+            check_r5_work(deadline)
+            if record["seq"] <= cursor.seq:
+                continue
+            event = record["event"]
+            if record["kind"] == "caller_event" and admitted is not None and (
+                    event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):
+                raise SetupError("R5 successor retired before admission completion")
+            if record["kind"] == "caller_event" and event.get("event") in ("admitted", "exec_retired"):
+                subject = "new" if event["event"] == "exec_retired" else "caller"
+                context = r5_admitted_subject(event, subject)
+                if context.get("pid") != owner.pid and not (
+                        subject == "new" and event.get("old") == cursor.retired_caller):
+                    continue
+                if subject == "new":
+                    old = r5_caller_context(event, owner, cursor.original_image,
+                                            subject="old", lifecycle="exec_retired")
+                    if old != {**cursor.retired_subject, "lifecycle": "exec_retired"}:
+                        raise SetupError("R5 committed handoff changed the saved retired subject")
+                caller = r5_caller_context(event, owner, image, subject=subject)
+                if (caller["id"] == cursor.retired_caller
+                        or caller["incarnation"] != cursor.retired_incarnation + 1
+                        or record["at_ns"] < not_before_ns):
+                    raise SetupError("R5 admission reused stale caller/incarnation or preceded verified re-entry")
+                admitted = {"caller": caller["id"], "incarnation": caller["incarnation"],
+                            "seq": record["seq"], "at_ns": record["at_ns"], "image": image,
+                            "publication": event["event"]}
+                committed = None
+            elif record["kind"] == "pass_committed" and admitted is not None:
+                committed = r5_pass_receipt(record)
+                if committed["pass"] <= cursor.completed_pass["pass"]:
+                    raise SetupError("R5 completing pass borrowed pre-exec history")
+        if complete and admitted is not None and committed is not None:
+            remaining_until(deadline)
+            executable.verify()
+            executable.image_receipt({"image": 1}, owner)
+            remaining_until(deadline)
+            return {**admitted, "completed_pass": committed}
+        pause_until(deadline, 0.2)
+
+
+def inventory_early_gaps(records, owner, admission, module, lower, upper):
+    """Same-stream caller IDs bind birth/incarnation; PID-only gaps need its interval."""
+    return [record for record in records if record["kind"] == "gap_recorded"
+            and record["event"].get("module") == module
+            and record["seq"] > admission["seq"] and lower <= record["at_ns"] <= upper
+            and record["event"].get("pid") in (None, owner.pid)
+            and (record["event"].get("caller") == admission["caller"]
+                 or record["event"].get("caller") is None and record["event"].get("pid") == owner.pid)
+            and record["event"].get("reason") in (
+                "use_before_admission", "before_admission", "before_semantic_boundary",
+                "retired_before_coverage", "instance_unproven", "provider_instance_unproven")]
+
+
+RECOVERED_HISTORY_LIMITATION = (
+    "Exact independently ledgered fixed-workload outcomes with retained partial history; "
+    "sticky public loss reasons cannot count repeated same-reason idle cuts.")
+
+
+def inventory_inherited_no_calls(row):
+    api = row.get("api_returns") or {}
+    return (api.get("count") is None and api.get("saturated") is False
+        and api.get("historical_only_returns") == 0 and row.get("mechanisms") is None
+        and row.get("operations") is None and row.get("semantics") == "unknown (no calls observed)"
+        and row.get("coverage") == {"lossy": True, "reasons": ["no_calls", "semantic_loss"]})
+
+
+def inventory_recovered_quiet_instance(record, recovery):
+    if recovery is None or not inventory_inherited_no_calls(recovery["successor_semantic"]["event"]):
+        return False
+    first, positive = recovery["successor_instance"], recovery["successor_first_return"]
+    row = record["event"]
+    return (record["kind"] == "instance_observed" and record["seq"] >= first["seq"]
+        and (positive is None or record["seq"] < positive["seq"])
+        and all(row.get(key) == first["event"].get(key) for key in ("id", "caller", "module"))
+        and (row.get("state"), row.get("reason")) == ("uncertain", "semantic_loss"))
+
+
+def inventory_recovered_history(records, previous, owner, image, provider, admission, semantic):
+    """Bind the one supported inherited-loss shape to this observer's exec history.
+
+    This is an outcome receipt, not proof of uninterrupted capture. H2 keeps
+    domain loss disclosure on a separately proven H6 successor indefinitely.
+    """
+    if previous is None:
+        return None
+    proof, end = previous["proof"], previous["end"]
+    old_image = proof["image"]
+    if (proof["incarnation"] != 0 or admission["incarnation"] != 1
+            or old_image["pid"] != owner.pid or old_image["start_time"] != image["start_time"]
+            or proof["provider"] != provider or proof["caller"] == admission["caller"]
+            or proof["instance"] == semantic["event"]["instance"]
+            or proof["module"] != semantic["event"]["module"]
+            or inventory_semantic_totals(end["semantic"]["event"]) is None
+            or (end["instance"]["event"].get("state"), end["instance"]["event"].get("reason"))
+               != ("observed", None)):
+        raise SetupError("Inventory recovered history lacks its clean original measured endpoint")
+    by_seq = {row["seq"]: row for row in records}
+    if any(by_seq.get(end[field]["seq"]) != end[field] for field in ("physical", "instance", "semantic", "pass")):
+        raise SetupError("Inventory recovered history borrowed another stream's original endpoint")
+    admitted = by_seq.get(admission["seq"])
+    if (admitted is None or admitted["kind"] != "caller_event"
+            or admitted["event"].get("event") not in ("admitted", "exec_retired")):
+        raise SetupError("Inventory recovered history lacks its actual successor admission")
+    subject = "new" if admitted["event"].get("event") == "exec_retired" else "caller"
+    current = r5_caller_context(admitted["event"], owner, image, subject=subject)
+    if (current["id"], current["incarnation"]) != (admission["caller"], admission["incarnation"]):
+        raise SetupError("Inventory recovered history changed successor admission identity")
+    retirements = [row for row in records if end["pass"]["seq"] < row["seq"] <= admission["seq"]
+                   and inventory_exec_retirement(row, proof["caller"])]
+    if len(retirements) != 1:
+        raise SetupError("Inventory recovered history lacks one original exec retirement")
+    retirement = retirements[0]
+    old = r5_caller_context(retirement["event"], owner, old_image,
+        subject=inventory_exec_retirement(retirement, proof["caller"]), lifecycle="exec_retired")
+    if old["incarnation"] != proof["incarnation"]:
+        raise SetupError("Inventory recovered history changed the retired incarnation")
+    first = next((row for row in records if row["kind"] == "semantic_edge_observed"
+                  and row["event"].get("instance") == semantic["event"]["instance"]), None)
+    if first is None or first["seq"] <= admission["seq"]:
+        raise SetupError("Inventory recovered history lacks its first successor semantic publication")
+    first_return = next((row for row in records if row["kind"] == "semantic_edge_observed"
+        and row["event"].get("instance") == semantic["event"]["instance"]
+        and type((row["event"].get("api_returns") or {}).get("count")) is int
+        and row["event"]["api_returns"]["count"] > 0), None)
+    if any(not inventory_inherited_no_calls(row["event"]) for row in records
+           if row["kind"] == "semantic_edge_observed" and row["event"].get("instance") == semantic["event"]["instance"]
+           and (first_return is None or row["seq"] < first_return["seq"])):
+        raise SetupError("Inventory recovered history changed its inherited no-call prefix")
+    old_instances = [row for row in records if retirement["seq"] < row["seq"] < first["seq"]
+        and row["kind"] == "instance_observed" and row["event"].get("id") == proof["instance"]
+        and (row["event"].get("caller"), row["event"].get("module"), row["event"].get("state"),
+             row["event"].get("reason")) == (proof["caller"], proof["module"], "retired", "instance_retired")]
+    old_loss = [row for row in records if retirement["seq"] < row["seq"] < first["seq"]
+        and row["kind"] == "semantic_edge_observed" and row["event"].get("instance") == proof["instance"]
+        and (row["event"].get("caller"), row["event"].get("module")) == (proof["caller"], proof["module"])
+        and (row["event"].get("coverage") or {}).get("lossy") is True
+        and {"instance_retired", "semantic_loss"} <= set(row["event"]["coverage"].get("reasons", []))
+        <= {"instance_retired", "image_retired", "semantic_loss"}]
+    if (not old_instances or not old_loss
+            or not (first["event"].get("coverage") == {"lossy": True, "reasons": ["semantic_loss"]}
+                    or inventory_inherited_no_calls(first["event"]))):
+        raise SetupError("Inventory recovered history lacks retained old loss before the successor boundary")
+    first_instance = next((row for row in records if row["kind"] == "instance_observed"
+        and row["event"].get("id") == semantic["event"]["instance"]), None)
+    if (first_instance is None or not admission["seq"] < first_instance["seq"] < first["seq"]
+            or (first_instance["event"].get("caller"), first_instance["event"].get("module"))
+                != (admission["caller"], proof["module"])
+            or not ((first_instance["event"].get("state"), first_instance["event"].get("reason")) == ("observed", None)
+                or (first_instance["event"].get("state"), first_instance["event"].get("reason")) == ("uncertain", "semantic_loss")
+                    and inventory_inherited_no_calls(first["event"]))):
+        raise SetupError("Inventory recovered history lacks its supported initial successor registration")
+    return {"previous_end_seq": end["pass"]["seq"], "retirement": retirement,
+        "old_instance": old_instances[0], "old_semantic": old_loss[0],
+        "successor_admission": admitted, "successor_instance": first_instance, "successor_semantic": first,
+        "successor_first_return": first_return,
+        "limitation": RECOVERED_HISTORY_LIMITATION}
+
+
+def inventory_semantic_totals(row, *, recovered=False):
+    api, ops = row.get("api_returns") or {}, row.get("operations") or {}
+    fields = {"api": api.get("count"), **{key: ops.get(key) for key in
+              ("calls", "completed", "failed", "unknown", "orphans", "dropped")}}
+    if any(type(value) is not int or value < 0 for value in fields.values()):
+        return None
+    if fields["calls"] > fields["api"] or fields["completed"] + fields["failed"] > fields["api"]:
+        return None
+    coverage = row.get("coverage") or {}
+    allowed_coverage = {"lossy": True, "reasons": ["semantic_loss"]} if recovered else {"lossy": False, "reasons": []}
+    if (api.get("saturated") is not False or api.get("historical_only_returns") != 0
+            or coverage != allowed_coverage or row.get("semantics") != "observed"):
+        return None
+    mechanisms = {}
+    for mech in row.get("mechanisms") or []:
+        key = mechanism_row_id(mech)
+        values = mech.get("calls"), mech.get("errors")
+        if key in mechanisms or any(type(value) is not int or value < 0 for value in values):
+            raise SetupError("Inventory S1 mechanism counters are duplicate or invalid")
+        mechanisms[key] = list(values)
+    if not mechanisms:
+        return None
+    return {**fields, "mechanisms": mechanisms}
+
+
+def inventory_early_phase_populations(batches, expected, physical, api, *, api_expected=None,
+                                      physical_hooks=None, started_ns=0):
+    api_expected = expected if api_expected is None else api_expected
+    result = {}
+    for label, predicate in (("setup", lambda phase: phase == "h6-setup"),
+                              ("warmup", lambda phase: phase.startswith("h6-warm"))):
+        population = [row for row in batches if predicate(row["phase"]) and row["t0"] >= started_ns]
+        count = sum(row["n"] for row in population if inventory_physical_batch(row, physical_hooks))
+        api_count = sum(row["n"] for row in population if row["fn"] != "C_GetFunctionList")
+        result[label] = {"phases": sorted({row["phase"] for row in population}), "expected": count,
+            "api_expected": api_count,
+            "observed_physical": count if physical == expected else None,
+            "observed_api": api_count if api == api_expected else None,
+            "missed_physical": 0 if physical == expected else None,
+            "missed_api": 0 if api == api_expected else None,
+            "physical_phase_attribution_unknown": 0 if physical == expected else count,
+            "api_phase_attribution_unknown": 0 if api == api_expected else api_count}
+    return result
+
+
+def inventory_boundary(records, owner, image, provider, admission, floor, marker, prefix_batches,
+                       *, exact=False, deadline=None, prior=None, physical_hooks=None, started_ns=0,
+                       recovery_from=None):
+    """Derive a complete idle boundary from the actual same-observer records.
+
+    Physical and instance rows are cumulative replacements. A pass without a
+    changed physical row cannot refresh a stale bucket. Coalesced rows may
+    complete in later passes; none are accepted until their actual marker and
+    the emitter's deferred accounting settle.
+    """
+    physical, instances, semantics, settled = None, {}, {}, None
+    if prior:
+        row = prior["instance"]
+        instances[row["event"]["id"]] = row
+    ack = marker["ack"]
+    selected = admission["caller"]
+    emitted = Counter()
+    for record in records:
+        check_r5_work(deadline)
+        event, kind = record["event"], record["kind"]
+        if record["seq"] <= floor:
+            continue
+        emission = {"edge_observed": "edge_events", "instance_observed": "instance_events",
+                    "semantic_edge_observed": "semantic_edge_events"}.get(kind)
+        if emission:
+            emitted[emission] += 1
+        if kind == "caller_event" and event.get("event") != "admitted" and (
+                event.get("caller") == selected or event.get("old") == selected):
+            raise SetupError("Inventory selected caller retired before its idle boundary")
+        if kind == "edge_observed" and event.get("caller") == selected:
+            caller = r5_caller_context(event, owner, image)
+            if caller["incarnation"] != admission["incarnation"]:
+                raise SetupError("Inventory physical proof changed caller incarnation")
+            module = r5_admitted_subject(event, "module")
+            mapping = provider["mapping"]
+            if (module.get("status") != "observed" or module.get("id") != event.get("module")
+                    or any(type(module.get(key)) is not int for key in ("device_major", "device_minor", "inode"))
+                    or [module.get("device_major"), module.get("device_minor")] != mapping["dev"]
+                    or module.get("inode") != mapping["ino"]):
+                continue  # a sibling module, pathname or equal digest is no proof
+            if physical and physical["event"]["module"] != event["module"]:
+                raise SetupError("Inventory held provider acquired ambiguous module IDs")
+            physical, settled = record, None
+        elif kind == "instance_observed" and event.get("caller") == selected:
+            # Measurement already authorized one instance. Its retirement or
+            # replacement cannot recover while waiting for coalesced counts.
+            # Readiness has no prior instance and keeps its discovery waits.
+            if prior and event.get("module") == prior["instance"]["event"]["module"]:
+                if event.get("id") != prior["instance"]["event"]["id"]:
+                    raise SetupError("Inventory measured phase changed its authorized instance")
+                if event.get("state") != "observed" or event.get("reason") is not None:
+                    raise SetupError("Inventory measured instance is retired or uncertain")
+            instances[event.get("id")] = record
+            settled = None
+        elif kind == "semantic_edge_observed" and event.get("caller") == selected:
+            if prior and event.get("instance") == prior["instance"]["event"]["id"] and (
+                    event.get("coverage") != prior["semantic"]["event"].get("coverage")
+                    or (event.get("api_returns") or {}).get("historical_only_returns") != 0):
+                raise SetupError("Inventory measured semantic authority gained loss or historical returns")
+            semantics[event.get("instance")] = record
+            settled = None
+        elif kind == "pass_committed":
+            completion = r5_pass_receipt(record)
+            deferred = [event.get(key) for key in ("edge_events_deferred", "instance_events_deferred",
+                                                   "semantic_edge_events_deferred")]
+            written = [event.get(key) for key in ("edge_events", "instance_events", "semantic_edge_events")]
+            if any(type(value) is not int or value < 0 for value in deferred + written):
+                raise SetupError("Inventory pass lacks explicit bounded emitter accounting")
+            if any(event[key] < emitted[key] for key in (
+                    "edge_events", "instance_events", "semantic_edge_events")):
+                raise SetupError("Inventory pass accounting omits actual emitted proof rows")
+            emitted.clear()
+            if physical is not None and not any(deferred) and completion["pass"] > admission["completed_pass"]["pass"]:
+                settled = record
+    if physical is None or settled is None:
+        return None
+    edge = physical["event"]
+    entries = edge.get("entries") or {}
+    if ((edge.get("mapping") or {}).get("state") != "mapped"
+            or coverage_of(edge).get("state") != "counted" or coverage_of(edge).get("lossy")
+            or type(entries.get("count")) is not int or entries["count"] <= 0
+            or entries.get("saturated")):
+        return None
+    candidates = [row for row in instances.values() if row["event"].get("module") == edge["module"]]
+    if len(candidates) != 1:
+        return None  # physical totals cannot be divided among instance rows
+    instance = candidates[0]
+    semantic = semantics.get(instance["event"]["id"])
+    if semantic is None or semantic["event"].get("module") != edge["module"]:
+        return None
+    recovery = prior.get("recovery") if prior else None
+    if prior is None and (semantic["event"].get("coverage") or {}).get("lossy"):
+        recovery = inventory_recovered_history(records, recovery_from, owner, image, provider, admission, semantic)
+    if instance["event"].get("state") != "observed" or instance["event"].get("reason") is not None:
+        if (prior is None and inventory_recovered_quiet_instance(instance, recovery)
+                and inventory_inherited_no_calls(semantic["event"])):
+            return None
+        raise SetupError("Inventory S1 instance is retired or uncertain")
+    counts = inventory_semantic_totals(semantic["event"], recovered=recovery is not None)
+    if counts is None or counts["api"] <= 0 or counts["completed"] <= 0:
+        return None
+    if any(row["seq"] >= settled["seq"] for row in (physical, instance, semantic)):
+        return None
+    key = (owner.pid, admission["incarnation"], provider["path"])
+    hooks = (physical_hooks or {}).get(provider["path"])
+    if hooks is not None and hooks["provider"] != provider:
+        raise SetupError("Inventory physical hooks changed the held provider")
+    totals = ledger_s1_totals(prefix_batches, 0)
+    api_expected = totals[5].get(key, 0)
+    expected = counted_totals(prefix_batches, started_ns, physical_hooks=physical_hooks).get(key, 0)
+    warm = [row for row in marker["batches"] if row["fn"] != "C_GetFunctionList"
+            and row["phase"].startswith("h6-warm")]
+    if not warm and ack["command"] == "W":
+        raise SetupError("Inventory warmup acknowledgment lacks independently ledgered real work")
+    finish = [row["t1"] for row in marker["batches"]
+              if row["fn"] in S1_DIRECT_FNS | S1_FINISH_FNS]
+    last_call = max(finish, default=ack["t0"])
+    observed_last = (semantic["event"].get("operations") or {}).get("last_seen_ns")
+    if (physical["at_ns"] < last_call or semantic["at_ns"] < last_call or settled["at_ns"] < ack["t1"]
+            or type(observed_last) is not int or not last_call <= observed_last <= settled["at_ns"]
+            or entries["count"] > expected or counts["api"] > api_expected
+            or counts["completed"] > totals[2].get(key, 0)
+            or counts["failed"] > totals[3].get(key, 0)):
+        return None
+    for mech, values in counts["mechanisms"].items():
+        if values[0] > totals[0].get(key + (mech,), 0) or values[1] > totals[1].get(key + (mech,), 0):
+            return None
+    lower = min(row["t0"] for row in prefix_batches
+                if (row["pid"], row["gen"], row["module"]) == key)
+    gaps = inventory_early_gaps(records, owner, admission, edge["module"], lower, settled["at_ns"])
+    if entries["count"] < expected or counts["api"] < api_expected:
+        if (exact or not gaps or type(entries.get("last_seen_ns")) is not int
+                or entries["last_seen_ns"] < last_call or entries["count"] < sum(row["n"] for row in warm)):
+            return None
+    else:
+        gaps = [row for row in gaps if row["event"].get("reason") == "before_semantic_boundary"
+                and row["event"].get("subject") in SEMANTIC_EARLY_SUBJECTS]
+    if ack["command"] == "W":
+        marker_totals = ledger_s1_totals(warm, 0)
+        if counts["completed"] < marker_totals[2].get(key, 0):
+            return None
+    return {"physical": physical, "instance": instance, "semantic": semantic, "pass": settled,
+            "recovery": recovery,
+            "counts": {"physical": entries["count"], **counts},
+            "early": {"physical_expected": expected, "physical_observed": entries["count"],
+                      "physical_missed": expected - entries["count"], "api_expected": api_expected,
+                      "api_observed": counts["api"], "api_missed": api_expected - counts["api"],
+                      "unknown": counts["unknown"], "gaps": gaps,
+                      "populations": inventory_early_phase_populations(
+                          [row for row in prefix_batches if (row["pid"], row["gen"], row["module"]) == key],
+                          expected, entries["count"], counts["api"], api_expected=api_expected,
+                          physical_hooks=physical_hooks, started_ns=started_ns)}}
+
+
+def inventory_readiness_retry_ready(records, admission, floor, ack, deadline):
+    """Pace priming work after publication opportunities, never confer readiness.
+
+    inventory_boundary has already validated these passes' emitter accounting.
+    The first post-ACK pass can publish an already staged semantic batch; hold
+    the caller idle for a second settled pass before advancing its work marker.
+    """
+    opportunities, deferred = set(), False
+    for record in records:
+        check_r5_work(deadline)
+        if record["seq"] <= floor or record["kind"] != "pass_committed":
+            continue
+        completion = r5_pass_receipt(record)
+        if completion["at_ns"] <= ack["t1"] or completion["pass"] <= admission["completed_pass"]["pass"]:
+            continue
+        deferred = any(record["event"][key] for key in (
+            "edge_events_deferred", "instance_events_deferred", "semantic_edge_events_deferred"))
+        if not deferred:
+            opportunities.add(completion["pass"])
+    return len(opportunities) >= 2 and not deferred
+
+
+def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, attempt, deadline,
+                            *, prefix_batches=(), prefix_markers=(), physical_hooks=None, recovery_from=None):
+    """Release measurement only on fresh held-provider/instance/S1 proof."""
+    if owner is not cursor.owner or owner.identity != cursor.birth_identity:
+        raise SetupError("Inventory readiness changed the original owned birth or observer cursor")
+    remaining_until(deadline)
+    started = prefix_markers[0]["ack"]["t0"] if prefix_markers else monotonic_ns()
+    provider = provider_receipt(provider_pin)
+    prefix, markers = list(prefix_batches), list(prefix_markers)
+    for number in range(max(1, len(markers)), 21):
+        remaining_until(deadline)
+        executable.verify()
+        image = executable.image_receipt({"image": admission["incarnation"]}, owner)
+        # Initial readiness already owns ACKed W1. Observe it before deciding
+        # whether another real entry is needed to prime native admission.
+        fresh = number > len(markers)
+        marker = attempt(number, deadline) if fresh else markers[-1]
+        ack = marker["ack"]
+        if (ack.get("command") != "W" or ack.get("attempt") != number
+                or ack.get("gen") != admission["incarnation"] or ack.get("idle") != 1
+                or not started <= ack["t0"] <= ack["t1"] < deadline):
+            raise SetupError("Inventory readiness has a stale or unbounded real warmup attempt")
+        if fresh:
+            markers.append(marker)
+            prefix.extend(marker["batches"])
+        # Observe while this caller is acknowledged idle. A redraw read later
+        # cannot replace a missing count/semantic marker or completing pass.
+        while True:
+            records, complete = cursor.read(deadline, full=recovery_from is not None)
+            boundary = inventory_boundary(records if recovery_from is not None else cursor.saved_gaps + records,
+                owner, image, provider,
+                admission, max(cursor.seq, admission["seq"]), marker, prefix, deadline=deadline,
+                physical_hooks=physical_hooks, started_ns=cursor.started_ns, recovery_from=recovery_from)
+            if complete and boundary is not None:
+                remaining_until(deadline)
+                executable.verify()
+                executable.image_receipt({"image": admission["incarnation"]}, owner)
+                if provider_receipt(provider_pin) != provider:
+                    raise SetupError("Inventory held provider custody changed during readiness")
+                remaining_until(deadline)
+                return {"caller": admission["caller"], "incarnation": admission["incarnation"],
+                    "module": boundary["physical"]["event"]["module"],
+                    "instance": boundary["instance"]["event"]["id"], "image": image,
+                    "provider": provider, "admission": admission, "cursor": cursor.receipt(),
+                    "physical_hooks": physical_hooks or {}, "observer_started_ns": cursor.started_ns,
+                    "started_ns": started, "observed_ns": monotonic_ns(), "deadline_ns": deadline,
+                    "attempts": number, "max_attempts": 20, "markers": markers,
+                    "baseline": boundary}
+            if complete and inventory_readiness_retry_ready(records, admission,
+                    max(cursor.seq, admission["seq"]), ack, deadline):
+                break
+            pause_until(deadline, 0.05)
+    raise SetupError("Inventory provider/instance/S1 readiness exhausted 20 bounded real attempts")
+
+
+def wait_inventory_measured_boundary(owner, executable, provider_pin, admission, cursor,
+                                     proof, marker, prefix_batches, deadline, *, exact_delta=False):
+    provider = proof["provider"]
+    while True:
+        remaining_until(deadline)
+        image = executable.image_receipt({"image": admission["incarnation"]}, owner)
+        records, complete = cursor.read(deadline)
+        boundary = inventory_boundary(cursor.saved_gaps + records, owner, image, provider, admission,
+            proof["baseline"]["pass"]["seq"], marker, prefix_batches, deadline=deadline,
+            prior=proof["baseline"], physical_hooks=proof["physical_hooks"],
+            started_ns=proof["observer_started_ns"])
+        if complete and boundary is not None:
+            if boundary["instance"]["event"]["id"] != proof["instance"]:
+                raise SetupError("Inventory measured phase changed its authorized instance")
+            if exact_delta and not inventory_exact_idle_delta(proof["baseline"], boundary,
+                    marker["batches"], owner.pid, admission["incarnation"], provider,
+                    proof["physical_hooks"], proof["observer_started_ns"]):
+                pause_until(deadline, 0.05)
+                continue
+            remaining_until(deadline)
+            executable.verify()
+            if provider_receipt(provider_pin) != provider:
+                raise SetupError("Inventory measured provider custody changed")
+            remaining_until(deadline)
+            return boundary
+        pause_until(deadline, 0.05)
+
+
+def inventory_exact_idle_delta(before, after, batches, pid, gen, provider, physical_hooks, started_ns):
+    """Wait for the actual ledgered idle tail; excess counters can never settle."""
+    key = pid, gen, provider["path"]
+    totals = ledger_s1_totals(batches, 0)
+    desired = {"physical": counted_totals(batches, started_ns, physical_hooks=physical_hooks).get(key, 0),
+        "api": totals[5].get(key, 0), "calls": totals[4].get(key, 0),
+        "completed": totals[2].get(key, 0), "failed": totals[3].get(key, 0),
+        "unknown": 0, "orphans": 0, "dropped": 0}
+    delta = {name: after["counts"][name] - before["counts"][name] for name in desired}
+    mechanisms = set(before["counts"]["mechanisms"]) | set(after["counts"]["mechanisms"])
+    for mech in mechanisms:
+        old, new = before["counts"]["mechanisms"].get(mech, [0, 0]), after["counts"]["mechanisms"].get(mech, [0, 0])
+        for index in (0, 1):
+            name = f"mechanism:{mech}:{index}"
+            delta[name] = new[index] - old[index]
+            desired[name] = totals[index].get(key + (mech,), 0)
+    if any(value < 0 or value > desired[name] for name, value in delta.items()):
+        raise SetupError("Inventory idle publication exceeds or regresses its exact ledgered delta")
+    return delta == desired
+
+
+def wait_passes(jsonl_path, count, timeout=120):
+    """Wait until the event log holds >= count pass_committed records."""
+    deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        try:
+            text = Path(jsonl_path).read_text()
+        except FileNotFoundError:
+            text = ""
+        passes = sum(1 for line in text.splitlines()
+                     if '"pass_committed"' in line)
+        if passes >= count:
+            return passes
+        if monotonic_ns() >= deadline:
+            raise SetupError(f"only {passes}/{count} inventory passes committed")
+        pause_until(deadline, 0.5)
+
+
+def move_and_verify(cgroup, caller, moves, note):
+    """Move an owned caller; record the verified membership interval edge."""
+    check_dispatch()
+    cgroup.move(caller)
+    actual = cgroup_of(caller.pid)
+    moves.append({"t": monotonic_ns(), "cgroup": actual, "note": note})
+    return actual
+
+
+def create_tracked(ctx, path):
+    """create_cgroup plus its cleanup wrapper (needed for rename fixups)."""
+    before = len(ctx.groups)
+    group = create_cgroup(Path(path), ctx.groups)
+    return group, ctx.groups[before]
+
+
+def replace_tracked(ctx, selected, wrapper):
+    """Replace only the held empty directory and immediately own its successor."""
+    if wrapper not in ctx.groups or wrapper.group is not selected:
+        raise SetupError("replacement target is not the leg's owned cgroup")
+    with cleanup_section():
+        old_ino, path = selected.identity[1], selected.path
+        # Retain the removed inode until the new directory is acquired so
+        # inode reuse cannot erase the identity distinction under test.
+        held = os.dup(selected.fd)
+        try:
+            try:
+                wrapper.remove()  # retains parent/path/held-FD and emptiness checks
+            except Exception as error:
+                case = getattr(ctx, "case", ctx)
+                detail = f"replacement cgroup: {type(error).__name__}: {error}"
+                case.cleanup_failed = True
+                case.cleanup_errors.append(detail)
+                raise LegCleanupError(detail) from error
+            finally:
+                # CreatedDirectory.remove closes its group and parent FDs on
+                # success or refusal. Do not retry a closed wrapper later.
+                ctx.groups.remove(wrapper)
+                getattr(ctx, "case", ctx).cleanup_totals["cgroups"] += 1
+            replacement, enrolled = create_tracked(ctx, path)
+            new_ino = replacement.identity[1]
+            if new_ino == old_ino:
+                raise SetupError("replacement cgroup reused the held original inode")
+            return replacement, enrolled, old_ino, new_ino
+        finally:
+            os.close(held)
+
+
+def fixup_renamed_wrappers(moves, top_wrapper, new_top, children):
+    """Repoint cleanup wrappers after an owned rename; verify + record.
+
+    Only the top dir is renamed; children move with it and are repointed
+    (relative names under the new top).
+    """
+    os.rename(top_wrapper.path, new_top)
+    top_wrapper.path = Path(new_top)
+    if top_wrapper.group is not None:
+        top_wrapper.group.path = Path(new_top)
+        top_wrapper.group.verify()
+    for wrapper, rel in children:
+        wrapper.path = Path(new_top) / rel
+        if wrapper.group is not None:
+            wrapper.group.path = wrapper.path
+            wrapper.group.verify()
+    moves.append({"t": monotonic_ns(), "cgroup": str(new_top), "note": "rename-held"})
+
+
+def _namespace_ids():
+    return {name: (Path("/proc/self/ns") / name).stat().st_ino
+            for name in ("mnt", "pid", "time", "user", "cgroup")}
+
+
+def _read_mountinfo():
+    def decode(value):
+        return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
+    rows = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, right = line.split(" - ", 1)
+        fields, filesystem = left.split(), right.split()
+        rows.append({"id": int(fields[0]), "target": decode(fields[4]),
+                     "optional": fields[6:], "fs": filesystem[0]})
+    if not rows:
+        raise SetupError("empty mountinfo cannot prove private operator namespace")
+    return rows
+
+
+def _mount_call(source, target, flags):
+    ctypes.set_errno(0)
+    result = _LIBC.mount(ctypes.c_char_p(os.fsencode(source) if source is not None else None),
+        ctypes.c_char_p(os.fsencode(target)), ctypes.c_char_p(None), ctypes.c_ulong(flags), ctypes.c_void_p(None))
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+def _unshare_mount_namespace():
+    ctypes.set_errno(0)
+    if _LIBC.unshare(ctypes.c_int(0x00020000)):  # CLONE_NEWNS only
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _make_mounts_private():
+    _mount_call(None, "/", (1 << 14) | (1 << 18))  # MS_REC | MS_PRIVATE, after CLONE_NEWNS
+
+
+def _bind_operator_mount(source, target):
+    _mount_call(source, target, 1 << 12)  # MS_BIND, one actual cgroup root
+
+
+def _unmount_operator_mount(target):
+    ctypes.set_errno(0)
+    if _LIBC.umount2(ctypes.c_char_p(os.fsencode(target)), ctypes.c_int(0)):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+class PrivateOperatorNamespace:
+    """One process-owned mount clone, entered before any child or reader."""
+    def __init__(self):
+        self.original_fd = self.private_fd = None
+        self.proof = None
+
+    def acquire(self):
+        if threading.active_count() != 1 or len(list(Path("/proc/self/task").iterdir())) != 1:
+            raise SetupError("operator namespace must precede every reader thread")
+        if (Path("/proc/self/task") / str(os.getpid()) / "children").read_text().strip():
+            raise SetupError("operator namespace must precede every child")
+        before = _namespace_ids()
+        self.original_fd = os.open("/proc/self/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+        _unshare_mount_namespace()
+        after = _namespace_ids()
+        if before["mnt"] == after["mnt"] or any(before[name] != after[name] for name in before if name != "mnt"):
+            raise SetupError("mount-only namespace clone changed the wrong namespace")
+        self.private_fd = os.open("/proc/self/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+        _make_mounts_private()
+        rows = _read_mountinfo()
+        if any(flag.startswith(("shared:", "master:", "propagate_from:")) for row in rows for flag in row["optional"]):
+            raise SetupError("operator mount namespace still has shared/slave propagation")
+        self.proof = {"before": before, "after": after, "prepared_ns": monotonic_ns(),
+                      "private": True, "shared_or_slave": 0, "mountinfo_entries": len(rows)}
+        self.verify()
+
+    def verify(self):
+        if self.proof is None or _namespace_ids() != self.proof["after"]:
+            raise SetupError("operator namespace identity changed")
+        if any(flag.startswith(("shared:", "master:", "propagate_from:"))
+               for row in _read_mountinfo() for flag in row["optional"]):
+            raise SetupError("operator mount namespace propagation changed")
+
+    def close(self):
+        # The process remains in its private clone until exit; never mutate or
+        # re-enter the original namespace during capture or cleanup.
+        for name in ("private_fd", "original_fd"):
+            if (fd := getattr(self, name)) is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+
+def initialize_operator_namespace(ctx):
+    with cleanup_section():
+        if getattr(ctx, "operator_namespace", None) is not None:
+            raise SetupError("operator mount namespace was already initialized")
+        ctx.operator_namespace = PrivateOperatorNamespace()  # enroll before unshare
+        ctx.operator_namespace.acquire()
+
+
+def _open_operator_dir(path):
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+
+
+def _operator_mount_id(fd):
+    matches = re.findall(r"^mnt_id:\s+([0-9]+)$", Path(f"/proc/self/fdinfo/{fd}").read_text(), re.MULTILINE)
+    if len(matches) != 1:
+        raise SetupError("held operator FD lacks an actual mount ID")
+    return int(matches[0])
+
+
+class OperatorCgroupPath:
+    """Owned ordinary ancestors and bind roots; native N3 groups stay canonical."""
+    def __init__(self, ctx, directory, selected, outside):
+        self.namespace = ctx.operator_namespace
+        self.base = Path(directory) / "scope-path"
+        self.selected, self.outside = selected, outside
+        self.parent_fd = self.base_fd = self.root_fd = None
+        self.base_identity = self.parent_identity = None
+        self.base_created = False
+        self.directories, self.mounts = {}, []
+        self.proof = {"operation": "operator-path-ancestor-rename-and-alias-replacement"}
+
+    @property
+    def path(self):
+        return self.base / "current/root"
+
+    def _verify_parent(self):
+        for fd, path, expected in ((self.parent_fd, self.base.parent, self.parent_identity),
+                                   (self.base_fd, self.base, self.base_identity)):
+            if fd is None:
+                continue
+            held, actual = os.fstat(fd), path.stat(follow_symlinks=False)
+            if (not stat.S_ISDIR(actual.st_mode) or expected != (held.st_dev, held.st_ino)
+                    or expected != (actual.st_dev, actual.st_ino)):
+                raise SetupError("owned operator ancestor was replaced")
+
+    def _mkdir(self, relative):
+        self._verify_parent()
+        os.mkdir(relative, mode=0o755, dir_fd=self.base_fd)
+        self.directories[relative] = None  # enroll immediately, before stat
+        info = os.stat(relative, dir_fd=self.base_fd, follow_symlinks=False)
+        self.directories[relative] = (info.st_dev, info.st_ino)
+
+    def _rmdir(self, relative):
+        self._verify_parent()
+        info = os.stat(relative, dir_fd=self.base_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self.directories[relative]:
+            raise SetupError("owned operator directory was replaced")
+        os.rmdir(relative, dir_fd=self.base_fd)
+        del self.directories[relative]
+
+    def snapshot(self, path, fd=None):
+        self.namespace.verify()
+        opened = fd is None
+        fd = _open_operator_dir(path) if opened else fd
+        try:
+            info, magic, mount = os.fstat(fd), fs_magic(fd), _operator_mount_id(fd)
+            matches = [row for row in _read_mountinfo() if row["id"] == mount and row["target"] == str(path)]
+            if magic != 0x63677270 or len(matches) != 1 or matches[0]["fs"] != "cgroup2":
+                raise SetupError("operator path is not the actual held cgroup2 bind mount")
+            return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino, "magic": magic,
+                    "mount_id": mount, "mount_namespace": self.namespace.proof["after"]["mnt"],
+                    "filesystem": matches[0]["fs"], "t": monotonic_ns()}
+        finally:
+            if opened:
+                os.close(fd)
+
+    def native(self, group):
+        group.verify()
+        group.path.relative_to("/sys/fs/cgroup")
+        held = os.fstat(group.fd)
+        if (held.st_dev, held.st_ino) != group.identity or fs_magic(group.fd) != 0x63677270:
+            raise SetupError("operator target lacks its actual canonical held cgroup2 identity")
+        return {"path": str(group.path), "dev": held.st_dev, "ino": held.st_ino, "magic": 0x63677270}
+
+    def _bind(self, relative, group):
+        check_dispatch()
+        self.namespace.verify()
+        native = self.native(group)
+        entry = {"relative": relative, "expected": (native["dev"], native["ino"]), "snapshot": None}
+        self.mounts.append(entry)  # retain even a failed/uncertain mount attempt
+        _bind_operator_mount(group.path, self.base / relative)
+        actual = self.snapshot(self.base / relative)
+        if (actual["dev"], actual["ino"]) != entry["expected"]:
+            raise SetupError("bind mount differs from the actual owned canonical cgroup")
+        entry["snapshot"] = actual
+        check_dispatch()
+        return actual
+
+    def _unmount(self, entry):
+        check_dispatch()
+        self.namespace.verify()
+        path = self.base / entry["relative"]
+        matches = [row for row in _read_mountinfo() if row["target"] == str(path)]
+        if matches:
+            expected = entry["snapshot"]
+            if expected is None:
+                raise SetupError("unproven operator bind remains owned for failed cleanup")
+            actual = self.snapshot(path)
+            if ((actual["dev"], actual["ino"]) != entry["expected"]
+                    or expected is not None and actual["mount_id"] != expected["mount_id"]):
+                raise SetupError("refusing to unmount a replaced operator mount")
+            _unmount_operator_mount(path)  # normal unmount only; all alias FDs are closed
+            if any(row["target"] == str(path) for row in _read_mountinfo()):
+                raise SetupError("operator mount remained after normal unmount")
+        elif entry["snapshot"] is not None:
+            raise SetupError("original owned operator mount disappeared before cleanup")
+        self.mounts.remove(entry)
+        check_dispatch()
+
+    def _rename(self, source, target):
+        check_dispatch()
+        self._verify_parent()
+        info = os.stat(source, dir_fd=self.base_fd, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != self.directories[source]:
+            raise SetupError("operator ancestor identity changed before rename")
+        try:
+            os.stat(target, dir_fd=self.base_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SetupError("operator rename would replace a foreign ancestor")
+        os.rename(source, target, src_dir_fd=self.base_fd, dst_dir_fd=self.base_fd)
+        self.directories = {target + relative[len(source):] if relative == source or relative.startswith(source + "/")
+                            else relative: identity for relative, identity in self.directories.items()}
+        for entry in self.mounts:
+            if entry["relative"].startswith(source + "/"):
+                entry["relative"] = target + entry["relative"][len(source):]
+        check_dispatch()
+
+    def acquire(self):
+        self.namespace.verify()
+        self.parent_fd = os.open(self.base.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(self.parent_fd)
+        self.parent_identity = info.st_dev, info.st_ino
+        os.mkdir(self.base.name, mode=0o755, dir_fd=self.parent_fd)
+        self.base_created = True
+        info = os.stat(self.base.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        self.base_identity = info.st_dev, info.st_ino
+        self.base_fd = os.open(self.base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        self._mkdir("current")
+        self._mkdir("current/root")
+        self.proof.update(namespace=self.namespace.proof, selected=self.native(self.selected), outside=self.native(self.outside))
+        first = self._bind("current/root", self.selected)
+        self.root_fd = _open_operator_dir(self.path)
+        # Exercise both required mechanics before starting any observer. The
+        # retained alias mount itself is never renamed or detached by this probe.
+        self._rename("current", "retained")
+        retained = self.snapshot(self.base / "retained/root", self.root_fd)
+        if any(retained[key] != first[key] for key in ("dev", "ino", "magic", "mount_id")):
+            raise SetupError("pre-observer ancestor rename changed the held root")
+        self._rename("retained", "current")
+        self._mkdir("probe-root")
+        probe = self._bind("probe-root", self.outside)
+        if (probe["dev"], probe["ino"]) == (first["dev"], first["ino"]) or probe["mount_id"] == first["mount_id"]:
+            raise SetupError("outside probe is not an independent physical/mount identity")
+        self._unmount(self.mounts[-1])
+        self._rmdir("probe-root")
+        self.proof["probe_ns"] = monotonic_ns()
+        self.proof["initial"] = self.snapshot(self.path, self.root_fd)
+
+    def rename_selected(self):
+        with cleanup_section():
+            self._rename("current", "retained")
+            self.proof["renamed"] = self.snapshot(self.base / "retained/root", self.root_fd)
+
+    def replace_original(self):
+        with cleanup_section():
+            self._mkdir("current")
+            self._mkdir("current/root")
+            self.proof["replacement"] = self._bind("current/root", self.outside)
+            self.proof["held_after_replacement"] = self.snapshot(self.base / "retained/root", self.root_fd)
+
+    def remove(self):
+        with cleanup_section():
+            self._verify_parent()
+            if self.root_fd is not None:
+                os.close(self.root_fd)
+                self.root_fd = None
+            for entry in list(reversed(self.mounts)):
+                self._unmount(entry)
+            for relative in sorted(self.directories, key=lambda name: name.count("/"), reverse=True):
+                self._rmdir(relative)
+            if self.base_created:
+                self._verify_parent()
+                actual = os.stat(self.base.name, dir_fd=self.parent_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(actual.st_mode) or (actual.st_dev, actual.st_ino) != self.base_identity:
+                    raise SetupError("owned operator base was replaced before cleanup")
+                os.rmdir(self.base.name, dir_fd=self.parent_fd)
+                self.base_created = False
+            for name in ("base_fd", "parent_fd"):
+                if (fd := getattr(self, name)) is not None:
+                    os.close(fd)
+                    setattr(self, name, None)
+
+
+def create_operator_path(ctx, directory, selected, outside):
+    with cleanup_section():
+        owned = OperatorCgroupPath(ctx, directory, selected, outside)
+        ctx.operator_paths.append(owned)
+        owned.acquire()
+        return owned
+
+
+@owned_leg
+def run_cgroup_r1(ctx, cell_dir, backend):
+    """Re-entry plus retained-root operator ancestor rename/alias replacement."""
+    leg_dir = Path(cell_dir) / backend / "trace"
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-r1")
+    pins = {}
+    for name in ("caller-a", "caller-b"):
+        path = leg_dir / name
+        shutil.copyfile(ctx.pins["caller"].path, path)
+        path.chmod(0o755)
+        pins[name] = leg_pin(ctx, path)
+    provider = ctx.provider_pin
+    root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
+    selected, _ = create_tracked(ctx, root.path / "selected")
+    outside, _ = create_tracked(ctx, root.path / "outside")
+    sub, _ = create_tracked(ctx, selected.path / "sub")
+    operator = create_operator_path(ctx, leg_dir, selected, outside)
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pins["caller-a"],
+                                     provider, ctx.args.uid, ctx.args.gid, env)
+    stdout.record("ready", 0)
+    images = [pins["caller-a"].image_receipt(stdout.record("image", 0), caller)]
+    moves = []
+    move_and_verify(selected, caller, moves, "initial")
+    argv = [str(ctx.binary.path), "trace", "--cgroup", str(operator.path),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "240s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "cgroup-reentry", "leg": f"trace/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    warm_cursor = len(capture.lines)
+    n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "warm", "selected",
+               0, selected, phases)
+    warm_boundary = wait_cgroup_trace_population(capture, images[0], "C_GenerateRandom", 5, warm_cursor,
+                                                 named=False)
+    phases[-1].update(output_cursor=warm_boundary["output_cursor"], output_end=warm_boundary["output_end"],
+                      output_observed_ns=warm_boundary["observed_ns"])
+    t_out = monotonic_ns()
+    move_and_verify(outside, caller, moves, "exit")
+    n3_command(caller, stdout, "C_GetInfo", 3, 50, "aside", "outside",
+               0, outside, phases)
+    output_cursor = len(capture.lines)
+    request, _, t0, t1 = caller_exec(caller, stdout, images, "thread-exec", pins["caller-b"])
+    transitions = [{"from_image": 0, "to_image": 1, "mode": "nonleader",
+                    "same_path": False, "scope": "outside",
+                    "t0": t0, "t1": t1, "request": request}]
+    n3_command(caller, stdout, "C_GetInfo", 3, 50, "outside-b", "outside",
+               1, outside, phases)
+    t_in = monotonic_ns()
+    move_and_verify(sub, caller, moves, "descendant-reentry")
+    proof = warm_caller(capture, caller, stdout, images[-1], phases, group=sub,
+                        output_cursor=output_cursor, marker_fn="C_GenerateRandom")
+    n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
+               1, sub, phases)
+    move_and_verify(selected, caller, moves, "same-image-move")
+    operator.rename_selected()
+    n3_command(caller, stdout, "C_GetSessionInfo", 3, 100, "still", "selected",
+               1, selected, phases)
+    operator.replace_original()
+    n3_command(caller, stdout, "C_GetSessionInfo", 3, 100, "renamed", "selected",
+               1, selected, phases)
+    positive_tail = wait_cgroup_trace_population(capture, images[-1], "C_GetSessionInfo", 16,
+                                                proof["proof_cursor"], named=True)
+    move_and_verify(outside, caller, moves, "operator-path-replacement-negative")
+    operator.proof["outside_move_ns"] = moves[-1]["t"]
+    n3_command(caller, stdout, "C_GetInfo", 3, 100, "operator-outside", "outside",
+               1, outside, phases)
+    obs_rc, stopped, latency = stop_observer(owned)
+    caller_rc = stop_caller(caller, stdout, 1)
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = next(p for p in phases if p["phase"] == "measured")
+    receipt = {
+        "cell": "cgroup-reentry", "leg": f"trace/{backend}", "scope_kind": "cgroup",
+        "owned_pids": [caller.pid],
+        "scope_intervals": [
+            {"pid": caller.pid, "membership": "selected", "t0": ready, "t1": t_out},
+            {"pid": caller.pid, "membership": "selected", "t0": t_in, "t1": operator.proof["outside_move_ns"]},
+        ],
+        "operator_path": operator.proof,
+        "observer_argv": argv,
+        "cgroup_positive_tail": positive_tail,
+        "moves": moves,
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "post-reentry", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 10, "phases": ["measured"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": [proof],
+        "exec_transitions": transitions, "phases": phases,
+        "require_named": True, "require_named_images": [1], "first_unknown_images": [],
+        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {"session": True},
+        "session_reuse": session_reuse_from(ledger),
+        "requested_backend": backend,
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+def provider_entry(path):
+    """Independent provider identity receipt for inventory legs."""
+    info = os.stat(path)
+    return {"path": str(path), "ino": info.st_ino,
+            "sha256": sha256_file(path)}
+
+
+def phase_window(batches, phases):
+    """Ledger [t0, t1] span and entered total over named phases."""
+    picked = [batch for batch in batches if inventory_phase_name(batch)
+              in phases or batch["phase"] in phases]
+    total = sum(batch["n"] for batch in picked
+                if batch["fn"] != "C_GetFunctionList")
+    if not picked:
+        return None, None, 0
+    return (min(batch["t0"] for batch in picked),
+            max(batch["t1"] for batch in picked), total)
+
+
+def counted_totals(batches, started_ns, stopped_ns=None, *, physical_hooks=None, scope_intervals=None):
+    """Per-(pid, gen, module) entered totals over in-capture phases only.
+
+    Generation 0 runs setup before READY, which strictly precedes the
+    observer spawn by harness construction; the guard below proves it from
+    the ledger clock, so main+teardown is the independent gen0 expectation.
+    Opt-in h6-setup is counted after observer startup. Controlled teardown
+    after stopped_ns stays post-stop work; the legacy setup guard is unchanged.
+    """
+    totals: Counter = Counter()
+    for batch in batches:
+        if batch["gen"] == 0 and batch["phase"] == "setup":
+            if batch["t1"] >= started_ns:
+                raise SetupError("gen0 setup overlaps the observer lifetime: "
+                                 "the gated start is broken")
+            continue
+        if batch["t1"] < started_ns or stopped_ns is not None and batch["t0"] >= stopped_ns:
+            continue
+        if batch["t0"] < started_ns or stopped_ns is not None and batch["t1"] > stopped_ns:
+            raise SetupError("Inventory physical ledger batch overlaps the observer boundary")
+        if scope_intervals is not None and not any(
+                interval["pid"] == batch["pid"] and interval["membership"] == "selected"
+                and interval["t0"] <= batch["t0"] <= batch["t1"] <= interval["t1"]
+                for interval in scope_intervals):
+            continue
+        if not inventory_physical_batch(batch, physical_hooks):
+            continue
+        totals[(batch["pid"], batch["gen"], batch["module"])] += batch["n"]
+    return totals
+
+
+def wait_inventory_original_checkpoint(ctx, path, owner, executable, deadline):
+    while True:
+        remaining_until(deadline)
+        try:
+            cursor = r5_admission_checkpoint(ctx, path, owner, executable)
+            remaining_until(deadline)
+            if cursor.retired_incarnation != 0:
+                raise SetupError("Inventory initial caller is not its original incarnation")
+            return cursor
+        except SetupError as error:
+            if str(error) != "R5 original caller lacks complete same-stream admission/pass":
+                raise
+        pause_until(deadline, 0.05)
+
+
+def release_inventory_measurement(controller, provider, proof, deadline, *, pending=False):
+    remaining_until(proof["deadline_ns"])
+    if provider_receipt(provider) != proof["provider"]:
+        raise SetupError("Inventory held provider custody changed before measurement")
+    remaining_until(proof["deadline_ns"])
+    command = controller.dispatch("M", deadline, proof_deadline=proof["deadline_ns"])
+    return command if pending else controller.complete(command)
+
+
+def wait_inventory_sibling_baseline(sibling, executable, provider_pin, cursor, marker, deadline, *, physical_hooks=None):
+    """Read the original owned MS cursor while W1 stays idle; dispatch no work."""
+    if sibling.owner is not cursor.owner or sibling.owner.identity != cursor.birth_identity:
+        raise SetupError("System sibling baseline changed original owner/observer custody")
+    admission = {"caller": cursor.retired_caller, "incarnation": cursor.retired_incarnation,
+        "seq": cursor.retired_admission_seq, "completed_pass": cursor.completed_pass}
+    provider = provider_receipt(provider_pin)
+    while True:
+        remaining_until(deadline)
+        executable.verify()
+        image = executable.image_receipt({"image": 0}, sibling.owner)
+        records, complete = cursor.read(deadline, full=True)
+        baseline = inventory_sibling_boundary(records, image, provider, admission, marker,
+            physical_hooks=physical_hooks, started_ns=cursor.started_ns)
+        if complete and baseline is not None:
+            remaining_until(deadline)
+            executable.verify()
+            executable.image_receipt({"image": 0}, sibling.owner)
+            if provider_receipt(provider_pin) != provider:
+                raise SetupError("System sibling baseline changed its held provider")
+            remaining_until(deadline)
+            return {**baseline, "observed_ns": monotonic_ns()}
+        pause_until(deadline, 0.05)
+
+
+def inventory_target_phases(ctx, log_path, target, original_executable, successor_executable,
+                            provider, *, outside=None, sub=None, moves=None,
+                            sibling=None, physical_hooks=None):
+    """The shared real R5/SystemMixed gate, with independent sibling batches."""
+    moves = moves if moves is not None else []
+    proofs, measured, stages = [], [], []
+    recovery0 = inventory_phase_deadline("successor-recovery", 0)
+    budget = ACTIVE_LEG.get()
+    sibling_deadline = (budget.deadline_ns if budget else wait_deadline(815)) if sibling else None
+    initial_cursor = wait_inventory_original_checkpoint(ctx, log_path, target.owner,
+                                                        original_executable, recovery0)
+    sibling_baseline = None
+    if sibling:
+        sibling_cursor = wait_inventory_original_checkpoint(ctx, log_path, sibling.owner, original_executable, recovery0)
+        sibling_first = sibling.warm(1, sibling_deadline)
+    first = target.warm(1, recovery0)
+    initial_admission = {"caller": initial_cursor.retired_caller,
+        "incarnation": initial_cursor.retired_incarnation,
+        "seq": getattr(initial_cursor, "retired_admission_seq", initial_cursor.seq),
+        "completed_pass": initial_cursor.completed_pass}
+    initial = wait_inventory_s1_ready(target.owner, original_executable, provider,
+        initial_admission, initial_cursor, target.warm, recovery0,
+        prefix_batches=first["batches"], prefix_markers=[first], physical_hooks=physical_hooks)
+    proofs.append(initial)
+    fixed_deadline = inventory_phase_deadline("fixed-measurement")
+    first_measurement = release_inventory_measurement(target, provider, initial, fixed_deadline)
+    end0 = wait_inventory_measured_boundary(target.owner, original_executable, provider,
+        initial_admission, initial_cursor, initial, first_measurement,
+        target.ledger()["batches"], fixed_deadline)
+    measured.append({"proof": initial, "marker": first_measurement, "end": end0})
+    # Teardown finishes inside selected membership, while the original image
+    # is still authorized. No provider call may occur in the outside interval.
+    teardown = target.command("T", fixed_deadline)
+    tail_end = wait_inventory_measured_boundary(target.owner, original_executable, provider,
+        initial_admission, initial_cursor, {**initial, "baseline": end0}, teardown,
+        target.ledger()["batches"], fixed_deadline, exact_delta=True)
+    checkpoint = r5_admission_checkpoint(ctx, log_path, target.owner, original_executable)
+    checkpoint_receipt = checkpoint.receipt()
+    if sibling:
+        sibling_baseline = wait_inventory_sibling_baseline(sibling, original_executable, provider,
+            sibling_cursor, sibling_first, fixed_deadline, physical_hooks=physical_hooks)
+    if outside:
+        move_and_verify(outside, target.owner, moves, "X-exit-for-exec")
+        t_out = moves[-1]["t"]
+    else:
+        t_out = None
+    recovery = inventory_phase_deadline("successor-recovery", 1)
+    exec_start = monotonic_ns()
+    target.command("X", recovery)
+    exec_stop = wait_exec_stop(target.owner.pid, deadline=recovery)
+    remaining_until(recovery)
+    successor_executable.verify()
+    stopped_image = successor_executable.image_receipt({"image": 1}, target.owner)
+    remaining_until(recovery)
+    if sub:
+        move_and_verify(sub, target.owner, moves, "X-descendant-reentry")
+        remaining_until(recovery)
+        t_in = moves[-1]["t"]
+    else:
+        t_in = exec_stop
+    successor_executable.verify()
+    successor_executable.image_receipt({"image": 1}, target.owner)
+    remaining_until(recovery)
+    if sibling:
+        sibling.warm(2, sibling_deadline)
+    remaining_until(recovery)
+    ptrace_continue(target.owner.pid)
+    remaining_until(recovery)
+    resumed = monotonic_ns()
+    stages.append({"label": "exec", "t0": exec_start, "t1": resumed})
+    if sibling:
+        sibling.warm(3, sibling_deadline)
+    target.ready(recovery, image=1, executable=successor_executable)
+    admission = wait_r5_successor_admitted(log_path, target.owner, successor_executable, checkpoint,
+        not_before_ns=t_in, timeout=remaining_until(recovery))
+    proof = wait_inventory_s1_ready(target.owner, successor_executable, provider, admission,
+        checkpoint, target.warm, recovery, physical_hooks=physical_hooks, recovery_from=measured[0])
+    proofs.append(proof)
+    stages.append({"label": "recovery", "t0": resumed, "t1": proof["observed_ns"]})
+    fixed_deadline = inventory_phase_deadline("fixed-measurement")
+    measurement_start = monotonic_ns()
+    pending = release_inventory_measurement(target, provider, proof, fixed_deadline, pending=True)
+    if sibling:
+        sibling.warm(4, sibling_deadline)
+    measurement = target.complete(pending)
+    end1 = wait_inventory_measured_boundary(target.owner, successor_executable, provider,
+        admission, checkpoint, proof, measurement,
+        [row for row in target.ledger()["batches"] if row["gen"] == 1], fixed_deadline)
+    measured.append({"proof": proof, "marker": measurement, "end": end1})
+    stages.append({"label": "measurement", "t0": measurement_start, "t1": monotonic_ns()})
+    return {"proofs": proofs, "measurements": measured, "stages": stages,
+        "sibling_baseline": sibling_baseline,
+        "teardown": {"marker": teardown, "end": tail_end},
+        "cursor": checkpoint, "outside_ns": t_out, "reentry_ns": t_in,
+        "freeze": {"exec_stop_ns": exec_stop, "stopped_image": stopped_image,
+            "checkpoint": checkpoint_receipt, "reentry_ns": t_in, "resumed_ns": resumed,
+            "admitted": admission}}
+
+
+def inventory_final_records(cursor, deadline):
+    records, complete = cursor.read(deadline, full=True, final=True)
+    if not complete or not records or records[-1]["kind"] != "ended":
+        raise SetupError("Inventory stop lacks its complete same-observer ended record")
+    return records
+
+
+@owned_leg(inventory=True)
+def run_cgroup_inventory_r5(ctx, cell_dir, backend):
+    """R5: stopped re-entry, fresh admission/provider/S1, fixed measurements."""
+    leg_dir = Path(cell_dir) / backend / "inventory"
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-r5")
+    ledger_bin = leg_dir / "ledger"
+    shutil.copyfile(ctx.pins["ledger"].path, ledger_bin)
+    ledger_bin.chmod(0o755)
+    original_executable = leg_pin(ctx, ledger_bin)
+    ledger2 = leg_dir / "ledger2"
+    shutil.copyfile(ctx.pins["ledger"].path, ledger2)
+    ledger2.chmod(0o755)
+    successor_executable = leg_pin(ctx, ledger2)
+    provider = ctx.provider_pin
+    # Discover executes provider code as the workload UID; only this owned
+    # subtree is writable by it, while the observer's leg directory is not.
+    manifest_path = leg_dir / "workload" / "manifest-A.json"
+    manifest = build_manifest(ctx.discover_pin, provider.path, manifest_path, env,
+                              ctx.args.uid, ctx.args.gid)
+    physical_hooks = inventory_manifest_hooks(manifest, provider)
+    root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
+    selected, _ = create_tracked(ctx, root.path / "selected")
+    outside, _ = create_tracked(ctx, root.path / "outside")
+    sub, _ = create_tracked(ctx, selected.path / "sub")
+    gate_s = leg_dir / "gate-S0"
+    owned_x, out_x, err_x = spawn_ledger(
+        ctx.owners, ctx.readers, leg_dir,
+        [str(ledger_bin), "exec-chain", "--cell", "RX", "--module", str(provider.path),
+         "--iters", "2", *inventory_control_args(),
+         "--sleep-us", "50000", "--hold", "--chain", f"leader:{ledger2}"],
+        env, ctx.args.uid, ctx.args.gid, "RX")
+    owned_s, out_s, err_s = spawn_ledger(
+        ctx.owners, ctx.readers, leg_dir,
+        [str(ledger_bin), "map", "--cell", "RS0", "--module", str(provider.path),
+         "--gate", str(gate_s), "--hold"],
+        env, ctx.args.uid, ctx.args.gid, "RS0")
+    control_x = InventoryController(owned_x, out_x, original_executable)
+    control_x.ready(inventory_phase_deadline("setup"))
+    wait_ledger_line(out_s, "READY ", timeout=60)
+    moves = []
+    x_pid = owned_x.pid
+    s_pid = owned_s.pid
+    move_and_verify(selected, owned_x, moves, "X-initial")
+    move_and_verify(selected, owned_s, moves, "S0-initial")
+    seize_until_exec(x_pid, ctx, owned_x)
+    owned, capture, errors, started, doc_path, log_path = spawn_inventory(
+        ctx, leg_dir, ["--cgroup", str(selected.path)], [], ["--manifest", str(manifest_path)],
+        backend, 300)
+    try:
+        ready = wait_inventory_ready(owned, errors, log_path, backend)
+    except BackendRefused as refused:
+        ptrace_detach_running(x_pid, ctx)
+        owned_x.popen.send_signal(signal.SIGINT)
+        owned_s.popen.send_signal(signal.SIGINT)
+        receipt = {"cell": "cgroup-reentry", "leg": f"inventory/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_inventory_h6({}, {}, receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    wait_passes(log_path, 2)
+    gate_s.touch()
+    control = inventory_target_phases(ctx, log_path, control_x, original_executable,
+        successor_executable, provider, outside=outside, sub=sub, moves=moves,
+        physical_hooks=physical_hooks)
+    out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
+    obs_rc, stopped, latency = stop_inventory(owned)
+    enter_phase("cleanup")
+    ptrace_detach_running(x_pid, ctx)
+    cleanup_deadline = inventory_phase_deadline("cleanup")
+    final_records = inventory_final_records(control["cursor"], cleanup_deadline)
+    control_x.command("T", cleanup_deadline)
+    control_x.command("F", cleanup_deadline)
+    owned_s.popen.send_signal(signal.SIGINT)
+    x_rc = wait_process(owned_x.popen, 15)
+    s_rc = wait_process(owned_s.popen, 15)
+    finish_readers([out_x, err_x, out_s, err_s, capture, errors])
+    ledgers = {"RX": parse_inv_ledger("".join(out_x.lines)),
+               "RS0": parse_inv_ledger("".join(out_s.lines))}
+    scope_intervals = [
+        {"pid": x_pid, "membership": "selected", "t0": ready, "t1": control["outside_ns"]},
+        {"pid": x_pid, "membership": "selected", "t0": control["reentry_ns"], "t1": stopped},
+        {"pid": s_pid, "membership": "selected", "t0": ready, "t1": stopped}]
+    totals = counted_totals(ledgers["RX"]["batches"], started, stopped,
+                            physical_hooks=physical_hooks, scope_intervals=scope_intervals)
+    m_t0, m_t1, m_n = phase_window(
+        ledgers["RX"]["batches"], ["RX:h6-measured:gen1", "RX:h6-failed:gen1"])
+    warm_phases = sorted({inventory_phase_name(row) for row in ledgers["RX"]["batches"]
+        if row["t1"] < m_t0 and row["fn"] != "C_GetFunctionList"})
+    w_t0, w_t1, w_n = phase_window(ledgers["RX"]["batches"], warm_phases)
+    key0 = (x_pid, 0, str(provider.path))
+    key1 = (x_pid, 1, str(provider.path))
+    receipt = {
+        "cell": "cgroup-reentry", "leg": f"inventory/{backend}", "scope_kind": "cgroup",
+        "scope_label": "cgroup", "owned_pids": [x_pid, s_pid],
+        "scope_intervals": scope_intervals,
+        "moves": moves,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "observer_rc": obs_rc,
+        **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
+        "manual_rebind": False, "s1_expected": True,
+        "providers": {"A": provider_receipt(provider)},
+        "physical_hooks": physical_hooks,
+        "expected_incarnations": {
+            str(x_pid): {"gens": {
+                "0": {"exe": str(ledger_bin), "retired": True},
+                "1": {"exe": str(ledger2), "retired": False}}},
+            str(s_pid): {"gens": {
+                "0": {"exe": str(ledger_bin), "retired": False}}}},
+        "expected_edges": {
+            f"{x_pid}:0:A": {"counted": True, "count": totals.get(key0, -1)},
+            f"{x_pid}:1:A": {"counted": True, "count": totals.get(key1, -1)},
+            f"{s_pid}:0:A": {"zero_ok": True}},
+        "measured": {"label": "post-reentry successor", "t0": m_t0, "t1": m_t1,
+                     "expected_calls": m_n,
+                     "phases": ["RX:h6-measured:gen1", "RX:h6-failed:gen1"]},
+        "warmup": {"label": "pre-exec generation", "t0": w_t0, "t1": w_t1,
+                   "expected_calls": w_n, "phases": warm_phases},
+        "allowed_gap_subjects": ["exact image authority unavailable",
+                                 "native capture scope custody unproven",
+                                 "used by an unidentified caller image"],
+        "cell_endings": {"RX": {"how": "exited" if x_rc == 0 else "signaled", "rc": x_rc},
+                         "RS0": {"how": "exited" if s_rc == 0 else "signaled", "rc": s_rc}},
+        "requested_backend": backend,
+        "freeze": control["freeze"],
+        "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
+            "stages": control["stages"], "teardown": control["teardown"], "final_records": final_records},
+    }
+    doc = json.loads(doc_path.read_text())
+    result = evaluate_inventory_h6(doc, ledgers, receipt)
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+@owned_leg(inventory=True)
+def run_system_mixed(ctx, cell_dir, backend):
+    """system-mixed: execing + sibling same-file callers, attested + count-only.
+
+    MX exec-chains on attested A, idling before provider loading until W.
+    MS performs independently ledgered A/B batches through exec, recovery and
+    measurement; B stays count-only. MF's provider file is deleted after
+    READY, so its producer proof is foreign while valid siblings stay exact.
+    """
+    leg_dir = Path(cell_dir) / backend / "inventory"
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-mix")
+    ledger_bin = leg_dir / "ledger"
+    shutil.copyfile(ctx.pins["ledger"].path, ledger_bin)
+    ledger_bin.chmod(0o755)
+    original_executable = leg_pin(ctx, ledger_bin)
+    ledger2 = leg_dir / "ledger2"
+    shutil.copyfile(ctx.pins["ledger"].path, ledger2)
+    ledger2.chmod(0o755)
+    successor_executable = leg_pin(ctx, ledger2)
+    provider_a = ctx.provider_pin
+    provider_b = leg_dir / "provider-B.so"
+    shutil.copyfile(provider_a.path, provider_b)
+    provider_b.chmod(0o755)
+    provider_b_pin = leg_pin(ctx, provider_b)
+    provider_f = leg_dir / "provider-F.so"
+    shutil.copyfile(provider_a.path, provider_f)
+    provider_f.chmod(0o755)
+    manifest_path = leg_dir / "workload" / "manifest-A.json"
+    manifest = build_manifest(ctx.discover_pin, provider_a.path, manifest_path, env,
+                              ctx.args.uid, ctx.args.gid)
+    physical_hooks = inventory_manifest_hooks(manifest, provider_a)
+    # B's private calibration proves its own table/getter physical targets.
+    # Only A's manifest below reaches the observer; B remains count-only.
+    calibration_b = build_manifest(ctx.discover_pin, provider_b_pin.path,
+        leg_dir / "workload" / "manifest-B-physical.json", env, ctx.args.uid, ctx.args.gid)
+    physical_hooks.update(inventory_manifest_hooks(calibration_b, provider_b_pin))
+    gate_f = leg_dir / "gate-F"
+    # XE and XS spawn from the same file: independent same-file callers.
+    owned_e, out_e, err_e = spawn_ledger(
+        ctx.owners, ctx.readers, leg_dir,
+        [str(ledger_bin), "exec-chain", "--cell", "MX", "--module", str(provider_a.path),
+         "--iters", "2", *inventory_control_args(),
+         "--sleep-us", "50000", "--hold", "--chain", f"leader:{ledger2}"],
+        env, ctx.args.uid, ctx.args.gid, "MX")
+    owned_s, out_s, err_s = spawn_ledger(
+        ctx.owners, ctx.readers, leg_dir,
+        [str(ledger_bin), "mech", "--cell", "MS", "--module", str(provider_a.path),
+         "--module", str(provider_b), "--iters", "3", *inventory_control_args(),
+         "--sleep-us", "100000", "--hold"],
+        env, ctx.args.uid, ctx.args.gid, "MS")
+    owned_f, out_f, err_f = spawn_ledger(
+        ctx.owners, ctx.readers, leg_dir,
+        [str(ledger_bin), "mech", "--cell", "MF", "--module", str(provider_f),
+         "--iters", "1", "--gate", str(gate_f), "--hold"],
+        env, ctx.args.uid, ctx.args.gid, "MF")
+    control_e = InventoryController(owned_e, out_e, original_executable)
+    control_s = InventoryController(owned_s, out_s, original_executable)
+    control_e.ready(inventory_phase_deadline("setup"))
+    control_s.ready(inventory_phase_deadline("setup"))
+    wait_ledger_line(out_f, "READY ", timeout=60)
+    e_pid, s_pid, f_pid = owned_e.pid, owned_s.pid, owned_f.pid
+    provider_f.unlink()
+    seize_until_exec(e_pid, ctx, owned_e)
+    owned, capture, errors, started, doc_path, log_path = spawn_inventory(
+        ctx, leg_dir, ["--system", "--max-scan-pids", str(SYSTEM_SCAN_LIMIT)], [], ["--manifest", str(manifest_path)],
+        backend, 300)
+    try:
+        ready = wait_inventory_ready(owned, errors, log_path, backend)
+    except BackendRefused as refused:
+        ptrace_detach_running(e_pid, ctx)
+        for owned_p in (owned_e, owned_s, owned_f):
+            owned_p.popen.send_signal(signal.SIGINT)
+        receipt = {"cell": "system-mixed", "leg": f"inventory/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_inventory_h6({}, {}, receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    wait_passes(log_path, 2)
+    gate_f.touch()
+    control = inventory_target_phases(ctx, log_path, control_e, original_executable,
+        successor_executable, provider_a, sibling=control_s, physical_hooks=physical_hooks)
+    out_f.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 120)
+    obs_rc, stopped, latency = stop_inventory(owned)
+    enter_phase("cleanup")
+    ptrace_detach_running(e_pid, ctx)
+    cleanup_deadline = inventory_phase_deadline("cleanup")
+    final_records = inventory_final_records(control["cursor"], cleanup_deadline)
+    control_e.command("T", cleanup_deadline)
+    control_e.command("F", cleanup_deadline)
+    control_s.command("T", cleanup_deadline)
+    control_s.command("F", cleanup_deadline)
+    owned_f.popen.send_signal(signal.SIGINT)
+    e_rc = wait_process(owned_e.popen, 15)
+    s_rc = wait_process(owned_s.popen, 15)
+    f_rc = wait_process(owned_f.popen, 15)
+    finish_readers([out_e, err_e, out_s, err_s, out_f, err_f, capture, errors])
+    ledgers = {"MX": parse_inv_ledger("".join(out_e.lines)),
+               "MS": parse_inv_ledger("".join(out_s.lines)),
+               "MF": parse_inv_ledger("".join(out_f.lines))}
+    totals_e = counted_totals(ledgers["MX"]["batches"], started, stopped, physical_hooks=physical_hooks)
+    totals_s = counted_totals(ledgers["MS"]["batches"], started, stopped, physical_hooks=physical_hooks)
+    m_t0, m_t1, m_n = phase_window(
+        ledgers["MX"]["batches"], ["MX:h6-measured:gen1", "MX:h6-failed:gen1"])
+    warm_phases = sorted({inventory_phase_name(row) for row in ledgers["MX"]["batches"]
+        if row["t1"] < m_t0 and row["fn"] != "C_GetFunctionList"})
+    w_t0, w_t1, w_n = phase_window(ledgers["MX"]["batches"], warm_phases)
+    a_path, b_path = str(provider_a.path), str(provider_b)
+    receipt = {
+        "cell": "system-mixed", "leg": f"inventory/{backend}", "scope_kind": "system",
+        "scope_label": "system",
+        "system_scan_limit": SYSTEM_SCAN_LIMIT,
+        "owned_pids": [e_pid, s_pid, f_pid], "foreign_pids": [f_pid],
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "observer_rc": obs_rc,
+        **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
+        "manual_rebind": False, "s1_expected": True,
+        "providers": {"A": provider_receipt(provider_a),
+                      "B": provider_receipt(provider_b_pin)},
+        "physical_hooks": physical_hooks,
+        "count_only_providers": ["B"],
+        "expected_incarnations": {
+            str(e_pid): {"gens": {
+                "0": {"exe": str(ledger_bin), "retired": True},
+                "1": {"exe": str(ledger2), "retired": False}}},
+            str(s_pid): {"gens": {
+                "0": {"exe": str(ledger_bin), "retired": False}}},
+            # No incarnation row is required for the foreign caller: refusal
+            # may mean no caller row at all. Its edges must still carry no
+            # counted usage (foreign_pids rule above).
+        },
+        "expected_edges": {
+            f"{e_pid}:0:A": {"counted": True,
+                             "count": totals_e.get((e_pid, 0, a_path), -1)},
+            f"{e_pid}:1:A": {"counted": True,
+                             "count": totals_e.get((e_pid, 1, a_path), -1)},
+            f"{s_pid}:0:A": {"counted": True,
+                             "count": totals_s.get((s_pid, 0, a_path), -1)},
+            f"{s_pid}:0:B": {"counted": True,
+                             "count": totals_s.get((s_pid, 0, b_path), -1)}},
+        "measured": {"label": "exec successor", "t0": m_t0, "t1": m_t1,
+                     "expected_calls": m_n,
+                     "phases": ["MX:h6-measured:gen1", "MX:h6-failed:gen1"]},
+        "warmup": {"label": "pre-exec generation", "t0": w_t0, "t1": w_t1,
+                   "expected_calls": w_n, "phases": warm_phases},
+        "allow_path_gaps": True,
+        "allowed_gap_subjects": ["exact image authority unavailable",
+                                 "native capture scope custody unproven",
+                                 "used by an unidentified caller image"],
+        "cell_endings": {"MX": {"how": "exited" if e_rc == 0 else "signaled", "rc": e_rc},
+                         "MS": {"how": "exited" if s_rc == 0 else "signaled", "rc": s_rc},
+                         "MF": {"how": "exited" if f_rc == 0 else "signaled", "rc": f_rc}},
+        "requested_backend": backend,
+        "freeze": control["freeze"],
+        "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
+            "stages": control["stages"], "teardown": control["teardown"], "sibling": "MS", "sibling_providers": ["A", "B"],
+            "sibling_baseline": control["sibling_baseline"],
+            "final_records": final_records},
+    }
+    doc = json.loads(doc_path.read_text())
+    result = evaluate_inventory_h6(doc, ledgers, receipt)
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+def run_cgroup_reentry(ctx, cell_dir, backend):
+    """R1 reentry + R2 replacement + R3/R4 stops + R5 S1 inventory."""
+    cell_dir = Path(cell_dir)
+    return [run_cgroup_r1(ctx, cell_dir, backend),
+            run_cgroup_r2(ctx, cell_dir, backend),
+            run_cgroup_stop_before(ctx, cell_dir, backend),
+            run_cgroup_stop_during(ctx, cell_dir, backend),
+            run_cgroup_inventory_r5(ctx, cell_dir, backend)]
+
+
+CELL_RUNNERS = {
+    "pid-leader": run_pid_leader,
+    "pid-reexec": run_pid_reexec,
+    "pid-nonleader-cold": run_pid_nonleader_cold,
+    "pid-failed-exec": run_pid_failed_exec,
+    "leader-exit-exec": run_leader_exit_exec,
+    "rapid-chain": run_rapid_chain,
+    "cgroup-reentry": run_cgroup_reentry,
+    "system-mixed": lambda ctx, cell_dir, backend: [run_system_mixed(ctx, cell_dir, backend)],
+}
+
+
+def run_cell_backend(ctx, cell, backend):
+    """Run one cell x backend; SetupError becomes a recorded error result."""
+    cell_dir = ctx.out / cell
+    cell_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    completed_before = len(ctx.completed_results)
+    try:
+        results = CELL_RUNNERS[cell](ctx, cell_dir, backend)
+    except LegCleanupError as error:
+        ctx.cleanup_failed = True
+        results = [*ctx.completed_results[completed_before:],
+                   {"pass": False, "status": "error", "cell": cell, "leg": backend,
+                    "errors": [f"{type(error).__name__}: {error}"]}]
+    except (SetupError, TimeoutError, AssertionError, OSError,
+            ValueError, subprocess.SubprocessError) as error:
+        results = [*ctx.completed_results[completed_before:],
+                   {"pass": False, "status": "error", "cell": cell,
+                    "leg": backend, "errors": [f"{type(error).__name__}: {error}"]}]
+    for result in results:
+        result.setdefault("cell", cell)
+        print(json.dumps({key: result.get(key) for key in
+                          ("cell", "leg", "status", "pass", "calls", "named",
+                           "unknown", "physical_entered", "physical_counted",
+                           "completed_operations", "negative_reason", "errors")}),
+              flush=True)
+    return results
+
+
+def required_recovery_coverage(batches, cells, backends):
+    """Require one exact positive per requested recovery leg, without new rows."""
+    expected = {(cell, f"{kind}/{backend}") for cell in cells for backend in backends
+                for kind in REQUIRED_LEGS[cell]}
+    rows = defaultdict(list)
+    coverage = {"required": len(expected), "positive": 0, "missing": [],
+                "nonpositive": [], "duplicates": [], "unexpected": []}
+    for cell, backend, results in batches:
+        required = {(cell, f"{kind}/{backend}") for kind in REQUIRED_LEGS[cell]}
+        optional = {(cell, f"capability-preexec/{backend}")} if cell == "leader-exit-exec" else set()
+        for result in results:
+            identity = (result.get("cell"), result.get("leg"))
+            if identity in required:
+                rows[identity].append(result)
+            elif identity not in optional:
+                coverage["unexpected"].append({"cell": identity[0], "leg": identity[1],
+                                               "requested_cell": cell, "requested_backend": backend})
+    for cell, leg in sorted(expected):
+        matches = rows.get((cell, leg), [])
+        identity = {"cell": cell, "leg": leg}
+        if not matches:
+            coverage["missing"].append(identity)
+        elif len(matches) != 1:
+            coverage["duplicates"].append({**identity, "count": len(matches)})
+        elif matches[0].get("pass") is True and matches[0].get("status") == "pass":
+            coverage["positive"] += 1
+        else:
+            coverage["nonpositive"].append({**identity, "pass": matches[0].get("pass"),
+                                            "status": matches[0].get("status")})
+    coverage["complete"] = coverage["positive"] == coverage["required"] and not coverage["unexpected"]
+    return coverage
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Installed automatic exec/scope recovery acceptance (H6 slice 4). "
+                    "Live use requires root with an ordinary workload uid/gid.")
+    parser.add_argument("--binary", type=Path, required=True,
+                        help="absolute path of the staged p11scope binary")
+    parser.add_argument("--provider", type=Path,
+                        default=Path("/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"),
+                        help="absolute path of the SoftHSM provider")
+    parser.add_argument("--discover", type=Path, default=None,
+                        help="absolute path of p11scope-discover "
+                             "(default: sibling of --binary)")
+    parser.add_argument("--source-revision", required=True,
+                        help="exact 40-hex source commit under test")
+    parser.add_argument("--uid", type=int, required=True)
+    parser.add_argument("--gid", type=int, required=True)
+    parser.add_argument("--cells", default=",".join(CELLS))
+    parser.add_argument("--backends", default=",".join(BACKENDS))
+    parser.add_argument("--out", type=Path, required=True,
+                        help="absolute new-only output directory (disk, never tmpfs)")
+    args = parser.parse_args(argv)
+    cells = args.cells.split(",")
+    backends = args.backends.split(",")
+    if os.geteuid() != 0 or args.uid <= 0 or args.gid <= 0:
+        parser.error("live harness requires root observer and an ordinary workload uid/gid")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+        parser.error("supply the exact source commit under test")
+    if any(name not in CELLS for name in cells):
+        parser.error(f"supported cells: {','.join(CELLS)}")
+    if any(name not in BACKENDS for name in backends):
+        parser.error(f"supported backends: {','.join(BACKENDS)}")
+    if args.discover is None:
+        args.discover = args.binary.parent / "p11scope-discover"
+    if not args.out.is_absolute() or any(
+            not path.is_absolute() for path in (args.binary, args.provider, args.discover)):
+        parser.error("all input/output paths must be absolute")
+    if "tmpfs" in str(args.out):
+        parser.error("output must live on disk, never tmpfs")
+    os.umask(0o022)
+    args.out.mkdir(mode=0o755)  # new-only; refuse accidental reuse
+    (args.out / "bin").mkdir(mode=0o755)
+    ctx = Case(args)
+    pins = []
+    results = []
+    result_batches = []
+    cleanup_receipt: dict = {"processes": 0, "cgroups": 0, "pins": 0, "errors": []}
+    with signal_cleanup():
+        try:
+            if "cgroup-reentry" in cells:
+                initialize_operator_namespace(ctx)
+            with cleanup_section():
+                ctx.binary = FilePin(args.binary)
+                pins.append(ctx.binary)
+                ctx.provider_pin = FilePin(args.provider)
+                pins.append(ctx.provider_pin)
+                ctx.discover_pin = FilePin(args.discover)
+                pins.append(ctx.discover_pin)
+            ctx.pins = compile_case_fixtures(args.out / "bin", pins)
+            ctx.b_file_offset = symbol_file_offset(
+                str(args.out / "bin" / "provider.so"), "C_Initialize")
+            for cell in cells:
+                for backend in backends:
+                    batch = run_cell_backend(ctx, cell, backend)
+                    results.extend(batch)
+                    result_batches.append((cell, backend, batch))
+                    if ctx.cleanup_failed:
+                        break
+                if ctx.cleanup_failed:
+                    break
+        finally:
+            with cleanup_section():
+                for scope in reversed(ctx.scopes):
+                    try:
+                        cleanup_leg_resources(scope)
+                    except LegCleanupError:
+                        pass  # the adapter has retained every failure on the case
+                ctx.leg_pins.extend(pins)
+                pins.clear()
+                try:
+                    cleanup_leg_resources(ctx)
+                except LegCleanupError:
+                    pass
+                namespace = getattr(ctx, "operator_namespace", None)
+                if namespace is not None and not any(
+                        any((scope.owners, scope.readers, scope.traced, getattr(scope, "operator_paths", ())))
+                        for scope in ctx.scopes):
+                    try:
+                        namespace.close()
+                    except OSError as error:
+                        ctx.cleanup_failed = True
+                        ctx.cleanup_errors.append(f"operator namespace FD: {type(error).__name__}: {error}")
+                cleanup_receipt.update(ctx.cleanup_totals, errors=list(ctx.cleanup_errors))
+                try:
+                    write_json(args.out / "cleanup.json", cleanup_receipt)
+                except OSError as error:
+                    ctx.cleanup_failed = True
+                    ctx.cleanup_errors.append(f"cleanup receipt unwritable: {error}")
+                    print(f"cleanup receipt unwritable: {error}", flush=True)
+    if ctx.cleanup_failed:
+        results.append({"cell": "harness", "leg": "cleanup", "status": "error", "pass": False,
+                        "errors": list(ctx.cleanup_errors)})
+    counts = {"passed": 0, "failed": 0, "negative": 0, "informational": 0}
+    for result in results:
+        passed, status = result.get("pass"), result.get("status")
+        capability = str(result.get("leg", "")).startswith("capability-preexec/")
+        if capability and passed is None and status in ("demonstrated", "limitation"):
+            counts["informational"] += 1
+        elif passed is False and status == "negative":
+            counts["negative"] += 1
+        elif not capability and passed is True and status == "pass":
+            counts["passed"] += 1
+        else:
+            counts["failed"] += 1
+    coverage = required_recovery_coverage(result_batches, cells, backends)
+    required_complete = coverage["complete"] and counts["failed"] == counts["negative"] == 0
+    summary = {
+        "source_revision": args.source_revision,
+        "candidate": ctx.binary.metadata(), "provider": ctx.provider_pin.metadata(),
+        "abi": "Linux x86-64 LP64", "kernel": os.uname().release,
+        "cells": [cell for cell in cells for _ in backends], "backends": list(backends),
+        "legs": results,
+        **counts, "required_coverage": coverage, "required_complete": required_complete,
+        "complete": required_complete and set(cells) == set(CELLS) and set(backends) == set(BACKENDS),
+        "unexecuted": [name for name in CELLS if name not in cells],
+    }
+    write_json(args.out / "summary.json", summary)
+    print(json.dumps({**counts, "required_complete": required_complete,
+                      "complete": summary["complete"], "out": str(args.out)}), flush=True)
+    return 0 if required_complete else 1
+
+
+def spawn_inventory(ctx, leg_dir, scope_args, module_args, manifest_args,
+                    backend, duration_s, tag="inventory"):
+    """Spawn an inventory observer; returns (owned, capture, errors, started, paths)."""
+    leg_dir = Path(leg_dir)
+    doc_path = leg_dir / f"{tag}.json"
+    log_path = leg_dir / f"{tag}.jsonl"
+    argv = [str(ctx.binary.path), "inventory", *scope_args, *module_args,
+           *manifest_args, "--duration", str(duration_s), "-o", str(doc_path),
+           "--event-log", str(log_path), "--capture", "native",
+           "--attach-backend", backend]
+    started = monotonic_ns()
+    owned = spawn_owned(ctx.owners, argv, 0, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, env=dict(os.environ), start_new_session=True)
+    capture = owned_reader(ctx.readers, Reader, owned.popen.stdout, leg_dir / f"{tag}.stdout.txt")
+    errors = owned_reader(ctx.readers, Reader, owned.popen.stderr, leg_dir / f"{tag}.stderr.txt")
+    return owned, capture, errors, started, doc_path, log_path
+
+
+def wait_inventory_ready(owned, errors, log_path, backend, timeout=120):
+    """Wait for the first committed pass; BackendRefused on explicit refusal."""
+    deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        try:
+            text = Path(log_path).read_text()
+        except FileNotFoundError:
+            text = ""
+        if '"pass_committed"' in text:
+            return monotonic_ns()
+        rc = owned.popen.poll()
+        if rc is not None:
+            tail = "".join(errors.lines[-20:])
+            if rc != 0 and REFUSAL_MARKERS.search(tail):
+                raise BackendRefused(f"{backend}: {tail.strip()[-500:]}")
+            raise SetupError(f"inventory observer exited rc={rc} before first pass: "
+                             f"{tail[-1000:]}")
+        if monotonic_ns() >= deadline:
+            raise SetupError("inventory observer never committed a pass")
+        pause_until(deadline, 0.5)
+
+
+def stop_inventory(owned, limit_seconds=INVENTORY_STOP_SECONDS):
+    return stop_observer(owned, limit_seconds)
+
+
+def wait_ledger_line(reader, prefix, timeout=120):
+    """Wait for an inventory-ledger stdout line with prefix; returns the line."""
+    try:
+        return reader.wait(lambda r: next(
+            (line for line in r.lines if line.startswith(prefix)), None), timeout)
+    except TimeoutError:
+        raise SetupError(f"ledger never printed {prefix!r}")
+
+
+def ledger_pids(reader):
+    """Parse pid per gen from IDENT lines seen so far."""
+    pids = {}
+    for line in reader.lines:
+        if line.startswith("IDENT "):
+            fields = dict(INV_KV.findall(line))
+            try:
+                pids[int(fields["gen"])] = int(fields["pid"])
+            except (KeyError, ValueError):
+                continue
+    return pids
+
+
+@owned_leg
+def run_cgroup_stop_before(ctx, cell_dir, backend):
+    """R3: stop before the first completed collection; capture stays empty."""
+    leg_dir = Path(cell_dir) / backend / "stop-before"
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-stop3")
+    image = leg_dir / "caller-a"
+    shutil.copyfile(ctx.pins["caller"].path, image)
+    image.chmod(0o755)
+    pin = leg_pin(ctx, image)
+    provider = ctx.provider_pin
+    root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
+    selected, _ = create_tracked(ctx, root.path / "selected")
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin,
+                                     provider, ctx.args.uid, ctx.args.gid, env)
+    stdout.record("ready", 0)
+    moves = []
+    move_and_verify(selected, caller, moves, "initial")
+    argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "cgroup-reentry", "leg": f"stop-before/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    # No call is ever issued: stop lands before the first completed collection.
+    obs_rc, stopped, latency = stop_observer(owned)
+    caller_rc = stop_caller(caller, stdout, 0)
+    finish_readers([stdout, capture, errors])
+    receipt = {"cell": "cgroup-reentry", "leg": f"stop-before/{backend}",
+               "scope_kind": "cgroup", "owned_pids": [caller.pid], "moves": moves,
+               "observer_rc": obs_rc, "caller_rc": caller_rc,
+               "observer_started_ns": started, "observer_ready_ns": ready,
+               "observer_stopped_ns": stopped,
+               **stop_receipt(owned, latency),
+               "expect_empty": True}
+    result = evaluate_trace_h6("".join(capture.lines), [], receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+@owned_leg
+def run_cgroup_stop_during(ctx, cell_dir, backend):
+    """R4: stop during final membership work; completed phases stay intact."""
+    leg_dir = Path(cell_dir) / backend / "stop-during"
+    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-stop4")
+    pins = {}
+    for name in ("caller-a", "caller-b"):
+        path = leg_dir / name
+        shutil.copyfile(ctx.pins["caller"].path, path)
+        path.chmod(0o755)
+        pins[name] = leg_pin(ctx, path)
+    provider = ctx.provider_pin
+    root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
+    selected, _ = create_tracked(ctx, root.path / "selected")
+    outside, _ = create_tracked(ctx, root.path / "outside")
+    sub, _ = create_tracked(ctx, selected.path / "sub")
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pins["caller-a"],
+                                     provider, ctx.args.uid, ctx.args.gid, env)
+    stdout.record("ready", 0)
+    images = [pins["caller-a"].image_receipt(stdout.record("image", 0), caller)]
+    moves = []
+    move_and_verify(selected, caller, moves, "initial")
+    argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "240s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "cgroup-reentry", "leg": f"stop-during/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "warm", "selected",
+               0, selected, phases)
+    t_out = monotonic_ns()
+    move_and_verify(outside, caller, moves, "exit")
+    # Unlike R1, this stop leg makes no outside API calls before exec.
+    # Synchronize the caller's ledger label with the verified move using
+    # its existing zero-call ACK, within the original successor budget.
+    enter_phase("successor-recovery", key=len(images))
+    n3_command(caller, stdout, "C_GetInfo", 0, 0, "exec-scope", "outside",
+               0, outside, phases)
+    output_cursor = len(capture.lines)
+    request, _, t0, t1 = caller_exec(caller, stdout, images, "thread-exec", pins["caller-b"])
+    transitions = [{"from_image": 0, "to_image": 1, "mode": "nonleader",
+                    "same_path": False, "scope": "outside",
+                    "t0": t0, "t1": t1, "request": request}]
+    t_in = monotonic_ns()
+    move_and_verify(sub, caller, moves, "descendant-reentry")
+    proof = warm_caller(capture, caller, stdout, images[-1], phases, group=sub,
+                        output_cursor=output_cursor)
+    n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
+               1, sub, phases)
+    # Final membership work continues around the stop: one call strictly
+    # before, the observer stops, one call strictly after.
+    n3_command(caller, stdout, "C_GetSessionInfo", 1, 0, "still-pre", "selected",
+               1, sub, phases)
+    obs_rc, stopped, latency = stop_observer(owned)
+    begin = monotonic_ns()
+    check_dispatch()
+    caller.popen.stdin.write("calls C_GetSessionInfo 1 0 still-post selected\n")
+    caller.popen.stdin.flush()
+    stdout.record("ack", 1, "still-post")
+    finish = monotonic_ns()
+    phases.append({"image": 1, "fn": "C_GetSessionInfo", "phase": "still-post",
+                   "scope": "selected", "count": 1, "t0": begin, "t1": finish,
+                   "actual_cgroup": cgroup_of(caller.pid)})
+    caller_rc = stop_caller(caller, stdout, 1)
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = next(p for p in phases if p["phase"] == "measured")
+    receipt = {
+        "cell": "cgroup-reentry", "leg": f"stop-during/{backend}", "scope_kind": "cgroup",
+        "owned_pids": [caller.pid],
+        "scope_intervals": [
+            {"pid": caller.pid, "membership": "selected", "t0": ready, "t1": t_out},
+            {"pid": caller.pid, "membership": "selected", "t0": t_in, "t1": stopped},
+        ],
+        "moves": moves,
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        **stop_receipt(owned, latency),
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "post-reentry", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 10, "phases": ["measured"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": [proof],
+        "exec_transitions": transitions, "phases": phases,
+        "require_named": True, "require_named_images": [1], "first_unknown_images": [],
+        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {"session": True},
+        "session_reuse": session_reuse_from(ledger),
+        "requested_backend": backend,
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -22,19 +22,55 @@ PROVIDER_SOURCE = ROOT / "crates" / "discover" / "tests" / "fixture" / "version_
 RECORDER_SOURCE = r"""
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <unistd.h>
 typedef unsigned char CK_BYTE;
 typedef unsigned long CK_ULONG, CK_RV, CK_FLAGS;
 typedef struct { CK_BYTE major, minor; } CK_VERSION;
 typedef struct { char *name; void *table; CK_FLAGS flags; } CK_INTERFACE;
 typedef struct { CK_VERSION version; void *functions[104]; } Table;
-static CK_RV record(void) {
+typedef struct { CK_ULONG type; void *value; CK_ULONG length; } Attr;
+static void attributes(CK_ULONG address, CK_ULONG count) {
+    const Attr *attrs = (const Attr *)(uintptr_t)address;
+    printf("P11SCOPE_TEST_ATTRIBUTES [");
+    for (CK_ULONG i = 0; i < count; i++) {
+        if (i) printf(",");
+        printf("[%lu,%lu,", attrs[i].type, attrs[i].length);
+        if (attrs[i].type == 0x180) {
+            printf("\"");
+            for (CK_ULONG j = 0; j < attrs[i].length; j++)
+                printf("%02x", ((const CK_BYTE *)attrs[i].value)[j]);
+            printf("\"");
+        } else if (attrs[i].type == 1 && attrs[i].length == 1) {
+            printf("%u", *(const CK_BYTE *)attrs[i].value);
+        } else if ((attrs[i].type == 0 || attrs[i].type == 0x100 ||
+                    attrs[i].type == 0x121 || attrs[i].type == 0x161) &&
+                   attrs[i].length == sizeof(CK_ULONG)) {
+            printf("%lu", *(const CK_ULONG *)attrs[i].value);
+        } else printf("null");
+        printf("]");
+    }
+    printf("]\n");
+}
+static CK_RV record(CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3,
+                    CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7,
+                    CK_ULONG a8, CK_ULONG a9) {
+    (void)a0; (void)a6; (void)a7; (void)a8; (void)a9;
     const char *value = getenv("P11SCOPE_TEST_RECORDER_FD");
     if (value) { int fd = atoi(value); char byte = 'C'; (void)write(fd, &byte, 1); }
     const char *failure = getenv("P11SCOPE_TEST_RECORDER_FAIL_CALL");
     static unsigned calls;
     calls++;
+    if (getenv("P11SCOPE_TEST_OBJECT_ATTRIBUTES")) {
+        if (calls == 1) attributes(a1, a2);
+        if (calls == 16) { attributes(a2, a3); attributes(a4, a5); }
+    }
     if (failure && calls == (unsigned)strtoul(failure, NULL, 10)) return 5;
+    if (a0 >= 0x701 && a0 <= 0x705) {
+        static const CK_RV results[] = {17, 18, 336, 5, 1};
+        return results[a0 - 0x701];
+    }
     return 0;
 }
 static Table table;
@@ -209,7 +245,7 @@ class CanaryWorkloadTests(unittest.TestCase):
         self.fail("workload did not publish READY within bounded test timeout")
 
     def assert_roster(self, mode, roster, pid):
-        expected_workers = {"matrix": 0, "blocked": 4, "faults": 2}[mode]
+        expected_workers = {"matrix": 0, "blocked": 4, "faults": 2, "object-blocked": 4}[mode]
         self.assertEqual(roster["schema"], "p11scope/canary-roster/v1")
         self.assertEqual(roster["mode"], mode)
         self.assertEqual(roster["pid"], pid)
@@ -529,8 +565,8 @@ class CanaryWorkloadTests(unittest.TestCase):
                 self.assert_no_publication_temporaries()
 
     def test_gated_modes_publish_complete_private_live_rosters_and_release_calls(self):
-        expected_calls = {"matrix": 25, "blocked": 4, "faults": 2}
-        for mode in ("matrix", "blocked", "faults"):
+        expected_calls = {"matrix": 25, "blocked": 4, "faults": 2, "object-blocked": 4}
+        for mode in expected_calls:
             with self.subTest(mode=mode):
                 ready = self.case_dir / f"{mode}.ready"
                 go = self.case_dir / f"{mode}.go"
@@ -568,13 +604,68 @@ class CanaryWorkloadTests(unittest.TestCase):
                 os.close(read_fd)
                 self.assert_no_ready_temporaries()
 
+    def test_concurrent_modes_retain_ready_and_zero_calls_past_ten_seconds_before_go(self):
+        expected_calls = {"blocked": 4, "faults": 2, "object-blocked": 4}
+        waiting = []
+        for mode in expected_calls:
+            ready, go = self.case_dir / f"{mode}.ready", self.case_dir / f"{mode}.go"
+            read_fd, write_fd = os.pipe()
+            self.addCleanup(os.close, read_fd)
+            os.set_blocking(read_fd, False)
+            env = dict(os.environ, P11SCOPE_TEST_RECORDER_FD=str(write_fd))
+            try:
+                child = self.launch(mode, provider=self.recorder, ready=ready, go=go,
+                                    env=env, pass_fds=(write_fd,))
+            finally:
+                os.close(write_fd)
+            first = self.wait_ready(child, ready)
+            self.assert_roster(mode, json.loads(first), child.pid)
+            with self.assertRaises(BlockingIOError):
+                os.read(read_fd, 1)
+            waiting.append((mode, child, ready, go, read_fd, first))
+
+        # Real wall time crosses the old native deadline without an observer,
+        # a clock override or any provider call. All three shared modes must
+        # retain their exact READY roster until the delayed GO arrives.
+        time.sleep(10.25)
+        for mode, child, ready, go, read_fd, first in waiting:
+            with self.subTest(mode=mode):
+                self.assertIsNone(child.poll(), f"{mode} exited before delayed GO")
+                self.assertEqual(ready.read_bytes(), first)
+                self.assert_roster(mode, json.loads(first), child.pid)
+                self.assertFalse(go.exists())
+                with self.assertRaises(BlockingIOError):
+                    os.read(read_fd, 1)
+                go.touch()
+
+        for mode, child, ready, _go, read_fd, first in waiting:
+            with self.subTest(mode=mode):
+                stdout, stderr = child.communicate(timeout=3)
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertIn("all calls CKR_OK", stdout)
+                self.assertEqual(os.read(read_fd, 4096), b"C" * expected_calls[mode])
+                self.assertEqual(ready.read_bytes(), first)
+        self.assert_no_ready_temporaries()
+
     def test_gate_timeout_is_nonpass_but_retains_complete_ready_diagnostic(self):
         ready, go = self.case_dir / "timeout.ready", self.case_dir / "timeout.go"
-        child = self.launch("blocked", ready=ready, go=go)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        env = dict(os.environ, P11SCOPE_TEST_RECORDER_FD=str(write_fd))
+        began = time.monotonic()
+        try:
+            child = self.launch("blocked", provider=self.recorder, ready=ready, go=go,
+                                env=env, pass_fds=(write_fd,))
+        finally:
+            os.close(write_fd)
         first = self.wait_ready(child, ready)
-        stdout, stderr = child.communicate(timeout=12)
+        self.assert_roster("blocked", json.loads(first), child.pid)
+        stdout, stderr = child.communicate(timeout=35)
+        self.assertGreaterEqual(time.monotonic() - began, 30)
         self.assertNotEqual(child.returncode, 0, stdout)
         self.assertEqual(ready.read_bytes(), first)
+        self.assertFalse(go.exists())
+        self.assertEqual(os.read(read_fd, 4096), b"")
         self.assertIn("timed out waiting for GO", stderr)
         self.assert_no_ready_temporaries()
 
@@ -622,6 +713,7 @@ class CanaryWorkloadTests(unittest.TestCase):
             ("matrix", "canary_workload matrix: all calls CKR_OK"),
             ("blocked", "blocked hostile subset: all calls CKR_OK"),
             ("faults", "blocked template faults: all calls CKR_OK"),
+            ("object", "canary_workload object: all calls match expected RV"),
         ):
             with self.subTest(mode=mode):
                 result = subprocess.run([str(self.workload), str(self.provider), mode], cwd=ROOT,
@@ -630,6 +722,42 @@ class CanaryWorkloadTests(unittest.TestCase):
                 self.assertIn(marker, result.stdout)
                 if mode == "matrix":
                     self.assertEqual(sum(line.endswith(" -> 0x0") for line in result.stdout.splitlines()), 25)
+                if mode == "object":
+                    ledger = [line for line in result.stdout.splitlines()
+                              if line.startswith("P11SCOPE_OBJECT ")]
+                    self.assertEqual(len(ledger), 30)
+                    self.assertTrue(all('"rv":0' in line and '"ready":1' in line
+                                        for line in ledger[:25]))
+
+    def test_object_fixture_supplies_all_six_fields_and_disjoint_pair_values(self):
+        result = subprocess.run(
+            [str(self.workload), str(self.recorder), "object"], cwd=ROOT,
+            env=dict(os.environ, P11SCOPE_TEST_OBJECT_ATTRIBUTES="1"),
+            text=True, capture_output=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line.removeprefix("P11SCOPE_TEST_ATTRIBUTES "))
+                for line in result.stdout.splitlines()
+                if line.startswith("P11SCOPE_TEST_ATTRIBUTES ")]
+        width = TARGET_BITS // 8
+        public = [[0, width, 4], [0x100, width, 16], [1, 1, 1],
+                  [0x161, width, 32], [0x121, width, 2048],
+                  [0x180, 10, "06082a8648ce3d030107"]]
+        private = [[0, width, 2], [0x100, width, 3], [1, 1, 0],
+                   [0x161, width, 24], [0x121, width, 4096],
+                   [0x180, 7, "06052b81040022"]]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row[:6] for row in rows], [public, public, private])
+        self.assertTrue(all([cell[0] for cell in row[6:]] == [0x11, 3] for row in rows))
+
+    def test_object_fixture_has_real_partial_error_and_cancel_rvs(self):
+        result = subprocess.run([str(self.workload), str(self.provider), "object"], cwd=ROOT,
+                                text=True, capture_output=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line.removeprefix("P11SCOPE_OBJECT "))
+                for line in result.stdout.splitlines() if line.startswith("P11SCOPE_OBJECT ")]
+        self.assertEqual([(row["session"], row["rv"], row["ready"]) for row in rows[25:]],
+                         [(0x701, 17, 1), (0x702, 18, 1), (0x703, 336, 1),
+                          (0x704, 5, 1), (0x705, 1, 1)])
 
 
 def parse_args(argv):

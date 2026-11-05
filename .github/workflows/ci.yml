@@ -2,26 +2,50 @@ name: ci
 on:
   push:
   pull_request:
-  # Manual runs from the Actions tab. The two dispatch-only jobs below run
-  # only when their input is selected; every other job runs as on push.
+  # Checks remain the default. Delivery routes call the maintained workflows
+  # at this commit without repeating the ordinary check matrix.
   workflow_dispatch:
     inputs:
+      delivery_task:
+        description: Run ordinary checks or one independent delivery task
+        type: choice
+        options: [checks, packages, docker, kubernetes]
+        default: checks
       release_preview:
         description: Run release-preview (hosted; builds and verifies the release artifacts)
         type: boolean
         default: true
       privileged_e2e:
-        description: Run privileged-e2e (waits for a [self-hosted, bpf] runner)
+        description: Run four gated capture cells on a hosted Ubuntu 26.04 runner
+        type: boolean
+        default: false
+      accepted_ci_run_id:
+        description: Completed successful exact-source ordinary CI run for package delivery
+        type: string
+      artifact_run_id:
+        description: Completed exact-source FULL package producer run for runtime delivery
+        type: string
+      capture_mode:
+        description: Package delivery modes
+        type: choice
+        options: [full, p0, both]
+        default: both
+      delivery_jobs:
+        description: Package build jobs (canonical integer 1 through 16)
+        type: string
+        default: '2'
+      run_k2:
+        description: Also run Kubernetes attach-pod controls
         type: boolean
         default: false
 permissions:
   contents: read
-# Per ref, so a branch that moves cancels its superseded run. Several refs at
+# Per ref, so a branch that moves sequences its queued runs. Several refs at
 # one commit (a release branch, main and the tag) each start a run; the dedupe
 # job below lets only the first of them run the check matrix.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 # The cargo-installed CI tools. Each version is read by both the install step
 # and its cache key, so a version bump can never be served an older binary.
 env:
@@ -65,16 +89,18 @@ jobs:
   # an earlier run on the commit is unfinished, this job waits for it (75
   # minutes at most), so a cancelled or failed earlier run never leaves the
   # commit without a result: the matrix then runs here. Pull requests (which
-  # test a merge commit) and manual dispatches always run it, and any API
-  # error runs it too. A covering run must itself have run lint and
-  # coverage-report, so a run that only deduplicated never covers another.
+  # test a merge commit) and default manual checks always run it; selected
+  # delivery tasks opt out before the API query. Any API error runs checks.
+  # A covering run must itself have run lint,
+  # coverage-report and bpf-noninterference successfully.
   dedupe:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     permissions:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      DELIVERY_TASK: ${{ inputs.delivery_task || 'checks' }}
     outputs:
       run: ${{ steps.decide.outputs.run }}
     steps:
@@ -87,6 +113,14 @@ jobs:
             printf '## dedupe\n\n%s\n' "$2" >>"$GITHUB_STEP_SUMMARY"
             exit 0
           }
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            case "$DELIVERY_TASK" in
+              checks) ;;
+              packages|docker|kubernetes)
+                decide false "delivery task $DELIVERY_TASK selected; ordinary checks were not requested" ;;
+              *) echo "invalid delivery task: $DELIVERY_TASK" >&2; exit 1 ;;
+            esac
+          fi
           if [ "$GITHUB_EVENT_NAME" != push ]; then
             decide true "$GITHUB_EVENT_NAME run: the check matrix runs"
           fi
@@ -107,9 +141,9 @@ jobs:
                 active="$active $id"
               elif [ "$conclusion" = success ]; then
                 ran=$(gh api "$api/runs/$id/jobs?per_page=100" \
-                  --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report") and .conclusion == "success")] | length') \
+                  --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report" or .name == "bpf-noninterference") and .conclusion == "success")] | unique_by(.name) | length') \
                   || ran=0
-                if [ "$ran" = 2 ]; then
+                if [ "$ran" = 3 ]; then
                   decide false "commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it"
                 fi
               fi
@@ -121,12 +155,44 @@ jobs:
             echo "dedupe: waiting for earlier run(s) on $GITHUB_SHA:$active"
             sleep 60
           done
-  # Static gates: formatting, compilation, both clippy profiles, the
-  # diagnostic-object inventory test and script lints.
+  package-delivery:
+    name: package-delivery
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'packages' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/package-preview.yml
+    with:
+      accepted_ci_run_id: ${{ inputs.accepted_ci_run_id }}
+      capture_mode: ${{ inputs.capture_mode }}
+      jobs: ${{ inputs.delivery_jobs }}
+  docker-delivery:
+    name: docker-delivery
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'docker' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/docker-runtime.yml
+    with:
+      preview_run_id: ${{ inputs.artifact_run_id }}
+  kubernetes-delivery:
+    name: kubernetes-delivery
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'kubernetes' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/kubernetes-runtime.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+      artifact_run_id: ${{ inputs.artifact_run_id }}
+      run_k2: ${{ inputs.run_k2 }}
+  # Static gates: formatting, compilation (gnu plus the shipped musl and
+  # P0 configurations), both clippy profiles, the diagnostic-object
+  # inventory test, feature host-admission regressions and script lints.
   lint:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,7 +202,8 @@ jobs:
       # read inline like .coverage-floor; crate rust-version tracks its major.minor.
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 shellcheck softhsm2
       # Cache keys (see the header): the runner image, and the apt C toolchain
       # that build scripts invoke.
       - name: Cache keys
@@ -191,6 +258,14 @@ jobs:
       # The wide Detailed profile changes the embedded BPF object and the slot
       # bound; lint it so a default-only change cannot break the other profile.
       - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline -p p11scope --all-targets --features wide-detailed-2112 -- -D warnings
+      # Every shipped configuration compiles on push: the static musl
+      # observer plus the P0 feature set on both libcs. A musl-only break (a
+      # libc wrapper with no musl binding) once landed and was found only by
+      # a manual build.
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl
       # libtest exits 0 when a filter matches nothing, so this step proves a test
       # actually ran rather than trusting the source to keep naming one. A rename,
       # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
@@ -199,6 +274,55 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
           grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
+      - name: Run feature host-admission regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          mkdir -m 700 "$RUNNER_TEMP/feature-regression-tmp"
+          export TMPDIR="$RUNNER_TEMP/feature-regression-tmp"
+          selectors=(
+            run::tests::refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery
+            run::tests::refused_multi_host_precedes_owned_workload_and_output
+            run::tests::counter_capture_and_run_require_host_after_build_policy_validation
+            inventory::tests::refused_multi_host_precedes_inventory_sinks_and_auto_fallback
+            inventory::tests::typed_multi_host_refusal_never_becomes_native_auto_scan_success
+            attach::tests::empty_live_session_requires_host_admission_for_every_backend
+            doctor::tests::object_capture_check_matches_build
+            doctor::tests::object_capture_check_fails_on_flavor_mismatch
+            doctor::tests::object_capture_check_fails_on_unsafe_flavor_mismatch
+          )
+          feature_regression_status=0
+          for features in stub-object-attributes unsafe-unvalidated-metadata stub-object-attributes,unsafe-unvalidated-metadata; do
+            config_status=0
+            log="$RUNNER_TEMP/feature-host-${features//,/+}.log"
+            if cargo +"$(cat .release-rust-version)" test --locked --offline -p p11scope --lib \
+              --no-default-features --features "$features" -- \
+              --exact --test-threads=1 --color never "${selectors[@]}" 2>&1 | tee "$log"; then
+              :
+            else
+              config_status=1
+            fi
+            # Check the final outer summary and every unique named positive:
+            # zero matches, ignored tests or a nested summary cannot pass.
+            summary=$(grep '^test result:' "$log" | tail -n 1 || true)
+            if [[ "$summary" != "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; "* ]]; then
+              printf 'feature regressions %s: expected 9 passed, 0 failed, 0 ignored; got %s\n' "$features" "$summary" >&2
+              config_status=1
+            fi
+            for selector in "${selectors[@]}"; do
+              count=$(grep -Fxc -- "test $selector ... ok" "$log" || true)
+              if [[ "$count" != 1 ]]; then
+                printf 'feature regressions %s: expected one passing %s, got %s\n' "$features" "$selector" "$count" >&2
+                config_status=1
+              fi
+            done
+            printf 'feature regressions %s: status=%s\n' "$features" "$config_status"
+            if [[ "$config_status" != 0 ]]; then
+              feature_regression_status=1
+            fi
+          done
+          exit "$feature_regression_status"
       - run: pipx install ruff==0.16.8
       # SYSPLAN residual gates. None names a lane body: the lint step
       # addresses directories through a shell variable, never a scripts/
@@ -218,7 +342,7 @@ jobs:
   audit:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -261,7 +385,7 @@ jobs:
   tests:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -327,7 +451,7 @@ jobs:
       # The workspace gate, every target but artifact_contracts: the script
       # rewrites --all-targets into --lib --bins --examples --benches plus one
       # --test per integration target from cargo metadata.
-      - run: python3 -I scripts/ci-test-partition.py run --partition rest -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
+      - run: python3 -I scripts/ci-test-partition.py run --partition rest -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets --no-fail-fast
       - name: Aya dependency unit tests
         env:
           CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
@@ -338,6 +462,222 @@ jobs:
       - run: cargo +"$(cat .release-rust-version)" test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
       - name: Prove the prepared dependency trees are unchanged
         run: python3 -I scripts/prepare-dependencies.py --check
+  # Reuse the tests runner slot. Failure of tests still permits this independent
+  # diagnostic, while cancellation and a deduplicated run suppress it.
+  bpf-noninterference:
+    needs: [dedupe, tests]
+    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      # Ubuntu 26 packages bpftool separately; older images use a versioned
+      # linux-tools executable. Select the package-owned binary, not the
+      # common wrapper that dispatches by the runner's Azure kernel name.
+      # The BTF-order fallback shells to bpftool for its canonical C dump.
+      - name: Install packaged bpftool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y linux-tools-generic
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
+          test -x "$bpftool_source"
+          sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
+          bpftool version
+          sudo bpftool version
+      # Pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
+      # b27149d51; the pin commit itself only guards the canary strip),
+      # on top of 873adf5c4:
+      # the round-10 inventory lifecycle ring raise (805a596ae, 2 MiB to
+      # 8 MiB) changes one word in each Inventory object's `maps` (the
+      # DISCOVERY ring size); both Inventory objects keep byte-identical
+      # code, symbols and .maps (keygen compiles out of the Inventory
+      # flavors), with unchanged file sizes. The keygen return-path
+      # publication gate (991e36dd5, f3cab1ce2) grows the default
+      # Detailed .text by 128 B (ordinary_return and
+      # object_return_ordinary, +64 B each, where capture_return_facts
+      # inlines); every other Detailed code section differs only in
+      # subprogram call offsets, .rel.text moves with the calls, the
+      # symbol set is unchanged, .maps is unchanged, and no map or
+      # program is added. The unsafe entry flag compiles out of default
+      # builds (unsafe-unvalidated-metadata cfg). The journal object,
+      # which this gate does not compare, reshapes two .text
+      # subprograms only (register allocation from the gate
+      # restructure); its membership gate, return-code gate and flag
+      # sets are identical and it keeps withholding unregistered ids.
+      # No other BPF input changed since 873adf5c4.
+      # Earlier pin 873adf5c4, the round-9 integration tip, on top of cf46fc5e:
+      # the 6.14 Option A exit-time mapping summaries (3107325eb) add a
+      # Detailed-only kind-7 arm to emit_lifecycle, a kind selection to
+      # the exit hook, and link the native exit-summary reader. The
+      # default Detailed object gains .text (+424 B) and
+      # raw_tp/sched_process_exit (+32 B), one new symbol and a grown
+      # .text relocation table; every other Detailed code section is
+      # identical modulo subprogram call offsets, .maps is unchanged,
+      # and no map or program is added. Both Inventory objects keep
+      # byte-identical code, maps and BTF meaning; only .debug_* (+80 B)
+      # and .BTF.ext line info move with the added source lines, and
+      # five statics rename by crate disambiguator only. a670f5599 is
+      # test-only. The pkcs11 0.2.3 repin (559cf089e) changes no code
+      # bytes or BTF meaning; it does not itself build (mid-round
+      # call-site drift, repaired by 1048aad51), so the pin absorbs
+      # through this tip instead. No other BPF input changed since
+      # cf46fc5e.
+      # Earlier pin cf46fc5e, the gate-1 loader frame and bank series on
+      # top of b200e06f: the image-bank allocator narrowing, the bank-B
+      # cookie qualification at the image query seam, the verifier-visible
+      # bank indexes, the 512-byte p11_return fit and the witness-pass
+      # refusal count are all inside the gate-1 (P11SCOPE_LOADER_GATE)
+      # regions of image_identity.c, image_identity.h and
+      # image_identity_query.c. The default objects keep every allocated
+      # and executable section, symbol, relocation and .BTF byte
+      # (scripts/check-gate0-identity.py, journal object included); only
+      # .BTF.ext line info and .debug_* move with the shifted source
+      # lines. No other BPF input changed since b200e06f.
+      # Earlier pin b200e06f, the PID-scope birth witness on top of 4dbdf106 (the
+      # picked d0bfdfcf, which is not an ancestor of this pin): the birth
+      # marker compares the target leader's start time with the
+      # published PID_START_TICK value before it mints a READY row, so a
+      # process that reuses the target PID number gets no record. The
+      # default Detailed object gains the PID_START_TICK map (.maps +28 B),
+      # raw_tp/sched_process_exec passes the PID-scope tgid to the birth
+      # (+144 B) and .text takes the witness inside p11_instance_exec_birth
+      # (+272 B); uprobe, uretprobe and sched_process_exit differ only in
+      # subprogram call offsets, and no program is added. Both Inventory
+      # objects keep their code, symbols and .maps; only debug line data
+      # and .BTF.ext line info move. The journal object, which this gate
+      # does not compare, gains the same map and witness. No other BPF
+      # input changed since 4dbdf106.
+      # Earlier pin d0bfdfcf, the verifier-cost series on top of 8b7ee11a: the
+      # 7.4-rc1 Detailed load fix (87fd5ed0, getter slots classified by one
+      # outlined helper with a packed scalar result), the outlined GetID
+      # return facts (f7553014), the bpf_loop discovery-directory scan
+      # (cb5f4c35) and the bpf_loop default cleanup sweep (d0bfdfcf). The
+      # default Detailed object changes code in .text (+992 B) and uprobe
+      # (+6848 B); uretprobe and the sched, task, iter, fentry and fexit
+      # sections keep their instructions and differ only in subprogram call
+      # offsets, .maps is unchanged, and no map or program is added. Both
+      # Inventory objects change .text (-232 B; the directory scan becomes a
+      # bpf_loop callback) and uprobe (+24 B); their other code sections
+      # differ only in call offsets and .maps is unchanged. The journal
+      # object, which this gate does not compare, takes the same changes.
+      # No other BPF input changed since 8b7ee11a.
+      # Earlier pin 8b7ee11a, the 7.3 exec-release and 6/7-argument copy_vma hooks
+      # (the picked hook-set series 9fb2c1fb..df782cfc plus the refused-helper
+      # fault 8b7ee11a): the default Detailed object gains the fexit/exec_mmap
+      # section (p11_image_mmap_release) and p11_inst_vma_retcopy in
+      # fexit/copy_vma; p11_inst_vma_copy and every other code section are
+      # byte-identical (only relocation, symbol, string, BTF and debug
+      # sections move), .maps is unchanged, and both Inventory objects are
+      # byte-identical to 55101d3c. The journal object, which this gate does
+      # not compare, gains the same two programs. No other BPF input changed
+      # since 55101d3c.
+      # Earlier pin 55101d3c, the journal READY writer (picked 54693889) plus its
+      # comment corrections: the default Detailed object differs from 6641123f
+      # only in debug sections (54693889 changes .debug_line through the
+      # instance_epoch.c source checksum; 55101d3c also rewraps a
+      # journal_marker.h comment, which shifts .debug_info line numbers);
+      # code, maps and size are unchanged and both Inventory objects are
+      # byte-identical. The journal object, which this gate does
+      # not compare, gains p11_instance_exec_birth and its exec-root call.
+      # No other BPF input changed since 6641123f.
+      # Earlier pin 6641123f, the async control value flags: the default Detailed
+      # object marks an unreadable C_AsyncJoin id argument at entry and an OK
+      # C_AsyncGetID with a null output pointer at return as
+      # ASYNC_VALUE_UNREADABLE (p11_entry +32 B, ordinary_return +160 B,
+      # object_return_ordinary +80 B; .text +240 B, uprobe +32 B; no new map
+      # or program, .maps unchanged); both Inventory objects are
+      # byte-identical to 16a7bd53. No other BPF input changed since 16a7bd53.
+      # Earlier pin 16a7bd53, the default journal and birth-marker lane (FULL and P0
+      # builds carry the marker unless P11SCOPE_BIRTH_MARKER=0): the default
+      # Detailed object gains JOURNAL_MARKER_CTL (one map, no new program) plus
+      # the p11_instance_exec_birth and p11_instance_scope_gap bodies and their
+      # calls from the exec, exit, uprobe and uretprobe hooks (.text +4304 B,
+      # .maps +32 B); both Inventory objects are byte-identical to b3b75346.
+      # No other BPF input changed since b3b75346.
+      # Earlier pin b3b75346, the reviewed exec-witness health-counter fix: the native
+      # witness no longer counts allocator misses, and emit_lifecycle stamps the
+      # EXEC ticket in Detailed only while short-lived tracking is armed outside
+      # aggregate captures (counter objects compile the ticket out), a code
+      # change in the Detailed and InventoryCallers objects. No other BPF input
+      # changed since 9a0b277a.
+      # Earlier pin 9a0b277a, the reviewed PID-scope EXEC ticket fix: emit_lifecycle no
+      # longer takes the EXEC task ticket under PID scope, a code change in the
+      # Detailed and InventoryCallers objects (the inventory object should differ
+      # only in line info). No other BPF input changed since 30208b48.
+      # Earlier pin 30208b48, the post-loader-gate-wiring tree. Since 90b8cf9f the BPF
+      # inputs changed in 76098298, a785b4a3 and d63208ac (objects still
+      # matched 90b8cf9f at d63208ac), then 5f67b34f, 32e7dd9a and 523323e0:
+      # at 30208b48 only .debug_* and .BTF.ext line info differ in all three
+      # objects (switched-off loader-gate cfg lines shift source lines);
+      # code, map and BTF type sections are byte-identical.
+      # Earlier pin 90b8cf9f: the BPF input changes
+      # since ba92b4e2 are exactly these 12 reviewed commits (loader
+      # hit-transaction series, bank identity/fold lifecycle, journal
+      # caller/header parity, staged kind-7 notes, birth-marker build
+      # derivation):
+      #   11accb2b feat: derive birth marker selection from P11SCOPE_BIRTH_MARKER
+      #   5cdfcb23 docs: mark the kind-7 exit-mappings ABI staged
+      #   ac35d1cc fix: restore journal header parity and check flag conversion
+      #   c4d87451 fix: migrate object_return journal caller to Option reason
+      #   054dc38f test: cover loader acknowledgement, bank cutover and token records
+      #   81fef0a2 feat: add loader transition counters, native acknowledgement and bank cutover
+      #   4f48d083 fix: select loader path before ring reservation
+      #   083455fc test: cover loader hit transaction, contention and retained charging
+      #   f2432aa2 fix: serialize loader admission through a hit transaction
+      #   4c905928 test: cover bank identity qualification and fold lifecycle
+      #   81794750 fix: qualify bank identities and complete the fold lifecycle
+      #   2f09b7d3 fix: scope finite_increment to single-bank builds
+      # Compare complete objects, including metadata, from this baseline forward.
+      # Object parity does not establish installed/live acceptance.
+      # The checker reconstructs and explicitly fetches each immutable snapshot,
+      # then builds it offline (including nested nightly Cargo). No target cache.
+      - name: Compare complete default objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81
+          comparison_root="$RUNNER_TEMP/bpf-noninterference"
+          mkdir -m 700 "$comparison_root"
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$BASELINE" \
+            --work "$comparison_root/repeat-baseline" --repeat-baseline
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
+            --work "$comparison_root/integration"
+          test -s "$comparison_root/repeat-baseline/comparison.json"
+          test -s "$comparison_root/integration/comparison.json"
+      - name: Retain available comparison evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-noninterference
+          path: |
+            ${{ runner.temp }}/bpf-noninterference/*/*.json
+            ${{ runner.temp }}/bpf-noninterference/*/*.jsonl
+            ${{ runner.temp }}/bpf-noninterference/*/*.stdout
+            ${{ runner.temp }}/bpf-noninterference/*/*.stderr
+            ${{ runner.temp }}/bpf-noninterference/*/baseline/
+            ${{ runner.temp }}/bpf-noninterference/*/candidate/
+          if-no-files-found: error
+          retention-days: 90
   # The same workspace test gate, narrowed to artifact_contracts and split
   # into shards. Each shard computes the same longest-first plan from the
   # binary's own test list and the checked-in scripts/ci-test-weights.json,
@@ -348,7 +688,7 @@ jobs:
     name: contracts-${{ matrix.shard }}
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -406,7 +746,7 @@ jobs:
   scripts:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -432,23 +772,27 @@ jobs:
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-count-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-stagea-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/bench-marker-cost.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/capture-stopped-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/check-canary-evidence.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/dump-owned-bpf-maps.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/k8s-profile-entry.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/kubernetes-runtime.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/qualify-inventory-c1b.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/bench-inventory-native.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/measure-c5-campaign.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/qualify-release-matrix.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/release-matrix-contract.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/qualify-task-storage-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/qualify-e16-surfaces.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/run-t7-static-campaign.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
-          UNRUN: scripts/system-scope-measure.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-owned.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-receipt.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-sample.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-supervisor.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/system-scope-soak.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/system-manifest-soak.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/task-1.6-lane-a.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/tsprobe.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/lane-build-release-oracle-1.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
@@ -463,9 +807,21 @@ jobs:
           UNRUN: scripts/verify-discover-containers.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-induced-gaps.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/kind-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/kind-attach-pod-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/cold-pod-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/knative-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/docker-shared-layer-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/late-provider-negative.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-p11kit-pid-startup.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-p11kit-remote.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/joint-throughput.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/joint-stall-live.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/key-operations-linked-control.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/key-operations-system.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/fedora-softhsm-cell.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-abi-routing.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-fork-scope.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-ia32-compat.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -477,6 +833,13 @@ jobs:
           UNRUN: scripts/matrix/verify-knative.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-pidns.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-proxy-stack.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/soak-weekly.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/lifecycle-cli.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/scale-8192.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/run-root-integration.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/run-witness-cli.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/container-cells.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/qualify-real-providers.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           EOF
           cat "$RUNNER_TEMP/lanes.txt"
           { echo '## UNRUN lanes'; echo '```'; cat "$RUNNER_TEMP/lanes.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
@@ -486,7 +849,7 @@ jobs:
       - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 python3-yaml shellcheck softhsm2
       # Cache keys (see the header): the runner image, and the apt C toolchain
       # that build scripts invoke.
       - name: Cache keys
@@ -507,6 +870,31 @@ jobs:
           key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
       - if: steps.bpf-linker.outputs.cache-hit != 'true'
         run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      # Ubuntu 26 packages bpftool separately; older images use a versioned
+      # linux-tools executable. Select the package-owned binary, not the
+      # common wrapper that dispatches by the runner's Azure kernel name.
+      # The gate-0 identity twins shell to bpftool for their raw BTF dumps.
+      - name: Install packaged bpftool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y linux-tools-generic
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
+          test -x "$bpftool_source"
+          sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
+          bpftool version
+          sudo bpftool version
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.
@@ -530,6 +918,8 @@ jobs:
       - run: scripts/verify-discover-containers.sh --self-test
       - run: scripts/verify-capability-tier.sh --self-test
       - run: scripts/verify-live-discovery-preflight.sh --self-test
+      - run: scripts/verify-p11kit-pid-startup.sh --self-test
+      - run: scripts/verify-p11kit-remote.sh --self-test
       - run: scripts/verify-canaries.sh --self-test
       - run: scripts/verify-provider-matrix.sh --self-test
       - run: scripts/release-gate.sh --self-test
@@ -539,29 +929,42 @@ jobs:
       - run: scripts/build-release.sh --self-test
       - run: scripts/bench-overhead.sh --self-test
       - run: scripts/bench-stagea-overhead.sh --self-test
+      - run: scripts/bench-marker-cost.sh --self-test
       - run: scripts/bench-count-overhead.sh --self-test
       - run: scripts/bench-discovery.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test
       - run: scripts/kind-e2e.sh --self-test
+      - run: scripts/kind-attach-pod-e2e.sh --self-test
+      - run: scripts/cold-pod-e2e.sh --self-test
+      - run: scripts/knative-e2e.sh --self-test
+      - run: scripts/docker-shared-layer-e2e.sh --self-test
+      - run: scripts/late-provider-negative.sh --self-test
       - run: scripts/tsprobe.sh --self-test
       - run: scripts/qualify-inventory-native.sh --self-test
         timeout-minutes: 10
       - run: scripts/bench-inventory-native.sh --self-test
       - run: scripts/measure-c5-campaign.sh --self-test
       - run: scripts/qualify-release-matrix.sh --self-test
+      - run: scripts/qualify-stop-races.sh --self-test
       - run: scripts/matrix/verify-fork-scope.sh --self-test
       - run: scripts/matrix/verify-ia32-compat.sh --self-test
       - run: scripts/matrix/verify-oracle.sh --self-test
       - run: scripts/matrix/verify-shared-layer.sh --self-test
       - run: scripts/matrix/verify-uretprobe-seccomp.sh --self-test
+      - run: scripts/ci/build-counter-fixtures.sh --self-test
+      - run: scripts/ci/joint-stall-live.sh --self-test
+      - run: scripts/ci/run-root-integration.sh --self-test
+      - run: scripts/ci/run-witness-cli.sh --self-test
       - run: python3 -I scripts/check-bpf-map-defs.py --self-test
       - run: python3 -I scripts/check-canary-evidence.py --self-test
       - run: python3 -I scripts/check-capture-evidence.py --self-test
+      - run: python3 -I scripts/check-counter-object.py --self-test
       - run: python3 -I scripts/check-live-discovery-object.py --self-test
       - run: python3 -I scripts/dump-owned-bpf-maps.py --self-test
       - run: python3 -I scripts/check-live-discovery-evidence.py --self-test
       - run: python3 -I scripts/lane-attach-e2e-oracle.py --self-test
       - run: python3 -I scripts/kind-e2e-oracle.py --self-test
+      - run: python3 -I scripts/container-cells-oracle.py --self-test
       - run: python3 -I scripts/lane-inspect-doctor-oracle.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-1.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-2.py --self-test
@@ -570,6 +973,7 @@ jobs:
       - run: python3 -I scripts/lane-bench-overhead-oracle-1.py --self-test
       - run: python3 -I scripts/lane-bench-overhead-oracle-3.py --self-test
       - run: python3 -I scripts/bench-stagea-overhead-analyze.py --self-test
+      - run: python3 -I scripts/bench-marker-cost-analyze.py --self-test
       - run: python3 -I scripts/bench-count-overhead-analyze.py --self-test
       - run: python3 -I scripts/bench-discovery-stats.py --self-test
       - run: python3 -I scripts/task-1.6-lane-a.py --self-test
@@ -579,8 +983,9 @@ jobs:
       - run: python3 -I scripts/measure-c5-analysis.py --self-test
       - run: python3 -I scripts/qualify-e16-surfaces.py --self-test
       - run: python3 -I scripts/ci-test-partition.py --self-test
+      - run: python3 -I scripts/system-scope-soak-oracle.py --self-test
       - run: scripts/verify-inspect-doctor.sh
-      - run: scripts/verify-attach-e2e.sh
+      - run: scripts/verify-attach-e2e.sh --diagnose-skips
       # Every tests/python suite (F-62): the runner checks that each file is
       # registered exactly once (run here, driven by a named cargo test or
       # self-test, or excluded with a reason), fails on any unregistered or
@@ -596,26 +1001,56 @@ jobs:
   # token gets actions: read and nothing else; upload-artifact uses the runtime
   # token, not GITHUB_TOKEN. It neither restores nor saves a cache.
   archive-log:
-    needs: [lint, audit, tests, contracts, scripts]
+    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]
     # Not always(): a cancelled run's log is truncated by definition, and
     # publishing it produces an artifact that looks like evidence of a
     # completed job and is not. Failures still archive. A run the dedupe job
     # skipped has no check job log to keep, so it archives nothing.
     if: ${{ !cancelled() && !contains(needs.*.result, 'skipped') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      CHECK_JOBS: lint audit tests contracts-1 contracts-2 contracts-3 contracts-4 contracts-5 contracts-6 contracts-7 contracts-8 scripts
+      CHECK_JOBS: lint audit tests bpf-noninterference contracts-1 contracts-2 contracts-3 contracts-4 contracts-5 contracts-6 contracts-7 contracts-8 scripts
     steps:
       - run: |
           mkdir "$RUNNER_TEMP/checks-logs"
           for job in $CHECK_JOBS; do
-            JOB_ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq ".jobs[] | select(.name == \"$job\") | .id")
-            # Exactly one job by that name: none means the list rotted, two
-            # would splice two ids into one URL.
-            test "$(printf '%s\n' "$JOB_ID" | grep -c '^[0-9][0-9]*$')" = 1
+            # The jobs list can flake (a transient 502 killed a real run's
+            # archive) or carry one name twice after a rerun, so fetch
+            # id+created_at pairs with the same bounded 3x5s retry the log
+            # fetch below uses, then pick the latest attempt.
+            JOB_ROWS=""
+            for list_attempt in 1 2 3; do
+              if JOB_ROWS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq ".jobs[] | select(.name == \"$job\") | \"\(.id) \(.created_at)\""); then
+                if [ -n "$JOB_ROWS" ]; then
+                  break
+                fi
+                echo "job $job: jobs list has no entry for it (list attempt $list_attempt)" >&2
+              else
+                echo "job $job: jobs list fetch failed (list attempt $list_attempt)" >&2
+              fi
+              if [ "$list_attempt" = 3 ]; then
+                echo "job $job: no jobs-list entry after 3 attempts; last rows observed: [${JOB_ROWS:-none}]" >&2
+                exit 1
+              fi
+              sleep 5
+            done
+            # After a rerun the list can hold one name twice; keep the latest
+            # attempt (greatest created_at, greatest id breaking a tie), never
+            # splice two ids into one URL.
+            # grep -c exits 1 on zero matches, which under `bash -e` would
+            # kill this step silently, so `|| true` keeps the count while the
+            # loud check below owns the failure.
+            JOB_COUNT=$(printf '%s\n' "$JOB_ROWS" | grep -c '^[0-9][0-9]* ' || true)
+            JOB_IDS=$(printf '%s\n' "$JOB_ROWS" | grep '^[0-9][0-9]* ' | cut -d' ' -f1 | tr '\n' ' ')
+            JOB_ID=$(printf '%s\n' "$JOB_ROWS" | grep '^[0-9][0-9]* ' | sort -k2,2 -k1,1n | tail -n 1 | cut -d' ' -f1)
+            if [ -z "$JOB_ID" ]; then
+              echo "job $job: no numeric job id among rows: [$JOB_ROWS]" >&2
+              exit 1
+            fi
+            echo "job $job: archiving job id $JOB_ID ($JOB_COUNT listed: $JOB_IDS)"
             # .../jobs/<id>/logs answers 302 to blob storage and gh api follows it: a 302 in a
             # verbose trace is the success path, not a failure. It can also 404 for a short
             # window right after the job completes, while the log is finalized, hence the
@@ -651,38 +1086,197 @@ jobs:
           retention-days: 90
   # SYSPLAN residual F-04: one privileged CI E2E job running the gated
   # system-scope cells (pid/system x metrics/profile) with their
-  # expected-count oracles. Required-but-manual: it runs only on manual
-  # dispatch, on a self-hosted BPF-capable runner. On push/PR it skips
-  # without implying anything ran; while no runner carries these labels
-  # the job waits rather than going green. Real and runnable: dispatch it
-  # from the Actions tab once a [self-hosted, bpf] runner exists.
+  # expected-count oracles. Manual on an ordinary hosted runner; push/PR
+  # skips do not qualify these cells. A missing capability, incomplete
+  # matrix or failed count/window oracle fails rather than becoming a skip.
+  # Endpoint/WIDE/population scale and long soaks are separate qualifications.
   privileged-e2e:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.privileged_e2e }}
-    runs-on: [self-hosted, bpf]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.privileged_e2e }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Prepare owned hosted test storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          work=/var/tmp/p11scope-ws-tmp
+          if [[ ! -e "$work" ]]; then mkdir -m 700 "$work"; fi
+          test -d "$work" && test ! -L "$work" && test -O "$work"
+          test "$(stat -c %a "$work")" = 700
+          case "$(stat -f -c %T "$work")" in
+            tmpfs|ramfs) echo "capture TMPDIR must be disk-backed" >&2; exit 1 ;;
+          esac
+          echo "TMPDIR=$work" >>"$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=2" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - run: sudo -n apt-get update && sudo -n apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm procps python3 softhsm2 util-linux
+      - name: Check hosted capture prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n true
+          test "$(id -u)" -ne 0
+          test -r /sys/kernel/btf/vmlinux
+          command -v flock
+          command -v pgrep
+          {
+            uname -a
+            id
+            clang-18 --version
+            free -h
+            df -h "$TMPDIR"
+            ulimit -a
+            cat /proc/sys/kernel/perf_event_paranoid
+            cat /proc/sys/kernel/yama/ptrace_scope
+          } >"$TMPDIR/hosted-capabilities.txt"
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Build observer and discovery helper
+        run: cargo +"$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover
       # The four gated cells in one lane invocation: --scope both runs
       # pid+system, --mode both runs metrics+profile, and the lane's own
       # oracle joins observer report + traces + workload TRUTH per cell.
-      - run: scripts/system-scope-measure.sh --scope both --mode both
-  # SYSPLAN residual F-28: release preview (musl build, docker build/lint,
-  # kubeconform, SBOM, build-release.sh wired). Manual like the privileged
-  # lane: dispatch it on demand; it never blocks PRs and never implies a
-  # release ran. Hosted runners suffice (passwordless sudo covers the
-  # receipt steps); no special labels needed.
+      - name: Run four gated system-scope cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          ulimit -n 65536
+          test -x "$PWD/target/release/p11scope"
+          test -x "$PWD/target/release/p11scope-discover"
+          if pgrep -x 'cargo|rustc' >/dev/null; then
+            echo "compiler still active before capture" >&2
+            exit 1
+          else
+            status=$?
+            if [[ "$status" -ne 1 ]]; then
+              echo "cannot verify a quiet capture host" >&2
+              exit 1
+            fi
+          fi
+          # shellcheck disable=SC2016
+          flock -n "$TMPDIR/hosted-system.lock" bash -c '
+            set -euo pipefail
+            binary="$PWD/target/release/p11scope"
+            doctor_status=0
+            sudo -n env TMPDIR="$TMPDIR" "$binary" doctor >"$TMPDIR/hosted-doctor.txt" 2>&1 || doctor_status=$?
+            printf "%s\n" "$doctor_status" >"$TMPDIR/hosted-doctor-status.txt"
+            python3 -I - "$TMPDIR/hosted-doctor.txt" "$doctor_status" << "PY"
+          import re
+          import sys
+          from pathlib import Path
+
+          if int(sys.argv[2]) not in (0, 1):
+              raise RuntimeError("doctor did not finish with a supported verdict")
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          for name in ("uprobe-multi attach (own libc)", "uretprobe vs seccomp"):
+              rows = [line for line in lines if line.startswith(name)]
+              if len(rows) != 1 or re.fullmatch(re.escape(name) + r" \.* ok(?:[ \t].*)?", rows[0]) is None:
+                  raise RuntimeError("functional doctor row missing, duplicated or not ok: " + name)
+          PY
+            exec scripts/system-scope-measure.sh --scope both --mode both \
+              --duration 8 --n-calls 20000 --binary "$binary" --no-build \
+              --work "$TMPDIR/hosted-system-e2e"
+          '
+      - name: Validate four required capture records
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - "$TMPDIR/hosted-system-e2e/matrix.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          def require(ok, reason):
+              if not ok:
+                  raise RuntimeError(reason)
+
+          matrix = json.loads(Path(sys.argv[1]).read_text())
+          require(matrix.get("schema") == "p11scope/system-scope-matrix/v1", "matrix schema")
+          expected = {"pid/metrics", "pid/profile", "system/metrics", "system/profile"}
+          records = matrix["records"]
+          require(set(records) == expected, "four distinct capture records required")
+          for key in sorted(expected):
+              row = records[key]
+              condition = row["condition"]
+              require(key == condition["scope"] + "/" + condition["mode"], "cell identity")
+              require(condition["n_calls"] == 20000, "expected workload size")
+              truth = row["truth_vs_observed"]
+              require(truth["truth"]["C_GenerateRandom"] == 20000, "nonzero workload truth")
+              require(truth["counts_match"] is True, "expected-count oracle failed")
+              require(row["window"]["window_valid"] is True, "capture window oracle failed")
+              harness = row["harness"]
+              require(harness["observer_exit"] == 0, "observer exit")
+              require(harness["observer_timed_out"] is False, "observer timeout")
+              require(harness["observer_signal"] is None, "observer signal")
+              evidence = row["evidence"]
+              for name in ("event_loss", "semantic_capture_failures"):
+                  value = evidence["counters"][name]
+                  require(type(value) is int and value == 0, "capture loss counter: " + name)
+              pending = evidence["in_flight_at_end"]
+              require(type(pending) is int and pending == 0, "calls remain in flight")
+              report = json.loads(Path(row["artifacts"]["report"]).read_text())
+              require(report["evidence"]["drain_proven"] is True, "final drain unproven")
+              print("PASS " + key + " expected_random_calls=20000")
+          PY
+      - name: Collect bounded capture context
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CAPTURE_FAILED: ${{ job.status == 'failure' }}
+        run: |
+          set -euo pipefail
+          python3 -I - "$TMPDIR" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve()
+          output = root / "hosted-context"
+          output.mkdir(mode=0o700)
+          sources = [("doctor.txt", root / "hosted-doctor.txt"),
+                     ("doctor-status.txt", root / "hosted-doctor-status.txt")]
+          if os.environ["CAPTURE_FAILED"] == "true":
+              for cell in ("pid-metrics", "pid-profile", "system-metrics", "system-profile"):
+                  for name in ("stderr.txt", "workload.log"):
+                      sources.append((cell + "-" + name, root / "hosted-system-e2e" / cell / name))
+          for label, source in sources:
+              if not source.is_file() or source.is_symlink() or not source.resolve().is_relative_to(root):
+                  continue
+              with source.open("rb") as stream:
+                  stream.seek(0, os.SEEK_END)
+                  stream.seek(max(0, stream.tell() - 16384))
+                  (output / label).write_bytes(stream.read(16384))
+          PY
+      - name: Retain bounded hosted capture results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-system-cells
+          path: |
+            /var/tmp/p11scope-ws-tmp/hosted-capabilities.txt
+            /var/tmp/p11scope-ws-tmp/hosted-context/
+            /var/tmp/p11scope-ws-tmp/hosted-system-e2e/matrix.json
+            /var/tmp/p11scope-ws-tmp/hosted-system-e2e/*/summary.txt
+          if-no-files-found: warn
+          retention-days: 7
+  # SYSPLAN residual F-28: release preview (musl FULL and P0 builds,
+  # docker build/lint, kubeconform, SBOM, build-release.sh wired for both
+  # capture modes). Manual like the privileged lane: dispatch it on demand;
+  # it never blocks PRs and never implies a release ran. Hosted runners
+  # suffice (passwordless sudo covers the receipt steps); no special labels
+  # needed.
   release-preview:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_preview }}
-    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.release_preview }}
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -691,17 +1285,27 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 softhsm2
-      # Azure kernel tools omit bpftool. Select the generic package's real
-      # executable instead of the common wrapper that dispatches by uname.
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml softhsm2
+      # Ubuntu 26 packages bpftool separately; older images use a versioned
+      # linux-tools executable. Select the package-owned binary, not the
+      # common wrapper that dispatches by the runner's Azure kernel name.
       - name: Install packaged bpftool
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get install -y linux-tools-generic
-          tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
-          [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
-          bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
           test -x "$bpftool_source"
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
@@ -711,6 +1315,9 @@ jobs:
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
       - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --target x86_64-unknown-linux-musl
+      # The P0 pre-build keeps its own target dir: it is a compile gate only,
+      # and the docker build below consumes the FULL binary above.
+      - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl --target-dir target/p0-preview
       - run: docker build -f deploy/Dockerfile.observer -t p11scope-observer:preview .
       - run: docker build -f deploy/Dockerfile.holder -t p11scope-holder:preview .
       - name: Download verified release tools
@@ -743,11 +1350,14 @@ jobs:
       # Only selected public outputs below are uploaded as artifacts.
       - run: mkdir -m 700 "$RUNNER_TEMP/release-evidence"
       - run: TMPDIR="$RUNNER_TEMP/release-evidence" scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"
+      - run: TMPDIR="$RUNNER_TEMP/release-evidence" scripts/build-release.sh --capture-mode p0 "$RUNNER_TEMP/release-evidence/receipt-p0"
       - name: Release receipt summary
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          python3 -I - "$RUNNER_TEMP/release-evidence/receipt" "$GITHUB_STEP_SUMMARY" <<'PY'
+          set -euo pipefail
+          for receipt in "$RUNNER_TEMP/release-evidence/receipt" "$RUNNER_TEMP/release-evidence/receipt-p0"; do
+          python3 -I - "$receipt" "$GITHUB_STEP_SUMMARY" <<'PY'
           from pathlib import Path
           import re
           import sys
@@ -812,10 +1422,11 @@ jobs:
           COUNTERS = {
               "event_loss", "start_insert_failures", "unmatched_returns", "rv_update_failures",
               "cgroup_scope_failures", "abi_refusals", "semantic_capture_failures",
-              "unregistered_mechanisms", "template_tail_failures", "process_tracking_fallbacks",
-              "process_tracking_failures", "process_tracking_evictions", "state_reconciliations",
-              "session_cancel_ambiguities", "session_cancel_unknown_flags", "operation_state_imports",
-              "auth_state_ambiguities", "async_target_failures", "async_orphans", "async_duplicates",
+              "unregistered_mechanisms", "unpublished_mechanisms", "template_tail_failures",
+              "process_tracking_fallbacks", "process_tracking_failures", "process_tracking_evictions",
+              "state_reconciliations", "session_cancel_ambiguities", "session_cancel_unknown_flags",
+              "operation_state_imports", "auth_state_ambiguities", "async_target_failures",
+              "async_orphans", "async_duplicates",
               "async_evictions", "fork_state_ambiguities", "semantic_state_drops", "semantic_history_drops",
               "pending_at_end", "malformed_records", "orphan_ops", "unmatched_closes",
               "shape_decode_failures", "shape_decode_total_failures", "discovery_conflicts",
@@ -917,13 +1528,15 @@ jobs:
               output.write("\n## Release diagnostic summary\n\n```json\n")
               output.write(json.dumps(report, sort_keys=True, indent=2) + "\n```\n")
           PY
+          done
       # Assemble public assets from the verified receipt, source and notices.
       - name: Assemble public release candidate
         shell: bash
         run: |
           set -euo pipefail
+          source_archive="$RUNNER_TEMP/release-evidence/source.tar.gz"
           python3 -I scripts/export-source.py \
-            --output "$RUNNER_TEMP/release-evidence/p11scope-0.3.0-source.tar.gz"
+            --output "$source_archive"
           python3 -I scripts/release-notices.py \
             --cargo-about "$RUNNER_TEMP/release-tools/cargo-about" \
             --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.5.tar.gz" \
@@ -931,12 +1544,24 @@ jobs:
           python3 -I scripts/package-release.py \
             --receipt "$RUNNER_TEMP/release-evidence/receipt" \
             --notices "$RUNNER_TEMP/release-evidence/notices" \
-            --source "$RUNNER_TEMP/release-evidence/p11scope-0.3.0-source.tar.gz" \
+            --source "$source_archive" \
             --output "$RUNNER_TEMP/release-evidence/public"
+          python3 -I scripts/package-release.py \
+            --capture-mode p0 \
+            --receipt "$RUNNER_TEMP/release-evidence/receipt-p0" \
+            --notices "$RUNNER_TEMP/release-evidence/notices" \
+            --source "$source_archive" \
+            --output "$RUNNER_TEMP/release-evidence/public-p0"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-preview-public-assets
           path: ${{ runner.temp }}/release-evidence/public/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-preview-public-assets-p0
+          path: ${{ runner.temp }}/release-evidence/public-p0/
           if-no-files-found: error
           retention-days: 30
       # This SBOM describes the preview container image, not the official
@@ -952,7 +1577,47 @@ jobs:
           path: ${{ runner.temp }}/sbom-observer-container-preview.spdx.json
           if-no-files-found: error
           retention-days: 30
-      - run: '"$RUNNER_TEMP/release-tools/kubeconform" -summary deploy/k8s/'
+      - name: Validate Kubernetes and Knative manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse the live Knative lane's official release and content pin.
+          version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)
+          digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)
+          [[ "$version" =~ ^knative-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+          schemas=$(mktemp -d "$RUNNER_TEMP/knative-schema.XXXXXX")
+          trap 'rm -rf "$schemas"' EXIT
+          curl -fsSL --retry 3 -o "$schemas/serving-crds.yaml" \
+            "https://github.com/knative/serving/releases/download/$version/serving-crds.yaml"
+          printf '%s  %s\n' "$digest" "$schemas/serving-crds.yaml" | sha256sum --check
+          # Materialize only served Service/v1, preserving the pinned schema.
+          /usr/bin/python3 -I - "$schemas" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          import yaml
+
+          root = Path(sys.argv[1])
+          documents = yaml.safe_load_all((root / "serving-crds.yaml").read_text())
+          crds = [row for row in documents if isinstance(row, dict)
+                  and row.get("apiVersion") == "apiextensions.k8s.io/v1"
+                  and row.get("kind") == "CustomResourceDefinition"
+                  and row.get("metadata", {}).get("name") == "services.serving.knative.dev"]
+          assert len(crds) == 1, "expected one official Knative Service CRD"
+          spec = crds[0]["spec"]
+          assert spec["group"] == "serving.knative.dev" and spec["names"]["kind"] == "Service"
+          versions = [row for row in spec["versions"] if row["name"] == "v1"]
+          assert len(versions) == 1 and versions[0]["served"] is True, "expected served Service/v1"
+          schema = versions[0]["schema"]["openAPIV3Schema"]
+          assert isinstance(schema, dict) and schema.get("type") == "object"
+          destination = root / "serving.knative.dev/service_v1.json"
+          destination.parent.mkdir()
+          destination.write_text(json.dumps(schema) + "\n")
+          PY
+          # Group and version prevent a core Service from using the CRD schema.
+          "$RUNNER_TEMP/release-tools/kubeconform" -summary -schema-location default \
+            -schema-location "$schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" deploy/k8s/
   # SYSPLAN residual F-40: coverage gate with a ratchet. The floor lives in
   # .coverage-floor (raise it, never lower it); the gate fails the workflow
   # when workspace line coverage drops below it. Include the existing CLI and
@@ -968,7 +1633,7 @@ jobs:
   coverage:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       # Full DWARF plus coverage makes the self-inspecting test executable
       # exceed the scanner's 256 MiB object limit. Keep line tables and
@@ -1016,21 +1681,21 @@ jobs:
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: python3 -I scripts/ci-test-partition.py run --partition "${{ matrix.partition }}" -- cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --no-report
-      # The scanner rejects objects at or above 256 MiB; fail here after the
-      # instrumented build rather than mid-merge when an executable outgrows
-      # it. cargo-llvm-cov builds under target/llvm-cov-target (see the pack
-      # step below), so a pre-run check over target/ would pass vacuously.
-      - name: Assert test executables are under the 256 MiB object limit
+      - name: Prepare host coverage linker
         shell: bash
         run: |
-          if [ -d target/llvm-cov-target/debug/deps ]; then
-            oversized=$(find target/llvm-cov-target/debug/deps -type f -size +268435455c)
-            if [ -n "$oversized" ]; then
-              echo "$oversized"
-              exit 1
-            fi
-          fi
+          umask 077
+          cat > "$RUNNER_TEMP/coverage-linker" <<'SH'
+          #!/bin/sh
+          exec cc -Wl,--compress-debug-sections=zlib "$@"
+          SH
+          chmod 0700 "$RUNNER_TEMP/coverage-linker"
+      - run: python3 -I scripts/ci-test-partition.py run --partition "${{ matrix.partition }}" -- cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --no-report --no-fail-fast
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ runner.temp }}/coverage-linker
+      # The packer refuses when a test pins the test binary instead of
+      # the small owned fixture (the source guard, not a size check);
+      # intermediate .rlib files are not objects.
       - run: python3 -I scripts/ci-test-partition.py coverage-pack --partition "${{ matrix.partition }}" --target-dir target/llvm-cov-target --output "$RUNNER_TEMP/coverage"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1041,7 +1706,7 @@ jobs:
           retention-days: 1
   coverage-report:
     needs: coverage
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
@@ -1080,19 +1745,33 @@ jobs:
       # merged report measures the root package alone and drops every other
       # workspace member from the line count.
       - run: cargo +"$(cat .release-rust-version)" llvm-cov report --locked --offline --workspace --fail-under-lines "$(cat .coverage-floor)"
-  # SYSPLAN residual F-29: flake quarantine. Failure-gated triage evidence:
-  # when any check job fails, each ledgered flake re-runs exactly once,
-  # serially, in isolation. A green quarantine run never greens the workflow.
+  # SYSPLAN residual F-29: triage after a relevant test job fails. Each
+  # ledgered flake re-runs exactly once, serially, in isolation. Lint/audit
+  # alone stay red without these repros; quarantine never greens the workflow.
   quarantine:
-    needs: [lint, audit, tests, contracts, scripts]
-    if: failure()
-    runs-on: ubuntu-24.04
+    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]
+    if: ${{ failure() && (needs.tests.result == 'failure' || needs.contracts.result == 'failure' || needs.scripts.result == 'failure' || needs.bpf-noninterference.result == 'failure') }}
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml

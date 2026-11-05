@@ -673,22 +673,40 @@ impl FdScope {
 
     pub fn assert_delta(&self, expected: usize) {
         let after = fd_resources_quiesced().expect("complete final FD census");
+        // Baseline FDs that survive must be unchanged. Those closed
+        // concurrently (sibling teardown racing our run in a parallel test
+        // binary) are tolerated only when no new FD hides behind the close:
+        // a compensating close still fails with the baseline message (the
+        // oracle-compensated pin), while a pure disappear with the expected
+        // leak count passes.
+        let mut common = 0;
+        let mut missing = None;
         for (fd, resource) in &self.before {
-            assert_eq!(
-                after.get(fd),
-                Some(resource),
-                "baseline FD {fd} changed across {}",
-                self.label,
-            );
+            match after.get(fd) {
+                Some(current) => {
+                    assert_eq!(
+                        current, resource,
+                        "baseline FD {fd} changed across {}",
+                        self.label,
+                    );
+                    common += 1;
+                }
+                None => missing = Some(*fd),
+            }
+        }
+        let leaked = after.len().checked_sub(common).expect("FD count bound");
+        if let Some(fd) = missing
+            && leaked != expected
+        {
+            panic!("baseline FD {fd} changed across {}", self.label,);
         }
         assert_eq!(
-            after.len(),
-            self.before
-                .len()
-                .checked_add(expected)
-                .expect("FD count bound"),
-            "FD delta across {}",
+            leaked,
+            expected,
+            "FD delta across {} ({} baseline, {common} common, {} after)",
             self.label,
+            self.before.len(),
+            after.len(),
         );
     }
 }
@@ -878,6 +896,7 @@ impl Harness {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             source.clone(),
             limits,
         )?;

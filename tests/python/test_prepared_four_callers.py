@@ -92,7 +92,10 @@ class FinalizerFixture:
         subprocess.run(["git", "config", "user.name", "fixture"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=self.root, check=True)
         subprocess.run(["git", "add", "."], cwd=self.root, check=True)
-        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=self.root, check=True)
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "commit", "-qm", "fixture"], cwd=self.root, check=True)
         self.tools = self.prepared.tools
         shutil.copy2(FIXTURES / "fixture_common.py", self.tools / "fixture_common.py")
         for name in ("stable cargo", "bpf cargo"):
@@ -384,7 +387,8 @@ class PreparedFourCallersTests(unittest.TestCase):
                 subprocess.run(["git", "add", "."], cwd=root, check=True)
                 if scenario == "duplicate-merge":
                     subprocess.run(["git", "add", "-f", str(generated)], cwd=root, check=True)
-                subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+                subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                                "commit", "-qm", "fixture"], cwd=root, check=True)
                 fixture_bin = base / "fixture bin"
                 fixture_bin.mkdir()
                 for name in ("fixture_common.py", "fake-rustup.py", "fake-sudo.py"):
@@ -496,7 +500,8 @@ class PreparedFourCallersTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "fixture"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=root, check=True)
             subprocess.run(["git", "add", "."], cwd=root, check=True)
-            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                            "commit", "-qm", "fixture"], cwd=root, check=True)
             fixture_bin = base / "fixture bin"
             fixture_bin.mkdir()
             for name in ("fixture_common.py", "fake-rustup.py", "fake-sudo.py"):

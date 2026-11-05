@@ -3,6 +3,8 @@
 """Unprivileged coordinator probes with injected BPF acquisition boundaries."""
 import copy
 import contextlib
+import ctypes
+import errno
 import io
 import json
 import os
@@ -28,6 +30,25 @@ from _loader import load_path
 capture = load_path(ROOT / 'scripts/capture-stopped-canary.py', 'capture')
 c = capture.custody
 fixtures = load_path(ROOT / 'tests/python/test_canary_evidence.py', 'canary_fixtures')
+
+
+def foreign_population_error(map_id=101, pid=8888, tid=8888):
+    fixture = fixtures.StoppedPopulationTests('test_framed_records_bind_generations_for_future_coordinator')
+    maps, records, arguments = fixture.reconciliation_fixture()
+    item = next(row for row in maps if row['id'] == map_id)
+    # Distinct raw identifiers/bytes make accidental exception interpolation
+    # visible without making those values part of the desired diagnostic.
+    item['id'] = 90909090
+    for row in records:
+        if row['map_id'] == map_id:
+            row['map_id'] = 90909090
+    foreign = {'map_id': 90909090, 'pid': pid, 'tid': tid, 'generation': 123456789,
+               'value': b'PRIVATE_CANARY_VALUE'}
+    try:
+        capture.dumper.reconcile_task_storage(maps, [foreign, *records], **arguments)
+    except RuntimeError as error:
+        return error
+    raise AssertionError('foreign task-storage row was accepted')
 
 
 def generation(pid):
@@ -75,6 +96,53 @@ def config_for(pid, directory, lane='aggregate-only-metrics'):
 def synthetic_done(config, group, deadline, check):
     config.done.write_text(json.dumps({'schema': 'p11scope/canary-done/v1', 'mode': 'matrix',
                                       'pid': config.workload_pid, 'generation': config.generation}))
+
+
+def kernel_release(release):
+    """Observe `release` as the running kernel inside the patched scope.
+
+    Only the release string is faked; every other uname field stays real,
+    so the production readiness resolver maps a foreign kernel exactly as
+    the coordinator would observe it there.
+    """
+    real = os.uname()
+    fake = os.uname_result((real.sysname, real.nodename, release, real.version, real.machine))
+    return patch.object(os, 'uname', return_value=fake)
+
+
+@contextlib.contextmanager
+def virtual_monotonic():
+    """Run deadline loops against a virtual monotonic clock.
+
+    Sleeps issued by the code under test advance virtual time instead
+    of really waiting, so bound-expiry probes prove the full declared
+    wait (identical deadline arithmetic through the real readiness and
+    custody path) in about a second of wall time. Each virtual sleep
+    also advances a microsecond past the request so expiry overshoots
+    the deadline the way real time does, keeping the lower-bound assert
+    exact. Stdlib internals (notably subprocess.Popen.wait's deadline
+    polling, which keys off the real clock) sleep really without moving
+    the virtual clock, so virtual time never runs ahead of real waiting.
+    """
+    now = [time.monotonic()]
+    real_monotonic, real_sleep = time.monotonic, time.sleep
+
+    def monotonic():
+        return now[0]
+
+    def sleep(seconds):
+        caller = sys._getframe(1).f_globals
+        if caller is capture.__dict__ or caller is c.__dict__:
+            if seconds > 0:
+                now[0] += seconds + 1e-6
+        else:
+            real_sleep(seconds)
+
+    time.monotonic, time.sleep = monotonic, sleep
+    try:
+        yield now
+    finally:
+        time.monotonic, time.sleep = real_monotonic, real_sleep
 
 
 STARTUP_THREAD = '''import pathlib, threading, time
@@ -166,7 +234,8 @@ class FakeMaps(capture.LiveMaps):
         self.maps = [capture.dumper.normalize_map_metadata({
             'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
             'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
-            'max_entries': row['max_entries'], 'flags': row['flags']}, index + 100)
+            'max_entries': row['max_entries'],
+            'flags': capture.LIVE_IMAGE_MAP_FLAGS.get(name, row['flags'])}, index + 100)
             for index, (name, row) in enumerate(sorted(definitions.items()))]
 
     def inventory(self, group, deadline):
@@ -252,7 +321,7 @@ class FakeMaps(capture.LiveMaps):
                 elif item['name'] == 'TASK_COOKIE' and task['role'] == 'leader' and self.config.mode != 'metrics':
                     raw = struct.pack('<Q', 1)
                 elif item['name'] == 'THREAD_OWNER' and task['role'] == 'worker':
-                    raw = bytearray(544)
+                    raw = bytearray(560)
                     struct.pack_into('<Q', raw, 0, (task['pid'] << 32) | task['tid'])
                     struct.pack_into('<QQII', raw, 520, 0, 0, 1, 1)
                 else:
@@ -390,8 +459,13 @@ def shell_wait_failure(directory, mode):
     shell = (ROOT / 'scripts/verify-canaries.sh').read_text()
     def function(name):
         return shell.split(name + '() {', 1)[1].split('\n}\n', 1)[0].join((name + '() {', '\n}\n'))
+    capture_selection = 'case $CAPTURE_MODE in\n' + shell.split(
+        'case $CAPTURE_MODE in\n', 1)[1].split('\nesac', 1)[0] + '\nesac\n'
     program = ('set -eu\nWORK=' + str(directory) + '\n'
         'WPID=\nWORKLOAD_STARTTIME=\nTARGET_BITS=64\n'
+        'CAPTURE_MODE=full\n' + capture_selection
+        + 'CANARY_WORKLOAD="$WORK/canary_workload"\n'
+        'MATRIX_PROVIDER="$WORK/matrix-provider.so"\nPRIVACY_PROVIDER="$WORK/privacy-provider.so"\n'
         'P11SCOPE_DEFAULT=/bin/true\nP11SCOPE_FEATURE=/bin/true\n'
         'TASK_STORAGE_READER=/bin/true\nTASK_STORAGE_OBJECT=/bin/true\n'
         'process_starttime() { echo 1; }\n'
@@ -430,7 +504,7 @@ def coordinator_case(pid, directory, case):
     roster_samples, start_dumps = {}, 0
     original_handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
     original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    expected_success = kind in ('native', 'immediate_exit', 'idle_owner')
+    expected_success = kind in ('native', 'immediate_exit', 'idle_owner', 'epoch_sample')
     initial_descriptors = open_descriptors()
     failed_resume = False
     replay_count, inventory_count, position_count = 0, 0, 0
@@ -572,6 +646,13 @@ def coordinator_case(pid, directory, case):
         return original_refuse(item, deadline)
     def frames(*args):
         raw = original_frames(*args)
+        if kind == 'epoch_sample':
+            epoch_id = next(item['id'] for item in source.maps if item['name'] == 'PROC_EPOCH')
+            values = (fixtures.StoppedPopulationTests.epoch_value((), (), 4, 0), bytes(152))
+            # These are iterator identities, never stopped-roster members.
+            return b''.join(capture.dumper.TASK_STORAGE_HEADER.pack(
+                capture.dumper.TASK_STORAGE_MAGIC, 1, epoch_id, task, task, len(value)) + value
+                for task, value in zip((0xffff0001, 0xffff0002), values)) + raw
         if kind == 'frames':
             return raw[:-1]
         if kind == 'cookie':
@@ -585,13 +666,13 @@ def coordinator_case(pid, directory, case):
             # likewise exclude it or the replay's byte count mismatches.
             owner_id = next(item['id'] for item in source.maps if item['name'] == 'THREAD_OWNER')
             return (capture.dumper.TASK_STORAGE_HEADER.pack(capture.dumper.TASK_STORAGE_MAGIC, 1,
-                    owner_id, pid, pid, 544) + bytes(544) + raw)
+                    owner_id, pid, pid, 560) + bytes(560) + raw)
         if kind == 'binding' and detail == 'owner_count':
             raw = bytearray(raw)
             offset = 0
             while offset < len(raw):
                 header = capture.dumper.TASK_STORAGE_HEADER.unpack_from(raw, offset)
-                if header[5] == 544:
+                if header[5] in (544, 560):
                     struct.pack_into('<I', raw, offset + capture.dumper.TASK_STORAGE_HEADER.size + 536, 2)
                 offset += capture.dumper.TASK_STORAGE_HEADER.size + header[5]
             return bytes(raw)
@@ -752,6 +833,17 @@ def coordinator_case(pid, directory, case):
         if kind == 'idle_owner' and not errors:
             retained = Path(directory) / f'mapdump_THREAD_OWNER_{config.lane}.bin'
             assert retained.is_file() and len(retained.read_bytes()) == 0, 'idle owner bytes were staged'
+        if kind == 'epoch_sample' and not errors:
+            manifest = json.loads(result.read_text())
+            epoch = next(item for item in manifest if item['name'] == 'PROC_EPOCH')
+            receipt = json.loads(Path(epoch['snapshot']['receipt']).read_text())
+            surface = next(row for row in receipt['surfaces'] if row['id'] == epoch['id'])
+            assert set(surface) == {'id', 'acquisition_id', 'phase', 'size', 'sha256', 'record_count'}
+            assert (surface['phase'], surface['record_count'], surface['size']) == ('sampled', 2, 304)
+            assert Path(epoch['file']).read_bytes() == (
+                fixtures.StoppedPopulationTests.epoch_value((), (), 4, 0) + bytes(152))
+            assert all(str(task) not in json.dumps(receipt) for task in (0xffff0001, 0xffff0002))
+            assert [name for name, _ in source.calls].count('INSTANCE_GEN') == 1
         for fd in test_handles:
             assert select.select([fd], [], [], 1)[0]
             try:
@@ -774,6 +866,57 @@ def coordinator_case(pid, directory, case):
             owner.close()
         for fd in test_handles:
             os.close(fd)
+
+
+def ready_bound_case(pid, directory, spec):
+    """Per-kernel readiness bound runs with a faked kernel release.
+
+    spec is pass_515 (ready immediately, must complete), fail_66 or
+    fail_515 (never ready, must expire at the declared bound). The
+    coordinator, custody and FakeMaps are all real; only os.uname is
+    faked, so the production resolver maps the kernel to its bound and
+    the elapsed clock proves which bound the run enforced. Expiry probes
+    also virtualize the monotonic clock, so the full declared wait costs
+    ~1 s of wall time; the passing probe keeps its literal clock as the
+    real end-to-end completion proof.
+    """
+    release, never_ready = {'pass_515': ('5.15.221-ready-bound-test', False),
+                            'fail_66': ('6.6.157-ready-bound-test', True),
+                            'fail_515': ('5.15.221-ready-bound-test', True)}[spec]
+    expected = {'pass_515': 30, 'fail_66': 20, 'fail_515': 30}[spec]
+    config = config_for(pid, directory)
+    if never_ready:
+        # Never signal readiness: the observer must outlive the longest
+        # declared bound so expiry always happens in the readiness loop,
+        # and custody reaps it on the way out.
+        config.observer_args = [sys.executable, '-c', 'import time; time.sleep(60)']
+    source = FakeMaps(config)
+    output = io.StringIO()
+    with kernel_release(release), \
+            patch.object(capture, 'wait_done', side_effect=synthetic_done), \
+            contextlib.redirect_stdout(output), \
+            ExitStack() as stack:
+        if never_ready:
+            stack.enter_context(virtual_monotonic())
+        started = time.monotonic()
+        try:
+            manifest = capture.capture(config, source)
+        except capture.CaptureError as error:
+            assert never_ready, (spec, error)
+            assert 'phase deadline expired' in str(error), str(error)
+            manifest = None
+        else:
+            assert not never_ready, spec
+        elapsed = time.monotonic() - started
+    line = f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={expected}'
+    assert line in output.getvalue().splitlines(), output.getvalue()
+    if never_ready:
+        lower, upper = (20, 27) if spec == 'fail_66' else (30, 44)
+        assert lower <= elapsed < upper, (spec, elapsed)
+        assert not (Path(directory) / f'mapdump_manifest_{config.lane}.json').exists()
+        assert not config.go.exists()
+    else:
+        assert manifest.is_file()
 
 
 OWNED_OBSERVER = r'''import json, os, pathlib, subprocess, sys, time
@@ -958,7 +1101,7 @@ def owned_case(pid, directory, case, program, provider):
             struct.pack_into('<Q', raw, header.size, 0x100000001)
             return bytes(raw)
         if case in ('cookie', 'owner'):
-            name, size = ('TASK_COOKIE', 8) if case == 'cookie' else ('THREAD_OWNER', 544)
+            name, size = ('TASK_COOKIE', 8) if case == 'cookie' else ('THREAD_OWNER', 560)
             item = next(item for item in source.maps if item['name'] == name)
             value = struct.pack('<Q', 1) + bytes(size - 8)
             return header.pack(capture.dumper.TASK_STORAGE_MAGIC, 1, item['id'], config.workload_pid,
@@ -988,6 +1131,11 @@ def owned_case(pid, directory, case, program, provider):
             assert not owner.active and all(group.closed for group in owner.groups)
         return replay(manifest, prefix)
     error = None
+    # ready_first_515 replays the immediate-ready owned pass under a faked
+    # 5.15 kernel, proving the 30 s legacy bound reaches the owned path
+    # (launch deadline and owned readiness share the resolved value).
+    bound_release = '5.15.221-ready-bound-test' if case == 'ready_first_515' else None
+    bound_output = io.StringIO()
     try:
         with ExitStack() as stack:
             if case == 'startup_threads':
@@ -1027,6 +1175,9 @@ def owned_case(pid, directory, case, program, provider):
                     opened(*args)
                     source.rings['EVENTS'].rows = [fixtures.event_bytes(0)]
                 stack.enter_context(patch.object(source, 'open_rings', side_effect=event))
+            if bound_release is not None:
+                stack.enter_context(kernel_release(bound_release))
+                stack.enter_context(contextlib.redirect_stdout(bound_output))
             try:
                 manifest = coordinator.run()
             except capture.CaptureError as caught:
@@ -1060,6 +1211,9 @@ def owned_case(pid, directory, case, program, provider):
         if case.startswith('missing_ready') or case == 'missing_capture':
             assert 'phase deadline expired' in str(error), str(error)
             assert not config.go.exists() and not source.opened_rings
+        if bound_release is not None:
+            line = f'CANARY_READY_BOUND_DECLARED kernel={bound_release} seconds=30'
+            assert line in bound_output.getvalue().splitlines(), bound_output.getvalue()
         for fd in handles:
             assert select.select([fd], [], [], 1)[0], 'owned process survived cleanup'
     finally:
@@ -1075,7 +1229,332 @@ def owned_case(pid, directory, case, program, provider):
             os.close(fd)
 
 
+class RetainedRingDiagnosticTests(unittest.TestCase):
+    """Real ring framing and sanitizer seams, with only FD/mmap I/O injected."""
+
+    def read_ring(self, name, category, continuity=None):
+        capture.evidence.initialize(64)
+        fixture = fixtures.RingLayoutTests('test_ring_layout_rejects_busy_and_wrap')
+        item, mappings, libc, fake_mmap, fake_u64 = fixture.retained_fixture(
+            capture.evidence, name=name)
+        item['id'] = 90909090
+        private = b'PRIVATE_CANARY_RING_BYTES'
+        page = capture.evidence.mmap.PAGESIZE
+        mappings[1].data[page + 8:page + 8 + len(private)] = private
+        length = capture.evidence.RING_RECORD_SIZES[name]
+        header = length | {'healthy': 0, 'busy': 1 << 31, 'discard': 1 << 30,
+                           'length': 0}[category]
+        if category == 'length':
+            header = length - 1
+        struct.pack_into('<I', mappings[1].data, page, header)
+        rows, failure = None, None
+        with patch.object(capture.evidence.ctypes, 'CDLL', return_value=libc), \
+                patch.object(capture.evidence.mmap, 'mmap', side_effect=fake_mmap), \
+                patch.object(capture.evidence, 'u64', side_effect=fake_u64):
+            try:
+                with capture.evidence.RetainedRingReader(item) as reader:
+                    if continuity is None:
+                        rows = reader.read_records()
+                    else:
+                        source = SimpleNamespace(ring_records=lambda _: {name: reader.read_records()})
+                        rows = capture.retained_ring_records(source, {}, *continuity,
+                                                            variant='default', privacy='allowlisted')[name]
+            except AssertionError as error:
+                failure = error
+        self.assertTrue(all(mapping.closed for mapping in mappings))
+        with self.assertRaises(OSError):
+            os.fstat(libc.fds[0])
+        return rows, failure
+
+    def sanitized_ring(self, error):
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stderr(diagnostic):
+            issues = capture.sanitized('retained-rings', error)
+        text = '\n'.join(issues) + diagnostic.getvalue()
+        for private in ('PRIVATE_CANARY_RING', '90909090', str(ROOT), __file__):
+            self.assertNotIn(private, text)
+        return issues
+
+    def test_real_ring_refusals_publish_only_approved_name_and_category(self):
+        for name in ('EVENTS', 'DISCOVERY'):
+            rows, failure = self.read_ring(name, 'healthy')
+            self.assertIsNone(failure)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(rows[0]), capture.evidence.RING_RECORD_SIZES[name])
+            for category in ('busy', 'discard', 'length'):
+                with self.subTest(ring=name, refusal=category):
+                    rows, failure = self.read_ring(name, category)
+                    self.assertIsNone(rows)
+                    self.assertIsNotNone(failure)
+                    self.assertEqual(self.sanitized_ring(failure), [
+                        f'retained-rings: ring={name} refusal={category}'])
+
+    def test_ring_diagnostic_rejects_spoofed_types_fields_and_messages(self):
+        _, trusted = self.read_ring('EVENTS', 'discard')
+        self.assertEqual(self.sanitized_ring(trusted), [
+            'retained-rings: ring=EVENTS refusal=discard'])
+        trusted.args = ('PRIVATE_CANARY_RING_MESSAGE',)
+        self.assertEqual(self.sanitized_ring(trusted), [
+            'retained-rings: ring=EVENTS refusal=discard'])
+
+        class PrivateString(str):
+            def __str__(self):
+                raise AssertionError('PRIVATE_CANARY_RING_STR')
+
+        for attribute, invalid in (
+                ('ring_name', 'EVENTS PRIVATE_CANARY_RING'), ('ring_name', []),
+                ('ring_name', PrivateString('EVENTS')),
+                ('category', 'discard PRIVATE_CANARY_RING'), ('category', True),
+                ('category', PrivateString('discard'))):
+            _, altered = self.read_ring('EVENTS', 'discard')
+            setattr(altered, attribute, invalid)
+            with self.subTest(attribute=attribute, value_type=type(invalid).__name__):
+                self.assertEqual(self.sanitized_ring(altered), [
+                    'retained-rings: RingRecordRefusal'])
+
+        class Subclass(capture.evidence.RingRecordRefusal):
+            def __str__(self):
+                raise AssertionError('PRIVATE_CANARY_RING_STR')
+
+        lookalike = type('RingRecordRefusal', (AssertionError,), {})('PRIVATE_CANARY_RING')
+        lookalike.ring_name, lookalike.category = 'EVENTS', 'discard'
+        for error, kind in ((lookalike, 'RingRecordRefusal'),
+                            (Subclass('discard', 'EVENTS'), 'Subclass'),
+                            (AssertionError('ring=EVENTS refusal=discard PRIVATE_CANARY_RING'),
+                             'AssertionError')):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.sanitized_ring(error), [f'retained-rings: {kind}'])
+        diagnostic = io.StringIO()
+        diagnostic.close()
+        with contextlib.redirect_stderr(diagnostic):
+            self.assertEqual(capture.sanitized('retained-rings', trusted), [
+                'retained-rings: ring=EVENTS refusal=discard'])
+
+    def test_events_discard_keeps_only_a_finite_continuity_category(self):
+        _, error = self.read_ring('EVENTS', 'discard')
+        error.continuity_category = 'coverage-failed'
+        self.assertEqual(self.sanitized_ring(error), [
+            'retained-rings: ring=EVENTS refusal=discard continuity=coverage-failed'])
+
+    @staticmethod
+    def continuity_fixture():
+        maps = []
+        for map_id, (name, wanted) in enumerate(sorted(capture.definitions.SAFE_MAPS.items()), 1000):
+            maps.append({'id': map_id, 'name': name, 'type': capture.MAP_TYPES[wanted['type']],
+                'bytes_key': wanted['key_size'], 'bytes_value': wanted['value_size'],
+                'max_entries': wanted['max_entries'],
+                'map_flags': capture.LIVE_IMAGE_MAP_FLAGS.get(name, wanted['flags']),
+                'oracle': capture.dumper.SNAPSHOT_MAP_ORACLES[capture.MAP_TYPES[wanted['type']]]})
+        token = lambda raw: [f'0x{byte:02x}' for byte in raw]
+        cell = lambda index, value, width: {'key': token(struct.pack('<I', index)),
+                                           'value': token(value.to_bytes(width, 'little'))}
+        bound = next(row['max_entries'] for row in maps if row['name'] == 'SLOT_FILE')
+        ordinary = {'INSTANCE_GEN': [cell(index, value, 8) for index, value in
+                                    enumerate((2, 0, 0, 1))],
+                    'SLOT_FILE': [cell(index, int(index == 7), 4) for index in range(bound)],
+                    'WATCHED_FILES': [{'key': token(bytes([0xd7]) * 16),
+                                       'value': token(bytes(4))}]}
+        return maps, ordinary
+
+    def test_continuity_diagnostic_uses_complete_owned_map_decoder_facts(self):
+        for case, expected in (
+                ('healthy', 'map-facts-present'), ('disabled', 'coverage-disabled'),
+                ('failed', 'coverage-failed'), ('invalid-coverage', 'unknown'),
+                ('missing-coverage', 'unknown'), ('duplicate-coverage', 'unknown'),
+                ('truncated-coverage', 'unknown'), ('foreign-coverage', 'unknown'),
+                ('missing-image', 'unknown'), ('empty-slots', 'slot-files-empty'),
+                ('invalid-slot', 'slot-files-invalid'), ('truncated-slots', 'unknown'),
+                ('empty-watched', 'watched-files-empty'), ('missing-watched', 'unknown'),
+                ('invalid-watched', 'watched-files-invalid'),
+                ('unwatched-slot', 'slot-files-invalid'), ('duplicate-file-slot', 'unknown')):
+            maps, ordinary = self.continuity_fixture()
+            if case in ('disabled', 'failed', 'invalid-coverage'):
+                ordinary['INSTANCE_GEN'][3]['value'] = list(struct.pack('<Q', {
+                    'disabled': 0, 'failed': 2, 'invalid-coverage': 3}[case]))
+            elif case == 'missing-coverage':
+                ordinary['INSTANCE_GEN'].pop()
+            elif case == 'duplicate-coverage':
+                ordinary['INSTANCE_GEN'][2] = ordinary['INSTANCE_GEN'][3]
+            elif case == 'truncated-coverage':
+                ordinary['INSTANCE_GEN'][3]['value'].pop()
+            elif case == 'foreign-coverage':
+                next(row for row in maps if row['name'] == 'INSTANCE_GEN')['id'] = maps[0]['id']
+            elif case == 'missing-image':
+                maps = [row for row in maps if row['name'] != 'IMAGE_CONTINUITY']
+            elif case == 'empty-slots':
+                ordinary['SLOT_FILE'][7]['value'] = [0] * 4
+            elif case == 'invalid-slot':
+                ordinary['SLOT_FILE'][7]['value'] = list(struct.pack('<I', 1025))
+            elif case == 'truncated-slots':
+                ordinary['SLOT_FILE'].pop()
+            elif case == 'empty-watched':
+                ordinary['WATCHED_FILES'] = []
+            elif case == 'missing-watched':
+                del ordinary['WATCHED_FILES']
+            elif case == 'invalid-watched':
+                ordinary['WATCHED_FILES'][0]['value'] = list(struct.pack('<I', 1024))
+            elif case == 'unwatched-slot':
+                ordinary['SLOT_FILE'][7]['value'] = [2, 0, 0, 0]
+            elif case == 'duplicate-file-slot':
+                ordinary['WATCHED_FILES'].append({'key': [0] * 16, 'value': [0] * 4})
+            with self.subTest(case=case):
+                self.assertEqual(capture.continuity_map_category(
+                    maps, ordinary, variant='default', privacy='allowlisted'), expected)
+                rows, error = self.read_ring('EVENTS', 'discard', (maps, ordinary))
+                self.assertIsNone(rows)
+                self.assertEqual(self.sanitized_ring(error), [
+                    f'retained-rings: ring=EVENTS refusal=discard continuity={expected}'])
+
+    def test_continuity_context_cannot_override_ring_scope_or_spoof_fields(self):
+        maps, ordinary = self.continuity_fixture()
+        for name, category in (('EVENTS', 'healthy'), ('DISCOVERY', 'healthy'),
+                               ('DISCOVERY', 'discard'), ('EVENTS', 'busy'), ('EVENTS', 'length')):
+            rows, error = self.read_ring(name, category, (maps, ordinary))
+            if category == 'healthy':
+                self.assertIsNone(error)
+                self.assertEqual(len(rows), 1)
+            else:
+                self.assertEqual(self.sanitized_ring(error), [
+                    f'retained-rings: ring={name} refusal={category}'])
+        class PrivateString(str):
+            def __str__(self):
+                raise AssertionError('PRIVATE_CANARY_RING_STR')
+        for field in ('PRIVATE_CANARY_RING_CONTEXT', [], True, PrivateString('coverage-failed')):
+            _, error = self.read_ring('EVENTS', 'discard')
+            error.continuity_category = field
+            self.assertEqual(self.sanitized_ring(error), ['retained-rings: RingRecordRefusal'])
+        for name, category in (('DISCOVERY', 'discard'), ('EVENTS', 'busy')):
+            _, error = self.read_ring(name, category)
+            error.continuity_category = 'coverage-failed'
+            self.assertEqual(self.sanitized_ring(error), ['retained-rings: RingRecordRefusal'])
+
+
 class StoppedCanaryCaptureTests(unittest.TestCase):
+    def test_outside_epoch_sample_publishes_all_values_without_iterator_identities(self):
+        self.probe('case:epoch_sample')
+
+    def test_population_diagnostic_preserves_map_relation_and_leader_only(self):
+        # Generic sanitization currently discards the map that distinguishes a
+        # continuity bookkeeping mismatch from foreign cookie/owner capture.
+        for map_id, name in ((101, 'TASK_COOKIE'), (102, 'THREAD_OWNER'),
+                             (103, 'ROOT_AFFILIATION')):
+            for relation, pid, tid, leader in (
+                ('outside-roster', 8888, 8888, 'yes'),
+                ('outside-roster', 8888, 8889, 'no'),
+                ('wrong-group', 7002, 7002, 'yes'),
+                ('wrong-group', 8888, 7002, 'no'),
+            ):
+                with self.subTest(map=name, relation=relation, leader=leader):
+                    error = foreign_population_error(map_id, pid, tid)
+                    error.private_context = 'PRIVATE_CANARY_CONTEXT'
+                    error.args = ('PRIVATE_CANARY_EXCEPTION_TEXT',)
+                    diagnostic = io.StringIO()
+                    with contextlib.redirect_stderr(diagnostic):
+                        issues = capture.sanitized('retained-semantics', error)
+                    self.assertEqual(issues, [f'retained-semantics: task-storage map={name} '
+                                              f'relation={relation} leader={leader}'])
+                    for forbidden in ('8888', '8889', '7002', '90909090', '123456789',
+                                      'PRIVATE_CANARY', str(ROOT), __file__):
+                        self.assertNotIn(forbidden, diagnostic.getvalue() + '\n'.join(issues))
+
+    def test_population_diagnostic_forgery_and_closed_stderr_keep_failure(self):
+        error = foreign_population_error()
+        self.assertEqual(type(error).__name__, 'TaskStoragePopulationError')
+
+        class PrivateString(str):
+            def __eq__(self, other):
+                raise AssertionError('untrusted field equality was evaluated')
+
+        class Spoofed(capture.dumper.TaskStoragePopulationError):
+            def __str__(self):
+                raise AssertionError('untrusted exception text was evaluated')
+
+        for field, value in (('map_name', 'PRIVATE_CANARY_MAP'),
+                             ('map_name', PrivateString('PROC_EPOCH')),
+                             ('map_name', None),
+                             ('relation', 'outside-roster\nPRIVATE_CANARY_RELATION'),
+                             ('relation', PrivateString('outside-roster')),
+                             ('relation', ['outside-roster']),
+                             ('leader', 1), ('leader', 'yes')):
+            with self.subTest(field=field, value_type=type(value).__name__):
+                error = foreign_population_error()
+                setattr(error, field, value)
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic):
+                    self.assertEqual(capture.sanitized('retained-semantics', error),
+                                     ['retained-semantics: TaskStoragePopulationError'])
+                self.assertNotIn('PRIVATE_CANARY', diagnostic.getvalue())
+        error = foreign_population_error()
+        del error.map_name
+        self.assertEqual(capture.sanitized('retained-semantics', error),
+                         ['retained-semantics: TaskStoragePopulationError'])
+
+        plain = RuntimeError('task-storage map=PROC_EPOCH relation=outside-roster '
+                             'leader=yes PRIVATE_CANARY_TEXT')
+        plain.map_name, plain.relation, plain.leader = 'PROC_EPOCH', 'outside-roster', True
+        for error, kind in ((plain, 'RuntimeError'),
+                            (Spoofed('PROC_EPOCH', 'outside-roster', True), 'Spoofed')):
+            self.assertEqual(capture.sanitized('retained-semantics', error),
+                             [f'retained-semantics: {kind}'])
+
+        error = foreign_population_error()
+        diagnostic = io.StringIO()
+        diagnostic.close()
+        with contextlib.redirect_stderr(diagnostic):
+            self.assertEqual(capture.sanitized('retained-semantics', error),
+                             ['retained-semantics: task-storage map=TASK_COOKIE '
+                              'relation=outside-roster leader=yes'])
+
+    def test_retained_object_scrub_requires_q_before_reading_hash(self):
+        # Kernel reads are the injected external boundary. The real LiveMaps
+        # method still selects its retained FDs, interprets Q and fails closed.
+        for word, populated, refused in ((0, False, True), (1, False, True),
+                                         ((1 << 63) | 1, False, True),
+                                         (1 << 63, True, True), (1 << 63, False, False)):
+            with self.subTest(word=word, populated=populated):
+                source = object.__new__(capture.LiveMaps)
+                source.fd_by_id = {41: 141, 42: 142}
+                maps = [{'id': 41, 'name': 'STOP_GATE'}, {'id': 42, 'name': 'OBJECT_START'}]
+                commands = []
+                def syscall(number, command, attr, size):
+                    fd, _, key, value, _ = capture.dumper.BPF_ATTR_MAP_ELEM.unpack(ctypes.string_at(attr, size))
+                    commands.append((command, fd))
+                    if command == 1:
+                        self.assertEqual(fd, 141)
+                        ctypes.memmove(value, struct.pack('<Q', word), 8)
+                        return 0
+                    self.assertEqual((command, fd, key), (4, 142, 0))
+                    ctypes.set_errno(0 if populated else errno.ENOENT)
+                    return 0 if populated else -1
+                with patch.object(capture.ctypes, 'CDLL', return_value=SimpleNamespace(syscall=syscall)):
+                    if refused:
+                        with self.assertRaises(capture.CaptureError):
+                            source.verify_object_scrub(maps, time.monotonic() + 2)
+                    else:
+                        source.verify_object_scrub(maps, time.monotonic() + 2)
+                self.assertEqual(commands, [(1, 141)] + ([(4, 142)] if word == 1 << 63 else []))
+
+    def test_object_blocked_dispatch_uses_exact_object_rows_and_zero_neighbors(self):
+        objects = load_path(ROOT / 'tests/python/test_canary_object.py', 'object_fixtures')
+        fixture = objects.ObjectSideRowTests('test_blocked_offsets_match')
+        starts, rows = fixture.blocked_fixture()
+        ordinary = {'START': [{'key': objects.tok(key), 'value': objects.tok(objects.start_row(
+                        starts[capture.evidence.u64(key, 0) & 0xffffffff]['session'],
+                        {0x501: 22, 0x502: 61, 0x503: 29, 0x504: 26}[
+                            starts[capture.evidence.u64(key, 0) & 0xffffffff]['session']]))}
+                    for key, _ in rows],
+                    'OBJECT_START': [{'key': objects.tok(key), 'value': objects.tok(row['raw'])}
+                                     for key, row in rows], 'EVIDENCE': []}
+        config = SimpleNamespace(workload_mode='object-blocked', target_bits=64)
+        text = lambda: 'P11SCOPE_OBJECT_POINTERS ' + json.dumps(fixture.POINTERS)
+        capture.assert_blocked_semantics(config, ordinary, list(starts.values()), text)
+        for worker, offset in ((0, 96), (1, 426), (2, 352), (3, 120), (3, 431)):
+            bad = copy.deepcopy(ordinary)
+            current = int(bad['OBJECT_START'][worker]['value'][offset], 16)
+            bad['OBJECT_START'][worker]['value'][offset] = f'0x{current ^ 1:02x}'
+            with self.subTest(worker=worker, offset=offset), self.assertRaises(AssertionError):
+                capture.assert_blocked_semantics(config, bad, list(starts.values()), text)
+
     def test_observer_may_start_worker_before_capture_ready(self):
         self.probe('startup_threads')
 
@@ -1397,6 +1876,109 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                         self.assertIn('close-input: OSError', message)
                     self.assertEqual(open_descriptors(), before)
 
+    def live_inventory(self):
+        """Live kernel metadata shaped from the pinned ELF policy.
+
+        Linux reports only permanent map flags on the map object and
+        moves WRONLY to the created FD, so the two private IMAGE hash
+        maps read live flags 1 (NO_PREALLOC) while the ELF still
+        declares 17; every other field stays exact.
+        """
+        rows = []
+        for index, (name, row) in enumerate(sorted(capture.definitions.SAFE_MAPS.items())):
+            flags = capture.LIVE_IMAGE_MAP_FLAGS.get(name, row['flags'])
+            rows.append(capture.dumper.normalize_map_metadata({
+                'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
+                'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
+                'max_entries': row['max_entries'], 'flags': flags}, index + 100))
+        return rows
+
+    def test_image_map_flag_validation_preserves_protection(self):
+        """G23: the live IMAGE expectation is narrowed, nothing else.
+
+        The pinned ELF policy still declares WRONLY (17); the live
+        comparison accepts exactly the kernel's permanent-flags report
+        (1) for the two private IMAGE hashes. Any other live value, any
+        other field drift, or any other map's flag drift still fails.
+        """
+        self.assertEqual(capture.definitions.SAFE_MAPS["IMAGE_CONTINUITY"]['flags'], 17)
+        self.assertEqual(capture.definitions.SAFE_MAPS["IMAGE_TGID_INDEX"]['flags'], 17)
+        capture.validate_inventory(self.live_inventory(), 'default')
+        for name in ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX"):
+            for flags in (0, 16, 17, 129, 1 | 128 | 256):
+                with self.subTest(name=name, flags=flags):
+                    maps = self.live_inventory()
+                    next(item for item in maps if item['name'] == name)['map_flags'] = flags
+                    with self.assertRaisesRegex(capture.CaptureError,
+                                                f'map definition mismatch name={name}'):
+                        capture.validate_inventory(maps, 'default')
+        for field, value in (("type", "array"), ("bytes_key", 4),
+                             ("bytes_value", 16), ("max_entries", 1024)):
+            with self.subTest(field=field):
+                maps = self.live_inventory()
+                item = next(item for item in maps if item['name'] == "IMAGE_CONTINUITY")
+                item[field] = value
+                if field == "type":
+                    item['oracle'] = 'dump'
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            'map definition mismatch name=IMAGE_CONTINUITY'):
+                    capture.validate_inventory(maps, 'default')
+        maps = self.live_inventory()
+        next(item for item in maps if item['name'] == "CONFIG")['map_flags'] = 0
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=CONFIG'):
+            capture.validate_inventory(maps, 'default')
+
+    def test_aggregate_only_inventory_expects_singleton_image_maps(self):
+        """Aggregate-only lanes load IMAGE maps at one entry, by contract.
+
+        `--mode metrics` selects CapturePolicy::AggregateOnly, which wants
+        no instance hooks, so the loader sizes IMAGE_CONTINUITY,
+        IMAGE_TGID_INDEX and IMAGE_QUERY_REQUESTS to max_entries=1
+        (src/attach.rs; the image_query contract accepts count=1). The
+        pinned ELF policy still declares full sizes; the live comparison
+        expects exactly the loader's size-1 report on aggregate-only
+        lanes. Any other size, any other field drift, or any other map's
+        drift still fails, and allowlisted lanes still require full sizes.
+        """
+        singletons = {"IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"}
+
+        def aggregate_inventory():
+            maps = self.live_inventory()
+            for item in maps:
+                if item['name'] in singletons:
+                    item['max_entries'] = 1
+            return maps
+
+        capture.validate_inventory(aggregate_inventory(), 'default', 'aggregate-only')
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=IMAGE_CONTINUITY'):
+            capture.validate_inventory(aggregate_inventory(), 'default', 'allowlisted')
+        for name, full in (("IMAGE_CONTINUITY", 16384), ("IMAGE_TGID_INDEX", 16384),
+                           ("IMAGE_QUERY_REQUESTS", 1024)):
+            with self.subTest(name=name, size="full"):
+                maps = aggregate_inventory()
+                next(item for item in maps if item['name'] == name)['max_entries'] = full
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            f'map definition mismatch name={name}'):
+                    capture.validate_inventory(maps, 'default', 'aggregate-only')
+            with self.subTest(name=name, size="two"):
+                maps = aggregate_inventory()
+                next(item for item in maps if item['name'] == name)['max_entries'] = 2
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            f'map definition mismatch name={name}'):
+                    capture.validate_inventory(maps, 'default', 'aggregate-only')
+        maps = aggregate_inventory()
+        next(item for item in maps if item['name'] == "IMAGE_QUERY_REQUESTS")['bytes_value'] = 32
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=IMAGE_QUERY_REQUESTS'):
+            capture.validate_inventory(maps, 'default', 'aggregate-only')
+        maps = aggregate_inventory()
+        next(item for item in maps if item['name'] == "CONFIG")['max_entries'] = 1
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=CONFIG'):
+            capture.validate_inventory(maps, 'default', 'aggregate-only')
+
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.
 
@@ -1404,11 +1986,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         an ordinary array is claiming a dump no cgroup_array can answer.
         """
         def inventory():
-            return [capture.dumper.normalize_map_metadata({
-                'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
-                'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
-                'max_entries': row['max_entries'], 'flags': row['flags']}, index + 100)
-                for index, (name, row) in enumerate(sorted(capture.definitions.SAFE_MAPS.items()))]
+            return self.live_inventory()
         maps = inventory()
         capture.validate_inventory(maps, 'default')
         self.assertEqual(next(item for item in maps if item['name'] == 'CGROUP_FILTER')['oracle'],
@@ -1503,6 +2081,37 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                                                    '--'] + config.observer_args)
             self.assertEqual(external.workload_origin, 'external')
 
+    def test_object_attributes_cli_defaults_present_and_refuses_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
+            base = []
+            for name in ('lane', 'variant', 'mode', 'privacy', 'workload_mode', 'out_dir', 'prefix',
+                         'ready', 'go', 'done', 'finish', 'observer_log', 'workload_log', 'reader', 'obj',
+                         'target_bits'):
+                base += ['--' + name.replace('_', '-'), str(getattr(config, name))]
+            default = capture.parse_args(base + ['--workload-origin', 'owned', '--'] + config.observer_args)
+            self.assertEqual(default.object_attributes, 'present')
+            stub = capture.parse_args(base + ['--workload-origin', 'owned', '--object-attributes', 'absent',
+                                              '--'] + config.observer_args)
+            self.assertEqual(stub.object_attributes, 'absent')
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    capture.parse_args(base + ['--object-attributes', 'bogus', '--'] + config.observer_args)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_run_applies_object_attributes_to_evidence(self):
+        capture.evidence.set_object_attributes('present')
+        self.addCleanup(capture.evidence.set_object_attributes, 'present')
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(os.getpid(), directory)
+            config.object_attributes = 'absent'
+            config.ready.write_bytes(b'stale READY')
+            with patch.object(c.Custody, 'launch') as launched:
+                with self.assertRaises(capture.CaptureError):
+                    capture.capture(config, FakeMaps(config))
+                launched.assert_not_called()
+            self.assertTrue(capture.evidence.object_attributes_absent())
+
     def test_profile_readiness_accepts_attach_complete_without_live_frame(self):
         # The live frame is TTY-only (src/run.rs LiveDisplay): on the canary's
         # log file it appears only as the final frame, after the capture has
@@ -1544,6 +2153,275 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                 stream.write('p11scope \u2014 test \u2014 privacy=allowlisted\n'.encode())
             self.assertTrue(coordinator.final_privacy_present(time.monotonic() + 1))
 
+    def test_ready_bound_declares_20s_for_modern_observer_startup(self):
+        self.assertEqual(capture.READY_SECONDS, 20)
+        for release in ('6.6.157-ready-bound-test', '6.6.0', '6.12.10-generic',
+                        '7.0.0-38-generic', '7.2.9'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release), 20)
+
+    def test_ready_bound_preserves_preliminary_workload_roster_allowance(self):
+        for release in ('6.6.157-ready-bound-test', '7.0.0-38-generic'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release, workload_roster=True), 8)
+        for release in ('5.15.221-ready-bound-test', '6.1.188-ready-bound-test'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release, workload_roster=True), 30)
+
+    def test_ready_bound_run_keeps_preliminary_roster_deadline_separate(self):
+        # Subtracting these origins after adding 30 rounds in opposite directions.
+        for release, expected, origin in (('6.6.157-ready-bound-test', 8, 2.2),
+                                          ('7.0.0-38-generic', 8, 2.3),
+                                          ('5.15.221-ready-bound-test', 30, 2.2),
+                                          ('6.1.188-ready-bound-test', 30, 2.3)):
+            with self.subTest(release=release, origin=origin), tempfile.TemporaryDirectory() as directory:
+                config = config_for(os.getpid(), directory)
+                deadlines = []
+
+                def roster(_config, deadline):
+                    deadlines.append(deadline)
+                    raise capture.CaptureError('stop-at-preliminary-roster')
+
+                with kernel_release(release), virtual_monotonic() as clock, \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        patch.object(capture, 'ready_roster', side_effect=roster), \
+                        patch.object(c.Custody, 'launch') as launched:
+                    clock[0] = origin
+                    started = clock[0]
+                    with self.assertRaises(capture.CaptureError):
+                        capture.capture(config, FakeMaps(config))
+                    launched.assert_not_called()
+                self.assertEqual(deadlines, [started + expected])
+                self.assertFalse(config.observer_log.exists())
+                self.assertFalse(config.go.exists())
+
+    def test_ready_bound_declares_30s_for_legacy_kernels(self):
+        self.assertEqual(capture.READY_SECONDS_LEGACY_KERNEL, 30)
+        for release in ('5.15.221-ready-bound-test', '5.15.0',
+                        '6.1.188-ready-bound-test', '6.1.0'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release), 30)
+
+    def test_ready_bound_refuses_unknown_kernels(self):
+        for release in ('5.4.0', '5.10.123-generic', '5.19.17', '6.0.19',
+                        '6.5.13-generic', '4.19.0', '', 'not-a-kernel', '6', '6.x'):
+            with self.subTest(release=release):
+                with self.assertRaises(capture.CaptureError) as raised:
+                    capture.ready_bound_seconds(release)
+                self.assertIn('kernel', str(raised.exception))
+
+    def test_ready_bound_ignores_environment_override(self):
+        bogus = {'CANARY_READY_SECONDS': '999', 'CANARY_READY_BOUND_SECONDS': '999',
+                 'READY_SECONDS': '999', 'P11SCOPE_READY_SECONDS': '999',
+                 'WORKLOAD_ROSTER_SECONDS': '999'}
+        with patch.dict(os.environ, bogus):
+            self.assertEqual(capture.ready_bound_seconds('6.6.157-ready-bound-test'), 20)
+            self.assertEqual(capture.ready_bound_seconds('6.6.157-ready-bound-test', workload_roster=True), 8)
+            self.assertEqual(capture.ready_bound_seconds('5.15.221-ready-bound-test'), 30)
+            with self.assertRaises(capture.CaptureError):
+                capture.ready_bound_seconds('5.4.0')
+
+    def test_ready_bound_accepts_str_subclasses(self):
+        class Release(str):
+            pass
+        for release, expected in ((Release('6.6.157-ready-bound-test'), 20),
+                                  (Release('5.15.221-ready-bound-test'), 30)):
+            with self.subTest(release=str(release)):
+                self.assertEqual(capture.ready_bound_seconds(release), expected)
+
+    def test_ready_bound_rejects_non_string_releases(self):
+        for release in (None, 12345, b'6.6.0', ['6.6.0']):
+            with self.subTest(release=release):
+                with self.assertRaises(capture.CaptureError) as raised:
+                    capture.ready_bound_seconds(release)
+                self.assertIn('unparseable', str(raised.exception))
+
+    def test_ready_bound_declared_label_stays_single_line(self):
+        self.assertEqual(capture.declared_kernel_label('6.6.157-ready-bound-test'),
+                         '6.6.157-ready-bound-test')
+        label = capture.declared_kernel_label('6.6.157\nINJECTED\r\x00\x1b')
+        self.assertNotIn('\n', label)
+        self.assertNotIn('\r', label)
+        self.assertTrue(all(32 <= ord(char) < 127 for char in label), label)
+        self.assertTrue(label.startswith('6.6.157'), label)
+        self.assertLessEqual(len(capture.declared_kernel_label('6.6.' + '1' * 100)), 64)
+
+    def test_ready_bound_run_declares_sanitized_label(self):
+        # Hostile uname string on the success path: the run still declares
+        # the correct bound (the suffix never selects it), but the printed
+        # line stays one parseable line. validate_config is stubbed to stop
+        # the run right after the declaration, before any launch or file.
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(os.getpid(), directory)
+            output = io.StringIO()
+            with kernel_release('6.6.157\nINJECTED'), \
+                    contextlib.redirect_stdout(output), \
+                    patch.object(capture, 'validate_config',
+                                 side_effect=capture.CaptureError('stop-after-declaration')):
+                with self.assertRaises(capture.CaptureError):
+                    capture.capture(config, FakeMaps(config))
+        hits = [line for line in output.getvalue().splitlines()
+                if 'CANARY_READY_BOUND_DECLARED' in line]
+        self.assertEqual(len(hits), 1, output.getvalue())
+        self.assertIn('seconds=20', hits[0], output.getvalue())
+        self.assertEqual(len(hits[0].split()), 3, output.getvalue())
+
+    def test_ready_bound_unknown_kernel_run_refuses_before_launch(self):
+        for release in ('5.4.0-ready-bound-test', '6.5.0-ready-bound-test'):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                config = config_for(os.getpid(), directory)
+                with kernel_release(release), \
+                        patch.object(c.Custody, 'launch') as launched:
+                    with self.assertRaises(capture.CaptureError) as raised:
+                        capture.capture(config, FakeMaps(config))
+                    launched.assert_not_called()
+                self.assertIn('kernel', str(raised.exception))
+                self.assertFalse(config.observer_log.exists())
+
+    def test_ready_bound_unknown_kernel_run_prints_no_declaration(self):
+        # Twin of the refusal-before-launch test at the operator surface:
+        # a refused run must not declare a bound on stdout, while the
+        # refusal reason still reaches the operator on stderr with a
+        # nonzero exit. Refusal happens before config validation, so the
+        # argv below only needs to parse.
+        for release in ('5.4.0-ready-bound-test', '6.5.0-ready-bound-test'):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                lane = 'aggregate-only-metrics'
+                prefix = str(Path(directory) / lane)
+                argv = ['--lane', lane, '--variant', 'default', '--mode', 'metrics',
+                       '--privacy', 'aggregate-only', '--workload-mode', 'matrix',
+                       '--out-dir', directory, '--prefix', prefix,
+                       '--ready', f'{prefix}.ready', '--go', f'{prefix}.go',
+                       '--done', f'{prefix}.done', '--finish', f'{prefix}.finish',
+                       '--observer-log', f'{prefix}.observer.log',
+                       '--workload-log', f'{prefix}.workload.log',
+                       '--reader', sys.executable, '--obj', sys.executable,
+                       '--target-bits', '64', '--workload-pid', str(os.getpid()),
+                       '--generation', '1', '--', sys.executable, '-c', 'pass']
+                out, err = io.StringIO(), io.StringIO()
+                with kernel_release(release), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    status = capture.main(argv)
+                self.assertEqual(status, 1)
+                self.assertNotIn('CANARY_READY_BOUND_DECLARED', out.getvalue())
+                self.assertIn('kernel', err.getvalue())
+                self.assertIn(release, err.getvalue())
+
+    def ready_bound_probe(self, spec, timeout):
+        """ready_bound_case driver with a guard beyond probe()'s 12 s.
+
+        Expiry probes run the readiness loop against a virtual monotonic
+        clock: the loop still waits the full declared bound (identical
+        deadline arithmetic through the real readiness and custody path)
+        but in ~1 s of wall time. The outer timeout stays real, so a
+        genuine hang still fails loudly instead of passing quietly.
+        """
+        old = c._subreaper()
+        c._subreaper(1)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'])
+        outside = os.pidfd_open(child.pid)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                command = ['timeout', '--kill-after=1s', f'{timeout}s',
+                           sys.executable, '-I', __file__, '--probe', 'ready_bound:' + spec,
+                           str(child.pid), directory]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(select.select([outside], [], [], 0)[0])
+                self.assertEqual(c._children(os.getpid(), [os.getpid()], time.monotonic() + 1), [child.pid])
+        finally:
+            try:
+                signal.pidfd_send_signal(outside, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=2)
+            os.close(outside)
+            end = time.monotonic() + 2
+            while time.monotonic() < end:
+                pids = c._children(os.getpid(), [os.getpid()], end)
+                if not pids:
+                    break
+                wave = [(pid, os.pidfd_open(pid)) for pid in pids]
+                try:
+                    for _, fd in wave:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    for pid, fd in wave:
+                        assert select.select([fd], [], [], max(0, end - time.monotonic()))[0]
+                        assert os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG).si_pid == pid
+                finally:
+                    for _, fd in wave:
+                        os.close(fd)
+            c._subreaper(old)
+
+    def test_ready_bound_515_run_within_30s_passes(self):
+        self.probe('ready_bound:pass_515')
+
+    def observer_readiness_boundary(self, ready_after):
+        """Publish the actual ready line on the existing virtual clock."""
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'observer.log'
+            log.write_bytes(b'')
+            config = SimpleNamespace(mode='profile', privacy='allowlisted', observer_log=log)
+            coordinator = capture.Coordinator(config, None)
+            with virtual_monotonic() as clock:
+                started = clock[0]
+                deadline = started + capture.ready_bound_seconds('6.6.157-ready-bound-test')
+
+                def check_alive(bound):
+                    self.assertEqual(bound, deadline, 'readiness deadline was renewed')
+                    capture.remaining(bound)
+                    if ready_after is not None and clock[0] - started >= ready_after:
+                        log.write_bytes(b'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\n')
+
+                observer = SimpleNamespace(group=SimpleNamespace(check_alive=check_alive))
+                error = None
+                try:
+                    coordinator.readiness(observer, deadline)
+                except capture.CaptureError as caught:
+                    error = caught
+                return error, clock[0] - started, log.read_bytes()
+
+    def test_ready_bound_modern_accepts_actual_ready_line_before_20s(self):
+        for ready_after in (0, 17.217, 19.99):
+            with self.subTest(ready_after=ready_after):
+                error, elapsed, payload = self.observer_readiness_boundary(ready_after)
+                self.assertIsNone(error)
+                self.assertGreaterEqual(elapsed, ready_after)
+                self.assertLess(elapsed, 20)
+                self.assertIn(b'p11scope: capturing: ', payload)
+
+    def test_ready_bound_modern_refuses_at_deadline_late_and_never_ready(self):
+        for ready_after in (20, 20.01, None):
+            with self.subTest(ready_after=ready_after):
+                error, elapsed, payload = self.observer_readiness_boundary(ready_after)
+                self.assertIsInstance(error, capture.CaptureError)
+                self.assertIn('phase deadline expired', str(error))
+                self.assertGreaterEqual(elapsed, 20)
+                self.assertLess(elapsed, 20.1)
+                self.assertEqual(payload, b'')
+
+    def test_ready_bound_expired_clock_refuses_cached_actual_ready_line(self):
+        for overdue in (0, .01):
+            with self.subTest(overdue=overdue), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / 'observer.log'
+                log.write_bytes(b'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\n')
+                config = SimpleNamespace(mode='profile', privacy='allowlisted', observer_log=log)
+                coordinator = capture.Coordinator(config, None)
+                observer = SimpleNamespace(group=SimpleNamespace(check_alive=lambda _deadline: None))
+                with virtual_monotonic() as clock:
+                    deadline = clock[0] + capture.ready_bound_seconds('6.6.157-ready-bound-test')
+                    clock[0] = deadline + overdue
+                    with self.assertRaisesRegex(capture.CaptureError, 'phase deadline expired'):
+                        coordinator.readiness(observer, deadline)
+                self.assertIn(b'p11scope: capturing: ', log.read_bytes())
+
+    def test_ready_bound_66_run_over_20s_still_fails(self):
+        self.ready_bound_probe('fail_66', 16)
+
+    def test_ready_bound_515_run_over_30s_fails(self):
+        self.ready_bound_probe('fail_515', 45)
+
 
 CASES = (
     ['native:' + lane for lane in ('aggregate-only-metrics', 'default-safe-profile', 'default-safe-trace',
@@ -1572,7 +2450,7 @@ for case in CASES:
         self.probe('case:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_' + case.replace(':', '_').replace('-', '_'), test)
 
-for case in ('ready_first', 'ready_first_terminal_barrier', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
+for case in ('ready_first', 'ready_first_515', 'ready_first_terminal_barrier', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
              'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
              'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
              'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',
@@ -1591,6 +2469,8 @@ if __name__ == '__main__':
             owned_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][6:], sys.argv[5], sys.argv[6])
         elif sys.argv[2].startswith('case:'):
             coordinator_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][5:])
+        elif sys.argv[2].startswith('ready_bound:'):
+            ready_bound_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][len('ready_bound:'):])
         else:
             globals()[sys.argv[2]](int(sys.argv[3]), sys.argv[4])
     else:

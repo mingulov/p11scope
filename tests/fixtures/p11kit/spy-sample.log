@@ -1,0 +1,89 @@
+
+
+*************** OpenSC PKCS#11 spy *****************
+Loaded: "/var/tmp/p11scope-ws-tmp/wp3b-probe/libsofthsm2-owned.so"
+
+0: C_GetInterface
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.936
+[compat]
+[in] pInterfaceName 000076e1dc14cf2e / 7
+    00000000  50 4B 43 53 20 31 31                             PKCS 11         
+[in] pVersion = NULL
+[in] flags = 
+Returned:  0 CKR_OK
+
+1: C_Initialize
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.936
+[in] pInitArgs = 0x5e36c7ac14b0
+     flags: 2
+       CKF_OS_LOCKING_OK
+Returned:  0 CKR_OK
+
+2: C_GetSlotList
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Count is 2
+[out] *pulCount = 0x2
+Returned:  0 CKR_OK
+
+3: C_GetSlotList
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Slot 1187903695
+Slot 1
+[out] *pulCount = 0x2
+Returned:  0 CKR_OK
+
+4: C_GetSlotList
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Count is 2
+[out] *pulCount = 0x2
+Returned:  0 CKR_OK
+
+5: C_GetSlotList
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Slot 1187903695
+Slot 1
+[out] *pulCount = 0x2
+Returned:  0 CKR_OK
+
+6: C_GetSlotInfo
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] slotID = 0x46cdf8cf
+[out] pInfo: 
+      slotDescription:        'SoftHSM slot ID 0x46cdf8cf      '
+                              '                                '
+      manufacturerID:         'SoftHSM project                 '
+      hardwareVersion:         2.6
+      firmwareVersion:         2.6
+      flags:                   1
+        CKF_TOKEN_PRESENT                
+Returned:  0 CKR_OK
+
+7: C_GetSlotInfo
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] slotID = 0x1
+[out] pInfo: 
+      slotDescription:        'SoftHSM slot ID 0x1             '
+                              '                                '
+      manufacturerID:         'SoftHSM project                 '
+      hardwareVersion:         2.6
+      firmwareVersion:         2.6
+      flags:                   1
+        CKF_TOKEN_PRESENT                
+Returned:  0 CKR_OK
+
+8: C_OpenSession
+P:764625; T:0x130712436545344 2026-11-01 21:21:33.941
+[in] slotID = 0x46cdf8cf
+[in] flags = 0x6
+[in] pApplication = (nil)
+[in] Notify = (nil)
+[out] *phSession = 0x1
+Returned:  0 CKR_OK

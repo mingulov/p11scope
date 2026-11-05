@@ -9,14 +9,15 @@
 //! helpers and never hands the model an oracle identity/sharing fact.
 
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use crate::semantics_objects::journal::StagingLedger;
 use crate::semantics_objects::{
     AffectedScope, AttrObservation, AttributeList, Attribution, Birth, CallKey, CallToken,
     CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
     HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS, MechanismEvidence,
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits,
-    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, QueryStatus, RefCut, ResultSlot,
-    SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState, SlotScope,
-    ViewOrigin,
+    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, QueryStatus, RefCut,
+    ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
+    SlotScope, ViewOrigin,
 };
 use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::capture;
@@ -236,6 +237,10 @@ struct Book {
 /// A reference history driving one shared model across explicit domains.
 struct Hist {
     model: ObjectSemantics,
+    /// The history's reservation ledger (N1c): reference-model tests
+    /// own a private ledger, so the shared census never binds here —
+    /// it binds in adapter-integrated scenes.
+    ledger: StagingLedger,
     domains: Vec<(ObjectDomain, Book)>,
 }
 
@@ -248,6 +253,7 @@ impl Hist {
     fn with_limits(limits: ObjectLimits) -> Self {
         let mut hist = Self {
             model: ObjectSemantics::with_limits(limits),
+            ledger: StagingLedger::new(),
             domains: Vec::new(),
         };
         hist.add_domain(base_domain(), true);
@@ -257,6 +263,7 @@ impl Hist {
     fn unqualified() -> Self {
         let mut hist = Self {
             model: ObjectSemantics::new(),
+            ledger: StagingLedger::new(),
             domains: Vec::new(),
         };
         hist.add_domain(base_domain(), false);
@@ -287,12 +294,13 @@ impl Hist {
             requested: call.requested,
             entry_mechanism: call.mechanism,
             scope: call.scope,
+            entry_output: OutputEvidence::NotCaptured,
         }
     }
 
     fn try_begin_in(&mut self, dom: usize, cut: u64, call: Call) -> Result<CallToken, ObjectGap> {
         let origin = self.origin(dom, cut, &call);
-        let token = self.model.begin(origin)?;
+        let token = self.model.begin(origin, &mut self.ledger)?;
         self.domains[dom].1.calls.insert(cut, (token, None));
         Ok(token)
     }
@@ -324,7 +332,7 @@ impl Hist {
             found: done.found,
             attributes: done.attributes,
         };
-        self.model.complete(token, fact)
+        self.model.complete(token, fact, &mut self.ledger)
     }
 
     fn done(&mut self, token: CallToken, cut: u64, done: Done) -> ObjectEffects {
@@ -364,7 +372,7 @@ impl Hist {
 
     fn settle_in(&mut self, dom: usize, frontier: u64) -> ObjectEffects {
         let prefix = self.prefix(dom, frontier);
-        let effects = self.model.settle(prefix);
+        let effects = self.model.settle(prefix, &mut self.ledger);
         // A bootstrap is a one-time reference statement.
         self.domains[dom].1.bootstrap = None;
         effects
@@ -1201,6 +1209,7 @@ fn s2s3_stale_origin_and_dependency_fences_predecessor_loss() {
     let lost = h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     assert!(!has_created(&lost));
     let settled = h.settle(6);
@@ -1353,6 +1362,7 @@ fn s2s3_stale_origin_and_dependency_fences_timeout_mints_no_proof() {
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     let after = h.settle(8);
     assert!(!has_created(&after), "timeout/loss mints no proof");
@@ -2125,7 +2135,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_reference_boundaries() {
         let effects = h.settle(4);
         let id = created(&effects, x, 0).unwrap();
         h.model
-            .invalidate(AffectedScope::Domain(base_domain()), reason);
+            .invalidate(AffectedScope::Domain(base_domain()), reason, &mut h.ledger);
         let p = h.project();
         assert_eq!(view(&p, id).lifetime, Lifetime::Retired(reason));
         assert_eq!(
@@ -2156,8 +2166,11 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_ended_domain_releases_tickets() 
     h.settle(2);
     let in_flight = h.begin(3, create(SA));
     assert_eq!(h.project().usage.pending_calls, 1);
-    h.model
-        .invalidate(AffectedScope::Domain(base_domain()), ObjectGap::Unload);
+    h.model.invalidate(
+        AffectedScope::Domain(base_domain()),
+        ObjectGap::Unload,
+        &mut h.ledger,
+    );
     assert_eq!(
         h.project().usage.pending_calls,
         0,
@@ -2188,6 +2201,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_token_reset_and_local_loss() {
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SC)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     let p = h.project();
     assert_eq!(view(&p, ic).lifetime, Lifetime::Retired(ObjectGap::Loss));
@@ -2206,6 +2220,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_token_reset_and_local_loss() {
     h.model.invalidate(
         AffectedScope::Slot(base_domain(), slot(SLOT1)),
         ObjectGap::TokenReset,
+        &mut h.ledger,
     );
     let p = h.project();
     assert_eq!(
@@ -2213,7 +2228,8 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_token_reset_and_local_loss() {
         Lifetime::Retired(ObjectGap::TokenReset)
     );
     assert_eq!(view(&p, ib).lifetime, Lifetime::Live, "other slot survives");
-    h.model.invalidate(AffectedScope::Capture, ObjectGap::Loss);
+    h.model
+        .invalidate(AffectedScope::Capture, ObjectGap::Loss, &mut h.ledger);
     let p = h.project();
     assert_eq!(view(&p, ib).lifetime, Lifetime::Retired(ObjectGap::Loss));
     // Global loss voids bootstrap: later success publishes nothing.
@@ -2302,7 +2318,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_open_set_mismatch() {
     let _open = h.begin(5, sign_init(SA, H1));
     // A prefix through 6 that omits the registered open call.
     let bad = CompleteInputPrefix::reference(base_domain(), RefCut::reference(6), &[], None);
-    h.model.settle(bad);
+    h.model.settle(bad, &mut h.ledger);
     assert_eq!(
         view(&h.project(), id).attribution,
         Attribution::Downgraded(ObjectGap::PrefixContradiction)
@@ -2318,7 +2334,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_open_set_mismatch() {
         &[CallKey::reference(5)],
         None,
     );
-    h.model.settle(phantom);
+    h.model.settle(phantom, &mut h.ledger);
     assert_eq!(
         view(&h.project(), id).attribution,
         Attribution::Downgraded(ObjectGap::PrefixContradiction)
@@ -2608,6 +2624,91 @@ fn s2s3_metadata_provenance_curve_and_type_labels() {
     assert_eq!(view(&h.project(), other).label, None);
 }
 
+/// A private key inherits the size of its pair's public key when both
+/// handles come from one successful `C_GenerateKeyPair` return: the
+/// private view labels `rsa_2048` although its own modulus query was
+/// refused. No new read: the public key's established size is reused.
+#[test]
+fn s2s3_pair_mate_private_key_inherits_public_size() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let public = attrs(&[
+        scalar(CKA_CLASS, 2),
+        scalar(CKA_KEY_TYPE, 0),
+        scalar(CKA_MODULUS_BITS, 2048),
+    ]);
+    h.run(5, get_attrs(SA, H1), 6, ok().attrs(public));
+    // The provider refuses CKA_MODULUS_BITS on the private key: it is
+    // not an RSA private-key attribute (CKR_ATTRIBUTE_TYPE_INVALID).
+    let private = attrs(&[
+        scalar(CKA_CLASS, 3),
+        scalar(CKA_KEY_TYPE, 0),
+        AttrObservation::unavailable(CKA_MODULUS_BITS),
+    ]);
+    h.run(7, get_attrs(SA, H2), 8, ok().attrs(private));
+    let e = h.settle(8);
+    created(&e, x, 0).expect("the public mate is created");
+    let private_id = created(&e, x, 1).expect("the private mate is created");
+    assert_eq!(
+        view(&h.project(), private_id).label,
+        Some(KeyLabel::Rsa { modulus_bits: 2048 })
+    );
+}
+
+/// An unpaired private key never inherits a size: without a pair mate
+/// from the same successful return, the view stays unlabeled.
+#[test]
+fn s2s3_unpaired_private_key_stays_unlabeled() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let private = attrs(&[
+        scalar(CKA_CLASS, 3),
+        scalar(CKA_KEY_TYPE, 0),
+        AttrObservation::unavailable(CKA_MODULUS_BITS),
+    ]);
+    h.run(5, get_attrs(SA, H1), 6, ok().attrs(private));
+    let e = h.settle(6);
+    let id = created(&e, x, 0).expect("the created view exists");
+    assert_eq!(view(&h.project(), id).label, None);
+}
+
+/// A failed `C_GenerateKeyPair` mints no pair: the handles never bind
+/// mate views, so a later private-key view on one stays unlabeled.
+#[test]
+fn s2s3_failed_key_pair_creates_no_inheritable_mate() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA),
+        4,
+        rv(CkRv::FUNCTION_FAILED).result(0, H1).result(1, H2),
+    );
+    let g = h.run(
+        5,
+        get_attrs(SA, H2),
+        6,
+        ok().attrs(attrs(&[
+            scalar(CKA_CLASS, 3),
+            scalar(CKA_KEY_TYPE, 0),
+            AttrObservation::unavailable(CKA_MODULUS_BITS),
+        ])),
+    );
+    let e = h.settle(6);
+    assert_eq!(created(&e, x, 0), None);
+    assert_eq!(created(&e, x, 1), None);
+    assert!(!has_created(&e), "a failed creation mints no view");
+    let id = sole(first_observed(&e, g));
+    assert_eq!(view(&h.project(), id).label, None);
+}
+
 #[test]
 fn s2s3_metadata_provenance_classifiers_reject_unsupported_values() {
     let l = LinuxLayout::Lp64;
@@ -2866,7 +2967,7 @@ fn s2s3_bounded_state_and_redaction_cut_exhaustion() {
         &[],
         Some(RefCut::reference(0)),
     );
-    let effects = h.model.settle(top);
+    let effects = h.model.settle(top, &mut h.ledger);
     let id = created(&effects, x, 0).expect("published before exhaustion");
     assert_eq!(
         h.try_begin_in(0, u64::MAX, get_size(SA, H1)),
@@ -2901,6 +3002,7 @@ fn scale_origin(
         requested: [None, None],
         entry_mechanism: MechanismEvidence::NotCaptured,
         scope: SlotScope::Unknown,
+        entry_output: OutputEvidence::NotCaptured,
     }
 }
 
@@ -2931,6 +3033,7 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     // reach the capture-wide 65,536 object records; then N+1 per instance,
     // capture-wide and for the 1,024-call pending budget.
     let mut model = ObjectSemantics::new();
+    let mut ledger = StagingLedger::new();
     let rss_before = crate::discovery::inventory_workload::rss_bytes();
     let mut created_total = 0usize;
     let mut last_cut = BTreeMap::new();
@@ -2945,16 +3048,13 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
                 raw += 1;
                 cut += 1;
                 let token = model
-                    .begin(scale_origin(
-                        domain,
-                        cut,
-                        "C_CreateObject",
-                        0x6600 + session,
-                        None,
-                    ))
+                    .begin(
+                        scale_origin(domain, cut, "C_CreateObject", 0x6600 + session, None),
+                        &mut ledger,
+                    )
                     .expect("within pending budget");
                 cut += 1;
-                model.complete(token, scale_created(cut, 0x9000_0000 + raw));
+                model.complete(token, scale_created(cut, 0x9000_0000 + raw), &mut ledger);
                 if raw.is_multiple_of(64) {
                     let prefix = CompleteInputPrefix::reference(
                         domain,
@@ -2962,7 +3062,7 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
                         &[],
                         bootstrap.take(),
                     );
-                    created_total += count_created(&model.settle(prefix));
+                    created_total += count_created(&model.settle(prefix, &mut ledger));
                 }
             }
         }
@@ -2981,36 +3081,37 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     let domain = ObjectDomain::reference(1, 1, 1, 100, 1);
     let cut = last_cut[&0];
     let token = model
-        .begin(scale_origin(
-            domain,
-            cut + 1,
-            "C_CreateObject",
-            0x6600,
-            None,
-        ))
+        .begin(
+            scale_origin(domain, cut + 1, "C_CreateObject", 0x6600, None),
+            &mut ledger,
+        )
         .unwrap();
-    model.complete(token, scale_created(cut + 2, 0x9100_0001));
-    let effects = model.settle(CompleteInputPrefix::reference(
-        domain,
-        RefCut::reference(cut + 2),
-        &[],
-        None,
-    ));
+    model.complete(token, scale_created(cut + 2, 0x9100_0001), &mut ledger);
+    let effects = model.settle(
+        CompleteInputPrefix::reference(domain, RefCut::reference(cut + 2), &[], None),
+        &mut ledger,
+    );
     assert_eq!(count_created(&effects), 0, "per-instance N+1 refused");
 
     // Capture-wide N+1 in a fresh instance.
     let domain = ObjectDomain::reference(1, 1, 1, 999, 1);
     model.register_domain(domain).unwrap();
     let token = model
-        .begin(scale_origin(domain, 1, "C_CreateObject", 0x6600, None))
+        .begin(
+            scale_origin(domain, 1, "C_CreateObject", 0x6600, None),
+            &mut ledger,
+        )
         .unwrap();
-    model.complete(token, scale_created(2, 0x9999_0001));
-    let effects = model.settle(CompleteInputPrefix::reference(
-        domain,
-        RefCut::reference(2),
-        &[],
-        Some(RefCut::reference(0)),
-    ));
+    model.complete(token, scale_created(2, 0x9999_0001), &mut ledger);
+    let effects = model.settle(
+        CompleteInputPrefix::reference(
+            domain,
+            RefCut::reference(2),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
+        &mut ledger,
+    );
     assert_eq!(count_created(&effects), 0, "capture-wide N+1 refused");
     assert_eq!(model.project().usage.object_records, 65_536);
     assert!(model.project().gap(ObjectGap::ObjectCapacity) >= 2);
@@ -3020,24 +3121,18 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     model.register_domain(domain).unwrap();
     for cut in 1..=1_024u64 {
         model
-            .begin(scale_origin(
-                domain,
-                cut,
-                "C_GetObjectSize",
-                0x6600,
-                Some(0x9000_0001),
-            ))
+            .begin(
+                scale_origin(domain, cut, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
+                &mut ledger,
+            )
             .expect("N pending");
     }
     assert_eq!(model.project().usage.pending_calls, 1_024);
     assert_eq!(
-        model.begin(scale_origin(
-            domain,
-            1_025,
-            "C_GetObjectSize",
-            0x6600,
-            Some(0x9000_0001)
-        )),
+        model.begin(
+            scale_origin(domain, 1_025, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
+            &mut ledger
+        ),
         Err(ObjectGap::PendingCapacity)
     );
     let rss_after = crate::discovery::inventory_workload::rss_bytes();
@@ -3129,9 +3224,11 @@ fn s2s3_bounded_state_and_redaction_sentinel_canaries() {
     let mut text = String::new();
     text.push_str(&format!("{dup:?}"));
     let effects = h.settle_in(dom, 10);
-    let invalidated = h
-        .model
-        .invalidate(AffectedScope::Session(domain, sess(SA)), ObjectGap::Loss);
+    let invalidated = h.model.invalidate(
+        AffectedScope::Session(domain, sess(SA)),
+        ObjectGap::Loss,
+        &mut h.ledger,
+    );
     let projection = h.project();
     let origin = h.origin(dom, 11, &get_size(SA, H1).input(1, H2));
     let fact = CompletedFact {
@@ -3191,6 +3288,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_void_rejects_applied_snapshots()
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     h.run(6, close(SB), 7, ok());
     h.done(c0, 8, ok().result(0, H2));
@@ -3353,7 +3451,10 @@ fn s2s3_stale_origin_and_dependency_fences_unrepresentable_begin_voids_proof() {
     );
     let mut colliding = h.origin(0, 5, &get_size(SA, H1));
     colliding.key = CallKey::reference(99);
-    assert_eq!(h.model.begin(colliding), Err(ObjectGap::MalformedFact));
+    assert_eq!(
+        h.model.begin(colliding, &mut h.ledger),
+        Err(ObjectGap::MalformedFact)
+    );
     assert_eq!(
         view(&h.project(), id).attribution,
         Attribution::Downgraded(ObjectGap::MalformedFact)
@@ -3365,7 +3466,10 @@ fn s2s3_stale_origin_and_dependency_fences_unrepresentable_begin_voids_proof() {
     let id = created(&h.settle(4), x, 0).unwrap();
     let mut late = h.origin(0, 2, &get_size(SA, H1));
     late.key = CallKey::reference(77);
-    assert_eq!(h.model.begin(late), Err(ObjectGap::ClosedFrontier));
+    assert_eq!(
+        h.model.begin(late, &mut h.ledger),
+        Err(ObjectGap::ClosedFrontier)
+    );
     let p = h.project();
     assert_eq!(
         view(&p, id).attribution,
@@ -3538,8 +3642,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
         None,
         "the refused call may still be running"
     );
-    h.model
-        .outcome_lost(LostOutcome::Refused(base_domain(), RefCut::reference(9)));
+    h.model.outcome_lost(
+        LostOutcome::Refused(base_domain(), RefCut::reference(9)),
+        &mut h.ledger,
+    );
     h.rebootstrap(0, 10);
     h.settle(10);
     let later = h.run(11, create(SA), 12, ok().result(0, H3));
@@ -3553,7 +3659,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
     // be running: ClosedFrontier (a new key at or below the frontier).
     let mut late = h.origin(0, 3, &get_size(SA, H9));
     late.key = CallKey::reference(1_003);
-    assert_eq!(h.model.begin(late), Err(ObjectGap::ClosedFrontier));
+    assert_eq!(
+        h.model.begin(late, &mut h.ledger),
+        Err(ObjectGap::ClosedFrontier)
+    );
     h.rebootstrap(0, 13);
     h.settle(13);
     let blocked = h.run(14, create(SA), 15, ok().result(0, H4));
@@ -3563,8 +3672,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
         None,
         "a ClosedFrontier begin may still be running"
     );
-    h.model
-        .outcome_lost(LostOutcome::Refused(base_domain(), RefCut::reference(16)));
+    h.model.outcome_lost(
+        LostOutcome::Refused(base_domain(), RefCut::reference(16)),
+        &mut h.ledger,
+    );
     h.rebootstrap(0, 17);
     h.settle(17);
     let resumed = h.run(18, create(SA), 19, ok().result(0, H5));
@@ -3575,7 +3686,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
     let occupant = h.begin(20, get_size(SA, H9));
     let mut clash = h.origin(0, 20, &get_size(SA, H9));
     clash.key = CallKey::reference(1_020);
-    assert_eq!(h.model.begin(clash), Err(ObjectGap::MalformedFact));
+    assert_eq!(
+        h.model.begin(clash, &mut h.ledger),
+        Err(ObjectGap::MalformedFact)
+    );
     h.done(occupant, 21, ok());
     h.rebootstrap(0, 22);
     h.settle(22);
@@ -3586,8 +3700,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
         None,
         "a colliding begin may still be running"
     );
-    h.model
-        .outcome_lost(LostOutcome::Refused(base_domain(), RefCut::reference(25)));
+    h.model.outcome_lost(
+        LostOutcome::Refused(base_domain(), RefCut::reference(25)),
+        &mut h.ledger,
+    );
     h.rebootstrap(0, 26);
     h.settle(26);
     let resumed = h.run(27, create(SA), 28, ok().result(0, H7));
@@ -3603,14 +3719,17 @@ fn s2s3_stale_origin_and_dependency_fences_lost_outcome_releases_ticket() {
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     h.rebootstrap(0, 4);
     let refused = h.settle(4);
     assert!(refused.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::BootstrapRefused
     }));
-    h.model
-        .outcome_lost(LostOutcome::Ticket(stuck, RefCut::reference(5)));
+    h.model.outcome_lost(
+        LostOutcome::Ticket(stuck, RefCut::reference(5)),
+        &mut h.ledger,
+    );
     for (_, completion) in h.domains[0].1.calls.values_mut() {
         if completion.is_none() {
             *completion = Some(5);
@@ -3639,8 +3758,11 @@ fn s2s3_bounded_state_and_redaction_proof_generation_never_wraps() {
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     h.settle(2);
     h.model.exhaust_generation(base_domain());
-    h.model
-        .invalidate(AffectedScope::Domain(base_domain()), ObjectGap::Loss);
+    h.model.invalidate(
+        AffectedScope::Domain(base_domain()),
+        ObjectGap::Loss,
+        &mut h.ledger,
+    );
     assert_eq!(
         h.try_begin_in(0, 3, create(SA)),
         Err(ObjectGap::DomainEnded),
@@ -3661,21 +3783,24 @@ fn s2s3_stale_origin_and_dependency_fences_lost_outcome_bound_is_validated() {
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     let open = h.begin(5, create(SA));
     let before = h.project().usage.pending_calls;
-    let e = h
-        .model
-        .outcome_lost(LostOutcome::Ticket(open, RefCut::reference(4)));
+    let e = h.model.outcome_lost(
+        LostOutcome::Ticket(open, RefCut::reference(4)),
+        &mut h.ledger,
+    );
     assert!(malformed(&e), "a bound below the begin is rejected");
     assert_eq!(h.project().usage.pending_calls, before, "ticket kept");
     let done = h.begin(7, create(SA));
     h.done(done, 9, ok().result(0, H2));
-    let e = h
-        .model
-        .outcome_lost(LostOutcome::Ticket(done, RefCut::reference(8)));
+    let e = h.model.outcome_lost(
+        LostOutcome::Ticket(done, RefCut::reference(8)),
+        &mut h.ledger,
+    );
     assert!(malformed(&e), "a bound below the completion is rejected");
     assert_eq!(h.project().usage.pending_calls, before + 1, "ticket kept");
-    let e = h
-        .model
-        .outcome_lost(LostOutcome::Ticket(open, RefCut::reference(10)));
+    let e = h.model.outcome_lost(
+        LostOutcome::Ticket(open, RefCut::reference(10)),
+        &mut h.ledger,
+    );
     assert!(!malformed(&e));
     assert_eq!(h.project().usage.pending_calls, before, "released");
 }
@@ -3738,6 +3863,7 @@ fn churn(limits: ObjectLimits, cycles: u64) -> (ObjectSemantics, Vec<ObjectId>, 
         requested: [None, None],
         entry_mechanism: MechanismEvidence::NotCaptured,
         scope,
+        entry_output: OutputEvidence::NotCaptured,
     };
     let completed =
         |cut: u64, result: ResultSlot, session_out: HandleInput<SessionHandle>| CompletedFact {
@@ -3760,49 +3886,61 @@ fn churn(limits: ObjectLimits, cycles: u64) -> (ObjectSemantics, Vec<ObjectId>, 
     };
     let sa = HandleInput::Value(sess(SA));
     let mut model = ObjectSemantics::with_limits(limits);
+    let mut ledger = StagingLedger::new();
     model.register_domain(domain).unwrap();
     let open = model
-        .begin(origin(
-            1,
-            "C_OpenSession",
-            HandleInput::Absent,
-            HandleInput::Absent,
-            slot(SLOT1),
-        ))
+        .begin(
+            origin(
+                1,
+                "C_OpenSession",
+                HandleInput::Absent,
+                HandleInput::Absent,
+                slot(SLOT1),
+            ),
+            &mut ledger,
+        )
         .unwrap();
-    model.complete(open, completed(2, ResultSlot::NotCaptured, sa));
-    model.settle(prefix(2, Some(0)));
+    model.complete(open, completed(2, ResultSlot::NotCaptured, sa), &mut ledger);
+    model.settle(prefix(2, Some(0)), &mut ledger);
     let mut ids = Vec::new();
     let mut peak = 0;
     for i in 0..cycles {
         let b = 3 + 4 * i;
         let c = model
-            .begin(origin(
-                b,
-                "C_CreateObject",
-                sa,
-                HandleInput::Absent,
-                SlotScope::Unknown,
-            ))
+            .begin(
+                origin(
+                    b,
+                    "C_CreateObject",
+                    sa,
+                    HandleInput::Absent,
+                    SlotScope::Unknown,
+                ),
+                &mut ledger,
+            )
             .unwrap();
         model.complete(
             c,
             completed(b + 1, ResultSlot::Handle(obj(H1)), HandleInput::Absent),
+            &mut ledger,
         );
         let d = model
-            .begin(origin(
-                b + 2,
-                "C_DestroyObject",
-                sa,
-                HandleInput::Value(obj(H1)),
-                SlotScope::Unknown,
-            ))
+            .begin(
+                origin(
+                    b + 2,
+                    "C_DestroyObject",
+                    sa,
+                    HandleInput::Value(obj(H1)),
+                    SlotScope::Unknown,
+                ),
+                &mut ledger,
+            )
             .unwrap();
         model.complete(
             d,
             completed(b + 3, ResultSlot::NotCaptured, HandleInput::Absent),
+            &mut ledger,
         );
-        let e = model.settle(prefix(b + 3, None));
+        let e = model.settle(prefix(b + 3, None), &mut ledger);
         ids.push(created(&e, c, 0).expect("churn keeps publishing new IDs"));
         if i % 64 == 0 || i + 1 == cycles {
             let usage = model.project().usage;
@@ -3923,7 +4061,11 @@ fn churn_domain(n: u64) -> ObjectDomain {
 
 /// One short-lived process: open, create, settle, then an exec boundary
 /// ends the domain. Returns the created view.
-fn short_lived(model: &mut ObjectSemantics, domain: ObjectDomain) -> Option<ObjectId> {
+fn short_lived(
+    model: &mut ObjectSemantics,
+    domain: ObjectDomain,
+    ledger: &mut StagingLedger,
+) -> Option<ObjectId> {
     let origin =
         |cut: u64, function: &str, session: HandleInput<SessionHandle>, scope| OriginFact {
             domain,
@@ -3936,6 +4078,7 @@ fn short_lived(model: &mut ObjectSemantics, domain: ObjectDomain) -> Option<Obje
             requested: [None, None],
             entry_mechanism: MechanismEvidence::NotCaptured,
             scope,
+            entry_output: OutputEvidence::NotCaptured,
         };
     let completed = |cut: u64, result: ResultSlot, session_out| CompletedFact {
         cut: RefCut::reference(cut),
@@ -3949,35 +4092,50 @@ fn short_lived(model: &mut ObjectSemantics, domain: ObjectDomain) -> Option<Obje
     };
     let sa = HandleInput::Value(sess(SA));
     let open = model
-        .begin(origin(1, "C_OpenSession", HandleInput::Absent, slot(SLOT1)))
+        .begin(
+            origin(1, "C_OpenSession", HandleInput::Absent, slot(SLOT1)),
+            &mut *ledger,
+        )
         .ok()?;
-    model.complete(open, completed(2, ResultSlot::NotCaptured, sa));
+    model.complete(
+        open,
+        completed(2, ResultSlot::NotCaptured, sa),
+        &mut *ledger,
+    );
     let create = model
-        .begin(origin(3, "C_CreateObject", sa, SlotScope::Unknown))
+        .begin(
+            origin(3, "C_CreateObject", sa, SlotScope::Unknown),
+            &mut *ledger,
+        )
         .ok()?;
     model.complete(
         create,
         completed(4, ResultSlot::Handle(obj(H1)), HandleInput::Absent),
+        &mut *ledger,
     );
-    let effects = model.settle(CompleteInputPrefix::reference(
-        domain,
-        RefCut::reference(4),
-        &[],
-        Some(RefCut::reference(0)),
-    ));
-    model.invalidate(AffectedScope::Domain(domain), ObjectGap::Exec);
+    let effects = model.settle(
+        CompleteInputPrefix::reference(
+            domain,
+            RefCut::reference(4),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
+        &mut *ledger,
+    );
+    model.invalidate(AffectedScope::Domain(domain), ObjectGap::Exec, &mut *ledger);
     created(&effects, create, 0)
 }
 
 fn domain_churn(limits: ObjectLimits, domains: u64) -> (ObjectSemantics, Vec<ObjectId>) {
     let mut model = ObjectSemantics::with_limits(limits);
+    let mut ledger = StagingLedger::new();
     let mut ids = Vec::new();
     for n in 0..domains {
         let domain = churn_domain(n);
         model
             .register_domain(domain)
             .expect("ended domains are reclaimed under the cap");
-        ids.push(short_lived(&mut model, domain).expect("new domains keep working"));
+        ids.push(short_lived(&mut model, domain, &mut ledger).expect("new domains keep working"));
         if n % 256 == 0 || n + 1 == domains {
             assert!(model.project().usage.domains <= limits.instances);
         }
@@ -4015,32 +4173,41 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
         ..ObjectLimits::policy()
     };
     let mut model = ObjectSemantics::with_limits(limits);
-    let refused_begin = |model: &mut ObjectSemantics, domain: ObjectDomain| {
-        model.begin(OriginFact {
-            domain,
-            cut: RefCut::reference(50),
-            key: CallKey::reference(50),
-            entry_ns: 50,
-            function: fid("C_GetObjectSize"),
-            session: HandleInput::Value(sess(SA)),
-            inputs: [HandleInput::Value(obj(H1)), HandleInput::Absent],
-            requested: [None, None],
-            entry_mechanism: MechanismEvidence::NotCaptured,
-            scope: SlotScope::Unknown,
-        })
-    };
+    let mut ledger = StagingLedger::new();
+    let refused_begin =
+        |model: &mut ObjectSemantics, domain: ObjectDomain, ledger: &mut StagingLedger| {
+            model.begin(
+                OriginFact {
+                    domain,
+                    cut: RefCut::reference(50),
+                    key: CallKey::reference(50),
+                    entry_ns: 50,
+                    function: fid("C_GetObjectSize"),
+                    session: HandleInput::Value(sess(SA)),
+                    inputs: [HandleInput::Value(obj(H1)), HandleInput::Absent],
+                    requested: [None, None],
+                    entry_mechanism: MechanismEvidence::NotCaptured,
+                    scope: SlotScope::Unknown,
+                    entry_output: OutputEvidence::NotCaptured,
+                },
+                &mut *ledger,
+            )
+        };
     // A never-registered domain is never created implicitly.
     let stranger = churn_domain(77);
     assert_eq!(
-        refused_begin(&mut model, stranger),
+        refused_begin(&mut model, stranger, &mut ledger),
         Err(ObjectGap::UnknownDomain)
     );
-    let e = model.settle(CompleteInputPrefix::reference(
-        stranger,
-        RefCut::reference(60),
-        &[],
-        Some(RefCut::reference(0)),
-    ));
+    let e = model.settle(
+        CompleteInputPrefix::reference(
+            stranger,
+            RefCut::reference(60),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
+        &mut ledger,
+    );
     assert!(e.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::UnknownDomain
     }));
@@ -4050,22 +4217,23 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
     let (a, b, c) = (churn_domain(1), churn_domain(2), churn_domain(3));
     for d in [a, b] {
         model.register_domain(d).unwrap();
-        short_lived(&mut model, d).unwrap();
+        short_lived(&mut model, d, &mut ledger).unwrap();
     }
     model.register_domain(c).unwrap();
-    let live = short_lived(&mut model, c);
+    let live = short_lived(&mut model, c, &mut ledger);
     assert!(live.is_some());
     let before = model.project();
     assert_eq!(before.usage.pruned_domains, 2);
 
     // Late facts for a pruned domain: refused, counted, no state, no join.
-    assert_eq!(refused_begin(&mut model, a), Err(ObjectGap::DomainPruned));
-    let e = model.settle(CompleteInputPrefix::reference(
-        a,
-        RefCut::reference(60),
-        &[],
-        Some(RefCut::reference(55)),
-    ));
+    assert_eq!(
+        refused_begin(&mut model, a, &mut ledger),
+        Err(ObjectGap::DomainPruned)
+    );
+    let e = model.settle(
+        CompleteInputPrefix::reference(a, RefCut::reference(60), &[], Some(RefCut::reference(55))),
+        &mut ledger,
+    );
     assert!(e.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::DomainPruned
     }));
@@ -4073,9 +4241,13 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
         x,
         ObjectEffect::Created { .. } | ObjectEffect::FirstObserved { .. }
     )));
-    model.invalidate(AffectedScope::Domain(a), ObjectGap::Loss);
-    model.invalidate(AffectedScope::Session(a, sess(SA)), ObjectGap::Loss);
-    let e = model.outcome_lost(LostOutcome::Refused(a, RefCut::reference(70)));
+    model.invalidate(AffectedScope::Domain(a), ObjectGap::Loss, &mut ledger);
+    model.invalidate(
+        AffectedScope::Session(a, sess(SA)),
+        ObjectGap::Loss,
+        &mut ledger,
+    );
+    let e = model.outcome_lost(LostOutcome::Refused(a, RefCut::reference(70)), &mut ledger);
     assert!(e.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::DomainPruned
     }));
@@ -4099,7 +4271,7 @@ fn s2s3_bounded_state_and_redaction_domain_with_pending_ticket_is_kept() {
     // An ended domain is reclaimed; the held domain with a ticket is not.
     let ended = churn_domain(1);
     h.model.register_domain(ended).unwrap();
-    short_lived(&mut h.model, ended).unwrap();
+    short_lived(&mut h.model, ended, &mut h.ledger).unwrap();
     let next = churn_domain(2);
     assert_eq!(h.model.register_domain(next), Ok(()));
     assert_eq!(
@@ -4112,5 +4284,429 @@ fn s2s3_bounded_state_and_redaction_domain_with_pending_ticket_is_kept() {
     assert!(
         created(&e, pending, 0).is_some(),
         "the held domain still joins"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// initialize_era (6.07a P4: owner-approved 2026-10-29, merged P4-M1…M6)
+// ---------------------------------------------------------------------------
+
+fn init_call() -> Call {
+    call("C_Initialize")
+}
+
+#[test]
+fn s2s3_initialize_first_mint_qualifies_follow_ons() {
+    // P4-M3 case (i): a qualified OK on a held, never-initialized,
+    // unended domain with independent birth custody mints the era;
+    // later begins qualify. A birth bootstrap alone is not a live era.
+    let mut h = Hist::qualified();
+    let init = h.run(1, init_call(), 2, ok());
+    let effects = h.settle(2);
+    assert!(
+        unresolved(&effects, init).is_none(),
+        "the mint publishes no refusal"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the first success never contradicts"
+    );
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    let id = created(&effects, x, 0).expect("post-mint creation qualifies");
+    assert_eq!(view(&h.project(), id).lifetime, Lifetime::Live);
+    // Twin: success itself is not journal authority — an unqualified
+    // OK (no independent birth custody) mints nothing.
+    let mut h = Hist::unqualified();
+    h.run(1, init_call(), 2, ok());
+    h.settle(2);
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    assert_eq!(created(&effects, x, 0), None);
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
+}
+
+#[test]
+fn s2s3_initialize_already_is_benign_noop() {
+    // P4-M4: ALREADY_INITIALIZED confirms the live era — no mint, no
+    // end, no void, no contradiction.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    h.run(5, init_call(), 6, rv(CkRv::CRYPTOKI_ALREADY_INITIALIZED));
+    let effects = h.settle(6);
+    let id = created(&effects, x, 0).unwrap();
+    let p = h.project();
+    assert_eq!(view(&p, id).lifetime, Lifetime::Live);
+    assert!(p.sessions.iter().any(|s| s.state == SessionState::Live));
+    assert!(
+        effects.effects.iter().all(|effect| !matches!(
+            effect,
+            ObjectEffect::Downgraded { .. }
+                | ObjectEffect::Unresolved { .. }
+                | ObjectEffect::Gap { .. }
+        )),
+        "ALREADY disturbs nothing"
+    );
+    // ... and mints nothing on a pristine domain.
+    let mut h = Hist::unqualified();
+    h.run(1, init_call(), 2, rv(CkRv::CRYPTOKI_ALREADY_INITIALIZED));
+    h.settle(2);
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    assert_eq!(created(&effects, x, 0), None, "ALREADY mints no era");
+}
+
+#[test]
+fn s2s3_initialize_failed_reinit_mints_nothing() {
+    // P4-M4: a failed Initialize on a fresh era domain mints nothing.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    h.run(3, call("C_Finalize"), 4, ok());
+    h.settle(4);
+    let era = h.add_domain(ObjectDomain::reference(1, 1, 1, 1, 2), false);
+    h.run_in(era, 1, init_call(), 2, rv(CkRv::FUNCTION_FAILED));
+    h.settle_in(era, 2);
+    let x = h.run_in(era, 3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle_in(era, 4);
+    assert_eq!(
+        created(&effects, x, 0),
+        None,
+        "failed re-init mints nothing"
+    );
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
+}
+
+#[test]
+fn s2s3_initialize_finalize_reinit_split() {
+    // P4-M3 case (ii): post-Finalize, a qualified OK on the fresh
+    // sealed era domain mints the new era; handle-value reuse across
+    // eras never merges identities. Reference-model split only: the
+    // sealed successor issuance path is finding 2 (pending 6.04).
+    let mut h = Hist::qualified();
+    h.run(1, init_call(), 2, ok());
+    h.settle(2);
+    h.run(3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
+    let x = h.run(5, create(SA), 6, ok().result(0, H1));
+    h.run(7, call("C_Finalize"), 8, ok());
+    let effects = h.settle(8);
+    let old = created(&effects, x, 0).unwrap();
+    assert_eq!(
+        view(&h.project(), old).lifetime,
+        Lifetime::AccessEnded(ObjectGap::Finalize)
+    );
+    let era = h.add_domain(ObjectDomain::reference(1, 1, 1, 1, 2), true);
+    h.run_in(era, 1, init_call(), 2, ok());
+    h.settle_in(era, 2);
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the successor first success mints"
+    );
+    h.run_in(era, 3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
+    let y = h.run_in(era, 5, create(SA), 6, ok().result(0, H1));
+    let effects = h.settle_in(era, 6);
+    let new = created(&effects, y, 0).expect("re-init mint qualifies the new era");
+    assert_ne!(new, old, "handle-value reuse across eras never merges");
+    assert_eq!(
+        view(&h.project(), new).origin,
+        ViewOrigin::Created(CreationFamily::Create)
+    );
+    assert_eq!(
+        h.try_begin_in(0, 9, create(SA)),
+        Err(ObjectGap::DomainEnded),
+        "the ended era stays ended: no resurrection"
+    );
+}
+
+#[test]
+fn s2s3_initialize_duplicate_ok_contradicts() {
+    // P4-M5: a genuine second qualified OK while the era is live
+    // contradicts — a conforming provider answers ALREADY there, so OK
+    // evidences an unseen Finalize or a nonconforming provider. The
+    // first success mints; a birth bootstrap alone contradicts nothing.
+    let mut h = Hist::qualified();
+    h.run(1, init_call(), 2, ok());
+    h.settle(2);
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the first success mints"
+    );
+    h.run(3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
+    let x = h.run(5, create(SA), 6, ok().result(0, H1));
+    let before = h.settle(6);
+    let id = created(&before, x, 0).unwrap();
+    h.run(7, init_call(), 8, ok());
+    let effects = h.settle(8);
+    assert!(effects.effects.contains(&ObjectEffect::Downgraded {
+        object: id,
+        reason: ObjectGap::UnseenFinalize
+    }));
+    assert!(h.project().gap(ObjectGap::UnseenFinalize) >= 1);
+    // Post-contradiction proof needs a new bootstrap above the fence.
+    let y = h.run(9, create(SA), 10, ok().result(0, H2));
+    let effects = h.settle(10);
+    assert_eq!(created(&effects, y, 0), None);
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
+}
+
+#[test]
+fn s2s3_initialize_concurrent_oks_first_mints_second_contradicts() {
+    // P4-M5: cut-order-first mints; the concurrent second OK — exempt
+    // from mint fencing as a fellow Initialize — then contradicts on
+    // the post-mint live era. Both begins carry birth custody.
+    let mut h = Hist::qualified();
+    let first = h.begin(1, init_call());
+    let second = h.begin(2, init_call());
+    h.done(first, 4, ok());
+    h.done(second, 5, ok());
+    let effects = h.settle(5);
+    assert!(
+        h.project().gap(ObjectGap::UnseenFinalize) >= 1,
+        "the second OK contradicts"
+    );
+    assert!(
+        !effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::Downgraded { .. })),
+        "a pristine domain has no joins to downgrade"
+    );
+    // The contradiction voided the mint: follow-ons stay unproven.
+    let x = h.run(6, create(SA), 7, ok().result(0, H1));
+    let effects = h.settle(7);
+    assert_eq!(created(&effects, x, 0), None);
+}
+
+#[test]
+fn s2s3_initialize_straddler_fenced_publishes_nothing() {
+    // P4-M3: pending/straddling calls are fenced at the mint; their
+    // pre-split snapshots never publish across it. Birth custody is
+    // present — without the fence the straddler would publish.
+    let mut h = Hist::qualified();
+    let init = h.begin(1, init_call());
+    let straddler = h.begin(2, create(SA));
+    h.done(init, 4, ok());
+    h.done(straddler, 5, ok().result(0, H1));
+    let effects = h.settle(5);
+    assert_eq!(
+        created(&effects, straddler, 0),
+        None,
+        "the straddler publishes nothing"
+    );
+    assert_eq!(
+        unresolved(&effects, straddler),
+        None,
+        "a fenced end replays nothing, not even a gap"
+    );
+    // The era itself is live for post-split begins.
+    let x = h.run(6, create(SA), 7, ok().result(0, H2));
+    let effects = h.settle(7);
+    assert!(
+        created(&effects, x, 0).is_some(),
+        "post-split begins qualify"
+    );
+}
+
+#[test]
+fn s2s3_initialize_straddler_fence_is_causal() {
+    // P4-M3 causal (finding 4): the mint fences straddlers; without the
+    // fence the straddler would publish across the split and a delayed
+    // removal would damage the successor. Full effect/gap delta plus the
+    // real settlement trace; M5 (fence removal) must fail the boundary
+    // assertion while the healthy post-boundary control holds.
+    use crate::semantics_objects::trace_settlement_for_test;
+    let mut h = Hist::qualified();
+    let domain = base_domain();
+    // Open first so the straddler and remover have a live session to act
+    // on; the session itself predates the mint and stays live.
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let init = h.begin(3, init_call());
+    let straddler = h.begin(4, create(SA));
+    // Delayed removal straddling the mint: begins before the anchor,
+    // completes after the successor exists. Its replay would retire
+    // the successor view.
+    let remover = h.begin(5, destroy(SA, H2));
+    h.done(init, 6, ok());
+    h.done(straddler, 7, ok().result(0, H1));
+    let x = h.begin(8, create(SA));
+    h.done(x, 9, ok().result(0, H2));
+    h.done(remover, 10, ok());
+    let gaps_before = h.project().gap(ObjectGap::BootstrapUnproven);
+    let (effects, trace) = trace_settlement_for_test(domain, || h.settle(10));
+    // Boundary: the straddler publishes nothing — no Created, no
+    // Unresolved, and no new gap. A Gap instead of Unresolved still
+    // fails here via the gap delta.
+    assert_eq!(
+        created(&effects, straddler, 0),
+        None,
+        "the straddler publishes nothing"
+    );
+    assert_eq!(
+        unresolved(&effects, straddler),
+        None,
+        "a fenced end replays nothing, not even Unresolved"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::BootstrapUnproven),
+        gaps_before,
+        "a fenced end emits no gap either"
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Created { call, .. } if *call == straddler
+        )),
+        "no Created effect names the straddler"
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved { call, .. } if *call == straddler
+        )),
+        "no Unresolved effect names the straddler"
+    );
+    // The delayed remover also replays nothing: the successor view it
+    // names stays Live, never retired or destroyed.
+    assert_eq!(
+        unresolved(&effects, remover),
+        None,
+        "the fenced remover replays nothing"
+    );
+    // Settlement trace: fenced calls replay their pre-mint begins
+    // (one non-terminal step each) but no terminal end; the mint and
+    // the post-split join replay fully.
+    let straddler_begins = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == straddler && !step.terminal)
+        .count();
+    let straddler_ends = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == straddler && step.terminal)
+        .count();
+    let remover_begins = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == remover && !step.terminal)
+        .count();
+    let remover_ends = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == remover && step.terminal)
+        .count();
+    assert_eq!(
+        (straddler_begins, straddler_ends),
+        (1, 0),
+        "the straddler began before the mint but its end never replays"
+    );
+    assert_eq!(
+        (remover_begins, remover_ends),
+        (1, 0),
+        "the remover began before the mint but its end never replays"
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.call == init && step.terminal),
+        "the mint end replays"
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.call == x && step.terminal),
+        "the post-split end replays"
+    );
+    // Healthy post-boundary control: the successor qualifies and stays
+    // Live despite the delayed remover naming its handle.
+    let id = created(&effects, x, 0).expect("post-split begins qualify");
+    assert_eq!(
+        view(&h.project(), id).lifetime,
+        Lifetime::Live,
+        "the successor survives the fenced remover"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the mint itself contradicts nothing"
+    );
+}
+
+#[test]
+fn s2s3_initialize_pending_mints_nothing() {
+    // P4-M4: PENDING (Initialize is synchronous) mints nothing.
+    let mut h = Hist::unqualified();
+    h.run(1, init_call(), 2, rv(CkRv::PENDING));
+    h.settle(2);
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    assert_eq!(created(&effects, x, 0), None, "PENDING mints nothing");
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
+}
+
+#[test]
+fn s2s3_initialize_late_completion_after_finalize_is_stale() {
+    // P4-M6: a pre-finalize Initialize whose completion stages but
+    // never replays before the era ends is dropped with the era (no
+    // mint, no join, no contradiction); a late re-delivery of its
+    // released ticket is refused as stale.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let before = h.settle(4);
+    let id = created(&before, x, 0).unwrap();
+    let init = h.begin(5, init_call());
+    h.run(6, call("C_Finalize"), 7, ok());
+    h.done(init, 8, ok());
+    h.settle(8);
+    assert_eq!(
+        view(&h.project(), id).lifetime,
+        Lifetime::AccessEnded(ObjectGap::Finalize)
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the dropped Initialize contradicts nothing"
+    );
+    let late = h.done(init, 9, ok());
+    assert!(late.effects.contains(&ObjectEffect::Gap {
+        reason: ObjectGap::StaleToken
+    }));
+    assert_eq!(
+        view(&h.project(), id).lifetime,
+        Lifetime::AccessEnded(ObjectGap::Finalize),
+        "no resurrection"
+    );
+}
+
+#[test]
+fn s2s3_session_handle_reuse_retires_old_mints_new() {
+    // 6.07a: opening over a live session word retires the old
+    // incarnation (uncertain: the close was never observed) and
+    // mints the new one; old views retire, never silently rebind.
+    let mut h = Hist::qualified();
+    let first = h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let second = h.run(5, open_in(slot(SLOT1)), 6, ok().session_out(SA));
+    let effects = h.settle(6);
+    let s1 = opened(&effects, first).unwrap();
+    let s2 = opened(&effects, second).unwrap();
+    assert_ne!(s1, s2, "reuse mints a new incarnation");
+    let p = h.project();
+    assert_eq!(
+        p.session(s1).unwrap().state,
+        SessionState::Ended(ObjectGap::HandleReuse)
+    );
+    assert_eq!(p.session(s2).unwrap().state, SessionState::Live);
+    let id = created(&effects, x, 0).unwrap();
+    assert_eq!(
+        view(&p, id).lifetime,
+        Lifetime::Retired(ObjectGap::HandleReuse),
+        "old views retire"
     );
 }

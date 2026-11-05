@@ -7,6 +7,7 @@
 use std::ops::Range;
 
 use crate::identity::{read_object_bytes, read_object_bytes_with};
+use object::read::elf::FileHeader as _;
 use object::read::elf::ProgramHeader as _;
 use object::read::elf::SectionHeader as _;
 use object::{Architecture, BinaryFormat, Object as _, ObjectSegment as _, ObjectSymbol as _, elf};
@@ -25,6 +26,26 @@ pub enum ElfAbi {
     Ilp32,
 }
 
+/// File-derived facts for raw memory scanning. Structural metadata may
+/// contain function addresses, but those words are not ordinal anchors.
+#[derive(Debug)]
+pub struct RawScanElfFacts {
+    pub abi: ElfAbi,
+    pub exports: Vec<(String, u64)>,
+    /// A 3.x interface getter name (`C_GetInterface`/`C_GetInterfaceList`)
+    /// appears among the image's dynamic symbols in any symbol type —
+    /// including non-definitions (`STT_GNU_IFUNC`, absolute) that
+    /// `is_definition` excludes from `exports`.
+    pub getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol it could not read
+    /// (unreadable name) or translate (a wanted definition outside every
+    /// segment), so `exports` may be incomplete.
+    pub witness_fault: bool,
+    pub excluded_anchor_ranges: Vec<(u64, u64)>,
+    pub structural_bytes: u64,
+    pub work_units: u64,
+}
+
 /// One bounded read of an already-opened ELF, retained for every later query.
 #[derive(Debug)]
 pub struct ElfSnapshot {
@@ -34,6 +55,10 @@ pub struct ElfSnapshot {
     executable_ranges: Vec<(u64, u64)>,
 }
 
+/// Structural classification only (ELF magic, endianness, class/machine);
+/// segment ranges are unchecked. Never translate addresses or offsets from
+/// the returned object — use `classified_validated_object` for any export
+/// walk or range query.
 pub fn classified_object(data: &[u8]) -> Result<(object::File<'_>, ElfAbi), String> {
     let object = object::File::parse(data)
         .map_err(|error| format!("not parseable as an ELF object: {error}"))?;
@@ -60,6 +85,55 @@ pub fn classified_object(data: &[u8]) -> Result<(object::File<'_>, ElfAbi), Stri
 
 fn parse(data: &[u8]) -> Result<object::File<'_>, String> {
     classified_object(data).map(|(object, _)| object)
+}
+
+/// Segment-range validation shared by the snapshot and demand-paged paths:
+/// every segment's virtual range must not overflow `u64`, and every file
+/// range must lie within the `data_len` bytes actually present. Returns the
+/// executable file ranges for the snapshot's attachability index. Both
+/// query paths refuse corrupt headers here, before any address translation.
+fn validated_segment_ranges(
+    object: &object::File<'_>,
+    data_len: u64,
+) -> Result<Vec<(u64, u64)>, String> {
+    let mut executable_ranges = Vec::new();
+    for segment in object.segments() {
+        segment
+            .address()
+            .checked_add(segment.size())
+            .ok_or_else(|| "segment virtual-address range overflows u64".to_string())?;
+        let file_range = {
+            let (start, size) = segment.file_range();
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| "segment file range overflows u64".to_string())?;
+            if end > data_len {
+                return Err("segment file range extends past the ELF bytes".into());
+            }
+            (start, end)
+        };
+        if segment.permissions().executable() {
+            executable_ranges.push(file_range);
+        }
+    }
+    Ok(executable_ranges)
+}
+
+/// `classified_object` plus the snapshot's segment-range validation, with
+/// the executable file ranges the parse produced. Every export walk goes
+/// through here so corrupt headers refuse before any address translation.
+/// The snapshot constructor keeps its own order (interpreter first) and does
+/// not use this entry, preserving its error precedence for doubly-corrupt
+/// images.
+// The tuple return matches the file's existing export-facts tuples; no alias
+// without a new shared type.
+#[allow(clippy::type_complexity)]
+pub(crate) fn classified_validated_object(
+    data: &[u8],
+) -> Result<(object::File<'_>, ElfAbi, Vec<(u64, u64)>), String> {
+    let (object, abi) = classified_object(data)?;
+    let executable_ranges = validated_segment_ranges(&object, data.len() as u64)?;
+    Ok((object, abi, executable_ranges))
 }
 
 fn file_offset(object: &object::File<'_>, address: u64) -> Option<u64> {
@@ -164,27 +238,7 @@ impl ElfSnapshot {
     fn from_data(data: Vec<u8>) -> Result<Self, String> {
         let (object, abi) = classified_object(&data)?;
         let interpreter = interpreter(&object)?;
-        let mut executable_ranges = Vec::new();
-        let data_len = data.len() as u64;
-        for segment in object.segments() {
-            segment
-                .address()
-                .checked_add(segment.size())
-                .ok_or_else(|| "segment virtual-address range overflows u64".to_string())?;
-            let file_range = {
-                let (start, size) = segment.file_range();
-                let end = start
-                    .checked_add(size)
-                    .ok_or_else(|| "segment file range overflows u64".to_string())?;
-                if end > data_len {
-                    return Err("segment file range extends past the ELF bytes".into());
-                }
-                (start, end)
-            };
-            if segment.permissions().executable() {
-                executable_ranges.push(file_range);
-            }
-        }
+        let executable_ranges = validated_segment_ranges(&object, data.len() as u64)?;
 
         Ok(Self {
             data,
@@ -272,29 +326,310 @@ impl ElfSnapshot {
     }
 
     pub fn exports_matching(&self, wanted: &[&str]) -> Result<Vec<(String, u64)>, String> {
-        let object = parse(&self.data)?;
-        Ok(exports_matching_in_object(&object, wanted))
+        // The bytes were validated at construction, so the shared validation
+        // always passes here; the walk still goes through the one entry.
+        let (object, _, _) = classified_validated_object(&self.data)?;
+        Ok(exports_matching_in_object(&object, wanted).exports)
+    }
+
+    pub fn raw_scan_facts(&self, wanted: &[&str]) -> Result<RawScanElfFacts, String> {
+        raw_scan_facts_from_bytes(&self.data, wanted)
     }
 }
 
-/// The shared exports walk: names from `wanted` that the image exports in
-/// `.dynsym`, in dynsym order with their file offsets. Per-symbol faults skip
-/// the symbol; the walk itself cannot fail.
-pub(crate) fn exports_matching_in_object(
-    object: &object::File<'_>,
+// Sorted disjoint intervals keep section/segment clipping linear after one
+// indexed collection; untrusted ELF tables never cause an S x P walk.
+fn merge_raw_metadata_ranges(ranges: &mut Vec<(u64, u64)>, work: &mut u64) {
+    let count = ranges.len() as u64;
+    *work = work.saturating_add(count.saturating_mul(u64::from(count.max(1).ilog2()) + 2));
+    ranges.sort_unstable();
+    let mut kept = 0usize;
+    for index in 0..ranges.len() {
+        let (start, end) = ranges[index];
+        if kept > 0 && start <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(end);
+        } else {
+            ranges[kept] = (start, end);
+            kept += 1;
+        }
+    }
+    ranges.truncate(kept);
+}
+
+fn intersect_raw_metadata_ranges(
+    left: &[(u64, u64)],
+    right: &[(u64, u64)],
+    out: &mut Vec<(u64, u64)>,
+    work: &mut u64,
+) {
+    let (mut a, mut b) = (0, 0);
+    while a < left.len() && b < right.len() {
+        *work = work.saturating_add(1);
+        let start = left[a].0.max(right[b].0);
+        let end = left[a].1.min(right[b].1);
+        if start < end {
+            out.push((start, end));
+        }
+        if left[a].1 <= right[b].1 {
+            a += 1;
+        } else {
+            b += 1;
+        }
+    }
+}
+
+fn subtract_raw_zero_fill_projections(
+    ranges: Vec<(u64, u64)>,
+    zero_fill: &[(u64, u64)],
+    work: &mut u64,
+) -> Vec<(u64, u64)> {
+    let mut retained = Vec::new();
+    let mut at = 0;
+    for (mut start, end) in ranges {
+        *work = work.saturating_add(1);
+        while at < zero_fill.len() && zero_fill[at].1 <= start {
+            *work = work.saturating_add(1);
+            at += 1;
+        }
+        while at < zero_fill.len() && zero_fill[at].0 < end {
+            *work = work.saturating_add(1);
+            if start < zero_fill[at].0 {
+                retained.push((start, zero_fill[at].0));
+            }
+            start = start.max(zero_fill[at].1);
+            if start >= end {
+                break;
+            }
+            at += 1;
+        }
+        if start < end {
+            retained.push((start, end));
+        }
+    }
+    retained
+}
+
+fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfFacts, String> {
+    let (object, abi, _) = classified_validated_object(data)?;
+    let mut ranges = Vec::new();
+    let mut work_units = 0u64;
+    macro_rules! collect {
+        ($elf:expr) => {{
+            let elf = $elf;
+            let endian = elf.endian();
+            let sections = elf.elf_section_table();
+            let programs = elf.elf_program_headers();
+            work_units = work_units.saturating_add((sections.len() + programs.len()) as u64);
+            let mut by_bias = std::collections::BTreeMap::new();
+            let mut loaded_file = Vec::new();
+            let mut zero_fill = Vec::new();
+            for segment in programs {
+                if segment.p_type(endian) != elf::PT_LOAD {
+                    continue;
+                }
+                let (offset, size) = segment.file_range(endian);
+                let address: u64 = segment.p_vaddr(endian).into();
+                let memory_size: u64 = segment.p_memsz(endian).into();
+                // classified_validated_object already checked every LOAD's
+                // file/virtual arithmetic and actual file extent.
+                let end = offset + size;
+                if offset < end {
+                    let bias = i128::from(address) - i128::from(offset);
+                    let (loads, _) = by_bias
+                        .entry(bias)
+                        .or_insert_with(|| (Vec::new(), Vec::new()));
+                    loads.push((offset, end));
+                    loaded_file.push((offset, end));
+                }
+                if memory_size > size {
+                    // A file-named VMA can include the loader-zeroed tail.
+                    // Its projected offsets cannot prove metadata ownership,
+                    // even if another LOAD really contains metadata there.
+                    // memsz removes authority only; it never extends filesz.
+                    zero_fill.push((end, offset.saturating_add(memory_size)));
+                }
+            }
+            let index_work = u64::from((by_bias.len() as u64).max(1).ilog2()) + 1;
+            work_units = work_units
+                .saturating_add((sections.len() as u64).saturating_mul(index_work))
+                .saturating_add((programs.len() as u64).saturating_mul(index_work));
+            // The existing parser handles ELF32/64 and extended indexes.
+            // Only exact GOT names need strings, and each check examines
+            // at most nine bytes rather than searching an unbounded name.
+            let names = elf
+                .elf_header()
+                .section_strings_index(endian, elf.data())
+                .ok()
+                .and_then(|index| sections.section(index).ok())
+                .and_then(|section| section.data(endian, elf.data()).ok())
+                .unwrap_or(&[]);
+            for section in sections.iter() {
+                let flags: u64 = section.sh_flags(endian).into();
+                if flags & u64::from(elf::SHF_ALLOC) == 0 {
+                    continue;
+                }
+                let kind = section.sh_type(endian);
+                let got = kind == elf::SHT_PROGBITS
+                    && names
+                        .get(section.sh_name(endian) as usize..)
+                        .is_some_and(|name| {
+                            name.starts_with(b".got\0") || name.starts_with(b".got.plt\0")
+                        });
+                let metadata = matches!(
+                    kind,
+                    elf::SHT_SYMTAB
+                        | elf::SHT_STRTAB
+                        | elf::SHT_RELA
+                        | elf::SHT_HASH
+                        | elf::SHT_DYNAMIC
+                        | elf::SHT_NOTE
+                        | elf::SHT_REL
+                        | elf::SHT_DYNSYM
+                        | elf::SHT_INIT_ARRAY
+                        | elf::SHT_FINI_ARRAY
+                        | elf::SHT_PREINIT_ARRAY
+                        | elf::SHT_GROUP
+                        | elf::SHT_SYMTAB_SHNDX
+                        | elf::SHT_RELR
+                        | elf::SHT_GNU_HASH
+                        | elf::SHT_GNU_VERDEF
+                        | elf::SHT_GNU_VERNEED
+                        | elf::SHT_GNU_VERSYM
+                );
+                if !metadata && !got {
+                    continue;
+                }
+                let address: u64 = section.sh_addr(endian).into();
+                // File ranges alone are insufficient: section and LOAD must
+                // agree on their virtual/file translation at every retained
+                // byte, and only actual p_filesz bytes can be structural.
+                if let Some((start, len)) = section.file_range(endian)
+                    && let Some(end) = start.checked_add(len)
+                    && address.checked_add(len).is_some()
+                    && start < end
+                    && end <= data.len() as u64
+                    && let Some((_, metadata)) =
+                        by_bias.get_mut(&(i128::from(address) - i128::from(start)))
+                {
+                    metadata.push((start, end));
+                }
+            }
+            for (loads, metadata) in by_bias.values_mut() {
+                merge_raw_metadata_ranges(loads, &mut work_units);
+                merge_raw_metadata_ranges(metadata, &mut work_units);
+                intersect_raw_metadata_ranges(metadata, loads, &mut ranges, &mut work_units);
+            }
+            merge_raw_metadata_ranges(&mut loaded_file, &mut work_units);
+            // Headers remain structural even without a section table, but
+            // only their actually loaded bytes exclude a raw observation.
+            let mut headers = vec![(0, std::mem::size_of_val(elf.elf_header()) as u64)];
+            let phoff: u64 = elf.elf_header().e_phoff(endian).into();
+            let phbytes = std::mem::size_of_val(programs) as u64;
+            if let Some(end) = phoff.checked_add(phbytes)
+                && phoff < end
+                && end <= data.len() as u64
+            {
+                headers.push((phoff, end));
+            }
+            merge_raw_metadata_ranges(&mut headers, &mut work_units);
+            intersect_raw_metadata_ranges(&headers, &loaded_file, &mut ranges, &mut work_units);
+            merge_raw_metadata_ranges(&mut ranges, &mut work_units);
+            merge_raw_metadata_ranges(&mut zero_fill, &mut work_units);
+            ranges = subtract_raw_zero_fill_projections(ranges, &zero_fill, &mut work_units);
+            names.len() as u64
+        }};
+    }
+    let names_bytes = match &object {
+        object::File::Elf32(elf) => collect!(elf),
+        object::File::Elf64(elf) => collect!(elf),
+        _ => unreachable!("classified ELF"),
+    };
+    let walk = exports_matching_in_object(&object, wanted);
+    Ok(RawScanElfFacts {
+        abi,
+        exports: walk.exports,
+        getter_present: walk.getter_present,
+        witness_fault: walk.witness_fault,
+        excluded_anchor_ranges: ranges,
+        // export_table_bytes already includes the ELF/program headers.
+        structural_bytes: export_table_bytes(&object, data.len() as u64)
+            .saturating_add(names_bytes)
+            .min(data.len() as u64),
+        work_units,
+    })
+}
+
+/// The raw-scan companion to `read_export_facts_bounded`, using the same
+/// object parser and mapping bound. Existing export-only APIs are unchanged.
+pub fn read_raw_scan_facts_bounded(
+    file: &std::fs::File,
     wanted: &[&str],
-) -> Vec<(String, u64)> {
+    max_mapped_bytes: u64,
+) -> Result<RawScanElfFacts, String> {
+    let len = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .len();
+    if len > max_mapped_bytes {
+        return Err(format!(
+            "file length {len} exceeds reserved mapped-byte bound {max_mapped_bytes}"
+        ));
+    }
+    let len = usize::try_from(len).map_err(|_| "ELF file length does not fit address space")?;
+    // SAFETY: read-only and no longer than the current file/reservation;
+    // the caller retains the existing pin-before/after discipline.
+    let bytes = unsafe { memmap2::MmapOptions::new().len(len).map(file) }
+        .map_err(|error| format!("read failed: {error}"))?;
+    raw_scan_facts_from_bytes(&bytes, wanted)
+}
+
+/// The shared exports walk: names from `wanted` that the image exports in
+/// `.dynsym`, in dynsym order with their file offsets, plus the two
+/// witness-completeness bits the legacy-prefix proof relies on (see
+/// [`RawScanElfFacts`]). Per-symbol faults skip the symbol; the walk
+/// itself cannot fail.
+#[derive(Debug, Default)]
+pub(crate) struct ExportWalk {
+    pub(crate) exports: Vec<(String, u64)>,
+    pub(crate) getter_present: bool,
+    pub(crate) witness_fault: bool,
+}
+
+pub(crate) fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> ExportWalk {
     let mut found = Vec::new();
+    let mut getter_present = false;
+    let mut witness_fault = false;
     for symbol in object.dynamic_symbols() {
-        let Ok(name) = symbol.name() else { continue };
+        let Ok(name) = symbol.name() else {
+            // An unreadable name: the walk cannot tell whether this
+            // symbol was wanted, so the witness may be incomplete.
+            witness_fault = true;
+            continue;
+        };
+        // Getter presence is recorded whatever the symbol type —
+        // including non-definitions (`STT_GNU_IFUNC`, absolute) the
+        // `is_definition` filter below excludes from `found` — and
+        // whatever the caller asked for, so a narrow `wanted` cannot
+        // hide a 3.x route from the legacy-prefix proof.
+        if name == "C_GetInterface" || name == "C_GetInterfaceList" {
+            getter_present = true;
+        }
         if !wanted.contains(&name) || !symbol.is_definition() {
             continue;
         }
         if let Some(offset) = file_offset(object, symbol.address()) {
             found.push((name.to_string(), offset));
+        } else {
+            // A wanted definition outside every segment: dropped from
+            // the witness, so the witness may be incomplete.
+            witness_fault = true;
         }
     }
-    found
+    ExportWalk {
+        exports: found,
+        getter_present,
+        witness_fault,
+    }
 }
 
 /// Structural bytes the export query logically consumed: the ELF header, the
@@ -348,16 +683,19 @@ fn export_facts_from_mmap(
     mmap: &memmap2::Mmap,
     wanted: &[&str],
 ) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
-    let (object, abi) = classified_object(mmap)?;
-    let exports = exports_matching_in_object(&object, wanted);
+    // The same segment-range validation the snapshot applies: without it,
+    // `file_offset` translates through corrupt headers to offsets past EOF.
+    let (object, abi, _) = classified_validated_object(mmap)?;
+    let exports = exports_matching_in_object(&object, wanted).exports;
     Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
 }
 
 /// `(abi, exports)` for `wanted` without reading the whole file: the image is
 /// demand-paged through a shared mapping and queried with the same
-/// `object`-based core as [`ElfSnapshot`], so facts and refusals agree
-/// exactly with the snapshot oracle. Returns the structural table bytes the
-/// query logically consumed, for budget charging. Every mapping failure takes
+/// `object`-based core as [`ElfSnapshot`], so facts and segment-range
+/// refusals agree exactly with the snapshot oracle (PT_INTERP validation is
+/// snapshot-side only). Returns the structural table bytes the query
+/// logically consumed, for budget charging. Every mapping failure takes
 /// the read-failure skip shape; parsed bytes are never retained.
 // The tuple return is the frozen A5 API; no alias without a new public type.
 #[allow(clippy::type_complexity)]
@@ -418,6 +756,57 @@ pub fn exports_matching(
     wanted: &[&str],
 ) -> Result<Vec<(String, u64)>, String> {
     ElfSnapshot::read(file)?.exports_matching(wanted)
+}
+
+/// DT_NEEDED library names of an ELF object, in dynamic-section order.
+/// Parsed from a read-only mapping with the same classification and
+/// segment-range validation as the export queries, so corrupt headers
+/// refuse before any string is read. An object without a dynamic section
+/// (statically linked) needs nothing and yields an empty list. Names are
+/// returned verbatim; the caller decides which ones to resolve and how.
+pub fn needed_libraries(file: &std::fs::File) -> Result<Vec<String>, String> {
+    // SAFETY: a read-only shared mapping of the file; the bytes are only read
+    // through the parser's checked accessors, never written or retained.
+    // This relies on memmap2's no-concurrent-modification contract, the same
+    // residual exposure documented on `read_export_facts`.
+    let mmap =
+        unsafe { memmap2::Mmap::map(file) }.map_err(|error| format!("read failed: {error}"))?;
+    needed_libraries_from_mmap(&mmap)
+}
+
+fn needed_libraries_from_mmap(mmap: &memmap2::Mmap) -> Result<Vec<String>, String> {
+    let (object, _, _) = classified_validated_object(mmap)?;
+    needed_libraries_in_object(&object)
+}
+
+pub(crate) fn needed_libraries_in_object(object: &object::File<'_>) -> Result<Vec<String>, String> {
+    macro_rules! walk {
+        ($elf:expr) => {{
+            // Absent dynamic section means statically linked: no names.
+            // Corrupt table data refuses instead of yielding a partial list.
+            let table = $elf
+                .elf_dynamic_table()
+                .map_err(|_| "invalid ELF dynamic table".to_string())?;
+            let mut needed = Vec::new();
+            for entry in table.iter() {
+                if entry.tag != elf::DT_NEEDED {
+                    continue;
+                }
+                let bytes = table
+                    .string(entry)
+                    .map_err(|_| "invalid DT_NEEDED string".to_string())?;
+                let name = std::str::from_utf8(bytes)
+                    .map_err(|_| "DT_NEEDED name is not valid UTF-8".to_string())?;
+                needed.push(name.to_string());
+            }
+            return Ok(needed);
+        }};
+    }
+    match object {
+        object::File::Elf32(object) => walk!(object),
+        object::File::Elf64(object) => walk!(object),
+        _ => unreachable!("classified ELF"),
+    }
 }
 
 /// File offset of one defined symbol, or `Ok(None)` when it is not defined.

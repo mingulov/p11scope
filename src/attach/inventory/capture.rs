@@ -83,13 +83,18 @@ use super::activation::{
 };
 use super::callers::{CallerRowFault, CallerUseCursor, CallerUseIo};
 use super::{AttachBackend, PreparedInventory, Scope};
+#[cfg(test)]
+pub(crate) use crate::attach::selected_detailed::baseline::scripted_observation;
+pub(crate) use crate::attach::selected_detailed::baseline::{
+    BindingObservation, CallerImageObservation,
+};
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
 use crate::discovery::inventory_attach_set::{
     AttachEndpoint, AttachObjectId, EndpointId, InventoryAttachSet, TargetDelta,
 };
 use crate::process::PidPin;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use aya::Ebpf;
 use aya::maps::Map;
 use p11scope_ebpf_common::inventory_callers::{CallerObjectKey, CallerObjectUse};
@@ -99,6 +104,7 @@ use p11scope_ebpf_common::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::os::fd::AsFd as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -289,6 +295,102 @@ pub(crate) enum CaptureScope {
     /// One process, by its retained original pidfd. A start-time pin or an
     /// exited process is refused before anything loads.
     Pid(PidPin),
+    /// The existing retained cgroup scope; membership is filtered in BPF.
+    #[cfg_attr(not(test), allow(dead_code))] // Cg4 wires the public command.
+    Cgroup(CgroupCaptureScope),
+}
+
+/// Constructor-validated cgroup data. Retain the original Scope and root FD;
+/// callers cannot substitute a System/PID scope or reopen an operator path.
+#[derive(Clone)]
+pub(crate) struct CgroupCaptureScope {
+    scope: Scope,
+}
+
+impl CgroupCaptureScope {
+    pub(crate) fn root(&self) -> &std::sync::Arc<std::fs::File> {
+        let Scope::Cgroup { dir, .. } = &self.scope else {
+            unreachable!("the cgroup constructor validates its scope")
+        };
+        dir
+    }
+}
+
+impl CaptureScope {
+    #[cfg_attr(not(test), allow(dead_code))] // Cg4 wires the public command.
+    pub(crate) fn cgroup(scope: Scope) -> Result<Self> {
+        if !matches!(scope, Scope::Cgroup { .. }) {
+            bail!("Inventory cgroup capture requires a retained cgroup scope");
+        }
+        Ok(Self::Cgroup(CgroupCaptureScope { scope }))
+    }
+
+    pub(crate) fn scope_coverage(&self) -> CaptureScopeCoverage {
+        match self {
+            Self::System => CaptureScopeCoverage::System,
+            Self::Pid(pin) => CaptureScopeCoverage::Pid(ScopeIncarnation {
+                pid: pin.pid(),
+                start_time: pin.start_time(),
+            }),
+            Self::Cgroup(_) => CaptureScopeCoverage::Cgroup,
+        }
+    }
+
+    pub(crate) fn clone_for_prepare(&self) -> Result<Self> {
+        match self {
+            Self::System => Ok(Self::System),
+            Self::Pid(pin) => Ok(Self::Pid(
+                pin.try_clone()
+                    .map_err(anyhow::Error::msg)
+                    .context("cloning the PID custody for a preparation")?,
+            )),
+            Self::Cgroup(cgroup) => Ok(Self::Cgroup(cgroup.clone())),
+        }
+    }
+
+    fn into_prepared_scope(self) -> Result<CapturePreparation> {
+        Ok(match self {
+            Self::System => CapturePreparation {
+                scope: Scope::System,
+                pid_pin: None,
+                held_scope: HeldCaptureScope::System,
+            },
+            Self::Pid(pin) => {
+                require_live_pid_custody(&pin)?;
+                let incarnation = ScopeIncarnation {
+                    pid: pin.pid(),
+                    start_time: pin.start_time(),
+                };
+                CapturePreparation {
+                    scope: Scope::Pid(pin.pid()),
+                    pid_pin: Some(pin),
+                    held_scope: HeldCaptureScope::Pid(incarnation),
+                }
+            }
+            Self::Cgroup(cgroup) => CapturePreparation {
+                held_scope: HeldCaptureScope::Cgroup {
+                    _root: std::sync::Arc::clone(cgroup.root()),
+                },
+                scope: cgroup.scope,
+                pid_pin: None,
+            },
+        })
+    }
+}
+
+struct CapturePreparation {
+    scope: Scope,
+    pid_pin: Option<PidPin>,
+    held_scope: HeldCaptureScope,
+}
+
+enum HeldCaptureScope {
+    System,
+    Pid(ScopeIncarnation),
+    /// Root custody only; this never proves continuous caller membership.
+    Cgroup {
+        _root: std::sync::Arc<std::fs::File>,
+    },
 }
 
 /// One extend quantum: at most `max_entries` attach attempts before
@@ -328,9 +430,12 @@ impl ReadWindow {
     }
 
     /// The row bound (scripted facades honour it).
-    #[cfg(test)]
     pub(crate) fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
     }
 }
 
@@ -347,8 +452,49 @@ impl NativeDomainId {
     /// process: the Inventory capture here and the Detailed (C6) object
     /// alike must mint through it, so no two loaded objects ever share
     /// a domain.
+    pub(crate) fn try_mint() -> Result<Self> {
+        mint_domain_from(&NEXT_DOMAIN)
+    }
+
+    /// Opaque identity word for sealed journal-domain minting (H8): the
+    /// process-unique domain tag as the model domain's native-source word.
+    /// Equality only; never ordered or compared across domains beyond the
+    /// model key's own equality. Only the journal child may call this.
+    pub(crate) fn journal_tag(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
     pub(crate) fn mint() -> Self {
-        Self(NEXT_DOMAIN.fetch_add(1, Ordering::Relaxed))
+        Self::try_mint().expect("test domain allocation is not exhausted")
+    }
+}
+
+fn mint_domain_from(counter: &AtomicU64) -> Result<NativeDomainId> {
+    let value = counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            if next == 0 { None } else { next.checked_add(1) }
+        })
+        .map_err(|_| anyhow::anyhow!("native identity domain exhausted"))?;
+    Ok(NativeDomainId(value))
+}
+
+#[cfg(test)]
+mod domain_mint_tests {
+    use super::*;
+
+    #[test]
+    fn domain_mint_refuses_zero_and_exhaustion_without_reusing_identity() {
+        for initial in [0, u64::MAX] {
+            let counter = AtomicU64::new(initial);
+            assert!(mint_domain_from(&counter).is_err());
+            assert_eq!(counter.load(Ordering::Relaxed), initial);
+        }
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let last = mint_domain_from(&counter).unwrap();
+        assert_eq!(last, NativeDomainId(u64::MAX - 1));
+        assert!(mint_domain_from(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
 
@@ -386,6 +532,15 @@ pub(crate) struct ScopeIncarnation {
     pub start_time: Option<u64>,
 }
 
+/// Capture coverage is explicit. A cgroup root does not carry the machine's
+/// or one PID incarnation's continuous-membership authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureScopeCoverage {
+    System,
+    Pid(ScopeIncarnation),
+    Cgroup,
+}
+
 /// Where the retained targets for a delta's objects come from: the attach
 /// set in production. The facade takes shared clones; it never borrows.
 pub(crate) trait CaptureTargets {
@@ -407,17 +562,27 @@ impl CaptureTargets for InventoryAttachSet {
     }
 }
 
-/// Whether the capture's scope is still the process it was opened for.
-/// Every non-held state is sticky; `at_ns` (CLOCK_MONOTONIC) is the
+/// Retained scope custody. PID states track the original process; cgroup
+/// custody tracks the original root through terminal reads. Every non-held
+/// PID state is sticky; `at_ns` (CLOCK_MONOTONIC) is the
 /// earliest instant the coverage can have stopped being proven: the exec
 /// record's own instant, else the last poll or health read that still
 /// proved custody.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScopeCustody {
     System,
+    /// The original cgroup root remains held, including after detach. This
+    /// says nothing about active links or continuous caller residency.
+    CgroupHeld,
     /// The original pidfd is live, its leader thread is alive, and no
     /// lifecycle record was lost or seen: every entry link fires for it.
     PidHeld,
+    /// The retained original pidfd proved exit without earlier uncertainty.
+    /// This preserves only historical counts of its already-bound image.
+    PidExited {
+        at_ns: u64,
+        proof: OriginalPidExit,
+    },
     /// The process lives, but coverage from `at_ns` on is unproven: an
     /// exec of the target (a nonleader exec replaces the task the entries
     /// were bound to), its leader thread exited (OneProcess entries stop
@@ -431,6 +596,44 @@ pub(crate) enum ScopeCustody {
         at_ns: u64,
         reason: String,
     },
+}
+
+/// An irreversible fact about the capture's original pin, never current
+/// process or semantic authority. Only a successful original-pidfd poll mints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginalPidExit {
+    domain: NativeDomainId,
+    scope: ScopeIncarnation,
+}
+
+impl OriginalPidExit {
+    fn from_poll(
+        domain: NativeDomainId,
+        scope: ScopeIncarnation,
+        pin: &PidPin,
+        poll: &CustodyPoll,
+    ) -> Option<Self> {
+        (matches!(poll, CustodyPoll::Exited)
+            && pin.pidfd().is_ok()
+            && scope.start_time.is_some()
+            && scope.pid == pin.pid()
+            && scope.start_time == pin.start_time())
+        .then_some(Self { domain, scope })
+    }
+
+    pub(crate) fn domain(self) -> NativeDomainId {
+        self.domain
+    }
+
+    pub(crate) fn scope(self) -> ScopeIncarnation {
+        self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId, scope: ScopeIncarnation) -> Self {
+        assert!(scope.start_time.is_some());
+        Self { domain, scope }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -773,18 +976,21 @@ pub(crate) struct WitnessBatch {
     /// was detected, and — when health is proven, nothing rose, and
     /// custody holds — the latest proven-clean instant.
     pub health_read_ns: u64,
+    /// CLOCK_MONOTONIC before this read's witness-row quantum. Every
+    /// initial count was looked up at or after this batch PRE bound;
+    /// it is not an exact per-pair lookup timestamp. `u64::MAX` means the
+    /// clock failed; `0` means no row read was attempted.
+    pub rows_anchor_ns: u64,
     /// CLOCK_MONOTONIC after this read's rows were read: every row here was
     /// inserted before it (`u64::MAX` when the clock read failed, `0`
     /// when nothing was read). Stamped after the count refresh too, so it
     /// also bounds every count here.
     pub rows_read_ns: u64,
-    /// CLOCK_MONOTONIC when this read's count-refresh lookup began (round
-    /// 5, anchor skew): every count here was observed at or after it
-    /// (`u64::MAX` when the clock read failed, `0` when nothing was
-    /// read). Count anchors (base reads) stamp from here, never from
-    /// the post-quantum `rows_read_ns` — genuine growth between a
-    /// pair's lookup and the late batch stamp must land at or after
-    /// its own anchor, never strictly before it.
+    /// CLOCK_MONOTONIC before this read's count-refresh quantum. Every
+    /// refreshed count was looked up at or after this batch PRE bound;
+    /// it anchors base reads, never observations. `rows_read_ns` is the
+    /// common POST bound for observations. `u64::MAX` means the clock
+    /// failed; `0` means no refresh was attempted.
     pub counts_read_ns: u64,
     /// Held objects whose retained pin no longer matches (modified in
     /// place) or could not be rechecked, first reported in this batch:
@@ -926,6 +1132,7 @@ pub(crate) struct CleanupSummary {
 
 /// Facade bookkeeping that travels through every state.
 struct CaptureBook {
+    promotion_baseline_generation: u64,
     domain: NativeDomainId,
     budget: InventoryBudget,
     /// The backend this capture attaches entries with (fixed at prepare).
@@ -938,7 +1145,7 @@ struct CaptureBook {
     /// the retained objects.
     link_ns_per_site: BTreeMap<u32, u64>,
     pair_limit: usize,
-    scope: Option<ScopeIncarnation>,
+    scope: HeldCaptureScope,
     /// Endpoint → object for every ENDPOINT_OBJECT binding this capture
     /// published and read back. Bounded by N. An entry here that is in
     /// neither `attached` nor `failed` is published-but-unattached (its
@@ -948,6 +1155,7 @@ struct CaptureBook {
     /// Endpoints that failed: never retried. Bounded by N.
     failed: BTreeMap<u32, String>,
     custody_lost: Option<(u64, String)>,
+    original_exit: Option<OriginalPidExit>,
     /// First reason PID-scope coverage became unproven (sticky).
     unproven: Option<(u64, String)>,
     /// System scope: the earliest-dated lifecycle loss (sticky).
@@ -1018,7 +1226,7 @@ pub(in crate::attach::inventory) fn system_book_lifecycle_loss(
     pin_check_failures: u64,
 ) -> Option<String> {
     let budget = InventoryBudget::new(1, 8).expect("a valid one-endpoint budget");
-    let mut book = CaptureBook::new(budget, 1, None, monotonic_ns());
+    let mut book = CaptureBook::new_scoped(budget, 1, HeldCaptureScope::System, monotonic_ns());
     book.observe_lifecycle(&CaptureHealth::from_parts(
         health,
         malformed_discovery,
@@ -1028,14 +1236,41 @@ pub(in crate::attach::inventory) fn system_book_lifecycle_loss(
 }
 
 impl CaptureBook {
+    #[cfg(test)]
     fn new(
         budget: InventoryBudget,
         pair_limit: usize,
         scope: Option<ScopeIncarnation>,
         now_ns: u64,
     ) -> Self {
+        Self::new_scoped(
+            budget,
+            pair_limit,
+            scope.map_or(HeldCaptureScope::System, HeldCaptureScope::Pid),
+            now_ns,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_scoped(
+        budget: InventoryBudget,
+        pair_limit: usize,
+        scope: HeldCaptureScope,
+        now_ns: u64,
+    ) -> Self {
+        Self::new_scoped_with_domain(NativeDomainId::mint(), budget, pair_limit, scope, now_ns)
+    }
+
+    fn new_scoped_with_domain(
+        domain: NativeDomainId,
+        budget: InventoryBudget,
+        pair_limit: usize,
+        scope: HeldCaptureScope,
+        now_ns: u64,
+    ) -> Self {
         Self {
-            domain: NativeDomainId::mint(),
+            promotion_baseline_generation: 0,
+            domain,
             budget,
             backend: AttachBackend::Singles,
             groups: Vec::new(),
@@ -1046,6 +1281,7 @@ impl CaptureBook {
             attached: BTreeSet::new(),
             failed: BTreeMap::new(),
             custody_lost: None,
+            original_exit: None,
             unproven: None,
             lifecycle_lost: None,
             held_ns: now_ns,
@@ -1072,7 +1308,22 @@ impl CaptureBook {
     }
 
     fn scope_pid(&self) -> Option<u32> {
-        self.scope.map(|scope| scope.pid)
+        self.incarnation().map(|scope| scope.pid)
+    }
+
+    fn incarnation(&self) -> Option<ScopeIncarnation> {
+        match &self.scope {
+            HeldCaptureScope::Pid(scope) => Some(*scope),
+            HeldCaptureScope::System | HeldCaptureScope::Cgroup { .. } => None,
+        }
+    }
+
+    fn scope_coverage(&self) -> CaptureScopeCoverage {
+        match &self.scope {
+            HeldCaptureScope::System => CaptureScopeCoverage::System,
+            HeldCaptureScope::Pid(scope) => CaptureScopeCoverage::Pid(*scope),
+            HeldCaptureScope::Cgroup { .. } => CaptureScopeCoverage::Cgroup,
+        }
     }
 
     /// Attached or failed: nothing more to do for this ID.
@@ -1081,10 +1332,22 @@ impl CaptureBook {
     }
 
     fn custody(&self) -> ScopeCustody {
-        if self.scope.is_none() {
-            return ScopeCustody::System;
+        match &self.scope {
+            HeldCaptureScope::System => return ScopeCustody::System,
+            HeldCaptureScope::Cgroup { .. } => return ScopeCustody::CgroupHeld,
+            HeldCaptureScope::Pid(_) => {}
         }
         if let Some((lost_ns, lost)) = &self.custody_lost {
+            if self.unproven.is_none()
+                && self.lifecycle_lost.is_none()
+                && self.changed_objects.is_empty()
+                && let Some(proof) = self.original_exit
+            {
+                return ScopeCustody::PidExited {
+                    at_ns: *lost_ns,
+                    proof,
+                };
+            }
             // Lost custody never hides an earlier-dated unproven one: the
             // earliest instant coverage stopped being proven stands.
             return match &self.unproven {
@@ -1110,7 +1373,8 @@ impl CaptureBook {
     /// PID scope only; the earliest instant (and its reason) stands, so a
     /// later-found loss dated earlier is never masked (C5.2 closure I-1b).
     fn mark_unproven(&mut self, at_ns: u64, reason: String) {
-        if self.scope.is_some() {
+        self.original_exit = None;
+        if self.incarnation().is_some() {
             keep_earliest(&mut self.unproven, at_ns, reason);
         }
     }
@@ -1118,7 +1382,7 @@ impl CaptureBook {
     /// Lifecycle evidence was lost: PID scope's custody is unproven from
     /// `at_ns`; the machine records the earliest loss for every batch.
     fn mark_lifecycle_loss(&mut self, at_ns: u64, reason: String) {
-        if self.scope.is_some() {
+        if self.incarnation().is_some() {
             self.mark_unproven(at_ns, reason);
         } else {
             keep_earliest(&mut self.lifecycle_lost, at_ns, reason);
@@ -1135,7 +1399,8 @@ impl CaptureBook {
     }
 
     fn mark_lost(&mut self, reason: String) {
-        if self.scope.is_some() && self.custody_lost.is_none() {
+        self.original_exit = None;
+        if self.incarnation().is_some() && self.custody_lost.is_none() {
             self.custody_lost = Some((self.held_ns, reason));
         }
     }
@@ -1149,6 +1414,7 @@ impl CaptureBook {
                 }
             }
             CustodyPoll::Unproven(reason) => self.mark_unproven(self.held_ns, reason),
+            CustodyPoll::Exited => self.mark_lost("PID custody lost: the PID target exited".into()),
             CustodyPoll::Lost(reason) => self.mark_lost(format!("PID custody lost: {reason}")),
         }
     }
@@ -1170,7 +1436,7 @@ impl CaptureBook {
     /// was lost, so custody since the last clean health read is unproven;
     /// under system scope the loss may hide any caller's exec or exit.
     fn observe_lifecycle(&mut self, health: &CaptureHealth) {
-        let hidden = if self.scope.is_some() {
+        let hidden = if self.incarnation().is_some() {
             "an exec of the PID target"
         } else {
             "an exec or exit of a watched caller"
@@ -1228,6 +1494,7 @@ fn keep_earliest(slot: &mut Option<(u64, String)>, at_ns: u64, reason: String) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CustodyPoll {
     Held,
+    Exited,
     Unproven(String),
     Lost(String),
 }
@@ -1274,13 +1541,13 @@ fn poll_custody_with(
 ) -> CustodyPoll {
     match exited() {
         Ok(false) => {}
-        Ok(true) => return CustodyPoll::Lost("the PID target exited".into()),
+        Ok(true) => return CustodyPoll::Exited,
         Err(error) => return CustodyPoll::Lost(error),
     }
     let leader = leader();
     match exited() {
         Ok(false) => {}
-        Ok(true) => return CustodyPoll::Lost("the PID target exited".into()),
+        Ok(true) => return CustodyPoll::Exited,
         Err(error) => return CustodyPoll::Lost(error),
     }
     match leader {
@@ -1309,6 +1576,7 @@ fn poll_custody_with(
 /// One custody poll into the book. The instant is taken before the poll:
 /// a held verdict proves custody up to the start of its reads, never past
 /// them.
+#[cfg(test)]
 fn poll_into(
     book: &mut CaptureBook,
     clock: &mut dyn FnMut() -> u64,
@@ -1841,6 +2109,41 @@ impl InventoryCapture {
         callers: CallerBudget,
         backend: AttachBackend,
     ) -> Result<Self> {
+        Self::prepare_with_host(
+            scope,
+            endpoints,
+            callers,
+            backend,
+            crate::attach::require_multi_capable_host(),
+        )
+    }
+
+    /// Private proof controls exercise preparation independently of live host admission.
+    #[cfg(test)]
+    pub(crate) fn prepare_for_proof(
+        scope: CaptureScope,
+        endpoints: InventoryBudget,
+        callers: CallerBudget,
+        backend: AttachBackend,
+    ) -> Result<Self> {
+        Self::prepare_with_host(
+            scope,
+            endpoints,
+            callers,
+            backend,
+            Ok(crate::attach::MultiCapableHost::for_test()),
+        )
+    }
+
+    fn prepare_with_host(
+        scope: CaptureScope,
+        endpoints: InventoryBudget,
+        callers: CallerBudget,
+        backend: AttachBackend,
+        host: crate::attach::MultiHostVerdict,
+    ) -> Result<Self> {
+        let _host = host?;
+        let domain = NativeDomainId::try_mint()?;
         if backend == AttachBackend::Multi && matches!(scope, CaptureScope::Pid(_)) {
             crate::attach::kernel_multi_pid_filter().map_err(|reason| {
                 anyhow::anyhow!(
@@ -1849,17 +2152,11 @@ impl InventoryCapture {
                 )
             })?;
         }
-        let (scope, pin) = match scope {
-            CaptureScope::System => (Scope::System, None),
-            CaptureScope::Pid(pin) => {
-                require_live_pid_custody(&pin)?;
-                (Scope::Pid(pin.pid()), Some(pin))
-            }
-        };
-        let incarnation = pin.as_ref().map(|pin| ScopeIncarnation {
-            pid: pin.pid(),
-            start_time: pin.start_time(),
-        });
+        let CapturePreparation {
+            scope,
+            pid_pin,
+            held_scope,
+        } = scope.into_prepared_scope()?;
         // Every entry link costs a descriptor (the `Session::start`
         // precedent): raise first, then prove the backend's link bound + 3
         // + reserve fit.
@@ -1873,11 +2170,17 @@ impl InventoryCapture {
         // The seen set's bound IS the CALLER_USE capacity (pair precondition).
         let pair_limit = super::callers::seen_limit(callers)?;
         let prepared =
-            PreparedInventory::prepare_callers_pinned(scope, pin, endpoints, callers, backend)?;
+            PreparedInventory::prepare_callers_pinned(scope, pid_pin, endpoints, callers, backend)?;
         Ok(Self {
             state: CaptureState::Prepared(Box::new(prepared)),
-            book: CaptureBook::new(endpoints, pair_limit, incarnation, monotonic_ns())
-                .with_backend(backend),
+            book: CaptureBook::new_scoped_with_domain(
+                domain,
+                endpoints,
+                pair_limit,
+                held_scope,
+                monotonic_ns(),
+            )
+            .with_backend(backend),
         })
     }
 
@@ -1908,9 +2211,8 @@ impl InventoryCapture {
         }
     }
 
-    /// The PID incarnation this capture covers (`None` for the machine).
-    pub(crate) fn incarnation(&self) -> Option<ScopeIncarnation> {
-        self.book.scope
+    pub(crate) fn scope_coverage(&self) -> CaptureScopeCoverage {
+        self.book.scope_coverage()
     }
 
     /// Polls the pidfd and the leader thread, then reports custody.
@@ -1932,10 +2234,26 @@ impl InventoryCapture {
 /// machine, or once custody is lost). Every read polls first, whatever
 /// the phase, so its custody and proof instant are its own.
 fn poll_book(book: &mut CaptureBook, pin: Option<&PidPin>) {
-    if book.scope.is_none() || book.custody_lost.is_some() {
+    // Revalidate the original pin while an exit fact can authorize a tail.
+    // Once custody is uncertain, later polls cannot upgrade that loss.
+    if book.incarnation().is_none() || (book.custody_lost.is_some() && book.original_exit.is_none())
+    {
         return;
     }
-    poll_into(book, &mut monotonic_ns, || poll_custody(pin));
+    let now_ns = monotonic_ns();
+    let poll = poll_custody(pin);
+    let proof = book
+        .incarnation()
+        .filter(|_| {
+            book.unproven.is_none()
+                && book.lifecycle_lost.is_none()
+                && book.changed_objects.is_empty()
+        })
+        .and_then(|scope| {
+            pin.and_then(|pin| OriginalPidExit::from_poll(book.domain, scope, pin, &poll))
+        });
+    book.absorb_poll(poll, now_ns);
+    book.original_exit = proof;
 }
 
 fn pid_pin_of(state: &CaptureState) -> Option<&PidPin> {
@@ -2104,6 +2422,92 @@ impl InventoryCapture {
         read_witnesses_from(state, &mut self.book, phase, window)
     }
 
+    /// Explicit pre-view identity acquisition; one exclusive native query can
+    /// run at a time. Render/key callbacks never acquire these kernel facts.
+    pub(crate) fn query_promotion_baselines(
+        &mut self,
+        capture: crate::inventory_promotion::CaptureId,
+        presentation: Arc<crate::inventory_present::Presentation>,
+        targets: &[crate::attach::selected_detailed::baseline::BaselineTarget],
+        window: ReadWindow,
+        reserve: impl FnOnce(
+            usize,
+        ) -> std::result::Result<
+            crate::semantics_edge::resources::ResourceLease,
+            crate::semantics_edge::resources::SemanticResourceRefusal,
+        >,
+    ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
+        let generation = self.next_image_query_generation()?;
+        match &mut self.state {
+            CaptureState::Prepared(prepared) => crate::attach::selected_detailed::baseline::query(
+                &mut prepared.ebpf,
+                self.book.domain,
+                generation,
+                capture,
+                presentation,
+                targets,
+                window,
+                reserve,
+            ),
+            CaptureState::Active(active) => active.state_mut().query_promotion_baselines(
+                self.book.domain,
+                generation,
+                capture,
+                presentation,
+                targets,
+                window,
+                reserve,
+            ),
+            CaptureState::Failed { .. } | CaptureState::Moving => {
+                bail!("Inventory native owner is unavailable for a baseline")
+            }
+        }
+    }
+
+    /// One genuine identity-only endpoint sample under the same exclusive
+    /// native owner/generation as promotion baselines. No Presentation or
+    /// permission-bearing receipt is involved. Metadata workers never receive
+    /// a mutable query handle and must already name an admitted NativeExact
+    /// row; the specifically approved inventory-owner guard is this
+    /// operation's one admission-adjacent consumer.
+    pub(crate) fn observe_caller_image(
+        &mut self,
+        original: &Arc<PidPin>,
+        window: ReadWindow,
+    ) -> Result<CallerImageObservation> {
+        let generation = self.next_image_query_generation()?;
+        match &mut self.state {
+            CaptureState::Prepared(prepared) => {
+                crate::attach::selected_detailed::baseline::observe_caller_image(
+                    &mut prepared.ebpf,
+                    self.book.domain,
+                    generation,
+                    original,
+                    window,
+                )
+            }
+            CaptureState::Active(active) => active.state_mut().observe_caller_image(
+                self.book.domain,
+                generation,
+                original,
+                window,
+            ),
+            CaptureState::Failed { .. } | CaptureState::Moving => {
+                bail!("Inventory native owner is unavailable for caller image observation")
+            }
+        }
+    }
+
+    fn next_image_query_generation(&mut self) -> Result<u64> {
+        ensure!(!self.book.stopping, "Inventory is stopping");
+        self.book.promotion_baseline_generation = self
+            .book
+            .promotion_baseline_generation
+            .checked_add(1)
+            .context("Inventory image query generation exhausted")?;
+        Ok(self.book.promotion_baseline_generation)
+    }
+
     /// The pidfd-keyed TASK_COOKIE answer for `pin` in this domain.
     pub(crate) fn query_cookie(&self, pin: &PidPin) -> CookieQuery {
         let ebpf = match &self.state {
@@ -2168,11 +2572,21 @@ impl InventoryCapture {
                 (RetiringInner::Retiring(retiring), Some(error))
             }
         };
-        RetiringCapture {
-            inner,
-            book,
-            failure,
-        }
+        retiring_capture(inner, book, failure)
+    }
+}
+
+/// Every begin_stop branch transfers the same root-owning book here, including
+/// active and failed captures. No optional root clone or default scope exists.
+fn retiring_capture(
+    inner: RetiringInner,
+    book: CaptureBook,
+    failure: Option<String>,
+) -> RetiringCapture {
+    RetiringCapture {
+        inner,
+        book,
+        failure,
     }
 }
 
@@ -2295,6 +2709,12 @@ impl RetiringCapture {
             },
         }
     }
+
+    /// Give up reclamation for process exit: keep every native owner
+    /// alive without joining the retirement job.
+    pub(crate) fn abandon_for_process_exit(self) {
+        crate::inventory_capture::ExitRetention::hold(self)
+    }
 }
 
 /// A retired capture: maps and pins stay readable until it drops.
@@ -2356,6 +2776,12 @@ impl RetiredCapture {
     pub(crate) fn query_cookie(&self, pin: &PidPin) -> CookieQuery {
         let ebpf = self.inner.as_ref().map(|inner| inner.state().ebpf());
         query_cookie_in(ebpf, self.book.domain, pin)
+    }
+
+    /// Give up reclamation for process exit: keep the retired owners
+    /// alive instead of dropping them.
+    pub(crate) fn abandon_for_process_exit(self) {
+        crate::inventory_capture::ExitRetention::hold(self)
     }
 }
 
@@ -2485,11 +2911,12 @@ fn read_witnesses_from(
         health_unproven: None,
         health_baseline_ns: book.health_ns,
         health_read_ns: 0,
+        rows_anchor_ns: 0,
         rows_read_ns: 0,
         counts_read_ns: 0,
         changed_objects: Vec::new(),
         custody: book.custody(),
-        custody_proven_ns: book.scope.map(|_| book.held_ns),
+        custody_proven_ns: book.incarnation().map(|_| book.held_ns),
         lifecycle_proven_ns: book.drained_ns,
         lifecycle_loss: book.lifecycle_loss(),
         unsettled: book.stopping,
@@ -2521,7 +2948,7 @@ fn read_witnesses_from(
     let mut io: &Ebpf = state.ebpf();
     read_rows_from_with(&mut io, book, &mut batch, window, capacity);
     batch.custody = book.custody();
-    batch.custody_proven_ns = book.scope.map(|_| book.held_ns);
+    batch.custody_proven_ns = book.incarnation().map(|_| book.held_ns);
     batch.lifecycle_proven_ns = book.drained_ns;
     batch.lifecycle_loss = book.lifecycle_loss();
     batch
@@ -2592,9 +3019,21 @@ fn read_rows_from_with<I: CallerUseIo>(
     window: ReadWindow,
     capacity: u32,
 ) {
+    read_rows_from_with_clock(io, book, batch, window, capacity, &mut monotonic_ns);
+}
+
+fn read_rows_from_with_clock<I: CallerUseIo>(
+    io: &mut I,
+    book: &mut CaptureBook,
+    batch: &mut WitnessBatch,
+    window: ReadWindow,
+    capacity: u32,
+    clock: &mut impl FnMut() -> u64,
+) {
     let published = &book.published;
     let failed = &book.failed;
     let scope_pid = book.scope_pid();
+    batch.rows_anchor_ns = clock();
     let read = book.cursor.read_with(
         io,
         window.max_rows,
@@ -2608,11 +3047,11 @@ fn read_rows_from_with<I: CallerUseIo>(
     // after it, so a base read anchors at-or-before its own lookup.
     // The batch stamp stays after the quantum — binding horizons
     // prove their starts strictly after the rows' read finished.
-    batch.counts_read_ns = monotonic_ns();
+    batch.counts_read_ns = clock();
     let refreshed = book
         .cursor
         .refresh_with(io, window.max_rows, window.deadline);
-    batch.rows_read_ns = monotonic_ns();
+    batch.rows_read_ns = clock();
     absorb_rows(book, batch, read);
     absorb_counts(book, batch, refreshed);
 }
@@ -2855,6 +3294,9 @@ fn query_cookie_with(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cgroup_tests;
 
 #[cfg(test)]
 mod privileged_tests;

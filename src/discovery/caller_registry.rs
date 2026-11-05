@@ -18,14 +18,33 @@
 //! behind a publication revision and become visible only at `publish`, so
 //! inventory facts cross the same batch boundary as discovery facts.
 
-use crate::discovery::native_binding::{BindingCensus, UnboundReason};
+pub(crate) mod instance_input;
+
+use instance_input::{
+    AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
+};
+
+use crate::discovery::native_binding::{BindingCensus, BoundImage, UnboundReason};
+use crate::discovery::retained_member::RetainedGroupMember;
+use crate::discovery::scan::CaptureWorkBudget;
+use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+use crate::process::CustodyCharge;
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
+pub(crate) mod metadata;
+
+use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResourceReserver};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use crate::semantics_objects::journal::ConsumptionOrdinal;
+use crate::semantics_objects::journal::joint_audit::{DisposedJointQuantum, IngestedJointQuantum};
+use crate::semantics_objects::journal::joint_driver::{
+    JointCaptureOwner, RawJointQuantum, RawQuantumIdentity,
+};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Capture-clock basis for every `*_ns` timestamp in the registry.
 pub(crate) const CLOCK_BASIS: &str = "CLOCK_MONOTONIC";
@@ -37,6 +56,25 @@ pub(crate) const CLOCK_UNIT: &str = "ns";
 /// coordinator records a gap when the clock is unavailable.
 pub(crate) fn now_ns() -> u64 {
     crate::attach::monotonic_ns().unwrap_or(0)
+}
+
+/// Diagnostic-only settlement-latency toggle:
+/// `P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY` set to exactly `1`
+/// records the per-applied-call ENTRY-to-application delay in 1 ms
+/// buckets and prints the cumulative p50/p99/max line beside the
+/// stop line. Anything else, including unset, records nothing;
+/// default paths are behavior-identical.
+pub(crate) const DIAGNOSTIC_SETTLEMENT_LATENCY_ENV: &str = "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY";
+
+/// Pure predicate over the toggle value: only exactly `1` enables.
+pub(crate) fn diagnostic_settlement_latency_by_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+pub(crate) fn diagnostic_settlement_latency_by_env() -> bool {
+    diagnostic_settlement_latency_by_env_value(
+        std::env::var_os(DIAGNOSTIC_SETTLEMENT_LATENCY_ENV).as_deref(),
+    )
 }
 
 /// Stable capture-local caller ID. Minted monotonically per incarnation,
@@ -80,8 +118,9 @@ pub(crate) struct ExeIdentity {
 /// Which authority backs a caller incarnation's image reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageAuthority {
-    /// BPF task-cookie/exec-ID identity (the native lifecycle adapter).
-    NativeExact { task_cookie: u64, exec_id: u64 },
+    /// Opaque expected native image (the native lifecycle adapter),
+    /// installed only after a successful guarded owner opening.
+    NativeExact { image: BoundImage },
     /// pidfd/start-time pin with exe-identity exec detection. Exact for
     /// lifetime (reuse-proof); exec detection is a best-effort change
     /// detector, and any uncertainty retires rather than merges.
@@ -136,6 +175,12 @@ pub(crate) struct CallerRecord {
     pub lifecycle: CallerLifecycle,
     pub lifecycle_reason: Option<String>,
     pub first_seen_ns: u64,
+    /// When the incarnation was admitted, on the observer's
+    /// `CLOCK_MONOTONIC`: the boundary stale native records order
+    /// against. The scan path admits after its collection, so this is
+    /// the admission detection time, never the pass-start `now` that
+    /// `first_seen_ns` keeps for scan-window comparisons.
+    pub admitted_ns: u64,
     pub last_seen_ns: u64,
     pub retired: bool,
 }
@@ -153,6 +198,37 @@ pub(crate) trait ProcessSource {
     /// the generation is dead even though `/proc` still parses — so a
     /// dead-but-unreaped target retires instead of re-admitting.
     fn gone(&self, pid: u32) -> bool;
+    /// A leader-exit hook plus a held process pin is not proof of a live
+    /// worker. Sources without fresh original-custody task evidence defer.
+    fn leader_exit_observation(
+        &self,
+        _pin: &Self::Pin,
+        _work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) -> crate::process::leader_exit::LeaderExitObservation {
+        crate::process::leader_exit::LeaderExitObservation::Unresolved
+    }
+    /// Cold-admit an already-zombie leader: when `pin` names a zombie
+    /// thread group with exactly one live survivor, mint the survivor
+    /// from this same pin and return its exe identity for the record.
+    /// `Ok(None)` means "not a cold-admittable zombie" (the ordinary
+    /// gone refusal applies); `Err` is a NAMED refusal (ambiguity —
+    /// never a pick — or a raced proof, which stays silent about
+    /// whether the group is dead). The default never cold-admits:
+    /// scripted sources gain no process authority from this hook.
+    fn cold_zombie_exe(&self, _pin: &Arc<Self::Pin>) -> Result<Option<ExeIdentity>, String> {
+        Ok(None)
+    }
+    /// Share original custody only when the source can prove its concrete type.
+    /// Scripted sources do not gain process authority from an Arc wrapper.
+    fn shared_semantic_custody(&self, _pin: &Arc<Self::Pin>) -> Option<Arc<PidPin>> {
+        None
+    }
+    fn install_shared_custody_charge(&self, _pin: &mut Self::Pin, _charge: &Arc<CustodyCharge>) {}
+    /// Inspect held process custody without duplicating its pidfd. A known
+    /// Detailed Arc can be reused after this check without a pidfd duplicate.
+    fn semantic_custody_ref<'pin>(&self, _pin: &'pin Self::Pin) -> Option<&'pin PidPin> {
+        None
+    }
 }
 
 /// The exe identity of `pid` (`/proc/<pid>/exe` metadata plus its link
@@ -198,6 +274,216 @@ impl ProcessSource for OsProcessSource {
     fn gone(&self, pid: u32) -> bool {
         generation_gone(pid) || process_is_zombie(pid)
     }
+
+    fn leader_exit_observation(
+        &self,
+        pin: &PidPin,
+        work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) -> crate::process::leader_exit::LeaderExitObservation {
+        pin.leader_exit_observation(work)
+    }
+
+    fn cold_zombie_exe(&self, pin: &Arc<PidPin>) -> Result<Option<ExeIdentity>, String> {
+        if !process_is_zombie(pin.pid()) {
+            return Ok(None);
+        }
+        // A scratch budget bounds the mint's own charges; the mint is a
+        // handful of local reads, never pass work.
+        let mut work = CaptureWorkBudget::default();
+        match cold_admit_member(pin, &mut work) {
+            Ok(minted) => {
+                let exe = minted.member.read_exe_identity();
+                drop(minted);
+                // A member whose exe is unreadable proves nothing: fail
+                // closed to the ordinary gone refusal.
+                Ok(exe)
+            }
+            Err(ColdRefusal::Ambiguous(reason)) => Err(reason),
+            Err(ColdRefusal::Dead) => Ok(None),
+            // A raced proof stays silent about whether the group is
+            // dead, so it keeps its own reason instead of the generic
+            // gone refusal (which would falsely claim an exit).
+            Err(ColdRefusal::Raced) => {
+                Err("admission raced a thread change; retries on the next observation".to_string())
+            }
+        }
+    }
+
+    fn shared_semantic_custody(&self, pin: &Arc<PidPin>) -> Option<Arc<PidPin>> {
+        Some(Arc::clone(pin))
+    }
+
+    fn install_shared_custody_charge(&self, pin: &mut PidPin, charge: &Arc<CustodyCharge>) {
+        pin.install_shared_custody_charge(Arc::clone(charge));
+    }
+
+    fn semantic_custody_ref<'pin>(&self, pin: &'pin PidPin) -> Option<&'pin PidPin> {
+        Some(pin)
+    }
+}
+
+/// A cold-minted survivor: the retained member plus the minter Arc that
+/// keeps its borrow alive. The minter clones the admission pin's own
+/// Arc — never a fresh numeric-PID reopen — so the original custody
+/// stays authoritative across the handoff.
+pub(crate) struct ColdMint {
+    pub member: RetainedGroupMember,
+    pub minter: Arc<PidPin>,
+}
+
+/// Why a cold mint refused: the group has no live survivor (the
+/// ordinary gone path), the survivors are ambiguous (a NAMED refusal —
+/// never a pick), or the proof raced and stayed unproven (fail closed
+/// like a gone process, like the sweep mint's silent custody refusal).
+#[derive(Debug)]
+pub(crate) enum ColdRefusal {
+    Dead,
+    Ambiguous(String),
+    Raced,
+}
+
+/// The private reservation owner for one cold mint: exactly the member
+/// envelope (two retained slots — the member directory plus the dup'd
+/// original pidfd — and one transient unit), mirroring the sweep
+/// confirm's member owner. Private to the mint, invisible to any
+/// shared census; its leases return when the mint drops.
+pub(crate) fn cold_member_owner() -> ReservationOwner {
+    ReservationOwner::new(SegmentPolicy {
+        headroom: 7,
+        workers: 1,
+        retained: 2,
+        max_ranges: 0,
+    })
+}
+
+/// The local-syscall grace for a cold mint: a handful of nonblocking
+/// reads, capped by the work budget's own deadline when it has one.
+/// Mirrors the sweep confirm's mint deadline; expiry fails closed.
+fn cold_mint_deadline(work: &CaptureWorkBudget) -> Instant {
+    const GRACE: Duration = Duration::from_secs(1);
+    let grace = Instant::now() + GRACE;
+    let capped = work.effective_deadline_ns().and_then(|limit| {
+        let clock = crate::attach::monotonic_ns()?;
+        let left = limit.checked_sub(clock)?;
+        Instant::now().checked_add(Duration::from_nanos(left))
+    });
+    capped.map(|deadline| deadline.min(grace)).unwrap_or(grace)
+}
+
+/// Live non-leader task IDs of `tgid`, sorted. `ColdRefusal::Dead`
+/// when the listing itself fails (the group is gone or unreadable).
+fn live_survivor_tids(tgid: u32) -> Result<Vec<u32>, ColdRefusal> {
+    let mut tids: Vec<u32> = std::fs::read_dir(format!("/proc/{tgid}/task"))
+        .map_err(|_| ColdRefusal::Dead)?
+        .map(|entry| {
+            entry
+                .map_err(|_| ColdRefusal::Dead)?
+                .file_name()
+                .to_string_lossy()
+                .parse::<u32>()
+                .map_err(|_| ColdRefusal::Dead)
+        })
+        .collect::<Result<_, _>>()?;
+    tids.retain(|tid| *tid != tgid);
+    tids.sort();
+    Ok(tids)
+}
+
+/// Mint the lone survivor of an already-zombie leader from the held
+/// original: the TGID's own task listing selects exactly one non-leader
+/// candidate, then the retained-member proof (tgkill liveness, group
+/// anchor, birth brackets) admits it, then a post-mint task re-list
+/// refuses by the ambiguity name when the live set grew or changed,
+/// and the original pidfd re-proves the group alive before the mint
+/// lands (a group dead under a passing re-list refuses raced).
+/// No numeric-PID reopen anywhere: the listings and the mint all
+/// derive from `original`, whose pidfd stays non-ready while threads
+/// live. A bare TID never selects here — its own task listing holds no
+/// non-leader entry — and no parentage is consulted.
+pub(crate) fn cold_admit_member(
+    original: &Arc<PidPin>,
+    work: &mut CaptureWorkBudget,
+) -> Result<ColdMint, ColdRefusal> {
+    cold_admit_member_with_relist(original, work, &mut |tgid| live_survivor_tids(tgid))
+}
+
+/// `cold_admit_member` with the post-mint task re-list injected:
+/// production passes the live listing; tests script the second
+/// listing so a survivor appearing between the two lists is
+/// deterministic, never timing.
+pub(crate) fn cold_admit_member_with_relist(
+    original: &Arc<PidPin>,
+    work: &mut CaptureWorkBudget,
+    relist: &mut impl FnMut(u32) -> Result<Vec<u32>, ColdRefusal>,
+) -> Result<ColdMint, ColdRefusal> {
+    let tgid = original.pid();
+    work.spend(1).map_err(|_| ColdRefusal::Raced)?;
+    let mut lone = None;
+    let mut extra = false;
+    let entries = std::fs::read_dir(format!("/proc/{tgid}/task")).map_err(|_| ColdRefusal::Dead)?;
+    for entry in entries {
+        let tid: u32 = entry
+            .map_err(|_| ColdRefusal::Dead)?
+            .file_name()
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ColdRefusal::Dead)?;
+        if tid == tgid {
+            continue;
+        }
+        if lone.is_some() {
+            extra = true;
+            break;
+        }
+        lone = Some(tid);
+    }
+    if extra {
+        return Err(ColdRefusal::Ambiguous(format!(
+            "thread group {tgid} has more than one live survivor (ambiguous; refusing to pick one)"
+        )));
+    }
+    let Some(tid) = lone else {
+        return Err(ColdRefusal::Dead);
+    };
+    let owner = cold_member_owner();
+    let deadline = cold_mint_deadline(work);
+    let member = match RetainedGroupMember::acquire(original, tid, &owner, work, deadline) {
+        Ok(member) => member,
+        // A raced or refused proof carries no admission signal: fail
+        // closed to the ordinary gone refusal.
+        Err(_) => return Err(ColdRefusal::Raced),
+    };
+    // Post-mint re-list: the exactly-one decision above trusted one
+    // `read_dir` pass, but getdents skips entries under concurrent
+    // modification, so a survivor born (or missed) during the first
+    // listing would admit a two-survivor group. Refuse by the existing
+    // ambiguity name when the live set grew or changed; an empty
+    // re-list is an ordinary dead group, and an unreadable one is a
+    // raced proof (the mint just proved a survivor). The refused
+    // member drops here, releasing its mint slot with the refusal.
+    work.spend(1).map_err(|_| ColdRefusal::Raced)?;
+    let mut fresh = relist(tgid).map_err(|_| ColdRefusal::Raced)?;
+    fresh.sort();
+    if fresh.is_empty() {
+        return Err(ColdRefusal::Dead);
+    }
+    if fresh != [tid] {
+        return Err(ColdRefusal::Ambiguous(format!(
+            "thread group {tgid} has more than one live survivor (ambiguous; refusing to pick one)"
+        )));
+    }
+    // The re-list passed, but the listing may be stale: an original
+    // whose pidfd no longer reports the group alive means the group
+    // died under the listing, so refuse raced instead of admitting a
+    // dead group. pidfd readiness never flips back, so this closes the
+    // gap; the refused member drops here with its mint slot.
+    if !original.still_the_same() {
+        return Err(ColdRefusal::Raced);
+    }
+    Ok(ColdMint {
+        member,
+        minter: Arc::clone(original),
+    })
 }
 
 /// What one `reconcile` concluded about a caller.
@@ -207,6 +493,11 @@ pub(crate) enum CallerEvent {
         id: CallerId,
     },
     Exited {
+        id: CallerId,
+        reason: String,
+    },
+    /// The old incarnation ended; no successor was authorized.
+    Retired {
         id: CallerId,
         reason: String,
     },
@@ -226,9 +517,60 @@ pub(crate) enum CallerEvent {
     },
 }
 
+#[derive(Clone, Copy)]
+enum SuccessorAdmission {
+    Unrestricted,
+    ScopedDenied,
+}
+
+/// Lifecycle reason for a natively proven exec retirement: the later image
+/// of the same task was witnessed (its exec sequence advanced under its
+/// task cookie, or its leader task changed under the held pidfd).
+const NATIVE_EXEC_REASON: &str = "a later image of the same task was witnessed natively (its exec \
+     sequence advanced under its task cookie, or its leader task changed under the held pidfd)";
+
+/// Moves original custody and its accounting together through every handoff.
+/// The OS pin embeds the same peer for bare H0/history Arc holders. Drop the
+/// pin first, then its peer; neither source identity nor charge is retagged.
+pub(crate) struct SharedCallerPin<Pin> {
+    pin: Arc<Pin>,
+    charge: Arc<CustodyCharge>,
+}
+
+impl<Pin> std::ops::Deref for SharedCallerPin<Pin> {
+    type Target = Pin;
+    fn deref(&self) -> &Pin {
+        &self.pin
+    }
+}
+
+impl<Pin> SharedCallerPin<Pin> {
+    fn new<Source: ProcessSource<Pin = Pin>>(
+        mut pin: Pin,
+        source: &Source,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<Self, SemanticResourceRefusal> {
+        // Cover inline tracked/prepared overlap as well as both heap Arcs.
+        let charge = CustodyCharge::reserve::<Pin>(reserve, 2 * std::mem::size_of::<Self>())?;
+        source.install_shared_custody_charge(&mut pin, &charge);
+        Ok(Self {
+            pin: Arc::new(pin),
+            charge,
+        })
+    }
+
+    fn share(&self) -> Self {
+        Self {
+            pin: Arc::clone(&self.pin),
+            charge: Arc::clone(&self.charge),
+        }
+    }
+}
+
 struct TrackedCaller<Pin> {
     record: CallerRecord,
-    pin: Option<Pin>,
+    pin: Option<SharedCallerPin<Pin>>,
+    leader_exit_pending: bool,
 }
 
 /// Tracks caller incarnations: admission, exit/exec/reuse retirement with
@@ -236,32 +578,159 @@ struct TrackedCaller<Pin> {
 /// never rewritten and IDs are never reused.
 pub(crate) struct CallerAdapter<Source: ProcessSource> {
     source: Source,
+    custody_reserver: SemanticResourceReserver,
     next_id: u32,
     incarnations: BTreeMap<u32, u32>,
     callers: BTreeMap<CallerId, TrackedCaller<Source::Pin>>,
     live_by_pid: BTreeMap<u32, CallerId>,
     max_callers: usize,
     admit_refused: u64,
+    scoped_retire_cursor: Option<u32>,
+    /// A per-incarnation detection-clock read failed (F7a): the
+    /// coordinator takes the gap fallback explicitly. Sticky until
+    /// taken.
+    detection_clock_failed: bool,
 }
 
 /// Why one admission attempt failed: an honest pin failure, or a budget
 /// refusal carrying the resource, limit, and requested occupancy.
-struct AdmitFailure {
-    reason: String,
-    budget: Option<BudgetRefusal>,
+pub(crate) struct AdmitFailure {
+    pub(crate) reason: String,
+    pub(crate) budget: Option<BudgetRefusal>,
+}
+
+impl AdmitFailure {
+    fn custody_storage(refusal: SemanticResourceRefusal) -> Self {
+        Self {
+            reason: "original process custody storage refused before allocation".into(),
+            budget: Some(BudgetRefusal {
+                resource: "semantic_bytes",
+                limit: refusal.limit_bytes,
+                requested: refusal.requested_bytes,
+            }),
+        }
+    }
+}
+
+/// A fresh source pin and identity reads, still without an admitted ID.
+/// Only a borrowed cgroup transaction permit can commit it.
+pub(crate) struct PreparedScopedCaller<Pin> {
+    pid: u32,
+    pin: SharedCallerPin<Pin>,
+    generation: crate::inspect_system::MemberGeneration,
+    existing: Option<CallerId>,
+}
+
+impl<Pin> PreparedScopedCaller<Pin> {
+    pub(crate) fn existing(&self) -> Option<CallerId> {
+        self.existing
+    }
+    pub(crate) fn generation(&self) -> &crate::inspect_system::MemberGeneration {
+        &self.generation
+    }
+}
+
+/// Permit-backed proof of current cgroup membership for one staged
+/// owner candidate: the final-sampled member's pid and generation,
+/// validated against the borrowed admission permit. Constructible
+/// only through `validate`, lifetime-bound to the permit borrow so it
+/// cannot span transactions, move-only (no `Clone`, `Default`, or
+/// serialization). The permit check re-reads custody liveness —
+/// refuses on mismatch, supplies no replacement identity. The job
+/// fence rides the transaction outcome gate beside this proof, never
+/// inside it: a permit proves its member, not the whole transaction.
+pub(crate) struct ScopedOwnerProof<'a> {
+    pid: u32,
+    generation: crate::inspect_system::MemberGeneration,
+    _permit: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> ScopedOwnerProof<'a> {
+    /// Validate staged (pid, generation) against the borrowed
+    /// final-sample permit: pid and generation match, custody live,
+    /// work finish polled. Anything else is `None`.
+    pub(crate) fn validate(
+        pid: u32,
+        generation: &crate::inspect_system::MemberGeneration,
+        permit: &'a crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+    ) -> Option<Self> {
+        if pid != permit.pid()
+            || *generation != *permit.generation()
+            || !permit.check()
+            || !permit.finish_check()
+        {
+            return None;
+        }
+        Some(Self {
+            pid,
+            generation: generation.clone(),
+            _permit: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn generation(&self) -> &crate::inspect_system::MemberGeneration {
+        &self.generation
+    }
 }
 
 impl<Source: ProcessSource> CallerAdapter<Source> {
-    pub(crate) fn new(source: Source) -> Self {
+    /// Never reopen the PID: this is the source pin enclosed by the original
+    /// scoped preparation, before the collection's final sample.
+    pub(crate) fn scoped_shared_semantic_custody(
+        &self,
+        prepared: &PreparedScopedCaller<Source::Pin>,
+    ) -> Option<Arc<PidPin>> {
+        self.source.shared_semantic_custody(&prepared.pin.pin)
+    }
+
+    pub(crate) fn scoped_semantic_custody_ref<'pin>(
+        &self,
+        prepared: &'pin PreparedScopedCaller<Source::Pin>,
+    ) -> Option<&'pin PidPin> {
+        self.source.semantic_custody_ref(&prepared.pin)
+    }
+
+    pub(crate) fn shared_semantic_custody(&self, caller: CallerId) -> Option<Arc<PidPin>> {
+        let tracked = self.callers.get(&caller)?;
+        if tracked.record.retired || self.live_id(tracked.record.pid) != Some(caller) {
+            return None;
+        }
+        self.source
+            .shared_semantic_custody(&tracked.pin.as_ref()?.pin)
+    }
+
+    pub(crate) fn semantic_custody_ref(&self, caller: CallerId) -> Option<&PidPin> {
+        let tracked = self.callers.get(&caller)?;
+        if tracked.record.retired || self.live_id(tracked.record.pid) != Some(caller) {
+            return None;
+        }
+        self.source.semantic_custody_ref(tracked.pin.as_ref()?)
+    }
+    pub(crate) fn new(source: Source, custody_reserver: SemanticResourceReserver) -> Self {
         Self {
             source,
+            custody_reserver,
             next_id: 0,
             incarnations: BTreeMap::new(),
             callers: BTreeMap::new(),
             live_by_pid: BTreeMap::new(),
             max_callers: DEFAULT_MAX_CALLERS,
             admit_refused: 0,
+            scoped_retire_cursor: None,
+            detection_clock_failed: false,
         }
+    }
+
+    /// Take and clear the detection-clock failure flag (F7a): true
+    /// when a per-incarnation stamp saw a clock-read failure since the
+    /// last take. The coordinator disables the stale-exit guard on
+    /// true, never a silent pass-start stamp.
+    pub(crate) fn take_detection_clock_failed(&mut self) -> bool {
+        std::mem::take(&mut self.detection_clock_failed)
     }
 
     /// The caller budget this adapter enforces at admission. The
@@ -333,7 +802,26 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// binder queries a task cookie through (Task 6 C4).
     pub(crate) fn live_pin(&self, pid: u32) -> Option<(&CallerRecord, &Source::Pin)> {
         let tracked = self.callers.get(self.live_by_pid.get(&pid)?)?;
-        Some((&tracked.record, tracked.pin.as_ref()?))
+        Some((&tracked.record, &**tracked.pin.as_ref()?))
+    }
+
+    pub(crate) fn share_caller_pin(
+        &self,
+        caller: CallerId,
+    ) -> Option<SharedCallerPin<Source::Pin>> {
+        Some(self.callers.get(&caller)?.pin.as_ref()?.share())
+    }
+
+    pub(crate) fn mark_leader_exit_pending(&mut self, caller: CallerId, pending: bool) {
+        if let Some(tracked) = self.callers.get_mut(&caller) {
+            tracked.leader_exit_pending = pending;
+        }
+    }
+
+    pub(crate) fn leader_exit_pending(&self, caller: CallerId) -> bool {
+        self.callers
+            .get(&caller)
+            .is_some_and(|tracked| tracked.leader_exit_pending)
     }
 
     fn mint(&mut self) -> Result<CallerId> {
@@ -366,25 +854,44 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 self.callers.len() + 1,
             );
         }
-        let pin = self
+        let mut pin = self
             .source
             .open(pid)
             .map_err(|error| anyhow!("cannot pin caller pid {pid}: {error}"))?;
         // A zombie pins successfully (its pidfd and `/proc` entries
         // survive until the parent reaps it), but admitting one mints a
         // caller for a dead generation that retires on the next pass —
-        // one spurious incarnation per pass. Refuse up front instead.
+        // one spurious incarnation per pass. Refuse up front instead,
+        // unless it is an already-zombie leader with exactly one live
+        // survivor, which cold-admits below with the survivor-served
+        // image (the opened pin stays authoritative throughout).
+        let mut cold_exe = None;
         if self.source.gone(pid) {
-            bail!("cannot pin caller pid {pid}: no live process with that pid (it exited)");
+            let original = Arc::new(pin);
+            match self.source.cold_zombie_exe(&original) {
+                Ok(Some(exe)) => {
+                    cold_exe = Some(exe);
+                    pin = Arc::try_unwrap(original).map_err(|_| {
+                        anyhow!("cannot pin caller pid {pid}: cold admission retained its original")
+                    })?;
+                }
+                Ok(None) => {
+                    bail!("cannot pin caller pid {pid}: no live process with that pid (it exited)")
+                }
+                Err(named) => bail!("cannot admit caller pid {pid}: {named}"),
+            }
         }
         let start_time = self.source.start_time(pid);
-        let exe = self.source.exe_identity(pid);
+        let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
+        let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
+            .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;
         let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
         self.incarnations.insert(pid, incarnation.saturating_add(1));
         self.callers.insert(
             id,
             TrackedCaller {
+                leader_exit_pending: false,
                 record: CallerRecord {
                     id,
                     pid,
@@ -396,6 +903,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
                     first_seen_ns: now_ns,
+                    admitted_ns: now_ns,
                     last_seen_ns: now_ns,
                     retired: false,
                 },
@@ -406,13 +914,385 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         Ok(id)
     }
 
+    pub(crate) fn prepare_scoped_caller(
+        &mut self,
+        preparation: &crate::inspect_system::inventory_cgroup::CgroupPreparation<'_>,
+    ) -> Result<PreparedScopedCaller<Source::Pin>, AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        if !preparation.check() {
+            return Err(failed(
+                "original cgroup transaction custody could not be revalidated",
+            ));
+        }
+        let pid = preparation.pid();
+        let existing = self.live_id(pid);
+        let pin = if let Some(id) = existing {
+            self.callers
+                .get(&id)
+                .and_then(|tracked| tracked.pin.as_ref())
+                .ok_or_else(|| failed("retained cgroup caller custody unavailable"))?
+                .share()
+        } else {
+            let pin = self
+                .source
+                .open(pid)
+                .map_err(|_| failed("cgroup caller source pin unavailable"))?;
+            SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
+                .map_err(AdmitFailure::custody_storage)?
+        };
+        let generation = crate::inspect_system::MemberGeneration {
+            start_time: self.source.start_time(pid),
+            exe: self.source.exe_identity(pid),
+        };
+        if self.source.gone(pid)
+            || !self.source.still_the_same(&pin)
+            || generation != *preparation.generation()
+        {
+            return Err(failed(
+                "cgroup caller source generation or image changed before final sampling",
+            ));
+        }
+        if let Some(id) = existing {
+            let record = self.record(id).expect("live caller retains its record");
+            if record.start_time != generation.start_time || record.exe != generation.exe {
+                return Err(failed(
+                    "retained caller is a different image from the scoped transaction",
+                ));
+            }
+        }
+        Ok(PreparedScopedCaller {
+            pid,
+            pin,
+            generation,
+            existing,
+        })
+    }
+
+    /// Commit one prepared scoped caller under its exact member permit.
+    /// `now_ns` is the pass clock for scan-window stamps; `detected`
+    /// samples the actual admission detection time per incarnation,
+    /// after the permit/custody validation below — the boundary stale
+    /// native records order against. On clock-read failure the stamp
+    /// is zero (the guard never filters) and the failure flag is set
+    /// for the coordinator's explicit gap fallback, never a silent
+    /// pass-start stamp.
+    pub(crate) fn commit_scoped_caller(
+        &mut self,
+        prepared: PreparedScopedCaller<Source::Pin>,
+        permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<(CallerId, bool), AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        if prepared.pid != permit.pid()
+            || prepared.generation != *permit.generation()
+            || !permit.check()
+            || !self.source.still_the_same(&prepared.pin)
+            || !permit.finish_check()
+            || self.live_id(prepared.pid) != prepared.existing
+        {
+            return Err(failed(
+                "cgroup transaction was interrupted or changed at admission commit",
+            ));
+        }
+        if let Some(id) = prepared.existing {
+            let record = self
+                .record(id)
+                .ok_or_else(|| failed("retained cgroup caller disappeared"))?;
+            if record.retired
+                || record.start_time != prepared.generation.start_time
+                || record.exe != prepared.generation.exe
+            {
+                return Err(failed(
+                    "retained cgroup caller changed before admission commit",
+                ));
+            }
+            self.callers.get_mut(&id).unwrap().record.last_seen_ns = now_ns;
+            return Ok((id, false));
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let budget = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len().saturating_add(1),
+            };
+            return Err(AdmitFailure {
+                reason: "cgroup caller admission refused on the retained caller budget".into(),
+                budget: Some(budget),
+            });
+        }
+        // Per-incarnation detection (F7a): after the validation above.
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
+        let id = self
+            .mint()
+            .map_err(|_| failed("caller ID space exhausted"))?;
+        let incarnation = self.incarnations.get(&prepared.pid).copied().unwrap_or(0);
+        self.incarnations
+            .insert(prepared.pid, incarnation.saturating_add(1));
+        self.callers.insert(
+            id,
+            TrackedCaller {
+                leader_exit_pending: false,
+                record: CallerRecord {
+                    id,
+                    pid: prepared.pid,
+                    start_time: prepared.generation.start_time,
+                    exe: prepared.generation.exe,
+                    incarnation,
+                    exec_observed: true,
+                    authority: ImageAuthority::ScanPinned,
+                    lifecycle: CallerLifecycle::Mapped,
+                    lifecycle_reason: None,
+                    first_seen_ns: now_ns,
+                    admitted_ns,
+                    last_seen_ns: now_ns,
+                    retired: false,
+                },
+                pin: Some(prepared.pin),
+            },
+        );
+        self.live_by_pid.insert(prepared.pid, id);
+        Ok((id, true))
+    }
+
+    /// Commit one held exec handoff under its exact member permit (H6
+    /// slice 2): the moved original pin proves the same process, and the
+    /// borrowed permit proves current scope membership. The verified
+    /// pre-sample generation arrives with the call, so commit performs
+    /// no post-sample generation recapture; permit.check() custody
+    /// liveness reread excepted (refuses on mismatch, supplies no
+    /// replacement identity). Checks mirror
+    /// `commit_scoped_caller` — pid/generation match, permit check,
+    /// custody, finish — with no fallible tail after them. A live
+    /// candidate for this pid joins only when it already holds the
+    /// current incarnation; pid equality alone never adopts it.
+    /// Returns the successor and whether it was freshly minted.
+    /// `now_ns` is the pass clock for scan-window stamps; `detected`
+    /// samples the actual admission detection time per incarnation,
+    /// after the validation below. On clock-read failure the stamp is
+    /// zero with the failure flag set, never a silent pass-start stamp.
+    pub(crate) fn commit_handoff_caller(
+        &mut self,
+        pid: u32,
+        pin: SharedCallerPin<Source::Pin>,
+        permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+        generation: crate::inspect_system::MemberGeneration,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<(CallerId, bool), AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        if pid != permit.pid()
+            || generation != *permit.generation()
+            || !permit.check()
+            || !self.source.still_the_same(&pin)
+            || !permit.finish_check()
+        {
+            return Err(failed(
+                "cgroup transaction was interrupted or changed at handoff commit",
+            ));
+        }
+        if let Some(id) = self.live_by_pid.get(&pid).copied() {
+            let record = self
+                .record(id)
+                .ok_or_else(|| failed("retained cgroup caller disappeared"))?;
+            if record.retired
+                || record.start_time != generation.start_time
+                || record.exe != generation.exe
+            {
+                return Err(failed(
+                    "the pid's live caller is not this handoff's current incarnation; \
+                     pid equality alone never adopts it",
+                ));
+            }
+            self.callers.get_mut(&id).unwrap().record.last_seen_ns = now_ns;
+            return Ok((id, false));
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let budget = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len().saturating_add(1),
+            };
+            return Err(AdmitFailure {
+                reason: "cgroup successor admission refused on the retained caller budget".into(),
+                budget: Some(budget),
+            });
+        }
+        // Per-incarnation detection (F7a): after the validation above.
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
+        let id = self
+            .mint()
+            .map_err(|_| failed("caller ID space exhausted"))?;
+        let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
+        self.incarnations.insert(pid, incarnation.saturating_add(1));
+        self.callers.insert(
+            id,
+            TrackedCaller {
+                leader_exit_pending: false,
+                record: CallerRecord {
+                    id,
+                    pid,
+                    start_time: generation.start_time,
+                    incarnation,
+                    exec_observed: generation.exe.is_some(),
+                    exe: generation.exe,
+                    authority: ImageAuthority::ScanPinned,
+                    lifecycle: CallerLifecycle::Mapped,
+                    lifecycle_reason: None,
+                    first_seen_ns: now_ns,
+                    admitted_ns,
+                    last_seen_ns: now_ns,
+                    retired: false,
+                },
+                pin: Some(pin),
+            },
+        );
+        self.live_by_pid.insert(pid, id);
+        Ok((id, true))
+    }
+
+    /// Install native-exact authority on an admitted caller after its
+    /// staged owner proved under the permit-backed proof. The caller
+    /// must be live, unretired, still scan-pinned, and name the
+    /// proof's pid and generation, with its held pin still the same;
+    /// anything else refuses without touching the record.
+    pub(crate) fn install_scoped_native_authority(
+        &mut self,
+        caller: CallerId,
+        image: BoundImage,
+        proof: &ScopedOwnerProof<'_>,
+    ) -> Result<(), AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        let record = self
+            .record(caller)
+            .ok_or_else(|| failed("scoped native activation names no retained caller"))?;
+        if record.retired
+            || record.authority != ImageAuthority::ScanPinned
+            || record.pid != proof.pid()
+            || self.live_id(record.pid) != Some(caller)
+        {
+            return Err(failed(
+                "retained cgroup caller changed before native authority installation",
+            ));
+        }
+        if record.start_time != proof.generation().start_time
+            || record.exe != proof.generation().exe
+        {
+            return Err(failed(
+                "retained caller is a different generation from the scoped proof",
+            ));
+        }
+        let live = self
+            .callers
+            .get(&caller)
+            .and_then(|tracked| tracked.pin.as_ref())
+            .is_some_and(|pin| self.source.still_the_same(pin));
+        if !live {
+            return Err(failed(
+                "retained caller custody lapsed before native authority installation",
+            ));
+        }
+        self.callers
+            .get_mut(&caller)
+            .expect("validated retained caller")
+            .record
+            .authority = ImageAuthority::NativeExact { image };
+        Ok(())
+    }
+
+    /// Restore scan-pinned authority after a failed activation commit
+    /// that had already installed `image`. Only the exact installed
+    /// image flips back; anything else is left untouched and reported.
+    /// Caller IDs are never reused, so the flip cannot land on a
+    /// newer incarnation.
+    pub(crate) fn cancel_scoped_native_authority(
+        &mut self,
+        caller: CallerId,
+        image: BoundImage,
+    ) -> Result<(), String> {
+        let tracked = self.callers.get_mut(&caller).ok_or_else(|| {
+            format!(
+                "scoped native activation rollback names no retained caller {}",
+                caller.label()
+            )
+        })?;
+        if tracked.record.authority == (ImageAuthority::NativeExact { image }) {
+            tracked.record.authority = ImageAuthority::ScanPinned;
+            Ok(())
+        } else {
+            Err(format!(
+                "scoped native activation rollback missed its installed image for {}",
+                caller.label()
+            ))
+        }
+    }
+
+    /// Retire a live caller whose installed native-exact authority
+    /// survived a failed activation rollback with no activated owner:
+    /// the record keeps its evidence and authority, leaves the live
+    /// map, and drops its pin, so no live `NativeExact` caller lacks
+    /// its owner. Returns false — changing nothing — when the caller
+    /// is unknown, already retired, not live, or no longer
+    /// native-exact (an already rolled-back caller is healthy and
+    /// stays). Caller IDs are never reused, so the retirement cannot
+    /// land on a newer incarnation.
+    pub(crate) fn retire_native_caller_without_owner(
+        &mut self,
+        caller: CallerId,
+        reason: String,
+        now_ns: u64,
+    ) -> bool {
+        let stranded = self.callers.get(&caller).is_some_and(|tracked| {
+            !tracked.record.retired
+                && matches!(tracked.record.authority, ImageAuthority::NativeExact { .. })
+                && self.live_by_pid.get(&tracked.record.pid) == Some(&caller)
+        });
+        if !stranded {
+            return false;
+        }
+        self.retire(caller, CallerLifecycle::Unknown, reason, now_ns);
+        true
+    }
+
     /// Reconcile's admission: the budget refusal carries its
     /// resource/limit/requested structurally; pin failures stay bare.
+    /// `detected` samples the admission detection time per incarnation,
+    /// after the pin/liveness/generation validation inside `admit` —
+    /// never a sweep-start sample shared across admissions. On
+    /// clock-read failure the stamp is zero with the failure flag set,
+    /// never a silent pass-start stamp.
     fn try_admit(
         &mut self,
         pid: u32,
         authority: ImageAuthority,
         now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<CallerId, AdmitFailure> {
         if self.live_by_pid.contains_key(&pid) {
             return Err(AdmitFailure {
@@ -438,11 +1318,25 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: Some(refusal),
             });
         }
-        self.admit(pid, authority, now_ns)
+        let id = self
+            .admit(pid, authority, now_ns)
             .map_err(|error| AdmitFailure {
                 reason: format!("{error:#}"),
                 budget: None,
-            })
+            })?;
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
+        self.callers
+            .get_mut(&id)
+            .expect("the admitted caller retains its record")
+            .record
+            .admitted_ns = admitted_ns;
+        Ok(id)
     }
 
     fn retire(&mut self, id: CallerId, lifecycle: CallerLifecycle, reason: String, now_ns: u64) {
@@ -463,11 +1357,33 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// `id`'s image ended while its pin held. It retires exec-retired with
     /// its evidence and the pid is admitted again as its successor. A
     /// retired or unknown `id` changes nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // Reached only by tests today.
     pub(crate) fn exec_transition(
         &mut self,
         id: CallerId,
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
+    ) -> Vec<CallerEvent> {
+        self.exec_transition_inner(id, authority_for, now_ns, SuccessorAdmission::Unrestricted)
+    }
+
+    /// A scope-independent EXEC proof retires the old image. Membership of
+    /// its successor is a separate transaction, never inherited from its PID.
+    pub(crate) fn exec_transition_scoped(&mut self, id: CallerId, now_ns: u64) -> Vec<CallerEvent> {
+        self.exec_transition_inner(
+            id,
+            &mut |_| ImageAuthority::ScanPinned,
+            now_ns,
+            SuccessorAdmission::ScopedDenied,
+        )
+    }
+
+    fn exec_transition_inner(
+        &mut self,
+        id: CallerId,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+        admission: SuccessorAdmission,
     ) -> Vec<CallerEvent> {
         let Some(pid) = self
             .callers
@@ -477,15 +1393,38 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         else {
             return Vec::new();
         };
-        self.retire(
-            id,
-            CallerLifecycle::ExecRetired,
-            "a later image of the same task was witnessed natively (its exec sequence advanced \
-             under its task cookie, or its leader task changed under the held pidfd)"
-                .into(),
-            now_ns,
-        );
-        vec![match self.try_admit(pid, authority_for(pid), now_ns) {
+        if matches!(admission, SuccessorAdmission::ScopedDenied) {
+            self.retire(
+                id,
+                CallerLifecycle::ExecRetired,
+                NATIVE_EXEC_REASON.into(),
+                now_ns,
+            );
+            return vec![self.retired_event(id)];
+        }
+        // H6 slice 2: the original held pin moves to the successor first,
+        // then the old incarnation retires. The successor is never reopened
+        // by scalar PID. This rides the same two primitives as the
+        // coordinator's pending handoff.
+        let authority = authority_for(pid);
+        let handoff = self.retire_for_exec_handoff(id, now_ns);
+        let commit = match handoff {
+            Some((pid, pin)) => self.admit_retained_successor(
+                pid,
+                pin,
+                authority,
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            ),
+            None => self.commit_retained_successor(
+                pid,
+                None,
+                authority,
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            ),
+        };
+        vec![match commit {
             Ok(new) => CallerEvent::ExecRetired { old: id, new },
             Err(failure) => CallerEvent::AdmitFailed {
                 pid,
@@ -495,25 +1434,271 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }]
     }
 
+    /// Retire `id` for a coordinator exec handoff (H6 slice 2): the
+    /// original held pin moves to the caller first, then the old
+    /// incarnation retires exec-retired. `None` unless `id` is live with
+    /// its pin. The coordinator mints the pending successor from this
+    /// custody; the pin is never dropped here and never reopened by PID.
+    pub(crate) fn retire_for_exec_handoff(
+        &mut self,
+        id: CallerId,
+        now_ns: u64,
+    ) -> Option<(u32, SharedCallerPin<Source::Pin>)> {
+        let pid = self
+            .callers
+            .get(&id)
+            .filter(|tracked| !tracked.record.retired)
+            .map(|tracked| tracked.record.pid)?;
+        let pin = self.callers.get_mut(&id)?.pin.take()?;
+        self.retire(
+            id,
+            CallerLifecycle::ExecRetired,
+            NATIVE_EXEC_REASON.into(),
+            now_ns,
+        );
+        Some((pid, pin))
+    }
+
+    /// Admit one exec successor on retained custody (H6 slice 2): the moved
+    /// original pin proves the same process. A dead pin, a live pid
+    /// collision, a full caller budget, or a zombie refuses; nothing here
+    /// reopens the successor by scalar PID. `detected` samples the
+    /// admission detection time per incarnation, after validation
+    /// (F7a): the supplied `now_ns` may be a stale pass-start stamp and
+    /// must never stand in for detection.
+    pub(crate) fn admit_retained_successor(
+        &mut self,
+        pid: u32,
+        pin: SharedCallerPin<Source::Pin>,
+        authority: ImageAuthority,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<CallerId, AdmitFailure> {
+        self.commit_retained_successor(pid, Some(pin), authority, now_ns, detected)
+    }
+
+    /// The one retained-custody commit behind every exec handoff: the native
+    /// transition path, the scan-proven path, and the coordinator's pending
+    /// successor commit share these checks, in this order. `detected`
+    /// samples the admission detection time per incarnation, after the
+    /// custody/liveness validation above; on clock-read failure the
+    /// stamp is zero with the failure flag set.
+    fn commit_retained_successor(
+        &mut self,
+        pid: u32,
+        pin: Option<SharedCallerPin<Source::Pin>>,
+        authority: ImageAuthority,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<CallerId, AdmitFailure> {
+        let Some(pin) = pin else {
+            return Err(AdmitFailure {
+                reason: "no retained process custody for the exec successor \
+                     (the successor is never reopened by scalar PID)"
+                    .into(),
+                budget: None,
+            });
+        };
+        if !self.source.still_the_same(&pin) {
+            return Err(AdmitFailure {
+                reason: "original process custody lost: the process exited or the pid was reused"
+                    .into(),
+                budget: None,
+            });
+        }
+        if self.live_by_pid.contains_key(&pid) {
+            return Err(AdmitFailure {
+                reason: format!(
+                    "pid {pid} already has live caller {}",
+                    self.live_by_pid[&pid].label()
+                ),
+                budget: None,
+            });
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let refusal = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len() + 1,
+            };
+            return Err(AdmitFailure {
+                reason: format!(
+                    "caller budget exhausted: the registry retains at most {} callers (requested caller {}); the admission was refused",
+                    refusal.limit, refusal.requested,
+                ),
+                budget: Some(refusal),
+            });
+        }
+        // A zombie pins successfully but admits nothing: same refusal as a
+        // fresh open, so a dead-but-unreaped target never mints a spurious
+        // successor incarnation.
+        if self.source.gone(pid) {
+            return Err(AdmitFailure {
+                reason: format!(
+                    "cannot pin caller pid {pid}: no live process with that pid (it exited)"
+                ),
+                budget: None,
+            });
+        }
+        let start_time = self.source.start_time(pid);
+        let exe = self.source.exe_identity(pid);
+        // Per-incarnation detection (F7a): after the validation above.
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
+        let id = self.mint().map_err(|error| AdmitFailure {
+            reason: format!("{error:#}"),
+            budget: None,
+        })?;
+        let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
+        self.incarnations.insert(pid, incarnation.saturating_add(1));
+        self.callers.insert(
+            id,
+            TrackedCaller {
+                leader_exit_pending: false,
+                record: CallerRecord {
+                    id,
+                    pid,
+                    start_time,
+                    incarnation,
+                    exec_observed: exe.is_some(),
+                    exe,
+                    authority,
+                    lifecycle: CallerLifecycle::Mapped,
+                    lifecycle_reason: None,
+                    first_seen_ns: now_ns,
+                    admitted_ns,
+                    last_seen_ns: now_ns,
+                    retired: false,
+                },
+                pin: Some(pin),
+            },
+        );
+        self.live_by_pid.insert(pid, id);
+        Ok(id)
+    }
+
     /// Reconcile tracked callers against one scan pass's observed pids:
     /// detect exit, exec (leader and nonleader — both change the exe
     /// identity while the pin holds), and PID reuse; admit newly observed
     /// pids. Every transition is an event; failures to admit are events,
     /// never silent. `authority_for` resolves the image authority per pid,
     /// so one pass can mix native-exact and scan-pinned incarnations.
+    #[cfg_attr(not(test), allow(dead_code))] // Reached only by tests today.
     pub(crate) fn reconcile(
         &mut self,
         observed: &BTreeSet<u32>,
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
     ) -> Vec<CallerEvent> {
+        self.reconcile_detected(observed, authority_for, now_ns, &mut || Some(now_ns))
+    }
+
+    /// Reconcile with a per-incarnation admission detection clock:
+    /// `now_ns` is the pass clock for scan-window stamps
+    /// (`first_seen_ns` and retirement/last-seen), while `detected` is
+    /// sampled once per admitted incarnation, after its
+    /// generation/liveness/executable/reuse validation — the boundary
+    /// stale native records order against (`admitted_ns`). The
+    /// production scan path passes the monotonic clock; callers that
+    /// admit at the pass clock use [`Self::reconcile`]. On clock-read
+    /// failure the incarnation stamps zero with the failure flag set,
+    /// never a silent pass-start stamp.
+    pub(crate) fn reconcile_detected(
+        &mut self,
+        observed: &BTreeSet<u32>,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Vec<CallerEvent> {
+        self.reconcile_inner(
+            observed,
+            authority_for,
+            now_ns,
+            detected,
+            SuccessorAdmission::Unrestricted,
+            &mut || true,
+        )
+    }
+
+    /// Retire independently proven old generations without authorizing any
+    /// successor. The explicit work callback bounds these lifecycle checks.
+    pub(crate) fn reconcile_scoped(
+        &mut self,
+        now_ns: u64,
+        work: &mut dyn FnMut() -> bool,
+    ) -> Vec<CallerEvent> {
+        self.reconcile_inner(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            now_ns,
+            &mut || Some(now_ns),
+            SuccessorAdmission::ScopedDenied,
+            work,
+        )
+    }
+
+    /// The retirement event for an already-retired caller (H6 slice 2): the
+    /// coordinator mints its pending handoff from the retired record and
+    /// reports the retirement now while the successor commits later.
+    pub(crate) fn retired_event(&self, id: CallerId) -> CallerEvent {
+        CallerEvent::Retired {
+            id,
+            reason: self
+                .record(id)
+                .and_then(|record| record.lifecycle_reason.clone())
+                .unwrap_or_else(|| "caller retired".into()),
+        }
+    }
+
+    fn reconcile_inner(
+        &mut self,
+        observed: &BTreeSet<u32>,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+        admission: SuccessorAdmission,
+        work: &mut dyn FnMut() -> bool,
+    ) -> Vec<CallerEvent> {
         let mut events = Vec::new();
-        let live: Vec<(u32, CallerId)> = self
-            .live_by_pid
-            .iter()
-            .map(|(pid, id)| (*pid, *id))
-            .collect();
+        let live: Vec<(u32, CallerId)> = match admission {
+            SuccessorAdmission::Unrestricted => self
+                .live_by_pid
+                .iter()
+                .map(|(pid, id)| (*pid, *id))
+                .collect(),
+            SuccessorAdmission::ScopedDenied => {
+                // Bounded lifecycle work leaves room for fresh final sampling.
+                // Its cursor has no membership authority; it only schedules
+                // later retained callers fairly across partial collections.
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+                let start = self.scoped_retire_cursor.map_or(Unbounded, Excluded);
+                let end = self.scoped_retire_cursor.map_or(Unbounded, Included);
+                self.live_by_pid
+                    .range((start, Unbounded))
+                    .chain(
+                        self.live_by_pid
+                            .range((Unbounded, end))
+                            .filter(|_| self.scoped_retire_cursor.is_some()),
+                    )
+                    .take(128)
+                    .map(|(pid, id)| (*pid, *id))
+                    .take_while(|_| work())
+                    .collect()
+            }
+        };
         for (pid, id) in live {
+            if !work() {
+                break;
+            }
+            if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                self.scoped_retire_cursor = Some(pid);
+            }
             let same = self
                 .callers
                 .get(&id)
@@ -533,13 +1718,33 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     // Same generation, new image: an exec (leader or
                     // nonleader). Retire the old incarnation with its
                     // evidence, admit the new one.
+                    if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                        self.retire(
+                            id,
+                            CallerLifecycle::ExecRetired,
+                            "executable image changed while the generation pin held (exec)".into(),
+                            now_ns,
+                        );
+                        events.push(self.retired_event(id));
+                        continue;
+                    }
+                    // H6 slice 2: the original held pin moves to the
+                    // successor first, then the old incarnation retires.
+                    // The successor is never reopened by scalar PID.
+                    let authority = authority_for(pid);
+                    let pin = self
+                        .callers
+                        .get_mut(&id)
+                        .and_then(|tracked| tracked.pin.take());
                     self.retire(
                         id,
                         CallerLifecycle::ExecRetired,
                         "executable image changed while the generation pin held (exec)".into(),
                         now_ns,
                     );
-                    match self.try_admit(pid, authority_for(pid), now_ns) {
+                    let commit =
+                        self.commit_retained_successor(pid, pin, authority, now_ns, detected);
+                    match commit {
                         Ok(new) => events.push(CallerEvent::ExecRetired { old: id, new }),
                         Err(failure) => events.push(CallerEvent::AdmitFailed {
                             pid,
@@ -595,7 +1800,11 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     ),
                 };
                 self.retire(id, lifecycle, reason, now_ns);
-                match self.try_admit(pid, authority_for(pid), now_ns) {
+                if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                    events.push(self.retired_event(id));
+                    continue;
+                }
+                match self.try_admit(pid, authority_for(pid), now_ns, detected) {
                     Ok(new) => events.push(CallerEvent::Reused { old: id, new }),
                     Err(failure) => events.push(CallerEvent::AdmitFailed {
                         pid,
@@ -611,7 +1820,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             if self.live_by_pid.contains_key(&pid) {
                 continue;
             }
-            match self.try_admit(pid, authority_for(pid), now_ns) {
+            match self.try_admit(pid, authority_for(pid), now_ns, detected) {
                 Ok(id) => events.push(CallerEvent::Admitted { id }),
                 Err(failure) => events.push(CallerEvent::AdmitFailed {
                     pid,
@@ -849,6 +2058,8 @@ pub(crate) enum UnknownReason {
     /// The caller's identity cannot be bound to native evidence.
     #[allow(dead_code)] // Task 6 C4 binder stages it.
     IdentityUnavailable,
+    /// A retained cgroup filter does not prove continuous caller residency.
+    ScopeMembershipUnproven,
     /// A capture capacity (named resource) ran out.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C4 stage it.
     CapacityLimited(&'static str),
@@ -883,6 +2094,7 @@ impl UnknownReason {
             Self::NotAttached => "not_attached",
             Self::AttachFailed => "attach_failed",
             Self::IdentityUnavailable => "identity_unavailable",
+            Self::ScopeMembershipUnproven => "scope_membership_unproven",
             Self::CapacityLimited(_) => "capacity_limited",
             Self::Loss(_) => "loss",
             Self::RetiredBeforeCoverage => "retired_before_coverage",
@@ -911,6 +2123,7 @@ impl UnknownReason {
             Self::NotAttached => "not attached".into(),
             Self::AttachFailed => "attach failed".into(),
             Self::IdentityUnavailable => "caller identity unavailable".into(),
+            Self::ScopeMembershipUnproven => "continuous cgroup membership unproven".into(),
             Self::CapacityLimited(resource) => format!("capacity limited: {resource}"),
             Self::Loss(reason) => format!("loss: {reason}"),
             Self::RetiredBeforeCoverage => "retired before coverage".into(),
@@ -1147,6 +2360,17 @@ pub(crate) struct PendingCountDecision {
     pub outcome: PendingCountOutcome,
 }
 
+/// A copy of one direct count mutation and its resulting published edge total.
+/// This carries no pair identity or implication about native ownership.
+#[derive(Clone, Copy)]
+pub(crate) struct CountPublication {
+    pub caller: CallerId,
+    pub module: Option<ModuleId>,
+    pub staged: u64,
+    pub base: u64,
+    pub edge_total: Option<u64>,
+}
+
 /// A pending count's publication-time outcome (P3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingCountOutcome {
@@ -1373,8 +2597,13 @@ pub(crate) enum EntryOutcome {
     UnknownEdge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // H7 slice D: the semantic observation carries the 240 B validated object tail inline to its drop point; mutations stay allocation-free.
 enum Mutation {
+    NoteInstance(AdmittedInstance),
+    ObserveInstanceSemantic(AdmittedInstanceCall),
+    InstanceSemanticLoss(InstanceSemanticLoss),
+    RetireInstance(InstanceRetirement),
     NoteMapping {
         caller: CallerId,
         pid: u32,
@@ -1406,6 +2635,12 @@ enum Mutation {
     NoteRefreshLoss {
         reason: String,
     },
+    /// The capture scope went unproven (lifecycle evidence or scope
+    /// custody lost): bound-pair growth stages nothing more (pending
+    /// first-sight installs still land, now `lossy`), so every counted
+    /// column is a lower bound. The lifecycle/custody gap discloses
+    /// the cause; this carries no second gap.
+    NoteCountedLoss,
     NoteWitness {
         caller: CallerId,
         module: ModuleKey,
@@ -1526,11 +2761,130 @@ enum Mutation {
     },
 }
 
-/// The caller/module registry. Mutations stage in batch order and apply
-/// only at `publish`, so readers (including the JSON renderer) observe
-/// one consistent snapshot per batch and the ordering test can pin that
-/// facts publish synchronously with the batch return.
+/// A publication is applied but its original frame has not finished. This
+/// refusal carries no evidence and permits neither replay nor acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JointPublicationPending;
+
+/// Diagnostic settlement-latency histogram buckets: 1 ms linear
+/// buckets over [0, 10 s), plus overflow. The 1 ms resolution is the
+/// measurement's stated resolution against the 250 ms budget.
+pub(crate) const SETTLEMENT_LATENCY_BUCKETS: usize = 10_000;
+/// Bucket width in nanoseconds.
+const SETTLEMENT_LATENCY_BUCKET_NS: u64 = 1_000_000;
+
+/// Diagnostic per-call settlement delay: ENTRY timestamp (the
+/// record's `ts_ns` on the ktime/CLOCK_MONOTONIC basis) to registry
+/// application, histogrammed in 1 ms buckets. ENTRY precedes END by
+/// the call's own duration (microseconds for the throughput
+/// providers), so ENTRY-based delays overstate END-based settlement
+/// by that negligible amount; plumbing END would cost a field on
+/// every admitted call for no verdict change at 250 ms. Counts
+/// only, never identities: the histogram cannot name a call.
+/// Allocated only while the diagnostic toggle enables it.
+pub(crate) struct SettlementLatencyHist {
+    buckets: Box<[u64; SETTLEMENT_LATENCY_BUCKETS]>,
+    overflow: u64,
+    unknown_ts: u64,
+    samples: u64,
+    max_ms: u64,
+}
+
+/// Cumulative settlement-latency summary for the stop line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SettlementLatencySummary {
+    pub samples: u64,
+    /// Smallest ms `m` with at least `ceil(q * samples)` samples at
+    /// or below `m`, treating overflow as +infinity; when the rank
+    /// falls in overflow the percentile is `max_ms` (a finite upper
+    /// bound) with `overflow > 0` disclosing it. `None` without samples.
+    pub p50_ms: Option<u64>,
+    pub p99_ms: Option<u64>,
+    pub max_ms: u64,
+    pub overflow: u64,
+    pub unknown_ts: u64,
+}
+
+impl SettlementLatencyHist {
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: Box::new([0; SETTLEMENT_LATENCY_BUCKETS]),
+            overflow: 0,
+            unknown_ts: 0,
+            samples: 0,
+            max_ms: 0,
+        }
+    }
+
+    /// Record one applied call's ENTRY-to-application delay. A zero
+    /// timestamp (scripted calls, or a failed clock read on either
+    /// side) carries no delay and counts unknown instead.
+    pub(crate) fn record(&mut self, ts_ns: u64, now_ns: u64) {
+        if ts_ns == 0 || now_ns == 0 {
+            self.unknown_ts = self.unknown_ts.saturating_add(1);
+            return;
+        }
+        let ms = now_ns.saturating_sub(ts_ns) / SETTLEMENT_LATENCY_BUCKET_NS;
+        if let Some(bucket) = self.buckets.get_mut(ms as usize) {
+            *bucket = bucket.saturating_add(1);
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.max_ms = self.max_ms.max(ms);
+    }
+
+    fn percentile(&self, numerator: u64, denominator: u64) -> Option<u64> {
+        if self.samples == 0 {
+            return None;
+        }
+        // 1-based rank: ceil(q * n), saturating (n > 0 here).
+        let rank = self
+            .samples
+            .saturating_mul(numerator)
+            .saturating_add(denominator - 1)
+            / denominator;
+        let rank = rank.max(1);
+        let mut cumulative = 0u64;
+        for (ms, count) in self.buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            if cumulative >= rank {
+                return Some(ms as u64);
+            }
+        }
+        // The rank falls in overflow: max_ms bounds it above, and
+        // the disclosed overflow count says the bound is loose.
+        Some(self.max_ms)
+    }
+
+    pub(crate) fn summary(&self) -> SettlementLatencySummary {
+        SettlementLatencySummary {
+            samples: self.samples,
+            p50_ms: self.percentile(1, 2),
+            p99_ms: self.percentile(99, 100),
+            max_ms: self.max_ms,
+            overflow: self.overflow,
+            unknown_ts: self.unknown_ts,
+        }
+    }
+}
+
+struct AppliedJointPublication {
+    identity: RawQuantumIdentity,
+    frontier: Option<ConsumptionOrdinal>,
+    base_revision: u64,
+    // Borrow labels only from the physical inputs actually prepared for this
+    // original. Semantic staging and later arrivals cannot widen the prefix.
+    physical_prefix_end: Option<usize>,
+    applied: Option<usize>,
+    targets_bound: bool,
+    _storage: crate::semantics_edge::resources::ResourceLease,
+}
+
+/// Staged physical and semantic inputs share one publication revision.
 pub(crate) struct CallerRegistry {
+    semantic_resources: crate::semantics_edge::resources::SemanticResourcePool,
+    instance_state: instance_input::InstanceState,
     limits: RegistryLimits,
     next_module: u32,
     callers: BTreeSet<CallerId>,
@@ -1552,6 +2906,9 @@ pub(crate) struct CallerRegistry {
     suppressed_hasher: std::hash::RandomState,
     gaps_suppressed: u64,
     staged: Vec<Mutation>,
+    /// One retained phase over the existing staging vector, never a second
+    /// queue. New staged inputs belong to the next publication.
+    joint_publication: Option<AppliedJointPublication>,
     /// Why an edge no producer covered reads unknown: `ScanOnly` until a
     /// native usage producer runs (Task 6 C5 sets `NotAttached`).
     uncovered_reason: UnknownReason,
@@ -1560,6 +2917,13 @@ pub(crate) struct CallerRegistry {
     last_health_regression_ns: Option<u64>,
     /// The producer stopped: every watch ended here and none starts.
     watches_ended_ns: Option<u64>,
+    /// The capture scope went unproven (lifecycle evidence or scope
+    /// custody lost): bound-pair growth stages nothing more (pending
+    /// first-sight installs still land, now `lossy`), so every counted
+    /// column is a lower bound — set by `NoteCountedLoss`, sticky for
+    /// the capture, and honored by every later counted install and
+    /// `Counted` note, including edges born after the loss.
+    counted_loss: bool,
     /// Coverage-note gaps already recorded, once per (caller, module,
     /// subject); bounded by the gap retention bound (past it the gap
     /// list is full and further gaps only count as suppressed).
@@ -1590,11 +2954,83 @@ pub(crate) struct CallerRegistry {
     /// Semantic keys refused: materializations past
     /// `max_semantic_states` plus per-edge keys past the S1 bounds.
     semantic_refused: u64,
+    /// Installed Joint feed receipts by instance key (guarded H9
+    /// path): consumed once at registration; empty in production
+    /// (no live grants), so every feed stays S1Only. Bounded by the
+    /// instance limit.
+    joint_grants: HashMap<instance_input::InstanceKey, instance_input::PendingJointGrant>,
+    joint_grant_allocation: instance_input::JointGrantTableAllocation,
+    // The map and copied-key wrappers drop before retained bucket storage.
+    joint_grant_storage: Option<crate::semantics_edge::resources::ResourceLease>,
+    /// Capture-wide key-use reducer (guarded H9 path): once Joint
+    /// accounting starts, S1Only siblings and later terminals keep
+    /// contributing facts for the rest of the capture.
+    joint_keyuse: crate::semantics_key_use::KeyUseReducer,
+    /// Prospective-association fallback ledger (N1c): ledger-less
+    /// publications charge their key-use opens here; ledger-bearing
+    /// publications use the supplied shared owner. Each association
+    /// returns its ticket to the owner which minted it.
+    assoc_fallback: crate::semantics_objects::journal::StagingLedger,
+    /// Current Joint-mode feeds; feeds may permanently fall back.
+    joint_feeds: usize,
+    /// Capture-lifetime accounting latch, set by a true Joint
+    /// registration. Independent of object publication authority:
+    /// ordered fallback can create opens before any seal arrives.
+    joint_accounting: bool,
+    /// Last H8 projection retained at seal/failure delivery: capture
+    /// commits from it; `None` names `bootstrap_unavailable`.
+    key_projection: Option<crate::semantics_objects::ObjectProjection>,
+    /// Joint calls reduced S1Only-direct for lack of H8 staging
+    /// (no ledger supplied, or the shared ledger refused): S1
+    /// preserved, Joint evidence absent for those calls.
+    joint_direct_fallback: u64,
+    /// Diagnostic settlement-latency histogram (`None` unless the
+    /// diagnostic toggle enables it): per-applied-call
+    /// ENTRY-to-application delay. Boxed and absent by default, so
+    /// the default registry pays one branch per applied call.
+    settlement_latency: Option<Box<SettlementLatencyHist>>,
 }
 
 impl CallerRegistry {
+    pub(crate) fn semantic_storage_reserver(&self) -> SemanticResourceReserver {
+        self.semantic_resources.reserver()
+    }
+
+    /// Provider copies and their retained containers share the reducers' one
+    /// capture-wide pool. The move-only lease follows the actual allocation.
+    pub(crate) fn reserve_semantic_storage(
+        &self,
+        bytes: usize,
+    ) -> Result<
+        crate::semantics_edge::resources::ResourceLease,
+        crate::semantics_edge::resources::SemanticResourceRefusal,
+    > {
+        self.semantic_resources.reserve(bytes)
+    }
+
+    pub(crate) fn semantic_resource_snapshot(
+        &self,
+    ) -> crate::semantics_edge::resources::SemanticResourceSnapshot {
+        self.semantic_resources.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_semantic_resource_limit(&mut self, limit: usize) {
+        assert_eq!(
+            self.semantic_occupied + self.instance_semantic_occupied(),
+            0
+        );
+        self.semantic_resources.reference_set_limit(limit);
+    }
+
     pub(crate) fn new(limits: RegistryLimits) -> Self {
+        let semantic_resources = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let assoc_fallback = crate::semantics_objects::journal::StagingLedger::with_resources(
+            semantic_resources.reserver(),
+        );
         Self {
+            semantic_resources,
+            instance_state: instance_input::InstanceState::default(),
             limits,
             next_module: 0,
             callers: BTreeSet::new(),
@@ -1609,9 +3045,11 @@ impl CallerRegistry {
             suppressed_hasher: std::hash::RandomState::new(),
             gaps_suppressed: 0,
             staged: Vec::new(),
+            joint_publication: None,
             uncovered_reason: UnknownReason::ScanOnly,
             last_health_regression_ns: None,
             watches_ended_ns: None,
+            counted_loss: false,
             coverage_gap_memo: BTreeSet::new(),
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
@@ -1627,7 +3065,38 @@ impl CallerRegistry {
             endpoints_refused: 0,
             semantic_occupied: 0,
             semantic_refused: 0,
+            joint_grants: HashMap::new(),
+            joint_grant_allocation: instance_input::JointGrantTableAllocation::for_entries(0)
+                .expect("empty grant table has no allocation"),
+            joint_grant_storage: None,
+            joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
+            assoc_fallback,
+            joint_feeds: 0,
+            joint_accounting: false,
+            key_projection: None,
+            joint_direct_fallback: 0,
+            settlement_latency: None,
         }
+    }
+
+    /// Enable or disable the diagnostic settlement-latency
+    /// histogram. Enabling allocates the buckets; disabling drops
+    /// them with their samples. Default off.
+    pub(crate) fn set_diagnostic_settlement_latency(&mut self, on: bool) {
+        if on {
+            if self.settlement_latency.is_none() {
+                self.settlement_latency = Some(Box::new(SettlementLatencyHist::new()));
+            }
+        } else {
+            self.settlement_latency = None;
+        }
+    }
+
+    /// The cumulative settlement-latency summary, when enabled.
+    pub(crate) fn settlement_latency_summary(&self) -> Option<SettlementLatencySummary> {
+        self.settlement_latency
+            .as_deref()
+            .map(SettlementLatencyHist::summary)
     }
 
     /// Why edges no producer covered read unknown. The scan lane leaves
@@ -1636,6 +3105,63 @@ impl CallerRegistry {
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 native lane.
     pub(crate) fn set_uncovered_reason(&mut self, reason: UnknownReason) {
         self.uncovered_reason = reason;
+    }
+
+    /// Tests-only reference wiring (N1): bind one module key to one
+    /// caller edge, retained exactly as a mapped admission would
+    /// leave it. Skips admission verdicts: the guarded-path tests
+    /// prove feed selection, not admission.
+    #[cfg(test)]
+    pub(crate) fn scripted_module_edge(&mut self, key: ModuleKey, caller: CallerId) -> ModuleId {
+        let module = self.modules_by_key.get(&key).copied().unwrap_or_else(|| {
+            let id = ModuleId(self.next_module);
+            self.next_module = self.next_module.saturating_add(1);
+            let mut paths = BTreeSet::new();
+            paths.insert("/scripted/driver.so".to_string());
+            self.modules.insert(
+                id,
+                ModuleRecord {
+                    id,
+                    key: key.clone(),
+                    paths,
+                    build_id: None,
+                    identity_source: None,
+                    admission: AdmissionState::Admitted,
+                    admission_class: None,
+                    admission_endpoints: None,
+                    admission_reasons: Vec::new(),
+                    admission_history: Vec::new(),
+                    lifecycle: ModuleLifecycle::Mapped,
+                    unloaded_observed: false,
+                    unbound_use: None,
+                },
+            );
+            self.modules_by_key.insert(key, id);
+            id
+        });
+        self.edges.insert(
+            (caller, module),
+            EdgeRecord {
+                caller,
+                module,
+                mapping: MappingState::Mapped,
+                mapping_reason: None,
+                mapping_evidence: MappingEvidence::DeepScan,
+                mapping_first_seen_ns: 0,
+                mapping_last_seen_ns: 0,
+                mapping_interruptions: 0,
+                entry_count: 0,
+                entry_saturated: false,
+                entry_first_seen_ns: None,
+                entry_last_seen_ns: None,
+                entry_in_flight: false,
+                entry_rose_since_previous_pass: false,
+                semantics: None,
+                double_loaded: false,
+                coverage: EdgeCoverage::default(),
+            },
+        );
+        module
     }
 
     /// Derived summary only: true when at least one edge holds usage
@@ -2262,6 +3788,16 @@ impl CallerRegistry {
         self.staged.push(Mutation::NoteRefreshLoss { reason });
     }
 
+    /// Stage one capture-unproven boundary: lifecycle evidence or scope
+    /// custody was lost, so bound-pair growth stages nothing more
+    /// (pending first-sight installs still land, now `lossy`) and every
+    /// counted column is a lower bound (`lossy`). Observed counts
+    /// stand; the lifecycle/custody gap discloses the cause, so this
+    /// stages no second gap — never silent loss.
+    pub(crate) fn note_counted_loss(&mut self) {
+        self.staged.push(Mutation::NoteCountedLoss);
+    }
+
     /// Stage one caller retirement: the caller's edges end with the
     /// reason and its counts freeze. Evidence is retained.
     pub(crate) fn retire_caller(&mut self, caller: CallerId, reason: String, at_ns: u64) {
@@ -2301,6 +3837,33 @@ impl CallerRegistry {
         self.staged.push(Mutation::RecordGap { gap });
     }
 
+    /// Staged (subject, reason) gap pairs awaiting the next commit, in
+    /// stage order. For twins whose disclosure cannot commit yet (an
+    /// unfinished publication stands in front of it).
+    #[cfg(test)]
+    pub(crate) fn staged_scope_gaps_for_test(&self) -> Vec<(String, String)> {
+        self.staged
+            .iter()
+            .filter_map(|staged| match staged {
+                Mutation::RecordGap { gap } => Some((gap.subject.clone(), gap.reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Staged gaps awaiting the next commit, in stage order, with their
+    /// caller attribution: for twins that pin whom a disclosure names.
+    #[cfg(test)]
+    pub(crate) fn staged_gaps_for_test(&self) -> Vec<RegistryGap> {
+        self.staged
+            .iter()
+            .filter_map(|staged| match staged {
+                Mutation::RecordGap { gap } => Some(gap.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Stage one gap for the module `key` names, resolving the ID at
     /// publication (F3-04): `record_gap` resolves eagerly against the
     /// committed snapshot, which misses a first-discovered module whose
@@ -2329,8 +3892,253 @@ impl CallerRegistry {
     }
 
     /// Apply every staged mutation in order and publish the snapshot.
-    /// Returns the number of applied mutations.
+    /// Returns the number of applied mutations. Ledger-less: Joint
+    /// feeds reduce S1Only-direct and key-use opens charge the
+    /// fallback; tests use this for the no-ledger twin. Production
+    /// commits borrow the capture owner's ledger instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish(&mut self) -> usize {
+        self.publish_inner(None, None)
+    }
+
+    /// Publish with the shared H8 staging ledger (guarded H9 path):
+    /// Joint feeds stage against it; `None` (plain [`publish`]) keeps
+    /// every feed S1Only-direct. Production commits borrow the
+    /// capture owner's ledger here.
+    pub(crate) fn publish_with_ledger(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> usize {
+        self.publish_inner(None, Some(ledger))
+    }
+
+    /// Publish with a count observer plus the capture owner's ledger:
+    /// the diagnostics commit path. Joint feeds stage against the
+    /// owner's ledger exactly like [`publish_with_ledger`].
+    pub(crate) fn publish_with_count_observer(
+        &mut self,
+        observer: Option<&mut dyn FnMut(CountPublication)>,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> usize {
+        self.publish_inner(observer, Some(ledger))
+    }
+
+    pub(crate) fn publication_pending(&self) -> bool {
+        self.joint_publication.is_some()
+    }
+
+    /// Check the actual original before any preparation/apply. The stamp only
+    /// protects phase custody; H3/H9 still validate the original frame itself.
+    pub(crate) fn validate_joint_publication(
+        &self,
+        frame: &IngestedJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<()> {
+        frame
+            .validate_owner(owner, producers)
+            .map_err(|reason| anyhow!("Joint publication original refused: {reason:?}"))?;
+        if let Some(phase) = &self.joint_publication
+            && (phase.identity != frame.identity()
+                || phase
+                    .frontier
+                    .is_some_and(|frontier| frontier != frame.frontier())
+                || phase.base_revision != self.facts_revision)
+        {
+            bail!("Joint publication must resume its exact original frame and revision");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_joint_publication(
+        &mut self,
+        raw: &RawJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<()> {
+        raw.validate_preparation(owner.adapter(), producers)
+            .map_err(|reason| anyhow!("Joint preparation original refused: {reason:?}"))?;
+        if self.joint_publication.is_some() {
+            bail!("Joint publication is already retained");
+        }
+        let storage = self
+            .semantic_resources
+            .reserve(std::mem::size_of::<AppliedJointPublication>())
+            .map_err(|reason| anyhow!("Joint publication storage refused: {reason:?}"))?;
+        self.joint_publication = Some(AppliedJointPublication {
+            identity: raw.h0_identity(),
+            frontier: None,
+            base_revision: self.facts_revision,
+            physical_prefix_end: None,
+            applied: None,
+            targets_bound: false,
+            _storage: storage,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn validate_joint_preparation(&self, raw: &RawJointQuantum) -> Result<()> {
+        let phase = self
+            .joint_publication
+            .as_ref()
+            .ok_or_else(|| anyhow!("no original Joint preparation"))?;
+        if phase.identity != raw.h0_identity()
+            || phase.frontier.is_some()
+            || phase.applied.is_some()
+            || phase.base_revision != self.facts_revision
+        {
+            bail!("Joint preparation must retain its original raw allocation and base revision");
+        }
+        Ok(())
+    }
+
+    /// Freeze only the actual successful physical preparation. Retrying the
+    /// same original may validate this boundary, but never extends it.
+    pub(crate) fn freeze_joint_physical_prefix(&mut self, raw: &RawJointQuantum) -> Result<()> {
+        self.validate_joint_preparation(raw)?;
+        let phase = self
+            .joint_publication
+            .as_mut()
+            .ok_or_else(|| anyhow!("no original Joint preparation"))?;
+        if phase.targets_bound
+            || phase
+                .physical_prefix_end
+                .is_some_and(|end| end > self.staged.len())
+        {
+            bail!("Joint physical inputs no longer retain their original prefix");
+        }
+        phase.physical_prefix_end.get_or_insert(self.staged.len());
+        Ok(())
+    }
+
+    pub(crate) fn bind_joint_publication_frame(
+        &mut self,
+        frame: &IngestedJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<()> {
+        self.validate_joint_publication(frame, owner, producers)?;
+        let phase = self
+            .joint_publication
+            .as_mut()
+            .ok_or_else(|| anyhow!("Joint physical preparation has not run"))?;
+        if phase.frontier.is_none() {
+            phase.frontier = Some(frame.frontier());
+        }
+        Ok(())
+    }
+
+    /// Only an engine-tail failure before preparation/application can unwind
+    /// this new phase. An applied phase always retains its original frame.
+    pub(crate) fn cancel_unapplied_joint_publication(&mut self) {
+        assert!(
+            self.joint_publication
+                .as_ref()
+                .is_some_and(|phase| phase.applied.is_none())
+        );
+        self.joint_publication = None;
+    }
+
+    pub(crate) fn apply_joint_publication(
+        &mut self,
+        owner: &mut JointCaptureOwner,
+        frame: &IngestedJointQuantum,
+        producers: &crate::attach::SessionDrainProducers,
+        observer: Option<&mut dyn FnMut(CountPublication)>,
+    ) -> Result<usize> {
+        self.validate_joint_publication(frame, owner, producers)?;
+        if !self
+            .joint_publication
+            .as_ref()
+            .is_some_and(|phase| phase.frontier == Some(frame.frontier()))
+        {
+            bail!("Joint inputs require their original bound frame before apply");
+        }
+        assert!(
+            self.joint_publication
+                .as_ref()
+                .is_some_and(|phase| phase.applied.is_none())
+        );
+        let applied = self.apply_staged(observer, Some(owner.ledger_mut()));
+        self.joint_publication
+            .as_mut()
+            .expect("retained original phase")
+            .applied = Some(applied);
+        Ok(applied)
+    }
+
+    pub(crate) fn joint_publication_applied(&self) -> bool {
+        self.joint_publication
+            .as_ref()
+            .is_some_and(|phase| phase.applied.is_some())
+    }
+
+    pub(crate) fn joint_publication_targets_bound(&self) -> bool {
+        self.joint_publication
+            .as_ref()
+            .expect("retained phase")
+            .targets_bound
+    }
+
+    pub(crate) fn mark_joint_publication_targets_bound(&mut self) {
+        self.joint_publication
+            .as_mut()
+            .expect("retained phase")
+            .targets_bound = true;
+    }
+
+    /// Completion is supplied only by the actual frame finish, never callback
+    /// words, a progress enum, a cut scalar or a second H3 take.
+    pub(crate) fn finish_joint_publication(
+        &mut self,
+        owner: &mut JointCaptureOwner,
+        disposed: &DisposedJointQuantum,
+    ) -> Result<usize> {
+        let phase = self
+            .joint_publication
+            .as_ref()
+            .ok_or_else(|| anyhow!("no retained Joint publication"))?;
+        if phase.identity != disposed.identity()
+            || phase.frontier != Some(disposed.frontier())
+            || phase.base_revision != self.facts_revision
+            || !phase.targets_bound
+        {
+            bail!("Joint completion does not name the retained original publication");
+        }
+        let applied = phase
+            .applied
+            .ok_or_else(|| anyhow!("Joint inputs have not applied"))?;
+        self.complete_publication(Some(owner.ledger_mut()));
+        self.joint_publication = None;
+        Ok(applied)
+    }
+
+    fn publish_inner(
+        &mut self,
+        observer: Option<&mut dyn FnMut(CountPublication)>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        assert!(
+            !self.publication_pending(),
+            "an unfinished Joint publication retains its original frame"
+        );
+        let applied = self.apply_staged(observer, ledger.as_deref_mut());
+        self.complete_publication(ledger);
+        applied
+    }
+
+    fn apply_staged(
+        &mut self,
+        mut observer: Option<&mut dyn FnMut(CountPublication)>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        // Return eligible shared charges before staging new calls:
+        // an association ended without its ledger must not cause a
+        // false capacity refusal at the next ledger contact.
+        if let Some(ledger) = ledger.as_deref_mut() {
+            self.flush_joint_releases(ledger);
+        }
+        self.validate_joint_grants_staged();
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
         // Per-pass activity starts quiet: advances below set it.
@@ -2338,12 +4146,105 @@ impl CallerRegistry {
             edge.entry_rose_since_previous_pass = false;
         }
         self.demoted_place_growth.clear();
-        for mutation in staged {
-            self.apply(mutation);
+        for (position, mutation) in staged.into_iter().enumerate() {
+            let count = if observer.is_some() {
+                match &mutation {
+                    Mutation::NoteCountedUse {
+                        caller,
+                        module,
+                        count,
+                        base,
+                        ..
+                    } => Some(CountPublication {
+                        caller: *caller,
+                        module: self.module_id_for(module),
+                        staged: *count,
+                        base: *base,
+                        edge_total: None,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match mutation {
+                Mutation::NoteInstance(input) => {
+                    self.apply_instance(input, Some(position), ledger.as_deref_mut())
+                }
+                other => self.apply(other, ledger.as_deref_mut()),
+            }
+            if let Some(mut count) = count {
+                count.edge_total = count
+                    .module
+                    .and_then(|module| self.edge(count.caller, module))
+                    .map(|edge| edge.entry_count);
+                observer.as_mut().expect("enabled count observer")(count);
+            }
         }
+        applied
+    }
+
+    fn complete_publication(
+        &mut self,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
+        // Settle original payload/association releases only after all frame
+        // consumers finish, even when this publication had no new effects.
+        if let Some(ledger) = ledger {
+            self.flush_joint_releases(ledger);
+        }
+        self.reconcile_initial_semantic_coverage();
         self.facts_revision = self.facts_revision.saturating_add(1);
         self.published_revision = self.facts_revision;
-        applied
+    }
+
+    /// Disclose the initial observation interval after physical and semantic
+    /// mutations join this publication, including a later physical reveal.
+    /// Instance batch stamps are non-authority metadata: use before a stamp
+    /// proves neither missing calls nor the actual start of semantic proof.
+    /// Current receipts, reducers and physical counters remain untouched.
+    fn reconcile_initial_semantic_coverage(&mut self) {
+        let mut first_observed = BTreeMap::<(CallerId, ModuleId), u64>::new();
+        for instance in self.instances() {
+            first_observed
+                .entry((instance.caller, instance.module))
+                .and_modify(|first| *first = (*first).min(instance.first_seen_ns))
+                .or_insert(instance.first_seen_ns);
+        }
+        // Retained instances bound this transient index; direct edge lookups
+        // avoid scanning every edge for each registration or replacement.
+        for ((caller, module), first_observed_ns) in first_observed {
+            let Some(edge) = self.edge(caller, module) else {
+                continue;
+            };
+            // Counted presentation can hide an earlier retained witness;
+            // either positive history can precede this registration stamp.
+            let physical_first_ns = edge
+                .entry_first_seen_ns
+                .filter(|_| edge.entry_count > 0)
+                .into_iter()
+                .chain(edge.coverage.witnessed_first_ns)
+                .min();
+            if !physical_first_ns.is_some_and(|first| first < first_observed_ns) {
+                continue;
+            }
+            let gap = RegistryGap {
+                caller: Some(caller),
+                module: Some(module),
+                pid: None,
+                subject: "physical provider use preceded first observed semantic registration"
+                    .into(),
+                reason: instance_input::InstanceReason::BeforeSemanticBoundary
+                    .label()
+                    .into(),
+                budget: None,
+            };
+            // Reconciliation is not a new occurrence each pass. Suppressed
+            // identities retain the existing bounded fingerprint policy.
+            if !self.gap_index.contains_key(&gap) {
+                self.push_gap(gap);
+            }
+        }
     }
 
     /// Publish one gap once per run. Identity is every published field
@@ -2378,8 +4279,24 @@ impl CallerRegistry {
         self.gap_repeats.push(1);
     }
 
-    fn apply(&mut self, mutation: Mutation) {
+    fn apply(
+        &mut self,
+        mutation: Mutation,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         match mutation {
+            Mutation::NoteInstance(input) => {
+                self.apply_instance(input, None, ledger.as_deref_mut())
+            }
+            Mutation::ObserveInstanceSemantic(input) => {
+                self.apply_instance_call(input, ledger.as_deref_mut())
+            }
+            Mutation::InstanceSemanticLoss(input) => {
+                self.apply_instance_loss(input, ledger.as_deref_mut())
+            }
+            Mutation::RetireInstance(input) => {
+                self.apply_instance_retirement(input, ledger.as_deref_mut())
+            }
             Mutation::NoteMapping {
                 caller,
                 pid,
@@ -2448,6 +4365,22 @@ impl CallerRegistry {
                     reason,
                     budget: None,
                 });
+            }
+            Mutation::NoteCountedLoss => {
+                // Sticky for the capture: every later counted install
+                // and `Counted` note honors it, including edges born
+                // after the loss.
+                self.counted_loss = true;
+                for edge in self.edges.values_mut() {
+                    // The capture scope went unproven: bound-pair growth
+                    // stages nothing more (pending first-sight installs
+                    // still land, now lossy), so every counted column
+                    // is a lower bound. Observed counts stand; the
+                    // lifecycle/custody gap discloses the cause.
+                    if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        edge.coverage.lossy = true;
+                    }
+                }
             }
             Mutation::NoteWitness {
                 caller,
@@ -2628,13 +4561,13 @@ impl CallerRegistry {
                 caller,
                 reason,
                 at_ns,
-            } => self.apply_retire(caller, reason, at_ns),
+            } => self.apply_retire(caller, reason, at_ns, ledger.as_deref_mut()),
             Mutation::NoteModuleAbsent {
                 caller,
                 module,
                 complete_scan,
                 at_ns,
-            } => self.apply_absent(caller, module, complete_scan, at_ns),
+            } => self.apply_absent(caller, module, complete_scan, at_ns, ledger.as_deref_mut()),
             Mutation::NoteMemberUnscanned { caller } => {
                 let mut modules = BTreeSet::new();
                 for edge in self
@@ -2657,6 +4590,12 @@ impl CallerRegistry {
                     modules.insert(edge.module);
                 }
                 for module in modules {
+                    self.invalidate_physical_instances(
+                        caller,
+                        Some(module),
+                        false,
+                        ledger.as_deref_mut(),
+                    );
                     self.recompute_module(module);
                 }
             }
@@ -3036,19 +4975,25 @@ impl CallerRegistry {
                 if !admitted {
                     PendingCountOutcome::Unadmitted { module: key }
                 } else {
-                    self.apply(Mutation::NoteCountedUse {
-                        caller,
-                        module: key.clone(),
-                        count,
-                        first_ns,
-                        last_ns,
-                        base,
-                    });
-                    self.apply(Mutation::NoteCoverage {
-                        caller,
-                        module: key.clone(),
-                        note: CoverageNote::Counted { since_ns },
-                    });
+                    self.apply(
+                        Mutation::NoteCountedUse {
+                            caller,
+                            module: key.clone(),
+                            count,
+                            first_ns,
+                            last_ns,
+                            base,
+                        },
+                        None,
+                    );
+                    self.apply(
+                        Mutation::NoteCoverage {
+                            caller,
+                            module: key.clone(),
+                            note: CoverageNote::Counted { since_ns },
+                        },
+                        None,
+                    );
                     PendingCountOutcome::Placed { module: key }
                 }
             }
@@ -3156,6 +5101,20 @@ impl CallerRegistry {
             // Multi-candidate placements reject ambiguous, never NoEdge.
             (PendingRejection::NoEdge, _) => {}
         }
+    }
+
+    /// A retirement boundary is uncertainty, never a witness or a count.
+    /// The coordinator supplies disjoint absolute ranges through its watermark.
+    pub(crate) fn note_retirement_count_gap(&mut self, caller: CallerId, base: u64, absolute: u64) {
+        if absolute <= base {
+            return;
+        }
+        self.record_gap(RegistryGap {
+            caller: Some(caller), module: None, pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: format!("the current physical owner is not proven for absolute count range ({base}, {absolute}] ({} unattributed calls); historical counts remain and no witness or module-level use is recorded", absolute - base),
+            budget: None,
+        });
     }
 
     /// One row whose endpoint several admitted modules share, with no
@@ -3269,9 +5228,13 @@ impl CallerRegistry {
         first_ns: u64,
         last_ns: u64,
     ) {
+        let counted_loss = self.counted_loss;
         let Some(edge) = self.coverage_edge(caller, module) else {
             return;
         };
+        if counted_loss {
+            edge.coverage.lossy = true;
+        }
         if count > edge.entry_count {
             edge.entry_rose_since_previous_pass = true;
             if count == MAX_EDGE_ENTRY_COUNT {
@@ -3397,6 +5360,7 @@ impl CallerRegistry {
         let module_id = self.modules_by_key.get(module).copied();
         let regression = self.last_health_regression_ns;
         let ended = self.watches_ended_ns.is_some();
+        let counted_loss = self.counted_loss;
         let positive = matches!(
             note,
             CoverageNote::Counted { .. } | CoverageNote::Watched { .. }
@@ -3437,6 +5401,9 @@ impl CallerRegistry {
                         .counted_since_ns
                         .map_or(since_ns, |was| was.min(since_ns)),
                 );
+                if counted_loss {
+                    coverage.lossy = true;
+                }
             }
             CoverageNote::Watched { since_ns } => {
                 if ended
@@ -3582,6 +5549,7 @@ impl CallerRegistry {
             });
             return EntryOutcome::UnknownEdge;
         };
+        let counted_loss = self.counted_loss;
         let Some(edge) = self.edges.get_mut(&(caller, id)) else {
             self.push_gap(RegistryGap {
                 caller: Some(caller),
@@ -3593,6 +5561,9 @@ impl CallerRegistry {
             });
             return EntryOutcome::UnknownEdge;
         };
+        if counted_loss {
+            edge.coverage.lossy = true;
+        }
         let (count, overflowed) = edge.entry_count.overflowing_add(delta);
         if count > edge.entry_count {
             edge.entry_rose_since_previous_pass = true;
@@ -3648,12 +5619,14 @@ impl CallerRegistry {
             .get(&(caller, id))
             .is_some_and(|edge| edge.semantics.is_none());
         if needs_materialize {
-            if self.semantic_occupied >= self.limits.max_semantic_states {
+            if self.semantic_occupied + self.instance_semantic_occupied()
+                >= self.limits.max_semantic_states
+            {
                 self.semantic_refused = self.semantic_refused.saturating_add(1);
                 let refusal = BudgetRefusal {
                     resource: "semantic_state",
                     limit: self.limits.max_semantic_states,
-                    requested: self.semantic_occupied + 1,
+                    requested: self.semantic_occupied + self.instance_semantic_occupied() + 1,
                 };
                 self.push_gap(RegistryGap {
                     caller: Some(caller),
@@ -3668,10 +5641,17 @@ impl CallerRegistry {
                 });
                 return;
             }
+            let reducer = match EdgeSemantics::with_resources(&self.semantic_resources) {
+                Ok(reducer) => reducer,
+                Err(refusal) => {
+                    self.refuse_semantic_resource(caller, id, refusal);
+                    return;
+                }
+            };
             self.edges
                 .get_mut(&(caller, id))
                 .expect("edge resolved above")
-                .semantics = Some(EdgeSemantics::default());
+                .semantics = Some(reducer);
             self.semantic_occupied = self.semantic_occupied.saturating_add(1);
         }
         let edge = self
@@ -3694,13 +5674,44 @@ impl CallerRegistry {
             .semantics
             .as_mut()
             .expect("semantic state materialized above")
-            .observe(call);
-        self.semantic_refused = self.semantic_refused.saturating_add(refused);
+            .observe_with_resources(call);
+        match refused {
+            Ok(refused) => self.semantic_refused = self.semantic_refused.saturating_add(refused),
+            Err(refusal) => self.refuse_semantic_resource(caller, id, refusal),
+        }
     }
 
-    fn apply_retire(&mut self, caller: CallerId, reason: String, at_ns: u64) {
+    fn refuse_semantic_resource(
+        &mut self,
+        caller: CallerId,
+        module: ModuleId,
+        refusal: crate::semantics_edge::resources::SemanticResourceRefusal,
+    ) {
+        self.semantic_refused = self.semantic_refused.saturating_add(1);
+        self.push_gap(RegistryGap {
+            caller: Some(caller),
+            module: Some(module),
+            pid: None,
+            subject: "semantic resource capacity exhausted".into(),
+            reason: "semantic_resource_capacity".into(),
+            budget: Some(BudgetRefusal {
+                resource: "semantic_resource",
+                limit: refusal.limit_bytes,
+                requested: refusal.requested_bytes,
+            }),
+        });
+    }
+
+    fn apply_retire(
+        &mut self,
+        caller: CallerId,
+        reason: String,
+        at_ns: u64,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         let _ = at_ns;
         self.retired.insert(caller, reason.clone());
+        self.invalidate_physical_instances(caller, None, true, shared);
         let mut modules = BTreeSet::new();
         for edge in self
             .edges
@@ -3756,6 +5767,7 @@ impl CallerRegistry {
         module: ModuleId,
         complete_scan: bool,
         at_ns: u64,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let _ = at_ns;
         {
@@ -3785,6 +5797,7 @@ impl CallerRegistry {
                 state.invalidate();
             }
         }
+        self.invalidate_physical_instances(caller, Some(module), complete_scan, shared);
         // The module unloaded only when no edge still maps it or could:
         // mapped and uncertain edges both block the verdict (an
         // incomplete scan just marked this edge uncertain, so it
@@ -3803,6 +5816,17 @@ impl CallerRegistry {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Deliver only decisions produced by the real registry, in an adversarial
+    /// order or more than once. This utility manufactures no outcome/handle.
+    pub(crate) fn deliver_pending_decisions(
+        registry: &mut CallerRegistry,
+        decisions: &[PendingCountDecision],
+    ) {
+        registry
+            .pending_count_decisions
+            .extend_from_slice(decisions);
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -3815,11 +5839,19 @@ pub(crate) mod tests {
         /// False simulates an unreadable `/proc` (a race or a permission
         /// wall): liveness answers but identity reads fail.
         readable: bool,
+        leader_exit: crate::process::leader_exit::LeaderExitObservation,
     }
 
     #[derive(Debug, Clone, Default)]
     struct ScriptedState {
         processes: HashMap<u32, ScriptedProcess>,
+        /// H6 slice 2: when set, `open` fails for every pid while pins
+        /// already held keep proving their process — the fd-exhaustion /
+        /// permission shape where numeric-PID reopen is unavailable but
+        /// retained custody works.
+        reopen_poisoned: bool,
+        reopen_attempts: usize,
+        leader_exit_queries: usize,
     }
 
     /// Scripted source: the pid/exit/reuse/exec sequence is programmed,
@@ -3849,6 +5881,20 @@ pub(crate) mod tests {
                         path: Some("/bin/driver".into()),
                     }),
                     readable: true,
+                    leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
+                },
+            );
+        }
+
+        pub(crate) fn spawn_matching_process(&self, pid: u32) {
+            self.set(
+                pid,
+                ScriptedProcess {
+                    alive: true,
+                    start_time: process_start_time(pid).unwrap(),
+                    exe: read_exe_identity(pid),
+                    readable: true,
+                    leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
             );
         }
@@ -3862,6 +5908,16 @@ pub(crate) mod tests {
         pub(crate) fn kill(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.alive = false;
+            }
+        }
+
+        pub(crate) fn set_leader_exit_observation(
+            &self,
+            pid: u32,
+            observation: crate::process::leader_exit::LeaderExitObservation,
+        ) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.leader_exit = observation;
             }
         }
 
@@ -3882,13 +5938,31 @@ pub(crate) mod tests {
                 });
             }
         }
+
+        /// Poison every future numeric-PID reopen; held pins are unaffected.
+        pub(crate) fn poison_reopen(&self) {
+            self.state.borrow_mut().reopen_poisoned = true;
+        }
+
+        /// Numeric-PID reopen attempts so far, poisoned or not.
+        pub(crate) fn reopen_attempts(&self) -> usize {
+            self.state.borrow().reopen_attempts
+        }
+
+        pub(crate) fn leader_exit_queries(&self) -> usize {
+            self.state.borrow().leader_exit_queries
+        }
     }
 
     impl ProcessSource for ScriptedSource {
         type Pin = (u32, u64);
 
         fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
-            let state = self.state.borrow();
+            let mut state = self.state.borrow_mut();
+            state.reopen_attempts = state.reopen_attempts.saturating_add(1);
+            if state.reopen_poisoned {
+                return Err(format!("poisoned numeric-PID reopen of {pid}"));
+            }
             let process = state
                 .processes
                 .get(&pid)
@@ -3931,13 +6005,177 @@ pub(crate) mod tests {
                 .get(&pid)
                 .is_some_and(|process| process.alive)
         }
+
+        fn leader_exit_observation(
+            &self,
+            pin: &Self::Pin,
+            _: &mut crate::process::leader_exit::LeaderExitReadBudget,
+        ) -> crate::process::leader_exit::LeaderExitObservation {
+            use crate::process::leader_exit::LeaderExitObservation;
+            let mut state = self.state.borrow_mut();
+            state.leader_exit_queries += 1;
+            let Some(process) = state.processes.get(&pin.0) else {
+                return LeaderExitObservation::GroupExited;
+            };
+            if !process.alive || process.start_time != pin.1 {
+                LeaderExitObservation::GroupExited
+            } else if !process.readable {
+                LeaderExitObservation::Unresolved
+            } else {
+                process.leader_exit
+            }
+        }
     }
 
     const AUTHORITY: ImageAuthority = ImageAuthority::ScanPinned;
 
+    #[test]
+    fn shared_process_custody_factory_charges_actual_arc_allocations() {
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let reserve = registry.semantic_storage_reserver();
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let pin = PidPin::open(std::process::id()).unwrap();
+        let inline = 2 * std::mem::size_of::<SharedCallerPin<PidPin>>();
+        let requested = CustodyCharge::requested_bytes::<PidPin>(inline).unwrap();
+        let (held, allocations, allocated_bytes) = crate::test_alloc::count_allocs_during(|| {
+            SharedCallerPin::new(pin, &OsProcessSource, &reserve).unwrap()
+        });
+        assert_eq!(allocations, 2, "the original pin and its charge peer");
+        assert_eq!(
+            allocated_bytes
+                + 2 * crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+                + inline,
+            requested
+        );
+        assert_eq!(
+            registry.semantic_resource_snapshot().charged_bytes,
+            before + requested
+        );
+        let original = OsProcessSource.shared_semantic_custody(&held.pin).unwrap();
+        let (shared, sharing_allocations, sharing_bytes) =
+            crate::test_alloc::count_allocs_during(|| held.share());
+        assert_eq!((sharing_allocations, sharing_bytes), (0, 0));
+        assert!(Arc::ptr_eq(&original, &shared.pin));
+        eprintln!(
+            "actual shared custody: PidPin={} wrapper={} peer={} heap={} charge={}",
+            std::mem::size_of::<PidPin>(),
+            std::mem::size_of::<SharedCallerPin<PidPin>>(),
+            std::mem::size_of::<CustodyCharge>(),
+            allocated_bytes,
+            requested
+        );
+        drop((original, shared, held));
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn shared_process_custody_refuses_before_any_arc_allocation() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let reserve = registry.semantic_storage_reserver();
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        registry.reference_semantic_resource_limit(before);
+        let pin = PidPin::open(std::process::id()).unwrap();
+        // The dup succeeding proves the pidfd is open; the witness proves
+        // the failed preparation closed it without depending on the fd
+        // number staying free (a parallel test may reuse it at once, and
+        // every pidfd to one pid shares one identity).
+        let witness = crate::discovery::identity::test_fixture::PidfdClosureWitness::record(
+            pin.pidfd().unwrap(),
+        );
+        let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            SharedCallerPin::new(pin, &OsProcessSource, &reserve)
+        });
+        assert!(result.is_err());
+        assert_eq!((allocations, bytes), (0, 0));
+        // The just-failed owned preparation closed this pidfd: the number
+        // is free (EBADF) or names a different open file description.
+        witness.assert_closed();
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn shared_process_custody_strong_and_paired_weak_lifetimes() {
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let held = SharedCallerPin::new(
+            PidPin::open(std::process::id()).unwrap(),
+            &OsProcessSource,
+            &registry.semantic_storage_reserver(),
+        )
+        .unwrap();
+        let original = OsProcessSource.shared_semantic_custody(&held.pin).unwrap();
+        let second = Arc::clone(&original);
+        let weak = PidPin::downgrade_shared(&original).unwrap();
+        let weak_second = PidPin::downgrade_shared(&original).unwrap();
+        // The dup succeeding proves the pidfd is open; the witness proves
+        // the last Arc drop closed it without depending on the fd number
+        // staying free (a parallel test may reuse it at once, and every
+        // pidfd to one pid shares one identity).
+        let witness = crate::discovery::identity::test_fixture::PidfdClosureWitness::record(
+            original.pidfd().unwrap(),
+        );
+        assert!(weak.matches_original(&original));
+        let charged = registry.semantic_resource_snapshot().charged_bytes;
+        drop(held);
+        drop(original);
+        assert!(weak.matches_original(&second));
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
+        drop(second);
+        // The paired Weak retains the memory charge, never the pidfd: the
+        // number is free (EBADF) or names a different open file description.
+        witness.assert_closed();
+        assert_eq!(
+            registry.semantic_resource_snapshot().charged_bytes,
+            charged,
+            "paired Weak retains the memory charge, never the pidfd"
+        );
+        let replacement = Arc::new(PidPin::open(std::process::id()).unwrap());
+        assert!(!weak.matches_original(&replacement));
+        assert!(
+            PidPin::downgrade_shared(&replacement).is_none(),
+            "an uncharged Arc is not displayed original custody"
+        );
+        drop(weak);
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
+        drop(weak_second);
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn shared_process_custody_weak_drop_first_and_independent_duplicate() {
+        use std::os::fd::AsRawFd as _;
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let held = SharedCallerPin::new(
+            PidPin::open(std::process::id()).unwrap(),
+            &OsProcessSource,
+            &registry.semantic_storage_reserver(),
+        )
+        .unwrap();
+        let original = OsProcessSource.shared_semantic_custody(&held.pin).unwrap();
+        let duplicate = Arc::new(original.try_clone().unwrap());
+        assert_ne!(
+            original.pidfd().unwrap().as_raw_fd(),
+            duplicate.pidfd().unwrap().as_raw_fd()
+        );
+        assert!(
+            PidPin::downgrade_shared(&duplicate).is_none(),
+            "a duplicated FD never inherits original allocation accounting"
+        );
+        let weak = PidPin::downgrade_shared(&original).unwrap();
+        drop(weak);
+        assert!(registry.semantic_resource_snapshot().charged_bytes > before);
+        drop((held, original));
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+        assert!(duplicate.still_the_same());
+    }
+
     fn adapter() -> (ScriptedSource, CallerAdapter<ScriptedSource>) {
         let source = ScriptedSource::default();
-        let adapter = CallerAdapter::new(source.clone());
+        let adapter = CallerAdapter::new(
+            source.clone(),
+            CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
+        );
         (source, adapter)
     }
 
@@ -4096,6 +6334,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scoped_retirement_pages_eventually_check_later_live_callers() {
+        let (source, mut adapter) = adapter();
+        for pid in 1..=257 {
+            source.spawn(pid, 500);
+            adapter.admit(pid, AUTHORITY, 50).unwrap();
+        }
+        let later = adapter.live_id(257).unwrap();
+        source.exec(257, 200, "/bin/later-image");
+        for _ in 0..3 {
+            adapter.reconcile_scoped(100, &mut || true);
+        }
+        assert!(adapter.record(later).unwrap().retired);
+        assert_eq!(adapter.live_id(257), None);
+        assert_eq!(
+            adapter.len(),
+            257,
+            "no successor inherited scope membership"
+        );
+    }
+
+    #[test]
     fn exec_retires_the_old_image_and_admits_the_new() {
         let (source, mut adapter) = adapter();
         source.spawn(7, 500);
@@ -4171,7 +6430,10 @@ pub(crate) mod tests {
         assert!(!generation_gone(pid));
         let source = OsProcessSource;
         assert!(source.gone(pid));
-        let mut adapter = CallerAdapter::new(OsProcessSource);
+        let mut adapter = CallerAdapter::new(
+            OsProcessSource,
+            CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
+        );
         let error = adapter.admit(pid, AUTHORITY, 10).unwrap_err();
         assert!(
             format!("{error:#}").contains("no live process"),
@@ -5979,6 +8241,115 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn thirty_two_first_installs_on_one_edge_yield_one() {
+        // G21 (Sol oracle correction): base == 0 dispatches to the maximum
+        // install, so 32 first sightings at one unit produce A=1, not 32.
+        // Only the first sight sets recency.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200 + pair, 0);
+        }
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 1);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+    }
+
+    #[test]
+    fn overlapping_demoted_growth_contributes_one_unit() {
+        // G21: demoted growth merges overlapping numeric intervals per
+        // (caller, module), so 32 identical (1,2] segments in one
+        // publication add one unit, not 32.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200, 0);
+        registry.publish();
+        assert_eq!(edge_of(&registry, CallerId(0), &keys[0]).entry_count, 1);
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 300 + pair, 400 + pair, 1);
+        }
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 2);
+    }
+
+    #[test]
+    fn disjoint_demoted_growth_accumulates() {
+        // G21: disjoint segments in one publication (a mid-publish rebase)
+        // all accumulate: (1,2] plus (2,3] on an edge at 1 yields 3.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200, 0);
+        registry.publish();
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 300, 400, 1);
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 310, 410, 2);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 3);
+    }
+
+    #[test]
+    fn repeated_first_sight_rereads_change_nothing() {
+        // G21: equal-or-less re-reads change nothing, even across 32 pairs
+        // and repeated publications: no count growth, no recency shift.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200 + pair, 0);
+        }
+        registry.publish();
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 500 + pair, 0);
+        }
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 1);
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+    }
+
+    #[test]
+    fn split_proof_publications_increment_per_proof_bearing_publish() {
+        // G21 publication recurrence: 32 terminal proofs (659,660] staged
+        // together yield B=1 (overlap). Split across N proof-bearing
+        // publications they yield B=N, one unit per publication — never a
+        // loose range.
+        for (batches, expected) in [(vec![32], 1), (vec![16, 16], 2), (vec![1; 32], 32)] {
+            let mut registry = registry();
+            let keys = mapped(
+                &mut registry,
+                CallerId(0),
+                &[("/lib/b.so", 12, AdmissionState::Admitted)],
+            );
+            for batch in batches {
+                for _ in 0..batch {
+                    registry.note_counted_use(CallerId(0), &keys[0], 1, 900, 910, 659);
+                }
+                registry.publish();
+            }
+            let edge = edge_of(&registry, CallerId(0), &keys[0]);
+            assert_eq!(edge.entry_count, expected);
+        }
+    }
+
+    #[test]
     fn counted_use_saturates_at_the_edge_cap() {
         let mut registry = registry();
         let keys = mapped(
@@ -6150,5 +8521,84 @@ pub(crate) mod tests {
             Some("CALLER_EVIDENCE[2] PairInsertFailure rose")
         );
         assert!(reason.text().starts_with("uncounted"), "{}", reason.text());
+    }
+
+    #[test]
+    fn settlement_latency_toggle_takes_exactly_one() {
+        use super::{
+            DIAGNOSTIC_SETTLEMENT_LATENCY_ENV, diagnostic_settlement_latency_by_env_value,
+        };
+        use std::ffi::OsStr;
+        assert_eq!(
+            DIAGNOSTIC_SETTLEMENT_LATENCY_ENV,
+            "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY"
+        );
+        assert!(diagnostic_settlement_latency_by_env_value(Some(
+            OsStr::new("1")
+        )));
+        for other in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+        ] {
+            assert!(
+                !diagnostic_settlement_latency_by_env_value(other),
+                "only exactly 1 enables: {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_latency_histogram_percentiles_are_exact_to_1ms() {
+        use super::SettlementLatencyHist;
+        let mut hist = SettlementLatencyHist::new();
+        assert_eq!(hist.summary().samples, 0);
+        assert_eq!(hist.summary().p99_ms, None);
+        // 100 samples at 0..100 ms (entry 1_000_000_000, now staggered).
+        for ms in 0..100u64 {
+            hist.record(1_000_000_000, 1_000_000_000 + ms * 1_000_000);
+        }
+        let summary = hist.summary();
+        assert_eq!(summary.samples, 100);
+        // rank ceil(0.5*100)=50 -> bucket 49; rank ceil(0.99*100)=99 -> 98.
+        assert_eq!(summary.p50_ms, Some(49));
+        assert_eq!(summary.p99_ms, Some(98));
+        assert_eq!(summary.max_ms, 99);
+        assert_eq!(summary.overflow, 0);
+        assert_eq!(summary.unknown_ts, 0);
+    }
+
+    #[test]
+    fn settlement_latency_histogram_overflow_unknown_and_max() {
+        use super::SettlementLatencyHist;
+        let mut hist = SettlementLatencyHist::new();
+        hist.record(1_000, 1_000 + 250_000_000); // 250 ms in-bucket.
+        hist.record(1_000, 1_000 + 12_000_000_000); // 12 s overflows.
+        hist.record(0, 2_000); // no timestamp: unknown, not a sample.
+        hist.record(1_000, 0); // failed clock read: unknown, not a sample.
+        let summary = hist.summary();
+        assert_eq!(summary.samples, 2);
+        assert_eq!(summary.overflow, 1);
+        assert_eq!(summary.unknown_ts, 2);
+        assert_eq!(summary.max_ms, 12_000);
+        // Both ranks land on the only in-bucket sample.
+        assert_eq!(summary.p50_ms, Some(250));
+        // rank ceil(0.99*2)=2 falls past the buckets: max bounds it.
+        assert_eq!(summary.p99_ms, Some(12_000));
+    }
+
+    #[test]
+    fn settlement_latency_setter_allocates_and_drops() {
+        use super::RegistryLimits;
+        let mut registry = super::CallerRegistry::new(RegistryLimits::default_limits());
+        assert_eq!(registry.settlement_latency_summary(), None);
+        registry.set_diagnostic_settlement_latency(true);
+        let summary = registry
+            .settlement_latency_summary()
+            .expect("enabled registry reports");
+        assert_eq!(summary.samples, 0);
+        registry.set_diagnostic_settlement_latency(false);
+        assert_eq!(registry.settlement_latency_summary(), None);
     }
 }

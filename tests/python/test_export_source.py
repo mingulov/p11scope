@@ -124,8 +124,11 @@ class ExportFixture:
         ]
         if force:
             commands.append(["git", "add", "--force", "--", *force])
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
         commands.append(
-            ["git", "-c", "user.name=Source Export Test", "-c", "user.email=test.invalid",
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Source Export Test", "-c", "user.email=test.invalid",
              "commit", "--quiet", "-m", "fixture"]
         )
         for command in commands:
@@ -193,10 +196,45 @@ class ExportSourceTests(unittest.TestCase):
 
     def full_fixture(self, name="full"):
         base = self.base / name
-        fixture = OFFLINE_TEST_MODULE.OfflineFixture(base)
+        bundle_source = base / "shared source repository"
+        bundle_source.mkdir(parents=True)
+        git_environment = {
+            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        }
+        git_environment.update({
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CEILING_DIRECTORIES": str(base.resolve()),
+        })
+        commands = (
+            ["git", "init", "--quiet", "--template="],
+            ["git", "add", "--all"],
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Bundle Source Test", "-c",
+             "user.email=test.invalid", "commit", "--quiet", "-m", "parent"],
+        )
+        (bundle_source / "README.md").write_text("committed parent source\n", encoding="utf-8")
+        for command in commands:
+            result = subprocess.run(command, cwd=bundle_source, env=git_environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        (bundle_source / "README.md").write_text("committed tip source\n", encoding="utf-8")
+        for command in (
+            ["git", "add", "README.md"],
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Bundle Source Test", "-c",
+             "user.email=test.invalid", "commit", "--quiet", "-m", "tip"],
+        ):
+            result = subprocess.run(command, cwd=bundle_source, env=git_environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        (bundle_source / "foreign-uncommitted.txt").write_text(
+            "must not enter the source bundle\n", encoding="utf-8"
+        )
+        fixture = OFFLINE_TEST_MODULE.OfflineFixture(base, shared_repository=bundle_source)
         fixture.testcase = self
         shutil.copy2(EXPORTER, fixture.root / "scripts/export-source.py")
         fixture.assemble()
+        fixture.bundle_source = bundle_source
         fixture.approve()
         shutil.rmtree(fixture.root / "third-party/src")
         (fixture.root / "third-party/.prepare-dependencies.lock").unlink(missing_ok=True)
@@ -208,20 +246,44 @@ class ExportSourceTests(unittest.TestCase):
         commands = (
             ["git", "init", "--quiet", "--template="],
             ["git", "add", "--all"],
-            ["git", "-c", "user.name=Full Export Test", "-c",
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Full Export Test", "-c",
              "user.email=test.invalid", "commit", "--quiet", "-m", "fixture"],
         )
-        git_environment = {
-            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
-        }
-        git_environment.update({
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-        })
         for command in commands:
             result = subprocess.run(command, cwd=fixture.root, env=git_environment,
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
         return fixture
+
+    def test_full_fixture_uses_only_its_committed_bundle_history(self):
+        repository_before = OFFLINE_TEST_MODULE.REPOSITORY
+        fixture = self.full_fixture("bundle-history")
+        self.assertEqual(OFFLINE_TEST_MODULE.REPOSITORY, repository_before)
+        source_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=fixture.bundle_source,
+            check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        self.assertEqual(fixture.shared_revision, source_head)
+
+        bundle = fixture.shared / "source.bundle"
+        clone = self.base / "bundle-history clone"
+        result = subprocess.run(
+            ["git", "clone", "--quiet", str(bundle), str(clone)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subjects = subprocess.run(
+            ["git", "log", "--format=%s", "-2"], cwd=clone, check=True,
+            text=True, stdout=subprocess.PIPE,
+        ).stdout.splitlines()
+        self.assertEqual(subjects, ["tip", "parent"])
+        self.assertEqual(
+            subprocess.run(["git", "rev-parse", "HEAD"], cwd=clone, check=True,
+                           text=True, stdout=subprocess.PIPE).stdout.strip(),
+            fixture.shared_revision,
+        )
+        self.assertFalse((clone / "foreign-uncommitted.txt").exists())
 
     @staticmethod
     def full_export(fixture, output: Path, *, environment=None, extra=()):
@@ -609,7 +671,8 @@ class ExportSourceTests(unittest.TestCase):
         subprocess.run(["git", "add", "--force", str(collision)], cwd=fixture.root,
                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         subprocess.run([
-            "git", "-c", "user.name=Full Export Test", "-c", "user.email=test.invalid",
+            "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+            "-c", "user.name=Full Export Test", "-c", "user.email=test.invalid",
             "commit", "--quiet", "-m", "collision",
         ], cwd=fixture.root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         collided = fixture.root.parent / "collision.tar.gz"
@@ -706,7 +769,8 @@ class ExportSourceTests(unittest.TestCase):
                 path.write_text("[net]\noffline = false\n")
                 subprocess.run(["git", "add", relative], cwd=fixture.root, check=True)
                 subprocess.run([
-                    "git", "-c", "user.name=Full Export Test", "-c",
+                    "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                    "-c", "user.name=Full Export Test", "-c",
                     "user.email=test.invalid", "commit", "--quiet", "-m", "config",
                 ], cwd=fixture.root, check=True)
                 output = fixture.root.parent / f"config-{index}.tar.gz"
@@ -724,7 +788,8 @@ class ExportSourceTests(unittest.TestCase):
         path.write_text("committed descendant\n")
         subprocess.run(["git", "add", relative], cwd=fixture.root, check=True)
         subprocess.run([
-            "git", "-c", "user.name=Full Export Test", "-c",
+            "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+            "-c", "user.name=Full Export Test", "-c",
             "user.email=test.invalid", "commit", "--quiet", "-m", "config directory",
         ], cwd=fixture.root, check=True)
         module = load_module(

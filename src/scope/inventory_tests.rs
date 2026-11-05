@@ -39,6 +39,13 @@ impl ScopePublicationIo for ScopeMaps {
         Ok(())
     }
 
+    // Witness vocabulary is pinned by the scope.rs witness tests with
+    // their own fake; this fake models an object without the witness
+    // map, so these stay outside the operation sequences below.
+    fn insert_pid_start(&mut self, _pid: u32, _tick: u64) -> Result<bool> {
+        Ok(false)
+    }
+
     fn insert_cgroup(&mut self, directory: File) -> Result<()> {
         self.operation(Operation::InsertCgroup(directory.metadata()?.ino()))?;
         self.cgroup = Some(directory);
@@ -51,6 +58,10 @@ impl ScopePublicationIo for ScopeMaps {
             .pid_readback
             .clone()
             .unwrap_or_else(|| self.pids.clone()))
+    }
+
+    fn read_pid_starts(&mut self) -> Result<BTreeMap<u32, u64>> {
+        Ok(BTreeMap::new())
     }
 
     fn write_config(&mut self, index: u32, value: u64) -> Result<()> {
@@ -248,7 +259,7 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
                 config: [0, 0x1234],
                 ..ScopeMaps::default()
             };
-            publish_detailed_with(&Scope::Pid(101), policy, token, &mut maps).unwrap();
+            publish_detailed_with(&Scope::Pid(101), policy, token, false, None, &mut maps).unwrap();
             assert_eq!(maps.pids, BTreeMap::from([(101, token.unwrap_or(1))]));
             assert_eq!(
                 maps.config,
@@ -264,8 +275,96 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
     for (scope, token) in [(Scope::Pid(101), Some(0)), (Scope::System, Some(17))] {
         let mut maps = ScopeMaps::default();
         assert!(
-            publish_detailed_with(&scope, CapturePolicy::Allowlisted, token, &mut maps).is_err()
+            publish_detailed_with(
+                &scope,
+                CapturePolicy::Allowlisted,
+                token,
+                false,
+                None,
+                &mut maps
+            )
+            .is_err()
         );
         assert!(maps.operations.is_empty());
     }
+}
+
+#[test]
+fn detailed_scope_track_short_lived_sets_only_the_extensive_bit() {
+    for track in [false, true] {
+        let mut maps = ScopeMaps::default();
+        publish_detailed_with(
+            &Scope::Pid(101),
+            CapturePolicy::Allowlisted,
+            None,
+            track,
+            None,
+            &mut maps,
+        )
+        .unwrap();
+        let bit = p11scope_ebpf_common::FLAG_TRACK_SHORT_LIVED;
+        assert_eq!(maps.config[0] & bit, if track { bit } else { 0 });
+        assert_eq!(maps.config[0] & !bit, 1 | 4);
+        assert!(p11scope_ebpf_common::valid_config(maps.config[0]));
+    }
+}
+
+// 614b P2#2: extensive mode arms Detailed policies only. Every
+// counter policy refuses the bit before any map operation, publishes
+// its ordinary aggregate CONFIG when disarmed, and never reaches the
+// kernel exe-identity read through CONFIG.
+#[test]
+fn counter_policies_refuse_track_short_lived_config() {
+    let bit = p11scope_ebpf_common::FLAG_TRACK_SHORT_LIVED;
+    for mode in [
+        p11scope_ebpf_common::CounterMode::Counts,
+        p11scope_ebpf_common::CounterMode::Timestamps,
+        p11scope_ebpf_common::CounterMode::Latency,
+    ] {
+        let mut armed = ScopeMaps::default();
+        let error = publish_detailed_with(
+            &Scope::Pid(101),
+            CapturePolicy::Counter(mode),
+            None,
+            true,
+            None,
+            &mut armed,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--track-short-lived"),
+            "{mode:?}: {error:#}"
+        );
+        assert!(armed.operations.is_empty(), "{mode:?} published on refusal");
+        assert_eq!(armed.config, [0, 0], "{mode:?}");
+
+        let mut disarmed = ScopeMaps::default();
+        publish_detailed_with(
+            &Scope::Pid(101),
+            CapturePolicy::Counter(mode),
+            None,
+            false,
+            None,
+            &mut disarmed,
+        )
+        .unwrap();
+        assert_eq!(disarmed.config[0] & bit, 0, "{mode:?}");
+        assert_eq!(disarmed.config[0], 1 | 16, "{mode:?}");
+        assert!(p11scope_ebpf_common::valid_config(disarmed.config[0]));
+    }
+    // Detailed-object aggregate (metrics without a counter mode) is
+    // not a counter policy: the boundary is the counter object, not
+    // the shared aggregate CONFIG bit.
+    let mut aggregate = ScopeMaps::default();
+    publish_detailed_with(
+        &Scope::Pid(101),
+        CapturePolicy::AggregateOnly,
+        None,
+        true,
+        None,
+        &mut aggregate,
+    )
+    .unwrap();
+    assert_eq!(aggregate.config[0], 1 | 16 | bit);
+    assert!(p11scope_ebpf_common::valid_config(aggregate.config[0]));
 }

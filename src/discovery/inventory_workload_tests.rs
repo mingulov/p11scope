@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::attach::Scope;
+use crate::attach::capture::NativeDomainId;
 use crate::capacity::{AttachCost, InventoryBudget};
 use crate::discovery::caller_registry::{
     AdmissionState, CallerEvent, CallerId, DEFAULT_MAX_CALLERS, DEFAULT_MAX_EDGES,
@@ -13,6 +14,8 @@ use crate::discovery::caller_registry::{
 use crate::discovery::engine::inventory::{ImageCheck, ImageGuard, UnavailableImageGuard};
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, InventoryScope};
 use crate::discovery::hooks::HookRegistry;
+use crate::discovery::native_binding::BoundImage;
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -63,6 +66,7 @@ fn run_workload_worker(mode: &str, timeout: std::time::Duration) -> WorkloadWork
         .stdout(std::fs::File::create(&stdout_path).unwrap())
         .stderr(std::fs::File::create(&stderr_path).unwrap())
         .process_group(0)
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -161,10 +165,12 @@ fn workload_fd_worker() {
     match mode.as_str() {
         "admission" => inject_admission_failures(),
         "mutation" => inject_provider_mutation(),
+        "mutation-uninitialized" => inject_provider_mutation_case(false),
         "discovery-loss" => inject_discovery_loss(),
         "churn" => run_churn_storm(),
         "shutdown" => interrupt_shutdown(),
         "rss" => workload_rss_worker(),
+        "h3-combined" => h3_combined_workload(),
         // Owned-pidfd accounting runs here, in a private process: the
         // census observes /proc/self/fd, which a concurrent lib test
         // can pollute with its own pidfds for our sleepers (a census
@@ -187,6 +193,43 @@ fn workload_fd_worker() {
             let accounted = std::fs::File::open("/dev/zero").unwrap();
             scope.assert_delta(1);
             drop(accounted);
+            scope.assert_delta(0);
+        }
+        "oracle-owned-replacement" => {
+            use std::os::unix::fs::FileExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider");
+            let staging = dir.path().join("staging");
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::write(&staging, b"new").unwrap();
+            let original = std::fs::File::open(&path).unwrap();
+            let fd = original.as_raw_fd();
+            let before = FdScope::open("before owned replacement");
+            std::fs::rename(&staging, &path).unwrap();
+            let scope = FdScope::open("after owned replacement");
+            let old = &before.before[&fd];
+            let retained = &scope.before[&fd];
+            assert_eq!(
+                (old.dev, old.ino, old.mode, old.rdev, old.pidfd_target),
+                (
+                    retained.dev,
+                    retained.ino,
+                    retained.mode,
+                    retained.rdev,
+                    retained.pidfd_target,
+                )
+            );
+            assert_eq!(old.link, path);
+            assert_eq!(
+                retained.link,
+                PathBuf::from(format!("{} (deleted)", path.display()))
+            );
+            assert_ne!(old, retained, "the oracle still checks the link annotation");
+            let mut bytes = [0; 3];
+            assert_eq!(original.read_at(&mut bytes, 0).unwrap(), bytes.len());
+            assert_eq!(&bytes, b"old");
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
             scope.assert_delta(0);
         }
         "oracle-retained" => {
@@ -255,6 +298,11 @@ fn workload_fd_oracle_detects_retention_and_distinct_resource_replacement() {
 }
 
 #[test]
+fn workload_fd_oracle_measures_after_owned_atomic_replacement() {
+    isolated_workload("oracle-owned-replacement");
+}
+
+#[test]
 fn workload_fd_worker_requires_execution_and_reaps_failures() {
     for (mode, reason) in [
         ("unknown", "unknown workload worker mode"),
@@ -302,6 +350,7 @@ fn workload_fd_deadline_guard_terminates_an_acknowledged_descendant() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .process_group(0)
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut worker = WorkloadWorker {
@@ -492,16 +541,20 @@ impl Drop for ChildReaper {
 struct AcceptAllImages;
 
 impl ImageGuard for AcceptAllImages {
-    fn check(&mut self, _: &crate::process::ProcessView, _: ImageIdentity) -> ImageCheck {
+    fn check(&mut self, _: &crate::process::ProcessView, _: BoundImage) -> ImageCheck {
         ImageCheck::Exact
     }
 }
 
-fn owner_image(pid: u32) -> ImageIdentity {
-    ImageIdentity {
-        task_cookie: u64::from(pid) + 1,
-        exec_id: 7,
-    }
+/// One stable scripted domain for this module's owner images; a fresh
+/// domain per call would break equality for the wrong reason.
+fn owner_domain() -> NativeDomainId {
+    static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(NativeDomainId::mint)
+}
+
+fn owner_image(pid: u32) -> BoundImage {
+    BoundImage::scripted(owner_domain(), u64::from(pid) + 1, 7).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +910,7 @@ fn grow_native_owners_to_257() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );
@@ -979,6 +1033,7 @@ fn system_sweep_releases_its_pins() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         ));
@@ -1000,12 +1055,17 @@ fn system_sweep_releases_its_pins() {
         })
         .count();
     let args = crate::cli::CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::System,
         metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,
@@ -1055,6 +1115,7 @@ fn owned_pidfd_census_classifier() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         ));
@@ -1743,7 +1804,7 @@ fn native_owner_growth_failure_accounts_loss_exactly() {
 /// Native-owner growth-path failure injection, run in the
 /// `owner-growth-failure` worker with its owned-pidfd accounting.
 fn inject_native_owner_growth_failure() {
-    fn some_image(pid: u32) -> Option<ImageIdentity> {
+    fn some_image(pid: u32) -> Option<BoundImage> {
         Some(owner_image(pid))
     }
     // One owned sleeper behind a real scan pass: BPF-style image
@@ -1754,6 +1815,7 @@ fn inject_native_owner_growth_failure() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -1771,6 +1833,7 @@ fn inject_native_owner_growth_failure() {
         Scope::Pid(pid),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )
@@ -1834,27 +1897,9 @@ fn inject_native_owner_growth_failure() {
     );
     assert_eq!(document["gaps_suppressed"], 0);
     assert_settled(&document, 0);
-    // The bad-image shape, direct: a zero task cookie never reaches the
-    // open — the growth path refuses it with no state change.
-    let mut harness = harness();
-    let now = harness.now_ns();
-    let mut guard = AcceptAllImages;
-    let error = harness
-        .coordinator_mut()
-        .test_open_native_owner(
-            pid,
-            ImageIdentity {
-                task_cookie: 0,
-                exec_id: 7,
-            },
-            &mut guard,
-            now,
-        )
-        .expect_err("a zero task cookie refuses the growth path");
-    assert!(
-        format!("{error:#}").contains("lacks image identity"),
-        "the error names the missing identity: {error:#}"
-    );
+    // The bad-image shape, direct: a zero task cookie cannot construct an
+    // expected image, so the growth path never sees it.
+    assert!(BoundImage::scripted(owner_domain(), 0, 7).is_none());
 }
 
 #[test]
@@ -1862,9 +1907,18 @@ fn provider_mutation_mid_run_splits_module_instances() {
     isolated_workload("mutation");
 }
 
+#[test]
+fn provider_mutation_without_getter_retains_no_uninitialized_table_pins() {
+    isolated_workload("mutation-uninitialized");
+}
+
 /// Provider-mutation injection (dlclose/dlopen of a changed `.so`),
 /// callable from the test above and from the RSS worker.
 fn inject_provider_mutation() {
+    inject_provider_mutation_case(true);
+}
+
+fn inject_provider_mutation_case(invoke_getter: bool) {
     let base = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -1902,7 +1956,11 @@ fn inject_provider_mutation() {
     let ready = dir.join("mut.ready");
     let go = dir.join("mut.go");
     let done = dir.join("mut.done");
-    let child = std::process::Command::new(&driver)
+    let mut command = std::process::Command::new(&driver);
+    if !invoke_getter {
+        command.arg("--map-only");
+    }
+    let child = command
         .arg("--ready")
         .arg(&ready)
         .arg("--go")
@@ -1913,16 +1971,27 @@ fn inject_provider_mutation() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let driver_pid = child.id();
     let reaper = ChildReaper(child);
     wait_for(&ready, "mutate ready");
+    assert!(
+        std::fs::read_to_string(&ready)
+            .unwrap()
+            .contains(if invoke_getter {
+                "getter_calls=1"
+            } else {
+                "getter_calls=0"
+            })
+    );
     let coordinator_scope = FdScope::open("provider mutation coordinator lifetime");
     let mut coordinator = InventoryCoordinator::new(
         Scope::Pid(driver_pid),
         HookRegistry::builtin(),
         vec![prov.clone()],
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )
@@ -1940,14 +2009,23 @@ fn inject_provider_mutation() {
         .unwrap();
     coordinator.commit_batch(false).unwrap();
     // Atomic replace plus the driver's dlclose/dlopen: the same path
-    // resolves to a new physical instance. The FD scope covers the
-    // whole second pass — scans open files transiently and retain
-    // nothing new.
-    let scope = FdScope::open("provider mutation second pass");
+    // resolves to a new physical instance. The retained old pin acquires
+    // a deleted-path annotation; settle that intentional change before
+    // measuring the scan. The outer scope still checks its full lifetime.
     std::fs::copy(&v2, dir.join("mut-prov.staging")).unwrap();
     std::fs::rename(dir.join("mut-prov.staging"), &prov).unwrap();
     std::fs::write(&go, "go\n").unwrap();
     wait_for(&done, "mutate done");
+    assert!(
+        std::fs::read_to_string(&done)
+            .unwrap()
+            .contains(if invoke_getter {
+                "getter_calls=2"
+            } else {
+                "getter_calls=0"
+            })
+    );
+    let scope = FdScope::open("provider mutation second pass");
     let t1 = crate::discovery::caller_registry::now_ns();
     coordinator
         .scan_pass(
@@ -1960,7 +2038,55 @@ fn inject_provider_mutation() {
         )
         .unwrap();
     coordinator.commit_batch(false).unwrap();
-    scope.assert_delta(0);
+    // A second provider generation adds one coordinator-owned pin. Account
+    // for its exact new inode rather than allowing arbitrary FD growth;
+    // assert_delta also preserves every baseline pin, including the old one.
+    let after = FdScope::open("provider mutation retained pins");
+    let added: Vec<_> = after
+        .before
+        .iter()
+        .filter(|(fd, _)| !scope.before.contains_key(fd))
+        .collect();
+    if !invoke_getter {
+        assert!(
+            added.is_empty(),
+            "uninitialized tables add no retained pins"
+        );
+        scope.assert_delta(0);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        drop(coordinator);
+        coordinator_scope.assert_delta(0);
+        drop(reaper);
+        assert_workload_worker_reaped(driver_pid);
+        return;
+    }
+    assert_eq!(added.len(), 1, "only the new provider pin is retained");
+    let new_pin = added[0].1;
+    use std::os::unix::fs::MetadataExt as _;
+    let expected = std::fs::metadata(&prov).unwrap();
+    let old_link = PathBuf::from(format!("{} (deleted)", prov.display()));
+    assert!(scope.before.values().any(|old| {
+        old.link == old_link && (old.dev, old.ino) != (expected.dev(), expected.ino())
+    }));
+    assert_eq!(new_pin.link, prov);
+    assert_eq!(
+        (
+            new_pin.dev,
+            new_pin.ino,
+            new_pin.mode,
+            new_pin.rdev,
+            new_pin.pidfd_target,
+        ),
+        (
+            expected.dev(),
+            expected.ino(),
+            expected.mode(),
+            expected.rdev(),
+            None,
+        ),
+        "the added FD pins the replacement provider inode"
+    );
+    scope.assert_delta(1);
     let document = crate::inventory::render_json(&coordinator, "workload", t0, t1, 2);
     assert_settled(&document, 0);
     // One pid, one incarnation, still mapped: dlclose/dlopen is not exec.
@@ -2344,6 +2470,423 @@ fn injected_workloads_stay_within_rss_bound() {
 }
 
 // ---------------------------------------------------------------------------
+// C-H3: one isolated RSS cell for the H3 combined workload.
+// ---------------------------------------------------------------------------
+
+/// Stated peak-RSS bound for the H3 combined workload cell
+/// (sparse-4096 instances plus churned mechanisms/presentations,
+/// pending/replay, and H7–H9 output) in one isolated process. Same
+/// empirical 256 MiB gate as the injection battery, as its own const
+/// so the two gates evolve independently. Never a production cap.
+const H3_COMBINED_RSS_BOUND_BYTES: u64 = 256 << 20;
+
+/// H3 combined workload: the representative retained population in one
+/// isolated worker — sparse 4096 instances with completed reducers,
+/// two churn passes with fresh mechanisms and fresh presentations,
+/// pending calls held then joined, and the H7–H9 output path (emitter
+/// pass, JSON value, serialized buffer, joint observations). Prints
+/// its peak RSS; the parent asserts the bound.
+fn h3_combined_workload() {
+    use crate::discovery::caller_registry::instance_input as instance;
+    use crate::semantics_edge::SemanticCall;
+
+    const RSA_PSS: u64 = 0x000d;
+    const AES_GCM: u64 = 0x1087;
+
+    fn init(function: &str, session: u64, mechanism: u64, ts_ns: u64) -> SemanticCall {
+        use p11scope_ebpf_common::capture;
+        SemanticCall {
+            function: function.into(),
+            session,
+            mechanism,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    fn op(function: &str, session: u64, ts_ns: u64) -> SemanticCall {
+        use p11scope_ebpf_common::capture;
+        SemanticCall {
+            function: function.into(),
+            session,
+            capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    // Phase A: sparse 4096 — one caller, one module, N registered
+    // instances each with a sparse completed reducer (Init + Op).
+    let mut h = harness();
+    h.stage_scale(&ScaleSpec {
+        name: "h3-combined",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9200,
+    });
+    h.commit();
+    let caller = h
+        .coordinator()
+        .adapter()
+        .live_id(9200)
+        .expect("live caller");
+    let module = ModuleKey::physical(8, 1, 100_000, Some("sha000000".into()), "/scale/m0.so");
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let keys: Vec<_> = (0..4096)
+        .map(|index| {
+            instance::key(
+                domain,
+                ImageIdentity {
+                    task_cookie: 1000 + index as u64,
+                    exec_id: 0,
+                },
+                crate::discovery::instances::InstanceId::from_raw(index as u64 + 1),
+                module.clone(),
+            )
+        })
+        .collect();
+    for key in &keys {
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance(instance::registration(key.clone(), caller, 100, None));
+    }
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 4096);
+    for quantum in keys.chunks(512) {
+        for key in quantum {
+            h.coordinator_mut()
+                .registry_mut()
+                .observe_instance_semantic(instance::call(
+                    key.clone(),
+                    caller,
+                    instance::position(domain, 1),
+                    init("C_SignInit", 1, RSA_PSS, 101),
+                    None,
+                ));
+            h.coordinator_mut()
+                .registry_mut()
+                .observe_instance_semantic(instance::call(
+                    key.clone(),
+                    caller,
+                    instance::position(domain, 2),
+                    op("C_Sign", 1, 102),
+                    None,
+                ));
+        }
+        h.commit();
+    }
+    assert_eq!(
+        h.coordinator().registry().instance_semantic_occupied(),
+        4096
+    );
+    // Phase B: churn — two passes with fresh mechanisms, each with a
+    // fresh retained presentation (old+new generations stay live).
+    let mut presentations = vec![crate::inventory_present::Presentation::capture(
+        h.coordinator(),
+        "h3-combined",
+        0,
+        105,
+        1,
+    )];
+    for round in 0..2 {
+        for quantum in keys.chunks(512) {
+            for key in quantum {
+                h.coordinator_mut()
+                    .registry_mut()
+                    .observe_instance_semantic(instance::call(
+                        key.clone(),
+                        caller,
+                        instance::position(domain, 3 + round * 2),
+                        init("C_EncryptInit", 2, AES_GCM, 110 + round * 10),
+                        None,
+                    ));
+                h.coordinator_mut()
+                    .registry_mut()
+                    .observe_instance_semantic(instance::call(
+                        key.clone(),
+                        caller,
+                        instance::position(domain, 4 + round * 2),
+                        op("C_Encrypt", 2, 111 + round * 10),
+                        None,
+                    ));
+            }
+            h.commit();
+        }
+        presentations.push(crate::inventory_present::Presentation::capture(
+            h.coordinator(),
+            "h3-combined",
+            0,
+            120 + round * 10,
+            2 + round,
+        ));
+    }
+    for presentation in &presentations {
+        assert_eq!(presentation.instances.len(), 4096);
+        assert_eq!(presentation.semantic_edges.len(), 4096);
+    }
+    // Phase C: pending/replay — PENDING multi-part calls held across
+    // a commit (live pending occupancy proves the hold is real), then
+    // joined; completions move only after the join. The pending count
+    // sizes to measured pool headroom (a quarter of it at a generous
+    // 8 KiB per async fact, floored at 32): the combined load must
+    // leave room for pending traffic, and the floor fails loudly if
+    // charge drift ever eats that headroom.
+    let pool_after_churn = h.coordinator().registry().semantic_resource_snapshot();
+    let headroom = pool_after_churn
+        .limit_bytes
+        .saturating_sub(pool_after_churn.charged_bytes);
+    // A quarter of headroom at 16 KiB per key for the full
+    // open/hold/detach/complete cycle, floored at 32 meaningful
+    // keys; the asserts below fail loudly if charge drift ever
+    // eats that headroom.
+    //
+    // Owner capacity note (2026-10-19, both advisors agree): the ~365 KiB
+    // margin under this synthetic ceiling load is thin but held, and the
+    // floor below is the tripwire — no capacity decision now, 64 MiB stays.
+    // Flip to a capacity decision if: (1) the floor trips with refused>0 or
+    // lossy>0 on the pinned load; (2) any production-shaped (non-synthetic)
+    // load refuses S1; (3) margin drops below the pending-32 cost (~512 KiB).
+    // On flip: per-charge diet/admission tightening first, envelope raise
+    // second. Never assert retained_sum against the S1 pool (it mixes
+    // unapproved H9-side heaps).
+    let pending_n = (headroom / 4 / 16384).clamp(32, 512);
+    println!(
+        "H3_C_HEADROOM {{\"charged\": {}, \"limit\": {}, \"pending_n\": {pending_n}}}",
+        pool_after_churn.charged_bytes, pool_after_churn.limit_bytes
+    );
+    let completed_before: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref().map(|s| s.completed()))
+        .sum();
+    // Proven async shape (d1_async_pending_flow_completes): an init
+    // starts the operation, the PENDING op queues against that live
+    // machine, and AsyncComplete replays it to completion. (GetID
+    // detach needs an explicitly opened session and its own pool
+    // headroom; the probe's occupancy asserts already pin detached
+    // accounting, so the cell keeps the completion cycle.)
+    for key in keys.iter().take(pending_n) {
+        h.coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(instance::call(
+                key.clone(),
+                caller,
+                instance::position(domain, 7),
+                init("C_SignInit", 7, RSA_PSS, 129),
+                None,
+            ));
+        h.coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(instance::call(
+                key.clone(),
+                caller,
+                instance::position(domain, 8),
+                SemanticCall {
+                    rv: pkcs11_types::CkRv::PENDING.0,
+                    ..op("C_Sign", 7, 130)
+                },
+                None,
+            ));
+    }
+    h.commit();
+    let completed_held: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref().map(|s| s.completed()))
+        .sum();
+    assert_eq!(
+        completed_held, completed_before,
+        "pending calls hold without completing"
+    );
+    let (pending_held, pending_edges, detached_held, dropped_sum, orphans_sum): (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    ) = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref())
+        .map(|s| {
+            let usage = s.resource_usage();
+            (
+                usage.pending_calls as u64,
+                u64::from(usage.pending_calls > 0),
+                usage.detached_calls as u64,
+                s.dropped(),
+                s.orphans(),
+            )
+        })
+        .fold((0, 0, 0, 0, 0), |acc, x| {
+            (
+                acc.0 + x.0,
+                acc.1 + x.1,
+                acc.2 + x.2,
+                acc.3 + x.3,
+                acc.4 + x.4,
+            )
+        });
+    println!(
+        "H3_C_DIAG pending={pending_held} pending_edges={pending_edges} \
+         detached={detached_held} dropped={dropped_sum} orphans={orphans_sum}"
+    );
+    let lossy_edges = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter(|row| row.lossy)
+        .count();
+    let historical_sum: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .map(|row| row.historical_only_returns)
+        .sum();
+    let gaps: std::collections::BTreeMap<String, usize> =
+        h.coordinator().registry().gaps().iter().fold(
+            std::collections::BTreeMap::new(),
+            |mut acc, gap| {
+                *acc.entry(format!("{}:{}", gap.subject, gap.reason))
+                    .or_insert(0) += 1;
+                acc
+            },
+        );
+    println!(
+        "H3_C_DIAG2 lossy_edges={lossy_edges} historical_only={historical_sum} \
+         semantic_refused={} gaps={gaps:?}",
+        h.coordinator().registry().instance_semantic_refused(),
+    );
+    assert_eq!(
+        pending_held, pending_n as u64,
+        "every sized pending call holds live"
+    );
+    assert_eq!(lossy_edges, 0, "no refusal invalidates the cell");
+    assert_eq!(
+        h.coordinator().registry().instance_semantic_refused(),
+        0,
+        "the sized cell refuses nothing"
+    );
+    for key in keys.iter().take(pending_n) {
+        h.coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(instance::call(
+                key.clone(),
+                caller,
+                instance::position(domain, 9),
+                SemanticCall {
+                    target_function: crate::kinds::function_id("C_Sign").unwrap(),
+                    async_value: 91,
+                    ..op("C_AsyncComplete", 7, 131)
+                },
+                None,
+            ));
+    }
+    h.commit();
+    let pending_left: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| {
+            row.semantics
+                .as_ref()
+                .map(|s| s.resource_usage().pending_calls as u64)
+        })
+        .sum();
+    assert_eq!(pending_left, 0, "every hold replays to completion");
+    let (detached_left, orphans_after, failed_after): (u64, u64, u64) = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref())
+        .map(|s| {
+            (
+                s.resource_usage().detached_calls as u64,
+                s.orphans(),
+                s.failed(),
+            )
+        })
+        .fold((0, 0, 0), |acc, x| (acc.0 + x.0, acc.1 + x.1, acc.2 + x.2));
+    println!(
+        "H3_C_DIAG3 detached_left={detached_left} orphans={orphans_after} \
+         failed={failed_after} refused={} lossy={}",
+        h.coordinator().registry().instance_semantic_refused(),
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .filter(|row| row.lossy)
+            .count(),
+    );
+    let completed_joined: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref().map(|s| s.completed()))
+        .sum();
+    assert_eq!(
+        completed_joined,
+        completed_held + pending_n as u64,
+        "every detached async completes exactly once"
+    );
+    // Phase D: H7–H9 output — emitter pass, JSON value, serialized
+    // buffer, and joint observations over the saturated population.
+    let presentation = presentations.last().unwrap();
+    let limit = presentation.budgets.instances_limit;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("h3-combined.jsonl");
+    let mut writer = crate::inventory_events::EventWriter::create(&path, 1 << 30, 5).unwrap();
+    let mut emitter = crate::inventory_events::InstanceEmitter::new();
+    let emission = emitter
+        .emit(
+            &mut writer,
+            &presentation.instances,
+            &presentation.semantic_edges,
+            limit,
+            140,
+        )
+        .unwrap();
+    assert_eq!(
+        emission.instance_emitted + emission.edge_emitted,
+        crate::inventory_events::INSTANCE_EVENTS_PER_PASS,
+        "the saturated pass fills the quota"
+    );
+    let document = crate::inventory::render_json_from_presentation(presentation);
+    assert_eq!(document["instances"].as_array().unwrap().len(), 4096);
+    let serialized = serde_json::to_vec(&document).unwrap();
+    assert!(!serialized.is_empty());
+    let observations = h.coordinator().registry().joint_observations(1);
+    std::hint::black_box((observations, serialized, presentations, keys));
+    println!("WORKLOAD_RSS_HWM_BYTES {}", peak_rss_bytes());
+}
+
+#[test]
+fn h3_combined_workload_stays_within_rss_bound() {
+    let output = run_workload_worker("h3-combined", std::time::Duration::from_secs(120));
+    assert_workload_worker_reaped(output.pid);
+    let stdout = output.result.expect("the H3 combined worker runs green");
+    let hwm: u64 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("WORKLOAD_RSS_HWM_BYTES ")?.parse().ok())
+        .expect("the worker prints its peak RSS");
+    println!("H3_COMBINED_RSS_HWM_BYTES {hwm}");
+    assert!(
+        hwm < H3_COMBINED_RSS_BOUND_BYTES,
+        "H3 combined peak RSS {hwm} bytes stays within {H3_COMBINED_RSS_BOUND_BYTES}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // C1b: callers past the deep-scan cap, through the coordinator.
 // ---------------------------------------------------------------------------
 
@@ -2435,6 +2978,11 @@ mod c1b {
         };
         let mut processes: Vec<ProcessRecord> = (REP..REP + CALLERS)
             .map(|pid| ProcessRecord {
+                application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                    crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                ),
+                complete_scan: None,
+                hints_examined: pid == REP,
                 pid,
                 status: if pid == REP {
                     MemberStatus::Scanned
@@ -2453,6 +3001,11 @@ mod c1b {
             })
             .collect();
         processes.extend((20_000..20_000 + IDLE).map(|pid| ProcessRecord {
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            complete_scan: None,
+            hints_examined: false,
             pid,
             status: MemberStatus::NotSelected { loss: None },
             objects: Vec::new(),
@@ -2484,6 +3037,8 @@ mod c1b {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            excluded: Vec::new(),
+            exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
         }
     }

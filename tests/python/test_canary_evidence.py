@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from unittest import mock
 
 
@@ -98,13 +99,10 @@ def owned_metrics_document(bits, calls=30):
         sources=("scan", "manifest"),
         discovery_skipped=0,
     )
-    evidence["discovery"][0]["tables"] = [
-        {"source": source, "version": list(version), "entries": entries}
-        for (source, version, entries), count in subject.VERSION_TABLES_SCANNED.items()
-        for _ in range(count)
-    ]
+    evidence["discovery"][0]["tables"] = subject.version_tables_fixture(
+        subject.VERSION_TABLES_SCANNED)
     evidence.update(
-        table_entries=988,
+        table_entries=1056,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -131,14 +129,14 @@ def owned_metrics_document(bits, calls=30):
         evidence["discovery"][0]["corroboration"] = ["conflict"]
     else:
         evidence["surfaces"].extend([
-            {"walk": "full", "functions": functions, "acquisition": "ok",
+            {"walk": walk, "functions": functions, "acquisition": "ok",
              "source": f"/opt/p11.so table {major}.{minor}"}
-            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+            for major, minor, functions, walk in (
+                (3, 1, 92, "full"), (3, 2, 104, "full"),
+                (3, 9, 104, "known_prefix"))
         ])
-        evidence["discovery"][0]["tables"].extend([
-            {"source": "scan", "version": [3, 1], "entries": 92},
-            {"source": "scan", "version": [3, 2], "entries": 104},
-        ])
+        evidence["discovery"][0]["tables"] = subject.version_tables_fixture(
+            subject.VERSION_TABLES_SCANNED_IA32)
         evidence["discovery"][0].update(corroborated=True, corroboration=["agreed"])
     document = subject.document_fixture(
         evidence,
@@ -295,7 +293,7 @@ class TaskStorageInventoryTests(unittest.TestCase):
              "key_size": 4, "value_size": 8, "max_entries": 0,
              "oracle": dumper.map_oracle({"name": "TASK_COOKIE", "type": "task_storage"})},
             {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
-             "key_size": 4, "value_size": 544, "max_entries": 0,
+             "key_size": 4, "value_size": 560, "max_entries": 0,
              "oracle": dumper.map_oracle({"name": "THREAD_OWNER", "type": "task_storage"})},
             {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
              "key_size": 4, "value_size": 8, "max_entries": 0,
@@ -331,13 +329,13 @@ class TaskStorageReaderTests(unittest.TestCase):
          "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
          "max_entries": 0, "map_flags": 1},
         {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
-         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 544,
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 560,
          "max_entries": 0, "map_flags": 1},
         {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
          "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
          "max_entries": 0, "map_flags": 1},
         {"name": "PROC_EPOCH", "id": 111, "type": "task_storage",
-         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 144,
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 152,
          "max_entries": 0, "map_flags": 1},
     ]
     # The frozen Task 2 D2 seeded surface the qualification canary reads.
@@ -350,8 +348,8 @@ class TaskStorageReaderTests(unittest.TestCase):
         ) + value
 
     def complete_stream(self):
-        owner = bytearray(544)
-        owner[536:] = b"LATEBYTE"
+        owner = bytearray(560)
+        owner[552:] = b"LATEBYTE"
         return b"".join([
             self.frame(1, 101, 7001, 7001, b"COOKIE01"),
             self.frame(1, 102, 7001, 7002, bytes(owner)),
@@ -505,7 +503,7 @@ class TaskStorageReaderTests(unittest.TestCase):
             obj.write_bytes(b"object")
             cases = (
                 (1, 8, 9.25, self.frame(1, 101, 7001, 7001, b"COOKIE01") + self.frame(2)),
-                (3, 560, 8.5, self.complete_stream()),
+                (3, 576, 8.5, self.complete_stream()),
                 (131072, 64 * 1024 * 1024, 60, self.frame(2)),
             )
             for maximum_records, maximum_bytes, timeout, stream in cases:
@@ -528,15 +526,15 @@ class TaskStorageReaderTests(unittest.TestCase):
                         str(obj), "4294967295", str(maximum_records), str(maximum_bytes),
                         str(int(timeout * 1000)),
                         "TASK_COOKIE:101:task_storage:4:8:0:1",
-                        "THREAD_OWNER:102:task_storage:4:544:0:1",
+                        "THREAD_OWNER:102:task_storage:4:560:0:1",
                         "ROOT_AFFILIATION:103:task_storage:4:8:0:1",
-                        "PROC_EPOCH:111:task_storage:4:144:0:1",
+                        "PROC_EPOCH:111:task_storage:4:152:0:1",
                     ])
                     parsed = dumper.parse_task_storage_frames(
                         actual, self.MAPS, max_records=maximum_records, max_bytes=maximum_bytes)
                     self.assertEqual(len(parsed), 0 if maximum_records == 131072 else maximum_records)
                     if maximum_records == 3:
-                        self.assertEqual(parsed[1]["value"][536:], b"LATEBYTE")
+                        self.assertEqual(parsed[1]["value"][552:], b"LATEBYTE")
                     if maximum_records < 4:
                         self.assertEqual(len(actual), maximum_bytes + (maximum_records + 1) * 28)
 
@@ -682,13 +680,13 @@ class TaskStorageReaderTests(unittest.TestCase):
             self.complete_stream(), self.MAPS, max_records=8, max_bytes=4096
         )
         self.assertEqual(len(records), 3)
-        self.assertEqual(len(records[1]["value"]), 544)
-        self.assertEqual(records[1]["value"][536:], b"LATEBYTE")
+        self.assertEqual(len(records[1]["value"]), 560)
+        self.assertEqual(records[1]["value"][552:], b"LATEBYTE")
         with tempfile.TemporaryDirectory() as directory:
             paths = dumper.publish_task_storage_surfaces(
                 Path(directory), "case", self.MAPS, records
             )
-            self.assertEqual(Path(paths["THREAD_OWNER"]).read_bytes()[536:], b"LATEBYTE")
+            self.assertEqual(Path(paths["THREAD_OWNER"]).read_bytes()[552:], b"LATEBYTE")
             self.assertTrue(all((Path(path).stat().st_mode & 0o777) == 0o600
                                 for path in paths.values()))
 
@@ -1799,10 +1797,10 @@ class StoppedPopulationTests(unittest.TestCase):
     """Valid EOF and byte counts cannot substitute for exact stopped owners."""
 
     @staticmethod
-    def epoch_value(slots=(1, 6), epochs=(2, 1), flags=0, exec_gen=3):
+    def epoch_value(slots=(1, 6), epochs=(2, 1), flags=0, exec_gen=3, marker=0):
         cells = list(slots) + [0] * (8 - len(slots))
         counts = list(epochs) + [0] * (8 - len(epochs))
-        return struct.pack("<18Q", *cells, *counts, flags, exec_gen)
+        return struct.pack("<19Q", *cells, *counts, flags, exec_gen, marker)
 
     def fixture(self, root, *, owned=False, empty=False):
         tasks = [
@@ -1844,6 +1842,9 @@ class StoppedPopulationTests(unittest.TestCase):
         manifest.append({"id": 110, "name": "CGROUP_FILTER", "type": "cgroup_array",
                          "key_size": 4, "value_size": 4, "max_entries": 1,
                          "map_flags": 0, "oracle": "refused-lookup"})
+        manifest.append({"id": 112, "name": "INSTANCE_GEN", "type": "array",
+                         "key_size": 4, "value_size": 8, "max_entries": 4,
+                         "map_flags": 1024, "oracle": "dump"})
         records = []
         for task in tasks:
             for name, map_id, flag in (("TASK_COOKIE", 101, "cookie"),
@@ -1853,7 +1854,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     continue
                 value = struct.pack("<Q", 3 if flag == "cookie" else 1)
                 if flag == "owner":
-                    value = bytearray(544)
+                    value = bytearray(560)
                     struct.pack_into("<Q", value, 0, (task["pid"] << 32) | task["tid"])
                     # Valid production discovery directory and both late fields.
                     struct.pack_into("<Q", value, 8, 47)
@@ -1890,7 +1891,9 @@ class StoppedPopulationTests(unittest.TestCase):
                 path = load_subject(TARGET_BITS).ring_raw_path(str(root / "case"), name)
                 content = b""
             else:
-                path = root / f"mapdump_{name}.bin"
+                # Match production: dump/refusal JSON, raw task-storage bytes.
+                suffix = ".bin" if item["type"] == "task_storage" else ".json"
+                path = root / f"mapdump_{name}{suffix}"
                 item["file"] = str(path)
                 if item["type"] == "task_storage":
                     content = b"".join(row["value"] for row in parsed if row["map_id"] == item["id"])
@@ -1898,6 +1901,8 @@ class StoppedPopulationTests(unittest.TestCase):
                     words = controls[name]
                     raw = struct.pack("<" + "Q" * len(words), *words)
                     content = json.dumps([{"key": [0, 0, 0, 0], "value": list(raw)}]).encode()
+                elif name == "INSTANCE_GEN":
+                    content = json.dumps(self.generation_cells()).encode()
                 elif item["type"] == "cgroup_array":
                     content = json.dumps(refusals.get(name, refusal_cells(item))).encode()
                 else:
@@ -1911,7 +1916,9 @@ class StoppedPopulationTests(unittest.TestCase):
                 records_kept = len(content) // subject.RING_RECORD_SIZES[name]
                 surface["positions"] = [
                     drained, drained + subject.RING_RECORD_STRIDES[name] * records_kept]
-            if item["type"] == "task_storage":
+            if name == "PROC_EPOCH":
+                surface.update(phase="sampled", record_count=len(content) // 152)
+            elif item["type"] == "task_storage":
                 surface["records"] = [{k: row[k] for k in ("pid", "tid", "generation")}
                                       for row in records if row["map_id"] == item["id"]]
             receipt["surfaces"].append(surface)
@@ -1923,6 +1930,296 @@ class StoppedPopulationTests(unittest.TestCase):
     def check(self, root, manifest):
         return load_subject(TARGET_BITS).owned_map_surfaces(
             "population", manifest, {item["name"] for item in manifest}, str(root / "case"))
+
+    @staticmethod
+    def generation_cells(attach=9):
+        return [{"key": list(struct.pack("<I", index)),
+                 "value": list(struct.pack("<Q", value))}
+                for index, value in enumerate((0, attach, 0, 0))]
+
+    def generation_sample(self):
+        return {"id": 112, "name": "INSTANCE_GEN", "type": "array", "oracle": "dump",
+                "bytes_key": 4, "bytes_value": 8, "max_entries": 4, "map_flags": 1024,
+                "cells": self.generation_cells()}
+
+    def test_global_epoch_sample_retains_real_native_birth_and_exec_values(self):
+        # Compose the real wrapper/hooks, then consume their actual record
+        # bytes at the reconciler and receipt replay seams. The owned child's
+        # identity deliberately does not join this canary workload roster.
+        source = r'''
+#define main existing_epoch_regressions
+#include "tests/fixtures/instance-epoch/helper_tests.c"
+#undef main
+int main(void) {
+    stop_gate_map_lookup = lookup;
+    bpf_get_current_task_btf = birth_current_task;
+    inst_map_lookup = lookup; inst_map_update = update; inst_map_delete = delete;
+    inst_pid_tgid = tgid; inst_probe_read_kernel = probe;
+    inst_storage_get = storage; inst_current_task = task;
+    leader.group_leader = &leader; leader.mm = &mm;
+    reset();
+    u64 ctx[2] = { (u64)&child, INST_CLONE_VM };
+    assert(task_newtask(ctx) == 0 && record_present[1]);
+    assert(records[1].flags == INST_RECORD_SHARED_MM && scope_calls == 1);
+    assert(fwrite(&records[1], sizeof(records[1]), 1, stdout) == 1);
+    current_task = &child; gen[INST_GEN_ATTACH] = 7;
+    assert(p11_instance_exec() == 1 && !records[1].flags);
+    assert(fwrite(&records[1], sizeof(records[1]), 1, stdout) == 1);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            harness, binary = root / "epoch.c", root / "epoch"
+            harness.write_text(source)
+            compiled = subprocess.run([
+                "clang-18", "-O2", "-g", "-Wall", "-Wextra", "-Werror",
+                "-Wno-unknown-attributes", "-I", str(ROOT),
+                "-I", str(ROOT / "crates/ebpf/native"), str(harness), "-o", str(binary),
+            ], capture_output=True, timeout=30)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr.decode())
+            produced = subprocess.run([str(binary)], capture_output=True, timeout=5)
+            self.assertEqual(produced.returncode, 0, produced.stderr.decode())
+            self.assertEqual(len(produced.stdout), 304)
+            self.assertEqual(produced.stdout[:152], self.epoch_value((), (), 4, 0))
+            self.assertEqual(produced.stdout[152:], self.epoch_value((), (), 0, 7))
+            maps, records, arguments = self.reconciliation_fixture()
+            outside = [{"map_id": 111, "pid": pid, "tid": pid, "value": value}
+                       for pid, value in ((8801, produced.stdout[:152]),
+                                          (8802, produced.stdout[152:]))]
+            records = [row for row in records if row["map_id"] != 111] + outside
+            bound = load_dumper().reconcile_task_storage(maps, records, **arguments)
+            self.assertEqual(set(bound), {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"})
+            manifest, receipt, _, controls = self.fixture(root)
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            surface = next(row for row in receipt["surfaces"] if row["id"] == 111)
+            self.assertEqual(set(surface), {
+                "id", "acquisition_id", "phase", "size", "sha256", "record_count"})
+            self.assertEqual((surface["phase"], surface["record_count"], surface["size"]),
+                             ("sampled", 2, 304))
+            self.assertNotIn("8801", json.dumps(receipt))
+            self.assertNotIn("8802", json.dumps(receipt))
+            raw_path = Path(next(item["file"] for item in manifest if item["id"] == 111))
+            self.assertEqual(raw_path.read_bytes(), produced.stdout)
+            self.assertEqual(len(self.check(root, manifest)), 12)
+
+    def reconciliation_fixture(self):
+        manifest, receipt, records, values = self.fixture(Path("/unused"))
+        controls = {}
+        for item in manifest:
+            if item["name"] in values:
+                words = values[item["name"]]
+                controls[item["name"]] = {
+                    "id": item["id"], "name": item["name"], "type": item["type"],
+                    "oracle": item["oracle"], "bytes_key": item["key_size"],
+                    "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+                    "map_flags": item["map_flags"],
+                    "value": struct.pack("<" + "Q" * len(words), *words),
+                }
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = controls
+        arguments["instance_gen"] = self.generation_sample()
+        return copy.deepcopy(TaskStorageReaderTests.MAPS), records, arguments
+
+    def test_epoch_acquisition_rejects_nonleaders_duplicates_and_invalid_values(self):
+        for case in ("nonleader", "duplicate", "zero-pid", "zero-tid", "unknown-map",
+                     "short", "journal-word", "journal-word-high", "future-attach"):
+            with self.subTest(case=case):
+                maps, records, arguments = self.reconciliation_fixture()
+                row = {"map_id": 111, "pid": 8801, "tid": 8801,
+                       "value": self.epoch_value((), (), 4, 0)}
+                if case == "nonleader":
+                    row["tid"] = 8802
+                elif case == "zero-pid":
+                    row["pid"] = 0
+                elif case == "zero-tid":
+                    row["tid"] = 0
+                elif case == "unknown-map":
+                    row["map_id"] = 999
+                elif case == "short":
+                    row["value"] = bytes(151)
+                elif case == "journal-word":
+                    row["value"] = self.epoch_value(marker=3)
+                elif case == "journal-word-high":
+                    row["value"] = self.epoch_value(marker=4)
+                elif case == "future-attach":
+                    row["value"] = self.epoch_value(exec_gen=10)
+                extra = [row, dict(row)] if case == "duplicate" else [row]
+                with self.assertRaises(RuntimeError):
+                    load_dumper().reconcile_task_storage(maps, records + extra, **arguments)
+
+    def test_epoch_acquisition_accepts_published_marker_words(self):
+        for marker, exec_gen in ((1, 0), ((7 << 2) | 2, 3), (2, 9)):
+            with self.subTest(marker=marker):
+                maps, records, arguments = self.reconciliation_fixture()
+                records.append({"map_id": 111, "pid": 8801, "tid": 8801,
+                                "value": self.epoch_value(marker=marker, exec_gen=exec_gen)})
+                bound = load_dumper().reconcile_task_storage(maps, records, **arguments)
+                self.assertEqual(set(bound), {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"})
+
+    def test_epoch_acquisition_rejects_invalid_marker_words(self):
+        for marker, exec_gen in ((3, 3), (4, 3), (5, 3), ((7 << 2) | 2, 0)):
+            with self.subTest(marker=marker, exec_gen=exec_gen):
+                maps, records, arguments = self.reconciliation_fixture()
+                records.append({"map_id": 111, "pid": 8801, "tid": 8801,
+                                "value": self.epoch_value(marker=marker, exec_gen=exec_gen)})
+                with self.assertRaises(RuntimeError):
+                    load_dumper().reconcile_task_storage(maps, records, **arguments)
+
+    def test_epoch_generation_sample_requires_exact_map_and_complete_distinct_cells(self):
+        for case in ("absent", "duplicate-id", "control-id", "name", "type", "key-size",
+                     "value-size", "capacity", "flags", "missing-key", "duplicate-key",
+                     "foreign-key", "short-value", "boolean-byte", "extra-field"):
+            with self.subTest(case=case):
+                maps, records, arguments = self.reconciliation_fixture()
+                sample = arguments["instance_gen"]
+                mutations = {"duplicate-id": ("id", 111), "control-id": ("id", 104),
+                             "name": ("name", "G_EPOCH"), "type": ("type", "hash"),
+                             "key-size": ("bytes_key", 8), "value-size": ("bytes_value", 16),
+                             "capacity": ("max_entries", 5), "flags": ("map_flags", 0)}
+                if case in mutations:
+                    key, value = mutations[case]
+                    sample[key] = value
+                elif case == "absent":
+                    arguments["instance_gen"] = None
+                elif case == "missing-key":
+                    sample["cells"].pop()
+                elif case == "duplicate-key":
+                    sample["cells"][1]["key"] = [0, 0, 0, 0]
+                elif case == "foreign-key":
+                    sample["cells"][3]["key"] = [4, 0, 0, 0]
+                elif case == "short-value":
+                    sample["cells"][1]["value"].pop()
+                elif case == "boolean-byte":
+                    sample["cells"][1]["value"][0] = True
+                else:
+                    sample["cells"][1]["extra"] = 1
+                with self.assertRaises(RuntimeError):
+                    load_dumper().reconcile_task_storage(maps, records, **arguments)
+
+    def test_sampled_epoch_receipt_requires_exact_shape_counts_and_all_values(self):
+        for case in ("healthy", "empty", "phase", "missing-phase", "records", "extra",
+                     "missing-count", "negative-count", "boolean-count", "oversized-count", "aggregate-count",
+                     "zero-nonempty", "too-many", "digest", "size", "missing-map",
+                     "wrong-type", "wrong-value-size", "missing-generation", "generation-key",
+                     "journal-word", "journal-word-high", "future-attach", "late-malformed-value"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                records[:] = [r for r in records if r["map_id"] != 111]
+                values = [self.epoch_value((), (), 4, 0), self.epoch_value(exec_gen=7)]
+                if case == "empty":
+                    values.clear()
+                elif case in ("journal-word", "journal-word-high", "future-attach", "late-malformed-value"):
+                    values[1] = {"journal-word": self.epoch_value(marker=3),
+                                 "journal-word-high": self.epoch_value(marker=4),
+                                 "future-attach": self.epoch_value(exec_gen=10),
+                                 "late-malformed-value": self.epoch_value(flags=1)}[case]
+                records.extend({"map_id": 111, "pid": 8801 + index, "tid": 8801 + index,
+                                "value": value} for index, value in enumerate(values))
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                surface = next(row for row in receipt["surfaces"] if row["id"] == 111)
+                if case == "phase":
+                    surface["phase"] = "stopped"
+                elif case == "missing-phase":
+                    surface.pop("phase")
+                elif case == "records":
+                    surface["records"] = []
+                elif case == "extra":
+                    surface["leader_validated"] = True
+                elif case == "missing-count":
+                    surface.pop("record_count")
+                elif case in ("negative-count", "boolean-count", "oversized-count", "aggregate-count", "zero-nonempty", "too-many"):
+                    surface["record_count"] = {"negative-count": -1, "boolean-count": True,
+                                               "oversized-count": 131073, "zero-nonempty": 0,
+                                               "aggregate-count": 131072, "too-many": 3}[case]
+                elif case == "digest":
+                    surface["sha256"] = "0" * 64
+                elif case == "size":
+                    surface["size"] -= 1
+                elif case in ("missing-map", "missing-generation"):
+                    name = "PROC_EPOCH" if case == "missing-map" else "INSTANCE_GEN"
+                    item = next(item for item in manifest if item["name"] == name)
+                    manifest.remove(item)
+                    receipt["surfaces"][:] = [row for row in receipt["surfaces"] if row["id"] != item["id"]]
+                elif case in ("wrong-type", "wrong-value-size"):
+                    item = next(item for item in manifest if item["name"] == "PROC_EPOCH")
+                    item["type" if case == "wrong-type" else "value_size"] = "hash" if case == "wrong-type" else 144
+                elif case == "generation-key":
+                    item = next(item for item in manifest if item["name"] == "INSTANCE_GEN")
+                    cells = self.generation_cells()
+                    cells[1]["key"] = [0, 0, 0, 0]
+                    raw = json.dumps(cells).encode()
+                    Path(item["file"]).write_bytes(raw)
+                    generation_surface = next(row for row in receipt["surfaces"] if row["id"] == item["id"])
+                    generation_surface.update(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                (root / "snapshot.json").write_text(json.dumps(receipt))
+                if case in ("healthy", "empty"):
+                    self.assertEqual(len(self.check(root, manifest)), 12)
+                else:
+                    message = {"aggregate-count": "count bound",
+                               "generation-key": "duplicate key",
+                               "wrong-value-size": "metadata mismatch"}.get(case, "stopped")
+                    with self.assertRaisesRegex(AssertionError, message):
+                        self.check(root, manifest)
+
+    def test_outside_epoch_control_bytes_reach_replay_and_final_privacy_scan(self):
+        subject = load_subject(TARGET_BITS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root)
+            records[:] = [row for row in records if row["map_id"] != 111]
+            raw = bytearray(self.epoch_value(range(1, 9), (0,) * 8))
+            sentinel = subject.SENTINELS["PIN"]
+            self.assertLessEqual(len(sentinel), 64)
+            # Epoch counters have no scalar range bound; the shape remains
+            # valid, so only scanning all retained control bytes finds this.
+            raw[64:64 + len(sentinel)] = sentinel
+            records.append({"map_id": 111, "pid": 8801, "tid": 8801, "value": bytes(raw)})
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            surfaces = self.check(root, manifest)
+            path = Path(next(item["file"] for item in manifest if item["name"] == "PROC_EPOCH"))
+            self.assertIn(path, surfaces)
+            self.assertEqual(path.read_bytes(), raw)
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy(surfaces)
+            # A sentinel in the inactive tail is independently invalid at
+            # replay, even after a matching size/digest is supplied.
+            raw[144:152] = sentinel[:8]
+            path.write_bytes(raw)
+            surface = next(row for row in receipt["surfaces"] if row["id"] == 111)
+            surface["sha256"] = hashlib.sha256(raw).hexdigest()
+            (root / "snapshot.json").write_text(json.dumps(receipt))
+            with self.assertRaises(AssertionError):
+                self.check(root, manifest)
+
+    def test_foreign_task_storage_error_has_only_finite_fields(self):
+        # Losing the typed failure (or permitting a foreign row) must not hide
+        # which finite map/relation failed after the coordinator sanitizes it.
+        dumper = load_dumper()
+        for map_id, name, size in ((101, "TASK_COOKIE", 8), (102, "THREAD_OWNER", 560),
+                                   (103, "ROOT_AFFILIATION", 8)):
+            for relation, pid, tid, leader in (
+                ("outside-roster", 8888, 8888, True),
+                ("outside-roster", 8888, 8889, False),
+                ("wrong-group", 7002, 7002, True),
+                ("wrong-group", 8888, 7002, False),
+            ):
+                with self.subTest(map=name, relation=relation, leader=leader):
+                    maps, records, arguments = self.reconciliation_fixture()
+                    foreign = {"map_id": map_id, "pid": pid, "tid": tid,
+                               "generation": 123456789, "value": bytes(size)}
+                    with self.assertRaises(RuntimeError) as caught:
+                        dumper.reconcile_task_storage(maps, [foreign, *records], **arguments)
+                    error = caught.exception
+                    self.assertEqual(type(error).__name__, "TaskStoragePopulationError")
+                    self.assertIs(type(error), dumper.TaskStoragePopulationError)
+                    self.assertEqual((error.map_name, error.relation, error.leader),
+                                     (name, relation, leader))
+                    self.assertIs(type(error.leader), bool)
+                    self.assertEqual(dumper.population_diagnostic(error),
+                                     f"task-storage map={name} relation={relation} "
+                                     f"leader={'yes' if leader else 'no'}")
 
     def test_exact_external_owned_and_permitted_empty_populations(self):
         stride = load_subject(TARGET_BITS).RING_RECORD_STRIDES["DISCOVERY"]
@@ -1939,7 +2236,7 @@ class StoppedPopulationTests(unittest.TestCase):
                 # An owned acquisition files a DISCOVERY ring its own observer
                 # already drained: every record consumed, nothing retained.
                 self.publish_fixture(root, *args, drained=5 * stride if owned else 0)
-                self.assertEqual(len(self.check(root, args[0])), 11)
+                self.assertEqual(len(self.check(root, args[0])), 12)
 
     def test_framed_records_bind_generations_for_future_coordinator(self):
         dumper = load_dumper()
@@ -1961,12 +2258,12 @@ class StoppedPopulationTests(unittest.TestCase):
             stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
         arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
         arguments["controls"] = controls
+        arguments["instance_gen"] = self.generation_sample()
         self.assertEqual(dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, parsed, **arguments), {
             "TASK_COOKIE": [{"pid": 7001, "tid": 7001, "generation": 900}],
             "THREAD_OWNER": [{"pid": 7001, "tid": 7002, "generation": 901},
                              {"pid": 7001, "tid": 7003, "generation": 902}],
             "ROOT_AFFILIATION": [],
-            "PROC_EPOCH": [{"pid": 7001, "tid": 7001, "generation": 900}],
         })
         for key in ("expected", "before", "after"):
             with self.subTest(bound=key):
@@ -1978,17 +2275,18 @@ class StoppedPopulationTests(unittest.TestCase):
 
     def test_idle_owner_storage_is_leaseless_and_roster_bound(self):
         # The native owner keeps a thread's storage after its first call and
-        # clears it when the lease returns: 544 zero bytes, no lease. It may
-        # belong to any stopped in-process task that is not expected to hold
-        # a lease, and never counts toward OWNER_CTL outstanding.
+        # clears the lease state when the lease returns: 560 zero bytes (an
+        # idle Detailed row; Inventory rows stay 544 zero bytes), no lease.
+        # It may belong to any stopped in-process task that is not expected
+        # to hold a lease, and never counts toward OWNER_CTL outstanding.
         idle = {"map_id": 102, "pid": 7001, "tid": 7001, "generation": 900,
-                "value": bytes(544)}
+                "value": bytes(560)}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, receipt, records, controls = self.fixture(root)
             records.append(dict(idle))
             self.publish_fixture(root, manifest, receipt, records, controls)
-            self.assertEqual(len(self.check(root, manifest)), 11)
+            self.assertEqual(len(self.check(root, manifest)), 12)
         for case in ("foreign", "expected-lease", "not-zero", "counted"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -2001,7 +2299,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     records[:] = [r for r in records if not (r["map_id"] == 102 and r["tid"] == 7002)]
                     row.update(tid=7002, generation=901)
                 elif case == "not-zero":
-                    value = bytearray(544)
+                    value = bytearray(560)
                     struct.pack_into("<Q", value, 0, (7001 << 32) | 7001)
                     row["value"] = bytes(value)
                 else:
@@ -2010,6 +2308,16 @@ class StoppedPopulationTests(unittest.TestCase):
                 self.publish_fixture(root, manifest, receipt, records, controls)
                 with self.assertRaisesRegex(AssertionError, "stopped"):
                     self.check(root, manifest)
+        # H8 slice A: an idle Detailed row keeps nonzero lifetime words
+        # past its zeroed lease prefix, and still counts as idle.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root)
+            row = dict(idle)
+            row["value"] = bytes(544) + struct.pack("<QQ", 7, 3)
+            records.append(row)
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            self.assertEqual(len(self.check(root, manifest)), 12)
 
     def test_idle_owner_first_does_not_shadow_affiliated_records(self):
         # An idle THREAD_OWNER for a task must not collide with that same
@@ -2019,7 +2327,7 @@ class StoppedPopulationTests(unittest.TestCase):
         dumper = load_dumper()
         manifest, receipt, records, values = self.fixture(Path("/unused"), owned=True)
         records.insert(0, {"map_id": 102, "pid": 7001, "tid": 7001,
-                           "generation": 900, "value": bytes(544)})
+                           "generation": 900, "value": bytes(560)})
         controls = {}
         for item in manifest:
             if item["name"] in values:
@@ -2037,6 +2345,7 @@ class StoppedPopulationTests(unittest.TestCase):
             stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
         arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
         arguments["controls"] = controls
+        arguments["instance_gen"] = self.generation_sample()
         bound = dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, parsed, **arguments)
         self.assertEqual(bound["THREAD_OWNER"], [
             {"pid": 7001, "tid": 7002, "generation": 901},
@@ -2069,14 +2378,14 @@ class StoppedPopulationTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "stopped.*map.*(population|identity)"):
                     self.check(root, manifest)
 
-    def test_proc_epoch_population_is_an_optional_subset_of_roster_leaders(self):
+    def test_proc_epoch_is_optional_sampled_continuity_control(self):
         # Absent: no leader touched a watched provider mapping after attach.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, receipt, records, controls = self.fixture(root)
             records[:] = [r for r in records if r["map_id"] != 111]
             self.publish_fixture(root, manifest, receipt, records, controls)
-            self.assertEqual(len(self.check(root, manifest)), 11)
+            self.assertEqual(len(self.check(root, manifest)), 12)
         # Every SHARED_MM / OVERFLOW / LOCAL_FAULT shape the hooks can leave.
         for label, value in (
             ("shared", self.epoch_value((), (), 1 << 2, 0)),
@@ -2088,25 +2397,18 @@ class StoppedPopulationTests(unittest.TestCase):
                 manifest, receipt, records, controls = self.fixture(root)
                 next(r for r in records if r["map_id"] == 111)["value"] = value
                 self.publish_fixture(root, manifest, receipt, records, controls)
-                self.assertEqual(len(self.check(root, manifest)), 11)
+                self.assertEqual(len(self.check(root, manifest)), 12)
 
-    def test_proc_epoch_refuses_nonleader_foreign_duplicate_and_malformed_records(self):
-        for case in ("non-leader", "foreign", "reused", "duplicate", "unknown-flag",
-                     "stamp-flag", "slot-beyond-table", "duplicate-slot", "slot-gap",
+    def test_proc_epoch_rejects_malformed_values_at_replay(self):
+        # Values-only replay cannot reconstruct iterator identities. Their
+        # leader/duplicate checks have separate acquisition-seam regressions.
+        for case in ("unknown-flag", "stamp-flag", "slot-beyond-table", "duplicate-slot", "slot-gap",
                      "orphan-epoch", "overflow-with-free-cell"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 manifest, receipt, records, controls = self.fixture(root)
                 row = next(r for r in records if r["map_id"] == 111)
-                if case == "non-leader":
-                    row.update(tid=7002, generation=901)
-                elif case == "foreign":
-                    row.update(pid=8888, tid=8888)
-                elif case == "reused":
-                    row["generation"] = 999
-                elif case == "duplicate":
-                    records.append(dict(row))
-                elif case == "unknown-flag":
+                if case == "unknown-flag":
                     row["value"] = self.epoch_value(flags=1 << 5)
                 elif case == "stamp-flag":
                     row["value"] = self.epoch_value(flags=1 << 0)
@@ -2120,7 +2422,6 @@ class StoppedPopulationTests(unittest.TestCase):
                     row["value"] = self.epoch_value((6,), (1, 1))
                 else:
                     row["value"] = self.epoch_value((6,), (1,), 1 << 3)
-                # A duplicate frame is refused by the framed parser itself.
                 with self.assertRaisesRegex((AssertionError, RuntimeError),
                                             "stopped|duplicate task-storage record"):
                     self.publish_fixture(root, manifest, receipt, records, controls)
@@ -2131,6 +2432,7 @@ class StoppedPopulationTests(unittest.TestCase):
         manifest, receipt, records, values = self.fixture(Path("/unused"))
         arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
         arguments["controls"] = {}
+        arguments["instance_gen"] = self.generation_sample()
         with self.assertRaisesRegex(RuntimeError, "invalid task-storage inventory"):
             dumper.reconcile_task_storage(TaskStorageReaderTests.QUALIFICATION_MAPS,
                                           [r for r in records if r["map_id"] != 111],
@@ -2243,7 +2545,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     struct.pack_into("<QQII", raw, 520, occupied, domains, starts, 1)
                     row["value"] = bytes(raw)
                 self.publish_fixture(root, manifest, receipt, records, controls)
-                self.assertEqual(len(self.check(root, manifest)), 11)
+                self.assertEqual(len(self.check(root, manifest)), 12)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2315,6 +2617,7 @@ class StoppedPopulationTests(unittest.TestCase):
                 }
         arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
         arguments["controls"] = controls
+        arguments["instance_gen"] = self.generation_sample()
         direct_maps = [
             {"id": item["id"], "name": item["name"], "type": item["type"],
              "oracle": item["oracle"], "bytes_key": item["key_size"],
@@ -2407,6 +2710,70 @@ class StoppedPopulationTests(unittest.TestCase):
 
 class FinalScannerSurfaceTests(unittest.TestCase):
     LANES = ("default-safe-start", "feature-safe-start", "feature-unsafe-fault")
+
+    def object_pilot_fixture(self, subject, root, *, case="healthy"):
+        fixture = StoppedPopulationTests("test_framed_records_bind_generations_for_future_coordinator")
+        object_lane = "object-ia32" if TARGET_BITS == 32 else "object-lp64"
+        types = {1: "hash", 2: "array", 3: "prog_array", 5: "percpu_hash", 6: "percpu_array",
+                 8: "cgroup_array", 9: "lru_hash", 27: "ringbuf", 29: "task_storage"}
+        for lane in (object_lane, object_lane + "-blocked"):
+            cell = root / lane
+            cell.mkdir()
+            manifest, receipt, records, controls = fixture.fixture(cell)
+            existing = {item["name"] for item in manifest}
+            for index, (name, row) in enumerate(subject.BPF_MAP_DEFS["SAFE_MAPS"].items(), 200):
+                if name not in existing:
+                    manifest.append({"id": index, "name": name, "type": types[row["type"]],
+                                     "key_size": row["key_size"], "value_size": row["value_size"],
+                                     "max_entries": row["max_entries"], "map_flags": row["flags"], "oracle": "dump"})
+            if lane.endswith("-blocked"):
+                if case == "map-sentinel":
+                    raw = bytearray(fixture.epoch_value(range(1, 9), (0,) * 8))
+                    sentinel = subject.SENTINELS["PIN"]
+                    raw[64:64 + len(sentinel)] = sentinel
+                    next(row for row in records if row["map_id"] == 111)["value"] = bytes(raw)
+                elif case == "receipt-alias":
+                    generation = subject.ALIASES["pss_hash"]
+                    for rows in (receipt["expected"], receipt["before"], receipt["after"], records):
+                        for row in rows:
+                            if row.get("tid") == 7001:
+                                row["generation"] = generation
+            fixture.publish_fixture(cell, manifest, receipt, records, controls)
+            for name in ("EVENTS", "DISCOVERY"):
+                subject.ring_raw_path(cell / "case", name).rename(subject.ring_raw_path(root / lane, name))
+            if case == "claimless" and lane.endswith("-blocked"):
+                for item in manifest:
+                    item.pop("snapshot")
+            manifest_path = root / f"mapdump_manifest_{lane}.json"
+            manifest_path.write_text(json.dumps(manifest))
+            for suffix, content in (("output", "{}"), ("observer.log", ""), ("workload.log", "")):
+                (root / f"{lane}.{suffix}").write_text(content)
+            if lane.endswith("-blocked"):
+                if case == "missing-sibling":
+                    manifest_path.unlink()
+                elif case == "wrong-width":
+                    manifest_path.rename(root / f"mapdump_manifest_{'object-lp64' if TARGET_BITS == 32 else 'object-ia32'}-blocked.json")
+                elif case == "missing-receipt":
+                    (cell / "snapshot.json").unlink()
+
+    def test_object_pilot_requires_both_receipts_and_scans_all_surfaces(self):
+        for case in ("healthy", "missing-sibling", "wrong-width", "claimless", "missing-receipt",
+                     "map-sentinel", "receipt-alias"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subject = load_subject(TARGET_BITS)
+                self.object_pilot_fixture(subject, root, case=case)
+                arguments = ["--object-pilot", str(root), str(TARGET_BITS)]
+                if case == "healthy":
+                    self.assertEqual(subject.main(arguments), 0)
+                elif case in ("map-sentinel", "receipt-alias"):
+                    message = ("ordinary pointer canaries leaked.*PIN" if case == "map-sentinel" else
+                               "scalar aliases.*pss_hash")
+                    with self.assertRaisesRegex(AssertionError, message):
+                        subject.main(arguments)
+                else:
+                    with self.assertRaises((AssertionError, OSError)):
+                        subject.main(arguments)
 
     def surfaces(self, subject, root, payload):
         result = {}
@@ -2530,6 +2897,83 @@ class FinalScannerSurfaceTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "scalar aliases"):
                 subject.assert_safe_lane_alias_privacy(lane, paths)
 
+    def test_json_identity_scan_preserves_custody_and_rejects_distinctive_markers(self):
+        subject = load_subject(TARGET_BITS)
+        fixture = StoppedPopulationTests("test_framed_records_bind_generations_for_future_coordinator")
+        marker = subject.LOADER_PAUSE_IDENTITIES["marker"]
+        for case, generation in (("healthy-receipt", 900), ("narrow-custody", 512),
+                                 ("decimal-marker", marker)):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = fixture.fixture(root)
+                for rows in (receipt["expected"], receipt["before"], receipt["after"], records):
+                    for row in rows:
+                        if row.get("tid") == 7001:
+                            row["generation"] = generation
+                fixture.publish_fixture(root, manifest, receipt, records, controls)
+                surfaces = fixture.check(root, manifest)
+                self.assertEqual(len(surfaces), 12)
+                paths = [root / "snapshot.json", *surfaces]
+                if case == "decimal-marker":
+                    with self.assertRaisesRegex(AssertionError, "loader/pause identity"):
+                        subject.assert_final_artifact_privacy(paths)
+                else:
+                    subject.assert_final_artifact_privacy(paths)
+        for case, content, forbidden in (
+            ("hex-marker", json.dumps({"generation": hex(marker)}).encode(), True),
+            ("encoded-map-marker", subject.positive_control_content(struct.pack("<Q", marker)), True),
+            ("encoded-map-narrow", subject.positive_control_content(struct.pack("<Q", 512)), False),
+            ("encoded-byte-narrow", subject.positive_control_content(b"\xfa"), False),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "map.json"
+                path.write_bytes(content)
+                if forbidden:
+                    with self.assertRaisesRegex(AssertionError, "loader/pause identity"):
+                        subject.assert_final_artifact_privacy([path])
+                else:
+                    subject.assert_final_artifact_privacy([path])
+
+    def test_published_start_json_byte_collision_preserves_identity_leak_detection(self):
+        subject = load_subject(TARGET_BITS)
+        fixture = StoppedPopulationTests("test_framed_records_bind_generations_for_future_coordinator")
+        # Controlled START key pid/tid words contain byte 0xfa without naming
+        # the private loader context_id 0xfa. Keep those bytes in every case.
+        pid, tid = 0x1FA01, 0x1FA02
+        self.assertNotIn(subject.LOADER_PAUSE_IDENTITIES["context_id"], (pid, tid))
+        key = struct.pack("<QII", (pid << 32) | tid, 3, 0)
+        marker = struct.pack("<Q", subject.LOADER_PAUSE_IDENTITIES["marker"])
+        loader = subject.LOADER_PAUSE_IDENTITIES["loader_path"].encode()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = fixture.fixture(root)
+            fixture.publish_fixture(root, manifest, receipt, records, controls)
+            item = next(row for row in manifest if row["name"] == "START")
+            path = Path(item["file"])
+            reference = root / "same-bytes.json"
+            for case, leaked in (("healthy-key-byte", b""), ("wide-identity", marker),
+                                 ("loader-path", loader)):
+                with self.subTest(case=case):
+                    value = leaked + bytes(subject.CALL_START_SIZE - len(leaked))
+                    content = json.dumps([{"key": [f"0x{byte:02x}" for byte in key],
+                                           "value": [f"0x{byte:02x}" for byte in value]}]).encode()
+                    self.assertIn(b'"0xfa"', content)
+                    path.write_bytes(content)
+                    reference.write_bytes(content)
+                    surface = next(row for row in receipt["surfaces"] if row["id"] == item["id"])
+                    surface.update(size=len(content), sha256=hashlib.sha256(content).hexdigest())
+                    (root / "snapshot.json").write_text(json.dumps(receipt))
+                    self.assertIn(path, fixture.check(root, manifest))
+                    if leaked:
+                        for scanned in (reference, path):
+                            with self.assertRaisesRegex(
+                                AssertionError, re.escape(f"loader/pause identity {leaked!r}")
+                            ):
+                                subject.assert_final_artifact_privacy([scanned])
+                    else:
+                        subject.assert_final_artifact_privacy([reference])
+                        subject.assert_final_artifact_privacy([path])
+
     def test_claimless_manifest_is_refused_in_every_lane(self):
         """A manifest claiming no snapshot must fail its lane, never pass it.
 
@@ -2604,7 +3048,7 @@ class StartRingSurfaceIntegrationTests(unittest.TestCase):
             if not ring:
                 suffix = "bin" if task_storage else "json"
                 path = root / f"mapdump_{name}_{lane}.{suffix}"
-                path.write_bytes(bytes(544) if task_storage else b"[]\n")
+                path.write_bytes(bytes(definition["value_size"]) if task_storage else b"[]\n")
                 item["file"] = str(path)
             manifest.append(item)
         manifest_path = root / f"mapdump_manifest_{lane}.json"
@@ -2775,6 +3219,35 @@ class RingLayoutTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             subject.parse_ring_records(raw, mmap.PAGESIZE, 376, 0)
 
+    def test_ring_parser_refusals_keep_bounds_and_legacy_callers_fail_closed(self):
+        subject = load_subject(TARGET_BITS)
+        capacity = mmap.PAGESIZE
+        raw = bytearray(2 * capacity)
+        length = subject.EVENT_SIZE
+        stride = subject.ring_stride(length)
+        struct.pack_into('<I', raw, 0, length)
+        cases = [
+            ('capacity', raw, capacity // 2, 0, stride),
+            ('mapping', raw[:-1], capacity, 0, stride),
+            ('positions', raw, capacity, stride, 0),
+            ('overwritten', raw, capacity, 0, capacity + 8),
+            ('truncated', raw, capacity, 0, stride - 8),
+        ]
+        for category, body, size, consumer, producer in cases:
+            with self.subTest(refusal=category), self.assertRaises(AssertionError) as caught:
+                subject.parse_ring_records(body, size, consumer, producer)
+            self.assertIs(type(caught.exception), subject.RingRecordRefusal)
+            self.assertEqual(caught.exception.category, category)
+            self.assertIsNone(subject.ring_diagnostic(caught.exception),
+                              'a legacy parser caller supplies no trusted ring name')
+        for name, lengths in subject.RING_RECORD_LENGTHS.items():
+            for record_length in lengths:
+                valid = bytearray(2 * capacity)
+                struct.pack_into('<I', valid, 0, record_length)
+                self.assertEqual(subject.parse_ring_records(
+                    valid, capacity, 0, subject.ring_stride(record_length), lengths),
+                    [bytes(record_length)], (name, record_length))
+
     def test_ring_adapter_closes_fd_and_partial_mapping_on_failure(self):
         subject = load_subject(TARGET_BITS)
         real_mmap = mmap.mmap
@@ -2872,8 +3345,12 @@ class RingLayoutTests(unittest.TestCase):
 
     def test_retained_event_validation_never_opens_live_bpf_maps(self):
         subject = load_subject(TARGET_BITS)
+        events = [event_bytes(index) for index in range(28)]
+        if TARGET_BITS == 32:
+            events[3] = event_bytes(3, mechanism=subject.UNKNOWN)
+            events[4] = event_bytes(4, mechanism=subject.MAXIMUM)
         retained = {
-            "EVENTS": [event_bytes(index) for index in range(28)],
+            "EVENTS": events,
             "DISCOVERY": [bytes(subject.DISCOVERY_RECORD_SIZE)],
         }
         positions = {name: (0, subject.RING_RECORD_STRIDES[name] * len(rows))
@@ -2884,7 +3361,239 @@ class RingLayoutTests(unittest.TestCase):
                 retained, "default-safe-profile", 0x555, positions)
 
 
+class VersionCanaryPrefixTests(unittest.TestCase):
+    def recovered_profile(self):
+        subject, document = self.profile(32)
+        evidence = document['evidence']
+        module = evidence['discovery'][0]
+        raw = [table for table in module['tables'] if table['source'] == 'scan']
+        # Actual retained FULL32 geometry: eight420-byte Table objects,
+        # aligned448 bytes apart in the terminal file-backed page.
+        for table, offset in zip(raw, (21024, 21472, 21920, 22368, 22816, 23264)):
+            table['file_offset'] = offset
+        for version, count, offset, anchors in (
+                ([3, 2], 68, 24160, 1), ([4, 0], 68, 23712, 1), ([4, 0], 92, 23712, 3)):
+            module['tables'].append(dict(source='scan', version=version, entries=count,
+                file_offset=offset, linkage='heuristic', exports_agreeing=anchors))
+            evidence['surfaces'].append(dict(source=module['path'] + f' table {version[0]}.{version[1]}',
+                acquisition='ok', walk='known_prefix', functions=count))
+        return subject, document
+
+    def test_ia32_actual_export_recovery_preserves_both_same_base_prefix_views(self):
+        subject, document = self.recovered_profile()
+        subject.validate_canary('default-safe-profile', document, 32)
+        self.assertEqual(document['evidence']['table_entries'], 1056)
+        self.assertEqual(len(document['evidence']['discovery'][0]['tables']), 22)
+        self.assertEqual(document['evidence']['attached_probes'], 208)
+
+    def test_lp64_independent_extension_keeps_its_complete_word_page_boundary(self):
+        page = os.sysconf('SC_PAGE_SIZE')
+        for count in (70, 83, 92):
+            offset = 8 * page - 8 * (count + 1 if count < 92 else 60)
+            with self.subTest(count=count):
+                subject, document = self.profile(boundary=(offset, count, 'known_prefix'))
+                evidence = document['evidence']
+                module = evidence['discovery'][0]
+                module['tables'][-1].update(linkage='heuristic', exports_agreeing=3)
+                module['tables'].append(dict(source='scan', version=[3, 1], entries=68,
+                    file_offset=offset, linkage='heuristic', exports_agreeing=1))
+                evidence['surfaces'].append(dict(source=module['path'] + ' table 3.1',
+                    acquisition='ok', walk='known_prefix', functions=68))
+                subject.validate_canary('default-safe-profile', document, 64)
+                evidence['surfaces'][-2]['walk'] = 'full'
+                with self.assertRaises(AssertionError):
+                    subject.validate_canary('default-safe-profile', document, 64)
+
+    def test_paired_three_export_witness_cannot_claim_an_unread_ordinal69(self):
+        page = os.sysconf('SC_PAGE_SIZE')
+        offset = 8 * page - 8 * 70
+        subject, document = self.profile(boundary=(offset, 69, 'known_prefix'))
+        evidence = document['evidence']
+        module = evidence['discovery'][0]
+        module['tables'][-1].update(linkage='heuristic', exports_agreeing=3)
+        module['tables'].append(dict(source='scan', version=[3, 1], entries=68,
+            file_offset=offset, linkage='heuristic', exports_agreeing=1))
+        evidence['surfaces'].append(dict(source=module['path'] + ' table 3.1',
+            acquisition='ok', walk='known_prefix', functions=68))
+        with self.assertRaises(AssertionError):
+            subject.validate_canary('default-safe-profile', document, 64)
+
+    def test_recovered_views_refuse_duplicate_unrelated_or_unproven_overlaps(self):
+        subject, healthy = self.recovered_profile()
+        subject.validate_canary('default-safe-profile', healthy, 32)
+        mutations = [
+            lambda d: d['evidence']['discovery'][0]['tables'].append(
+                dict(d['evidence']['discovery'][0]['tables'][-1])),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(file_offset=23716),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(file_offset=7 * 4096),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(entries=104),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(version=[3, 0]),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(source='manifest'),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(exports_agreeing=1),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(exports_agreeing=True),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(linkage='exports'),
+            lambda d: d['evidence']['discovery'][0]['tables'][-2].update(file_offset=23713),
+            lambda d: d['evidence']['discovery'][0]['tables'][-3].update(file_offset=23712),
+            lambda d: d['evidence']['discovery'][0]['tables'].pop(-2),
+            lambda d: d['evidence']['surfaces'][-1].update(walk='full'),
+            lambda d: d['evidence']['surfaces'][-1].update(source='unrelated table 4.0'),
+            lambda d: d['evidence'].update(table_entries=1812),
+            lambda d: d['evidence'].update(slots=105),
+            lambda d: d['evidence'].update(attached_probes=210),
+            lambda d: d['evidence'].update(event_loss=1),
+            lambda d: d['evidence'].update(drain_proven=False),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                document = copy.deepcopy(healthy)
+                mutate(document)
+                with self.assertRaises(AssertionError):
+                    subject.validate_canary('default-safe-profile', document, 32)
+
+    def profile(self, bits=64, boundary=None):
+        subject = load_capture_checker()
+        manifest = [
+            ((2, 40), 68, "full"), ((2, 40), 68, "full"),
+            ((3, 0), 92, "full"), ((3, 1), 92, "full"),
+            ((3, 2), 104, "full"), ((3, 9), 104, "known_prefix"),
+            ((4, 0), 68, "known_prefix"), ((3, 2), 104, "known_prefix"),
+            ((3, 0), 92, "known_prefix"), ((3, 1), 92, "known_prefix"),
+            ((2, 40), 68, "known_prefix"), ((0, 0), 0, "not_walked"),
+            ((3, 2), 104, "full"),
+        ]
+        raw = [((2, 40), 68, "full"), ((2, 40), 68, "full"),
+               ((3, 0), 92, "full")]
+        if bits == 32:
+            raw += [((3, 1), 92, "full"), ((3, 2), 104, "full"),
+                    ((3, 9), 104, "known_prefix")]
+        surfaces = Counter((walk, count) for _, count, walk in manifest + raw)
+        evidence = subject.evidence_fixture(
+            surfaces, sources=("scan", "manifest"), discovery_skipped=0)
+        module = evidence["discovery"][0]
+        module["tables"] = [
+            {"source": "manifest", "version": list(version), "entries": count}
+            for version, count, _ in manifest
+        ] + [
+            {"source": "scan", "version": list(version), "entries": count,
+             "file_offset": 4096 * (index + 1)}
+            for index, (version, count, _) in enumerate(raw)
+        ]
+        if boundary is not None:
+            offset, count, walk = boundary
+            module["tables"].append({
+                "source": "scan", "version": [3, 1], "entries": count,
+                "file_offset": offset,
+            })
+            evidence["surfaces"].append({
+                "source": module["path"] + " table 3.1", "acquisition": "ok",
+                "walk": walk, "functions": count,
+            })
+        module.update(corroborated=True,
+                      corroboration=["conflict"] if bits == 64 else ["agreed"])
+        evidence.update(table_entries=1056, slots=104, active_slots=104,
+                        attached_probes=208, vendor_interfaces=1,
+                        interface_list="ok", discovery_conflicts=int(bits == 64),
+                        drain_proven=True,
+                        stop_quiescence={"state": "proven", "post_q_events": False,
+                                         "post_q_discovery": False},
+                        **subject.SAFE_ALLOWANCES)
+        return subject, subject.document_fixture(evidence)
+
+    def test_exact_manifest_keeps_the_acquired_unknown_label_prefix(self):
+        for bits in (32, 64):
+            with self.subTest(bits=bits):
+                subject, document = self.profile(bits)
+                subject.validate_canary("default-safe-profile", document, bits)
+
+    def test_terminal_partial_and_full_rows_have_distinct_boundary_rules(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        for offset, count, walk in (
+            (8 * page - 8 * 60, 59, "known_prefix"),
+            (8 * page - 8 * 32, 31, "known_prefix"),
+            # Full rows can cross a page; the report has no VMA-end witness.
+            (8 * page - 8 * 60, 92, "full"),
+            (7 * page, 92, "full"),
+        ):
+            with self.subTest(offset=offset, count=count, walk=walk):
+                subject, document = self.profile(boundary=(offset, count, walk))
+                subject.validate_canary("default-safe-profile", document)
+
+    def test_terminal_prefix_refuses_invalid_extents_and_unrelated_rows(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        offset = 8 * page - 8 * 60
+        subject, healthy = self.profile(boundary=(offset, 59, "known_prefix"))
+        subject.validate_canary("default-safe-profile", healthy)
+        # Bind each loop value before storing a mutation.
+        mutations = [
+            (lambda d, n=n: d["evidence"]["discovery"][0]["tables"][-1].update(entries=n))
+            for n in (0, -1, 93, True, 1.5, 58)
+        ] + [
+            (lambda d, value=value: d["evidence"]["discovery"][0]["tables"][-1].update(file_offset=value))
+            for value in (None, -8, True, 8.0, offset + 1, (1 << 64) - 8)
+        ] + [
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(version=[3, 2]),
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+            lambda d: d["evidence"]["discovery"][0]["tables"].append(
+                dict(d["evidence"]["discovery"][0]["tables"][-1])),
+            lambda d: d["evidence"]["surfaces"][-1].update(walk="full"),
+            lambda d: d["evidence"]["surfaces"][-1].update(source="unrelated table 3.1"),
+            lambda d: d["evidence"]["surfaces"].append(dict(d["evidence"]["surfaces"][-1])),
+            lambda d: d["evidence"]["discovery"][0]["tables"][-2].update(file_offset=offset - 8),
+            lambda d: d["evidence"]["discovery"][0]["tables"][-2].update(file_offset=offset + 4096),
+            lambda d: d["evidence"]["discovery"][0]["tables"].pop(-2),
+            lambda d: next(t for t in d["evidence"]["discovery"][0]["tables"]
+                           if t["source"] == "manifest" and t["version"] == [4, 0]).update(entries=0),
+            lambda d: next(s for s in d["evidence"]["surfaces"]
+                           if s["walk"] == "known_prefix" and s["functions"] == 68).update(
+                               walk="refused", functions=0),
+            lambda d: d["evidence"].update(table_entries=988),
+            lambda d: d["evidence"].update(slots=103),
+            lambda d: d["evidence"].update(attached_probes=206),
+            lambda d: d["evidence"].update(event_loss=1),
+            lambda d: d["evidence"].update(drain_proven=False),
+            lambda d: d["capture"].update(privacy_mode="unsafe-unvalidated-metadata"),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                document = copy.deepcopy(healthy)
+                mutate(document)
+                self.assertNotEqual(document, healthy)
+                with self.assertRaises(AssertionError):
+                    subject.validate_canary("default-safe-profile", document)
+        subject, full = self.profile(boundary=(offset, 92, "full"))
+        full["evidence"]["surfaces"][-1]["walk"] = "known_prefix"
+        with self.assertRaises(AssertionError):
+            subject.validate_canary("default-safe-profile", full)
+        subject, ia32 = self.profile(32, boundary=(offset, 59, "known_prefix"))
+        with self.assertRaises(AssertionError):
+            subject.validate_canary("default-safe-profile", ia32, 32)
+
+
 class OwnedMetricsOracleTests(unittest.TestCase):
+    def test_owned_metrics_fixture_keeps_abi_specific_future_minor_scan(self):
+        for bits, surfaces in ((64, 16), (32, 19)):
+            with self.subTest(bits=bits):
+                capture, document = owned_metrics_document(bits)
+                evidence = document["evidence"]
+                self.assertEqual(len(evidence["surfaces"]), surfaces)
+                future = [table for table in evidence["discovery"][0]["tables"]
+                          if table["source"] == "scan" and table["version"] == [3, 9]]
+                self.assertEqual(future, ([{"source": "scan", "version": [3, 9],
+                                           "entries": 104, "file_offset": 6 * 4096}]
+                                         if bits == 32 else []))
+                capture.validate_canary("owned-default-metrics", document, bits)
+                if bits == 32:
+                    bad = copy.deepcopy(document)
+                    bad["evidence"]["surfaces"] = [
+                        row for row in bad["evidence"]["surfaces"]
+                        if row["source"] != "/opt/p11.so table 3.9"]
+                    with self.assertRaisesRegex(AssertionError, "unexpected surfaces"):
+                        capture.validate_canary("owned-default-metrics", bad, bits)
+                    bad = copy.deepcopy(document)
+                    bad["evidence"]["discovery"][0]["tables"].remove(future[0])
+                    with self.assertRaises(AssertionError):
+                        capture.validate_canary("owned-default-metrics", bad, bits)
+
     def test_owned_metrics_require_exact_30_and_closed_run_evidence(self):
         canary = load_subject(TARGET_BITS)
         capture, owned = owned_metrics_document(TARGET_BITS)
@@ -3091,6 +3800,9 @@ class RawSafeEventTests(unittest.TestCase):
     def test_safe_event_family_and_pid_mutation(self):
         subject = load_subject(TARGET_BITS)
         events = [event_bytes(index) for index in range(28)]
+        if TARGET_BITS == 32:
+            events[3] = event_bytes(3, mechanism=subject.UNKNOWN)
+            events[4] = event_bytes(4, mechanism=subject.MAXIMUM)
         subject.assert_event_records(events, "default-safe-profile", 0x555)
         bad = list(events)
         raw = bytearray(bad[0])

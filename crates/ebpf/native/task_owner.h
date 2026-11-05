@@ -10,7 +10,14 @@ typedef unsigned long long u64;
 #define __type(name, value) typeof(value) *name
 #define OWNER_LEASED 1U
 #ifndef P11SCOPE_OWNER_SLOT_BOUND
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#define P11SCOPE_OWNER_SLOT_BOUND 8192U
+#else
 #define P11SCOPE_OWNER_SLOT_BOUND 512U
+#endif
+#endif
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+_Static_assert(P11SCOPE_OWNER_SLOT_BOUND == 8192U, "bank owner bound must match cleanup");
 #endif
 #if defined(P11SCOPE_INVENTORY_ONLY)
 #define OWNER_LIMIT 64ULL
@@ -41,6 +48,13 @@ typedef unsigned long long u64;
 #define OWNER_START_COUNT_MISMATCH 512ULL
 #define OWNER_START_ROW_MISSING 1024ULL
 #define OWNER_DIRECTORY_MISMATCH 2048ULL
+/* A subordinate object row contradicted its START (marker, descriptor,
+ * binding or phase). Always set together with OWNER_BOOKKEEPING_FAILED. */
+#define OWNER_OBJECT_MISMATCH 4096ULL
+/* p11_owner_cleanup outcomes: 0 healthy, 1 failure, 2 a healthy settle
+ * that abandoned at least one live START at thread exit. Only 1 is
+ * failure; the exit root dirties the leader marker row on 2. */
+#define P11_OWNER_CLEANUP_ABANDONED_START 2U
 
 struct task_struct;
 struct thread_owner {
@@ -50,6 +64,16 @@ struct thread_owner {
     u64 selection_domains;
     u32 start_count;
     u32 flags;
+#ifndef P11SCOPE_INVENTORY_ONLY
+    /* H8 journal custody: physical-task lifetime identity for the
+     * object journal. Minted once per retained task-storage row (zero
+     * means unminted), never recycled, preserved across idle and
+     * exec/exit cleanup while lease state clears. Only the
+     * journal-selected producer reads or writes these; ordinary roots
+     * never touch them. Inventory-only objects carry no journal words. */
+    u64 journal_thread;
+    u64 journal_sequence;
+#endif
 };
 /* A thread's owner task storage is created once and retained. flags ==
  * OWNER_LEASED while it holds a lease (START rows or discovery state); flags
@@ -67,8 +91,47 @@ struct owner_control {
     u64 abandoned_discovery;
 };
 struct owner_start_key { u64 pid_tgid; u32 slot; u32 pad; };
+#define P11_OWNER_START_REASON_RETURN 0U
+#define P11_OWNER_START_REASON_COLLISION 1U
+#define P11_OWNER_START_REASON_EXEC_EXIT 6U
+#ifndef P11SCOPE_INVENTORY_ONLY
+#define JOURNAL_SETTLE_EMPTY 0U
+#define JOURNAL_SETTLE_SILENT 1U
+#define JOURNAL_SETTLE_ABANDON 2U
+#define JOURNAL_SETTLE_BLOCKED 3U
+struct journal_settle_words {
+    unsigned char record[64];
+    u32 state;
+    u32 pad;
+};
+_Static_assert(sizeof(struct journal_settle_words) == 72, "journal settle workspace ABI");
+_Static_assert(__builtin_offsetof(struct journal_settle_words, state) == 64, "settle state");
+#endif
+#if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* Optional journal settlement adds no consumed scalar result or new failure
+ * branch to ordinary physical cleanup. Existing exported signatures stay intact. */
+u32 p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                               struct journal_settle_words *out);
+u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
+long p11_owner_start_remove_reason(const struct owner_start_key *key, u32 required, u32 reason);
+#endif
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* T-L2 loader retirement: START removal plus the owned gate disposition
+ * report (see task_owner.c). Host harnesses define P11SCOPE_LOADER_GATE;
+ * no production build does, so production builds carry no code, map or
+ * symbol changes from this extend -- only DWARF line info shifts where
+ * the guarded source lines sit. */
+long p11_owner_start_remove_loader(const struct owner_start_key *key, u32 required, u32 reason,
+                                   u64 loader_cookie);
+#endif
 struct owner_discovery_key { u64 pid_tgid; u64 cookie; u64 domain; };
+#ifdef P11SCOPE_INVENTORY_ONLY
 _Static_assert(sizeof(struct thread_owner) == 544, "owner ABI");
+#else
+_Static_assert(sizeof(struct thread_owner) == 560, "owner ABI");
+_Static_assert(__builtin_offsetof(struct thread_owner, journal_thread) == 544, "journal thread");
+_Static_assert(__builtin_offsetof(struct thread_owner, journal_sequence) == 552, "journal sequence");
+#endif
 _Static_assert(__builtin_offsetof(struct thread_owner, discovery_cookies) == 8, "cookies");
 _Static_assert(__builtin_offsetof(struct thread_owner, occupied) == 520, "occupied");
 _Static_assert(__builtin_offsetof(struct thread_owner, selection_domains) == 528, "domains");
@@ -89,11 +152,118 @@ _Static_assert(__builtin_offsetof(struct owner_start_key, pad) == 12, "START pad
 _Static_assert(__builtin_offsetof(struct owner_discovery_key, cookie) == 8, "discovery cookie");
 _Static_assert(__builtin_offsetof(struct owner_discovery_key, domain) == 16, "discovery domain");
 
+/* H7 slice B subordinate custody: one 432-byte ObjectStart row per required
+ * object call, keyed by the START key under the same physical owner. The
+ * layouts below mirror ebpf-common object_wire byte-exactly; the static
+ * asserts pin the shared table. Inventory builds exclude this. */
+#ifndef P11SCOPE_INVENTORY_ONLY
+#define OBJECT_DESCRIPTORS_COUNT 105U
+#define OBJECT_START_BYTES 432U
+#define OBJECT_START_WORDS 54U
+#define OBJECT_ACTION_MAX 14U
+#define OBJECT_GUARD_MAX 2U
+#define OBJECT_PHASE_ENTRY 1U
+#define OBJECT_PHASE_READY 2U
+#define OBJECT_PHASE_RETURNING 3U
+#define OBJECT_CALL_START_TS_OFF 0U
+#define OBJECT_CALL_START_MARKER_OFF 264U
+#define OBJECT_CALL_START_IMAGE_OFF 272U
+/* The one original timestamp is also S1's duration origin and the future
+ * native BEGIN.entry_ns. Construction must not acquire a replacement clock. */
+struct call_start_seed {
+    u64 ts_ns;
+    u64 task_cookie;
+    u64 exec_id;
+    u64 object_required;
+};
+_Static_assert(sizeof(struct call_start_seed) == 32, "START seed ABI");
+_Static_assert(_Alignof(struct call_start_seed) == 8, "START seed alignment");
+_Static_assert(__builtin_offsetof(struct call_start_seed, ts_ns) == 0, "seed timestamp");
+_Static_assert(__builtin_offsetof(struct call_start_seed, task_cookie) == 8, "seed image");
+_Static_assert(__builtin_offsetof(struct call_start_seed, exec_id) == 16, "seed exec");
+_Static_assert(__builtin_offsetof(struct call_start_seed, object_required) == 24, "seed marker");
+struct object_descriptor_row {
+    u32 function;
+    unsigned char input_args[2];
+    unsigned char result_args[2];
+    unsigned char template_args[4];
+    unsigned char find_capacity_arg;
+    unsigned char find_count_arg;
+    unsigned char action;
+    unsigned char guard;
+};
+struct object_attr_slot {
+    u64 value_ptr;
+    u64 entry_capacity;
+    u64 returned_len;
+    unsigned char kind;
+    unsigned char slot_index;
+    unsigned char status;
+    unsigned char reserved[5];
+};
+struct object_attr_list {
+    unsigned char cells[32];
+    unsigned char inspected;
+    unsigned char flags;
+    unsigned char reserved[2];
+};
+struct object_start {
+    u64 task_cookie;
+    u64 exec_id;
+    u64 entry_ns;
+    u32 descriptor_index;
+    unsigned char layout;
+    unsigned char action;
+    unsigned char derive;
+    unsigned char phase;
+    u64 inputs[2];
+    u64 result_ptrs[2];
+    u64 get_template_base;
+    u64 inspected_header_end;
+    u64 find_capacity;
+    u64 find_count_ptr;
+    struct object_attr_slot slots[8];
+    struct object_attr_list requested[2];
+    unsigned char input_statuses[2];
+    unsigned char result_statuses[2];
+    unsigned short flags;
+    unsigned char get_inspected;
+    unsigned char reserved;
+};
+_Static_assert(sizeof(struct object_descriptor_row) == 16, "object descriptor ABI");
+_Static_assert(sizeof(struct object_attr_slot) == 32, "object slot ABI");
+_Static_assert(sizeof(struct object_attr_list) == 36, "object list ABI");
+_Static_assert(sizeof(struct object_start) == 432, "object start ABI");
+_Static_assert(__builtin_offsetof(struct object_start, entry_ns) == 16, "object time");
+_Static_assert(__builtin_offsetof(struct object_start, descriptor_index) == 24, "object index");
+_Static_assert(__builtin_offsetof(struct object_start, layout) == 28, "object layout");
+_Static_assert(__builtin_offsetof(struct object_start, inputs) == 32, "object inputs");
+_Static_assert(__builtin_offsetof(struct object_start, result_ptrs) == 48, "object results");
+_Static_assert(__builtin_offsetof(struct object_start, get_template_base) == 64, "object get");
+_Static_assert(__builtin_offsetof(struct object_start, inspected_header_end) == 72, "object span");
+_Static_assert(__builtin_offsetof(struct object_start, find_capacity) == 80, "object capacity");
+_Static_assert(__builtin_offsetof(struct object_start, find_count_ptr) == 88, "object count");
+_Static_assert(__builtin_offsetof(struct object_start, slots) == 96, "object slots");
+_Static_assert(__builtin_offsetof(struct object_start, requested) == 352, "object requested");
+_Static_assert(__builtin_offsetof(struct object_start, input_statuses) == 424, "object input status");
+_Static_assert(__builtin_offsetof(struct object_start, result_statuses) == 426, "object result status");
+_Static_assert(__builtin_offsetof(struct object_start, flags) == 428, "object flags");
+_Static_assert(__builtin_offsetof(struct object_start, get_inspected) == 430, "object inspected");
+_Static_assert(__builtin_offsetof(struct object_start, reserved) == 431, "object reserved");
+#endif
+
 /* Existing real Rust map symbols; only their addresses enter map helpers. */
 #ifndef P11SCOPE_INVENTORY_ONLY
 extern unsigned char START;
+extern unsigned char OBJECT_START;
+extern unsigned char OBJECT_DESCRIPTORS;
+extern unsigned char OBJECT_ZERO;
 #endif
 extern unsigned char DISCOVERY_STATE;
+/* The current task's owner row, or NULL when the task is gone or holds
+ * none (task_owner.c; the journal transactions key-bind it before
+ * their legs run). */
+struct thread_owner *p11_owner_current(void);
 static void *(*owner_map_lookup)(void *, const void *) = (void *)1;
 static long (*owner_map_update)(void *, const void *, const void *, u64) = (void *)2;
 static long (*owner_map_delete)(void *, const void *) = (void *)3;

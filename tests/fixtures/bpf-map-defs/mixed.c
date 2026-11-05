@@ -11,12 +11,43 @@ __attribute__((visibility("hidden"), noinline, used))
 void *memset(void *dest, int value, unsigned long count) { return dest; }
 #define HELPER(name) __attribute__((noinline, used)) int name(void) { return 0; }
 HELPER(p11_link_current_identity)
+#ifdef EXEC_COOKIE
+/* Identity-bearing metadata fixture; no kernel load or allocator model. */
+static struct { UINT(type, 29); UINT(map_flags, 1); TYPE(key, int);
+                TYPE(value, unsigned long long); } TASK_COOKIE SEC(".maps");
+struct fixture_cookie_control { unsigned long long words[5]; };
+static struct { UINT(type, 2); UINT(max_entries, 1); TYPE(key, unsigned);
+                TYPE(value, struct fixture_cookie_control); } COOKIE_CTL SEC(".maps");
+#ifndef EXEC_COOKIE_MISSING
+__attribute__((noinline, used)) unsigned long long p11_link_current_cookie(void) {
+    return (unsigned long long)((void *(*)(void))158)();
+}
+#endif
+#endif
 HELPER(p11_link_emit_fork)
 HELPER(p11_link_fork_allowed)
 /* Task 3 Stage A continuity halves (native instance_epoch.c). */
 HELPER(p11_instance_entry)
 HELPER(p11_instance_return)
 HELPER(p11_instance_exec)
+/* Finite no-argument kernel-only helper boundary, not a dumpability model. */
+__attribute__((noinline, used)) unsigned p11_exec_dumpability(void) {
+    void *task = ((void *(*)(void))158)();
+    unsigned long flags = 0;
+    return !((long (*)(void *, unsigned, const void *))113)(&flags, sizeof(flags), task)
+        && flags == 1;
+}
+/* 6.14 Option B exe-identity boundary: two out-word pointers and a u32
+ * success result, same checked-helper body shape as the predicate. */
+__attribute__((noinline, used)) unsigned p11_exe_identity(unsigned long *dev, unsigned long *ino) {
+    void *task = ((void *(*)(void))158)();
+    unsigned long id = 0;
+    if (((long (*)(void *, unsigned, const void *))113)(&id, sizeof(id), task))
+        return 0;
+    *dev = id;
+    *ino = id;
+    return 1;
+}
 #ifdef OWNER_GLOBAL
 #define OWNER_LINKAGE
 #else
@@ -27,7 +58,8 @@ HELPER(p11_instance_exec)
     int name(volatile int *ctx) { return ctx[index]; }
 OWNER(p11_owner_cleanup, 0)
 OWNER(p11_owner_start_get, 1)
-OWNER(p11_owner_start_insert, 2)
+OWNER(p11_owner_start_aggregate, 2)
+OWNER(p11_owner_start_begin, 11)
 OWNER(p11_owner_start_remove, 3)
 OWNER(p11_owner_discovery_get, 4)
 OWNER(p11_owner_discovery_insert, 5)
@@ -41,16 +73,25 @@ ROOT_HELPER(p11_root_propagate_thread, 8)
 ROOT_HELPER(p11_root_current_tag, 9)
 ROOT_HELPER(p11_root_current_exit, 10)
 SEC("tp_btf/task_newtask") int task_newtask(void *ctx) {
-    int result = p11_owner_start_get(ctx) + p11_owner_start_insert(ctx)
+    int result = p11_owner_start_get(ctx) + p11_owner_start_aggregate(ctx)
         + p11_owner_start_remove(ctx) + p11_owner_discovery_get(ctx)
-        + p11_owner_discovery_insert(ctx) + p11_owner_discovery_remove(ctx);
+        + p11_owner_discovery_insert(ctx) + p11_owner_discovery_remove(ctx)
+        + p11_owner_start_begin(ctx);
     result += p11_root_propagate_thread(ctx) + p11_root_current_tag(ctx);
 #ifdef OWNER_HEALTHY
     result += p11_owner_healthy(ctx);
 #endif
     return result;
 }
-SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) { return p11_owner_cleanup(ctx); }
+SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) {
+    unsigned long dev = 0, ino = 0;
+#if defined(EXEC_COOKIE) && !defined(EXEC_COOKIE_MISSING)
+    return p11_owner_cleanup(ctx) + p11_exec_dumpability() + (int)p11_link_current_cookie()
+        + (int)p11_exe_identity(&dev, &ino);
+#else
+    return p11_owner_cleanup(ctx) + p11_exec_dumpability() + (int)p11_exe_identity(&dev, &ino);
+#endif
+}
 SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {
     return p11_owner_cleanup(ctx) + p11_root_current_exit(ctx);
 }
@@ -58,4 +99,8 @@ SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {
 SEC("fentry/uprobe_mmap") int p11_inst_vma_map(void *ctx) { return 0; }
 SEC("fentry/uprobe_munmap") int p11_inst_vma_unmap(void *ctx) { return 0; }
 SEC("fexit/copy_vma") int p11_inst_vma_copy(void *ctx) { return 0; }
+SEC("fexit/copy_vma") int p11_inst_vma_retcopy(void *ctx) { return 0; }
+SEC("fentry/exec_mm_release") int p11_image_exec_release(void *ctx) { return 0; }
+SEC("fexit/exec_mmap") int p11_image_mmap_release(void *ctx) { return 0; }
+SEC("iter/task") int p11_image_query(void *ctx) { return 0; }
 #endif

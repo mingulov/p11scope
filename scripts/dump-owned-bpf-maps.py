@@ -26,18 +26,52 @@ TASK_STORAGE_HEADER = struct.Struct("<8sIIIII")
 TASK_STORAGE_RECORD = 1
 TASK_STORAGE_EOF = 2
 TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH")
+
+
+class TaskStoragePopulationError(RuntimeError):
+    """A rejected task relation with finite fields for the capture sanitizer."""
+
+    def __init__(self, map_name: str, relation: str, leader: bool):
+        self.map_name, self.relation, self.leader = map_name, relation, leader
+        super().__init__("stopped map: foreign identity")
+
+
+def population_diagnostic(error: BaseException) -> str | None:
+    """Publish only revalidated fields of this module's exact trusted error."""
+    if type(error) is not TaskStoragePopulationError:
+        return None
+    name = getattr(error, "map_name", None)
+    relation = getattr(error, "relation", None)
+    leader = getattr(error, "leader", None)
+    if (type(name) is not str or name not in TASK_STORAGE_NAMES
+            or type(relation) is not str or relation not in ("outside-roster", "wrong-group")
+            or type(leader) is not bool):
+        return None
+    return f"task-storage map={name} relation={relation} leader={'yes' if leader else 'no'}"
+
+
+IMAGE_HASH_NAMES = ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS")
+# The loader-gate select word exceeds BPF_OBJ_NAME_LEN like the other
+# arrays here; default builds carry no such map, so the remap only
+# fires on gate objects.
+OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS", "JOURNAL_MARKER_CTL", "IMAGE_BANK_SELECT")
 # The frozen Task 2 D2 qualification surface: the seed fixture creates and
 # seeds exactly these three maps, and the reader serves it without PROC_EPOCH
 # (its iterator object then neither creates nor reads that map). Every owned
 # capture uses the full TASK_STORAGE_NAMES inventory; reconcile requires it.
 TASK_STORAGE_QUALIFICATION_NAMES = TASK_STORAGE_NAMES[:3]
 TASK_STORAGE_VALUE_SIZES = {
-    "TASK_COOKIE": 8, "THREAD_OWNER": 544, "ROOT_AFFILIATION": 8, "PROC_EPOCH": 144,
+    "TASK_COOKIE": 8, "THREAD_OWNER": 544, "ROOT_AFFILIATION": 8, "PROC_EPOCH": 152,
 }
+# H8 slice A: Detailed THREAD_OWNER rows carry two trailing lifetime
+# words (560 B); Inventory-only rows stay 544 B. Both ABIs are live,
+# so the decoder accepts either exact size (never anything else).
+THREAD_OWNER_VALUE_SIZES = (544, 560)
 # Task 3 Stage A per-process mutation record (`struct instance_record`,
 # crates/ebpf/native/instance_epoch.h): u64 slot_plus1[8], u64 epoch[8],
-# u64 flags, u64 exec_attach_gen. Kernel metadata counters only.
-PROC_EPOCH_RECORD = struct.Struct("<8Q8QQQ")
+# u64 flags, u64 exec_attach_gen, u64 journal_bootstrap. Kernel metadata
+# counters only.
+PROC_EPOCH_RECORD = struct.Struct("<8Q8QQQQ")
 PROC_EPOCH_RECORD_SLOTS = 8
 PROC_EPOCH_FILE_SLOTS = 1024
 PROC_EPOCH_SHARED_MM = 1 << 2
@@ -50,10 +84,19 @@ def idle_owner_value(raw):
     """A retained THREAD_OWNER between calls: storage kept, lease returned.
 
     The native owner keeps each thread's storage after its first call and
-    clears every field when it returns the lease, so an idle owner is exactly
-    544 zero bytes. It holds no lease, START row or directory cell.
+    clears the lease state when it returns the lease. An idle Inventory
+    row is exactly 544 zero bytes; an idle Detailed row is 560 bytes
+    whose first 544 are zero while the trailing lifetime words persist
+    (H8 slice A). Either way it holds no lease, START row or directory
+    cell.
     """
-    return type(raw) is bytes and len(raw) == 544 and not any(raw)
+    if type(raw) is not bytes:
+        return False
+    if len(raw) == 544:
+        return not any(raw)
+    if len(raw) == 560:
+        return not any(raw[:544])
+    return False
 TASK_STORAGE_MAX_RECORDS = 131072
 TASK_STORAGE_MAX_BYTES = 64 * 1024 * 1024
 TASK_STORAGE_TIMEOUT_SECONDS = 8
@@ -335,9 +378,12 @@ def map_oracle(item):
 
 def canonical_map_name(item):
     name = item.get("name")
-    if item.get("type") != "task_storage" or not isinstance(name, str):
+    if not isinstance(name, str):
         return name
-    matches = [candidate for candidate in TASK_STORAGE_NAMES if candidate[:15] == name]
+    candidates = (TASK_STORAGE_NAMES if item.get("type") == "task_storage" else
+                  IMAGE_HASH_NAMES if item.get("type") == "hash" else
+                  OBJECT_ARRAY_NAMES if item.get("type") == "array" else ())
+    matches = [candidate for candidate in candidates if candidate[:15] == name]
     return matches[0] if len(matches) == 1 else name
 
 
@@ -644,15 +690,16 @@ def write_binary_receipt(path, value):
         raise
 
 
-def proc_epoch_value_valid(raw):
-    """Structural shape of one leader's instance_record.
+def proc_epoch_value_valid(raw, attach_generation):
+    """Current producer's instance_record shape and sampled generation bound.
 
     Cells are claimed 0 -> slot+1 by CAS and never change afterwards, in
     order, so occupied cells are a distinct prefix; an epoch only moves
     after its cell is claimed; OVERFLOW is only set once every cell is held
     by another file. Population is optional: no record means epoch zero.
     """
-    if type(raw) is not bytes or len(raw) != PROC_EPOCH_RECORD.size:
+    if (type(raw) is not bytes or len(raw) != PROC_EPOCH_RECORD.size
+            or not snapshot_uint(attach_generation)):
         return False
     words = PROC_EPOCH_RECORD.unpack(raw)
     slots = words[:PROC_EPOCH_RECORD_SLOTS]
@@ -669,7 +716,44 @@ def proc_epoch_value_valid(raw):
         return False
     if flags & PROC_EPOCH_OVERFLOW and len(occupied) != PROC_EPOCH_RECORD_SLOTS:
         return False
+    # Exec copies this monotonically increasing cell; older retained records
+    # need not equal its sample. The observer is stopped (the sole attach-cell
+    # writer), while native exec may only copy the existing generation.
+    if words[-2] > attach_generation:
+        return False
+    # Slice D birth marker: 0 is unpublished, 1 is DIRTY, and low
+    # bits 10 name a READY exec id. Anything else (low bits 11, a
+    # nonzero word with low bits 00, DIRTY with high bits) is not a
+    # marker word. A READY row must carry a published generation at
+    # or before the sampled one; the upper bound was checked above.
+    marker = words[-1]
+    if marker == 0 or marker == 1:
+        return True
+    if marker & 3 != 2 or words[-2] == 0:
+        return False
     return True
+
+
+def instance_attach_generation(sample, *, forbidden_ids=()):
+    """Validate the existing ordinary INSTANCE_GEN sample; perform no reads."""
+    if not isinstance(sample, dict):
+        raise RuntimeError("sampled INSTANCE_GEN: missing map sample")
+    snapshot_map_metadata(sample)
+    if (sample["id"] in forbidden_ids
+            or tuple(sample.get(key) for key in (
+                "name", "type", "bytes_key", "bytes_value", "max_entries", "map_flags"))
+            != ("INSTANCE_GEN", "array", 4, 8, 4, 1024)):
+        raise RuntimeError("sampled INSTANCE_GEN: invalid map metadata or identity")
+    cells = sample.get("cells")
+    if (not isinstance(cells, list) or len(cells) != 4
+            or any(not isinstance(cell, dict) or set(cell) != {"key", "value"}
+                   for cell in cells)):
+        raise RuntimeError("sampled INSTANCE_GEN: incomplete or malformed cells")
+    cells = normalize_map_dump(cells, sample)
+    for cell in cells:
+        if cell["key"] == ["0x01", "0x00", "0x00", "0x00"]:
+            return int.from_bytes(bytes(int(byte, 16) for byte in cell["value"]), "little")
+    raise RuntimeError("sampled INSTANCE_GEN: missing attach cell")
 
 
 def task_storage_specs(maps):
@@ -690,7 +774,10 @@ def task_storage_specs(maps):
             item.get("type"), item.get("bytes_key"), item.get("bytes_value"),
             item.get("max_entries"), item.get("map_flags"),
         )
-        expected = ("task_storage", 4, TASK_STORAGE_VALUE_SIZES[item["name"]], 0, 1)
+        pinned = TASK_STORAGE_VALUE_SIZES[item["name"]]
+        if item["name"] == "THREAD_OWNER" and actual[2] in THREAD_OWNER_VALUE_SIZES:
+            pinned = actual[2]
+        expected = ("task_storage", 4, pinned, 0, 1)
         if actual != expected:
             raise RuntimeError(
                 f"task-storage map id={item['id']} name={item['name']} metadata mismatch: "
@@ -851,14 +938,16 @@ def snapshot_map_metadata(item):
 
 
 def reconcile_task_storage(maps, records, *, expected, before, after, controls,
-                           lane, small_state=False):
+                           instance_gen, lane, small_state=False):
     """Pure population check after bounded framing/EOF validation.
 
     V1 frames contain pid/tid, not generation. Bind them to identical stopped
     before/after rosters here, and return generation-bearing identities in raw
-    surface order for a later receipt. Replayed receipts must supply that same
-    generation. This function neither acquires nor publishes evidence and does
-    not establish pidfd custody; the Task 3C coordinator owns that obligation.
+    surface order for the three identity maps' receipts. PROC_EPOCH is an
+    independently sampled global continuity control: validate its iterator
+    leaders/duplicates and every value without looking up foreign generations.
+    Return no control identities. This function neither acquires nor publishes
+    evidence and does not establish pidfd custody; the coordinator owns that.
     Controls are exact map metadata plus complete raw single-cell values.
     """
     roster = stopped_roster(expected, expected=True)
@@ -887,8 +976,9 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
     if not isinstance(records, list) or len(records) > TASK_STORAGE_MAX_RECORDS:
         raise RuntimeError("stopped map: missing or oversized record population")
     seen = {item["name"]: set() for item in ordered}
-    bound = {item["name"]: [] for item in ordered}
+    bound = {name: [] for name in TASK_STORAGE_QUALIFICATION_NAMES}
     idle = set()
+    total = 0
     for record in records:
         if (not isinstance(record, dict)
                 or not snapshot_uint(record.get("map_id"), 32, positive=True)
@@ -899,23 +989,35 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
         if (not snapshot_uint(record.get("pid"), 32, positive=True)
                 or not snapshot_uint(record.get("tid"), 32, positive=True)):
             raise RuntimeError(f"{context}: invalid task identity")
-        task = roster.get(record["tid"])
-        if task is None or task["pid"] != record["pid"]:
-            raise RuntimeError(f"{context}: foreign identity pid={record['pid']} tid={record['tid']}")
-        if "generation" in record and (
-                not snapshot_uint(record["generation"], positive=True)
-                or record["generation"] != task["generation"]):
-            raise RuntimeError(f"{context}: reused identity tid={record['tid']}")
-        key = identity(task)
-        if item["name"] == "PROC_EPOCH" and record["pid"] != record["tid"]:
-            # The hooks create the record on the group leader only.
-            raise RuntimeError(f"{context}: record on a non-leader tid={record['tid']}")
-        # Idle is a THREAD_OWNER-only state: the same task's leased cookie or
-        # affiliation is an independent lease, not a second owner record.
-        if key in seen[item["name"]] or (item["name"] == "THREAD_OWNER" and key in idle):
-            raise RuntimeError(f"{context}: duplicate identity tid={record['tid']}")
+        if item["name"] == "PROC_EPOCH":
+            if record["pid"] != record["tid"]:
+                raise RuntimeError(f"{context}: record on a non-leader")
+            key = (record["pid"], record["tid"])
+            if key in seen["PROC_EPOCH"]:
+                raise RuntimeError(f"{context}: duplicate control identity")
+        else:
+            task = roster.get(record["tid"])
+            if task is None or task["pid"] != record["pid"]:
+                raise TaskStoragePopulationError(
+                    item["name"], "outside-roster" if task is None else "wrong-group",
+                    record["pid"] == record["tid"],
+                )
+            if "generation" in record and (
+                    not snapshot_uint(record["generation"], positive=True)
+                    or record["generation"] != task["generation"]):
+                raise RuntimeError(f"{context}: reused identity tid={record['tid']}")
+            key = identity(task)
+            # An idle owner must not shadow its own leased cookie/affiliation.
+            if key in seen[item["name"]] or (item["name"] == "THREAD_OWNER" and key in idle):
+                raise RuntimeError(f"{context}: duplicate identity tid={record['tid']}")
         if type(record.get("value")) is not bytes or len(record["value"]) != item["bytes_value"]:
             raise RuntimeError(f"{context}: invalid value length")
+        total += len(record["value"])
+        if total > TASK_STORAGE_MAX_BYTES:
+            raise RuntimeError("stopped map: aggregate value byte bound exceeded")
+        if item["name"] == "PROC_EPOCH":
+            seen["PROC_EPOCH"].add(key)
+            continue
         if item["name"] == "THREAD_OWNER" and idle_owner_value(record["value"]):
             # Retained idle storage of an in-process roster task: no lease,
             # so it joins neither the leased population nor its binding.
@@ -923,9 +1025,7 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
             continue
         seen[item["name"]].add(key)
         bound[item["name"]].append({k: task[k] for k in ("pid", "tid", "generation")})
-    # PROC_EPOCH has no required population: a leader holds a record only
-    # once it touched a watched provider mapping (or was marked a CLONE_VM
-    # sharer) after attach, so any subset of roster leaders is honest.
+    # The global control sample is optional, never a workload population positive.
     for name, flag in (("TASK_COOKIE", "cookie"), ("THREAD_OWNER", "owner"),
                        ("ROOT_AFFILIATION", "root")):
         required = {identity(row) for row in roster.values() if row[flag]}
@@ -964,6 +1064,7 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
             healthy = values[0] == len(roots) <= limit and not any(values[1:])
         if not healthy:
             raise RuntimeError(f"{context}: unhealthy or inconsistent control")
+    attach_generation = instance_attach_generation(instance_gen, forbidden_ids=ids)
     tickets = set()
     for record in records:
         item = by_id[record["map_id"]]
@@ -981,7 +1082,7 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
             if struct.unpack("<Q", raw)[0] != 1:
                 raise RuntimeError(f"{context}: invalid affiliation value")
         elif name == "PROC_EPOCH":
-            if not proc_epoch_value_valid(raw):
+            if not proc_epoch_value_valid(raw, attach_generation):
                 raise RuntimeError(f"{context}: invalid mutation record value")
         else:
             original, = struct.unpack_from("<Q", raw)
@@ -1081,13 +1182,15 @@ def self_test():
     else:
         raise AssertionError("EVENTS built as a non-ringbuf was accepted")
     print("EVENTS ringbuf build guard: OK")
-    def epoch(slots=(), epochs=(), flags=0, exec_gen=0):
+    def epoch(slots=(), epochs=(), flags=0, exec_gen=0, marker=0):
         cells = list(slots) + [0] * (PROC_EPOCH_RECORD_SLOTS - len(slots))
         counts = list(epochs) + [0] * (PROC_EPOCH_RECORD_SLOTS - len(epochs))
-        return PROC_EPOCH_RECORD.pack(*cells, *counts, flags, exec_gen)
+        return PROC_EPOCH_RECORD.pack(*cells, *counts, flags, exec_gen, marker)
     for value in (epoch(), epoch((3,), (7,)), epoch((1024, 1), (1, 0), PROC_EPOCH_SHARED_MM, 9),
                   epoch(range(1, 9), (1,) * 8, PROC_EPOCH_OVERFLOW | PROC_EPOCH_LOCAL_FAULT)):
-        assert proc_epoch_value_valid(value)
+        assert proc_epoch_value_valid(value, 9)
+    for value in (epoch(marker=1), epoch((), (), 0, 3, (7 << 2) | 2), epoch((), (), 0, 9, 2)):
+        assert proc_epoch_value_valid(value, 9)
     for label, value in (
         ("file slot beyond the watched table", epoch((1025,), (1,))),
         ("duplicate file slot", epoch((3, 3), (1, 1))),
@@ -1097,8 +1200,13 @@ def self_test():
         ("stamp-only flag", epoch((3,), (1,), 1 << 0)),
         ("overflow with a free cell", epoch((3,), (1,), PROC_EPOCH_OVERFLOW)),
         ("truncated record", epoch()[:-8]),
+        ("marker low bits 11", epoch(marker=3)),
+        ("marker high bits with low bits 00", epoch(marker=4)),
+        ("marker DIRTY with high bits", epoch(marker=5)),
+        ("READY without a published generation", epoch((), (), 0, 0, (7 << 2) | 2)),
+        ("READY past the sampled generation", epoch((), (), 0, 10, (7 << 2) | 2)),
     ):
-        assert not proc_epoch_value_valid(value), label
+        assert not proc_epoch_value_valid(value, 9), label
     print("PROC_EPOCH record shape validation: OK")
     with tempfile.TemporaryDirectory() as tmp:
         fresh = os.path.join(tmp, "fresh.json")

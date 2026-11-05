@@ -6,10 +6,18 @@
 //! layout comes from `pkcs11_module::tables_for`/`read_fn_pointers` — the same
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
+use crate::discovery::caller_registry::cold_admit_member;
+use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{ExaminedObject, Pin, pin_of};
-use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
-use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
+use crate::discovery::overlay_witness::{
+    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessVerdict,
+    original_file_witness_required, prove_original_file,
+};
+use crate::discovery::retained_member::RetainedGroupMember;
+use crate::discovery::sweep_attribution::is_caller_range;
+use crate::process::{MountNamespaceId, PidPin, ProcessView, ProcessViewId};
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
 use p11scope_manifest::identity::{InspectedObject, open_object};
 use p11scope_manifest::maps::{
     Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
@@ -21,6 +29,7 @@ use pkcs11_module::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +43,17 @@ const INTERFACE_BYTES: usize = 3 * WORD;
 const READ_CHUNK: usize = 1024 * 1024;
 const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
 pub(crate) const MAX_TABLE_CANDIDATES: usize = 512;
+/// Slots in the 2.x `CK_FUNCTION_LIST` prefix every 3.x layout starts
+/// with: the accepted width when a 3.x-labelled table validates only
+/// its legacy prefix (a provider mislabelling quirk).
+const LEGACY_PREFIX_SLOTS: usize = 68;
+/// Slots in a 3.0/3.1 `CK_FUNCTION_LIST_3_0`: a structural failure inside
+/// `LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS` — unmapped memory, file-backed
+/// non-executable memory, or anonymous non-executable memory — refutes both
+/// the 92-wide and the 104-wide hypotheses, leaving the 68-slot prefix
+/// complete. Executable anonymous memory and executable unusable-path
+/// mappings prove nothing: they may hold a real extension.
+const STANDARD_30_SLOTS: usize = 92;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 pub(crate) const MAX_INTERFACE_RECORDS: usize = 512;
 const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
@@ -59,6 +79,48 @@ pub(crate) const INTERFACE_WINDOW_CEILING_REASON: &str =
 /// matches these markers — the push sites below must keep using them.
 pub(crate) const NO_TABLE_FOUND_MARKER: &str =
     "no function table was found in its file-backed data";
+/// Shell-quote a module path for the suggested discover command, so
+/// the line stays copy-pasteable when the path carries spaces or shell
+/// metacharacters. Paths of letters, digits, `/`, `_`, `-` and `.`
+/// pass through byte-identical; anything else is single-quoted with
+/// embedded quotes escaped.
+fn shell_quote_module_path(module_path: &str) -> String {
+    let safe = !module_path.is_empty()
+        && module_path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'));
+    if safe {
+        return module_path.to_string();
+    }
+    let mut quoted = String::with_capacity(module_path.len() + 2);
+    quoted.push('\'');
+    let mut first = true;
+    for part in module_path.split('\'') {
+        if !first {
+            quoted.push_str("'\\''");
+        }
+        first = false;
+        quoted.push_str(part);
+    }
+    quoted.push('\'');
+    quoted
+}
+/// Skip reason for a module whose table the memory scan cannot see: the
+/// fixed diagnosis plus the action that observes such a provider. One
+/// line; `module_path` is the skipped module's own path.
+pub(crate) fn no_table_found_reason(module_path: &str, hinted: bool) -> String {
+    let named = if hinted {
+        "matched a --module hint; "
+    } else {
+        ""
+    };
+    let quoted = shell_quote_module_path(module_path);
+    format!(
+        "{named}{NO_TABLE_FOUND_MARKER}; a table built at run time in .bss or on the heap is \
+         outside the memory scan's reach; to observe it, run p11scope-discover --module \
+         {quoted} -o <manifest.json> and pass --manifest <manifest.json>"
+    )
+}
 pub(crate) const HINT_NOT_MAPPED_REASON: &str = "not mapped in the target";
 pub(crate) const NO_ABSOLUTE_PATHNAME_REASON: &str = "no absolute pathname in /proc/<pid>/maps";
 pub(crate) const MAPS_CEILING_REASON: &str =
@@ -168,14 +230,39 @@ where
     Ok((abi, exports))
 }
 
-/// Demand-paged export facts for the scan path. Detailed mode preserves its
-/// sparse structural post-read charge. Inventory pre-debits a conservative
-/// logical mapped-byte reservation and fixes the dependency mapping to it.
+/// A previously retained file may already be watched by the instance hooks.
+/// Read its exports without mapping it in the observer's shared mm. The
+/// ordinary byte/deadline limits and the caller's post-read pin check remain.
+#[cfg(test)]
+fn read_retained_export_facts_budgeted(
+    file: &File,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) && budget.active_scan.is_none() {
+        return Err("read failed: inventory discovery requires an active scan".into());
+    }
+    let facts = read_elf_snapshot(file, budget)
+        .and_then(|snapshot| Ok((snapshot.abi(), snapshot.exports_matching(wanted)?)));
+    if let Some(reason) = budget.check_deadline_now() {
+        return Err(format!("read failed: {reason}"));
+    }
+    facts
+}
+
+/// Demand-paged export facts for unretained files; retained files use bounded
+/// reads to avoid invalidating the very instances the observer is watching.
+/// Detailed mode otherwise preserves its sparse structural post-read charge.
+/// Inventory pre-debits the unretained file's conservative mapped-byte bound.
+#[cfg(test)]
 fn read_export_facts_budgeted(
     file: &File,
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    if budget.retained_mapped_identity(file).is_some() {
+        return read_retained_export_facts_budgeted(file, wanted, budget);
+    }
     if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
         return read_inventory_export_facts_budgeted_with(
             file,
@@ -193,6 +280,88 @@ fn read_export_facts_budgeted(
     }
     budget.record_io(usize::try_from(charged).unwrap_or(usize::MAX));
     Ok((abi, exports))
+}
+
+fn read_raw_scan_facts_budgeted(
+    file: &File,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+) -> Result<ElfExportFacts, String> {
+    let (abi, exports, excluded_anchor_ranges, work_units, getter_present, witness_fault) =
+        if budget.retained_mapped_identity(file).is_some() {
+            let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units,
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
+            let mut metadata = None;
+            let (abi, exports) = read_inventory_export_facts_budgeted_with(
+                file,
+                wanted,
+                budget,
+                crate::attach::monotonic_ns,
+                |file, wanted, reservation| {
+                    let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(
+                        file,
+                        wanted,
+                        reservation,
+                    )?;
+                    metadata = Some((
+                        facts.excluded_anchor_ranges,
+                        facts.work_units,
+                        facts.getter_present,
+                        facts.witness_fault,
+                    ));
+                    Ok((facts.abi, facts.exports, facts.structural_bytes))
+                },
+            )?;
+            let (ranges, work, getter_present, witness_fault) =
+                metadata.expect("successful raw ELF query returned metadata");
+            (abi, exports, ranges, work, getter_present, witness_fault)
+        } else {
+            // Detailed retains its demand-paged structural post-read debit;
+            // no new whole-file gate is introduced for sparse objects.
+            let facts =
+                p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
+            let remaining = budget.remaining_window_io().unwrap_or(0);
+            if facts.structural_bytes > remaining {
+                budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+                return Err(format!("read failed: {IO_CEILING_REASON}"));
+            }
+            budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units,
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        };
+    budget.spend(work_units).map_err(str::to_string)?;
+    if let Some(reason) = budget.check_deadline_now() {
+        return Err(reason.into());
+    }
+    Ok(ElfExportFacts {
+        abi,
+        exports,
+        getter_present,
+        witness_fault,
+        excluded_anchor_ranges,
+    })
+}
+
+fn raw_anchor_overlaps_metadata(ranges: &[(u64, u64)], offset: u64, width: usize) -> bool {
+    let Some(end) = offset.checked_add(width as u64) else {
+        return true;
+    };
+    let next = ranges.partition_point(|(_, end)| *end <= offset);
+    ranges.get(next).is_some_and(|(start, _)| *start < end)
 }
 
 pub(crate) fn read_mountinfo<R: Read>(
@@ -604,13 +773,8 @@ fn interface_identity(
     runtime_view: Option<ProcessViewId>,
 ) -> Option<InterfaceIdentity> {
     let version_word = u64::from(table.version.0) | (u64::from(table.version.1) << 8);
-    // `usable` is the layout's field count — the same number the table
-    // charged under — with the stored record counts as fallback for versions
-    // the layout decoder refuses (hand-built records only; decoded tables
-    // always carry a decodable version).
-    let usable = spans_for(version_word)
-        .map(|(_, spans, _)| spans.iter().map(|span| span.fields().len()).sum())
-        .unwrap_or_else(|| table.entries.len() + table.null_entries.len() + table.unpinned.len());
+    // Identity follows actual observed positions, independently of metadata.
+    let usable = table.decoded_slot_count();
     let key = match maps.resolve(table.address) {
         Resolved::File {
             device,
@@ -701,6 +865,31 @@ fn stored_table_content_hash(table: &ScannedTable, version_word: u64, usable: us
     hash
 }
 
+fn observed_interface_identity(
+    table: &ScannedTable,
+    name_class: &'static str,
+    name_private: &Option<Vec<u8>>,
+    flags: u64,
+    maps: &MapIndex<'_>,
+    runtime_view: Option<ProcessViewId>,
+    budget: &CaptureWorkBudget,
+) -> Option<InterfaceIdentity> {
+    let mut identity =
+        interface_identity(table, name_class, name_private, flags, maps, runtime_view)?;
+    if let InterfaceTableKey::Runtime(key) = &mut identity.table
+        && let Some((shape, content)) = budget.runtime_table_contents.get(&(
+            key.view,
+            key.address,
+            key.version_word,
+            key.usable,
+        ))
+        && key.content == *shape
+    {
+        key.content = *content;
+    }
+    Some(identity)
+}
+
 /// The cached inspection of one file: exactly what `inspect_file_with_reader`
 /// returns. Only the digest-sized result is kept, never the file bytes.
 pub(crate) type InspectedFile = InspectedObject;
@@ -723,6 +912,53 @@ pub(crate) struct InspectedFileKey {
 pub(crate) struct ElfExportFacts {
     pub(crate) abi: ElfAbi,
     pub(crate) exports: Vec<(String, u64)>,
+    /// A 3.x interface getter name appears among the image's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `exports` (see `RawScanElfFacts`).
+    pub(crate) getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete (see `RawScanElfFacts`).
+    pub(crate) witness_fault: bool,
+    pub(crate) excluded_anchor_ranges: Vec<(u64, u64)>,
+}
+
+/// Identity of one dynamic loader file whose ELF facts loader arming read: the
+/// opened descriptor's own `st_dev` plus its `(ino, size, ctime)` pin. Both
+/// the reading and the reusing side key on `fstat` of an opened descriptor,
+/// so the comparison is like-for-like; any change to the file moves its
+/// ctime and misses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LoaderFactsKey {
+    pub(crate) device: u64,
+    pub(crate) pin: Pin,
+}
+
+/// The file-derived facts loader arming and its revalidation take from one
+/// dynamic loader ELF: its ABI, its executable `_dl_debug_state` hook and its
+/// `r_state` address, each with the exact decode error the snapshot gave.
+/// Only these few words are kept, never the file bytes. Nothing here comes
+/// from a target process, so the facts are safe to share across views the
+/// way the scan's export facts are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoaderElfFacts {
+    pub(crate) abi: ElfAbi,
+    pub(crate) hook: Result<Option<SymbolFact>, String>,
+    pub(crate) state_address: Result<Option<u64>, String>,
+}
+
+fn loader_cache_bytes(key: &LoaderFactsKey, value: &LoaderElfFacts) -> u64 {
+    let dynamic = value
+        .hook
+        .as_ref()
+        .err()
+        .map_or(0, String::len)
+        .saturating_add(value.state_address.as_ref().err().map_or(0, String::len));
+    u64::try_from(
+        std::mem::size_of_val(key)
+            .saturating_add(std::mem::size_of_val(value))
+            .saturating_add(dynamic),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn inspected_cache_bytes(key: &InspectedFileKey, value: &InspectedFile) -> u64 {
@@ -766,7 +1002,13 @@ fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
                     .len()
                     .saturating_mul(std::mem::size_of::<(String, u64)>()),
             )
-            .saturating_add(dynamic),
+            .saturating_add(dynamic)
+            .saturating_add(
+                value
+                    .excluded_anchor_ranges
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u64, u64)>()),
+            ),
     )
     .unwrap_or(u64::MAX)
 }
@@ -784,10 +1026,28 @@ struct ActiveInventoryWindow {
     stop_reason: Option<&'static str>,
 }
 
+/// Cooperative collection control and shared work, used by the cgroup
+/// serial collector. Returning false is sticky within the scan budget.
+#[derive(Clone)]
+pub(crate) struct CollectionWork(Arc<dyn Fn(u64) -> bool + Send + Sync>);
+impl std::fmt::Debug for CollectionWork {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("CollectionWork")
+    }
+}
+impl CollectionWork {
+    pub(crate) fn new(checkpoint: impl Fn(u64) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(checkpoint))
+    }
+}
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
 pub struct CaptureWorkBudget {
+    collection_work: Option<CollectionWork>,
+    retained_mapped: crate::discovery::identity::RetainedMappedIdentities,
+    kernel_anchor_exclusions: crate::discovery::kernel_identity::KernelAnchorExclusions,
     limits: ScanLimits,
     policy: DiscoveryPolicy,
     domain: Option<Arc<BudgetDomain>>,
@@ -796,8 +1056,17 @@ pub struct CaptureWorkBudget {
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
     admitted_runtime_tables: BTreeSet<RuntimeTableIdentity>,
+    // One current fingerprint per admitted runtime table position. This
+    // map is bounded by admitted_runtime_tables, including invalid words
+    // without placing their values in diagnostic/output records.
+    runtime_table_contents: BTreeMap<(ProcessViewId, u64, u64, usize), (u64, u64)>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
+    /// Dynamic loader facts one completed loader arm read and revalidated.
+    /// A later arm of the same unchanged loader file reuses them instead of
+    /// re-reading the whole loader for its locator, snapshot and both
+    /// revalidation brackets.
+    loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
     interface_records: usize,
     admitted_interfaces: BTreeSet<InterfaceIdentity>,
     /// New distinct candidates refused by the cardinality ceilings. Sticky
@@ -809,6 +1078,11 @@ pub struct CaptureWorkBudget {
     interface_refusals: u64,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
+    /// Deep scans this pass classified as kernel threads with no user
+    /// memory (verified absence, never a refusal). Sticky and never reset:
+    /// the pass summary discloses the count once instead of repeating one
+    /// gap per thread.
+    kernel_thread_absences: u64,
     work_ceiling: u64,
     work_units: u64,
     active_window: Option<ActiveInventoryWindow>,
@@ -825,11 +1099,35 @@ pub struct CaptureWorkBudget {
     pub(crate) last_installed_deadline: Option<u64>,
     scan_stop_reason: Option<&'static str>,
     scan_stop_reported: bool,
+    /// `--exclude-module` inputs for this capture (set once before scanning,
+    /// read by every member scan). Empty means "exclude nothing".
+    excludes: Vec<PathBuf>,
+    /// Files skipped as excluded by the operator, one record per (pid, file)
+    /// encounter. Accumulated across member scans; the caller aggregates by
+    /// file identity for process counts after all scans complete.
+    excluded: Vec<ExcludedRecord>,
+}
+
+/// One `--exclude-module` hit: a mapped file the scan skipped by operator
+/// choice, never a loss. The identity is the opened file's fstat
+/// (device + inode), comparable across views; the path is the target-view
+/// label for display; `via` is the exclusion input that matched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExcludedRecord {
+    pub pid: u32,
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub via: PathBuf,
 }
 
 impl CaptureWorkBudget {
     pub fn new(limits: ScanLimits) -> Self {
         Self {
+            collection_work: None,
+            retained_mapped: crate::discovery::identity::RetainedMappedIdentities::default(),
+            kernel_anchor_exclusions:
+                crate::discovery::kernel_identity::KernelAnchorExclusions::default(),
             limits,
             policy: DiscoveryPolicy::DetailedLegacy,
             domain: None,
@@ -838,14 +1136,17 @@ impl CaptureWorkBudget {
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
             admitted_runtime_tables: BTreeSet::new(),
+            runtime_table_contents: BTreeMap::new(),
             inspected_files: BTreeMap::new(),
             elf_export_facts: BTreeMap::new(),
+            loader_elf_facts: BTreeMap::new(),
             interface_records: 0,
             admitted_interfaces: BTreeSet::new(),
             table_refusals: 0,
             interface_refusals: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
+            kernel_thread_absences: 0,
             work_ceiling: DEFAULT_WORK_CEILING,
             work_units: 0,
             active_window: None,
@@ -859,7 +1160,80 @@ impl CaptureWorkBudget {
             last_installed_deadline: None,
             scan_stop_reason: None,
             scan_stop_reported: false,
+            excludes: Vec::new(),
+            excluded: Vec::new(),
         }
+    }
+
+    /// Set the capture's `--exclude-module` inputs before scanning.
+    pub(crate) fn set_excludes(&mut self, excludes: Vec<PathBuf>) {
+        self.excludes = excludes;
+    }
+
+    pub(crate) fn excludes(&self) -> &[PathBuf] {
+        &self.excludes
+    }
+
+    pub(crate) fn push_excluded(&mut self, record: ExcludedRecord) {
+        self.excluded.push(record);
+    }
+
+    pub(crate) fn excluded(&self) -> &[ExcludedRecord] {
+        &self.excluded
+    }
+
+    pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
+        self.collection_work = Some(work);
+    }
+
+    pub(crate) fn with_retained_mapped_identities(
+        mut self,
+        retained: crate::discovery::identity::RetainedMappedIdentities,
+    ) -> Self {
+        self.retained_mapped = retained;
+        self
+    }
+
+    pub(crate) fn retained_mapped_identity(
+        &self,
+        file: &File,
+    ) -> Option<crate::discovery::identity::MappedFile> {
+        self.retained_mapped.identity_for(file)
+    }
+
+    pub(crate) fn with_kernel_anchor_exclusions(
+        mut self,
+        exclusions: crate::discovery::kernel_identity::KernelAnchorExclusions,
+    ) -> Self {
+        self.kernel_anchor_exclusions = exclusions;
+        self
+    }
+
+    pub(crate) fn kernel_anchor_exclusions(
+        &self,
+    ) -> &crate::discovery::kernel_identity::KernelAnchorExclusions {
+        &self.kernel_anchor_exclusions
+    }
+
+    pub(crate) fn has_collection_work(&self) -> bool {
+        self.collection_work.is_some()
+    }
+    pub(crate) fn poll_collection(&mut self, units: u64) -> bool {
+        self.collection_checkpoint(units)
+    }
+
+    fn collection_checkpoint(&mut self, units: u64) -> bool {
+        let Some(work) = &self.collection_work else {
+            return true;
+        };
+        if self.scan_stop_reason.is_some() {
+            return false;
+        }
+        if !(work.0)(units) {
+            self.set_scan_stop("cgroup collection stopped or shared work allowance exhausted");
+            return false;
+        }
+        true
     }
 
     /// Set the work ceiling (tests of where a ceiling stops).
@@ -1041,7 +1415,6 @@ impl CaptureWorkBudget {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn window_exhaustions(&self) -> u64 {
         self.window_exhaustions
     }
@@ -1069,6 +1442,9 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn allowed_io(&mut self, operation_bytes: u64, wanted: usize) -> usize {
+        if !self.collection_checkpoint(1) {
+            return 0;
+        }
         if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
             return 0;
         }
@@ -1086,7 +1462,17 @@ impl CaptureWorkBudget {
         allowed
     }
 
+    /// A metadata reader could not obtain its complete proof within the
+    /// allowance returned by allowed_io. Keep the actual resource refusal
+    /// distinct from a target read/identity error, preserving any earlier stop.
+    pub(crate) fn note_io_refusal(&mut self) {
+        self.set_scan_stop(IO_CEILING_REASON);
+    }
+
     pub(crate) fn record_io(&mut self, bytes: usize) {
+        // Bound input/parse amplification as well as decoded work. Existing
+        // I/O ceilings remain independent. Checks cannot interrupt a read.
+        self.collection_checkpoint((bytes as u64).div_ceil(32));
         self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
         if let Some(window) = self.active_window.as_mut() {
             window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
@@ -1094,7 +1480,7 @@ impl CaptureWorkBudget {
     }
 
     pub fn charge(&mut self, units: u64) -> bool {
-        if self.scan_stop_reason.is_some() {
+        if self.scan_stop_reason.is_some() || !self.collection_checkpoint(units) {
             return false;
         }
         if let DiscoveryPolicy::Inventory(_) = self.policy {
@@ -1151,7 +1537,19 @@ impl CaptureWorkBudget {
         self.deadline_ns
     }
 
+    /// The existing deadline, without renewing a window or hiding the
+    /// absence of one. Callers retain the normal stop/clock checks.
+    pub(crate) fn effective_deadline_ns(&self) -> Option<u64> {
+        let window = self.active_window.as_ref().map(|window| window.deadline_ns);
+        match (window, self.deadline_ns) {
+            (Some(window), Some(transaction)) => Some(window.min(transaction)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
+
     fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
+        self.collection_checkpoint(0);
         if let Some(reason) = self.scan_stop_reason {
             return Some(reason);
         }
@@ -1172,7 +1570,10 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn check_deadline_now(&mut self) -> Option<&'static str> {
-        if self.deadline_ns.is_some() || self.active_window.is_some() {
+        if self.deadline_ns.is_some()
+            || self.active_window.is_some()
+            || self.collection_work.is_some()
+        {
             self.check_deadline(crate::attach::monotonic_ns())
         } else {
             None
@@ -1180,7 +1581,7 @@ impl CaptureWorkBudget {
     }
 
     fn has_deadline(&self) -> bool {
-        self.deadline_ns.is_some() || self.active_window.is_some()
+        self.deadline_ns.is_some() || self.active_window.is_some() || self.collection_work.is_some()
     }
 
     /// The capture's stop, sticky reason first and otherwise one clock poll:
@@ -1217,6 +1618,9 @@ impl CaptureWorkBudget {
     }
 
     fn allowed_capture_io(&mut self, wanted: usize) -> usize {
+        if !self.collection_checkpoint(1) {
+            return 0;
+        }
         if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
             return 0;
         }
@@ -1243,6 +1647,19 @@ impl CaptureWorkBudget {
     /// with the skip — future minors walk as known prefixes now.)
     pub(crate) fn refusal_counts(&self) -> (u64, u64) {
         (self.table_refusals, self.interface_refusals)
+    }
+
+    /// Record one kernel-thread verified absence (empty maps with
+    /// PF_KTHREAD on the pinned generation). The pass summary discloses
+    /// the count; saturates instead of wrapping.
+    pub(crate) fn note_kernel_thread_absence(&mut self) {
+        self.kernel_thread_absences = self.kernel_thread_absences.saturating_add(1);
+    }
+
+    /// Processes this pass examined and classified as kernel threads
+    /// with no user memory (0 when none ran).
+    pub(crate) fn kernel_thread_absences(&self) -> u64 {
+        self.kernel_thread_absences
     }
 
     pub(crate) fn admit_table(&mut self, entries: usize) -> bool {
@@ -1367,6 +1784,48 @@ impl CaptureWorkBudget {
             .inspected_files
             .insert(key, value)
             .map_or(0, |old| inspected_cache_bytes(&key, &old));
+        self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        true
+    }
+
+    pub(crate) fn loader_elf_facts_for(&self, key: &LoaderFactsKey) -> Option<LoaderElfFacts> {
+        self.loader_elf_facts.get(key).cloned()
+    }
+
+    /// Retains one loader's facts under its own entry allowance: the loader
+    /// map is bounded by the export entry limit value, but counted
+    /// separately from the export facts map, so export-map fullness can
+    /// never refuse loader retention (a refused loader re-reads its file
+    /// bytes on every arm, which is what exhausted the capture I/O budget
+    /// before this cache existed). Bytes share the one retained
+    /// cache-bytes ceiling with every other retained map.
+    pub(crate) fn note_loader_elf_facts(
+        &mut self,
+        key: LoaderFactsKey,
+        value: LoaderElfFacts,
+    ) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        let bytes = loader_cache_bytes(&key, &value);
+        if !self.cache_can_replace(
+            self.loader_elf_facts
+                .get(&key)
+                .map(|old| loader_cache_bytes(&key, old)),
+            bytes,
+            self.loader_elf_facts.len(),
+            self.inventory_limits()
+                .map(|limits| limits.retained.export_cache_entries),
+        ) {
+            return false;
+        }
+        let old = self
+            .loader_elf_facts
+            .insert(key, value)
+            .map_or(0, |old| loader_cache_bytes(&key, &old));
         self.retained_cache_bytes = self
             .retained_cache_bytes
             .saturating_sub(old)
@@ -1575,7 +2034,8 @@ pub struct ScannedTable {
     /// are generation-local and never identify a table across remaps.
     pub file_offset: Option<u64>,
     /// True only when a live provider export returned this table: the address
-    /// came from an observed `C_GetFunctionList`/`C_GetInterfaceList` return,
+    /// came from an observed `C_GetFunctionList`, `C_GetInterfaceList` or
+    /// `C_GetInterface` return,
     /// not from heuristic memory decode. Recorded at lowering time, when the
     /// process generation brackets the address — never reconstructed later
     /// from a retained address, which would be generation-local garbage.
@@ -1587,6 +2047,19 @@ pub struct ScannedTable {
     /// never decoded, never retained across input changes (a retired module
     /// takes its marks with it).
     pub manifest_supported: bool,
+    /// True when the 3.x extension is structurally impossible: the full
+    /// declared extent was readable, the 68-slot legacy prefix validated,
+    /// and the first structural failure — unmapped, file-backed
+    /// non-executable, or anonymous non-executable memory — falls in
+    /// `68..92`, refuting the 92-wide and 104-wide layouts. Executable
+    /// anonymous memory and executable unusable-path mappings never set
+    /// it. Set only by `decode_candidate`; truncation,
+    /// `decode_observed_words`, and anchor recovery never set it. Unioned
+    /// by `merge_scanned_module` like the other monotonic observation
+    /// flags — a later full-extent decode that refutes nothing cannot
+    /// clear an earlier proof until a complete rescan replaces the
+    /// module — and ignored by `PartialEq`.
+    pub extension_impossible: bool,
 }
 
 impl PartialEq for ScannedTable {
@@ -1607,6 +2080,17 @@ impl PartialEq for ScannedTable {
 }
 
 impl Eq for ScannedTable {}
+
+impl ScannedTable {
+    /// Slots this table decoded: entries plus NULL holes plus records
+    /// reconciliation moved aside. Stable across reconciliation, which
+    /// moves entries to `unpinned` without changing the sum — so every
+    /// consumer sizes this table by this count, never by re-reading the
+    /// declared version's layout.
+    pub(crate) fn decoded_slot_count(&self) -> usize {
+        self.entries.len() + self.null_entries.len() + self.unpinned.len()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedInterface {
@@ -1653,6 +2137,27 @@ pub struct ScannedModule {
     /// without group evidence (heap-lowered records, loader prearm,
     /// single-mapping projections) carry `false`.
     pub double_loaded: bool,
+    /// The operator-named `--module` input the narrowing attributed this
+    /// opened file to (verbatim path string, or an inode alias confirmed
+    /// against the opened files), evaluated at scan time while the file is
+    /// open. `None` with no `--module` inputs, when the narrowing
+    /// attributes the object to no hint, or for modules synthesized without
+    /// scan evidence. The planner reads it for the operator-named closure
+    /// exception only; it changes no scan filtering.
+    pub module_hint: Option<PathBuf>,
+    /// Scan evidence: how many same-file loads this object's candidate
+    /// group covers, from [`duplicate_exec_load_count`] — 1 for a
+    /// single load, 2+ for overlapping executable file-offset coverage
+    /// at distinct addresses (notably `dlmopen` private-namespace
+    /// loads). The loader-timing gate compares this count across
+    /// scans: a third load keeps `double_loaded` true on both sides
+    /// but moves the count, and that new instance's first calls went
+    /// unobserved. Modules synthesized without group evidence
+    /// (heap-lowered records, loader prearm, single-mapping
+    /// projections) carry 1. Merges keep the maximum — a partial pass
+    /// that sees fewer loads is not fresh evidence of fewer loads —
+    /// and only a complete-scan replacement lowers it.
+    pub same_file_loads: u32,
     pub path: String,
     /// ABI used by the userspace memory decoder. Present only when this module
     /// came from `scan_process_view`; mapping and kernel-record projections do
@@ -1683,6 +2188,24 @@ pub enum ScanOutcome {
 }
 
 impl ScanOutcome {
+    /// Presentation requires the scanner's complete initial/final mapping
+    /// bracket. This grants no absence, provider or call-attribution authority.
+    /// Memory-unavailable and successfully empty scans can complete that bracket.
+    pub(crate) fn mapping_scan_completed(&self) -> bool {
+        let skipped = match self {
+            Self::Scanned { skipped, .. } | Self::Unavailable { skipped, .. } => skipped,
+        };
+        !skipped.iter().any(|skip| {
+            [
+                INITIAL_MAPS_UNAVAILABLE_REASON,
+                FINAL_MAPS_UNAVAILABLE_REASON,
+                SCAN_GENERATION_CHANGED_REASON,
+            ]
+            .iter()
+            .any(|reason| skip.reason.starts_with(reason))
+        })
+    }
+
     pub fn modules(&self) -> &[ScannedModule] {
         match self {
             Self::Scanned { modules, .. } | Self::Unavailable { modules, .. } => modules,
@@ -1724,14 +2247,27 @@ pub(crate) fn standard_ordinal(name: &str) -> Option<u16> {
 /// The export-linkage witness for one module's tables: the module object's
 /// own `.dynsym` definitions of standard names, `(name, file offset)`.
 /// Definitions only — `is_definition` excludes `STT_GNU_IFUNC`, whose value
-/// is a resolver, not the function — so an IFUNC name is simply absent.
+/// is a resolver, not the function — so an IFUNC name is simply absent
+/// from `symbols` (but still sets `getter_present`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ObjectExports<'a> {
     /// The object whose `.dynsym` was read. Only an entry that lands in this
-    /// same object can agree; a forwarded entry is never compared against a
-    /// dependency's symbols it was not read from.
+    /// same object can agree — except an interposed `C_GetFunctionList`
+    /// bootstrap (see [`export_agreement`]), which the linker resolved by
+    /// name; a forwarded entry is never compared against a dependency's
+    /// symbols it was not read from. The bootstrap exception is checked
+    /// before scoring: bind refuses a forward the target object does not
+    /// define at the forwarded offset, so this witness never scores an
+    /// unverified forward.
     pub(crate) object: ObjectKey,
     pub(crate) symbols: &'a [(String, u64)],
+    /// A 3.x interface getter name appears among the object's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `symbols`. Refuses the legacy-prefix proof.
+    pub(crate) getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `symbols` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    pub(crate) witness_fault: bool,
 }
 
 impl<'a> ObjectExports<'a> {
@@ -1743,6 +2279,8 @@ impl<'a> ObjectExports<'a> {
             inode: 0,
         },
         symbols: &[],
+        getter_present: false,
+        witness_fault: false,
     };
 
     /// Every definition of `name`, in dynsym order (a versioned name may
@@ -1771,27 +2309,48 @@ impl<'a> ObjectExports<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExportAgreement {
     /// Ordinals whose target is exactly every definition of their name, in
-    /// the exporting object.
+    /// the exporting object — plus an interposed `C_GetFunctionList`
+    /// bootstrap (see [`export_agreement`]).
     pub(crate) agreeing: usize,
     /// Ordinals whose name is defined somewhere other than their target —
-    /// including a target in another object.
+    /// including a target in another object, except an interposed
+    /// `C_GetFunctionList` bootstrap in an otherwise agreeing table.
     pub(crate) disagreeing: usize,
 }
 
 impl ExportAgreement {
-    /// The table-level predicate (review follow-up (b)): at least one
-    /// exported standard name agrees and none disagrees. Per-slot naming
-    /// would split the single authorization predicate, so a contradiction
-    /// refuses the whole table.
+    /// At least one exported standard name agrees and none disagrees.
+    /// Name authorization additionally requires an exact witness for every
+    /// retained target; a failed name claim never discards valid targets.
     pub(crate) fn corroborates(self) -> bool {
         self.agreeing > 0 && self.disagreeing == 0
     }
 }
 
+/// Compares each retained entry against the module's own export witness.
+/// One cross-object forward is not a contradiction: the `C_GetFunctionList`
+/// bootstrap legitimately interposes in multi-provider processes (every
+/// provider exports it, so the first one loaded wins the relocation by
+/// name). When at least one other entry agrees in-object — proving the
+/// layout is a real function list — the forwarded bootstrap keeps its
+/// ABI-definitional name. A lone forward, or any other forwarded name,
+/// still contradicts: only the bootstrap interposes by construction.
+/// The arm trusts reconciled input: both bind paths refuse a forwarded
+/// bootstrap the pinned target's own `.dynsym` does not define at the
+/// forwarded offset (see `forwarded_bootstrap_verified`), so a forward
+/// reaching this score was resolved by name. A wrong-offset, stale, or
+/// hostile forward never agrees — it arrives as an unpinned contradiction.
 pub(crate) fn export_agreement(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,
 ) -> ExportAgreement {
+    let layout_proven = table.entries.iter().any(|entry| {
+        let mut offsets = exports.offsets_of(entry.name).peekable();
+        if offsets.peek().is_none() {
+            return false;
+        }
+        entry.object == exports.object && offsets.all(|offset| offset == entry.file_offset)
+    });
     let mut agreement = ExportAgreement::default();
     for entry in &table.entries {
         let mut offsets = exports.offsets_of(entry.name).peekable();
@@ -1800,7 +2359,9 @@ pub(crate) fn export_agreement(
         }
         let same_target =
             entry.object == exports.object && offsets.all(|offset| offset == entry.file_offset);
-        if same_target {
+        let interposed_bootstrap =
+            entry.name == "C_GetFunctionList" && entry.object != exports.object && layout_proven;
+        if same_target || interposed_bootstrap {
             agreement.agreeing += 1;
         } else {
             agreement.disagreeing += 1;
@@ -1818,6 +2379,69 @@ pub(crate) fn export_agreement(
     agreement
 }
 
+/// Whether a 3.x-labelled 68-slot prefix is the module's complete reachable
+/// surface, proven without calling the provider: the scan showed the full
+/// declared extent readable with the first structural failure in `68..92`
+/// (`extension_impossible`, refuting 92/104-wide), the module exports
+/// neither 3.x interface getter in any symbol type (no conforming route
+/// to a 3.x table), and every retained entry agrees with its export.
+/// `exports` is the module object's completely read `.dynsym` witness (a
+/// failed read never yields a `ReconciledModule`), so absence there is
+/// proven absence — unless the walk skipped a symbol (`witness_fault`) or
+/// saw a getter it could not list as a definition (`getter_present`).
+/// Truncation, a getter export, a disagreeing entry, an unpinned record,
+/// a missing file owner, a getter in any symbol type, or a faulted walk
+/// all stay unproven. Callers publish through [`published_walk`], which
+/// adds the linked-table gate.
+fn proven_complete_legacy_prefix(table: &ScannedTable, exports: &ObjectExports<'_>) -> bool {
+    if !table.extension_impossible {
+        return false;
+    }
+    if table.version.0 != 3 || table.walk != "known_prefix" {
+        return false;
+    }
+    if table.decoded_slot_count() != LEGACY_PREFIX_SLOTS || !table.unpinned.is_empty() {
+        return false;
+    }
+    if table.file_offset.is_none() {
+        return false;
+    }
+    if exports.getter_present || exports.witness_fault {
+        return false;
+    }
+    if exports.offsets_of("C_GetInterface").next().is_some()
+        || exports.offsets_of("C_GetInterfaceList").next().is_some()
+    {
+        return false;
+    }
+    let agreement = export_agreement(table, exports);
+    agreement.corroborates() && agreement.agreeing == table.entries.len()
+}
+
+/// The walk label every surface publisher reports for scanned table
+/// `index` of a module: `full` when the legacy-prefix proof holds,
+/// otherwise the raw decoder walk. A table an interface record links
+/// keeps the raw decoder walk, as the interface surfaces do, so one table
+/// never publishes both `full` and `known_prefix`. Plan lowering, engine
+/// history and semantic completeness all use this one helper, so a proven
+/// table is never `full` in one place and `known_prefix` in another.
+pub(crate) fn published_walk(
+    index: usize,
+    tables: &[ScannedTable],
+    interfaces: &[ScannedInterface],
+    exports: &ObjectExports<'_>,
+) -> &'static str {
+    let table = &tables[index];
+    let linked = interfaces
+        .iter()
+        .any(|interface| interface.table == Some(index));
+    if !linked && proven_complete_legacy_prefix(table, exports) {
+        "full"
+    } else {
+        table.walk
+    }
+}
+
 /// Publication evidence for one candidate table, strongest first: a table
 /// named by an interface triple outranks a live-return address match, which
 /// outranks a manifest offset match, which outranks agreement with the
@@ -1829,9 +2453,8 @@ pub(crate) struct TableEvidenceScore {
     pub(crate) linked: bool,
     pub(crate) live_return: bool,
     pub(crate) manifest: bool,
-    /// A fully walked table whose ordinals agree with the object's exported
-    /// standard names (`ExportAgreement::corroborates`). Names only: scan
-    /// targets stay count-only whatever their linkage.
+    /// Every retained target agrees with the object's own exported standard
+    /// name. Names only: scan targets stay count-only whatever their linkage.
     pub(crate) exports: bool,
     pub(crate) full_walk: bool,
 }
@@ -1850,6 +2473,8 @@ pub(crate) fn table_evidence_score(
     exports: &ObjectExports<'_>,
 ) -> TableEvidenceScore {
     let table = &tables[index];
+    let opaque_only = table_has_only_opaque_interfaces(index, interfaces);
+    let agreement = export_agreement(table, exports);
     TableEvidenceScore {
         // Only the standard `"PKCS 11"` interface implies the standard
         // function-list layout: a vendor ("other"), "null" or "unreadable"
@@ -1860,30 +2485,55 @@ pub(crate) fn table_evidence_score(
         linked: interfaces.iter().any(|interface| {
             interface.table == Some(index) && interface.name_class == "exact_standard"
         }),
-        // Either the export lowering recorded a live return at decode time, or
-        // a caller-held generation-safe address matches this table instance.
-        live_return: table.live_return || live_return_addresses.contains(&table.address),
+        // An opaque interface return proves an observation, not the standard
+        // layout. Typed legacy and exact-standard returns keep their proof.
+        live_return: !opaque_only
+            && (table.live_return || live_return_addresses.contains(&table.address)),
         // Either a bound fallback proof recorded manifest agreement, or a
         // caller-held manifest table offset matches this table instance.
         manifest: table.manifest_supported
             || table
                 .file_offset
                 .is_some_and(|offset| manifest_offsets.contains(&offset)),
-        // Only a complete walk is compared: a known prefix leaves ordinals
-        // unexamined that could contradict.
-        exports: table.walk == "full" && export_agreement(table, exports).corroborates(),
+        // Corroboration concerns the positions actually observed. A label
+        // suggesting an unavailable extension cannot erase their evidence.
+        exports: table.file_offset.is_some()
+            && agreement.corroborates()
+            && agreement.agreeing == table.entries.len(),
         full_walk: table.walk == "full",
     }
+}
+
+/// Opaque associations cannot supply the standard ordinal layout. A matching
+/// typed return retains its stronger proof with opaque metadata unlinked.
+pub(crate) fn table_has_only_opaque_interfaces(
+    index: usize,
+    interfaces: &[ScannedInterface],
+) -> bool {
+    interfaces
+        .iter()
+        .any(|interface| interface.table == Some(index))
+        && !interfaces.iter().any(|interface| {
+            interface.table == Some(index) && interface.name_class == "exact_standard"
+        })
 }
 
 /// Whether a score authorizes presenting the table's ordinal names as PKCS#11
 /// names: some publication evidence (linkage, live return, manifest, export
 /// agreement) said this table is the provider's — bare size/version
-/// plausibility never does. This is the single authorization predicate:
-/// admission bypass and name gating both read it, so a table cannot be
-/// published-but-unnamed or named-but-heuristic.
+/// plausibility never does. Observation admission also accepts an actual
+/// opaque publication without promoting its API names.
 pub(crate) fn table_name_authorized(score: &TableEvidenceScore) -> bool {
     score.linked || score.live_return || score.manifest || score.exports
+}
+
+/// A real publication can authorize observing targets without proving their
+/// API names. Raw opaque triples alone carry no live-return publication fact.
+pub(crate) fn table_observation_authorized(
+    table: &ScannedTable,
+    score: &TableEvidenceScore,
+) -> bool {
+    table.live_return || table_name_authorized(score)
 }
 
 /// Linkage kind for evidence: the strongest publication evidence behind the
@@ -1975,14 +2625,54 @@ pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<us
     span_bytes(layout, spans)
 }
 
+/// The minimum extent a plausible 3.x table can expose when its extension
+/// is unavailable. This only bounds acquisition; every legacy slot still
+/// has to pass the normal decoder before the prefix can be admitted.
+pub(crate) fn exact_legacy_prefix_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
+    let word = read_word_le(header, layout, 0).ok()?;
+    let (version, spans, _) = spans_for(word)?;
+    if version.0 != 3
+        || spans.iter().map(|span| span.fields().len()).sum::<usize>() < LEGACY_PREFIX_SLOTS
+    {
+        return None;
+    }
+    table_bytes(layout, LEGACY_PREFIX_SLOTS).ok()
+}
+
 /// Returns every non-NULL function pointer in one complete table snapshot.
 /// Addresses are capture-local and are used only to close the maps-A/maps-B
 /// stability bracket; callers must not persist them as identity.
+/// Test-only: production sizes reads by the decoded slot count
+/// (`exact_table_addresses_n`).
+#[cfg(test)]
 pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Option<Vec<u64>> {
     let word = read_word_le(snapshot, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
+    exact_table_addresses_n(
+        snapshot,
+        layout,
+        spans.iter().map(|span| span.fields().len()).sum(),
+    )
+}
+
+/// The first `slots` non-NULL function pointers of one complete table
+/// snapshot, in ordinal order: the decoded-count-bounded form of the
+/// unbounded whole-layout read, for tables whose declared layout is
+/// wider than their validated prefix. Refuses a header no layout walks
+/// and a count wider than the walked layout, instead of reading past it.
+pub(crate) fn exact_table_addresses_n(
+    snapshot: &[u8],
+    layout: LinuxLayout,
+    slots: usize,
+) -> Option<Vec<u64>> {
+    let word = read_word_le(snapshot, layout, 0).ok()?;
+    let (_, spans, _) = spans_for(word)?;
+    let walked: usize = spans.iter().map(|span| span.fields().len()).sum();
+    if slots > walked {
+        return None;
+    }
     let mut addresses = Vec::new();
-    for ordinal in 0..spans.iter().map(|span| span.fields().len()).sum() {
+    for ordinal in 0..slots {
         let address = read_function_pointer(snapshot, layout, ordinal).ok()?;
         if address != 0 {
             addresses.push(address);
@@ -1991,13 +2681,50 @@ pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Opt
     Some(addresses)
 }
 
+/// Whether a slot-validation failure at `ordinal` still leaves a complete
+/// validated 68-slot legacy prefix: the mislabelled-table shape (a 3.x
+/// version word over a 2.x table), accepted as its prefix instead of
+/// rejected. `prefix_non_null` counts validated non-NULL slots below 68.
+/// On the sweep (`strict_tail`) at least two are required so a
+/// single-entry BSS lookalike cannot admit a second table and churn the
+/// attach set pass to pass. Exact-address callers pass `false`: the
+/// provider's own address rules out a BSS lookalike, so one validated
+/// entry keeps the previous accept.
+fn mislabelled_tail_ordinal(
+    version: (u8, u8),
+    ordinal: usize,
+    prefix_non_null: usize,
+    strict_tail: bool,
+) -> bool {
+    let admitted = if strict_tail {
+        prefix_non_null > 1
+    } else {
+        prefix_non_null > 0
+    };
+    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && admitted
+}
+
 /// Decodes one candidate at `offset` inside `snapshot` (whose first byte is at
 /// `base_address` in the target). Returns the table only when every published slot
 /// is either NULL or points into a file-backed executable mapping — the criterion
 /// that makes a run of pointers a function table rather than data that looks like one.
-/// `runtime_view` scopes the cardinality identity for tables without a stable
-/// file owner (heap/anonymous exact reads): `None` keeps the memory sweep's
-/// file-identity-only charging bit for bit.
+/// A 3.x table whose extension is unavailable or fails validation after a
+/// complete validated 68-slot prefix decodes as that prefix, labelled with
+/// its declared version and a `known_prefix` walk. An incomplete or invalid
+/// legacy prefix is still rejected.
+/// `ctx` carries the caller's runtime view and mislabelled-tail bar.
+#[derive(Debug, Clone, Copy)]
+struct DecodeContext {
+    /// Scopes the cardinality identity for tables without a stable file
+    /// owner (heap/anonymous exact reads): `None` keeps the memory
+    /// sweep's file-identity-only charging bit for bit.
+    runtime_view: Option<ProcessViewId>,
+    /// Applies the sweep's mislabelled-tail bar (at least two validated
+    /// prefix entries); exact-address callers pass `false` for the
+    /// provider-provenanced accept.
+    strict_tail: bool,
+}
+
 fn decode_candidate(
     layout: LinuxLayout,
     snapshot: &[u8],
@@ -2005,7 +2732,7 @@ fn decode_candidate(
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
-    runtime_view: Option<ProcessViewId>,
+    ctx: DecodeContext,
 ) -> Result<Option<(ScannedTable, usize)>, ()> {
     let width = layout.word_bytes();
     let Some(raw_word) = offset
@@ -2034,19 +2761,35 @@ fn decode_candidate(
         _ => None,
     };
     let file_offset = table_owner.map(|(_, _, file_offset)| file_offset);
-    let Some(bytes) = offset
-        .checked_add(len)
-        .and_then(|end| snapshot.get(offset..end))
-    else {
-        return Ok(None);
+    let available = &snapshot[offset..];
+    let (bytes, mut short_prefix) = if let Some(bytes) = available.get(..len) {
+        (bytes, false)
+    } else {
+        let Some(prefix_len) = exact_legacy_prefix_bytes(raw_word, layout) else {
+            return Ok(None);
+        };
+        let Some(bytes) = available.get(..prefix_len) else {
+            return Ok(None);
+        };
+        (bytes, true)
     };
+    let full_extent_readable = !short_prefix;
+    let mut refuting_ordinal: Option<usize> = None;
 
-    // Validate the whole candidate before reserving or allocating decoded records.
+    // Validate the readable candidate before reserving decoded records.
     // Each validated slot is retained: file-backed entries as their normalized
     // (device, inode, file offset), NULLs as holes. The entry builder below
     // consumes this instead of re-resolving, and the runtime identity hashes it.
+    // A 3.x candidate that fails past a complete validated 68-slot prefix
+    // stops there and decodes as that prefix. When the extension is not
+    // completely available, only the complete legacy prefix is walked.
     let mut non_null = 0usize;
-    let field_count = spans.iter().map(|span| span.fields().len()).sum();
+    let mut prefix_non_null = 0usize;
+    let field_count = if short_prefix {
+        LEGACY_PREFIX_SLOTS
+    } else {
+        spans.iter().map(|span| span.fields().len()).sum()
+    };
     let mut slots: Vec<Option<(String, Device, u64, u64)>> = Vec::with_capacity(field_count);
     let mut names: Vec<&'static str> = Vec::with_capacity(field_count);
     for ordinal in 0..field_count {
@@ -2068,6 +2811,9 @@ fn decode_candidate(
             continue;
         }
         non_null += 1;
+        if ordinal < LEGACY_PREFIX_SLOTS {
+            prefix_non_null += 1;
+        }
         let Resolved::File {
             permissions,
             path,
@@ -2077,13 +2823,49 @@ fn decode_candidate(
             ..
         } = maps.resolve(value)
         else {
-            return Ok(None); // anonymous or unmapped ⇒ not a function table
+            // Anonymous or unmapped ⇒ not a function table, unless the
+            // failure is a mislabelled tail past a complete legacy prefix.
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
+                return Ok(None);
+            }
+            // Only a structural failure refutes the wider layouts: unmapped
+            // memory, or anonymous memory without execute permission (which
+            // cannot hold code). Executable anonymous memory (JIT code,
+            // trampolines) may hold a real extension the scanner cannot
+            // attach, so it proves nothing.
+            let refutes = match maps.containing(value) {
+                None => true,
+                Some(entry) => entry.permissions[2] != b'x',
+            };
+            if refutes {
+                refuting_ordinal = Some(ordinal);
+            }
+            short_prefix = true;
+            break;
         };
         if permissions[2] != b'x' {
-            return Ok(None); // a pointer into data ⇒ not a function table
+            // A file-backed pointer into data ⇒ not a function table,
+            // unless the failure is a mislabelled tail past a complete
+            // legacy prefix. Data cannot hold the extension, so the
+            // failure refutes the wider layouts.
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
+                return Ok(None);
+            }
+            refuting_ordinal = Some(ordinal);
+            short_prefix = true;
+            break;
         }
         let MappedPath::Usable(path) = path else {
-            return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
+            // Deleted/ambiguous pathname ⇒ cannot become an attach target,
+            // unless the failure is a mislabelled tail past a complete
+            // legacy prefix. The mapping is executable (a non-executable
+            // one failed above), so it may hold real code reached through
+            // a path the scanner cannot use: no refutation.
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
+                return Ok(None);
+            }
+            short_prefix = true;
+            break;
         };
         slots.push(Some((
             path.display().to_string(),
@@ -2092,10 +2874,28 @@ fn decode_candidate(
             file_offset,
         )));
     }
+    // A short accept walked a known prefix, never the declared layout:
+    // the `known_prefix` label carries that quirk into surfaces and the
+    // existing surface-gap verdict, with the declared version untouched.
+    let (walk, decoded_entries) = if short_prefix {
+        slots.truncate(LEGACY_PREFIX_SLOTS);
+        names.truncate(LEGACY_PREFIX_SLOTS);
+        non_null = prefix_non_null;
+        ("known_prefix", LEGACY_PREFIX_SLOTS)
+    } else {
+        (walk, field_count)
+    };
     if non_null == 0 {
         return Ok(None);
     }
-    let decoded_entries = spans.iter().map(|span| span.fields().len()).sum();
+    let len = if short_prefix {
+        let Ok(prefix_len) = table_bytes(layout, LEGACY_PREFIX_SLOTS) else {
+            return Ok(None);
+        };
+        prefix_len
+    } else {
+        len
+    };
     // Byte-identical repeats skip the candidate+entry charge but still decode
     // below. Without a stable file owner there is no file identity; a
     // view-scoped caller instead identifies the table by (view, address,
@@ -2112,7 +2912,7 @@ fn decode_candidate(
                 usable: decoded_entries,
             });
     let runtime_identity = if identity.is_none() {
-        runtime_view.map(|view| RuntimeTableIdentity {
+        ctx.runtime_view.map(|view| RuntimeTableIdentity {
             view,
             address,
             version_word: word,
@@ -2180,6 +2980,10 @@ fn decode_candidate(
             file_offset: *file_offset,
         });
     }
+    let extension_impossible = full_extent_readable
+        && version.0 == 3
+        && refuting_ordinal
+            .is_some_and(|ordinal| (LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS).contains(&ordinal));
     Ok(Some((
         ScannedTable {
             version,
@@ -2194,6 +2998,7 @@ fn decode_candidate(
             // caller that owns it, never manufactured here.
             live_return: false,
             manifest_supported: false,
+            extension_impossible,
         },
         len,
     )))
@@ -2204,7 +3009,10 @@ fn decode_candidate(
 /// `/proc/<pid>/mem` read; this helper only accepts a complete table snapshot.
 /// `runtime_view` scopes the cardinality identity for tables without a stable
 /// file owner; pass the reading view for exact-address validation, `None`
-/// only where no view exists (unit fixtures).
+/// only where no view exists (unit fixtures). The mislabelled-tail bar
+/// stays at the previous single-entry accept: the caller's address (the
+/// provider's own getter result or an exact pool address) rules out the
+/// BSS lookalike the sweep bar exists for.
 pub(crate) fn decode_exact_table(
     snapshot: &[u8],
     address: u64,
@@ -2213,8 +3021,180 @@ pub(crate) fn decode_exact_table(
     budget: &mut CaptureWorkBudget,
     runtime_view: Option<ProcessViewId>,
 ) -> Result<Option<ScannedTable>, ()> {
-    decode_candidate(layout, snapshot, 0, address, maps, budget, runtime_view)
-        .map(|decoded| decoded.map(|(table, _)| table))
+    decode_candidate(
+        layout,
+        snapshot,
+        0,
+        address,
+        maps,
+        budget,
+        DecodeContext {
+            runtime_view,
+            strict_tail: false,
+        },
+    )
+    .map(|decoded| decoded.map(|(table, _)| table))
+}
+
+/// Decode words acquired through a typed getter or independently corroborated
+/// ordinal source. Header metadata does not determine which words exist. NULL,
+/// unusable and unavailable positions remain distinct; only complete words
+/// supplied by the acquisition are represented here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_observed_words(
+    version: (u8, u8),
+    words: &[u64],
+    limit: usize,
+    address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    runtime_view: Option<ProcessViewId>,
+) -> Result<Option<ScannedTable>, ()> {
+    if limit > 104 || words.len() > limit {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    let mut null_entries = Vec::new();
+    let mut unpinned = Vec::new();
+    for (ordinal, &value) in words.iter().enumerate() {
+        if !budget.charge(1) {
+            return Err(());
+        }
+        let Some(name) = function_name(ordinal) else {
+            return Ok(None);
+        };
+        if value == 0 {
+            null_entries.push(name);
+            continue;
+        }
+        let target = match maps.resolve(value) {
+            Resolved::File {
+                permissions,
+                path: MappedPath::Usable(path),
+                device,
+                inode,
+                file_offset,
+                ..
+            } if inode != 0 && permissions[2] == b'x' => Some((path, device, inode, file_offset)),
+            _ => None,
+        };
+        if let Some((path, device, inode, file_offset)) = target {
+            entries.push(ScannedEntry {
+                name,
+                object: ObjectKey { device, inode },
+                object_path: path.display().to_string(),
+                file_offset,
+            });
+        } else {
+            unpinned.push(Skipped {
+                subject: name.to_string(),
+                reason: "observed function target is not a usable file-backed executable address"
+                    .to_string(),
+            });
+        }
+    }
+    let version_word = u64::from(version.0) | (u64::from(version.1) << 8);
+    let usable = words.len();
+    let file_owner = match maps.resolve(address) {
+        Resolved::File {
+            device,
+            inode,
+            file_offset,
+            ..
+        } if inode != 0 => Some((device, inode, file_offset)),
+        _ => None,
+    };
+    let mut content = 0xcbf2_9ce4_8422_2325u64;
+    for word in [version_word, usable as u64]
+        .into_iter()
+        .chain(words.iter().copied())
+    {
+        for byte in word.to_le_bytes() {
+            content = (content ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let file_identity = file_owner.map(|(device, inode, file_offset)| TableIdentity {
+        device,
+        inode,
+        file_offset,
+        version_word,
+        usable,
+    });
+    let runtime_identity = if file_identity.is_none() {
+        runtime_view.map(|view| RuntimeTableIdentity {
+            view,
+            address,
+            version_word,
+            usable,
+            content,
+        })
+    } else {
+        None
+    };
+    let repeat = file_identity
+        .as_ref()
+        .is_some_and(|id| budget.table_already_admitted(id))
+        || runtime_identity
+            .as_ref()
+            .is_some_and(|id| budget.runtime_table_already_admitted(id));
+    if !budget.admit_decoded_table(usable) || (!repeat && !budget.admit_table(usable)) {
+        return Err(());
+    }
+    if !repeat {
+        if let Some(id) = file_identity
+            && !budget.note_table_admitted(id)
+        {
+            return Err(());
+        }
+        if let Some(id) = runtime_identity
+            && !budget.note_runtime_table_admitted(id)
+        {
+            return Err(());
+        }
+    }
+    let table = ScannedTable {
+        version,
+        walk: if usable == limit && unpinned.is_empty() {
+            "full"
+        } else {
+            "known_prefix"
+        },
+        entries,
+        null_entries,
+        unpinned,
+        address,
+        file_offset: file_owner.map(|(_, _, offset)| offset),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    if let Some(id) = runtime_identity {
+        budget.runtime_table_contents.insert(
+            (id.view, id.address, id.version_word, id.usable),
+            (
+                stored_table_content_hash(&table, version_word, usable),
+                id.content,
+            ),
+        );
+    }
+    Ok(Some(table))
+}
+
+/// Only validated targets become dependencies. Invalid observed words remain
+/// in the table's partial diagnostics and private content fingerprint.
+pub(crate) fn decoded_table_addresses(
+    snapshot: &[u8],
+    layout: LinuxLayout,
+    table: &ScannedTable,
+) -> Option<Vec<u64>> {
+    table
+        .entries
+        .iter()
+        .map(|entry| {
+            let ordinal = usize::from(standard_ordinal(entry.name)?);
+            read_function_pointer(snapshot, layout, ordinal).ok()
+        })
+        .collect()
 }
 
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
@@ -2229,6 +3209,7 @@ fn detect_tables(
     detect_tables_for_layout(LinuxLayout::Lp64, snapshot, base_address, maps, budget)
 }
 
+#[cfg(test)]
 fn detect_tables_for_layout(
     layout: LinuxLayout,
     snapshot: &[u8],
@@ -2242,23 +3223,102 @@ fn detect_tables_for_layout(
         base_address,
         maps,
         budget,
+        None,
+        &[],
         crate::attach::monotonic_ns,
     )
 }
 
+/// Whether a kept decode dominates an anchor candidate, mirroring the
+/// overlap pass below (validated desc, length desc, start asc). A
+/// candidate covered by a validated table, or by an overlapping longer
+/// decode, adds no coverage; equal-length unvalidated ties go to the
+/// earlier start. Accepted residuals: same-start pairs where a future
+/// longer decode covers the shorter (the survivor covers the same words;
+/// admission dedups by object+offset); overlapping decodes performed
+/// before their dominator appears — a shorter (or equal-length
+/// later-start) decode the overlap pass drops once the longer (or
+/// earlier-start) overlapper decodes, since the skip only sees the past;
+/// and validated discards that hide an overlapping candidate from a
+/// future validated survivor (contrived).
+fn anchor_kept_dominates(
+    kept_start: usize,
+    kept_len: usize,
+    kept_validated: bool,
+    candidate: usize,
+    candidate_len: usize,
+) -> bool {
+    candidate != kept_start
+        && candidate < kept_start.saturating_add(kept_len)
+        && kept_start < candidate.saturating_add(candidate_len)
+        && (kept_validated
+            || kept_len > candidate_len
+            || (kept_len == candidate_len && kept_start < candidate))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
     snapshot: &[u8],
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
+    export_evidence: Option<&ObjectExports<'_>>,
+    excluded_anchor_ranges: &[(u64, u64)],
     mut now: F,
 ) -> (Vec<ScannedTable>, Vec<String>) {
     let mut skipped = Vec::new();
-    let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
+    let mut found: Vec<(usize, usize, bool, ScannedTable)> = Vec::new();
+    let mut anchors: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    if let Some(exports) = export_evidence {
+        if let Err(reason) = budget.spend(maps.entries().len() as u64) {
+            return (Vec::new(), vec![reason.to_string()]);
+        }
+        let executable: Vec<_> = maps
+            .entries()
+            .iter()
+            .filter(|mapping| {
+                mapping.device == exports.object.device
+                    && mapping.inode == exports.object.inode
+                    && mapping.permissions[2] == b'x'
+            })
+            .collect();
+        for (name, file_offset) in exports.symbols {
+            if let Some(reason) = budget.check_deadline(now()) {
+                return (Vec::new(), vec![reason.to_string()]);
+            }
+            if let Err(reason) = budget.spend(1) {
+                return (Vec::new(), vec![reason.to_string()]);
+            }
+            let Some(ordinal) = standard_ordinal(name).map(usize::from) else {
+                continue;
+            };
+            for mapping in &executable {
+                if let Some(reason) = budget.check_deadline(now()) {
+                    return (Vec::new(), vec![reason.to_string()]);
+                }
+                if let Err(reason) = budget.spend(1) {
+                    return (Vec::new(), vec![reason.to_string()]);
+                }
+                if let Some(address) = file_offset
+                    .checked_sub(mapping.file_offset)
+                    .and_then(|delta| mapping.start.checked_add(delta))
+                    .filter(|address| *address < mapping.end)
+                {
+                    let ordinals = anchors.entry(address).or_default();
+                    if !ordinals.contains(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
+                }
+            }
+        }
+    }
+    // At most one current width for each accepted offset; decoded-table
+    // budgets bound both this map and the existing result collection.
+    let mut seen = BTreeMap::<usize, usize>::new();
     let mut offset = 0usize;
     let width = layout.word_bytes();
-    while offset + width <= snapshot.len() {
+    'scan: while offset + width <= snapshot.len() {
         if (offset / width).is_multiple_of(4096)
             && budget.has_deadline()
             && budget.check_deadline(now()).is_some()
@@ -2278,8 +3338,47 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             }
             break;
         }
-        match decode_candidate(layout, snapshot, offset, base_address, maps, budget, None) {
-            Ok(Some((table, len))) => found.push((offset, len, table)),
+        let value = read_word_le(snapshot, layout, offset).expect("one complete word");
+        // A plausible header inside this object's proven ELF metadata is
+        // not an independent table witness. In particular, a GNU property
+        // word followed by padding and init/fini pointers must not acquire
+        // decoded-table capacity or become a legacy-prefix surface. Keep
+        // the independently exported anchor recovery below separate: its
+        // existing credibility rule concerns the actual anchor word.
+        let metadata_header = !excluded_anchor_ranges.is_empty()
+            && spans_for(value).is_some()
+            && export_evidence.is_some_and(|exports| {
+                base_address.checked_add(offset as u64).is_some_and(|address| {
+                    matches!(maps.resolve(address), Resolved::File { device, inode, file_offset, .. }
+                        if (ObjectKey { device, inode }) == exports.object
+                            && raw_anchor_overlaps_metadata(excluded_anchor_ranges, file_offset, width))
+                })
+            });
+        let decoded = if metadata_header {
+            Ok(None)
+        } else {
+            // Sweep decodes keep the strict mislabelled-tail bar: an
+            // unprovenanced version-like word needs two validated prefix
+            // entries before its tail can be accepted as a mislabelled
+            // prefix.
+            decode_candidate(
+                layout,
+                snapshot,
+                offset,
+                base_address,
+                maps,
+                budget,
+                DecodeContext {
+                    runtime_view: None,
+                    strict_tail: true,
+                },
+            )
+        };
+        match decoded {
+            Ok(Some((table, len))) => {
+                seen.insert(offset, table.decoded_slot_count());
+                found.push((offset, len, true, table));
+            }
             // Owner-approved 2026-09-27: F-14's version skip is retired —
             // future minors walk as known prefixes, and anything else the
             // gate rejects (unknown major, upper bits set) is data.
@@ -2293,23 +3392,122 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 break;
             }
         }
+        // An own exported function at its actual catalog position anchors
+        // partial recovery. Merely being in a provider mapping (or being
+        // all-zero data) is not such a witness. This is a single pass over
+        // pointer words, rather than rewalking 104 words at every offset.
+        if let Some(ordinals) = anchors.get(&value).filter(|_| {
+            if excluded_anchor_ranges.is_empty() {
+                return true;
+            }
+            let Some(exports) = export_evidence else {
+                return true;
+            };
+            let Some(address) = base_address.checked_add(offset as u64) else {
+                return false;
+            };
+            !matches!(maps.resolve(address), Resolved::File { device, inode, file_offset, .. }
+                if (ObjectKey { device, inode }) == exports.object
+                    && raw_anchor_overlaps_metadata(excluded_anchor_ranges, file_offset, width))
+        }) {
+            for &ordinal in ordinals {
+                if !budget.charge(1) {
+                    if let Some(reason) = budget.take_scan_stop_reason() {
+                        skipped.push(reason.into());
+                    }
+                    break 'scan;
+                }
+                let Some(candidate) = offset.checked_sub(width * (ordinal + 1)) else {
+                    continue;
+                };
+                if seen.get(&candidate).is_some_and(|count| *count > ordinal) {
+                    continue;
+                }
+                let header =
+                    read_word_le(snapshot, layout, candidate).expect("the earlier complete header");
+                let version = (header as u8, (header >> 8) as u8);
+                // Extended positions need their own export witness. A legacy
+                // label/common extent never turns following data into 3.x APIs.
+                let limit = if ordinal < 68 {
+                    68
+                } else if ordinal < 92 {
+                    92
+                } else {
+                    104
+                };
+                let count = ((snapshot.len() - candidate - width) / width).min(limit);
+                // Skip anchor decodes the overlap pass below would discard:
+                // a candidate covered by a validated table, or by an
+                // overlapping longer (or equal-length earlier-start) decode,
+                // adds no coverage but burns a table candidate each. An
+                // aliased export tail
+                // otherwise spends ~36 candidates per provider and exhausts
+                // the per-pass budget at system scale. Same-start
+                // extensions, longer recoveries, and candidates touching a
+                // kept decode still decode; the version sweep is unaffected,
+                // so version-readable tables always decode.
+                let candidate_len = table_bytes(layout, count).expect("bounded catalog");
+                let dominated = found.iter().any(|(start, kept_len, validated, _)| {
+                    anchor_kept_dominates(*start, *kept_len, *validated, candidate, candidate_len)
+                });
+                if dominated {
+                    continue;
+                }
+                let words: Vec<_> = (0..count)
+                    .map(|slot| {
+                        read_function_pointer(&snapshot[candidate..], layout, slot)
+                            .expect("complete observed word")
+                    })
+                    .collect();
+                let Some(address) = base_address.checked_add(candidate as u64) else {
+                    continue;
+                };
+                match decode_observed_words(version, &words, limit, address, maps, budget, None) {
+                    Ok(Some(mut table)) => {
+                        // Independent exports authorize names, not unobserved
+                        // extension completeness or interface-selection claims.
+                        table.walk = "known_prefix";
+                        seen.insert(candidate, count);
+                        found.push((
+                            candidate,
+                            table_bytes(layout, count).expect("bounded catalog"),
+                            false,
+                            table,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        if let Some(reason) = budget.take_scan_stop_reason() {
+                            skipped.push(reason.into());
+                        } else if let Some(reason) = budget.table_exhaustion_reason() {
+                            skipped.push(reason);
+                        }
+                        break 'scan;
+                    }
+                }
+            }
+        }
         offset += width;
     }
-    // Longest first, then drop anything overlapping an already-kept match.
-    found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut kept: Vec<(usize, usize, ScannedTable)> = Vec::new();
+    // Fully validated shapes outrank weaker export-anchored recovery. Within
+    // one evidence class keep the longest nonoverlapping match.
+    found.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+    let mut kept: Vec<(usize, usize, bool, ScannedTable)> = Vec::new();
     for candidate in found {
-        let overlaps = kept.iter().any(|(start, len, _)| {
-            candidate.0 < start.saturating_add(*len)
+        let overlaps = kept.iter().any(|(start, len, _, _)| {
+            // An independently anchored extension at this exact base can
+            // retain additional targets alongside the stronger prefix proof.
+            candidate.0 != *start
+                && candidate.0 < start.saturating_add(*len)
                 && *start < candidate.0.saturating_add(candidate.1)
         });
         if !overlaps {
             kept.push(candidate);
         }
     }
-    kept.sort_by_key(|(start, _, _)| *start);
+    kept.sort_by_key(|(start, _, _, _)| *start);
     (
-        kept.into_iter().map(|(_, _, table)| table).collect(),
+        kept.into_iter().map(|(_, _, _, table)| table).collect(),
         skipped,
     )
 }
@@ -2466,13 +3664,14 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             // only a new distinct interface consumes a lifetime record. A
             // refused triple is skipped — not fatal — so later repeats still
             // decode; the refusal counter keeps the scan incomplete.
-            let identity = interface_identity(
+            let identity = observed_interface_identity(
                 &tables[table],
                 name_class,
                 &name_private,
                 flags,
                 maps,
                 runtime_view,
+                budget,
             );
             let repeat = identity
                 .as_ref()
@@ -2659,31 +3858,51 @@ pub(crate) fn candidate_groups(maps: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&Ma
 /// and neither are disjoint ranges; same-address pairs are the one
 /// mapping, never a duplicate.
 pub(crate) fn duplicate_exec_coverage(group: &[&MapEntry]) -> bool {
+    duplicate_exec_load_count(group) >= 2
+}
+
+/// How many same-file loads `group` evidences: the maximum number of
+/// executable mappings at distinct addresses covering one shared file
+/// offset. One load maps each offset once; a `dlmopen`
+/// private-namespace second load maps the same executable file range
+/// at a second address, a third load at a third address, and so on.
+/// Data-only duplicates are not evidence (no call surface attaches
+/// there), disjoint ranges never share an offset, and same-address
+/// pairs are the one mapping, never a duplicate. At least 1: a module
+/// row evidences one load.
+pub(crate) fn duplicate_exec_load_count(group: &[&MapEntry]) -> u32 {
     let exec: Vec<&&MapEntry> = group
         .iter()
         .filter(|entry| entry.permissions[2] == b'x')
         .collect();
-    for (index, first) in exec.iter().enumerate() {
-        let first_len = first.end.saturating_sub(first.start);
-        let first_end = first.file_offset.saturating_add(first_len);
-        for second in exec.iter().skip(index + 1) {
-            if first.start == second.start {
-                continue;
-            }
-            let second_len = second.end.saturating_sub(second.start);
-            let second_end = second.file_offset.saturating_add(second_len);
-            if first.file_offset < second_end && second.file_offset < first_end {
-                return true;
+    let mut loads = 1u32;
+    for probe in &exec {
+        let mut addresses: Vec<u64> = Vec::new();
+        for other in &exec {
+            let other_len = other.end.saturating_sub(other.start);
+            let other_end = other.file_offset.saturating_add(other_len);
+            if other.file_offset <= probe.file_offset
+                && probe.file_offset < other_end
+                && !addresses.contains(&other.start)
+            {
+                addresses.push(other.start);
             }
         }
+        loads = loads.max(addresses.len() as u32);
     }
-    false
+    loads
 }
 
 /// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
 /// `map_files` is never required, and a container's own file is never copied out).
-fn open_in_target(view: &ProcessView, path: &str) -> Result<File, String> {
-    view.run_while_same(|| open_object(Path::new(&format!("/proc/{}/root{path}", view.pid()))))?
+fn open_in_target(
+    view: &ProcessView,
+    path: &str,
+    budget: &mut CaptureWorkBudget,
+) -> Result<File, String> {
+    view.with_filesystem(budget, |filesystem, _| {
+        filesystem.open_rooted_object(Path::new(path))
+    })
 }
 
 /// `(inode, size)` for a `--module` hint, read through the *observer's* filesystem view.
@@ -2761,6 +3980,122 @@ fn hint_gate(kind: HintMatch, hint: &Path, actual: &File) -> Result<(), String> 
     )
 }
 
+/// The first `--module` hint the narrowing attributes this opened object
+/// to: the first matched hint its alias gate accepts, in hint order. The
+/// planner reads it as the operator-named signal, so naming follows the
+/// narrowing exactly — a verbatim path match names without consulting
+/// observer identity (the container case), an inode match only once the
+/// opened files confirm the alias, and a bare name never (it never narrows
+/// in). The second element carries the last gate refusal seen, as the
+/// narrowing reported it.
+fn first_attributable_hint(
+    matched: &[(usize, HintMatch)],
+    hints: &[PathBuf],
+    actual: &File,
+) -> (Option<PathBuf>, Option<String>) {
+    let mut named = None;
+    let mut refusal = None;
+    for (index, kind) in matched {
+        match hint_gate(*kind, &hints[*index], actual) {
+            Ok(()) => {
+                named = Some(hints[*index].clone());
+                break;
+            }
+            Err(reason) => {
+                refusal = Some(reason);
+            }
+        }
+    }
+    (named, refusal)
+}
+
+/// `--exclude-module` path inputs resolved to file identity: the operator
+/// input plus the device and inode it resolved to.
+pub(crate) type ExcludePaths = Vec<(PathBuf, u64, u64)>;
+/// `--exclude-module` bare-name inputs: the operator input plus its match
+/// bytes (basename or ELF soname).
+pub(crate) type ExcludeNames = Vec<(PathBuf, Vec<u8>)>;
+
+/// Which `--exclude-module` input matches this opened mapped file, if any.
+/// Exact-file paths match by fstat identity (both sides opened files, never
+/// maps vs fstat, so a different file at the same path in another mount
+/// namespace is NOT excluded); bare names match by basename or ELF soname
+/// read from this handle. Returns the matching input for the report.
+pub(crate) fn exclude_match(
+    path: &str,
+    file: &File,
+    exclude_paths: &ExcludePaths,
+    exclude_names: &ExcludeNames,
+) -> Option<PathBuf> {
+    if let Ok(metadata) = file.metadata() {
+        let identity = (metadata.dev(), metadata.ino());
+        if let Some((input, _, _)) = exclude_paths
+            .iter()
+            .find(|(_, dev, ino)| (*dev, *ino) == identity)
+        {
+            return Some(input.clone());
+        }
+    }
+    if exclude_names.is_empty() {
+        return None;
+    }
+    if let Some(base) = Path::new(path).file_name()
+        && let Some((input, _)) = exclude_names
+            .iter()
+            .find(|(_, name)| *name == base.as_bytes())
+    {
+        return Some(input.clone());
+    }
+    // Soname from the pinned handle only (allowlist-v3 Row B pattern: exact
+    // equality against pinned-file metadata, discarded after classification,
+    // never published).
+    let mut charge = 0u64;
+    if let Ok(parsed) = read_elf_needed(file, &mut charge, 0)
+        && let Some(soname) = parsed.soname
+        && let Some((input, _)) = exclude_names.iter().find(|(_, name)| *name == soname)
+    {
+        return Some(input.clone());
+    }
+    None
+}
+
+/// PA-5 I3: which `--exclude-module` input conflicts with this startup
+/// `--prearm-module` or manifest-attested path, if any. Opens the file and
+/// reuses [`exclude_match`] (identity, resolved basename, soname), so a
+/// pre-armed provider matching an exclusion is refused at startup (exit 2),
+/// never silently coexisting with it. Unopenable paths yield no conflict
+/// here; discovery reports them precisely.
+pub(crate) fn startup_exclude_conflict(
+    include: &std::path::Path,
+    excludes: &[PathBuf],
+) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    if excludes.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(include).ok()?;
+    let exclude_paths: ExcludePaths = excludes
+        .iter()
+        .filter(|e| e.as_os_str().as_bytes().contains(&b'/'))
+        .filter_map(|e| {
+            std::fs::metadata(e)
+                .ok()
+                .map(|m| (e.clone(), m.dev(), m.ino()))
+        })
+        .collect();
+    let exclude_names: ExcludeNames = excludes
+        .iter()
+        .filter(|e| !e.as_os_str().as_bytes().contains(&b'/'))
+        .map(|e| (e.clone(), e.as_os_str().as_bytes().to_vec()))
+        .collect();
+    // Resolved basename: follow symlinks so a prearm via `p11-kit-proxy.so`
+    // (a symlink to `libp11-kit.so.0.4.8`) matches by its real name or soname.
+    let resolved = std::fs::canonicalize(include).unwrap_or_else(|_| include.to_path_buf());
+    let path_str = resolved.to_str()?;
+    exclude_match(path_str, &file, &exclude_paths, &exclude_names)
+}
+
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
 /// discovery loss. `ESRCH` is proof the process ended — the ordinary end of a
 /// process, already recorded by `scan_unavailable`, and nothing a capture that
@@ -2811,20 +4146,39 @@ fn opened_file_identity_guard(
 /// backing file). Best effort by design: without the privilege, or for a
 /// range unmapped since, the path open and key match stay the proof,
 /// exactly as before; only a proven different file refuses.
-fn mapped_file_guard(
+///
+/// A caller range the equality cannot prove — held file on overlayfs (or
+/// an unproven filesystem) at the same key, where a copy-up keeps the
+/// stale lower mapping at the fresh upper `(dev, ino)` — marks the join
+/// unproven instead of spending the witness here: the query runs once
+/// per file at the provider branch (`witness_join`), over the group's
+/// first witness-requiring range, and only for files that prove to be
+/// providers. Anything but a same-file verdict then refuses with the
+/// `original_file_unproven` gap, never a join.
+pub(crate) fn mapped_file_guard(
     io: &mut impl ScanIo,
     view: &ProcessView,
-    scanned: Option<crate::discovery::identity::FileIdentity>,
+    held: Option<MappedFile>,
     key: ObjectKey,
     group: &[&MapEntry],
-) -> Result<(), String> {
-    let Some(expected) = scanned else {
-        return Ok(());
+    budget: &mut CaptureWorkBudget,
+) -> Result<GuardOutcome, String> {
+    let Some(held) = held else {
+        return Ok(GuardOutcome::Proven);
     };
+    let expected = held.identity;
+    let mut unproven: Option<(u64, u64)> = None;
     for entry in group {
-        let mapped = io.range_identity(view, entry.start, entry.end)?;
+        let mapped = io.range_identity(view, entry.start, entry.end, budget)?;
         match mapped {
-            Ok(identity) if identity == expected => {}
+            Ok(identity) if identity == expected => {
+                if unproven.is_none()
+                    && is_caller_range(entry)
+                    && original_file_witness_required(&held, &identity)
+                {
+                    unproven = Some((entry.start, entry.end));
+                }
+            }
             Ok(identity) => {
                 return Err(format!(
                     "mapped range {:x}-{:x} is another file (st_dev {} st_ino {}) than the opened \
@@ -2843,7 +4197,44 @@ fn mapped_file_guard(
             Err(_) => {}
         }
     }
-    Ok(())
+    Ok(match unproven {
+        Some(range) => GuardOutcome::UnprovenOverlay { range },
+        None => GuardOutcome::Proven,
+    })
+}
+
+/// What `mapped_file_guard` established for one candidate file: either
+/// the legacy equality proved the join, or an overlay (or unproven
+/// filesystem) caller range matched by `(dev, ino)` and still needs the
+/// kernel witness before a provider row may join it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardOutcome {
+    Proven,
+    UnprovenOverlay { range: (u64, u64) },
+}
+
+/// Prove one witness-requiring provider file with the original-file
+/// witness: `None` joins, `Some` refuses with the gap reason. Runs once
+/// per file at the provider branch; every range of the group shares the
+/// file, so the one verdict over the first witness-requiring range
+/// covers all of them. A group whose ranges straddle a copy-up (one
+/// process mapping the provider both before and after) joins its stale
+/// ranges with the fresh ones on a same-file verdict; per-range proving
+/// would exhaust the per-scan budget on honest multi-range joins, so
+/// the mixed-mapping corner stays disclosed, not proved (see the
+/// overlay copy-up section in `docs/known-limitations.md`).
+pub(crate) fn witness_join(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    file: &File,
+    held: &MappedFile,
+    key: ObjectKey,
+    range: (u64, u64),
+    budget: &mut CaptureWorkBudget,
+) -> Option<String> {
+    io.prove_original_file(view, file, held, key, range, budget)
+        .gap_reason()
+        .map(str::to_string)
 }
 
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
@@ -2911,6 +4302,37 @@ impl MapsReadBuffers {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod maps_read_test {
+    use std::cell::RefCell;
+
+    type Observer = Box<dyn FnMut(usize)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+    }
+
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| observer.replace(self.0.take()));
+        }
+    }
+
+    pub(crate) fn observe<T>(observer: impl FnMut(usize) + 'static, run: impl FnOnce() -> T) -> T {
+        let previous = OBSERVER.with(|current| current.replace(Some(Box::new(observer))));
+        let _restore = Restore(previous);
+        run()
+    }
+
+    pub(super) fn returned(bytes: usize) {
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(bytes);
+            }
+        });
+    }
+}
+
 fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     reader: R,
     budget: &mut CaptureWorkBudget,
@@ -2974,6 +4396,8 @@ fn read_maps_bytes_with_buffers<R: Read, F: FnMut() -> Option<u64>, B: MapsReadB
             break;
         }
         let read = reader.read(&mut chunk[..allowed])?;
+        #[cfg(test)]
+        maps_read_test::returned(read);
         if read == 0 {
             break;
         }
@@ -3184,6 +4608,7 @@ impl CaptureWorkBudget {
         Self {
             limits: self.limits,
             policy: self.policy,
+            collection_work: self.collection_work.clone(),
             domain: self.domain.clone(),
             attempted_io_bytes: self.attempted_io_bytes,
             work_ceiling: self.work_ceiling,
@@ -3335,12 +4760,43 @@ pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let view = ProcessView::open(ProcessViewId(0), request.pid)?;
+    let started = Instant::now();
+    let view = match ProcessView::open_with_budget(ProcessViewId(0), request.pid, budget) {
+        Ok(view) => view,
+        Err(error) => {
+            // Construction uses this scan's allowance too. Only the actual
+            // budget stop state changes the public result scope; ordinary
+            // identity/read failures remain errors. A deadline may have passed
+            // inside the failed proof before its next budget clock poll.
+            if let Some(reason) = budget
+                .check_deadline_now()
+                .or_else(|| budget.stopped_reason())
+            {
+                return Ok(scan_stopped_before_view(started, reason));
+            }
+            return Err(error);
+        }
+    };
     scan_process_view(request, &view, budget)
 }
 
-// Private I/O seam: production and mutation tests share the entire acquisition loop.
-trait ScanMemory {
+fn scan_stopped_before_view(started: Instant, reason: &'static str) -> ScanOutcome {
+    ScanOutcome::Scanned {
+        modules: Vec::new(),
+        skipped: vec![
+            scan_skip(
+                "capture discovery",
+                format!("{INITIAL_MAPS_UNAVAILABLE_REASON}: process view construction stopped"),
+            ),
+            scan_skip("capture discovery", reason.into()),
+        ],
+        scan_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+// Scan I/O seam: production and mutation tests share the entire acquisition
+// loop; the privileged overlay cells drive the production IO too.
+pub(crate) trait ScanMemory {
     fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
 }
 
@@ -3350,17 +4806,38 @@ impl ScanMemory for File {
     }
 }
 
-trait ScanIo {
+pub(crate) trait ScanIo {
     type Memory: ScanMemory;
     fn open_maps(
         &mut self,
         view: &ProcessView,
-        budget: &CaptureWorkBudget,
+        budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<Box<dyn Read>>;
-    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<Self::Memory>;
-    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String>;
+    fn open_mem(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::io::Result<Self::Memory>;
+    fn final_generation(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), String>;
     fn maps_now(&self) -> Option<u64> {
         crate::attach::monotonic_ns()
+    }
+    /// Raw `/proc/<pid>/stat` text for empty-maps classification
+    /// (kernel-thread detection). The caller reads it under the view's
+    /// generation pin; the default reads the live proc file.
+    fn stat_text(&mut self, view: &ProcessView) -> std::io::Result<String> {
+        std::fs::read_to_string(format!("/proc/{}/stat", view.pid()))
+    }
+    /// Target of `/proc/<pid>/exe` for empty-maps classification
+    /// (zombie/exiting detection: `NotFound` means the executable is gone).
+    /// The caller reads it under the view's generation pin; the default
+    /// reads the live proc link.
+    fn exe_target(&mut self, view: &ProcessView) -> std::io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{}/exe", view.pid()))
     }
     /// The opened object's own `vm_file`, when `map_files` is readable
     /// (`identity::self_mapped_file`).
@@ -3373,14 +4850,82 @@ trait ScanIo {
         view: &ProcessView,
         start: u64,
         end: u64,
+        _budget: &mut CaptureWorkBudget,
     ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
         view.run_while_same(|| {
             crate::discovery::identity::map_files_identity(view.pid(), start, end)
         })
     }
+    /// Stash a cold-minted survivor for this scan: later `open_maps`
+    /// and `range_identity` calls route to it. The default drops the
+    /// stash (scripted IOs never serve survivor reads).
+    fn note_cold_member(&mut self, _pid: u32, _member: RetainedGroupMember, _minter: Arc<PidPin>) {}
+    /// The stashed cold survivor for `pid`, if this scan holds one.
+    fn cold_member_for(&self, _pid: u32) -> Option<&RetainedGroupMember> {
+        None
+    }
+    /// Whether this IO stashes a cold-minted survivor for later reads.
+    /// Production `ProcScanIo` only; scripted IOs keep the default so
+    /// a cold attempt never mints a real member for fixture bytes.
+    fn accepts_cold_member(&self) -> bool {
+        false
+    }
+    /// Prove the witness-requiring caller range `[start, end)` of the
+    /// scanned process is the held file. The default has no backend and
+    /// reports unavailable; the production IO spends the per-scan
+    /// witness budget and runs the kernel witness.
+    fn prove_original_file(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessVerdict {
+        let _ = (view, file, held, key, range, budget);
+        WitnessVerdict::Failed(WitnessFailure::Unavailable)
+    }
 }
 
-struct ProcScanIo;
+pub(crate) struct ProcScanIo {
+    cold: Option<ProcColdMember>,
+    witness_used: u32,
+}
+
+impl ProcScanIo {
+    pub(crate) fn new() -> Self {
+        Self {
+            cold: None,
+            witness_used: 0,
+        }
+    }
+
+    /// A scan that already spent `used` witness queries (the privileged
+    /// budget-exhaustion cell drives production with a spent budget).
+    #[cfg(test)]
+    pub(crate) fn with_witness_used(used: u32) -> Self {
+        Self {
+            cold: None,
+            witness_used: used,
+        }
+    }
+
+    /// Witness queries this scan spent (the privileged cells assert the
+    /// production budget spend exactly).
+    #[cfg(test)]
+    pub(crate) fn witness_used(&self) -> u32 {
+        self.witness_used
+    }
+}
+
+/// One scan's cold survivor: the member plus the minter Arc that keeps
+/// its borrow alive. Dropped with the scan; never shared across scans.
+struct ProcColdMember {
+    pid: u32,
+    member: RetainedGroupMember,
+    _minter: Arc<PidPin>,
+}
 
 impl ScanIo for ProcScanIo {
     type Memory = File;
@@ -3388,17 +4933,101 @@ impl ScanIo for ProcScanIo {
     fn open_maps(
         &mut self,
         view: &ProcessView,
-        _: &CaptureWorkBudget,
+        budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<Box<dyn Read>> {
-        Ok(Box::new(File::open(format!("/proc/{}/maps", view.pid()))?))
+        // The survivor's maps for a cold scan, not the dead leader's
+        // empty ones; live scans see the ordinary open unchanged.
+        if let Some(member) = self.cold_member_for(view.pid()) {
+            return Ok(Box::new(member.open_maps()?));
+        }
+        view.with_filesystem(budget, |filesystem, _| Ok(filesystem.open_maps()))
+            .map_err(std::io::Error::other)
+            .and_then(|file| file.map(|file| Box::new(file) as Box<dyn Read>))
     }
 
-    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<File> {
-        File::open(format!("/proc/{}/mem", view.pid()))
+    fn open_mem(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::io::Result<File> {
+        view.with_filesystem(budget, |filesystem, _| Ok(filesystem.open_memory()))
+            .map_err(std::io::Error::other)?
     }
 
-    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
-        view.run_while_same(|| ())
+    fn final_generation(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), String> {
+        view.with_filesystem(budget, |_, _| Ok(()))
+    }
+
+    fn range_identity(
+        &mut self,
+        view: &ProcessView,
+        start: u64,
+        end: u64,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+        // One range through the stashed survivor when this scan holds
+        // it: sequential cold-scan proofs (zombie scans are rare). The
+        // member re-proves birth and liveness itself, which subsumes
+        // the pin check for a proved survivor.
+        if let Some(member) = self.cold_member_for(view.pid()) {
+            return Ok(member
+                .stat_map_file(start, end)
+                .map_err(std::io::Error::other));
+        }
+        view.with_filesystem(budget, |filesystem, budget| {
+            Ok(filesystem
+                .mapped_file_metadata(start, end, budget)
+                .map(|metadata| {
+                    use std::os::unix::fs::MetadataExt;
+                    crate::discovery::identity::FileIdentity {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    }
+                }))
+        })
+    }
+
+    fn prove_original_file(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessVerdict {
+        // The per-scan budget spends before the run: a failed attempt
+        // still spends, and exhaustion refuses without running. The
+        // deep scan keeps its single trigger range; only the sweep
+        // passes every refused range of the key.
+        if self.witness_used >= OVERLAY_WITNESS_QUERIES_PER_SCAN {
+            return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+        }
+        self.witness_used += 1;
+        prove_original_file(view.pid(), file, held, key, &[range], budget)
+    }
+
+    fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {
+        self.cold = Some(ProcColdMember {
+            pid,
+            member,
+            _minter: minter,
+        });
+    }
+
+    fn cold_member_for(&self, pid: u32) -> Option<&RetainedGroupMember> {
+        self.cold
+            .as_ref()
+            .filter(|cold| cold.pid == pid)
+            .map(|cold| &cold.member)
+    }
+
+    fn accepts_cold_member(&self) -> bool {
+        true
     }
 }
 
@@ -3436,14 +5065,17 @@ impl<'a> ScanDependencies<'a> {
             let dependency = (|| {
                 let offset = usize::try_from(table.address.checked_sub(base)?).ok()?;
                 let bytes = snapshot.get(offset..)?;
-                let len = exact_table_bytes(bytes, layout)?;
+                // The decoded slot count, never the declared version: a
+                // mislabelled table's tail words are not slots.
+                let slots = table.decoded_slot_count();
+                let len = table_bytes(layout, slots).ok()?;
                 let bytes = bytes.get(..len)?;
                 let end = table.address.checked_add(len as u64)?;
                 let mapping = maps.containing(table.address)?;
                 if mapping.permissions[0] != b'r' || end > mapping.end {
                     return None;
                 }
-                let addresses = exact_table_addresses(bytes, layout)?;
+                let addresses = decoded_table_addresses(bytes, layout, table)?;
                 for address in addresses {
                     budget.spend(1).ok()?;
                     let target = maps.containing(address)?;
@@ -3506,42 +5138,192 @@ impl<'a> ScanDependencies<'a> {
     }
 }
 
+/// Failure of [`acquire_scan_maps`]: the refusal reason plus whether the
+/// snapshot itself read successfully but carried no mappings — the shape a
+/// kernel thread (and a zombie) always presents, classified at the initial
+/// call site instead of refused outright.
+struct AcquireMapsError {
+    reason: String,
+    empty_snapshot: bool,
+}
+
+impl AcquireMapsError {
+    fn refused(reason: String) -> Self {
+        Self {
+            reason,
+            empty_snapshot: false,
+        }
+    }
+
+    fn empty(reason: String) -> Self {
+        Self {
+            reason,
+            empty_snapshot: true,
+        }
+    }
+}
+
 fn acquire_scan_maps(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
-) -> Result<Vec<MapEntry>, String> {
+) -> Result<Vec<MapEntry>, AcquireMapsError> {
     if let Some(reason) = budget.stopped_now() {
-        return Err(reason.into());
+        return Err(AcquireMapsError::refused(reason.into()));
     }
     let reader = view
-        .run_while_same(|| io.open_maps(view, budget))?
-        .map_err(|error| error.to_string())?;
-    budget.spend(1).map_err(str::to_owned)?;
+        .run_while_same(|| io.open_maps(view, budget))
+        .map_err(AcquireMapsError::refused)?
+        .map_err(|error| AcquireMapsError::refused(error.to_string()))?;
+    budget
+        .spend(1)
+        .map_err(|error| AcquireMapsError::refused(error.to_owned()))?;
+    read_and_parse_maps(reader, budget, || io.maps_now())
+}
+
+/// Read, limit-check and parse one maps snapshot: shared by the leader
+/// maps read and the cold survivor-maps read, so both charge and
+/// classify identically.
+fn read_and_parse_maps(
+    reader: Box<dyn Read>,
+    budget: &mut CaptureWorkBudget,
+    maps_now: impl FnMut() -> Option<u64>,
+) -> Result<Vec<MapEntry>, AcquireMapsError> {
     let (bytes, reasons) = read_maps_with_limits(
         reader,
         budget,
         MAX_MAPS_BYTES,
         MAX_MAP_ENTRIES,
         64 * 1024,
-        || io.maps_now(),
+        maps_now,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| AcquireMapsError::refused(error.to_string()))?;
     if let Some(reason) = reasons.first().copied().or(budget.stopped_now()) {
-        return Err(reason.into());
+        return Err(AcquireMapsError::refused(reason.into()));
     }
-    if bytes.is_empty() || !bytes.ends_with(b"\n") {
-        return Err("empty or truncated /proc maps snapshot".into());
+    if bytes.is_empty() {
+        // A successful 0-byte read: the kernel-thread/zombie shape, which
+        // the initial call site classifies — never conflated with a
+        // truncated snapshot.
+        return Err(AcquireMapsError::empty(
+            "empty or truncated /proc maps snapshot".into(),
+        ));
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(AcquireMapsError::refused(
+            "empty or truncated /proc maps snapshot".into(),
+        ));
     }
     // Parsing is charged independently of the single charged index construction.
     budget
         .spend(bytes.iter().filter(|byte| **byte == b'\n').count() as u64)
-        .map_err(str::to_owned)?;
-    let maps = parse_maps(&bytes)?;
+        .map_err(|error| AcquireMapsError::refused(error.to_owned()))?;
+    let maps = parse_maps(&bytes).map_err(AcquireMapsError::refused)?;
     if maps.is_empty() {
-        return Err("empty /proc maps snapshot".into());
+        return Err(AcquireMapsError::refused(
+            "empty /proc maps snapshot".into(),
+        ));
     }
     Ok(maps)
+}
+
+/// Cold survivor maps for a zombie leader with one live survivor: mint
+/// the survivor from the view's own pin (duplicated, never reopened by
+/// number), stash it in the scan IO for this scan's later range proofs,
+/// and return the survivor's maps. `None` on ANY refusal — dead group,
+/// ambiguity, races, budget — so the caller falls through to the
+/// existing exited path unchanged.
+fn acquire_cold_survivor_maps(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+) -> Option<Vec<MapEntry>> {
+    if !crate::process::process_is_zombie(view.pid()) {
+        return None;
+    }
+    // Scripted IOs never take the stash, so never mint a real member
+    // for them: no real capture budget, no live-mint slot, and the
+    // exited outcome stands. Production `ProcScanIo` is unaffected.
+    if !io.accepts_cold_member() {
+        return None;
+    }
+    let original = Arc::new(view.retained_pin().try_clone().ok()?);
+    let minted = cold_admit_member(&original, budget).ok()?;
+    io.note_cold_member(view.pid(), minted.member, minted.minter);
+    io.cold_member_for(view.pid())?;
+    let reader = view
+        .run_while_same(|| io.open_maps(view, budget))
+        .ok()?
+        .ok()?;
+    budget.spend(1).ok()?;
+    read_and_parse_maps(reader, budget, || io.maps_now()).ok()
+}
+
+/// The scan-level exited outcome: the engine proves the end through the
+/// view's pin (`original_exited`) and stays silent when proven, so this is
+/// never a public refusal skip and never an admitted scanned-absent view.
+/// Shared by the entry check and the empty-maps classifier so the zombie /
+/// exiting shape follows exactly the existing exited path.
+fn exited_before_discovery(pid: u32) -> String {
+    format!("pid {pid} exited before discovery")
+}
+
+/// How a successfully read but empty initial maps snapshot classifies.
+/// Only a positively identified kernel thread is verified absence;
+/// everything unproven keeps the refusal.
+enum EmptyMapsClass {
+    KernelThread,
+    Refuse,
+}
+
+/// Classify an initial maps snapshot that read successfully but carried no
+/// mappings.
+///
+/// A kernel thread has no user address space, so its `/proc/<pid>/maps`
+/// always reads 0 bytes — verified absence (it can never call a
+/// provider), not a refusal. Identification is positive only: the
+/// `PF_KTHREAD` flag in `/proc/<pid>/stat` field 9, read under the same
+/// pidfd/start-time generation pin as the maps read, so a recycled pid
+/// can never be misclassified. A lost generation, or empty maps with no
+/// kernel-thread flag and no executable (a zombie or an exiting process),
+/// follows the exited path ([`exited_before_discovery`]): an error the
+/// engine proves or keeps as loss, never an admitted scanned-absent view
+/// and never a public refusal skip. Empty maps with an executable, an
+/// unreadable or malformed stat, a stat from another generation, or any
+/// other error keeps the refusal (fail closed).
+fn classify_empty_maps_snapshot(
+    view: &ProcessView,
+    io: &mut impl ScanIo,
+) -> Result<EmptyMapsClass, String> {
+    let stat = match view.run_while_same(|| io.stat_text(view)) {
+        Err(_) => return Err(exited_before_discovery(view.pid())),
+        Ok(Err(_)) => return Ok(EmptyMapsClass::Refuse),
+        Ok(Ok(stat)) => stat,
+    };
+    let flags = match crate::process::stat_flags_from_stat_text(&stat) {
+        Some(flags) => flags,
+        None => return Ok(EmptyMapsClass::Refuse),
+    };
+    // Byte-level generation binding: the stat line must describe the
+    // view's own pinned generation. Flags from a recycled pid — however
+    // kernel-thread-shaped — refuse instead of classifying.
+    let bound = crate::process::start_time_from_stat(&stat)
+        .is_ok_and(|start| Some(start) == view.start_time());
+    if !bound {
+        return Ok(EmptyMapsClass::Refuse);
+    }
+    if flags & crate::process::PF_KTHREAD != 0 {
+        return Ok(EmptyMapsClass::KernelThread);
+    }
+    // Not a kernel thread: only a missing executable (zombie/exiting)
+    // follows the exited path; a live executable keeps the refusal.
+    match view.run_while_same(|| io.exe_target(view)) {
+        Err(_) => Err(exited_before_discovery(view.pid())),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(exited_before_discovery(view.pid()))
+        }
+        Ok(_) => Ok(EmptyMapsClass::Refuse),
+    }
 }
 
 /// Scan through an already accepted process-generation pin. Capture discovery uses
@@ -3551,7 +5333,7 @@ pub fn scan_process_view(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo);
+    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo::new());
     #[cfg(test)]
     crate::first_use_probe::scan_returned(view, true, budget, &result);
     result
@@ -3565,7 +5347,8 @@ pub(crate) fn scan_process_view_without_memory(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let result = scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo, false);
+    let result =
+        scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo::new(), false);
     #[cfg(test)]
     crate::first_use_probe::scan_returned(view, false, budget, &result);
     result
@@ -3583,18 +5366,20 @@ fn scan_process_view_with_io(
 /// [`scan_process_view`] plus the objects this scan examined: opened,
 /// identified, and found to export nothing wanted, read from this scan's
 /// own maps snapshot (never an earlier sweep's). Empty when the scan's
-/// final bracket failed. C1b uses them to call a key examined.
+/// final bracket failed. C1b uses them to call a key examined. The flag
+/// reports whether the scan reached its `--module` hint loop; kernel
+/// threads and refused-initial scans never do.
 pub(crate) fn scan_process_view_examined(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
-    let result = scan_view_with_examined(request, view, budget, &mut ProcScanIo, true);
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+    let result = scan_view_with_examined(request, view, budget, &mut ProcScanIo::new(), true);
     #[cfg(test)]
     {
         let probe = result
             .as_ref()
-            .map(|(outcome, _)| outcome.clone())
+            .map(|(outcome, _, _)| outcome.clone())
             .map_err(Clone::clone);
         crate::first_use_probe::scan_returned(view, true, budget, &probe);
     }
@@ -3608,7 +5393,7 @@ fn scan_process_view_with_io_mode(
     io: &mut impl ScanIo,
     scan_memory: bool,
 ) -> Result<ScanOutcome, String> {
-    scan_view_with_examined(request, view, budget, io, scan_memory).map(|(outcome, _)| outcome)
+    scan_view_with_examined(request, view, budget, io, scan_memory).map(|(outcome, _, _)| outcome)
 }
 
 /// Post-read pin check: the export facts read after `before` are trusted only
@@ -3623,18 +5408,78 @@ fn check_pin_after_read(after: Result<Pin, String>, before: &Pin) -> Result<(), 
     }
 }
 
+/// Opt-in inventory identity scan. Custody receives the already opened file,
+/// never a pathname to reconstruct after the scan has completed.
+#[allow(dead_code)]
+pub(crate) fn scan_process_view_held(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    custody: &mut super::kernel_identity::ExaminedCustody,
+    scan: u64,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+    scan_view_with_custody(
+        request,
+        view,
+        budget,
+        &mut ProcScanIo::new(),
+        true,
+        custody,
+        scan,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_view_with_custody(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
+    custody: &mut super::kernel_identity::ExaminedCustody,
+    scan: u64,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+    let result = scan_view_examined_mode(
+        request,
+        view,
+        budget,
+        io,
+        scan_memory,
+        Some((&mut *custody, scan)),
+    );
+    if !result
+        .as_ref()
+        .is_ok_and(|(outcome, _, _)| outcome.mapping_scan_completed())
+        || budget.stopped_reason().is_some()
+    {
+        custody.discard_scan(scan);
+    }
+    result
+}
+
 fn scan_view_with_examined(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
     scan_memory: bool,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+    scan_view_examined_mode(request, view, budget, io, scan_memory, None)
+}
+
+fn scan_view_examined_mode(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
+    mut custody: Option<(&mut super::kernel_identity::ExaminedCustody, u64)>,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
     }
     if !view.still_the_same() {
-        return Err(format!("pid {} exited before discovery", request.pid));
+        return Err(exited_before_discovery(request.pid));
     }
     let started = Instant::now();
     let pid = request.pid;
@@ -3653,11 +5498,34 @@ fn scan_view_with_examined(
                 scan_ms: started.elapsed().as_millis() as u64,
             },
             Vec::new(),
+            false,
         )
     };
     let maps = match acquire_scan_maps(view, budget, io) {
         Ok(maps) => maps,
-        Err(reason) => return Ok(refused_initial(reason)),
+        Err(error) if error.empty_snapshot => match classify_empty_maps_snapshot(view, io) {
+            Ok(EmptyMapsClass::KernelThread) => {
+                budget.note_kernel_thread_absence();
+                return Ok((
+                    ScanOutcome::Scanned {
+                        modules: Vec::new(),
+                        skipped: Vec::new(),
+                        scan_ms: started.elapsed().as_millis() as u64,
+                    },
+                    Vec::new(),
+                    false,
+                ));
+            }
+            Ok(EmptyMapsClass::Refuse) => return Ok(refused_initial(error.reason)),
+            // A zombie leader with one live survivor scans the
+            // survivor's maps instead of exiting; every other
+            // unproven shape keeps the exact existing error.
+            Err(error) => match acquire_cold_survivor_maps(view, budget, io) {
+                Some(maps) => maps,
+                None => return Err(error),
+            },
+        },
+        Err(error) => return Ok(refused_initial(error.reason)),
     };
     let map_index = match index_maps_or_refuse(&maps, budget) {
         Ok(index) => index,
@@ -3675,7 +5543,7 @@ fn scan_view_with_examined(
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
     let (mem, unavailable) = if scan_memory {
-        let mem = match view.run_while_same(|| io.open_mem(view)) {
+        let mem = match view.run_while_same(|| io.open_mem(view, budget)) {
             Ok(mem) => mem,
             Err(reason) => {
                 return Ok(refused_initial(format!(
@@ -3698,10 +5566,33 @@ fn scan_view_with_examined(
         (None, None)
     };
 
-    let wanted = request.hooks.names();
+    let mut wanted = request.hooks.names();
+    wanted.extend(standard_function_names());
+    wanted.sort_unstable();
+    wanted.dedup();
     let hint_ids: Vec<Option<(u64, u64)>> =
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
+    // `--exclude-module`: full paths resolve once to observer (device, inode)
+    // (follow symlinks, like `--module`); bare names match by basename or ELF
+    // soname below. Unresolvable paths match nothing (reported as unmatched
+    // by the caller aggregating `budget.excluded()`).
+    let exclude_paths: ExcludePaths = budget
+        .excludes()
+        .iter()
+        .filter(|e| e.as_os_str().as_bytes().contains(&b'/'))
+        .filter_map(|e| {
+            std::fs::metadata(e)
+                .ok()
+                .map(|m| (e.clone(), m.dev(), m.ino()))
+        })
+        .collect();
+    let exclude_names: ExcludeNames = budget
+        .excludes()
+        .iter()
+        .filter(|e| !e.as_os_str().as_bytes().contains(&b'/'))
+        .map(|e| (e.clone(), e.as_os_str().as_bytes().to_vec()))
+        .collect();
 
     let groups = candidate_groups(&maps);
     // One mount-table read serves every object this scan opens (H-3).
@@ -3741,11 +5632,26 @@ fn scan_view_with_examined(
             })
             .collect();
         let hinted = !matched.is_empty();
-        if !request.hints.is_empty() && !hinted {
+        // F5: the exclusion match is evaluated before the `--module` hint
+        // filter, so a disjoint `--exclude-module` is recorded as excluded —
+        // never misreported as "matched no mapped file" — even for mappings
+        // the narrowing skips. A narrowed-out mapping stays silent on every
+        // pre-exclusion failure (it was never examined) and skips the scan
+        // body once exclusion has been evaluated; with no excludes the old
+        // fast path skips it before any open.
+        let narrowed_out = !request.hints.is_empty() && !hinted;
+        let excludes_present = !exclude_paths.is_empty() || !exclude_names.is_empty();
+        if narrowed_out && !excludes_present {
             continue;
         }
-        for (index, _) in &matched {
-            hint_matched[*index] = true;
+        // Path equality in the target view already confirms the hint
+        // here. An inode-only candidate confirms only after the gate
+        // below accepts it, so an unopenable or refused alias still
+        // owes its miss instead of masking it.
+        for (index, kind) in &matched {
+            if *kind == HintMatch::Path {
+                hint_matched[*index] = true;
+            }
         }
         let subject = match &named {
             Some((_, raw_path)) => String::from_utf8_lossy(raw_path).into_owned(),
@@ -3755,51 +5661,100 @@ fn scan_view_with_examined(
             ),
         };
         let Some(usable) = usable else {
-            skipped.push(Skipped {
-                subject,
-                reason: match named {
-                    Some((MappedPath::Unusable { reason }, _)) => reason,
-                    _ => NO_ABSOLUTE_PATHNAME_REASON.into(),
-                },
-            });
+            if !narrowed_out {
+                skipped.push(Skipped {
+                    subject,
+                    reason: match named {
+                        Some((MappedPath::Unusable { reason }, _)) => reason,
+                        _ => NO_ABSOLUTE_PATHNAME_REASON.into(),
+                    },
+                });
+            }
             continue;
         };
         let path = usable.display().to_string();
 
-        let file = match open_in_target(view, &path) {
+        let file = match open_in_target(view, &path, budget) {
             Ok(file) => file,
             Err(reason) => {
-                skipped.push(Skipped { subject, reason });
+                if !narrowed_out {
+                    skipped.push(Skipped { subject, reason });
+                }
                 continue;
             }
         };
         if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
-            skipped.push(Skipped { subject, reason });
+            if !narrowed_out {
+                skipped.push(Skipped { subject, reason });
+            }
             continue;
         }
-        let held = io.held_identity(&file);
+        let held = budget
+            .retained_mapped_identity(&file)
+            .or_else(|| io.held_identity(&file));
         let scanned_identity = held.map(|held| held.identity);
-        if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group) {
-            skipped.push(Skipped { subject, reason });
-            continue;
-        }
-        // Corroborate an inode-only match before attributing the object to the hint.
-        let mut refusal = None;
-        let attributable = matched.iter().any(|(index, kind)| {
-            match hint_gate(*kind, &request.hints[*index], &file) {
-                Ok(()) => true,
-                Err(reason) => {
-                    refusal = Some(reason);
-                    false
+        let guarded = match mapped_file_guard(io, view, held, key, &group, budget) {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                if !narrowed_out {
+                    skipped.push(Skipped { subject, reason });
+                }
+                continue;
+            }
+        };
+        // Corroborate an inode-only match before attributing the object to
+        // the hint. The attributed hint is also the operator-named signal
+        // the planner reads; naming follows the narrowing exactly.
+        let (named_hint, refusal) = first_attributable_hint(&matched, request.hints, &file);
+        let attributable = named_hint.is_some();
+        // Each accepted inode candidate confirms its hint; a refused one
+        // keeps its miss. The gates re-run here because the helper above
+        // stops at the first acceptance (path gates are free, so
+        // only inode candidates repeat their hint open).
+        if attributable {
+            for (index, kind) in &matched {
+                if *kind == HintMatch::Inode
+                    && hint_gate(*kind, &request.hints[*index], &file).is_ok()
+                {
+                    hint_matched[*index] = true;
                 }
             }
-        });
+        }
         if hinted && !attributable {
             skipped.push(Skipped {
                 subject,
                 reason: refusal
                     .unwrap_or_else(|| "no --module hint could be attributed here".into()),
             });
+            continue;
+        }
+        // `--exclude-module`: excluded files get no probes and use no
+        // slots; they are recorded, never silent. A file both hinted
+        // (`--module`) and excluded is an operator contradiction, refused
+        // here with a named error before any attach. Evaluated for
+        // narrowed-out mappings too (F5), which then skip the scan body.
+        if (!exclude_paths.is_empty() || !exclude_names.is_empty())
+            && let Some(matched) = exclude_match(&path, &file, &exclude_paths, &exclude_names)
+        {
+            if hinted {
+                return Err(format!(
+                    "{} is both named by --module and matched by --exclude-module {}; refusing a module that is both included and excluded",
+                    subject,
+                    matched.display()
+                ));
+            }
+            if let Ok(metadata) = file.metadata() {
+                budget.push_excluded(ExcludedRecord {
+                    pid,
+                    path: path.clone(),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    via: matched,
+                });
+            }
+            continue;
+        }
+        if narrowed_out {
             continue;
         }
         // A repeat scan of the unchanged file reuses the cached export facts with
@@ -3824,28 +5779,21 @@ fn scan_view_with_examined(
         let cached = budget
             .elf_export_facts_for(&cache_key)
             .filter(|_| pin_of(&file).is_ok_and(|after| after == before));
-        let (abi, exports) = match cached {
-            Some(facts) => (facts.abi, facts.exports),
+        let facts = match cached {
+            Some(facts) => facts,
             None => {
-                let (abi, exports) = match read_export_facts_budgeted(&file, &wanted, budget) {
+                let facts = match read_raw_scan_facts_budgeted(&file, &wanted, budget) {
                     Ok(facts) => facts,
                     Err(reason) => {
                         skipped.push(Skipped { subject, reason });
                         continue;
                     }
                 };
-                // The pin was taken before the bytes were read; a write that lands
-                // during the read must not become the facts the capture trusts.
+                // File-derived anchor exclusions share the export pin bracket.
                 match check_pin_after_read(pin_of(&file), &before) {
                     Ok(()) => {
-                        budget.note_elf_export_facts(
-                            cache_key,
-                            ElfExportFacts {
-                                abi,
-                                exports: exports.clone(),
-                            },
-                        );
-                        (abi, exports)
+                        budget.note_elf_export_facts(cache_key, facts.clone());
+                        facts
                     }
                     Err(reason) => {
                         skipped.push(Skipped { subject, reason });
@@ -3854,8 +5802,20 @@ fn scan_view_with_examined(
                 }
             }
         };
+        let ElfExportFacts {
+            abi,
+            exports,
+            getter_present,
+            witness_fault,
+            excluded_anchor_ranges,
+        } = facts;
         let layout = target_layout(abi);
-        if request.hints.is_empty() && exports.is_empty() {
+        let hook_exports: Vec<_> = exports
+            .iter()
+            .filter(|(name, _)| request.hooks.abi(name).is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if request.hints.is_empty() && hook_exports.is_empty() {
             // Opened, identified, and read: examined, and not a provider.
             if let Some(held) = held {
                 examined.push(ExaminedObject {
@@ -3863,18 +5823,50 @@ fn scan_view_with_examined(
                     identity: held.identity,
                     key_is_identity: held.key_is_identity(key),
                 });
+                if let Some((custody, scan)) = &mut custody {
+                    // The census includes this actual File and all current
+                    // scan/admitted FDs. Enclosing stop/deadline checks refuse
+                    // a count that completes after the collection has stopped.
+                    if budget.check_deadline_now().is_none() && budget.poll_collection(1) {
+                        custody.offer(*scan, *examined.last().expect("just examined"), file);
+                        if budget.check_deadline_now().is_some() || !budget.poll_collection(0) {
+                            custody.close();
+                        }
+                    } else {
+                        custody.close();
+                        custody.offer(*scan, *examined.last().expect("just examined"), file);
+                    }
+                }
             }
             continue;
         }
+        // The operator-named signal is the narrowing's own attribution: the
+        // first matched hint the alias gate accepted above. Recorded only;
+        // the planner reads it for the operator-named closure exception.
+        let module_hint = named_hint;
+        let same_file_loads = duplicate_exec_load_count(&group);
+        // A provider file the guard could not prove needs the kernel
+        // witness before its row joins: one query over the group's first
+        // witness-requiring range. Anything but a same-file verdict
+        // refuses with the finite gap, never a join. Files that prove
+        // not to be providers (above) never spend witness work.
+        if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held)
+            && let Some(reason) = witness_join(io, view, &file, &held, key, range, budget)
+        {
+            skipped.push(Skipped { subject, reason });
+            continue;
+        }
         let mut module = ScannedModule {
+            module_hint,
             mapped_identity: scanned_identity,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,
-            double_loaded: duplicate_exec_coverage(&group),
+            double_loaded: same_file_loads >= 2,
+            same_file_loads,
             path,
             decoder_abi: Some(abi),
-            exports: exports.into_iter().map(|(name, _)| name).collect(),
+            exports: hook_exports,
             tables: Vec::new(),
             interfaces: Vec::new(),
         };
@@ -3928,8 +5920,22 @@ fn scan_view_with_examined(
             }
         }
         for (base, snapshot) in &snapshots {
-            let (tables, exhausted) =
-                detect_tables_for_layout(layout, snapshot, *base, &map_index, budget);
+            let evidence = ObjectExports {
+                object: key,
+                symbols: &exports,
+                getter_present,
+                witness_fault,
+            };
+            let (tables, exhausted) = detect_tables_with_clock(
+                layout,
+                snapshot,
+                *base,
+                &map_index,
+                budget,
+                Some(&evidence),
+                &excluded_anchor_ranges,
+                crate::attach::monotonic_ns,
+            );
             dependency.retain_tables(&tables, snapshot, *base, layout, &map_index, budget);
             module.tables.extend(tables);
             skipped.extend(
@@ -3981,18 +5987,9 @@ fn scan_view_with_examined(
         // `capture.modules[]` as a module the capture observed. Without this the
         // gap has nothing to show — no entry to skip, no attach to fail, no counter.
         if module.tables.is_empty() && !io_exhausted && !budget.scan_stopped() {
-            let named = if hinted {
-                "matched a --module hint; "
-            } else {
-                ""
-            };
             skipped.push(Skipped {
                 subject: module.path.clone(),
-                reason: format!(
-                    "{named}{NO_TABLE_FOUND_MARKER}; a table \
-                     built at run time in .bss or on the heap is outside the memory \
-                     scan's reach"
-                ),
+                reason: no_table_found_reason(&module.path, hinted),
             });
         }
         modules.push(module);
@@ -4011,7 +6008,7 @@ fn scan_view_with_examined(
     // comparisons and final generation check have all succeeded. A failed bracket
     // remains an explicit occurrence even when a later scan or manifest attaches.
     let validation = (|| {
-        let maps_b = acquire_scan_maps(view, budget, io)?;
+        let maps_b = acquire_scan_maps(view, budget, io).map_err(|error| error.reason)?;
         let index_b = index_maps_or_refuse(&maps_b, budget)?;
         budget.spend(maps_b.len() as u64).map_err(str::to_owned)?;
         let groups_b = candidate_groups(&maps_b);
@@ -4028,7 +6025,7 @@ fn scan_view_with_examined(
         }
         Ok::<_, String>(accepted)
     })();
-    let generation = io.final_generation(view);
+    let generation = io.final_generation(view, budget);
     match (validation, generation) {
         (Ok(accepted), Ok(())) => {
             modules = modules
@@ -4074,7 +6071,7 @@ fn scan_view_with_examined(
             skipped,
         },
     };
-    Ok((outcome, examined))
+    Ok((outcome, examined, true))
 }
 
 #[cfg(test)]
@@ -4086,8 +6083,460 @@ pub(crate) fn bracket_refusal_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn final_maps_refusal_for_test(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    read_failure: bool,
+) -> ScanOutcome {
+    tests::final_maps_refusal(view, budget, read_failure)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exclusion_inputs(excludes: &[PathBuf]) -> (ExcludePaths, ExcludeNames) {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let paths = excludes
+            .iter()
+            .filter(|e| e.as_os_str().as_bytes().contains(&b'/'))
+            .filter_map(|e| {
+                std::fs::metadata(e)
+                    .ok()
+                    .map(|m| (e.clone(), m.dev(), m.ino()))
+            })
+            .collect();
+        let names = excludes
+            .iter()
+            .filter(|e| !e.as_os_str().as_bytes().contains(&b'/'))
+            .map(|e| (e.clone(), e.as_os_str().as_bytes().to_vec()))
+            .collect();
+        (paths, names)
+    }
+
+    /// A full `--exclude-module` path excludes exactly that file by identity.
+    #[test]
+    fn exclude_match_path_excludes_exactly_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libtarget.so.1");
+        let other = dir.path().join("libother.so.1");
+        std::fs::write(&target, b"fake-a").unwrap();
+        std::fs::write(&other, b"fake-b").unwrap();
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&target));
+        assert_eq!(paths.len(), 1);
+        let file = File::open(&target).unwrap();
+        assert_eq!(
+            exclude_match(target.to_str().unwrap(), &file, &paths, &names),
+            Some(target.clone())
+        );
+        let other_file = File::open(&other).unwrap();
+        assert_eq!(
+            exclude_match(other.to_str().unwrap(), &other_file, &paths, &names),
+            None
+        );
+    }
+
+    /// A symlinked exclusion path follows the link like `--module` does.
+    #[test]
+    fn exclude_match_path_follows_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("libreal.so.1");
+        let link = dir.path().join("liblink.so");
+        std::fs::write(&real, b"fake").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&link));
+        assert_eq!(paths.len(), 1);
+        let file = File::open(&real).unwrap();
+        assert_eq!(
+            exclude_match(real.to_str().unwrap(), &file, &paths, &names),
+            Some(link.clone())
+        );
+    }
+
+    /// The same path string in another mount namespace is a different file
+    /// (different identity) and is NOT excluded: matching is by fstat
+    /// identity, never by path string.
+    #[test]
+    fn exclude_match_path_ignores_a_different_file_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let excluded = dir.path().join("libns.so.1");
+        let stranger = dir.path().join("libother.so.1");
+        std::fs::write(&excluded, b"fake-a").unwrap();
+        std::fs::write(&stranger, b"fake-b").unwrap();
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&excluded));
+        // Same path string as the exclusion, but a different file's handle.
+        let stranger_file = File::open(&stranger).unwrap();
+        assert_eq!(
+            exclude_match(excluded.to_str().unwrap(), &stranger_file, &paths, &names),
+            None
+        );
+    }
+
+    /// A bare `--exclude-module` name matches every file with that basename.
+    #[test]
+    fn exclude_match_bare_name_matches_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("libbare.so.0");
+        std::fs::write(&named, b"not-an-elf").unwrap();
+        let bare = PathBuf::from("libbare.so.0");
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&bare));
+        assert!(paths.is_empty());
+        let file = File::open(&named).unwrap();
+        assert_eq!(
+            exclude_match(named.to_str().unwrap(), &file, &paths, &names),
+            Some(bare)
+        );
+    }
+
+    /// A bare name matching no basename still matches by ELF soname, across
+    /// versions: `libp11-kit.so.0` matches both `.0.4.8` and `.0.4.5`.
+    #[test]
+    fn exclude_match_bare_name_matches_soname_across_versions() {
+        use crate::discovery::elf_needed::fixture::{ElfSpec, build_elf, write_elf};
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = write_elf(
+            dir.path(),
+            "libp11-kit.so.0.4.8",
+            &build_elf(&ElfSpec::lib(b"libp11-kit.so.0", &[])),
+        );
+        let v2 = write_elf(
+            dir.path(),
+            "libp11-kit.so.0.4.5",
+            &build_elf(&ElfSpec::lib(b"libp11-kit.so.0", &[])),
+        );
+        let bare = PathBuf::from("libp11-kit.so.0");
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&bare));
+        for path in [&v1, &v2] {
+            let file = File::open(path).unwrap();
+            assert_eq!(
+                exclude_match(path.to_str().unwrap(), &file, &paths, &names),
+                Some(bare.clone()),
+                "{}",
+                path.display()
+            );
+        }
+        // An exact file name matches that version only.
+        let exact = PathBuf::from("libp11-kit.so.0.4.8");
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&exact));
+        let file = File::open(&v1).unwrap();
+        assert_eq!(
+            exclude_match(v1.to_str().unwrap(), &file, &paths, &names),
+            Some(exact.clone())
+        );
+        let file = File::open(&v2).unwrap();
+        assert_eq!(
+            exclude_match(v2.to_str().unwrap(), &file, &paths, &names),
+            None
+        );
+    }
+
+    /// A mapped file both hinted (`--module`) and excluded is refused at
+    /// discovery with a named error, before any attach. Uses a stopped
+    /// child and one of its own mapped libraries, so no host path is
+    /// hard-coded.
+    #[test]
+    fn scan_refuses_a_module_both_hinted_and_excluded() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .expect("own stopped child maps are readable");
+        let so = maps
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .find(|path| path.contains(".so") && std::path::Path::new(path).is_absolute())
+            .expect("a stopped shell maps at least one shared library")
+            .to_string();
+        let basename = std::path::Path::new(&so)
+            .file_name()
+            .expect("mapped library has a file name")
+            .to_os_string();
+        let hooks = HookRegistry::builtin();
+        let hints = vec![PathBuf::from(&so)];
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_excludes(vec![PathBuf::from(basename)]);
+        let error = scan_pid(
+            &ScanRequest {
+                pid,
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &mut budget,
+        )
+        .expect_err("a hinted file matched by --exclude-module is refused");
+        assert!(
+            error.contains("both named by --module and matched by --exclude-module"),
+            "{error}"
+        );
+    }
+
+    /// F5: under `--module` narrowing, a disjoint `--exclude-module` is
+    /// still evaluated (before the hint filter): the excluded mapping is
+    /// recorded as excluded, never misreported as "matched no mapped file",
+    /// while the hinted module is still examined and nothing is attached
+    /// for the excluded one. Uses a stopped child and two of its own
+    /// mapped libraries with distinct basenames, so no host path is
+    /// hard-coded.
+    #[test]
+    fn scan_records_excluded_mappings_despite_module_narrowing() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .expect("own stopped child maps are readable");
+        let mut libs: Vec<String> = maps
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .filter(|path| path.contains(".so") && std::path::Path::new(path).is_absolute())
+            .map(str::to_string)
+            .collect();
+        libs.sort();
+        libs.dedup();
+        assert!(
+            !libs.is_empty(),
+            "a stopped shell maps at least one shared library"
+        );
+        let basename_of = |path: &str| {
+            std::path::Path::new(path)
+                .file_name()
+                .expect("mapped library has a file name")
+                .to_os_string()
+        };
+        let hinted = libs
+            .iter()
+            .find(|path| basename_of(path) != basename_of(&libs[0]))
+            .expect("the child maps libraries with distinct basenames")
+            .clone();
+        let excluded = libs[0].clone();
+        assert_ne!(basename_of(&hinted), basename_of(&excluded));
+        let hooks = HookRegistry::builtin();
+        let hints = vec![PathBuf::from(&hinted)];
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_excludes(vec![PathBuf::from(basename_of(&excluded))]);
+        let outcome = scan_pid(
+            &ScanRequest {
+                pid,
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &mut budget,
+        )
+        .expect("a disjoint exclusion beside --module narrowing succeeds");
+        let _ = outcome;
+        assert!(
+            budget
+                .excluded()
+                .iter()
+                .any(|record| record.path == excluded),
+            "the narrowed-out exclusion is recorded, not unmatched: {:?}",
+            budget.excluded()
+        );
+        assert!(
+            budget.excluded().iter().all(|record| record.path != hinted),
+            "the hinted module is examined, never excluded: {:?}",
+            budget.excluded()
+        );
+    }
+
+    /// An exclusion matching nothing returns no match (the caller reports
+    /// the input as unmatched).
+    #[test]
+    fn exclude_match_reports_no_match_for_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join("libunrelated.so");
+        std::fs::write(&unrelated, b"not-an-elf").unwrap();
+        let missing = dir.path().join("libmissing.so");
+        let (paths, names) = exclusion_inputs(&[missing, PathBuf::from("libnope.so")]);
+        assert!(paths.is_empty(), "an unresolvable path matches nothing");
+        let file = File::open(&unrelated).unwrap();
+        assert_eq!(
+            exclude_match(unrelated.to_str().unwrap(), &file, &paths, &names),
+            None
+        );
+    }
+
+    /// M2: an exact `--module` path names the scanned module it narrows in.
+    /// Holds both before and after the narrowing derivation (the old
+    /// identity match agrees here); guards the mechanism swap.
+    #[test]
+    fn scan_names_a_module_narrowed_in_by_its_exact_path() {
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let hints = [fixture.path.clone()];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert_eq!(outcome.modules().len(), 1, "{:#?}", outcome.skipped());
+        assert_eq!(
+            outcome.modules()[0].module_hint,
+            Some(fixture.path.clone()),
+            "the attributed narrowing hint is the named signal"
+        );
+    }
+
+    /// M2: an inode alias confirmed against the opened files (a hardlink)
+    /// names the scanned module. Holds both before and after the narrowing
+    /// derivation; guards the mechanism swap.
+    #[test]
+    fn scan_names_a_module_narrowed_in_by_a_confirmed_inode_alias() {
+        let mut fixture = BracketFixture::new(8, true);
+        let alias = fixture._dir.path().join("provider-alias.so");
+        std::fs::hard_link(&fixture.path, &alias).unwrap();
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let hints = [alias.clone()];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert_eq!(outcome.modules().len(), 1, "{:#?}", outcome.skipped());
+        assert_eq!(
+            outcome.modules()[0].module_hint,
+            Some(alias),
+            "the confirmed alias is the named signal"
+        );
+    }
+
+    /// M2: a bare `--module` name never narrows a mapped file in — not even
+    /// its own basename — so no scanned module can ever carry a
+    /// basename/soname naming. The basename/soname branches are dead.
+    #[test]
+    fn bare_module_name_narrows_no_mapped_file_in() {
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let bare = PathBuf::from("provider.so");
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: std::slice::from_ref(&bare),
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert!(
+            outcome.modules().is_empty(),
+            "a bare name narrows everything out: {:?}",
+            outcome
+                .modules()
+                .iter()
+                .map(|module| &module.path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == "provider.so" && skip.reason == HINT_NOT_MAPPED_REASON
+            }),
+            "the bare hint matches no mapped file: {:?}",
+            outcome.skipped()
+        );
+    }
+
+    #[test]
+    fn held_scan_transfers_opened_nonprovider_and_invalidates_failed_brackets() {
+        use crate::discovery::kernel_identity::ExaminedCustody;
+        use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+        use std::os::fd::AsRawFd;
+        for failure in 0..4 {
+            let mut fixture = BracketFixture::new(8, false);
+            let meta = std::fs::metadata(&fixture.path).unwrap();
+            let identity = crate::discovery::identity::FileIdentity {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            };
+            fixture.mapped = Some((identity, identity));
+            fixture.fail_open_b = failure == 1;
+            fixture.fail_read_b = failure == 2;
+            fixture.fail_generation = failure == 3;
+            // Script maps/memory reads, but retain the real file the scanner
+            // opened. This does not claim a live kernel identity proof.
+            let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+            let hooks = HookRegistry::builtin();
+            let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 2);
+            let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+            let scan = custody.begin_scan();
+            let mut budget = CaptureWorkBudget::default();
+            let (outcome, examined, _) = scan_view_with_custody(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints: &[],
+                    hooks: &hooks,
+                },
+                &view,
+                &mut budget,
+                &mut fixture,
+                false,
+                &mut custody,
+                scan,
+            )
+            .unwrap();
+            if failure == 0 {
+                assert!(outcome.mapping_scan_completed());
+                assert_eq!(examined.len(), 1);
+                assert_eq!(
+                    owner.examined_for_test().0,
+                    1,
+                    "scan returned metadata without its exact File"
+                );
+                let fd = custody.file_for_test(scan).unwrap().as_raw_fd();
+                std::fs::remove_file(&fixture.path).unwrap();
+                assert!(custody.file_for_test(scan).unwrap().metadata().is_ok());
+                // The fd number may be reused by a parallel test the moment
+                // custody drops, so prove closure by object identity instead:
+                // afterwards the number is free or names a different object.
+                let identity = crate::discovery::identity::test_fixture::record_open_fd(fd);
+                drop(custody);
+                crate::discovery::identity::test_fixture::assert_fd_closed(fd, identity);
+            } else {
+                assert!(!outcome.mapping_scan_completed());
+                assert!(examined.is_empty());
+                assert_eq!(
+                    owner.examined_for_test().0,
+                    0,
+                    "failed scan retained file custody"
+                );
+            }
+        }
+    }
+
+    pub(super) fn final_maps_refusal(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+        read_failure: bool,
+    ) -> ScanOutcome {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.fail_open_b = !read_failure;
+        fixture.fail_read_b = read_failure;
+        let hints = [fixture.path.clone()];
+        scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            view,
+            budget,
+            &mut fixture,
+        )
+        .unwrap()
+    }
 
     pub(super) fn bracket_refusal(
         view: &ProcessView,
@@ -4152,7 +6601,7 @@ mod tests {
         fn open_maps(
             &mut self,
             _: &ProcessView,
-            budget: &CaptureWorkBudget,
+            budget: &mut CaptureWorkBudget,
         ) -> std::io::Result<Box<dyn Read>> {
             self.maps_reads += 1;
             if self.maps_reads == 2 {
@@ -4183,7 +6632,11 @@ mod tests {
                 .to_vec(),
             )))
         }
-        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<BracketMemory> {
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<BracketMemory> {
             Ok(BracketMemory {
                 file: self.mem.try_clone()?,
                 log: self.log.clone(),
@@ -4198,9 +6651,12 @@ mod tests {
         }
         fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
             match self.mapped {
+                // Scripted identities model an ordinary filesystem: the
+                // magic is explicit (an unproven filesystem would require
+                // the original-file witness instead of the legacy join).
                 Some((held, _)) => Some(crate::discovery::identity::MappedFile {
                     identity: held,
-                    fs_magic: None,
+                    fs_magic: Some(0xef53),
                 }),
                 None => crate::discovery::identity::self_mapped_file(file).ok(),
             }
@@ -4210,6 +6666,7 @@ mod tests {
             view: &ProcessView,
             start: u64,
             end: u64,
+            _: &mut CaptureWorkBudget,
         ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
             match self.mapped {
                 Some((_, range)) => Ok(Ok(range)),
@@ -4218,7 +6675,11 @@ mod tests {
                 }),
             }
         }
-        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
             self.log.borrow_mut().push("final generation".into());
             if self.fail_generation {
                 Err("injected generation loss".into())
@@ -4831,12 +7292,15 @@ mod tests {
             outcome.skipped()
         );
 
-        // The preprocessing itself is charged, one unit per snapshot entry.
-        // Leave one unit: every live process has multiple mappings, so the scan
-        // stops there without racing a separate read of this process's map count.
-        let mut budget = CaptureWorkBudget::default();
-        assert!(budget.charge(DEFAULT_WORK_CEILING - 1));
-        let outcome = scan_pid(&request, &mut budget).expect("a scan of this process");
+        // Isolate map preprocessing from constructor work: the retained view
+        // predates exhaustion, and this existing I/O fixture serves five real
+        // authored map rows without spending filesystem-proof work first.
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        let (outcome, examined, _) =
+            scan_view_with_examined(&request, &view, &mut budget, &mut fixture, true)
+                .expect("a bounded retained-view scan");
         assert!(
             outcome
                 .skipped()
@@ -4847,6 +7311,96 @@ mod tests {
             outcome.skipped()
         );
         assert!(outcome.modules().is_empty());
+        assert_eq!(
+            fixture.maps_reads, 1,
+            "the initial snapshot reached preprocessing"
+        );
+        assert!(
+            examined.is_empty(),
+            "a stopped snapshot grants no examined-object evidence"
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    #[test]
+    fn scan_pid_constructor_budget_stops_are_structured_partial_results() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+
+        for cold in [false, true] {
+            let mut group = ColdLeaderSubject::spawn(1);
+            if cold {
+                group.leave_leader();
+            }
+            let hooks = HookRegistry::builtin();
+            let request = ScanRequest {
+                pid: group.pid(),
+                hints: &[],
+                hooks: &hooks,
+            };
+            let mut sticky = CaptureWorkBudget::default();
+            assert!(!sticky.charge(u64::MAX));
+            let mut expired = CaptureWorkBudget::default();
+            expired.set_deadline(Some(0));
+            let mut cancelled = CaptureWorkBudget::default();
+            cancelled.set_collection_work(CollectionWork::new(|_| false));
+            let mut budgets = vec![
+                sticky,
+                CaptureWorkBudget::with_work_ceiling(1),
+                expired,
+                cancelled,
+            ];
+            if cold {
+                budgets.push(CaptureWorkBudget::new(ScanLimits {
+                    per_object_bytes: 0,
+                    total_bytes: 0,
+                }));
+            }
+            for mut budget in budgets {
+                let outcome = scan_pid(&request, &mut budget)
+                    .expect("a capture budget stop is partial, not an unreadable-provider error");
+                assert!(outcome.modules().is_empty());
+                assert!(
+                    !outcome.mapping_scan_completed(),
+                    "no accepted current maps proof exists"
+                );
+                let reason = budget
+                    .stopped_reason()
+                    .expect("the actual budget records the refusal");
+                assert!(
+                    outcome
+                        .skipped()
+                        .iter()
+                        .any(|skip| skip.subject == "capture discovery" && skip.reason == reason),
+                    "actual stop reason is retained: {:?}",
+                    outcome.skipped()
+                );
+                if !cold {
+                    assert_eq!(budget.attempted_io_bytes(), 0);
+                }
+            }
+            let mut healthy = CaptureWorkBudget::default();
+            let outcome = scan_pid(&request, &mut healthy).unwrap();
+            assert!(
+                outcome
+                    .modules()
+                    .iter()
+                    .any(|module| Path::new(&module.path) == group.program)
+            );
+            if !cold {
+                group.leave_leader();
+            }
+            group.call_three();
+        }
+        let hooks = HookRegistry::builtin();
+        let missing = ScanRequest {
+            pid: u32::MAX,
+            hints: &[],
+            hooks: &hooks,
+        };
+        assert!(
+            scan_pid(&missing, &mut CaptureWorkBudget::default()).is_err(),
+            "ordinary identity failures retain the public error scope"
+        );
     }
 
     /// Task 9.2-fix5 item A. A process that has already exited cannot have its
@@ -5049,6 +7603,65 @@ mod tests {
     }
 
     #[test]
+    fn same_file_load_count_counts_distinct_executable_instances() {
+        // One load: each offset mapped once.
+        let single = group_of(
+            b"1000-2000 r--p 00000000 08:01 7 /lib/provider.so\n\
+              2000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&single)), 1);
+        // A dlmopen double-load: the r-x file range mapped twice at
+        // different addresses.
+        let double = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&double)), 2);
+        // A third same-file load: the same r-x file range at a third
+        // address. The boolean detector stays true here too, so only
+        // the count sees the new instance.
+        let triple = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              c100-c200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&triple)), 3);
+        assert!(duplicate_exec_coverage(&group_refs(&triple)));
+        // Disjoint executable ranges: two segments, one load each.
+        let disjoint = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00002000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&disjoint)), 1);
+        // Data-only duplicates: no call surface, still one load.
+        let data = group_of(
+            b"a000-a100 r--p 00000000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b000-b100 r--p 00000000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&data)), 1);
+        // Partial executable overlap still shares offsets: two loads.
+        let overlap = group_of(
+            b"a100-a300 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b300 r-xp 00001100 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&overlap)), 2);
+        // The same mapping listed twice is the one mapping.
+        let repeated = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&repeated)), 1);
+    }
+
+    #[test]
     fn ilp32_tables_use_four_byte_words_and_ignore_adjacent_poison() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
         let map_index = MapIndex::new(&maps).unwrap();
@@ -5075,6 +7688,22 @@ mod tests {
             assert_eq!(tables[0].entries.len(), fields, "{version:#x}");
 
             snapshot.truncate(4 + fields * 4 - 1);
+            let truncated = detect_tables_for_layout(
+                LinuxLayout::Ilp32,
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            )
+            .0;
+            if fields > 68 {
+                assert_eq!(truncated.len(), 1, "the legacy prefix is complete");
+                assert_eq!(truncated[0].walk, "known_prefix");
+                assert_eq!(truncated[0].entries.len(), 68);
+                snapshot.truncate(4 + 68 * 4 - 1);
+            } else {
+                assert!(truncated.is_empty(), "an incomplete legacy layout refuses");
+            }
             assert!(
                 detect_tables_for_layout(
                     LinuxLayout::Ilp32,
@@ -5085,7 +7714,7 @@ mod tests {
                 )
                 .0
                 .is_empty(),
-                "a truncated final target word is never decoded"
+                "a truncated final legacy target word is never decoded"
             );
         }
     }
@@ -5149,6 +7778,1844 @@ mod tests {
             )
             .1
             .is_empty()
+        );
+    }
+
+    /// Fixture maps for the mislabelled-table tests: an executable
+    /// provider mapping for valid slots, a file-backed data mapping for
+    /// unrelated tail words, and a readable mapping holding the snapshot.
+    fn mislabelled_fixture_maps() -> Vec<MapEntry> {
+        parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap()
+    }
+
+    /// A table image with `head` valid executable slots followed by `tail`
+    /// file-backed data words under the given version word.
+    fn mislabelled_snapshot(word: u64, head: usize, tail: usize) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + (head + tail) * 8];
+        snapshot[..8].copy_from_slice(&word.to_le_bytes());
+        for slot in 0..head {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 0..tail {
+            let at = 8 + (head + slot) * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn genuine_tables_decode_their_declared_slot_count() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (word, version, slots) in [
+            (0x2802u64, (2u8, 40u8), 68usize),
+            (0x0003, (3, 0), 92),
+            (0x0103, (3, 1), 92),
+            (0x0203, (3, 2), 104),
+        ] {
+            let snapshot = mislabelled_snapshot(word, slots, 0);
+            let table = decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the table")
+            .unwrap_or_else(|| panic!("{version:?} must decode"));
+            assert_eq!(table.version, version);
+            assert_eq!(table.walk, "full");
+            assert_eq!(table.entries.len(), slots, "{version:?}");
+            assert!(table.null_entries.is_empty(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn mislabelled_3x_prefix_decodes_without_an_extended_snapshot() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let width = layout.word_bytes();
+            for minor in [0u8, 1, 2, 255] {
+                let mut snapshot = vec![0u8; 69 * width];
+                snapshot[0] = 3;
+                snapshot[1] = minor;
+                for slot in snapshot[width..].chunks_exact_mut(width) {
+                    slot.copy_from_slice(&0x1500u64.to_le_bytes()[..width]);
+                }
+                let (table, len) = decode_candidate(
+                    layout,
+                    &snapshot,
+                    0,
+                    0x7000,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                    DecodeContext {
+                        runtime_view: None,
+                        strict_tail: true,
+                    },
+                )
+                .expect("the prefix fits the budget")
+                .expect("a complete legacy prefix does not need extended bytes");
+                assert_eq!(table.version, (3, minor));
+                assert_eq!(table.walk, "known_prefix");
+                assert_eq!(table.entries.len(), 68);
+                assert_eq!(table.decoded_slot_count(), 68);
+                assert_eq!(len, 69 * width);
+                let declared_slots = if minor < 2 { 92 } else { 104 };
+                for extra in [1, width, (declared_slots - 68) * width - 1] {
+                    let mut partial_tail = snapshot.clone();
+                    partial_tail.resize(snapshot.len() + extra, 0xa5);
+                    let partial = decode_exact_table(
+                        &partial_tail,
+                        0x7000,
+                        layout,
+                        &map_index,
+                        &mut CaptureWorkBudget::default(),
+                        None,
+                    )
+                    .unwrap()
+                    .expect("an unproven partial extension cannot discard the legacy prefix");
+                    assert_eq!(partial.walk, "known_prefix");
+                    assert_eq!(partial.entries, table.entries);
+                    assert_eq!(partial.decoded_slot_count(), 68);
+                }
+                assert_eq!(
+                    exact_table_addresses_n(&snapshot, layout, table.decoded_slot_count()),
+                    Some(vec![0x1500; 68])
+                );
+                let mut dependencies = ScanDependencies::default();
+                dependencies.retain_tables(
+                    std::slice::from_ref(&table),
+                    &snapshot,
+                    0x7000,
+                    layout,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                );
+                assert!(!dependencies.invalid_span);
+                assert_eq!(
+                    dependencies.targets.keys().copied().collect::<Vec<_>>(),
+                    [0x1000]
+                );
+                let identity = interface_identity(&table, "null", &None, 0, &map_index, None)
+                    .expect("the prefix has its file identity");
+                let InterfaceTableKey::File(identity) = identity.table else {
+                    panic!("the table is file-backed");
+                };
+                assert_eq!(identity.usable, 68);
+            }
+        }
+    }
+
+    #[test]
+    fn mislabelled_3x_short_snapshots_refuse_incomplete_or_invalid_legacy_prefixes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let width = layout.word_bytes();
+            let mut snapshot = vec![0u8; 69 * width];
+            snapshot[0] = 3;
+            snapshot[1] = 2;
+            for slot in snapshot[width..].chunks_exact_mut(width) {
+                slot.copy_from_slice(&0x1500u64.to_le_bytes()[..width]);
+            }
+            for len in 0..snapshot.len() {
+                assert!(
+                    decode_exact_table(
+                        &snapshot[..len],
+                        0x7000,
+                        layout,
+                        &map_index,
+                        &mut CaptureWorkBudget::default(),
+                        None,
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "{layout:?}: incomplete legacy prefix at {len} bytes"
+                );
+            }
+            for broken in [0usize, 67] {
+                for pointer in [0x4500u64, 0x6000, u64::MAX] {
+                    let mut invalid = snapshot.clone();
+                    let at = width + broken * width;
+                    invalid[at..at + width].copy_from_slice(&pointer.to_le_bytes()[..width]);
+                    assert!(
+                        decode_exact_table(
+                            &invalid,
+                            0x7000,
+                            layout,
+                            &map_index,
+                            &mut CaptureWorkBudget::default(),
+                            None,
+                        )
+                        .unwrap()
+                        .is_none(),
+                        "{layout:?}: invalid legacy slot {broken} ({pointer:#x})"
+                    );
+                }
+            }
+            snapshot[0] = 4;
+            assert!(
+                decode_exact_table(
+                    &snapshot,
+                    0x7000,
+                    layout,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                    None,
+                )
+                .unwrap()
+                .is_none(),
+                "unknown major versions remain refused"
+            );
+        }
+    }
+
+    /// Fedora's stock SoftHSM labels its 68-slot 2.x table {3,2}. The scan
+    /// accepts the complete 68-slot prefix instead of rejecting the table
+    /// for its unusable 3.x tail.
+    #[test]
+    fn mislabelled_3x_table_with_complete_68_prefix_decodes_as_68() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (word, version, tail) in [
+            (0x0203u64, (3u8, 2u8), 36usize),
+            (0x0003, (3, 0), 24),
+            (0x0103, (3, 1), 24),
+        ] {
+            let snapshot = mislabelled_snapshot(word, 68, tail);
+            let table = decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the table")
+            .unwrap_or_else(|| panic!("{version:?} with a complete 68 prefix must decode"));
+            assert_eq!(table.version, version, "the declared version stays visible");
+            assert_eq!(table.walk, "known_prefix", "{version:?}");
+            assert_eq!(table.entries.len(), 68, "{version:?}");
+            assert!(table.null_entries.is_empty(), "{version:?}");
+            assert!(
+                table.entries.iter().all(|entry| entry.file_offset < 0x2000),
+                "{version:?}: every entry resolves into the executable mapping"
+            );
+        }
+        // The Fedora tail starts with an executable word (the personality
+        // routine) before the unrelated data: the prefix decision waits
+        // for the first unusable slot instead of stopping at slot 68.
+        let mut snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        for slot in 68..71 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the table")
+        .expect("an executable-led tail still decodes the 68 prefix");
+        assert_eq!((table.version, table.walk), ((3, 2), "known_prefix"));
+        assert_eq!(table.entries.len(), 68);
+    }
+
+    #[test]
+    fn mislabelled_3x_table_with_incomplete_68_prefix_is_rejected() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        // 67 of the first 68 slots valid, one data word inside the prefix.
+        for broken in [0usize, 67] {
+            let mut snapshot = mislabelled_snapshot(0x0203, 68, 36);
+            let at = 8 + broken * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+            assert!(
+                decode_exact_table(
+                    &snapshot,
+                    0x7000,
+                    LinuxLayout::Lp64,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                    None,
+                )
+                .expect("budget must admit the attempt")
+                .is_none(),
+                "slot {broken} breaks the 68 prefix"
+            );
+        }
+        // An all-NULL 68 prefix is data, not a table.
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 68..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        assert!(
+            decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "an all-NULL 68 prefix is not a table"
+        );
+        // The complete legacy prefix must be present, independently of
+        // the declared extended layout. A 67-slot prefix stays refused.
+        let snapshot = mislabelled_snapshot(0x0203, 67, 0);
+        assert!(
+            decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "an incomplete legacy prefix is not a table"
+        );
+    }
+
+    #[test]
+    fn mislabelled_3x_table_sweep_finds_single_68_slot_table() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        let (tables, skipped) = detect_tables(
+            &snapshot,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "the sweep finds the mislabelled table");
+        assert_eq!(tables[0].version, (3, 2));
+        assert_eq!(tables[0].walk, "known_prefix");
+        assert_eq!(tables[0].address, 0x7000);
+        assert_eq!(tables[0].entries.len(), 68);
+        // The decoded extent is the 68-slot prefix: overlap handling
+        // must not swallow the 36 tail bytes as table.
+        let (_, len) = decode_candidate(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            DecodeContext {
+                runtime_view: None,
+                strict_tail: true,
+            },
+        )
+        .expect("budget must admit the table")
+        .expect("offset 0 must decode");
+        assert_eq!(len, 8 + 68 * 8);
+    }
+
+    /// A full-extent 3.2-labelled image: valid executable entries at
+    /// `entries`, NULL holes elsewhere in the legacy prefix, file-backed
+    /// data words across the whole extension. The sweep must refuse the
+    /// single-entry shape (a BSS lookalike); the getter path decodes it
+    /// (the provider's own address rules out a lookalike).
+    fn sparse_3x_snapshot(entries: &[usize]) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for &ordinal in entries {
+            let at = 8 + ordinal * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for ordinal in 68..104 {
+            let at = 8 + ordinal * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn sweep_refuses_single_entry_and_zero_entry_3x_lookalikes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for entries in [&[0][..], &[][..]] {
+            let snapshot = sparse_3x_snapshot(entries);
+            let (tables, skipped) = detect_tables(
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            );
+            assert!(skipped.is_empty(), "{entries:?}: {skipped:?}");
+            assert!(
+                tables.is_empty(),
+                "{entries:?}: the sweep must refuse a lookalike with fewer than two prefix entries"
+            );
+        }
+        // Positive control: the same tail behind a complete 68-entry
+        // prefix still decodes on the sweep, so the refusal above pins
+        // the entry count, not the tail shape.
+        let full = mislabelled_snapshot(0x0203, 68, 36);
+        let (tables, skipped) =
+            detect_tables(&full, 0x7000, &map_index, &mut CaptureWorkBudget::default());
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "the full prefix still decodes");
+        assert_eq!(tables[0].entries.len(), 68);
+    }
+
+    #[test]
+    fn exact_decode_accepts_a_getter_returned_single_entry_3x_table() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let snapshot = sparse_3x_snapshot(&[0]);
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the attempt")
+        .expect("one validated entry at a provider-returned address decodes");
+        assert_eq!(table.version, (3, 2));
+        assert_eq!(table.walk, "known_prefix");
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.decoded_slot_count(), 68);
+        // Zero entries stay refused on the getter path too: no validated
+        // slot, no table.
+        let empty = sparse_3x_snapshot(&[]);
+        assert!(
+            decode_exact_table(
+                &empty,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "an all-NULL prefix is not a table on any path"
+        );
+    }
+
+    /// A decoded mislabelled table: version {3,2}, walk `known_prefix`,
+    /// 68 entries at the fixture snapshot base.
+    fn short_prefix_table() -> ScannedTable {
+        let device = Device { major: 8, minor: 1 };
+        ScannedTable {
+            version: (3, 2),
+            walk: "known_prefix",
+            entries: (0..68)
+                .map(|_| ScannedEntry {
+                    name: "C_Initialize",
+                    object: ObjectKey { device, inode: 7 },
+                    object_path: "/lib/provider.so".to_string(),
+                    file_offset: 0x500,
+                })
+                .collect(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: Some(0x2000),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        }
+    }
+
+    #[test]
+    fn interface_identity_charges_a_short_prefix_under_its_decoded_count() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let device = Device { major: 8, minor: 1 };
+        let table = short_prefix_table();
+        let identity = interface_identity(&table, "null", &None, 0, &map_index, None)
+            .expect("a file-backed table always has an identity");
+        assert_eq!(
+            identity.table,
+            InterfaceTableKey::File(TableIdentity {
+                device,
+                inode: 7,
+                file_offset: 0x2000,
+                version_word: 0x0203,
+                usable: 68,
+            }),
+            "the repeat key charges what the decode admitted"
+        );
+    }
+
+    #[test]
+    fn own_export_corroboration_does_not_depend_on_the_declared_table_label() {
+        let mut table = short_prefix_table();
+        table.entries.truncate(1);
+        table.null_entries = (1..68)
+            .map(|ordinal| function_name(ordinal).unwrap())
+            .collect();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: table.entries[0].object,
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        for version in [(2, 40), (3, 0), (3, 1), (3, 2)] {
+            table.version = version;
+            table.walk = if version == (2, 40) {
+                "full"
+            } else {
+                "known_prefix"
+            };
+            let score =
+                table_evidence_score(0, std::slice::from_ref(&table), &[], &[], &[], &exports);
+            assert!(
+                score.exports,
+                "{version:?}: identical observed positions and exports"
+            );
+            assert!(table_name_authorized(&score));
+            assert!(
+                !table_evidence_score(
+                    0,
+                    std::slice::from_ref(&table),
+                    &[],
+                    &[],
+                    &[],
+                    &ObjectExports::NONE
+                )
+                .exports
+            );
+        }
+    }
+
+    #[test]
+    fn observed_runtime_identity_distinguishes_invalid_words_from_null_and_each_other() {
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n6000-7000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessViewId(77);
+        let mut words = vec![0x1500u64; 68];
+        for invalid in [1u64, 2, 0] {
+            words[5] = invalid;
+            let table = decode_observed_words(
+                (7, 231),
+                &words,
+                68,
+                0x6000,
+                &index,
+                &mut budget,
+                Some(view),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(table.unpinned.len(), usize::from(invalid != 0));
+            assert_eq!(table.null_entries.len(), usize::from(invalid == 0));
+            let identity =
+                observed_interface_identity(&table, "null", &None, 0, &index, Some(view), &budget)
+                    .unwrap();
+            let InterfaceTableKey::Runtime(key) = identity.table else {
+                panic!("anonymous table");
+            };
+            assert!(budget.runtime_table_already_admitted(&key));
+        }
+        assert_eq!(budget.admitted_runtime_tables.len(), 3);
+        assert_eq!(budget.runtime_table_contents.len(), 1);
+        assert_eq!(budget.table_candidates_count(), 3);
+    }
+
+    #[test]
+    fn raw_extended_export_anchor_is_not_gated_by_header_metadata() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 105 * 8];
+        snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
+        snapshot[104 * 8..105 * 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        let symbols = [(function_name(103).unwrap().to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut CaptureWorkBudget::default(),
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty());
+        let table = tables
+            .iter()
+            .find(|table| table.address == 0x7000)
+            .expect("the actual export position anchors the observed extension");
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.entries[0].name, function_name(103).unwrap());
+        assert_eq!(table.decoded_slot_count(), 104);
+        assert_eq!(table.null_entries.len(), 103);
+    }
+
+    #[test]
+    fn same_base_extension_anchor_preserves_known_prefix_and_extra_targets() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [
+            ("C_Initialize".to_string(), 0x500),
+            (function_name(103).unwrap().to_string(), 0x700),
+        ];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        for word in [0x2802u64, 0x0003, 0x0103] {
+            let mut snapshot = vec![0u8; 105 * 8];
+            snapshot[..8].copy_from_slice(&word.to_le_bytes());
+            snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+            snapshot[93 * 8..94 * 8].copy_from_slice(&0x1600u64.to_le_bytes());
+            snapshot[104 * 8..105 * 8].copy_from_slice(&0x1700u64.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &[],
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            let targets: BTreeSet<_> = tables
+                .iter()
+                .filter(|table| table.address == 0x7000)
+                .flat_map(|table| table.entries.iter().map(|entry| entry.file_offset))
+                .collect();
+            assert_eq!(
+                targets,
+                [0x500, 0x600, 0x700].into_iter().collect(),
+                "{word:#x}: a shorter strict shape must not erase independently anchored targets"
+            );
+            assert!(
+                tables
+                    .iter()
+                    .enumerate()
+                    .any(|(at, table)| table.address == 0x7000
+                        && table.decoded_slot_count() <= 92
+                        && table_evidence_score(at, &tables, &[], &[], &[], &exports).exports),
+                "the known prefix retains its exact own-export name evidence"
+            );
+            assert!(
+                tables
+                    .iter()
+                    .enumerate()
+                    .any(|(at, table)| table.address == 0x7000
+                        && table.decoded_slot_count() == 104
+                        && !table_name_authorized(&table_evidence_score(
+                            at,
+                            &tables,
+                            &[],
+                            &[],
+                            &[],
+                            &exports
+                        ))),
+                "unproven extension callbacks remain unknown/count-only"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_fingerprint_is_not_reused_for_a_different_decoded_shape() {
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n6000-7000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessViewId(78);
+        let mut table = decode_observed_words(
+            (2, 40),
+            &[0x1500; 68],
+            68,
+            0x6000,
+            &index,
+            &mut budget,
+            Some(view),
+        )
+        .unwrap()
+        .unwrap();
+        let before =
+            observed_interface_identity(&table, "null", &None, 0, &index, Some(view), &budget)
+                .unwrap();
+        table.entries[0].file_offset += 1;
+        let after =
+            observed_interface_identity(&table, "null", &None, 0, &index, Some(view), &budget)
+                .unwrap();
+        assert_ne!(
+            before, after,
+            "a stale raw fingerprint cannot replace a changed current table shape"
+        );
+    }
+
+    #[test]
+    fn retain_tables_ignores_unmapped_tail_words_beyond_the_decoded_prefix() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table = short_prefix_table();
+        let mut snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        for slot in 68..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&(0x100u64 + slot as u64).to_le_bytes());
+        }
+        let mut dependencies = ScanDependencies::default();
+        dependencies.retain_tables(
+            std::slice::from_ref(&table),
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(
+            !dependencies.invalid_span,
+            "unmapped tail words are outside the decoded span"
+        );
+        assert_eq!(
+            dependencies.targets.keys().collect::<Vec<_>>(),
+            [&0x1000],
+            "only the executable mapping is a dependency target"
+        );
+    }
+
+    #[test]
+    fn raw_export_anchor_does_not_name_an_unproven_private_callback() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        for word in [0x2802u64, 0x0003, 0x0103, 0x0203, 0xe707] {
+            let mut snapshot = vec![0u8; 69 * 8];
+            snapshot[..8].copy_from_slice(&(0xa5a5_0000_0000_0000u64 | word).to_le_bytes());
+            snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+            snapshot[16..24].copy_from_slice(&0x1600u64.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &[],
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            let table = tables
+                .iter()
+                .find(|table| table.address == 0x7000)
+                .expect("valid targets remain observable");
+            assert_eq!(table.entries.len(), 2);
+            let score =
+                table_evidence_score(0, std::slice::from_ref(table), &[], &[], &[], &exports);
+            assert!(
+                !score.exports,
+                "{word:#x}: the private callback lacks ordinal/name proof"
+            );
+            assert!(
+                !table_name_authorized(&score),
+                "uncertain API names stay unknown/count-only"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_metadata_preserves_a_real_elf_zero_fill_table_in_the_last_file_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&path)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/crates/discover/tests/fixture/version_matrix.c"
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let file = open_object(&path).unwrap();
+        let elf = ElfSnapshot::read(&file).unwrap();
+        let facts = elf.raw_scan_facts(&["C_GetFunctionList"]).unwrap();
+        let table_va = elf
+            .defined_symbol_virtual_address("t240", 69 * 8)
+            .unwrap()
+            .unwrap();
+        let getter_va = elf
+            .defined_symbol_virtual_address("C_GetFunctionList", 1)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let u16_at = |at| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        assert_eq!(&bytes[..5], b"\x7fELF\x02");
+        let phoff = u64_at(32) as usize;
+        let phsize = usize::from(u16_at(54));
+        assert_eq!(phsize, 56);
+        let metadata = file.metadata().unwrap();
+        let device = Device {
+            major: u64::from(libc::major(metadata.dev())),
+            minor: u64::from(libc::minor(metadata.dev())),
+        };
+        let object = ObjectKey {
+            device,
+            inode: metadata.ino(),
+        };
+        let bias = 0x100_0000u64;
+        let mut maps_text = String::new();
+        let mut zero_fill_last_page = false;
+        // Derive the mapping geometry from this ELF's actual PT_LOADs. A
+        // file-named last page contains loader-zeroed bytes after p_filesz;
+        // their VMA offset projection does not identify file content.
+        for i in 0..usize::from(u16_at(56)) {
+            let at = phoff + i * phsize;
+            if u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) != 1 {
+                continue;
+            }
+            let flags = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+            let offset = u64_at(at + 8);
+            let va = u64_at(at + 16);
+            let filesz = u64_at(at + 32);
+            let memsz = u64_at(at + 40);
+            let start = va & !4095;
+            let end = (va + filesz + 4095) & !4095;
+            if va + filesz <= table_va && table_va + 69 * 8 <= end {
+                assert!(table_va + 69 * 8 <= va + memsz);
+                zero_fill_last_page = true;
+            }
+            maps_text.push_str(&format!(
+                "{:x}-{:x} r{}{}p {:08x} {:x}:{:x} {} {}\n",
+                bias + start,
+                bias + end,
+                if flags & 2 != 0 { 'w' } else { '-' },
+                if flags & 1 != 0 { 'x' } else { '-' },
+                offset & !4095,
+                device.major,
+                device.minor,
+                object.inode,
+                path.display(),
+            ));
+        }
+        assert!(
+            zero_fill_last_page,
+            "fixture must exercise the real BSS tail"
+        );
+        let maps = parse_maps(maps_text.as_bytes()).unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 69 * 8];
+        snapshot[4 * 8..5 * 8].copy_from_slice(&(bias + getter_va).to_le_bytes());
+        let exports = ObjectExports {
+            object,
+            symbols: &facts.exports,
+            getter_present: facts.getter_present,
+            witness_fault: facts.witness_fault,
+        };
+        for (header, walk) in [(0x2802u64, "full"), (0xa5a5_0000_0000_e707, "known_prefix")] {
+            snapshot[..8].copy_from_slice(&header.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                bias + table_va,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &facts.excluded_anchor_ranges,
+                || Some(0),
+            );
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(tables.len(), 1, "zero-fill table is useful: {tables:?}");
+            assert_eq!(tables[0].walk, walk);
+            assert_eq!(tables[0].entries.len(), 1);
+            assert_eq!(tables[0].entries[0].name, "C_GetFunctionList");
+            assert_eq!(tables[0].null_entries.len(), 67);
+        }
+    }
+
+    #[test]
+    fn strict_raw_metadata_header_does_not_admit_gnu_property_padding_and_arrays() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_GetFunctionList".to_string(), 0x900)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        // Actual ABI26 LP64 rv64 shape: GNU property value 3 looks like
+        // version 3.0, 66 padding words are NULL, and .init_array/.fini_array
+        // pointers look like ordinals 66/67. The dynamic tail is not a table.
+        // The installed b58 failure admitted its two unknown targets and
+        // counted an extra destructor call. None has an own-export anchor.
+        let mut snapshot = vec![0u8; 93 * 8];
+        snapshot[..8].copy_from_slice(&3u64.to_le_bytes());
+        snapshot[(67 * 8)..(68 * 8)].copy_from_slice(&0x1500u64.to_le_bytes());
+        snapshot[(68 * 8)..(69 * 8)].copy_from_slice(&0x1600u64.to_le_bytes());
+        snapshot[(69 * 8)..(70 * 8)].copy_from_slice(&0xcu64.to_le_bytes());
+        let ranges = [(0x2000, 0x2008), (0x2218, 0x2228)];
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &ranges,
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "metadata is not a provider refusal");
+        assert!(
+            tables.is_empty(),
+            "ELF metadata cannot anchor a strict raw table: {tables:?}"
+        );
+        assert_eq!(
+            budget.table_candidates, 0,
+            "reject before admitting decoded table capacity"
+        );
+
+        // The same sparse/private layout in ordinary data remains useful:
+        // neither NULL count, version label nor target names are filters.
+        for word in [0x2802u64, 0x0003, 0x0203] {
+            snapshot[..8].copy_from_slice(&word.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &[],
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            let table = tables.iter().find(|table| table.address == 0x7000).unwrap();
+            assert_eq!(table.entries.len(), 2);
+            assert_eq!(table.null_entries.len(), 66);
+            assert_eq!(table.decoded_slot_count(), 68);
+            assert_eq!(
+                table.walk,
+                if word == 0x2802 {
+                    "full"
+                } else {
+                    "known_prefix"
+                }
+            );
+        }
+        // Explicitly acquired words retain their bounded observation even
+        // when the returned address happens to lie in ELF metadata. All-NULL
+        // acquisition is different from an unanchored all-zero memory scan.
+        for words in [vec![0; 68], vec![0x1500; 68]] {
+            let table = decode_observed_words(
+                (3, 2),
+                &words,
+                68,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(table.decoded_slot_count(), 68);
+            assert_eq!(table.walk, "full");
+            assert_eq!(table.null_entries.len(), if words[0] == 0 { 68 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn strict_raw_metadata_header_requires_exact_elf_owner_provenance() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 69 * 8];
+        snapshot[..8].copy_from_slice(&0x2802u64.to_le_bytes());
+        snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+        for (inode, ranges, retained) in [
+            (7, vec![(0x2000, 0x2008)], false),
+            (8, vec![(0x2000, 0x2008)], true),
+            (7, vec![(0x1ff8, 0x2000)], true),
+            (7, vec![(0x2008, 0x2010)], true),
+            (7, vec![(0x1fff, 0x2001)], false),
+        ] {
+            let exports = ObjectExports {
+                object: ObjectKey {
+                    device: Device { major: 8, minor: 1 },
+                    inode,
+                },
+                symbols: &[],
+                getter_present: false,
+                witness_fault: false,
+            };
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &ranges,
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            assert_eq!(
+                tables.iter().any(|table| table.address == 0x7000),
+                retained,
+                "inode={inode}, ranges={ranges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_metadata_exclusion_uses_the_anchor_word_not_header_or_target() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let mut snapshot = vec![0u8; 69 * 8];
+        snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
+        snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+        snapshot[16..24].copy_from_slice(&0x1600u64.to_le_bytes());
+        // The actual anchor is file word [0x2008,0x2010). Header-only
+        // overlap and adjacent metadata cannot discard a normal data array.
+        for (ranges, retained) in [
+            (vec![], true),
+            (vec![(0x2000, 0x2008)], true),
+            (vec![(0x2010, 0x2020)], true),
+            (vec![(0x2008, 0x2010)], false),
+            (vec![(0x2007, 0x2009)], false),
+            (vec![(0x200f, 0x2011)], false),
+        ] {
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &ranges,
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            assert_eq!(
+                tables.iter().any(|table| table.address == 0x7000),
+                retained,
+                "{ranges:?}"
+            );
+            // The same readable acquired words remain useful even if an
+            // explicit caller actually returned an address in metadata.
+            let table = decode_observed_words(
+                (7, 231),
+                &[0x1500, 0x1600],
+                68,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(table.entries.len(), 2);
+        }
+        assert!(raw_anchor_overlaps_metadata(&[(0x100, 0x108)], 0x104, 4));
+        assert!(!raw_anchor_overlaps_metadata(&[(0x100, 0x108)], 0x108, 4));
+        assert!(raw_anchor_overlaps_metadata(&[], u64::MAX, 8));
+    }
+
+    #[test]
+    fn aliased_export_tail_charges_one_table_not_one_per_alias() {
+        // Mirror of the capacity fixture layout: a 2.40 table whose words
+        // past the distinct bodies alias the exported getter. Every alias
+        // occurrence is an anchor candidate, but candidates the overlap
+        // pass would discard must not charge the table budget: charging one
+        // candidate per alias burns ~36 candidates per provider and
+        // exhausts the 512-candidate ceiling at 14 providers (952
+        // endpoints), starving system scale. Four aliases keep every
+        // candidate inside the real table, so exactly one table decodes.
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_GetFunctionList".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        // Anchor address: the r-x mapping runs 0x1000-0x3000 at file
+        // offset 0, so file offset 0x500 lands at 0x1500.
+        let getter = 0x1500u64;
+        let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
+        for slot in 0..68u64 {
+            let word = if slot == 3 { getter } else { 0x1600 + slot * 8 };
+            snapshot.extend_from_slice(&word.to_le_bytes());
+        }
+        for _ in 0..4 {
+            snapshot.extend_from_slice(&getter.to_le_bytes());
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "one real table, no anchor phantoms");
+        assert_eq!(tables[0].address, 0x7000);
+        assert_eq!(tables[0].version, (2, 40));
+        assert_eq!(tables[0].entries.len(), 68);
+        assert_eq!(
+            budget.table_candidates_count(),
+            1,
+            "aliases must not charge the table budget"
+        );
+        assert_eq!(budget.decoded_table_entries_count(), 68);
+    }
+
+    #[test]
+    fn long_aliased_tail_charges_two_tables_for_thirty_six_aliases() {
+        // The full capacity tail: 36 alias occurrences. The first candidate
+        // past the real table's end touches but does not overlap it, so the
+        // overlap pass keeps it (a second charged table); every later alias
+        // overlaps that kept decode and must not charge. Burn per provider
+        // drops from ~36 candidates to 2, fitting 121 providers (8192
+        // endpoints) in the per-pass budget. The kept adjacent decode is
+        // downstream-harmless: its targets repeat the real table's.
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_GetFunctionList".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let getter = 0x1500u64;
+        let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
+        for slot in 0..68u64 {
+            let word = if slot == 3 { getter } else { 0x1600 + slot * 8 };
+            snapshot.extend_from_slice(&word.to_le_bytes());
+        }
+        for _ in 0..36 {
+            snapshot.extend_from_slice(&getter.to_le_bytes());
+        }
+        // Pad past the alias run so every candidate decodes a full width.
+        for _ in 0..68 {
+            snapshot.extend_from_slice(&0u64.to_le_bytes());
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 2, "real table plus one adjacent decode");
+        assert_eq!(tables[0].address, 0x7000);
+        assert_eq!(tables[0].entries.len(), 68);
+        assert_eq!(
+            budget.table_candidates_count(),
+            2,
+            "one kept adjacent decode, no cascade"
+        );
+    }
+
+    #[test]
+    fn anchor_skip_equal_length_tie_goes_to_the_earlier_start() {
+        // D1: unvalidated dominator with equal length but later start,
+        // scanned first. The overlap pass (validated desc, length desc,
+        // start asc) keeps the earlier start; the skip must mirror it,
+        // so the later-scanned earlier candidate is not dominated.
+        assert!(
+            !super::anchor_kept_dominates(100, 64, false, 90, 64),
+            "later start must not dominate an overlapping earlier start of equal length"
+        );
+        assert!(
+            super::anchor_kept_dominates(90, 64, false, 100, 64),
+            "earlier start dominates a later start of equal length"
+        );
+        assert!(
+            super::anchor_kept_dominates(100, 72, false, 90, 64),
+            "longer decode still dominates a shorter overlap"
+        );
+        assert!(
+            !super::anchor_kept_dominates(90, 64, false, 100, 72),
+            "shorter decode never dominates a longer overlap"
+        );
+    }
+
+    #[test]
+    fn private_capacity_tail_exposes_shared_reserve_without_api_name_proof() {
+        use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
+        use crate::plan::{
+            AdmissionPolicy, AdmissionScope, build_from_sources_for_policy_scoped,
+            classify_scanned_object,
+        };
+
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        // Exactly the CAPACITY_UNIQUE=32 layout:31 private bodies plus
+        // GFL at ordinal3, with remaining observed words aliasing GFL.
+        let mut words = vec![0x1500u64; 68];
+        for ordinal in 0..31 {
+            words[if ordinal < 3 { ordinal } else { ordinal + 1 }] = 0x1600 + ordinal as u64 * 8;
+        }
+        let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
+        for word in words {
+            snapshot.extend_from_slice(&word.to_le_bytes());
+        }
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(table.entries.len(), 68);
+        assert_eq!(
+            table
+                .entries
+                .iter()
+                .map(|entry| entry.file_offset)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            32
+        );
+        let key = table.entries[0].object;
+        let make = |object: u32, mut tables: Vec<ScannedTable>, exports: Vec<(String, u64)>| {
+            let path = format!("/owned/{object}.so");
+            let key = ObjectKey {
+                inode: u64::from(object),
+                ..key
+            };
+            for table in &mut tables {
+                for entry in &mut table.entries {
+                    entry.object = key;
+                    entry.object_path = path.clone();
+                }
+            }
+            ReconciledModule {
+                entry_objects: tables
+                    .iter()
+                    .map(|table| vec![PinnedObjectId(object); table.entries.len()])
+                    .collect(),
+                object: PinnedObjectId(object),
+                exports: exports.into(),
+                getter_present: false,
+                witness_fault: false,
+                scanned: ScannedModule {
+                    module_hint: None,
+                    mapped_identity: None,
+                    view: ProcessViewId(object),
+                    mount_namespace: MountNamespaceId {
+                        device: 0,
+                        inode: 1,
+                    },
+                    key,
+                    double_loaded: false,
+                    same_file_loads: 1,
+                    path,
+                    decoder_abi: Some(ElfAbi::Lp64),
+                    exports: Vec::new(),
+                    tables,
+                    interfaces: Vec::new(),
+                },
+            }
+        };
+        let mut tail = make(
+            2,
+            vec![table.clone()],
+            vec![("C_GetFunctionList".into(), 0x500)],
+        );
+        assert_eq!(
+            classify_scanned_object(std::slice::from_ref(&tail)).0,
+            "heuristic"
+        );
+        let score = table_evidence_score(
+            0,
+            &tail.scanned.tables,
+            &[],
+            &[],
+            &[],
+            &ObjectExports {
+                object: tail.scanned.key,
+                symbols: &tail.exports,
+                getter_present: tail.getter_present,
+                witness_fault: tail.witness_fault,
+            },
+        );
+        assert!(!table_name_authorized(&score));
+        let background = make(
+            1,
+            (0..120)
+                .map(|row| {
+                    let mut known = table.clone();
+                    known.live_return = true;
+                    known.file_offset = Some(0x4000 + row * 1024);
+                    for (ordinal, entry) in known.entries.iter_mut().enumerate() {
+                        entry.file_offset = row * 1024 + ordinal as u64 * 8;
+                    }
+                    known
+                })
+                .collect(),
+            Vec::new(),
+        );
+        let plan = |tail: &ReconciledModule| {
+            build_from_sources_for_policy_scoped(
+                &[background.clone(), tail.clone()],
+                &[],
+                &PinnedObjects::empty(),
+                AdmissionPolicy::inventory(
+                    crate::capacity::InventoryBudget::new(8192, 65536).unwrap(),
+                ),
+                AdmissionScope::Shared,
+            )
+        };
+        let refused = plan(&tail);
+        assert_eq!(refused.slots.len(), 8160);
+        assert!(
+            refused
+                .modules_skipped
+                .iter()
+                .any(|skip| skip.subject == "/owned/2.so"
+                    && skip.reason.contains("2048 are reserved")),
+            "{:?}",
+            refused.modules_skipped
+        );
+        tail.scanned.tables[0].live_return = true;
+        assert_eq!(
+            classify_scanned_object(std::slice::from_ref(&tail)).0,
+            "corroborated"
+        );
+        assert_eq!(
+            plan(&tail).slots.len(),
+            8192,
+            "actual publication takes the reserve"
+        );
+    }
+
+    #[test]
+    fn raw_anchor_preparation_honors_the_small_remaining_work_budget() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols: Vec<_> = (0..256)
+            .map(|_| ("C_Initialize".to_string(), 0x500))
+            .collect();
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(DEFAULT_WORK_CEILING - 8));
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &[],
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(tables.is_empty());
+        assert!(
+            !skipped.is_empty(),
+            "anchor preparation must stop, even with an empty snapshot"
+        );
+        assert!(budget.work_units_count() <= DEFAULT_WORK_CEILING);
+    }
+
+    #[test]
+    fn retain_tables_ignores_mapped_data_tail_words_beyond_the_decoded_prefix() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table = short_prefix_table();
+        // Mapped-data tail words (the Fedora typeinfo shape): still no
+        // data dependency, still a valid span.
+        let snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        let mut dependencies = ScanDependencies::default();
+        dependencies.retain_tables(
+            std::slice::from_ref(&table),
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(!dependencies.invalid_span);
+        assert_eq!(
+            dependencies.targets.keys().collect::<Vec<_>>(),
+            [&0x1000],
+            "data tail words are never dependency targets"
+        );
+    }
+
+    #[test]
+    fn exact_table_addresses_n_bounds_reads_to_the_decoded_prefix() {
+        let bounded = mislabelled_snapshot(0x0203, 68, 36);
+        let prefix = exact_table_addresses_n(&bounded, LinuxLayout::Lp64, 68)
+            .expect("the decoded prefix reads");
+        assert_eq!(prefix.len(), 68);
+        assert!(prefix.iter().all(|address| *address == 0x1500));
+        let whole = exact_table_addresses_n(&bounded, LinuxLayout::Lp64, 104)
+            .expect("the declared layout still reads whole");
+        assert_eq!(whole.len(), 104);
+        assert_ne!(prefix, whole, "the bound must exclude the tail words");
+        assert_eq!(
+            whole,
+            exact_table_addresses(&bounded, LinuxLayout::Lp64).expect("the unbounded form reads"),
+            "the unbounded form keeps reading the declared layout"
+        );
+        assert_eq!(
+            exact_table_addresses_n(&bounded, LinuxLayout::Lp64, 105),
+            None,
+            "a count wider than the walked layout refuses"
+        );
+        assert_eq!(
+            exact_table_addresses_n(&[0u8; 8], LinuxLayout::Lp64, 68),
+            None,
+            "a header no layout walks refuses"
+        );
+    }
+
+    #[test]
+    fn decoded_slot_count_sums_entries_nulls_and_unpinned() {
+        let mut table = short_prefix_table();
+        assert_eq!(table.decoded_slot_count(), 68);
+        table.null_entries.push("C_GetFunctionList");
+        table.unpinned.push(Skipped {
+            subject: "C_GetSlotList".to_string(),
+            reason: "entry was not attached".to_string(),
+        });
+        assert_eq!(
+            table.decoded_slot_count(),
+            70,
+            "holes and moved-aside records stay counted as decoded"
+        );
+    }
+
+    /// A stable mapping yields an identical admitted set every pass: a
+    /// BSS word in the tail span flipping to a version-like value between
+    /// deep-scan passes (no mapping change) must not admit a second
+    /// single-entry table. Such churn was once suspected of the Fedora
+    /// call retirements, but those gaps reproduce with a static scan, so
+    /// this is sweep-stability hardening, not their cause. This twin pins
+    /// that stability over the real tail shape (executable-led
+    /// personality slot, data typeinfo slot, BSS tail).
+    #[test]
+    fn mislabelled_68_slot_prefix_stays_stable_when_tail_words_change_between_passes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        // One mapping-sized snapshot: real table at offset 0 (68 distinct
+        // executable slots, Fedora tail with personality + typeinfo), then
+        // BSS zeros. Pass B flips one BSS word (slot 99's position) to a
+        // version word with a single distinct executable entry behind it.
+        fn sweep_snapshot(with_false_version: bool) -> Vec<u8> {
+            let mut snapshot = vec![0u8; 2048];
+            snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+            for ordinal in 0..68 {
+                let address = 0x1500u64 + ordinal as u64 * 0x10;
+                let at = 8 + ordinal * 8;
+                snapshot[at..at + 8].copy_from_slice(&address.to_le_bytes());
+            }
+            // Fedora tail: slot 68 executable (personality), slot 69 data
+            // (typeinfo), slots 70..98 file constants (data), slots 99..103
+            // BSS (zeros here, the file-tail span).
+            let tail = [(68usize, 0x1500u64), (69, 0x4500u64)];
+            for (slot, word) in tail {
+                let at = 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&word.to_le_bytes());
+            }
+            for slot in 70..99 {
+                let at = 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+            }
+            if with_false_version {
+                // BSS counter reaching 515 between passes: a version word
+                // at slot 99's position with one new executable entry
+                // (offset 0xa00, outside the real 68 distinct offsets
+                // 0x500..0x930) behind 67 NULL holes, then data tail.
+                let base = 8 + 99 * 8;
+                snapshot[base..base + 8].copy_from_slice(&0x0203u64.to_le_bytes());
+                snapshot[base + 8..base + 16].copy_from_slice(&0x1a00u64.to_le_bytes());
+                for ordinal in 68..104 {
+                    let at = base + 8 + ordinal * 8;
+                    snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+                }
+            }
+            snapshot
+        }
+        let first = sweep_snapshot(false);
+        let second = sweep_snapshot(true);
+        let (tables_a, skipped_a) = detect_tables(
+            &first,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        let (tables_b, skipped_b) = detect_tables(
+            &second,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(skipped_a.is_empty(), "{skipped_a:?}");
+        assert!(skipped_b.is_empty(), "{skipped_b:?}");
+        assert_eq!(
+            tables_a.len(),
+            1,
+            "the first pass finds the real 68-slot table"
+        );
+        assert_eq!(tables_a[0].entries.len(), 68);
+        // The BSS false version must not admit a second table: same count,
+        // same entries, same key on both passes with no mapping change.
+        assert_eq!(
+            tables_b.len(),
+            tables_a.len(),
+            "a BSS version-like word must not grow the admitted set"
+        );
+        assert_eq!(
+            tables_b, tables_a,
+            "the admitted set must be identical when only BSS tail words change"
+        );
+    }
+
+    /// The scan-1 controller copy of Fedora 44's stock SoftHSM, read
+    /// read-only and never executed: it must carry the mislabelled {3,2}
+    /// 68-slot table this fix accepts. Skips cleanly where the copy is
+    /// absent; the synthetic tests above stay the positive. File bytes
+    /// hold unrelocated addends rather than runtime pointers, so the slot
+    /// contents are pinned through the file's own `R_X86_64_64`
+    /// relocations (which name each slot's target in 2.x order), while
+    /// decoding is covered synthetically.
+    #[test]
+    fn fedora_softhsm_copy_carries_a_mislabelled_68_slot_table() {
+        use p11scope_manifest::identity::{inspect_file_with_reader_exporting, open_object};
+        use std::os::unix::fs::FileExt as _;
+        const LANE_COPY: &str = "/var/tmp/p11scope-ws-tmp/scan-1/libsofthsm2-fc44.so";
+        const CONTROLLER_COPY: &str = "/var/tmp/p11scope-ws-tmp/fedora-inputs/libsofthsm2-fc44.so";
+        const FEDORA_STOCK: &str = "/usr/lib64/pkcs11/libsofthsm2.so";
+        // The table's virtual address in Fedora's build (the start of
+        // `.data`). Translated to a file offset through the program
+        // headers below; never used as a file offset directly.
+        const TABLE_VADDR: u64 = 0xe7000;
+        // The 2.x `CK_FUNCTION_LIST` width (`LEGACY_PREFIX_SLOTS`): the
+        // number of slot relocations the Fedora table must carry.
+        const TABLE_SLOTS: usize = 68;
+        const EXPECTED_VERSION: u64 = 0x0203;
+        const PT_LOAD: u32 = 1;
+        const SHT_RELA: u32 = 4;
+        const R_X86_64_64: u32 = 1;
+
+        fn le16(bytes: &[u8], at: usize, what: &str) -> u16 {
+            u16::from_le_bytes(
+                bytes
+                    .get(at..at + 2)
+                    .unwrap_or_else(|| panic!("{what} at {at:#x} runs past the file"))
+                    .try_into()
+                    .expect("two bytes"),
+            )
+        }
+
+        fn le32(bytes: &[u8], at: usize, what: &str) -> u32 {
+            u32::from_le_bytes(
+                bytes
+                    .get(at..at + 4)
+                    .unwrap_or_else(|| panic!("{what} at {at:#x} runs past the file"))
+                    .try_into()
+                    .expect("four bytes"),
+            )
+        }
+
+        fn le64(bytes: &[u8], at: usize, what: &str) -> u64 {
+            u64::from_le_bytes(
+                bytes
+                    .get(at..at + 8)
+                    .unwrap_or_else(|| panic!("{what} at {at:#x} runs past the file"))
+                    .try_into()
+                    .expect("eight bytes"),
+            )
+        }
+
+        // Translate a virtual address to a file offset through the
+        // `PT_LOAD` program headers. The whole `len` bytes must be
+        // file-backed (`p_filesz`, not `p_memsz`).
+        fn file_offset_of(bytes: &[u8], vaddr: u64, len: u64) -> usize {
+            // ELF64 header: e_phoff@0x20, e_phentsize@0x36, e_phnum@0x38.
+            let phoff = le64(bytes, 0x20, "program header offset") as usize;
+            let phentsize = le16(bytes, 0x36, "program header size") as usize;
+            let phnum = le16(bytes, 0x38, "program header count") as usize;
+            assert_eq!(phentsize, 56, "ELF64 program headers are 56 bytes");
+            // p_type@0, p_offset@8, p_vaddr@16, p_filesz@32.
+            for index in 0..phnum {
+                let header = phoff + index * phentsize;
+                if le32(bytes, header, "program header type") != PT_LOAD {
+                    continue;
+                }
+                let offset = le64(bytes, header + 8, "segment file offset");
+                let start = le64(bytes, header + 16, "segment virtual address");
+                let filesz = le64(bytes, header + 32, "segment file size");
+                let end = start.checked_add(filesz).expect("segment range");
+                let want_end = vaddr.checked_add(len).expect("table range");
+                if start <= vaddr && want_end <= end {
+                    return (vaddr - start + offset) as usize;
+                }
+            }
+            panic!("{vaddr:#x} (+{len:#x}) is not file-backed by any LOAD segment");
+        }
+
+        // Every RELA entry in the file as (address, type, symbol name),
+        // resolving symbols through each RELA section's linked symbol
+        // and string tables.
+        fn rela_entries(bytes: &[u8]) -> Vec<(u64, u32, String)> {
+            // ELF64 header: e_shoff@0x28, e_shentsize@0x3a, e_shnum@0x3c.
+            let shoff = le64(bytes, 0x28, "section header offset") as usize;
+            let shentsize = le16(bytes, 0x3a, "section header size") as usize;
+            let shnum = le16(bytes, 0x3c, "section header count") as usize;
+            assert_eq!(shentsize, 64, "ELF64 section headers are 64 bytes");
+            // sh_type@4, sh_offset@24, sh_size@32, sh_link@40, sh_entsize@56.
+            let mut out = Vec::new();
+            for index in 0..shnum {
+                let header = shoff + index * shentsize;
+                if le32(bytes, header + 4, "section type") != SHT_RELA {
+                    continue;
+                }
+                let rela_off = le64(bytes, header + 24, "RELA section offset") as usize;
+                let rela_size = le64(bytes, header + 32, "RELA section size") as usize;
+                let link = le32(bytes, header + 40, "RELA symbol table link") as usize;
+                let entsize = le64(bytes, header + 56, "RELA entry size") as usize;
+                assert_eq!(entsize, 24, "ELF64 RELA entries are 24 bytes");
+                assert_eq!(rela_size % 24, 0, "RELA size is a multiple of 24");
+                assert!(link < shnum, "RELA links to section {link} of {shnum}");
+                let symtab = shoff + link * shentsize;
+                let sym_off = le64(bytes, symtab + 24, "symbol table offset") as usize;
+                let sym_size = le64(bytes, symtab + 32, "symbol table size") as usize;
+                let sym_entsize = le64(bytes, symtab + 56, "symbol entry size") as usize;
+                assert_eq!(sym_entsize, 24, "ELF64 symbol entries are 24 bytes");
+                let strlink = le32(bytes, symtab + 40, "string table link") as usize;
+                assert!(
+                    strlink < shnum,
+                    "symtab links to section {strlink} of {shnum}"
+                );
+                let strtab = shoff + strlink * shentsize;
+                let str_off = le64(bytes, strtab + 24, "string table offset") as usize;
+                let str_size = le64(bytes, strtab + 32, "string table size") as usize;
+                assert!(
+                    str_off
+                        .checked_add(str_size)
+                        .is_some_and(|end| end <= bytes.len()),
+                    "the string table fits the file"
+                );
+                for entry in 0..rela_size / 24 {
+                    let at = rela_off + entry * 24;
+                    let r_offset = le64(bytes, at, "relocation offset");
+                    let r_info = le64(bytes, at + 8, "relocation info");
+                    let sym = (r_info >> 32) as usize;
+                    let typ = (r_info & 0xffff_ffff) as u32;
+                    assert!(
+                        sym < sym_size / 24,
+                        "relocation symbol {sym} fits its table"
+                    );
+                    // st_name@0.
+                    let name_off = le32(bytes, sym_off + sym * 24, "symbol name offset") as usize;
+                    assert!(name_off < str_size, "symbol name offset fits its table");
+                    let tail = bytes.get(str_off + name_off..).unwrap_or_else(|| {
+                        panic!("symbol name at {name_off:#x} runs past the file")
+                    });
+                    let end = tail
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or_else(|| panic!("symbol name at {name_off:#x} is unterminated"));
+                    let name = std::str::from_utf8(&tail[..end])
+                        .unwrap_or_else(|_| panic!("symbol name at {name_off:#x} is UTF-8"))
+                        .to_string();
+                    out.push((r_offset, typ, name));
+                }
+            }
+            out
+        }
+
+        let path = match std::env::var("P11SCOPE_SCAN1_SOFTHSM") {
+            Ok(path) if !path.is_empty() => {
+                let path = PathBuf::from(path);
+                assert!(
+                    path.is_file(),
+                    "P11SCOPE_SCAN1_SOFTHSM requires {} to exist",
+                    path.display()
+                );
+                path
+            }
+            _ => {
+                let found = [LANE_COPY, CONTROLLER_COPY, FEDORA_STOCK]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.is_file());
+                let Some(path) = found else {
+                    eprintln!(
+                        "SKIP fedora_softhsm_copy_carries_a_mislabelled_68_slot_table: \
+                         reason=fedora-softhsm-copy-absent \
+                         (set P11SCOPE_SCAN1_SOFTHSM to require it)"
+                    );
+                    return;
+                };
+                path
+            }
+        };
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(
+            &bytes[..4],
+            b"\x7fELF",
+            "{} is an ELF object",
+            path.display()
+        );
+        assert_eq!(bytes[4], 2, "{} is 64-bit", path.display());
+        assert_eq!(bytes[5], 1, "{} is little-endian", path.display());
+        assert_eq!(
+            le16(&bytes, 18, "machine"),
+            62,
+            "{} is x86-64",
+            path.display()
+        );
+        let table_len = 8 + TABLE_SLOTS * 8;
+        let table_off = file_offset_of(&bytes, TABLE_VADDR, table_len as u64);
+        assert!(
+            table_off
+                .checked_add(table_len)
+                .is_some_and(|end| end <= bytes.len()),
+            "{} is {} bytes; the Fedora table needs {table_len} bytes at file offset {table_off:#x}",
+            path.display(),
+            bytes.len()
+        );
+        let word = u64::from_le_bytes(
+            bytes[table_off..table_off + 8]
+                .try_into()
+                .expect("eight version bytes"),
+        );
+        assert_eq!(
+            word, EXPECTED_VERSION,
+            "the Fedora table declares version 3.2"
+        );
+        let first_slot = TABLE_VADDR + 8;
+        let past_slots = first_slot + (TABLE_SLOTS as u64) * 8;
+        let mut slots: Vec<(u64, u32, String)> = rela_entries(&bytes)
+            .into_iter()
+            .filter(|(offset, _, _)| *offset >= first_slot && *offset < past_slots)
+            .collect();
+        slots.sort_by_key(|(offset, _, _)| *offset);
+        assert_eq!(
+            slots.len(),
+            TABLE_SLOTS,
+            "{} carries exactly {TABLE_SLOTS} slot relocations from {first_slot:#x}",
+            path.display()
+        );
+        for (ordinal, (offset, typ, name)) in slots.iter().enumerate() {
+            let want = first_slot + (ordinal as u64) * 8;
+            assert_eq!(*offset, want, "slot {ordinal} relocation address");
+            assert_eq!(*typ, R_X86_64_64, "slot {ordinal} ({name}) relocation type");
+            let expected = function_name(ordinal)
+                .unwrap_or_else(|| panic!("ordinal {ordinal} has a catalog name"));
+            assert_eq!(*name, expected, "slot {ordinal} names its 2.x function");
+        }
+        let file =
+            open_object(&path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &["C_GetFunctionList", "C_GetInterface"],
+        )
+        .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()));
+        let exported: Vec<&str> = inspected
+            .exports
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            exported.contains(&"C_GetFunctionList"),
+            "{} must export C_GetFunctionList: {exported:?}",
+            path.display()
+        );
+        assert!(
+            !exported.contains(&"C_GetInterface"),
+            "{} must not export C_GetInterface: {exported:?}",
+            path.display()
         );
     }
 
@@ -5359,6 +9826,7 @@ mod tests {
                 file_offset: Some(address),
                 live_return,
                 manifest_supported: manifest,
+                extension_impossible: false,
             };
         let tables = [
             table(0x1000, "full", false, false),         // 0: heuristic
@@ -5429,6 +9897,7 @@ mod tests {
             file_offset: Some(0x9000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let tables = [table];
         for name_class in ["other", "null", "unreadable"] {
@@ -5468,12 +9937,10 @@ mod tests {
         assert!(table_name_authorized(&score));
     }
 
-    /// U-15: a table with a vendor-only interface link is not authorized by
-    /// that link, but stays authorized when live-return or manifest evidence
-    /// also names it — linkage alone never authorizes names, but it never
-    /// takes away authorization another evidence source already gave.
+    /// An opaque return is observable without layout names; independently
+    /// bound manifest evidence can still supply those names.
     #[test]
-    fn vendor_linked_table_stays_authorized_via_live_return_or_manifest_evidence() {
+    fn opaque_publication_needs_independent_layout_evidence_for_names() {
         let live_returned = ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -5484,6 +9951,7 @@ mod tests {
             file_offset: Some(0xa000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let manifest_backed = ScannedTable {
             address: 0xb000,
@@ -5515,9 +9983,10 @@ mod tests {
         let live_score =
             table_evidence_score(0, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
         assert!(!live_score.linked, "the vendor interface must not link");
-        assert!(live_score.live_return);
-        assert_eq!(table_linkage(&live_score), "live_return");
-        assert!(table_name_authorized(&live_score));
+        assert!(!live_score.live_return);
+        assert_eq!(table_linkage(&live_score), "heuristic");
+        assert!(!table_name_authorized(&live_score));
+        assert!(table_observation_authorized(&tables[0], &live_score));
 
         let manifest_score =
             table_evidence_score(1, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
@@ -5547,6 +10016,7 @@ mod tests {
             file_offset: Some(0xc000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let vendor_linked_discovered_second = ScannedTable {
             address: 0xd000,
@@ -5595,6 +10065,7 @@ mod tests {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             },
             ScannedTable {
                 version: (3, 2),
@@ -5606,6 +10077,7 @@ mod tests {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             },
         ];
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
@@ -5646,6 +10118,7 @@ mod tests {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -5692,6 +10165,7 @@ mod tests {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -5751,6 +10225,76 @@ mod tests {
         // Exact path match with no local identity (containerized target): accepted.
         let absent = directory.path().join("target-namespace-only.so");
         assert_eq!(hint_gate(HintMatch::Path, &absent, &target), Ok(()));
+    }
+
+    /// M2: the narrowing's attribution names a verbatim path match without
+    /// consulting observer identity (the container case the old
+    /// identity-first matcher dropped).
+    #[test]
+    fn first_attributable_hint_names_a_verbatim_hint_without_observer_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let mapped = directory.path().join("libclosure.so.0");
+        std::fs::write(&mapped, b"fake").unwrap();
+        let file = open_object(&mapped).unwrap();
+        let hint = PathBuf::from("/target-namespace-only/libclosure.so.0");
+        let matched = [(0, HintMatch::Path)];
+        assert_eq!(
+            first_attributable_hint(&matched, std::slice::from_ref(&hint), &file),
+            (Some(hint), None),
+            "verbatim attribution names without observer resolution"
+        );
+    }
+
+    /// M2: an inode match confirmed against the opened files attributes its
+    /// hint; an unconfirmed one attributes nothing and carries the gate's
+    /// refusal, as the narrowing reported it.
+    #[test]
+    fn first_attributable_hint_confirms_an_inode_alias_before_naming() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider.so");
+        let alias = directory.path().join("provider-alias.so");
+        let foreign = directory.path().join("foreign.so");
+        std::fs::write(&provider, b"provider bytes").unwrap();
+        std::fs::hard_link(&provider, &alias).unwrap();
+        std::fs::write(&foreign, b"provider bytes").unwrap();
+        let target = open_object(&provider).unwrap();
+
+        let matched = [(0, HintMatch::Inode)];
+        assert_eq!(
+            first_attributable_hint(&matched, std::slice::from_ref(&alias), &target),
+            (Some(alias.clone()), None),
+            "the confirmed alias names"
+        );
+
+        let (named, refusal) =
+            first_attributable_hint(&matched, std::slice::from_ref(&foreign), &target);
+        assert_eq!(named, None, "the foreign file names nothing");
+        let refusal = refusal.expect("the gate refusal is carried");
+        assert!(
+            refusal.contains("physical identity") && refusal.contains("another filesystem"),
+            "{refusal}"
+        );
+    }
+
+    /// M2: attribution takes the first passing hint in hint order and keeps
+    /// the last gate refusal seen, exactly as the narrowing's `any` did.
+    #[test]
+    fn first_attributable_hint_takes_the_first_passing_hint_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider.so");
+        let foreign = directory.path().join("foreign.so");
+        std::fs::write(&provider, b"provider bytes").unwrap();
+        std::fs::write(&foreign, b"provider bytes").unwrap();
+        let target = open_object(&provider).unwrap();
+        let hints = [foreign, provider.clone()];
+        let matched = [(0, HintMatch::Inode), (1, HintMatch::Path)];
+        let (named, refusal) = first_attributable_hint(&matched, &hints, &target);
+        assert_eq!(named, Some(provider), "the first passing hint wins");
+        let refusal = refusal.expect("the earlier refusal is carried");
+        assert!(
+            refusal.contains("physical identity"),
+            "the narrowing still reports why the first hint failed: {refusal}"
+        );
     }
 
     #[test]
@@ -5936,33 +10480,42 @@ mod tests {
             "};",
             "the identity guard must immediately follow every successful target open"
         );
+        // Narrowed-out mappings stay silent on pre-exclusion failures (the
+        // exclusion-before-narrowing contract); only in-scope mismatches
+        // record a skip.
         assert_eq!(
             &scan_lines[guard + 1..guard + 4],
             [
+                "if !narrowed_out {",
                 "skipped.push(Skipped { subject, reason });",
-                "continue;",
                 "}"
             ],
-            "identity mismatch must always skip the opened object"
+            "identity mismatch skips the opened object unless narrowed out"
         );
-        let hint_gate = scan_lines
+        let attribution = scan_lines
             .iter()
-            .position(|line| *line == "let attributable = matched.iter().any(|(index, kind)| {")
+            .position(|line| {
+                *line
+                    == "let (named_hint, refusal) = first_attributable_hint(&matched, request.hints, &file);"
+            })
             .expect("hint-specific attribution must remain after the guard");
         assert!(
-            guard < hint_gate,
+            guard < attribution,
             "identity must be checked before hint gating"
         );
-        let physical_hint_gate = scan_lines
-            .iter()
-            .position(|line| *line == "match hint_gate(*kind, &request.hints[*index], &file) {")
-            .expect("scan path must gate aliases using both opened files");
+        // The alias gate lives in the attribution helper now; it still
+        // compares both opened files.
+        include_str!("scan.rs")
+            .lines()
+            .map(str::trim)
+            .position(|line| line == "match hint_gate(*kind, &hints[*index], actual) {")
+            .expect("attribution must gate aliases using both opened files");
         let elf_pin = scan_lines
             .iter()
             .position(|line| *line == "let before = match pin_of(&file) {")
             .expect("ELF inspection pin");
         assert!(
-            guard < physical_hint_gate && physical_hint_gate < elf_pin,
+            guard < attribution && attribution < elf_pin,
             "alias rejection must happen after maps identity and before ELF/table work"
         );
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
@@ -5972,17 +10525,14 @@ mod tests {
             "crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)"
         ));
         for decision in [
-            "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
+            "if narrowed_out && !excludes_present {\n            continue;\n        }",
             "if hinted && !attributable {",
-            "if request.hints.is_empty() && exports.is_empty() {\n            \
-             // Opened, identified, and read: examined, and not a provider.\n            \
-             if let Some(held) = held {\n                \
-             examined.push(ExaminedObject {\n                    \
+            "if request.hints.is_empty() && exports.is_empty() {",
+            "examined.push(ExaminedObject {\n                    \
              key,\n                    \
              identity: held.identity,\n                    \
              key_is_identity: held.key_is_identity(key),\n                \
-             });\n            }\n            \
-             continue;\n        }",
+             });",
         ] {
             assert!(
                 scan_body.contains(decision),
@@ -6096,6 +10646,78 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_shared_control_stops_actual_scan_charge() {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let checked = control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(CollectionWork::new(move |_| checked.check().is_ok()));
+        assert!(budget.charge(1));
+        control.cancel();
+        assert!(
+            !budget.charge(1),
+            "a stopped collection cannot continue decoded-record work"
+        );
+    }
+
+    #[test]
+    fn cgroup_shared_control_stops_actual_scan_and_maps_reads() {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let checked = control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(CollectionWork::new(move |_| checked.check().is_ok()));
+        assert_eq!(budget.allowed_io(0, 10), 10);
+        struct StopAfterRead {
+            control: crate::scope::inventory_cgroup::CollectionControl,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for StopAfterRead {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let read = self.bytes.read(out)?;
+                self.control.cancel();
+                Ok(read)
+            }
+        }
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = StopAfterRead {
+            control: control.clone(),
+            reads: reads.clone(),
+            bytes: std::io::Cursor::new(b"1000-2000 r-xp 00000000 08:01 7 /lib/a.so\n".to_vec()),
+        };
+        let result = read_maps_checked(
+            reader,
+            &mut budget,
+            MapsReadLimits {
+                max_bytes: 1024,
+                max_entries: 10,
+                chunk: 8,
+            },
+            || Some(1),
+            &mut MapsReadBuffers::default(),
+        );
+        assert!(
+            result.is_err(),
+            "the production maps read loop must stop after cancellation"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no second read after the checkpoint observes cancellation"
+        );
+        assert_eq!(
+            budget.allowed_io(0, 10),
+            0,
+            "the deep scan read boundary must poll control"
+        );
+        assert_eq!(
+            budget.allowed_capture_io(10),
+            0,
+            "the maps sweep read boundary must poll control"
+        );
+    }
+
+    #[test]
     fn work_budget_allows_exact_ceiling_and_rejects_overflow() {
         let mut budget = CaptureWorkBudget {
             work_ceiling: 4,
@@ -6161,6 +10783,8 @@ mod tests {
             0x7000,
             &map_index,
             &mut budget,
+            None,
+            &[],
             || {
                 polls += 1;
                 Some(if polls == 1 { 0 } else { 10 })
@@ -6633,7 +11257,7 @@ mod tests {
     /// (a criterion-free loop, not a benchmark; run single-threaded:
     /// `test -- --ignored maps_reuse_timing --test-threads=1 --nocapture`).
     #[test]
-    #[ignore]
+    #[ignore = "manual: indicative maps-reuse timing loop, no pass/fail bar; run by hand single-threaded"]
     fn maps_reuse_timing_per_thousand_reads() {
         use std::io::Cursor;
         use std::time::Instant;
@@ -6964,16 +11588,24 @@ mod tests {
         fn open_maps(
             &mut self,
             _: &ProcessView,
-            _: &CaptureWorkBudget,
+            _: &mut CaptureWorkBudget,
         ) -> std::io::Result<Box<dyn Read>> {
             Ok(Box::new(std::io::Cursor::new(
                 self.maps.clone().into_bytes(),
             )))
         }
-        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<File> {
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
             self.mem.try_clone()
         }
-        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
             view.run_while_same(|| ())
         }
     }
@@ -7230,6 +11862,57 @@ mod tests {
     }
 
     #[test]
+    fn retained_export_reads_preserve_getter_facts_and_refuse_exhausted_budgets() {
+        let fixture = ElfExportFactsFixture::new_provider();
+        let file = File::open(&fixture.path).unwrap();
+        let size = file.metadata().unwrap().len();
+        let wanted = ["C_GetFunctionList", "NSC_GetFunctionList", "not_exported"];
+        let (abi, exports, _) = p11scope_manifest::elf::read_export_facts(&file, &wanted).unwrap();
+        assert_eq!(exports.len(), 2, "standard and vendor getter controls");
+
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: size,
+            total_bytes: size,
+        });
+        assert_eq!(
+            read_retained_export_facts_budgeted(&file, &wanted, &mut budget).unwrap(),
+            (abi, exports.clone())
+        );
+        assert_eq!(budget.attempted_io_bytes(), size);
+
+        let mut bounded = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: size,
+            total_bytes: size - 1,
+        });
+        let error = read_retained_export_facts_budgeted(&file, &wanted, &mut bounded).unwrap_err();
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
+        assert_eq!(bounded.attempted_io_bytes(), size - 1);
+
+        let mut expired = CaptureWorkBudget::default();
+        expired.set_deadline(Some(0));
+        let error = read_retained_export_facts_budgeted(&file, &wanted, &mut expired).unwrap_err();
+        assert!(error.contains(SCAN_DEADLINE_REASON), "{error}");
+        assert_eq!(expired.attempted_io_bytes(), 0);
+
+        let mut inventory = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
+        assert!(read_retained_export_facts_budgeted(&file, &wanted, &mut inventory).is_err());
+        assert_eq!(inventory.attempted_io_bytes(), 0, "no active scan");
+        let window = inventory.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = inventory.checkpoint(window.clone()).unwrap();
+        assert_eq!(
+            read_retained_export_facts_budgeted(&file, &wanted, &mut inventory).unwrap(),
+            (abi, exports)
+        );
+        assert_eq!(inventory.attempted_io_bytes(), size);
+        let error =
+            read_retained_export_facts_budgeted(&file, &wanted, &mut inventory).unwrap_err();
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
+        assert_eq!(inventory.attempted_io_bytes(), size);
+        inventory.finish_scan(scan).unwrap();
+        inventory.finish_window(window).unwrap();
+    }
+
+    #[test]
     fn sparse_export_charge_applies_capture_ceiling_post_hoc() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("provider.so");
@@ -7384,6 +12067,7 @@ mod tests {
             file_offset: Some(0x2000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -7456,6 +12140,7 @@ mod tests {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut table_v3 = table_v2.clone();
         table_v3.version = (3, 2);
@@ -7544,6 +12229,7 @@ mod tests {
             file_offset: None,
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut changed = table.clone();
         changed.entries = vec![entry(0x200)];
@@ -7619,6 +12305,48 @@ mod tests {
     /// Every bounded/incomplete outcome — ceilings, stops, refusals, partial
     /// reads — truncates, and unknown future reasons fail closed.
     #[test]
+    fn no_table_skip_reason_ends_with_the_discover_action() {
+        assert_eq!(
+            no_table_found_reason("/usr/lib64/pkcs11/libsofthsm2.so", false),
+            "no function table was found in its file-backed data; a table built at run time in \
+             .bss or on the heap is outside the memory scan's reach; to observe it, run \
+             p11scope-discover --module /usr/lib64/pkcs11/libsofthsm2.so -o <manifest.json> and \
+             pass --manifest <manifest.json>"
+        );
+        let hinted = no_table_found_reason("/opt/p11.so", true);
+        assert!(
+            hinted.starts_with("matched a --module hint; "),
+            "{hinted:?} must keep the hint prefix"
+        );
+        assert!(
+            hinted.ends_with(
+                "; to observe it, run p11scope-discover --module /opt/p11.so -o <manifest.json> \
+                 and pass --manifest <manifest.json>"
+            ),
+            "{hinted:?} must end with the action naming its own path"
+        );
+        assert!(!hinted.contains('\n'), "{hinted:?} must stay one line");
+    }
+
+    #[test]
+    fn no_table_found_reason_quotes_paths_needing_shell_quoting() {
+        let spaced = no_table_found_reason("/opt/my providers/p11.so", false);
+        assert!(
+            spaced.ends_with(
+                "; to observe it, run p11scope-discover --module '/opt/my providers/p11.so' -o \
+                 <manifest.json> and pass --manifest <manifest.json>"
+            ),
+            "{spaced:?} must quote a path with spaces"
+        );
+        assert!(!spaced.contains('\n'), "{spaced:?} must stay one line");
+        let quoted = no_table_found_reason("/opt/p11's;rm/x.so", false);
+        assert!(
+            quoted.contains("--module '/opt/p11'\\''s;rm/x.so' -o"),
+            "{quoted:?} must escape the quote and stay one shell word"
+        );
+    }
+
+    #[test]
     fn scan_skip_truncation_classifier_marks_only_verified_absence_benign() {
         let mut budget = CaptureWorkBudget::default();
         let table_reason = budget.table_exhaustion_reason().unwrap();
@@ -7652,11 +12380,11 @@ mod tests {
                 "{reason:?} must truncate the scan it came from"
             );
         }
+        let plain = no_table_found_reason("/opt/p11.so", false);
+        let hinted = no_table_found_reason("/opt/p11.so", true);
         let benign = [
-            "no function table was found in its file-backed data; a table built at run time \
-             in .bss or on the heap is outside the memory scan's reach",
-            "matched a --module hint; no function table was found in its file-backed data; a \
-             table built at run time in .bss or on the heap is outside the memory scan's reach",
+            plain.as_str(),
+            hinted.as_str(),
             "not mapped in the target",
             "no absolute pathname in /proc/<pid>/maps",
             "ambiguous \\012 pathname",
@@ -8147,6 +12875,9 @@ mod tests {
         let facts = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
         };
         assert!(budget.note_elf_export_facts(key(1), facts.clone()));
         assert!(!budget.note_elf_export_facts(key(2), facts));
@@ -8173,6 +12904,9 @@ mod tests {
         let exact = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
         };
         let exact_bytes = export_cache_bytes(&key, &exact);
         let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
@@ -8188,10 +12922,109 @@ mod tests {
         let one_over = ElfExportFacts {
             abi: exact.abi,
             exports: vec![("C_GetFunctionList_".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
         };
         assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);
         assert!(!budget.note_elf_export_facts(key, one_over));
         assert_eq!(budget.elf_export_facts_for(&key), Some(exact));
+        assert_eq!(budget.retained_counts().5, exact_bytes);
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// The loader-facts wrapper keeps its own entry allowance: a full
+    /// export map refuses further exports but never loader retention, and
+    /// the loader map refuses its own second entry past the same limit
+    /// value. Bytes share the one ceiling; a sealed budget refuses.
+    #[test]
+    fn inventory_loader_cache_bounds_are_separate_and_exact() {
+        let pin = pin_of(&File::open("/bin/sh").unwrap()).unwrap();
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        let export_key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+        };
+        let exports = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        assert!(budget.note_elf_export_facts(export_key(1), exports.clone()));
+        assert!(!budget.note_elf_export_facts(export_key(2), exports));
+
+        let loader_key = |device| LoaderFactsKey { device, pin };
+        let loader_facts = LoaderElfFacts {
+            abi: ElfAbi::Lp64,
+            hook: Ok(None),
+            state_address: Ok(None),
+        };
+        // The export map is full, but the loader map counts separately.
+        assert!(budget.note_loader_elf_facts(loader_key(1), loader_facts.clone()));
+        assert_eq!(
+            budget.loader_elf_facts_for(&loader_key(1)),
+            Some(loader_facts.clone())
+        );
+        // The loader map's own allowance is the same limit value: one more
+        // entry refuses.
+        assert!(!budget.note_loader_elf_facts(loader_key(2), loader_facts.clone()));
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+
+        // Sealed on a fresh budget: the loader map is empty, so only the
+        // no-active-scan gate can refuse (on the budget above, entry
+        // fullness would refuse for the wrong reason).
+        let mut sealed = CaptureWorkBudget::for_inventory(limits);
+        let token = sealed.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = sealed.checkpoint(token.clone()).unwrap();
+        sealed.finish_scan(scan).unwrap();
+        assert!(!sealed.note_loader_elf_facts(loader_key(3), loader_facts));
+        sealed.finish_window(token).unwrap();
+    }
+
+    /// The loader-facts byte gate is exact: a value sized exactly to the
+    /// shared ceiling retains, and one byte over refuses with the old value
+    /// intact.
+    #[test]
+    fn inventory_loader_cache_byte_limit_accepts_exact_size_and_refuses_one_over() {
+        let pin = pin_of(&File::open("/bin/sh").unwrap()).unwrap();
+        let key = LoaderFactsKey { device: 9, pin };
+        let exact = LoaderElfFacts {
+            abi: ElfAbi::Lp64,
+            hook: Ok(None),
+            state_address: Ok(None),
+        };
+        let exact_bytes = loader_cache_bytes(&key, &exact);
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(1, 1, 1, 1, 1, exact_bytes).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(
+            InventoryDiscoveryLimits::new(1024, window, retained).unwrap(),
+        );
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        assert!(budget.note_loader_elf_facts(key, exact.clone()));
+        assert_eq!(budget.retained_counts().5, exact_bytes);
+        let one_over = LoaderElfFacts {
+            abi: exact.abi,
+            hook: Err("e".into()),
+            state_address: Ok(None),
+        };
+        assert_eq!(loader_cache_bytes(&key, &one_over), exact_bytes + 1);
+        assert!(!budget.note_loader_elf_facts(key, one_over));
+        assert_eq!(budget.loader_elf_facts_for(&key), Some(exact));
         assert_eq!(budget.retained_counts().5, exact_bytes);
 
         budget.finish_scan(scan).unwrap();
@@ -8535,8 +13368,745 @@ mod tests {
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
     }
+
+    /// A scan-IO double that serves canned maps bytes but never stashes
+    /// a cold member: the default `note_cold_member` (drop) and
+    /// `cold_member_for` (`None`) are exactly the shape every scripted
+    /// fixture IO has.
+    struct NoStashScriptedIo {
+        maps: Vec<u8>,
+    }
+
+    impl ScanIo for NoStashScriptedIo {
+        type Memory = File;
+
+        fn open_maps(
+            &mut self,
+            _view: &ProcessView,
+            _budget: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+
+        fn open_mem(
+            &mut self,
+            _view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
+            Err(std::io::Error::other("scripted IO serves no mem"))
+        }
+
+        fn final_generation(
+            &mut self,
+            _view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The raw-clone survivor for the scan cold-route twin: reports one
+    /// readiness byte over the pipe (whose write end arrives as the
+    /// argument) after arming, then parks in `pause()`. Raw syscalls
+    /// only (it runs on a COW-inherited stack).
+    extern "C" fn pause_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
+        // Parent-death guard (same body as
+        // `crate::fixture_guard::DieWithParent`, with the owner from the
+        // pre-fork store): a test that dies abruptly must not strand the
+        // parking survivor. Async-signal-safe: atomic load, prctl, getppid.
+        let owner =
+            crate::fixture_guard::SURVIVOR_OWNER_PID.load(std::sync::atomic::Ordering::Acquire);
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(127);
+            }
+            if libc::getppid() != owner as libc::pid_t {
+                libc::_exit(127);
+            }
+        }
+        // Readiness: the spawner returns only after this write, so a
+        // returned group is always armed. Without it, the spawner thread
+        // can exit before the survivor arms, and the `getppid` recheck
+        // cannot observe thread death, so the survivor misses its death
+        // signal and keeps the group alive forever.
+        let wfd = arg as usize as libc::c_int;
+        let byte = [1u8; 1];
+        // SAFETY: writing the stack byte to the pipe.
+        let wrote = unsafe { libc::write(wfd, byte.as_ptr().cast(), byte.len()) };
+        if wrote != byte.len() as isize {
+            unsafe {
+                libc::syscall(libc::SYS_exit, 1);
+            }
+        }
+        // SAFETY: the readiness byte was reported; the write end served
+        // its single byte.
+        unsafe {
+            libc::close(wfd);
+        }
+        loop {
+            // SAFETY: `pause()` takes no arguments and only returns on a signal.
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    /// A warm view of a group whose leader the test then turns into a
+    /// zombie with one live survivor: the forked child blocks on a go
+    /// pipe so the parent opens the view while the leader lives, then
+    /// the child raw-clones one survivor and exits its leader thread.
+    /// Killed and reaped on drop. The stack box stays alive here
+    /// because the survivor runs on the child's copy of it for the
+    /// survivor's whole life.
+    struct WarmZombieView {
+        view: ProcessView,
+        tgid: u32,
+        _stack: Box<[u8; 65536]>,
+    }
+
+    impl WarmZombieView {
+        fn spawn() -> Self {
+            let mut stack = Box::new([0u8; 65536]);
+            let top = stack.as_mut_ptr_range().end as *mut std::ffi::c_void;
+            let mut go = [0; 2];
+            // SAFETY: a valid two-element array for pipe2.
+            assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let mut ready = [0; 2];
+            // SAFETY: a valid two-element array for pipe2.
+            assert_eq!(
+                unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: the child only closes one end, reads one go byte,
+            // clones, and exits its leader thread; no allocator, no
+            // pthread, no locks.
+            // The survivor's parent-death owner, stored before the fork
+            // it inherits (see `SURVIVOR_OWNER_PID`).
+            crate::fixture_guard::SURVIVOR_OWNER_PID
+                .store(std::process::id(), std::sync::atomic::Ordering::Release);
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "warm-view fork failed");
+            if pid == 0 {
+                unsafe {
+                    libc::close(go[1]);
+                    libc::close(ready[0]);
+                    let mut byte = [0u8; 1];
+                    let got = libc::read(go[0], byte.as_mut_ptr().cast(), byte.len());
+                    if got != byte.len() as isize {
+                        libc::_exit(1);
+                    }
+                    const FLAGS: libc::c_int = libc::CLONE_VM
+                        | libc::CLONE_FS
+                        | libc::CLONE_FILES
+                        | libc::CLONE_SIGHAND
+                        | libc::CLONE_THREAD
+                        | libc::CLONE_SYSVSEM;
+                    let cloned = libc::clone(
+                        pause_survivor_main,
+                        top,
+                        FLAGS,
+                        ready[1] as isize as *mut std::ffi::c_void,
+                    );
+                    if cloned < 0 {
+                        libc::_exit(1);
+                    }
+                    // The main thread exits alone; the survivor keeps the group.
+                    libc::syscall(libc::SYS_exit, 0);
+                    libc::_exit(0);
+                }
+            }
+            // SAFETY: the parent keeps the write end and closes its read
+            // copy, so the child reads EOF (never hangs) if the parent dies.
+            unsafe {
+                libc::close(go[0]);
+                libc::close(ready[1]);
+            }
+            let tgid = pid as u32;
+            let view = ProcessView::open(ProcessViewId(7501), tgid)
+                .expect("a warm view opens while alive");
+            // Release the child only after the view pins the live leader.
+            let byte = [1u8; 1];
+            // SAFETY: writing one byte to the owned pipe.
+            let wrote = unsafe { libc::write(go[1], byte.as_ptr().cast(), byte.len()) };
+            assert_eq!(wrote, byte.len() as isize, "the go byte releases the child");
+            // SAFETY: the write end served its single write.
+            unsafe {
+                libc::close(go[1]);
+            }
+            // The survivor reports readiness after arming: one byte proves
+            // this returns only an armed group (a survivor that died first
+            // closes its ends, so a short read ends as EOF, never a hang).
+            let mut armed = [0u8; 1];
+            loop {
+                // SAFETY: `read` into the live stack buffer.
+                let got = unsafe { libc::read(ready[0], armed.as_mut_ptr().cast(), armed.len()) };
+                if got == armed.len() as isize {
+                    break;
+                }
+                if got == 0 {
+                    panic!("the survivor died before reporting readiness");
+                }
+                if got < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    panic!("survivor readiness read failed: {error}");
+                }
+            }
+            // SAFETY: the readiness byte was consumed; the read end served
+            // its single byte.
+            unsafe {
+                libc::close(ready[0]);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::process::process_is_zombie(tgid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "leader {tgid} never reached zombie state"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Self {
+                view,
+                tgid,
+                _stack: stack,
+            }
+        }
+    }
+
+    impl Drop for WarmZombieView {
+        fn drop(&mut self) {
+            unsafe {
+                // SIGKILL to the TGID stops the survivor; the leader is dead.
+                libc::kill(self.tgid as libc::pid_t, libc::SIGKILL);
+                let mut status = 0;
+                while libc::waitpid(self.tgid as libc::pid_t, &mut status, 0) < 0 {
+                    let err = std::io::Error::last_os_error().raw_os_error();
+                    if err == Some(libc::ECHILD) {
+                        break;
+                    }
+                    assert_eq!(err, Some(libc::EINTR));
+                }
+            }
+        }
+    }
+
+    /// A warm zombie view must die with its spawner: without the
+    /// survivor's parent-death arm the parked survivor keeps the group
+    /// alive forever once its spawner is gone. A helper thread plays
+    /// the spawner; only the arm can kill the forgotten group.
+    #[test]
+    fn warm_zombie_view_dies_with_spawning_thread() {
+        let recorded = std::thread::spawn(|| {
+            let warm = WarmZombieView::spawn();
+            let start = crate::process::process_start_time(warm.tgid)
+                .expect("the group leader has a start time");
+            let recorded = vec![(warm.tgid, start)];
+            std::mem::forget(warm);
+            recorded
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the warm zombie view {recorded:?} outlived its spawner"
+        );
+    }
+
+    /// A scripted IO never mints a real cold member: with a warm view
+    /// of a real zombie-with-survivor group, the cold attempt keeps the
+    /// exited outcome (`None`) and spends no mint budget. Control: the
+    /// production IO on the same view DOES mint, proving the group is
+    /// cold-admittable (so the `None` above is the gate, not a dead group).
+    #[test]
+    fn scripted_scan_io_never_mints_cold_member_for_real_zombie() {
+        let warm = WarmZombieView::spawn();
+        let mut scripted = NoStashScriptedIo {
+            maps: b"00400000-00401000 r-xp 00000000 08:01 1234 /bin/true\n".to_vec(),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            acquire_cold_survivor_maps(&warm.view, &mut budget, &mut scripted).is_none(),
+            "a scripted IO keeps the exited outcome for a real zombie with a survivor"
+        );
+        assert_eq!(
+            budget.work_units_count(),
+            0,
+            "a scripted IO spends no mint budget"
+        );
+        let mut production = ProcScanIo {
+            cold: None,
+            witness_used: 0,
+        };
+        let mut control_budget = CaptureWorkBudget::default();
+        let maps = acquire_cold_survivor_maps(&warm.view, &mut control_budget, &mut production)
+            .expect("the production IO mints the same group's survivor");
+        assert!(!maps.is_empty(), "the control serves real survivor maps");
+    }
+
+    /// The deep-scan guard must not join a stale lower mapping whose
+    /// `(dev, ino)` equals the held upper file (R-41). These tests pin the
+    /// production contract: an overlay-held, `(dev, ino)`-equal caller
+    /// range requires a kernel original-file verdict, and anything but a
+    /// same-file verdict refuses with the finite gap
+    /// `original_file_unproven` — never a join.
+    const K1_RED_OVERLAY_MAGIC: u64 = p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC;
+    const K1_RED_EXT4_MAGIC: u64 = 0xef53;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum K1RedVerdict {
+        SameFile,
+        OtherFile,
+        Unavailable,
+        BindingFailed,
+    }
+
+    struct K1RedIo {
+        reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        held_magic: Option<u64>,
+        witness: std::collections::VecDeque<K1RedVerdict>,
+        prove_calls: usize,
+        witness_used: u32,
+        witness_max: u32,
+    }
+
+    impl K1RedIo {
+        fn overlay(
+            reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        ) -> Self {
+            Self {
+                reads,
+                held_magic: Some(K1_RED_OVERLAY_MAGIC),
+                witness: std::collections::VecDeque::new(),
+                prove_calls: 0,
+                witness_used: 0,
+                witness_max: 8,
+            }
+        }
+
+        fn ext4(
+            reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        ) -> Self {
+            Self {
+                reads,
+                held_magic: Some(K1_RED_EXT4_MAGIC),
+                witness: std::collections::VecDeque::new(),
+                prove_calls: 0,
+                witness_used: 0,
+                witness_max: 8,
+            }
+        }
+
+        fn script_same_file(&mut self) {
+            self.witness.push_back(K1RedVerdict::SameFile);
+        }
+
+        fn script_other_file(&mut self) {
+            self.witness.push_back(K1RedVerdict::OtherFile);
+        }
+
+        fn script_unavailable(&mut self) {
+            self.witness.push_back(K1RedVerdict::Unavailable);
+        }
+
+        fn script_binding_failed(&mut self) {
+            self.witness.push_back(K1RedVerdict::BindingFailed);
+        }
+
+        fn exhaust(&mut self) {
+            self.witness_used = self.witness_max;
+        }
+    }
+
+    impl ScanIo for K1RedIo {
+        type Memory = std::fs::File;
+
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn std::io::Read>> {
+            panic!("the guard never opens maps")
+        }
+
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Self::Memory> {
+            panic!("the guard never opens memory")
+        }
+
+        fn final_generation(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            panic!("the guard never checks the final generation")
+        }
+
+        fn range_identity(
+            &mut self,
+            _: &ProcessView,
+            start: u64,
+            end: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            Ok(self
+                .reads
+                .get(&(start, end))
+                .copied()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)))
+        }
+
+        fn prove_original_file(
+            &mut self,
+            _: &ProcessView,
+            _: &std::fs::File,
+            _: &MappedFile,
+            _: ObjectKey,
+            range: (u64, u64),
+            _: &mut CaptureWorkBudget,
+        ) -> WitnessVerdict {
+            if self.witness_used >= self.witness_max {
+                return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+            }
+            self.prove_calls += 1;
+            self.witness_used += 1;
+            let _ = range;
+            match self
+                .witness
+                .pop_front()
+                .expect("scripted witness queried past its script")
+            {
+                K1RedVerdict::SameFile => WitnessVerdict::SameFile,
+                K1RedVerdict::OtherFile => WitnessVerdict::OtherFile,
+                K1RedVerdict::Unavailable => WitnessVerdict::Failed(WitnessFailure::Unavailable),
+                K1RedVerdict::BindingFailed => {
+                    WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed)
+                }
+            }
+        }
+    }
+
+    fn k1_red_identity() -> crate::discovery::identity::FileIdentity {
+        crate::discovery::identity::FileIdentity { dev: 42, ino: 7 }
+    }
+
+    fn k1_red_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 42,
+            },
+            inode: 7,
+        }
+    }
+
+    fn k1_red_entry(start: u64, permissions: &[u8; 4]) -> MapEntry {
+        MapEntry {
+            start,
+            end: start + 0x1000,
+            file_offset: 0,
+            permissions: *permissions,
+            device: Device {
+                major: 0,
+                minor: 42,
+            },
+            inode: 7,
+            raw_path: Some(b"/opt/prov.so".to_vec()),
+        }
+    }
+
+    /// The guard under test. The held magic rides the fake into the
+    /// held `MappedFile`. The guard marks witness-requiring joins
+    /// unproven and never consults the witness itself.
+    fn run_k1_guard(
+        io: &mut K1RedIo,
+        held: crate::discovery::identity::FileIdentity,
+        group: &[&MapEntry],
+    ) -> Result<GuardOutcome, String> {
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let held = MappedFile {
+            identity: held,
+            fs_magic: io.held_magic,
+        };
+        mapped_file_guard(io, &view, Some(held), k1_red_key(), group, &mut budget)
+    }
+
+    /// The provider-branch prove step under test: one witness query over
+    /// the outcome's range, mirroring the production call site. Panics
+    /// for a proven outcome, which production never proves.
+    fn run_k1_prove(
+        io: &mut K1RedIo,
+        held: crate::discovery::identity::FileIdentity,
+        outcome: GuardOutcome,
+    ) -> Option<String> {
+        let GuardOutcome::UnprovenOverlay { range } = outcome else {
+            panic!("the prove step runs only for unproven outcomes, got {outcome:?}");
+        };
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: held,
+            fs_magic: io.held_magic,
+        };
+        witness_join(io, &view, &file, &held, k1_red_key(), range, &mut budget)
+    }
+
+    #[test]
+    fn k1_guard_marks_unproven_without_spending() {
+        // The D1 pin: marking a witness-requiring join never consults
+        // the witness, so non-provider files spend nothing. No script:
+        // any consultation fails loud.
+        let held = k1_red_identity();
+        let entries: Vec<MapEntry> = (0..3)
+            .map(|index| k1_red_entry(0x7f00_0000 + index * 0x1000, b"r-xp"))
+            .collect();
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let reads: std::collections::BTreeMap<
+            (u64, u64),
+            crate::discovery::identity::FileIdentity,
+        > = entries
+            .iter()
+            .map(|entry| ((entry.start, entry.end), held))
+            .collect();
+        let mut io = K1RedIo::overlay(reads);
+        let outcome = run_k1_guard(&mut io, held, &group)
+            .expect("the guard marks, never refuses, an equal overlay group");
+        assert_eq!(
+            outcome,
+            GuardOutcome::UnprovenOverlay {
+                range: (entries[0].start, entries[0].end),
+            },
+            "the outcome names the first witness-requiring range"
+        );
+        assert_eq!(io.prove_calls, 0, "marking spends no query");
+        assert_eq!(io.witness_used, 0, "marking spends no budget");
+    }
+
+    #[test]
+    fn k1_guard_stale_lower_refuses_with_named_gap() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        assert_eq!(io.held_magic, Some(K1_RED_OVERLAY_MAGIC));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        assert!(matches!(outcome, GuardOutcome::UnprovenOverlay { .. }));
+        assert_eq!(io.prove_calls, 0, "marking spends nothing");
+        io.script_other_file();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("the stale lower mapping must refuse, never join the held upper file");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "the refusal carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(io.prove_calls, 1, "the refusal came from the witness");
+    }
+
+    #[test]
+    fn k1_guard_fresh_upper_joins_through_one_witness_query() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        assert_eq!(io.held_magic, Some(K1_RED_OVERLAY_MAGIC));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        assert!(matches!(outcome, GuardOutcome::UnprovenOverlay { .. }));
+        io.script_same_file();
+        assert!(
+            run_k1_prove(&mut io, held, outcome).is_none(),
+            "the fresh upper mapping joins the held upper file"
+        );
+        assert_eq!(io.prove_calls, 1, "the join came from the witness");
+        assert_eq!(io.witness_used, 1, "one budgeted query per file");
+    }
+
+    #[test]
+    fn k1_guard_budget_exhaustion_refuses_never_joins() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        io.exhaust();
+        let outcome = run_k1_guard(&mut io, held, &[&entry]).expect("marking needs no budget");
+        assert!(matches!(outcome, GuardOutcome::UnprovenOverlay { .. }));
+        io.script_same_file();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("exhaustion refuses, never degrades to (dev, ino)");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "exhaustion carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(io.prove_calls, 0, "no query runs past the budget");
+    }
+
+    #[test]
+    fn k1_prove_spends_one_query_per_file() {
+        // Nine witness-requiring ranges in one file: the guard marks the
+        // first and the prove step runs exactly one query for all of
+        // them, however large the group.
+        let held = k1_red_identity();
+        let entries: Vec<MapEntry> = (0..9)
+            .map(|index| k1_red_entry(0x7f00_0000 + index * 0x1000, b"r-xp"))
+            .collect();
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let reads: std::collections::BTreeMap<
+            (u64, u64),
+            crate::discovery::identity::FileIdentity,
+        > = entries
+            .iter()
+            .map(|entry| ((entry.start, entry.end), held))
+            .collect();
+        let mut io = K1RedIo::overlay(reads);
+        let outcome = run_k1_guard(&mut io, held, &group)
+            .expect("the guard marks a multi-range overlay group unproven");
+        assert_eq!(
+            outcome,
+            GuardOutcome::UnprovenOverlay {
+                range: (entries[0].start, entries[0].end),
+            },
+            "the outcome names the first witness-requiring range"
+        );
+        assert_eq!(io.prove_calls, 0, "marking spends nothing");
+        io.script_same_file();
+        assert!(
+            run_k1_prove(&mut io, held, outcome).is_none(),
+            "one verdict joins the whole file"
+        );
+        assert_eq!(io.prove_calls, 1, "exactly one query ran for nine ranges");
+        assert_eq!(io.witness_used, 1, "exactly one budget unit spent");
+    }
+
+    #[test]
+    fn k1_guard_witness_unavailable_refuses_with_gap() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_unavailable();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("an unavailable witness refuses, never silently joins");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "unavailability carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(
+            io.prove_calls, 1,
+            "the failed attempt still spends the budget"
+        );
+    }
+
+    #[test]
+    fn k1_guard_anchor_binding_failure_refuses_with_gap() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_binding_failed();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("an anchor binding failure refuses with the named gap");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "binding failure carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(
+            io.prove_calls, 1,
+            "the failed attempt still spends the budget"
+        );
+    }
+
+    #[test]
+    fn k1_guard_non_overlay_keys_join_without_witness() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        // No script: any witness consultation fails loud.
+        let mut io = K1RedIo::ext4(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        assert_eq!(io.held_magic, Some(K1_RED_EXT4_MAGIC));
+        let outcome =
+            run_k1_guard(&mut io, held, &[&entry]).expect("non-overlay keys keep today's join");
+        assert_eq!(
+            outcome,
+            GuardOutcome::Proven,
+            "no witness marking off overlayfs"
+        );
+        assert_eq!(io.prove_calls, 0, "the witness is never consulted");
+        assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
+    }
+
+    #[test]
+    fn k1_guard_legacy_refusal_needs_no_witness() {
+        let held = k1_red_identity();
+        let other = crate::discovery::identity::FileIdentity { dev: 42, ino: 9 };
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        // No script: any witness consultation fails loud.
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            other,
+        )]));
+        let reason = run_k1_guard(&mut io, held, &[&entry])
+            .expect_err("an already-unequal (dev, ino) keeps today's refusal");
+        assert!(
+            reason.contains("names more than one file"),
+            "the legacy refusal text stands, got {reason:?}"
+        );
+        assert_eq!(io.prove_calls, 0, "the witness is never consulted");
+        assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
+    }
+
+    #[test]
+    fn k1_guard_data_range_needs_no_witness() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r--p");
+        // No script: any witness consultation fails loud.
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("a data range keeps the legacy equality join");
+        assert_eq!(outcome, GuardOutcome::Proven, "data ranges need no witness");
+        assert_eq!(io.prove_calls, 0, "only caller ranges consult the witness");
+        assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
+    }
 }
 
 #[cfg(test)]
 #[path = "export_linkage_tests.rs"]
 mod export_linkage_tests;
+
+#[cfg(test)]
+#[path = "scan_kthread_tests.rs"]
+mod scan_kthread_tests;
+
+#[cfg(test)]
+#[path = "hostile_tables_tests.rs"]
+mod hostile_tables_tests;

@@ -1,25 +1,64 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+#[allow(dead_code)]
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::sync::Mutex;
+use support::DieWithParent as _;
+
+#[path = "support/transport_boundaries.rs"]
+mod transport_boundaries;
+
+/// Write an executable stub that a test will later exec: stage the bytes to
+/// a never-executed sibling, then copy them into place through a waited-for
+/// `cp` child, never in-process. An in-process write holds the destination
+/// open for writing, and a concurrent fork from another test thread inherits
+/// that fd — if the fork-child has not exec'd yet when the test execs the
+/// stub, the exec fails with ETXTBSY. The staging file is never executed and
+/// carries no mode bit; the waited `cp` owns the stub's write fd privately,
+/// so no in-process fork can inherit it, and the wait proves the fd is closed
+/// before any exec of the stub. `chmod` stays in-process: it opens no fd.
+fn write_executable_stub_via_waited_child(path: &std::path::Path, content: &[u8], mode: u32) {
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".src");
+    let staging = std::path::PathBuf::from(staging);
+    fs::write(&staging, content).expect("write executable-stub staging file");
+    let status = Command::new("cp")
+        .arg(&staging)
+        .arg(path)
+        .status()
+        .expect("copy executable stub through a waited child");
+    assert!(
+        status.success(),
+        "cp {} {}: {status}",
+        staging.display(),
+        path.display()
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("make stub executable");
+    fs::remove_file(&staging).expect("remove executable-stub staging file");
+}
 
 #[test]
 fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
+    // Ordinary flavors keep these two literal owner exports. The private
+    // journal mode retains its reason-aware removal through a separate gate;
+    // native_journal_link checks the actual ordinary/private ELF separation.
     let source = std::fs::read_to_string("build.rs").expect("read build script");
     for helper in ["p11_owner_lease", "p11_owner_refund"] {
         let export = format!("link-arg=--export={helper}");
         assert_eq!(
             source.matches(&export).count(),
             1,
-            "missing exact {helper} export"
+            "missing exact ordinary {helper} export"
         );
     }
     assert_eq!(
         source.matches("link-arg=--export=p11_owner_").count(),
         2,
-        "no pointer-taking owner transaction may be exported"
+        "ordinary owner exports must not add a pointer-taking transaction"
     );
 }
 
@@ -150,6 +189,7 @@ fn run_group_within(
         .stdout(fs::File::create(&stdout_path).expect("runner stdout file"))
         .stderr(fs::File::create(&stderr_path).expect("runner stderr file"))
         .process_group(0)
+        .die_with_parent()
         .spawn()
         .unwrap_or_else(|error| panic!("running {program}: {error}"));
     let pid = child.id();
@@ -276,7 +316,7 @@ fn assert_abi_routing_identity_contract(attach: &str, example: &str) -> Result<(
         "#[doc(hidden)]\npub fn prepare_qualification_identity(",
         "\n}\n\nfn validate_policy_map",
     )?;
-    let direct = "ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {\n    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)";
+    let direct = "ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {\n    prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD)";
     if wrapper != direct {
         return Err(
             "qualification identity wrapper must directly return unowned PID-scoped preparation"
@@ -319,7 +359,10 @@ fn assert_abi_routing_identity_contract(attach: &str, example: &str) -> Result<(
 }
 
 fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
-    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    // The Rust-side store_start insert wrapper is gone (START rows are
+    // constructed natively now); record_aggregate_start directly follows
+    // the wrapper cluster, so it bounds the same section.
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn record_aggregate_start(")?;
     for marker in [
         "p11_owner_start_get(key, 0)",
         "p11_owner_start_get(key, 1)",
@@ -336,7 +379,7 @@ fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     let retire = contract_section(
         owner,
         "static __always_inline long remove_start",
-        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+        "static __always_inline long start_remove_reason",
     )?;
     require_before(
         retire,
@@ -346,27 +389,60 @@ fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     )?;
     let remove = contract_section(
         owner,
-        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
-        "p11_owner_start_insert(const struct owner_start_key *key",
+        "static __always_inline long start_remove_reason",
+        "__attribute__((noinline)) long p11_owner_start_remove(",
     )?;
     for marker in [
-        "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad",
-        "start_key_valid(owner, key)",
-        "long rc = remove_start(ctl, owner, key);",
+        "if (!healthy(ctl) || !key || key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad)",
+        "if (!start_key_valid(owner, key)) {",
+        "long rc = remove_start(ctl, owner, key, reason);",
     ] {
         require_contract_marker(remove, marker, "native START remove")?;
     }
     require_before(
         remove,
-        "long rc = remove_start(ctl, owner, key);",
+        "if (!start_key_valid(owner, key)) {",
+        "long rc = remove_start(ctl, owner, key, reason);",
+        "START key validation before retirement",
+    )?;
+    require_before(
+        remove,
+        "long rc = remove_start(ctl, owner, key, reason);",
         "release_empty(ctl, owner)",
         "START retirement before owner release",
     )?;
+    require_contract_marker(
+        owner,
+        "#ifdef P11SCOPE_OBJECT_JOURNAL\n__attribute__((noinline)) long p11_owner_start_remove_reason(",
+        "journal START remove forwarding",
+    )?;
+    for (start, end, expected, contract) in [
+        (
+            "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+            "\n#ifdef P11SCOPE_OBJECT_JOURNAL\n__attribute__((noinline)) long p11_owner_start_remove_reason(",
+            "{\n    return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);\n}",
+            "ordinary START remove forwarding",
+        ),
+        (
+            "p11_owner_start_remove_reason(const struct owner_start_key *key,\n                                                            u32 required, u32 reason)",
+            "\n#endif",
+            "{\n    return start_remove_reason(key, required, reason);\n}",
+            "journal START remove forwarding",
+        ),
+    ] {
+        if contract_section(owner, start, end)?.trim() != expected {
+            return Err(format!(
+                "{contract} must directly preserve its arguments and reason"
+            ));
+        }
+    }
     Ok(())
 }
 
 fn assert_discovery_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
-    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    // Same rebounded wrapper section as the START seam above: the
+    // store_start insert wrapper was deleted with native construction.
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn record_aggregate_start(")?;
     for marker in [
         "p11_owner_discovery_get(key, u32::from(required))",
         "p11_owner_discovery_insert(key, state, flags)",
@@ -506,7 +582,138 @@ fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
+fn assert_bpf_snapshot_dependency_preparation(driver: &str) -> Result<(), String> {
+    let prepare = r#"command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
+    let root_fetch = r#""fetch", "--locked", "--manifest-path", str(logical / "Cargo.toml")"#;
+    let bpf_fetch =
+        r#""fetch", "--locked", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")"#;
+    let sysroot_fetch = r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#;
+    // Full lines prevent host_env from satisfying the env setter requirement.
+    let offline = "\n    env[\"CARGO_NET_OFFLINE\"] = \"true\"\n";
+    let host_offline = "\n    host_env[\"CARGO_NET_OFFLINE\"] = \"true\"\n";
+    let metadata = r#"metadata_log = command([host_cargo, "metadata", "--locked", "--offline""#;
+    let build = r#"build_log = command([host_cargo, "build", "--locked", "--offline", "--lib""#;
+    for marker in [
+        "with logical_source_alias(source, logical) as verify:",
+        "    def command(*args, **kwargs):\n        verify()\n        result = run_command(*args, **kwargs)\n        verify()\n        return result\n",
+        "--baseline-offline-payload",
+        "--candidate-offline-payload",
+        "helper._verify_payload_contents(",
+        "helper.replacement_config(",
+        "verify_home_configuration(",
+        r#""fetch", "--locked", "--offline", "--manifest-path", str(logical / "Cargo.toml")"#,
+        r#""fetch", "--locked", "--offline", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")"#,
+        r#""fetch", "--locked", "--offline", "--manifest-path", nightly["manifest"]"#,
+        r#""--no-deps", "--format-version", "1", "--manifest-path", str(logical / "Cargo.toml")]"#,
+        r#""--no-default-features", "--message-format=json", "--manifest-path", str(logical / "Cargo.toml")]"#,
+        "nightly-source-before",
+        "nightly-source-after",
+    ] {
+        require_contract_marker(driver, marker, "verified snapshot payload admission")?;
+    }
+    for (first, second) in [
+        (prepare, root_fetch),
+        (root_fetch, bpf_fetch),
+        (bpf_fetch, sysroot_fetch),
+        (sysroot_fetch, offline),
+        (sysroot_fetch, host_offline),
+        (offline, metadata),
+        (host_offline, metadata),
+        (metadata, build),
+    ] {
+        require_before(
+            driver,
+            first,
+            second,
+            "fresh BPF snapshot dependency preparation",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
+    let block = job_block(ci, "bpf-noninterference");
+    let condition = "    needs: [dedupe, tests]\n    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' }}\n";
+    if !block.starts_with(condition) {
+        return Err("BPF comparison must follow tests, including failed tests, unless cancelled/deduplicated".into());
+    }
+    for marker in [
+        "    runs-on: ubuntu-26.04\n",
+        "          fetch-depth: 0\n",
+        "rustup toolchain install \"$(cat .release-rust-version)\" --profile minimal",
+        "rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src",
+        "apt-get install -y clang-18 gcc libseccomp-dev llvm python3",
+        "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
+        "- name: Install packaged bpftool",
+        "set -euo pipefail",
+        // Pinned baseline 3681a1ab7: the keygen return-path gate
+        // (Detailed .text +128 B in the two inlined return functions;
+        // the unsafe entry flag compiles out of default builds) and the
+        // round-10 inventory ring raise (one `maps` word per Inventory
+        // object; code byte-identical), on top of 873adf5c4 (6.14
+        // exit-time mapping summaries); all enumerated in the ci.yml
+        // comment.
+        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
+        "python3 -I scripts/check-bpf-noninterference.py \\",
+        "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
+        "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
+        "--work \"$comparison_root/integration\"\n",
+        "test -s \"$comparison_root/repeat-baseline/comparison.json\"",
+        "test -s \"$comparison_root/integration/comparison.json\"",
+        "        if: ${{ !cancelled() }}\n        uses: actions/upload-artifact@",
+        "          if-no-files-found: error\n",
+        "${{ runner.temp }}/bpf-noninterference/*/baseline/",
+        "${{ runner.temp }}/bpf-noninterference/*/candidate/",
+    ] {
+        require_contract_marker(block, marker, "required default BPF comparison")?;
+    }
+    require_before(
+        block,
+        "--work \"$comparison_root/repeat-baseline\" --repeat-baseline",
+        "--work \"$comparison_root/integration\"",
+        "R/R control before exact R/C comparison",
+    )?;
+    if block
+        .matches("python3 -I scripts/check-bpf-noninterference.py \\")
+        .count()
+        != 2
+    {
+        return Err(
+            "BPF comparison must execute exactly the control and integration driver".into(),
+        );
+    }
+    if block.contains("--host-compiler-transition") {
+        return Err(
+            "the removed host compiler transition must not appear in the comparison".into(),
+        );
+    }
+    Ok(())
+}
+
+fn assert_hosted_bpf_external_lane_calls(ci: &str) -> Result<(), String> {
+    assert_hosted_bpf_noninterference(ci)?;
+    for line in job_block(ci, "bpf-noninterference").lines().map(str::trim) {
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
+        if line.starts_with('#') {
+            continue;
+        }
+        let names_script = line
+            .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
+            .any(|token| {
+                token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
+            });
+        if names_script && line != r#"python3 -I scripts/check-bpf-noninterference.py \"# {
+            return Err(format!(
+                "unreviewed comparison-job lane invocation: {line:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_hosted_dependency_preparation(ci: &str, bpf_driver: &str) -> Result<(), String> {
     // The prepared-selection proof runs once, in the lint job; every job that
     // runs project Cargo reconstructs the pinned sources before its first
     // project operation.
@@ -541,6 +748,11 @@ fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
         require_contract_marker(checks, marker, contract)?;
     }
     for job in CARGO_JOBS {
+        if job == "bpf-noninterference" {
+            assert_hosted_bpf_noninterference(ci)?;
+            assert_bpf_snapshot_dependency_preparation(bpf_driver)?;
+            continue;
+        }
         require_before(
             job_block(ci, job),
             prepare,
@@ -608,10 +820,18 @@ fn contracts_shard_count(ci: &str) -> Result<usize, String> {
 
 fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
     let lint = job_block(ci, "lint");
+    // The shipped configurations compile on push, not only on a manual
+    // dispatch: the static musl observer plus the P0 feature set on both
+    // libcs. A musl-only break (a libc wrapper with no musl binding) once
+    // landed and was found only by a manual build.
     for gate in [
         "fmt --all -- --check",
         "check --locked --offline --workspace --all-targets",
         "clippy --locked --offline --workspace --all-targets -- -D warnings",
+        "check --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl",
+        "clippy --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
     ] {
         if !step_calls(lint)
             .any(|call| call == format!("cargo +\"$(cat .release-rust-version)\" {gate}"))
@@ -630,6 +850,11 @@ fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
         ),
     ] {
         let expected = format!("{PARTITION_RUN}{partition} -- {WORKSPACE_TEST_GATE}");
+        let expected = if job == "tests" {
+            format!("{expected} --no-fail-fast")
+        } else {
+            expected
+        };
         if !step_calls(job_block(ci, job)).any(|call| call == expected) {
             return Err(format!(
                 "the scope line claims the workspace test gate, which the {job} job does not \
@@ -637,6 +862,111 @@ fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// The manual release preview builds both shipped capture modes, FULL and
+/// P0: one static musl pre-build, one official receipt run and one packaged
+/// public candidate each. The driver selects one mode per invocation
+/// (`--capture-mode full|p0`, default full), so a single receipt run can only
+/// ever prove one mode.
+fn assert_release_preview_builds_full_and_p0(ci: &str) -> Result<(), String> {
+    let preview = job_block(ci, "release-preview");
+    let cargo = "cargo +\"$(cat .release-rust-version)\"";
+    let evidence = "\"$RUNNER_TEMP/release-evidence";
+    for (marker, contract) in [
+        (
+            format!(
+                "{cargo} build --locked --offline --release --target x86_64-unknown-linux-musl"
+            ),
+            "FULL static pre-build",
+        ),
+        (
+            format!(
+                "{cargo} build --locked --offline --release --no-default-features \
+                 --features stub-object-attributes --target x86_64-unknown-linux-musl \
+                 --target-dir target/p0-preview"
+            ),
+            "P0 static pre-build",
+        ),
+        (
+            format!("TMPDIR={evidence}\" scripts/build-release.sh {evidence}/receipt\""),
+            "FULL official receipt run",
+        ),
+        (
+            format!(
+                "TMPDIR={evidence}\" scripts/build-release.sh --capture-mode p0 \
+                 {evidence}/receipt-p0\""
+            ),
+            "P0 official receipt run",
+        ),
+        (
+            format!(
+                "python3 -I scripts/package-release.py \\\n            --receipt {evidence}/receipt\" \\"
+            ),
+            "FULL public candidate",
+        ),
+        (
+            format!(
+                "python3 -I scripts/package-release.py \\\n            --capture-mode p0 \\\n            --receipt {evidence}/receipt-p0\" \\"
+            ),
+            "P0 public candidate",
+        ),
+        (
+            format!("for receipt in {evidence}/receipt\" {evidence}/receipt-p0\"; do"),
+            "receipt summary over both receipts",
+        ),
+        (
+            "name: release-preview-public-assets-p0\n".to_string(),
+            "P0 public asset upload",
+        ),
+    ] {
+        require_contract_marker(preview, &marker, contract)?;
+    }
+    Ok(())
+}
+
+/// The preview container image holds the FULL static binary, not the P0
+/// one: the FULL pre-build writes the default musl target dir that the
+/// observer Dockerfile copies, the P0 pre-build writes its own target dir
+/// so it cannot overwrite those bytes, and the docker build runs after
+/// the FULL pre-build.
+fn assert_release_preview_image_consumes_full_prebuild(
+    ci: &str,
+    dockerfile: &str,
+) -> Result<(), String> {
+    let preview = job_block(ci, "release-preview");
+    let full = "cargo +\"$(cat .release-rust-version)\" build --locked --offline --release --target x86_64-unknown-linux-musl";
+    let full_line = preview
+        .lines()
+        .find(|line| line.contains(full))
+        .ok_or_else(|| "the preview has no FULL static pre-build".to_string())?;
+    if full_line.contains("--target-dir") || full_line.contains("CARGO_TARGET_DIR") {
+        return Err(
+            "the FULL pre-build must write the default target dir the image copies".to_string(),
+        );
+    }
+    let p0 = preview
+        .lines()
+        .find(|line| line.contains("stub-object-attributes --target x86_64-unknown-linux-musl"))
+        .ok_or_else(|| "the preview has no P0 static pre-build".to_string())?;
+    if !p0.contains("--target-dir ") && !p0.contains("--target-dir=") {
+        return Err(
+            "the P0 pre-build must use its own target dir so the FULL binary survives for the image"
+                .to_string(),
+        );
+    }
+    let docker = preview
+        .find("docker build -f deploy/Dockerfile.observer")
+        .ok_or_else(|| "the preview has no observer docker build".to_string())?;
+    if docker < preview.find(full).unwrap_or(usize::MAX) {
+        return Err("the observer docker build must run after the FULL pre-build".to_string());
+    }
+    require_contract_marker(
+        dockerfile,
+        "COPY target/x86_64-unknown-linux-musl/release/p11scope",
+        "observer image",
+    )?;
     Ok(())
 }
 
@@ -755,7 +1085,7 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
     require_before(
         attach,
         "validate_policy_maps(&ebpf, object_has_unsafe)",
-        "crate::scope::publish(&mut ebpf, scope, policy, generation_token)",
+        "crate::scope::publish(",
         "exact policy-map metadata before publication",
     )
 }
@@ -894,11 +1224,21 @@ fn assert_live_discovery_host_contract(
         require_contract_marker(scope, marker, contract)?;
     }
 
+    // Both Detailed and counters use one Engine-owned start route. It passes
+    // the same owned-child capability, exact optional counter spec, the
+    // capture's retained return-probe admission, and the extensive-mode
+    // flag into the shared Session factory.
     if main.contains("Session::start(")
+        || main.contains("Session::start_counter(")
+        || main.contains("Session::start_for_capture(")
         || run.contains("Session::start(")
-        || engine.matches("Session::start(").count() != 1
+        || run.contains("Session::start_counter(")
+        || run.contains("Session::start_for_capture(")
+        || engine.contains("Session::start(")
+        || engine.contains("Session::start_counter(")
+        || engine.matches("Session::start_for_capture(").count() != 1
         || engine
-            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                )")
+            .matches("Session::start_for_capture(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                    counter.as_ref(),\n                    admission.clone(),\n                    track_short_lived,\n                )")
             .count()
             != 1
         || engine
@@ -941,7 +1281,7 @@ fn assert_live_discovery_host_contract(
     }
     for (marker, contract) in [
         (
-            "let object_has_unsafe = cfg!(feature = \"unsafe-unvalidated-metadata\");",
+            "let object_has_unsafe = flavor.unsafe_present;",
             "object-feature inventory selection",
         ),
         (
@@ -988,7 +1328,7 @@ fn assert_live_discovery_host_contract(
         (
             "SessionPreparation::PublishScope",
             "SessionPreparation::PrepareIdentity",
-            "crate::scope::publish(&mut ebpf",
+            "crate::scope::publish(",
         ),
         (
             "SessionPreparation::PrepareIdentity",
@@ -1023,7 +1363,7 @@ fn assert_live_discovery_host_contract(
         (
             "SessionPreparation::SelectScope",
             "SessionPreparation::LoadProgram",
-            "uprobe_scope = match scope",
+            "uprobe_scope = if let Some(pin) = selected",
         ),
         (
             "SessionPreparation::LoadProgram(prog_name)",
@@ -1048,6 +1388,40 @@ fn assert_live_discovery_host_contract(
     ] {
         let arm = contract_section(start_inner, step, next)?;
         require_contract_marker(arm, operation, "session preparation operation")?;
+    }
+    // The PrepareIdentity arm derives the gate from the object (counter
+    // sessions load the gate-free counter object even in gate-1 builds);
+    // a build-wide LOADER_GATE_BUILD here refused every counter mode.
+    let prepare_identity = contract_section(
+        start_inner,
+        "SessionPreparation::PrepareIdentity",
+        "SessionPreparation::PublishDescriptors",
+    )?;
+    require_contract_marker(
+        prepare_identity,
+        "identity_gate_required(counter.is_some())",
+        "per-object gate requirement",
+    )?;
+    // A closed selected session pins the probe scope to its owned process;
+    // without a selection the scope match below stays the fallback.
+    let select_scope = contract_section(
+        start_inner,
+        "SessionPreparation::SelectScope",
+        "SessionPreparation::LoadProgram",
+    )?;
+    for (marker, contract) in [
+        ("NonZeroU32::new(pin.pid())", "selected-process scope pin"),
+        ("match scope", "unselected scope fallback"),
+        (
+            "Scope::Pid(pid) => UProbeScope::OneProcess",
+            "pid scope fallback",
+        ),
+        (
+            "Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses",
+            "cgroup/system scope fallback",
+        ),
+    ] {
+        require_contract_marker(select_scope, marker, contract)?;
     }
     let dynamic_loader = contract_section(
         attach,
@@ -1230,30 +1604,49 @@ fn assert_owned_run_pause_internal_contract(
     )
 }
 
-fn assert_static_descriptor_cookie_contract(
-    attach: &str,
-    ebpf: &str,
-    owner: &str,
-) -> Result<(), String> {
-    const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
-
+fn assert_static_attach_scheduling_contract(attach: &str) -> Result<(), String> {
+    let ordinary = contract_section(
+        attach,
+        "fn attach_targets_observed_with(",
+        "fn attach_targets_observed_with_roots(",
+    )?;
+    require_contract_marker(
+        ordinary,
+        "attach_targets_observed_with_roots(",
+        "ordinary attachment delegates to common root scheduler",
+    )?;
+    require_contract_marker(
+        ordinary,
+        "StaticRoots::Detailed,",
+        "ordinary attachment selects Detailed roots",
+    )?;
     let scheduling = contract_section(
         attach,
-        "fn attach_targets_with(",
+        "fn attach_targets_observed_with_roots(",
         "fn standard_async_catalog",
     )?;
-    require_contract_marker(
+    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    require_before(
         scheduling,
-        "attach(\"p11_return\", slot, slot_attach_point(slot))",
-        "return-before-entry scheduling",
+        "collect::<Result<Vec<_>>>()?",
+        return_attach,
+        "ABI resolution before helper-mediated return attachment",
     )?;
     require_contract_marker(
+        scheduling,
+        "let return_program = if roots == StaticRoots::CounterBanks {\n        \
+         \"p11_counter_bank_return\"\n    } else {\n        \"p11_return\"\n    };",
+        "selected return root",
+    )?;
+    require_before(
+        scheduling,
+        return_attach,
+        "for program in entry_programs {",
+        "return-before-entry attachment",
+    )?;
+    require_before(
         scheduling,
         "for program in entry_programs {",
-        "entry scheduling",
-    )?;
-    require_contract_marker(
-        scheduling,
         "attach(program, slot, slot_attach_point(slot))",
         "selected-entry shared slot attach point",
     )?;
@@ -1262,6 +1655,18 @@ fn assert_static_descriptor_cookie_contract(
         "!return_attached.contains(&slot.index)",
         "return failure entry suppression",
     )?;
+    Ok(())
+}
+
+fn assert_static_descriptor_cookie_contract(
+    attach: &str,
+    ebpf: &str,
+    owner: &str,
+    flow: &str,
+) -> Result<(), String> {
+    const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
+
+    assert_static_attach_scheduling_contract(attach)?;
     let constructor = contract_section(attach, "fn slot_attach_point(", "fn attach_targets_with(")?;
     if constructor.matches(COOKIE).count() != 1 {
         return Err("slot attach point must construct exactly one shared descriptor cookie".into());
@@ -1306,27 +1711,27 @@ fn assert_static_descriptor_cookie_contract(
     )?;
     for (marker, contract) in [
         (
-            "p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "default mixed-ABI p11_entry descriptor consumer",
         ),
         (
-            "p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_LP64, false>(ctx, core::ptr::null_mut())",
             "diagnostic p11_entry LP64 descriptor consumer",
         ),
         (
-            "p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_ILP32, false>(ctx, core::ptr::null_mut())",
             "diagnostic p11_entry_ia32 descriptor consumer",
         ),
         (
-            "p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<1, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "p11_entry_template descriptor consumer",
         ),
         (
-            "p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<2, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "p11_entry_template_types descriptor consumer",
         ),
         (
-            "p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<3, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "p11_entry_template_pair descriptor consumer",
         ),
     ] {
@@ -1336,7 +1741,7 @@ fn assert_static_descriptor_cookie_contract(
     let template_second = contract_section(
         ebpf,
         "pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {",
-        "fn store_start",
+        "fn record_aggregate_start(",
     )?;
     for (marker, contract) in [
         ("let slot = slot_of(&ctx);", "template-second low-word slot"),
@@ -1355,7 +1760,7 @@ fn assert_static_descriptor_cookie_contract(
 
     let entry = contract_section(
         ebpf,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
         "#[uretprobe]",
     )?;
     for (marker, contract) in [
@@ -1384,7 +1789,7 @@ fn assert_static_descriptor_cookie_contract(
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "return START slot",
         ),
-        ("owned_start_get(&key)", "return START lookup"),
+        ("p11_owner_start_get(&key, 0)", "return START lookup"),
         ("owned_start_remove(&key, true)", "return START removal"),
         ("STATS.get_ptr_mut(slot)", "return STATS slot"),
         (
@@ -1392,14 +1797,75 @@ fn assert_static_descriptor_cookie_contract(
             "return RV_COUNTS slot",
         ),
         ("rv_count_add(&rk)", "return RV_COUNTS update"),
-        ("\n        slot,\n        target_function:", "Event.slot"),
         (
-            "let semantics = semantics_of(&ctx);",
+            "(*raw).event),\n                    &start,\n                    key.slot,\n                    &facts,",
+            "ordinary Event.slot",
+        ),
+        (
+            "(*raw).base.event),\n                &*start,\n                key.slot,\n                &facts,",
+            "object Event.slot",
+        ),
+        (
+            "let semantics = semantics_of(ctx);",
             "return descriptor consumer",
         ),
     ] {
         require_contract_marker(returned, marker, contract)?;
     }
+    // Each of the three return implementations builds its facts
+    // through the shared outlined consumer above: dropping any call
+    // would bypass descriptor semantics for that implementation's
+    // emission. The ordinary half and the monomorphic ordinary object
+    // copy capture with the false specialization; the generic
+    // (journal) object copy threads its JOURNAL parameter.
+    let ordinary_facts =
+        contract_section(ebpf, "fn ordinary_return(", "fn object_return_ordinary(")?;
+    let object_ordinary_facts = contract_section(
+        ebpf,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    )?;
+    let object_facts = contract_section(
+        ebpf,
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn p11_link_fork_allowed",
+    )?;
+    for (section, specialization, contract) in [
+        (
+            ordinary_facts,
+            "capture_return_facts::<false>",
+            "ordinary return",
+        ),
+        (
+            object_ordinary_facts,
+            "capture_return_facts::<false>",
+            "ordinary object return",
+        ),
+        (
+            object_facts,
+            "capture_return_facts::<JOURNAL>",
+            "generic object return",
+        ),
+    ] {
+        if section.matches("capture_return_facts::<").count() != 1
+            || !section.contains(specialization)
+        {
+            return Err(format!(
+                "{contract} must consume descriptor facts exactly once with its own specialization"
+            ));
+        }
+    }
+    // No-new-site guard: exactly the three justified calls above.
+    if returned.matches("capture_return_facts::<").count() != 3 {
+        return Err("each return implementation must consume descriptor facts exactly once".into());
+    }
+    // fill_call_event stores its slot parameter into Event.slot: the sink
+    // half of the call-site slot markers above.
+    require_contract_marker(
+        flow,
+        "core::ptr::write(core::ptr::addr_of_mut!((*out).slot), slot);",
+        "Event.slot sink",
+    )?;
 
     // The RV_COUNTS row for that cookie slot is counted exactly: an existing
     // row takes an in-place atomic add, a missing one is created only with
@@ -1437,7 +1903,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     let ebpf = read("crates/ebpf/src/main.rs");
     let entry = between(
         &ebpf,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>",
         "#[uretprobe]\npub fn p11_return",
     );
     let classify = entry
@@ -1450,7 +1916,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     assert!(classify < lp64 && lp64 < ilp32 && ilp32 < entered && entered < aggregate);
     assert_eq!(
         entry[..entered]
-            .matches("owned_start_remove(&key, false)")
+            .matches("start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED)")
             .count(),
         3
     );
@@ -1467,10 +1933,11 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     let attach = read("src/attach.rs");
     let scheduling = between(
         &attach,
-        "fn attach_targets_with(",
+        "fn attach_targets_observed_with_roots(",
         "fn standard_async_catalog",
     );
-    let return_attach = "attach(\"p11_return\", slot, slot_attach_point(slot))";
+    assert_static_attach_scheduling_contract(&attach).unwrap();
+    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
     require_before(
         scheduling,
         "collect::<Result<Vec<_>>>()?",
@@ -1479,7 +1946,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     )
     .unwrap();
     let direct_return_attach =
-        scheduling.replacen(return_attach, "attach(\"p11_return\", slot, point)", 1);
+        scheduling.replacen(return_attach, "attach(return_program, slot, point)", 1);
     assert!(
         require_before(
             &direct_return_attach,
@@ -1490,6 +1957,25 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
         .is_err(),
         "the return attachment must retain the shared slot attach point"
     );
+    let late_resolution = scheduling
+        .replacen("collect::<Result<Vec<_>>>()?", "unresolved_targets()", 1)
+        .replacen(
+            return_attach,
+            &format!("{return_attach}; collect::<Result<Vec<_>>>()?"),
+            1,
+        );
+    assert_ne!(late_resolution, scheduling);
+    assert!(
+        require_before(
+            &late_resolution,
+            "collect::<Result<Vec<_>>>()?",
+            return_attach,
+            "ABI resolution before helper-mediated return attachment",
+        )
+        .unwrap_err()
+        .contains("out of order"),
+        "the common scheduler must resolve every ABI before its first return attachment"
+    );
     assert!(scheduling.contains("entry_program(&slot.semantics, policy, object_has_unsafe, *abi)"));
     let production = between(
         &attach,
@@ -1498,9 +1984,29 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     );
     assert!(production.contains("attach_path_for(slot.object)"));
     assert!(production.contains("abi_for(slot.object)"));
+    let abi_resolution = "collect::<Result<_>>()?";
+    let observed_attachment = "attach_targets_observed_with_roots(";
+    require_before(
+        production,
+        abi_resolution,
+        observed_attachment,
+        "retained ABI resolution before observed attachment",
+    )
+    .unwrap();
+    let late_abi = production.replacen(abi_resolution, "", 1).replacen(
+        observed_attachment,
+        &format!("{observed_attachment}{abi_resolution}"),
+        1,
+    );
     assert!(
-        production.find("collect::<Result<_>>()?").unwrap()
-            < production.find("attach_targets_with(").unwrap()
+        require_before(
+            &late_abi,
+            abi_resolution,
+            observed_attachment,
+            "retained ABI resolution before observed attachment",
+        )
+        .is_err(),
+        "ABI resolution after the observed helper must be refused"
     );
 }
 
@@ -1671,11 +2177,25 @@ fn official_build_is_safe_only() {
         "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
         "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
         "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
-        "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
+        "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release \"$@\" \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
     .join("\n");
     assert!(official.contains(&command));
+    // FULL (default features) is the official capture mode; P0 is an explicit
+    // selection, and an unknown mode refuses before the build.
+    let modes = [
+        "case ${RELEASE_CAPTURE_MODE-full} in",
+        "    full) set -- ;;",
+        "    p0) set -- --no-default-features --features stub-object-attributes ;;",
+        "    *) echo \"invalid release capture mode: ${RELEASE_CAPTURE_MODE-}\" >&2; exit 1 ;;",
+        "esac",
+    ]
+    .join("\n");
+    assert!(
+        official.contains(&modes),
+        "official build capture-mode selection"
+    );
     // The official bytes carry no build-host paths: the remap roots are the
     // resolved checkout and the refused-then-default Cargo and rustup homes.
     for definition in [
@@ -1703,6 +2223,68 @@ fn official_build_is_safe_only() {
     ] {
         assert!(official.contains(marker), "official build misses {marker}");
     }
+}
+
+/// The official release bytes keep the explicit P0 option (attribute gate
+/// shut) for the verifier-budget lane; FULL is the default.
+#[test]
+fn official_build_is_p0_only() {
+    let release = read("scripts/build-release.sh");
+    let official = between(
+        &release,
+        "=== p11scope: isolated safe-only official static build ===",
+        "=== p11scope-discover: dynamic glibc + dynamic musl builds ===",
+    );
+    assert!(
+        official.contains("--features stub-object-attributes"),
+        "official build must shut the attribute gate"
+    );
+}
+
+/// Canary builds select FULL or P0 explicitly in both safe and diagnostic
+/// lanes. The release caller passes its capture mode through (FULL by
+/// default). Behavioral argv/oracle controls live in the dual-build caller
+/// suite.
+#[test]
+fn canary_builds_bind_declared_capture_mode() {
+    let canaries = read("scripts/verify-canaries.sh");
+    let builds = between(
+        &canaries,
+        "echo \"=== build ===\"",
+        "P11SCOPE_DEFAULT=\"$WORK/default-build/release/p11scope\"",
+    );
+    for marker in [
+        "set -- --release --workspace",
+        "[ \"$CAPTURE_MODE\" != p0 ] || set -- \"$@\" --features stub-object-attributes",
+        "canary_features=unsafe-unvalidated-metadata",
+        "[ \"$CAPTURE_MODE\" != p0 ] || canary_features=$canary_features,stub-object-attributes",
+        "--release --workspace --features \"$canary_features\"",
+    ] {
+        assert!(
+            builds.contains(marker),
+            "canary capture-mode build misses {marker}"
+        );
+    }
+    assert!(
+        read("scripts/build-release.sh")
+            .contains("scripts/verify-canaries.sh --capture-mode \"${RELEASE_CAPTURE_MODE-full}\"")
+    );
+}
+
+/// The attach-e2e lane's explicit P0 option builds P0 bytes (with or
+/// without the skip-attribution diagnostic), so live attach qualification
+/// can load on 1M-budget kernels.
+#[test]
+fn attach_e2e_build_is_p0_only() {
+    let attach = read("scripts/verify-attach-e2e.sh");
+    assert!(
+        attach.contains("e2e_features=\"stub-object-attributes\""),
+        "attach e2e build must shut the attribute gate"
+    );
+    assert!(
+        attach.contains("e2e_features=\"skip-attribution,stub-object-attributes\""),
+        "attach e2e diagnose build must shut the attribute gate"
+    );
 }
 
 #[test]
@@ -1777,12 +2359,11 @@ fn receipt_receipt_lane14_release_work_is_private_and_single_owner() {
     fs::create_dir(&bin).unwrap();
     fs::create_dir(&protected).unwrap();
     fs::write(&sentinel, b"must survive\n").unwrap();
-    fs::write(
-        bin.join("rm"),
+    write_executable_stub_via_waited_child(
+        &bin.join("rm"),
         b"#!/bin/sh\nprintf '%s\\n' rm >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("rm"), fs::Permissions::from_mode(0o700)).unwrap();
+        0o700,
+    );
     let output = Command::new("/bin/sh")
         .arg("scripts/build-release.sh")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -1900,12 +2481,11 @@ fn receipt_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed
     let work = fixture.path().join("work");
     fs::create_dir(&work).expect("create framing work directory");
     let stub = fixture.path().join("stub-checker");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &stub,
         b"#!/bin/sh\nprintf 'checker-stdout\\n'\nprintf 'checker-stderr\\n' >&2\nexit \"${P11SCOPE_TASK8_CHECKER_STATUS:-0}\"\n",
-    )
-    .expect("write stub checker");
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("make stub executable");
+        0o700,
+    );
     let runner = fixture.path().join("run-framing.sh");
     fs::write(
         &runner,
@@ -2131,6 +2711,9 @@ fn task7_pristine_driver_repo() -> tempfile::TempDir {
         let status = Command::new("git")
             .arg("-C")
             .arg(repo.path())
+            // No auto maintenance: git >= 2.47 runs it detached after a
+            // commit, and its lock files race the temp-dir cleanup.
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(&arguments)
             .status()
             .unwrap_or_else(|error| panic!("run git {arguments:?}: {error}"));
@@ -2166,16 +2749,15 @@ fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
         } else {
             "exit 97\n".to_string()
         };
-        fs::write(
+        write_executable_stub_via_waited_child(
             &path,
             format!(
                 "#!/bin/sh\necho \"${{0##*/}}\" >> {log}\n{completion}",
                 log = log.display()
-            ),
-        )
-        .expect("write release preflight tripwire");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make release preflight tripwire executable");
+            )
+            .as_bytes(),
+            0o700,
+        );
     }
     bin
 }
@@ -2502,9 +3084,10 @@ fn release_runs_every_python3_in_isolated_mode() {
         .match_indices("T4_TOOL_python3")
         .map(|(at, _)| &release[at..])
         .collect();
+    // Eleven since the official journal object gained its map-policy check.
     assert_eq!(
         sites.len(),
-        10,
+        11,
         "the pinned-interpreter call sites moved; re-check each one for -I"
     );
     for site in sites {
@@ -3205,8 +3788,8 @@ fn abi_routing_example_prepares_unowned_identity_before_either_attach() {
     assert_abi_routing_identity_contract(&attach, &example).unwrap();
 
     let swallowed = attach.replacen(
-        "    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)\n",
-        "    let _ = prepare_identity(ebpf, &Scope::Pid(pid.get()), None);\n    Ok(())\n",
+        "    prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD)\n",
+        "    let _ = prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD);\n    Ok(())\n",
         1,
     );
     assert_ne!(attach, swallowed, "swallowed-error mutation must apply");
@@ -3276,6 +3859,328 @@ fn user_process_session_snapshot_only_tolerates_initial_disappearance() {
             "tests/python/test_process_session_snapshot.py",
             "ProcessSessionSnapshotTests",
         ],
+    );
+}
+
+#[test]
+fn user_process_session_snapshot_dying_members() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_process_session_dying_members.py",
+            "DyingMemberSnapshotTests",
+        ],
+    );
+}
+
+#[test]
+fn snapshot_omits_a_zombie_member_and_lists_the_live_leader() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
+    sh -c 'sleep 0.2 & echo $! > "$1/zombie.pid"; exec sleep 30' sh "$work"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+zombie=$(cat "$work/zombie.pid")
+attempt=0
+while [ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" != Z ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "child never became a zombie" >&2; exit 1; }
+    sleep 0.05
+done
+snapshot_user_process_session "$sid" > "$work/members.json"
+python3 - "$work/members.json" "$leader" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(members) == 1, members
+assert members[0]["pid"] == int(sys.argv[2])
+assert members[0]["argv"] == ["sleep", "30"]
+assert set(members[0]) == {"pid", "starttime", "ppid", "pgid", "sid", "exe_sha256", "argv"}
+PY
+[ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" = Z ]
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+        ])
+        .output()
+        .expect("exercise zombie-member snapshot");
+    assert!(
+        output.status.success(),
+        "zombie-member snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn snapshot_lists_live_members_with_exact_argv() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+sleeper=
+trap 'for victim in "$leader" "$sleeper"; do [ -n "$victim" ] && kill -KILL "$victim" 2>/dev/null || true; done; rm -rf "$work"' EXIT
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
+    sh -c 'sleep 30 & echo $! > "$1/sleeper.pid"; wait' sh "$work"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+attempt=0
+while [ ! -s "$work/sleeper.pid" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "sleeper pid file never appeared" >&2; exit 1; }
+    sleep 0.05
+done
+sleeper=$(cat "$work/sleeper.pid")
+snapshot_user_process_session "$sid" > "$work/members.json"
+python3 - "$work/members.json" "$leader" "$sleeper" <<'PY'
+import json
+import re
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+leader, sleeper = int(sys.argv[2]), int(sys.argv[3])
+assert len(members) == 2, members
+by_pid = {member["pid"]: member for member in members}
+assert set(by_pid) == {leader, sleeper}
+for member in members:
+    assert set(member) == {"pid", "starttime", "ppid", "pgid", "sid", "exe_sha256", "argv"}
+    assert member["pgid"] == leader and member["sid"] == leader
+    assert re.fullmatch(r"[0-9a-f]{64}", member["exe_sha256"])
+assert by_pid[sleeper]["argv"] == ["sleep", "30"]
+assert by_pid[leader]["argv"][0:2] == ["sh", "-c"]
+assert len(by_pid[leader]["argv"]) == 5
+assert by_pid[leader]["exe_sha256"] != by_pid[sleeper]["exe_sha256"]
+PY
+kill -TERM "$sleeper"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+sleeper=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+        ])
+        .output()
+        .expect("exercise live-member snapshot");
+    assert!(
+        output.status.success(),
+        "live-member snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn snapshot_never_omits_a_live_execing_member_and_still_fails() {
+    let directory = tempfile::tempdir().expect("temporary exec-race directory");
+    let script = directory.path().join("exec-race.sh");
+    let exec_a = directory.path().join("exec_a.py");
+    let exec_b = directory.path().join("exec_b.py");
+    fs::write(
+        &exec_a,
+        format!(
+            "import os\nimport sys\nos.execv(sys.executable, [\"python3\", \"{}\", \"marker-b\"])\n",
+            exec_b.display(),
+        ),
+    )
+    .expect("write exec-a leg");
+    fs::write(
+        &exec_b,
+        format!(
+            "import os\nimport sys\nos.execv(sys.executable, [\"python3\", \"{}\", \"marker-a\"])\n",
+            exec_a.display(),
+        ),
+    )
+    .expect("write exec-b leg");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; fi' EXIT
+launch_user_recorded_process_group "$WORK/leader.pid" "$WORK/leader.log" \
+    python3 "$WORK/exec_a.py"
+leader=$USER_PROCESS_PID
+starttime=$USER_PROCESS_STARTTIME
+sid=$USER_PROCESS_SID
+attempt=0
+while ! tr '\0' ' ' < "/proc/$leader/cmdline" 2>/dev/null | grep -Fq marker; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "leader never started execing" >&2; exit 1; }
+    sleep 0.05
+done
+failures=0
+successes=0
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    attempt=$((attempt + 1))
+    if snapshot_user_process_session "$sid" > "$WORK/members.json"; then
+        successes=$((successes + 1))
+        python3 - "$WORK/members.json" "$leader" "$starttime" "$WORK" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+leader, starttime, work = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+assert len(members) == 1, members
+member = members[0]
+assert (member["pid"], member["starttime"], member["sid"]) == (leader, starttime, leader)
+shapes = (
+    ["python3", work + "/exec_a.py", "marker-a"],
+    ["python3", work + "/exec_b.py", "marker-b"],
+)
+assert member["argv"] in shapes, member["argv"]
+PY
+    else
+        failures=$((failures + 1))
+    fi
+done
+[ "$failures" -ge 1 ]
+[ "$successes" -ge 1 ]
+process_matches_starttime "$leader" "$starttime"
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+"#,
+    )
+    .expect("write exec-race script");
+    // SLACK hang guard: the script's own waits are event-driven or bounded,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(30);
+    let output = Command::new("timeout")
+        .args([bound.as_str(), "sh"])
+        .arg(&script)
+        .env("WORK", directory.path())
+        .output()
+        .expect("exercise exec-race snapshot");
+    assert!(
+        output.status.success(),
+        "exec-race snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn snapshot_fails_for_zombie_leader_with_live_thread() {
+    let directory = tempfile::tempdir().expect("temporary thread-group directory");
+    let script = directory.path().join("thread-group.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; wait "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+cat > "$work/thread-leader.c" <<'C'
+#include <pthread.h>
+#include <unistd.h>
+static void *sleeper(void *arg) {
+    (void)arg;
+    sleep(30);
+    return NULL;
+}
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, sleeper, NULL) != 0) return 1;
+    sleep(1);
+    pthread_exit(NULL);
+    return 0;
+}
+C
+cc -pthread -O2 -o "$work/thread-leader" "$work/thread-leader.c"
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" "$work/thread-leader"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+attempt=0
+while :; do
+    tgid_state=$(awk '$1 == "State:" { print $2; exit }' "/proc/$leader/status")
+    task_count=$(ls -d "/proc/$leader/task/"[0-9]* 2>/dev/null | wc -l)
+    live_tasks=$(for task in "/proc/$leader/task/"[0-9]*; do awk '$1 == "State:" { print $2; exit }' "$task/status" 2>/dev/null; done | grep -Ev '^(Z|X|x)$' | wc -l)
+    [ "$tgid_state" = Z ] && [ "$task_count" = 2 ] && [ "$live_tasks" = 1 ] && break
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "thread-group never reached zombie-leader/live-thread state" >&2; exit 1; }
+    sleep 0.05
+done
+python3 -c 'import sys; open(f"/proc/{sys.argv[1]}/exe", "rb")' "$leader" 2>/dev/null && { echo "zombie leader exe unexpectedly readable" >&2; exit 1; } || true
+if snapshot_user_process_session "$sid" > "$work/members.json" 2> "$work/snapshot.err"; then
+    echo "snapshot unexpectedly succeeded for zombie leader with live thread" >&2
+    cat "$work/members.json" >&2
+    exit 1
+fi
+[ "$(cat "$work/members.json")" != "[]" ]
+grep -Fq "cannot close process-group member $leader" "$work/snapshot.err"
+[ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$leader/status")" = Z ]
+live_after=$(for task in "/proc/$leader/task/"[0-9]*; do awk '$1 == "State:" { print $2; exit }' "$task/status" 2>/dev/null; done | grep -Ev '^(Z|X|x)$' | wc -l)
+[ "$live_after" = 1 ]
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+    )
+    .expect("write thread-group script");
+    // SLACK hang guard: the script's own waits are event-driven or bounded,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(20);
+    let output = Command::new("timeout")
+        .args(["--kill-after=2s", bound.as_str(), "sh"])
+        .arg(&script)
+        .output()
+        .expect("exercise thread-group snapshot");
+    assert!(
+        output.status.success(),
+        "thread-group snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -3399,12 +4304,20 @@ PY
     command "$real_python" "$@"
 }
 . scripts/lib.sh
+# Bounded poll (200 x 50ms): the child below always exits (done file appears,
+# work dir is removed, or its own 200 x 50ms bound), so a slow host delays but
+# never hangs this capture behind the background launcher subshell's wait.
 if launch_user_recorded_process_group "$work/identity.json" "$work/child.log" \
-    sh -c '(sleep 0.2; : > "$1") & trap "printf killed; exit 9" TERM; while [ ! -e "$1" ]; do :; done; printf survived' \
+    sh -c '(sleep 0.2; : > "$1") & trap "printf killed; exit 9" TERM; n=0; while [ ! -e "$1" ] && [ -d "${1%/*}" ] && [ "$n" -lt 200 ]; do n=$((n + 1)); sleep 0.05; done; [ -e "$1" ] && printf survived' \
     sh "$work/done"; then
     exit 1
 fi
-sleep 0.3
+attempt=0
+while [ "$attempt" -lt 200 ]; do
+    grep -Fqx survived "$work/child.log" 2>/dev/null && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
 grep -Fqx survived "$work/child.log"
 "#,
         ])
@@ -3885,7 +4798,7 @@ fn port_forward_term_during_launch_reaps_the_trap_visible_generation() {
     let bin = directory.path().join("bin");
     fs::create_dir(&bin).expect("create Python wrapper directory");
     let python_wrapper = bin.join("python3");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &python_wrapper,
         r#"#!/bin/sh
 if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; then
@@ -3898,11 +4811,10 @@ if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; t
     esac
 fi
 exec "$PF_TEST_REAL_PYTHON" "$@"
-"#,
-    )
-    .expect("write Python validation wrapper");
-    fs::set_permissions(&python_wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make Python validation wrapper executable");
+"#
+        .as_bytes(),
+        0o755,
+    );
     fs::write(
         &gate_script,
         format!(
@@ -4026,7 +4938,7 @@ fn mutated_process_group_record_never_signals_the_live_decoy_or_unvalidated_owne
     let bin = directory.path().join("bin");
     fs::create_dir(&bin).expect("create Python wrapper directory");
     let python_wrapper = bin.join("python3");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &python_wrapper,
         r#"#!/bin/sh
 if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; then
@@ -4075,11 +4987,10 @@ PY
     esac
 fi
 exec "$PF_TEST_REAL_PYTHON" "$@"
-"#,
-    )
-    .expect("write Python mutation wrapper");
-    fs::set_permissions(&python_wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make Python mutation wrapper executable");
+"#
+        .as_bytes(),
+        0o755,
+    );
     let script = directory.path().join("lifecycle.sh");
     fs::write(
         &script,
@@ -4425,9 +5336,9 @@ fn capture_evidence_checker_self_test() {
         "lane13 rejects a multiplier argument: OK",
         // The scan contributes three per-source table records, while exact
         // target occurrences remain deduplicated across scan and manifest.
-        "canary matrix 988/104/208 with 16 mixed surfaces: OK",
+        "canary baseline matrix 1056/104/208 with 16 mixed surfaces: OK",
         "canary scan contribution is required: OK",
-        "canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK",
+        "canary freeze lane is manifest-only 1056/104/208 with 13 surfaces: OK",
         "canary safe exact allowances: OK",
         "canary unsafe exact allowances: OK",
         "canary aggregate exact baseline: OK",
@@ -4705,7 +5616,11 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "isolated-python-invocations-exact-accepted",
         "tab-or-newline-root-rejected-status-77",
     ];
-    const LANE16_CASES: &[&str] = &[
+    let lane16_compiler_refusal = format!(
+        "cargo-not-Rust-{}-rejected",
+        read(".release-rust-version").trim()
+    );
+    let lane16_cases: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",
         "auto-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-sigstop-confirmed-positive-partial-0-exact-accepted",
         "never-structural-row-mutation-rejected",
@@ -4715,7 +5630,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "bare-observer-rejected",
         "path-observer-rejected",
         "outside-ROOT-work-target-release-observer-rejected",
-        "cargo-not-Rust-1.98.1-rejected",
+        lane16_compiler_refusal.as_str(),
         "cargo-without-locked-workspace-release-rejected",
         "private-CARGO_TARGET_DIR-ROOT-work-target-exact-accepted",
         "missing-observer-identity-ledger-rejected",
@@ -4763,7 +5678,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
             "lane16",
             "scripts/verify-receipt-lane16.sh",
             "verify-receipt-lane16 Task 4 receipt self-test: OK",
-            Some(LANE16_CASES),
+            Some(lane16_cases),
         ),
     ];
     let mut failures = Vec::new();
@@ -4783,23 +5698,19 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "systemd-run",
     ] {
         let path = guard.path().join(command);
-        fs::write(
+        write_executable_stub_via_waited_child(
             &path,
             b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
-        )
-        .expect("write Task 4 command tripwire");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make Task 4 command tripwire executable");
+            0o700,
+        );
     }
     let lane14_guard = tempfile::tempdir().expect("create Lane 14 first-mutator tripwire");
     let lane14_rm = lane14_guard.path().join("rm");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &lane14_rm,
         b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
-    )
-    .expect("write Lane 14 rm tripwire");
-    fs::set_permissions(&lane14_rm, fs::Permissions::from_mode(0o700))
-        .expect("make Lane 14 rm tripwire executable");
+        0o700,
+    );
 
     // A comment or unreachable branch containing `--self-test` must not turn
     // off the guard. The first mutator is caught, its sentinel survives, and
@@ -4974,6 +5885,228 @@ fn attach_pod_refuses_bad_arguments() {
     }
 }
 
+/// F1 (Sol-full): `scripts/attach-pod.sh` must resolve the pod cgroup through
+/// the shared kubelet-anchored resolver, never first-match-anywhere. A foreign
+/// subtree with a colliding scope name is created FIRST so an unanchored
+/// traversal meets it first (the hijack shape); the wrapper must still select
+/// exactly the UID-bound kubelet pod cgroup, report the decoy, and refuse
+/// ambiguity and absence loudly. The healthy twin (no decoy) proves the
+/// harness and the normal path. Driven end to end with stub kubectl/timeout/
+/// sudo/observer against a fabricated `P11SCOPE_CGROUP_ROOT`; a stub `find`
+/// remaps the legacy hardcoded `/sys/fs/cgroup` lookup onto the fixture so a
+/// first-match-anywhere regression fails by selecting the foreign scope.
+/// Needs no cluster, no sudo and no privileges; the script refuses root
+/// callers, so there is no drivable positive as root.
+#[test]
+fn attach_pod_selects_only_the_validated_pod_cgroup() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("attach-pod scope selection needs a non-root caller (the script refuses root)");
+        return;
+    }
+    const CID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const UID: &str = "0123abcd-4567-89ef-0123-456789abcdef";
+    const OTHER_UID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let work = tempfile::tempdir().expect("create attach-pod scope fixture");
+    let stub = work.path().join("stub");
+    let cg = work.path().join("cg");
+    let argv_path = work.path().join("argv");
+    fs::create_dir(&stub).expect("create stub bin directory");
+    let scope_name = format!("cri-containerd-{CID}.scope");
+    // The foreign subtree is created first so an unanchored traversal meets it
+    // first, exactly the hijack shape.
+    let foreign_scope = cg.join("aaa-foreign.slice").join(&scope_name);
+    let real_pod = cg
+        .join("kubepods.slice")
+        .join(format!("kubepods-pod{}.slice", UID.replace('-', "_")));
+    fs::create_dir_all(&foreign_scope).expect("create foreign decoy scope");
+    fs::create_dir_all(real_pod.join(&scope_name)).expect("create real pod scope");
+    fs::write(cg.join("cgroup.controllers"), "").expect("write cgroup v2 sentinel");
+
+    let real_find = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v find"])
+            .output()
+            .expect("locate the real find")
+            .stdout,
+    )
+    .expect("real find path is UTF-8");
+    let real_find = real_find.trim().to_string();
+    assert!(
+        !real_find.is_empty() && !real_find.contains([' ', '\'', '\n']),
+        "unsafe real find path: {real_find:?}"
+    );
+    let write_stub = |name: &str, body: &str| {
+        write_executable_stub_via_waited_child(
+            &stub.join(name),
+            format!("#!/bin/sh\n{body}").as_bytes(),
+            0o700,
+        );
+    };
+    write_stub(
+        "timeout",
+        r#"while [ $# -gt 0 ]; do
+    case $1 in
+        --signal=*|--kill-after=*) shift ;;
+        --signal|--kill-after) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+exec "$@"
+"#,
+    );
+    write_stub(
+        "sudo",
+        r#"[ "${1-}" = "-n" ] && shift
+exec "$@"
+"#,
+    );
+    // The legacy lookup hardcodes /sys/fs/cgroup; remap it onto the fixture so
+    // a first-match-anywhere regression selects the foreign scope instead of
+    // failing on absence. The resolver passes $CGROUP_ROOT (never the literal
+    // /sys/fs/cgroup), so this stub passes its calls through untouched.
+    write_stub(
+        "find",
+        &format!(
+            r#"if [ "${{1-}}" = /sys/fs/cgroup ]; then shift; exec {real_find} "$P11SCOPE_CGROUP_ROOT" "$@"; fi
+exec {real_find} "$@"
+"#
+        ),
+    );
+    write_stub(
+        "kubectl",
+        r#"case " $* " in
+    *"containerStatuses[0].name"*) printf '%s' "good-name" ;;
+    *"metadata.uid"*) printf '%s' "$FETCH_UID" ;;
+    *"containerID"*) printf '%s' "containerd://$FETCH_CID" ;;
+esac
+"#,
+    );
+    write_stub(
+        "observer",
+        r#"printf '%s\n' "$@" > "$OBSERVER_ARGV"
+exit 0
+"#,
+    );
+    let stub_path = format!(
+        "{}:{}",
+        stub.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |fetch_uid: &str| {
+        let _ = fs::remove_file(&argv_path);
+        Command::new("sh")
+            .args([
+                "scripts/attach-pod.sh",
+                "--pod",
+                "good",
+                "--namespace",
+                "default",
+                "--",
+                "--mode",
+                "metrics",
+            ])
+            .env("PATH", &stub_path)
+            .env("P11SCOPE_OBSERVER", stub.join("observer"))
+            .env("P11SCOPE_CGROUP_ROOT", &cg)
+            .env("FETCH_UID", fetch_uid)
+            .env("FETCH_CID", CID)
+            .env("OBSERVER_ARGV", &argv_path)
+            .output()
+            .expect("run attach-pod.sh")
+    };
+    let selected_cgroup = || {
+        let argv = fs::read_to_string(&argv_path).expect("observer must record its argv");
+        let argv: Vec<&str> = argv.lines().collect();
+        let position = argv
+            .iter()
+            .position(|line| *line == "--cgroup")
+            .expect("observer argv has no --cgroup");
+        argv.get(position + 1).expect("--cgroup value").to_string()
+    };
+    let log_of = |output: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // Hijack refused: the foreign decoy is reported and ignored, and the
+    // wrapper selects exactly the UID-bound kubelet pod cgroup.
+    let hijacked = run(UID);
+    let log = log_of(&hijacked);
+    assert!(
+        hijacked.status.success(),
+        "a foreign decoy must not block the real pod: {log}"
+    );
+    let selected = selected_cgroup();
+    assert!(
+        !selected.contains("aaa-foreign"),
+        "the foreign scope hijacked the observation: {selected}"
+    );
+    assert_eq!(
+        selected,
+        real_pod.display().to_string(),
+        "the wrapper must select the validated pod cgroup"
+    );
+    assert!(
+        log.contains("ignored 1 match"),
+        "the foreign decoy was not reported: {log}"
+    );
+
+    // Healthy twin: with no decoy the same single match is selected.
+    fs::remove_dir_all(cg.join("aaa-foreign.slice")).expect("remove the foreign decoy");
+    let healthy = run(UID);
+    let log = log_of(&healthy);
+    assert!(
+        healthy.status.success(),
+        "the single valid match must be selected: {log}"
+    );
+    assert_eq!(
+        selected_cgroup(),
+        real_pod.display().to_string(),
+        "the healthy twin must select the same pod cgroup"
+    );
+
+    // Ambiguity refused: the requested UID itself matching two valid kubelet
+    // pod cgroups is never guessed.
+    let ambiguous_pod = cg
+        .join("kubelet.slice/kubelet-kubepods.slice")
+        .join(format!(
+            "kubelet-kubepods-pod{}.slice",
+            UID.replace('-', "_")
+        ));
+    fs::create_dir_all(ambiguous_pod.join(&scope_name)).expect("create the ambiguous pod");
+    let ambiguous = run(UID);
+    let log = log_of(&ambiguous);
+    assert_eq!(
+        ambiguous.status.code(),
+        Some(1),
+        "an ambiguous container id must be refused: {log}"
+    );
+    assert!(
+        log.contains("refusing"),
+        "the ambiguous match was not refused loudly: {log}"
+    );
+
+    // Absence refused: the same container id under pods carrying other UIDs is
+    // not the requested pod.
+    let missing = run(OTHER_UID);
+    let log = log_of(&missing);
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "a uid mismatch must be refused: {log}"
+    );
+    assert!(
+        log.contains("could not locate the pod cgroup"),
+        "the uid mismatch was not refused as absent: {log}"
+    );
+}
+
 #[test]
 fn immutable_policy_maps() {
     const BPF_F_RDONLY_PROG: u32 = 1 << 7;
@@ -4995,7 +6128,21 @@ fn immutable_policy_maps() {
     );
     assert_eq!(definitions["CGROUP_FILTER"][FLAGS], 0);
     assert_eq!(definitions["TAIL_CALLS"][FLAGS], 0);
-    assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
+    if cfg!(feature = "unsafe-unvalidated-metadata") {
+        // docs/privacy/allowlist-v1.md: the policy-boolean lookup is
+        // "Unsafe diagnostic only", so the diagnostic object carries
+        // ATTR_BOOL_BITS — still immutable like every other policy map.
+        assert!(
+            definitions.contains_key("ATTR_BOOL_BITS"),
+            "diagnostic object misses unsafe-only map ATTR_BOOL_BITS"
+        );
+        assert_eq!(
+            definitions["ATTR_BOOL_BITS"][FLAGS], BPF_F_RDONLY_PROG,
+            "ATTR_BOOL_BITS"
+        );
+    } else {
+        assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
+    }
     for name in [
         "STATS",
         "START",
@@ -5008,6 +6155,37 @@ fn immutable_policy_maps() {
         "PAUSE_PIDS",
     ] {
         assert_eq!(definitions[name][FLAGS], 0, "dynamic map {name}");
+    }
+}
+
+/// Independent marker expectation from the switch requests and the build
+/// inputs, never from the build's own output.
+fn artifact_expected_marker_enabled() -> bool {
+    fn small_requested() -> bool {
+        option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_STATE_MAPS")
+                .is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
+                .is_some_and(|value| value == "1" || value == "true")
+    }
+    let journal_selected = match option_env!("P11SCOPE_JOURNAL") {
+        None => {
+            !cfg!(feature = "wide-detailed-2112")
+                && !cfg!(feature = "unsafe-unvalidated-metadata")
+                && !small_requested()
+                && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
+                && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
+                && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1")
+        }
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
+    };
+    match option_env!("P11SCOPE_BIRTH_MARKER") {
+        None => journal_selected,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_BIRTH_MARKER request {other:?}"),
     }
 }
 
@@ -5040,20 +6218,57 @@ fn frozen_policy_inventory_matches_embedded_object() {
     let directory = tempfile::tempdir().expect("temporary inventory directory");
     let object = directory.path().join("p11scope-ebpf");
     fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
-    let (variant, other_metadata, other_capacity) = match (
-        cfg!(feature = "wide-detailed-2112"),
-        cfg!(feature = "unsafe-unvalidated-metadata"),
-    ) {
-        (false, false) => ("default", "diagnostic", "wide-default"),
-        (false, true) => ("diagnostic", "default", "wide-diagnostic"),
-        (true, false) => ("wide-default", "wide-diagnostic", "default"),
-        (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
-    };
-    // Task 3 Stage A adds eight instance maps and three VMA hook programs.
-    let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (34, 21)
+    let wide = cfg!(feature = "wide-detailed-2112");
+    let unsafe_build = cfg!(feature = "unsafe-unvalidated-metadata");
+    let marker = artifact_expected_marker_enabled();
+    // The loader-gate selection is read from the embedded object
+    // itself (the bank-B map is present only in gate builds), never
+    // from ambient build environment.
+    let gate = aya_obj::Object::parse(p11scope::EBPF_OBJECT)
+        .expect("parse embedded object for gate selection")
+        .maps
+        .contains_key("TASK_COOKIE_B");
+    if marker && (wide || unsafe_build) {
+        eprintln!("explicit-marker test shape on a journalless build; no frozen variant covers it");
+        return;
+    }
+    if gate && (wide || unsafe_build) {
+        eprintln!("gate test shape on a wide/diagnostic build; no frozen variant covers it");
+        return;
+    }
+    let (variant, other_metadata, other_capacity) = if gate {
+        ("default-gate", "default", "diagnostic")
     } else {
-        (32, 16)
+        match (wide, unsafe_build) {
+            (false, false) if marker => ("default", "diagnostic", "wide-default"),
+            (false, false) => ("default-no-marker", "default", "wide-default"),
+            (false, true) => ("diagnostic", "default", "wide-diagnostic"),
+            (true, false) => ("wide-default", "wide-diagnostic", "default"),
+            (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
+        }
+    };
+    // Stage A plus image continuity: four additional private maps, one
+    // pre-mm hook and one same-object task iterator. H7 slice B adds the
+    // three subordinate-custody maps (OBJECT_START, OBJECT_DESCRIPTORS,
+    // OBJECT_ZERO) with no new programs. Selected detailed adds the
+    // three SELECTED_* maps and the bootstrap/cgroup-migrate programs.
+    // The birth-marker control map and the PID-scope start-time witness
+    // (PID_START_TICK) add two maps without a new program in carriable
+    // builds; journalless builds omit them, and the unsafe
+    // decoder maps add two more maps with five extra programs.
+    // The 7.3+ exec-release and 6/7-argument copy_vma variants add one
+    // program each; one of each pair loads. The loader gate adds five
+    // maps (bank B, select word, gate rows/control) with no new program.
+    let (maps, programs) = if gate {
+        (48, 22)
+    } else if unsafe_build {
+        (44, 27)
+    } else if wide {
+        (42, 22)
+    } else if marker {
+        (44, 22)
+    } else {
+        (42, 22)
     };
     let report = run_ok(
         "python3",
@@ -5166,48 +6381,131 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let attach = read("src/attach.rs");
     let ebpf = read("crates/ebpf/src/main.rs");
     let owner = read("crates/ebpf/native/task_owner.c");
+    let flow = read("crates/ebpf-common/src/object_flow.rs");
 
-    assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner).unwrap();
-    let remove_start = owner
-        .find("p11_owner_start_remove(const struct owner_start_key *key, u32 required)")
-        .expect("native START remover must exist");
-    let slot_bound = "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad";
-    for (replacement, reason) in [
-        ("key->pad", "omitted slot bound"),
+    assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner, &flow).unwrap();
+    let scheduling = between(
+        &attach,
+        "fn attach_targets_observed_with_roots(",
+        "fn standard_async_catalog",
+    );
+    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    let entry_attach = "attach(program, slot, slot_attach_point(slot))";
+    let late_return = scheduling
+        .replacen(return_attach, "missing_return()", 1)
+        .replacen(entry_attach, &format!("{entry_attach}; {return_attach}"), 1);
+    for (mutant, reason) in [
+        (late_return, "return-before-entry attachment"),
         (
+            scheduling.replacen("\"p11_return\"", "\"p11_entry\"", 1),
+            "selected return root",
+        ),
+        (
+            scheduling.replacen("!return_attached.contains(&slot.index)", "false", 1),
+            "return failure entry suppression",
+        ),
+    ] {
+        assert_ne!(
+            mutant, scheduling,
+            "{reason} mutation changes the scheduler"
+        );
+        let changed = attach.replacen(scheduling, &mutant, 1);
+        let error = assert_static_descriptor_cookie_contract(&changed, &ebpf, &owner, &flow)
+            .expect_err("the actual scheduler mutation must violate its contract");
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
+    let remove_start = between(
+        &owner,
+        "static __always_inline long start_remove_reason",
+        "__attribute__((noinline)) long p11_owner_start_remove(",
+    );
+    let slot_bound = "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad";
+    for (marker, replacement, reason) in [
+        (slot_bound, "key->pad", "omitted slot bound"),
+        (
+            slot_bound,
             "key->slot >= P11SCOPE_OWNER_SLOT_BOUND && key->pad",
             "bypassed slot bound",
         ),
+        (
+            slot_bound,
+            "key->slot >= P11SCOPE_OWNER_SLOT_BOUND",
+            "omitted key pad check",
+        ),
+        (
+            "if (!start_key_valid(owner, key)) {",
+            "if (0) {",
+            "bypassed key validation",
+        ),
+        (
+            "long rc = remove_start(ctl, owner, key, reason);",
+            "long rc = 0;",
+            "skipped START retirement",
+        ),
+        (
+            "long rc = remove_start(ctl, owner, key, reason);",
+            "long rc = remove_start(ctl, owner, key, P11_OWNER_START_REASON_RETURN);",
+            "discarded retirement reason",
+        ),
     ] {
-        let changed_remove = owner[remove_start..].replacen(slot_bound, replacement, 1);
+        assert_eq!(
+            remove_start.matches(marker).count(),
+            1,
+            "{reason} must target the actual shared removal helper"
+        );
+        let changed_remove = remove_start.replacen(marker, replacement, 1);
         assert_ne!(
-            changed_remove,
-            &owner[remove_start..],
+            changed_remove, remove_start,
             "{reason} mutation must change the remover"
         );
-        let changed_owner = format!("{}{}", &owner[..remove_start], changed_remove);
+        let changed_owner = owner.replacen(remove_start, &changed_remove, 1);
+        assert_ne!(changed_owner, owner, "{reason} must change the real source");
         assert!(
-            assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner).is_err(),
+            assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner, &flow)
+                .is_err(),
             "native START remover must reject {reason}"
         );
     }
-    let skipped_start_retirement = owner.replacen(
-        "long rc = remove_start(ctl, owner, key);",
-        "long rc = 0;",
-        1,
-    );
-    assert!(
-        assert_static_descriptor_cookie_contract(&attach, &ebpf, &skipped_start_retirement)
-            .is_err(),
-        "the native START remover must call the ownership-aware retirement helper"
-    );
+    for (forwarding, replacements, contract) in [
+        (
+            "return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);",
+            [
+                "return 0;",
+                "return start_remove_reason(key, P11_OWNER_START_REASON_RETURN, required);",
+                "return start_remove_reason(key, required, P11_OWNER_START_REASON_EXEC_EXIT);",
+            ],
+            "ordinary START remove forwarding",
+        ),
+        (
+            "return start_remove_reason(key, required, reason);",
+            [
+                "return 0;",
+                "return start_remove_reason(key, reason, required);",
+                "return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);",
+            ],
+            "journal START remove forwarding",
+        ),
+    ] {
+        assert_eq!(owner.matches(forwarding).count(), 1, "{contract} is unique");
+        for replacement in replacements {
+            let changed_owner = owner.replacen(forwarding, replacement, 1);
+            assert_ne!(
+                changed_owner, owner,
+                "{contract} mutation changes real code"
+            );
+            let error =
+                assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner, &flow)
+                    .expect_err("bypassed or swapped START forwarding must fail");
+            assert!(error.contains(contract), "{contract}: {error}");
+        }
+    }
     let dropped_return_descriptor = attach.replacen(
         "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),",
         "cookie: Some(attach_cookie(slot.index, 0)),",
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf, &owner)
+        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf, &owner, &flow)
             .is_err(),
         "the return attach site must carry the descriptor word"
     );
@@ -5222,7 +6520,7 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         "RV_COUNTS overwrite mutation must change the source"
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &overwrite, &owner).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &overwrite, &owner, &flow).is_err(),
         "an RV_COUNTS create that may overwrite a concurrent row must be rejected"
     );
     let high_word_stats = ebpf.replacen(
@@ -5231,14 +6529,15 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &high_word_stats, &owner).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &high_word_stats, &owner, &flow).is_err(),
         "a slot consumer must not use the descriptor word"
     );
 
     let no_count_only_fallback =
         ebpf.replacen(".unwrap_or(SlotSemantics::COUNT_ONLY)", ".unwrap()", 1);
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback, &owner).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback, &owner, &flow)
+            .is_err(),
         "a missing descriptor must remain count-only"
     );
 
@@ -5246,9 +6545,9 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         .find("pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {")
         .expect("template-second entry must exist");
     let template_second_end = ebpf[template_second_start..]
-        .find("fn store_start(")
+        .find("fn record_aggregate_start(")
         .map(|offset| template_second_start + offset)
-        .expect("template-second entry must end before store_start");
+        .expect("template-second entry must end before record_aggregate_start");
     let template_second = &ebpf[template_second_start..template_second_end];
     let low_word_slot = "        slot,\n        _pad: 0,";
     assert_eq!(
@@ -5272,8 +6571,8 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         &ebpf[template_second_end..]
     );
     let bypassed_primary_semantics = ebpf.replacen(
-        "    let semantics = semantics_of(&ctx);\n    let mut storage = MaybeUninit::<CallStart>::uninit();",
-        "    let semantics = SlotSemantics::COUNT_ONLY;\n    let mut storage = MaybeUninit::<CallStart>::uninit();",
+        "    let semantics = semantics_of(&ctx);\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
+        "    let semantics = SlotSemantics::COUNT_ONLY;\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
         1,
     );
     assert_eq!(
@@ -5282,10 +6581,16 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
                 &attach,
                 &template_second_high_word_slot,
                 &owner,
+                &flow,
             )
             .is_err(),
-            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics, &owner,)
-                .is_err(),
+            assert_static_descriptor_cookie_contract(
+                &attach,
+                &bypassed_primary_semantics,
+                &owner,
+                &flow,
+            )
+            .is_err(),
         ],
         [true, true],
         "the template-tail slot and every descriptor consumer must use the shared cookie path"
@@ -5376,14 +6681,33 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         &missing_worker_readback,
         "TAIL_CALLS worker readback must be required",
     );
+    let unpinned_selected_scope =
+        attach.replacen("NonZeroU32::new(pin.pid())", "NonZeroU32::new(0)", 1);
+    assert_rejects_attach_mutation(
+        &unpinned_selected_scope,
+        "selected scope must come from the owned-process pin",
+    );
     let worker_attach = attach.replacen(
-        "match attach(program, slot, slot_attach_point(slot))",
-        "match attach(\"interface_list_worker\", slot, slot_attach_point(slot))",
+        "attach(program, slot, slot_attach_point(slot))",
+        "attach(\"interface_list_worker\", slot, slot_attach_point(slot))",
         1,
     );
-    assert_rejects_attach_mutation(
-        &worker_attach,
-        "interface-list worker must not gain an attach site",
+    assert_ne!(
+        attach, worker_attach,
+        "worker attach-site mutation must apply"
+    );
+    assert_eq!(
+        assert_live_discovery_host_contract(
+            &worker_attach,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &main,
+            &run,
+        )
+        .unwrap_err(),
+        "interface-list worker must be loaded but never attached"
     );
     let benign_worker_comment = attach.replacen(
         "fn attach_targets_with(",
@@ -5544,6 +6868,63 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         )
         .is_err(),
         "policy-map metadata must be validated before publication"
+    );
+    let build_wide_gate = attach.replacen(
+        "identity_gate_required(counter.is_some())",
+        "LOADER_GATE_BUILD",
+        1,
+    );
+    assert_ne!(
+        attach, build_wide_gate,
+        "build-wide gate mutation must apply"
+    );
+    assert_rejects_attach_mutation(
+        &build_wide_gate,
+        "the PrepareIdentity arm must derive the gate per object",
+    );
+    let second_start_route = engine.replacen(
+        "                Session::start_for_capture(\n",
+        "                Session::start_for_capture(\n                Session::start_for_capture(\n",
+        1,
+    );
+    assert_ne!(
+        engine, second_start_route,
+        "second start-route mutation must apply"
+    );
+    assert_eq!(
+        assert_live_discovery_host_contract(
+            &attach,
+            &scope,
+            &events,
+            &hooks,
+            &second_start_route,
+            &main,
+            &run,
+        )
+        .unwrap_err(),
+        "Engine must own one shared Session::start route and one owned-child capability caller"
+    );
+    let escaped_counter_route = main.replacen(
+        "fn main() {",
+        "fn main() {\n    let _ = Session::start_counter(",
+        1,
+    );
+    assert_ne!(
+        main, escaped_counter_route,
+        "escaped counter-route mutation must apply"
+    );
+    assert_eq!(
+        assert_live_discovery_host_contract(
+            &attach,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &escaped_counter_route,
+            &run,
+        )
+        .unwrap_err(),
+        "Engine must own one shared Session::start route and one owned-child capability caller"
     );
 }
 
@@ -5966,17 +7347,432 @@ fn instance_epoch_kernel_shapes_are_flavored_apart_from_other_units() {
 }
 
 #[test]
-fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
-    let directory = tempfile::tempdir().expect("temporary native instance test");
-    // Both state sizes (F5): the small-state build must shrink
-    // INSTANCE_START (pinned by a static assert in the harness) while the
-    // native hook logic passes unchanged.
-    for small in [false, true] {
-        let binary = directory
-            .path()
-            .join(format!("instance-epoch-tests-small-{small}"));
-        let mut compiler = Command::new("clang-18");
-        compiler.args([
+fn stagea_hook_census_accepts_exact_kernel_names_and_refuses_collisions() {
+    let source = read("scripts/bench-stagea-overhead.sh");
+    let script = between(
+        &source,
+        "# STAGEA_HOOK_CENSUS_BEGIN\n",
+        "# STAGEA_HOOK_CENSUS_END",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let programs = directory.path().join("programs.json");
+    let links = directory.path().join("links.json");
+    let names = [
+        "p11_inst_vma_map",
+        "p11_inst_vma_unmap",
+        "p11_inst_vma_copy",
+        "p11_image_exec_release",
+    ];
+    let good: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            serde_json::json!({
+                "id":index + 1, "name":&name[..15], "run_time_ns":10, "run_cnt":1
+            })
+        })
+        .collect();
+    let good_links: Vec<_> = (0..4)
+        .map(|index| serde_json::json!({"id":index + 100,"prog_id":index + 1,"type":"tracing"}))
+        .collect();
+    fs::write(&programs, serde_json::to_vec(&good).unwrap()).unwrap();
+    fs::write(&links, serde_json::to_vec(&good_links).unwrap()).unwrap();
+    let run = |mode: &str| {
+        Command::new("python3")
+            .args(["-I", "-c", script])
+            .arg(&programs)
+            .arg(&links)
+            .arg(mode)
+            .output()
+            .unwrap()
+    };
+    for (mode, expected) in [("programs", "4"), ("links", "4"), ("stats", "40 4")] {
+        let output = run(mode);
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
+    // Each variant slot swaps only its own program: all four complete
+    // sets validate identically, while a set naming both variants of
+    // either slot is refused.
+    for names in [
+        [
+            "p11_inst_vma_map",
+            "p11_inst_vma_unmap",
+            "p11_inst_vma_copy",
+            "p11_image_mmap_release",
+        ],
+        [
+            "p11_inst_vma_map",
+            "p11_inst_vma_unmap",
+            "p11_inst_vma_retcopy",
+            "p11_image_exec_release",
+        ],
+        [
+            "p11_inst_vma_map",
+            "p11_inst_vma_unmap",
+            "p11_inst_vma_retcopy",
+            "p11_image_mmap_release",
+        ],
+    ] {
+        let set_good: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                serde_json::json!({
+                    "id":index + 1, "name":&name[..15], "run_time_ns":10, "run_cnt":1
+                })
+            })
+            .collect();
+        fs::write(&programs, serde_json::to_vec(&set_good).unwrap()).unwrap();
+        for (mode, expected) in [("programs", "4"), ("links", "4"), ("stats", "40 4")] {
+            let output = run(mode);
+            assert!(
+                output.status.success(),
+                "hook set {names:?} was refused in {mode} mode"
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+        }
+        let mut mixed = set_good.clone();
+        mixed.push(serde_json::json!({"id":5, "name":names[3], "run_time_ns":10, "run_cnt":1}));
+        mixed[3]["name"] = if names[3] == "p11_image_mmap_release" {
+            serde_json::json!("p11_image_exec_release")
+        } else {
+            serde_json::json!("p11_image_mmap_release")
+        };
+        fs::write(&programs, serde_json::to_vec(&mixed).unwrap()).unwrap();
+        assert!(
+            !run("programs").status.success(),
+            "mixed exec-release hook set was accepted"
+        );
+        let mut mixed_copy = set_good.clone();
+        mixed_copy
+            .push(serde_json::json!({"id":5, "name":names[2], "run_time_ns":10, "run_cnt":1}));
+        mixed_copy[2]["name"] = if names[2] == "p11_inst_vma_retcopy" {
+            serde_json::json!("p11_inst_vma_copy")
+        } else {
+            serde_json::json!("p11_inst_vma_retcopy")
+        };
+        fs::write(&programs, serde_json::to_vec(&mixed_copy).unwrap()).unwrap();
+        assert!(
+            !run("programs").status.success(),
+            "mixed copy_vma hook set was accepted"
+        );
+    }
+    fs::write(&programs, serde_json::to_vec(&good).unwrap()).unwrap();
+    for case in 0..2 {
+        let mut bad = good_links.clone();
+        if case == 0 {
+            // Keep the total four while omitting the required exec hook.
+            bad[3]["prog_id"] = serde_json::json!(1);
+        } else {
+            bad[3]["type"] = serde_json::json!("raw_tracepoint");
+        }
+        fs::write(&links, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(
+            !run("links").status.success(),
+            "hook link census case {case} was accepted"
+        );
+    }
+    fs::write(&links, serde_json::to_vec(&good_links).unwrap()).unwrap();
+    for case in 0..4 {
+        let mut bad = good.clone();
+        match case {
+            0 => {
+                bad.pop();
+            }
+            1 => {
+                let mut duplicate = good[3].clone();
+                duplicate["id"] = serde_json::json!(99);
+                bad.push(duplicate);
+            }
+            2 => {
+                bad[3]["name"] = serde_json::json!("p11_image_exec_collision");
+            }
+            _ => {
+                bad[3].as_object_mut().unwrap().remove("run_time_ns");
+            }
+        }
+        fs::write(&programs, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(
+            !run("stats").status.success(),
+            "hook census case {case} was accepted"
+        );
+    }
+}
+
+#[test]
+fn image_query_iterator_uses_seq_write_with_the_binary_row_abi() {
+    let directory = tempfile::tempdir().expect("temporary image iterator ABI contract");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+from pathlib import Path
+import struct, sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'image_query_abi_checker')
+
+def verify(data):
+    elf = checker.Elf(data)
+    symbols = [symbol for symbol in elf.symbols if symbol[0] == 'p11_image_query']
+    assert len(symbols) == 1, 'missing/duplicate image query program'
+    symbol = symbols[0]
+    assert symbol[3] == elf.indices['iter/task'], 'image query must be a task iterator'
+    row, body = elf.sections['iter/task']
+    insns = [struct.unpack_from('<BBhi', body, at)
+             for at in range(symbol[4], symbol[4] + symbol[5], 8)]
+    helpers = {immediate for op, reg, _, immediate in insns if (op, reg) == (0x85, 0)}
+    # Linux UAPI: lookup1, ktime5, seq_write127, task_storage_get156.
+    # seq_printf126 has five arguments and cannot write this binary row ABI.
+    assert 126 not in helpers, 'binary row must never call seq_printf126'
+    assert helpers == {1, 5, 127, 156}, f'unexpected iterator helper ABI: {helpers}'
+    writes = [index for index, insn in enumerate(insns) if insn == (0x85, 0, 0, 127)]
+    assert writes, 'missing actual seq_write127 call'
+    first_call = next(index for index, insn in enumerate(insns) if insn[0] == 0x85)
+    saved_context = {reg & 15 for op, reg, offset, immediate in insns[:first_call]
+                     if op == 0xbf and reg >> 4 == 1 and 6 <= reg & 15 <= 9
+                     and offset == immediate == 0}
+    assert saved_context, 'missing saved iterator context in prologue'
+    for at in writes:
+        # Pin the emitted three arguments: meta->seq, own-stack row, size40.
+        # This lowering contract supplements the actual kernel verifier gate.
+        assert at >= 5, 'truncated writer argument window'
+        meta, seq, stack, row_address, length = insns[at - 5:at]
+        assert (meta[0] == 0x79 and meta[1] & 15 == 1
+                and meta[1] >> 4 in saved_context and meta[2:] == (0, 0)
+                and seq == (0x79, 0x11, 0, 0)
+                and stack == (0xbf, 0xa2, 0, 0)
+                and row_address[:3] == (0x07, 2, 0)
+                and -512 <= row_address[3] <= -40 and row_address[3] % 8 == 0
+                and length == (0xb7, 3, 0, 40)
+                ), 'seq_write requires seq pointer, aligned stack row and exact40-byte length'
+    return row[4] + symbol[4], writes
+
+data = Path(sys.argv[1]).read_bytes()
+base, writes = verify(data)
+for at, field, value in [(writes[0], 4, 126), (writes[0] - 1, 4, 41),
+                          (writes[0] - 3, 1, 0x62)]:
+    bad = bytearray(data)
+    struct.pack_into('<i' if field == 4 else '<B', bad, base + at * 8 + field, value)
+    try: verify(bad)
+    except AssertionError: pass
+    else: raise AssertionError('wrong compiled writer ABI accepted')
+print('actual seq_write127 binary row ABI passes; three mutations refuse')
+"#,
+        ])
+        .arg(&object)
+        .output()
+        .expect("inspect actual task iterator writer helper ABI");
+    assert!(
+        output.status.success(),
+        "compiled image writer contract failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn image_query_iterator_retains_one_checked_callback_task() {
+    let directory = tempfile::tempdir().expect("temporary image iterator task contract");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+from pathlib import Path
+import struct, sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'image_query_task_checker')
+
+def verify(data):
+    elf = checker.Elf(data)
+    symbols = [s for s in elf.symbols if s[0] == 'p11_image_query']
+    assert len(symbols) == 1, 'missing/duplicate image query program'
+    symbol = symbols[0]
+    row, body = elf.sections['iter/task']
+    assert symbol[3] == elf.indices['iter/task'], 'wrong query section'
+    insns = [struct.unpack_from('<BBhi', body, at)
+             for at in range(symbol[4], symbol[4] + symbol[5], 8)]
+    first_call = next(i for i, insn in enumerate(insns) if insn[0] == 0x85)
+    contexts = {reg & 15 for op, reg, offset, immediate in insns[:first_call]
+                if op == 0xbf and reg >> 4 == 1 and 6 <= reg & 15 <= 9
+                and offset == immediate == 0}
+    loads = [i for i, (op, reg, offset, immediate) in enumerate(insns)
+             if op == 0x79 and reg >> 4 in contexts and offset == 8 and immediate == 0]
+    assert len(loads) == 1, f'callback task must be loaded once, saw {len(loads)}'
+    load = loads[0]
+    guard = load + 1
+    op, reg, offset, immediate = insns[guard]
+    assert (op in (0x15, 0x55) and reg == insns[load][1] & 15
+            and immediate == 0), 'callback task needs its own zero check'
+    start = guard + 1 if op == 0x15 else guard + 1 + offset
+    calls = [i for i, insn in enumerate(insns) if insn == (0x85, 0, 0, 156)]
+    assert len(calls) == 2 and start <= calls[0], 'missing two selected-task storage reads'
+    end = next(i for i in range(calls[-1] + 1, len(insns))
+               if insns[i] == (0x85, 0, 0, 127))
+    # A bounded LLVM lowering guard, not a verifier: follow the retained task
+    # through moves/own-stack spills along the selected task's read window.
+    aliases, spills, reads = {insns[load][1] & 15}, set(), []
+    for i in range(start, end):
+        op, reg, offset, immediate = insns[i]
+        dst, src = reg & 15, reg >> 4
+        if op == 0x85:
+            if i in calls:
+                assert 2 in aliases, 'storage read lost the checked callback task'
+            aliases -= set(range(6))
+        elif op == 0xbf:
+            aliases.discard(dst)
+            if src in aliases: aliases.add(dst)
+        elif op == 0x7b and dst == 10:
+            spills.discard(offset)
+            if src in aliases: spills.add(offset)
+        elif op & 7 == 1:
+            if src in aliases: reads.append(i)
+            aliases.discard(dst)
+            if op == 0x79 and src == 10 and offset in spills: aliases.add(dst)
+        elif op & 7 in (4, 7):
+            aliases.discard(dst)
+    assert reads and any(i > calls[-1] for i in reads), 'missing fresh retained-task field reads'
+    return row[4] + symbol[4], insns, load, guard, calls, reads, contexts
+
+data = Path(sys.argv[1]).read_bytes()
+base, insns, load, guard, calls, reads, contexts = verify(data)
+bad = bytearray(data)
+struct.pack_into('<i', bad, base + guard * 8 + 4, 1)
+mutations = [bad]
+bad = bytearray(data)
+at = next(i for i in range(calls[-1] - 1, calls[0], -1)
+          if insns[i][0] in (0xbf, 0x79) and insns[i][1] & 15 == 2)
+bad[base + at * 8 + 1] = 0xa2
+mutations.append(bad)
+bad = bytearray(data)
+at = next(i for i in reads if i > calls[-1])
+struct.pack_into('<BBhi', bad, base + at * 8, 0x79,
+                 (next(iter(contexts)) << 4) | (insns[at][1] & 15), 8, 0)
+mutations.append(bad)
+for bad in mutations:
+    try: verify(bad)
+    except AssertionError: pass
+    else: raise AssertionError('unchecked/reloaded/wrong storage task accepted')
+print('one checked callback task survives helper calls; three mutations refuse')
+"#,
+        ])
+        .arg(&object)
+        .output()
+        .expect("inspect actual task iterator callback pointer retention");
+    assert!(
+        output.status.success(),
+        "compiled image callback task contract failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The inlined native image/stamp helper stays within three 32-byte stack
+/// quanta (96 bytes): its intended code — the same-current-task provenance
+/// gate plus the selected-session seed split — occupies the third quantum
+/// (actual depth 72), past the earlier two-quantum budget. The
+/// kernel-meaningful invariant is the combined root-plus-helper fit in 512
+/// bytes, asserted below against the actual roots (currently 288) and
+/// independently by the call-chain frame test; the per-helper budget keeps
+/// the helper from eating the roots' room (implied root budget 416 against
+/// an actual 192). Mutation controls refuse the first byte past each budget
+/// (97, and the tightest root overflow 417 against a budgeted helper) plus
+/// any nested native call.
+#[test]
+fn image_entry_native_frame_fits_the_compiled_caller_budget() {
+    let directory = tempfile::tempdir().expect("temporary image entry stack contract");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+from pathlib import Path
+import struct, sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'image_stack_checker')
+
+def verify(data):
+    elf = checker.Elf(data)
+    sections = {elf.indices[name]: (row, body) for name, (row, body) in elf.sections.items()}
+    symbols = {symbol[0]: symbol for symbol in elf.symbols
+               if symbol[1] & 15 == 2 and symbol[5] and symbol[3]}
+    assert 'p11_image_entry' not in symbols, 'nested image entry must be inlined'
+    helper = symbols['p11_instance_entry']
+    def frame(symbol):
+        row, body = sections[symbol[3]]
+        insns = [struct.unpack_from('<BBhi', body, at)
+                 for at in range(symbol[4], symbol[4] + symbol[5], 8)]
+        offsets = []
+        for index, (op, reg, offset, immediate) in enumerate(insns):
+            # Pin LLVM's direct frame loads/stores and frame-address lowering.
+            # This bounded object contract does not replace kernel verification.
+            if ((op & 7 in (2, 3) and reg & 15 == 10)
+                    or (op & 7 == 1 and reg >> 4 == 10)) and offset < 0:
+                offsets.append((row[4] + symbol[4] + index * 8 + 2, -offset))
+            if (index and op == 0x07 and immediate < 0
+                    and insns[index - 1][:2] == (0xbf, 0xa0 | (reg & 15))):
+                offsets.append((row[4] + symbol[4] + index * 8 + 4, -immediate))
+        return max((depth for _, depth in offsets), default=0), offsets, insns
+    helper_depth, helper_offsets, insns = frame(helper)
+    assert helper_depth <= 96, f'native image/stamp frame {helper_depth} exceeds96'
+    assert not any((op, reg) == (0x85, 0x10) for op, reg, _, _ in insns), 'nested native call'
+    roots = [symbol for name, symbol in symbols.items()
+             if name == 'p11_entry' or name.startswith('p11_entry_')]
+    assert roots and 'p11_entry' in symbols, 'missing actual diagnostic entry'
+    for root in roots:
+        depth, _, _ = frame(root)
+        assert ((depth + 31) // 32 + (helper_depth + 31) // 32) * 32 <= 512, root[0] + ' combined stack exceeds512'
+    return helper, helper_offsets, symbols['p11_entry'], frame(symbols['p11_entry'])[1]
+
+data = Path(sys.argv[1]).read_bytes()
+helper, helper_offsets, root, root_offsets = verify(data)
+# Mutate actual emitted addressing/call instructions; each regression must refuse.
+for offsets, depth in [(helper_offsets, 97), (root_offsets, 417)]:
+    bad = bytearray(data)
+    at, _ = max(offsets, key=lambda pair: pair[1])
+    struct.pack_into('<h' if at % 8 == 2 else '<i', bad, at, -depth)
+    try: verify(bad)
+    except AssertionError: pass
+    else: raise AssertionError('over-budget actual frame accepted')
+bad = bytearray(data)
+elf = checker.Elf(data)
+row, body = next(value for name, value in elf.sections.items() if elf.indices[name] == helper[3])
+at = next(at for at in range(helper[4], helper[4] + helper[5], 8) if body[at] == 0x85)
+bad[row[4] + at + 1] = 0x10
+try: verify(bad)
+except AssertionError: pass
+else: raise AssertionError('nested native call accepted')
+print('actual entry roots and native frame budget pass; three mutations refuse')
+"#,
+        ])
+        .arg(&object)
+        .output()
+        .expect("inspect actual native entry frame and caller budgets");
+    assert!(
+        output.status.success(),
+        "compiled image stack contract failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn image_continuity_native_entry_index_poison_and_query() {
+    let directory = tempfile::tempdir().expect("temporary native image query test");
+    let binary = directory.path().join("image-query-tests");
+    let compile = Command::new("clang-18")
+        .args([
             "-O2",
             "-g",
             "-Wall",
@@ -5985,28 +7781,351 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
             "-Wno-unknown-attributes",
             "-I",
             "crates/ebpf/native",
-            "tests/fixtures/instance-epoch/helper_tests.c",
-        ]);
-        if small {
-            compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+            "tests/fixtures/image-identity/query_tests.c",
+            "-pthread",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile native image continuity/query regression");
+    assert!(
+        compile.status.success(),
+        "native image compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("run native image continuity/query regression");
+    assert!(
+        run.status.success(),
+        "native image regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn image_continuity_native_bank_b_cookies_seed_query_and_invalidate() {
+    // The same continuity/query regression compiled with the loader gate:
+    // the legacy suite must pass unchanged under the extended validity,
+    // then the qualified bank-B scenarios seed, query and invalidate.
+    let directory = tempfile::tempdir().expect("temporary native bank-B query test");
+    let binary = directory.path().join("image-query-bank-b-tests");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-DP11SCOPE_LOADER_GATE",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/image-identity/query_tests.c",
+            "-pthread",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile native bank-B continuity/query regression");
+    assert!(
+        compile.status.success(),
+        "native bank-B compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("run native bank-B continuity/query regression");
+    assert!(
+        run.status.success(),
+        "native bank-B regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("qualified bank-B cookies seed, query and invalidate"),
+        "the bank-B scenarios must run, not just compile: {stdout}"
+    );
+}
+
+#[test]
+fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
+    let directory = tempfile::tempdir().expect("temporary native instance test");
+    // Both state sizes (F5): the small-state build must shrink
+    // INSTANCE_START (pinned by a static assert in the harness) while the
+    // native hook logic passes unchanged. GAP supplies only loss marking;
+    // MARKER also runs the existing exec-birth controls. Ordinary builds
+    // keep their existing exec assertions and expose no gap selector.
+    for small in [false, true] {
+        for (mode, flag) in [
+            ("ordinary", None),
+            ("gap", Some("-DP11SCOPE_JOURNAL_GAP")),
+            ("marker", Some("-DP11SCOPE_JOURNAL_MARKER")),
+        ] {
+            let binary = directory
+                .path()
+                .join(format!("instance-epoch-tests-small-{small}-{mode}"));
+            let mut compiler = Command::new("clang-18");
+            compiler.args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Wno-unknown-attributes",
+                "-I",
+                "crates/ebpf/native",
+                "tests/fixtures/instance-epoch/helper_tests.c",
+            ]);
+            if small {
+                compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+            }
+            compiler.args(flag);
+            let compile = compiler
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .expect("execute clang-18 for native instance regression");
+            assert!(
+                compile.status.success(),
+                "native compile failed (small={small} mode={mode}): {}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let run = Command::new(&binary)
+                .output()
+                .expect("execute native instance regression");
+            assert!(
+                run.status.success(),
+                "native instance regression failed (small={small} mode={mode}): {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let gap = Command::new(&binary).arg("scope-gap").output().unwrap();
+            if mode == "ordinary" {
+                assert_eq!(gap.status.code(), Some(2));
+            } else {
+                assert!(
+                    gap.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&gap.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&gap.stdout)
+                        .contains("instance scope gap: retained DIRTY/latch controls verified")
+                );
+            }
         }
-        let compile = compiler
+    }
+}
+
+#[test]
+fn prearm_witness_native_harness_covers_every_path() {
+    let directory = tempfile::tempdir().expect("temporary native witness test");
+    let binary = directory.path().join("prearm-witness-tests");
+    let mut compiler = Command::new("clang-18");
+    compiler.args([
+        "-O2",
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unknown-attributes",
+        "-I",
+        "crates/ebpf/native",
+        "tests/fixtures/prearm-witness/harness.c",
+    ]);
+    let compile = compiler
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("execute clang-18 for native witness regression");
+    assert!(
+        compile.status.success(),
+        "native witness compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&binary)
+        .output()
+        .expect("execute native witness regression");
+    assert!(
+        run.status.success(),
+        "native witness regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout)
+            .contains("prearm witness harness: all controls verified")
+    );
+}
+
+#[test]
+fn prearm_witness_engine_wiring_source_order() {
+    // Spec P2-6 source-order contract (precedent: run.rs source-scan test).
+    // All reorder failure modes are fail-closed; this pins the order.
+    let engine = read("src/discovery/engine.rs");
+    let run = read("src/run.rs");
+    let plan = between(&engine, "fn discover_plan(", "fn resolve_prearm_pieces(");
+    require_before(
+        plan,
+        "prearm_witness::start(",
+        "set_scope_start_ns(",
+        "discover_plan",
+    )
+    .unwrap();
+    let session = between(&engine, "fn start_session_with(", "mod session_fixture");
+    require_before(
+        session,
+        "finish_start_capture_attempt(",
+        "finalize_prearm_witness(",
+        "start_session_with",
+    )
+    .unwrap();
+    let finalize = session
+        .find("finalize_prearm_witness(")
+        .expect("start_session_with finalizes the witness");
+    let ret = session
+        .rfind("Ok(session)")
+        .expect("start_session_with returns the session");
+    assert!(
+        finalize < ret,
+        "finalize must precede the return in start_session_with"
+    );
+    require_before(
+        run.as_str(),
+        "start_session(",
+        "capture_ready_line(",
+        "run.rs",
+    )
+    .unwrap();
+    // Inverted mutants must fail: each swapped order is out of order.
+    assert!(
+        require_before(
+            plan,
+            "set_scope_start_ns(",
+            "prearm_witness::start(",
+            "mutant",
+        )
+        .is_err(),
+        "swapped discover_plan order must fail"
+    );
+    assert!(
+        require_before(
+            session,
+            "finalize_prearm_witness(",
+            "finish_start_capture_attempt(",
+            "mutant",
+        )
+        .is_err(),
+        "swapped start_session_with order must fail"
+    );
+    assert!(
+        require_before(
+            run.as_str(),
+            "capture_ready_line(",
+            "start_session(",
+            "mutant",
+        )
+        .is_err(),
+        "swapped run.rs order must fail"
+    );
+    assert!(!(ret < finalize), "swapped finalize/return order must fail");
+}
+
+#[test]
+fn instance_epoch_journal_gap_selector_keeps_birth_and_exec_reads_separate() {
+    let directory = tempfile::tempdir().expect("native selector objects");
+    for (mode, flag, gap, birth) in [
+        ("ordinary", None, false, false),
+        ("gap", Some("-DP11SCOPE_JOURNAL_GAP"), true, false),
+        ("marker", Some("-DP11SCOPE_JOURNAL_MARKER"), true, true),
+    ] {
+        let preprocessed = Command::new("clang-18")
+            .args([
+                "-target",
+                "bpf",
+                "-E",
+                "-P",
+                "-dD",
+                "-I",
+                "crates/ebpf/native",
+            ])
+            .args(flag)
+            .arg("crates/ebpf/native/instance_epoch.c")
+            .output()
+            .expect("preprocess actual native selector");
+        assert!(preprocessed.status.success());
+        let source = String::from_utf8(preprocessed.stdout).unwrap();
+        for (name, expected) in [
+            ("u32 p11_instance_scope_gap(void)", gap),
+            ("void marker_latch(", gap),
+            ("extern unsigned char JOURNAL_MARKER_CTL;", gap),
+            ("u32 p11_instance_exec_birth(u32 pid_scope_tgid)", birth),
+            ("extern unsigned char PID_START_TICK;", birth),
+            ("start_boottime", birth),
+            ("self_exec_id", birth),
+            ("#define INST_MARKER_EXEC_ID(", birth),
+        ] {
+            assert_eq!(source.contains(name), expected, "{mode}: {name}");
+        }
+        assert!(!source.contains("probe_read_user"), "{mode}: new user read");
+        let object = directory.path().join(format!("instance-{mode}.o"));
+        let compiled = Command::new("clang-18")
+            .args([
+                "-target",
+                "bpf",
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-c",
+                "-I",
+                "crates/ebpf/native",
+            ])
+            .args(flag)
+            .arg("crates/ebpf/native/instance_epoch.c")
             .arg("-o")
-            .arg(&binary)
+            .arg(&object)
             .output()
-            .expect("execute clang-18 for native instance regression");
+            .expect("compile actual native selector object");
         assert!(
-            compile.status.success(),
-            "native compile failed (small={small}): {}",
-            String::from_utf8_lossy(&compile.stderr)
+            compiled.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
         );
-        let run = Command::new(binary)
-            .output()
-            .expect("execute native instance regression");
-        assert!(
-            run.status.success(),
-            "native instance regression failed (small={small}): {}",
-            String::from_utf8_lossy(&run.stderr)
+        let names = |selection: &str| {
+            let output = Command::new("llvm-nm")
+                .arg(selection)
+                .arg(&object)
+                .output()
+                .expect("inspect actual native selector symbols");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+                .collect::<BTreeSet<_>>()
+        };
+        let defined = names("--defined-only");
+        let undefined = names("--undefined-only");
+        assert_eq!(defined.contains("p11_instance_scope_gap"), gap, "{mode}");
+        assert_eq!(defined.contains("p11_instance_exec_birth"), birth, "{mode}");
+        for (name, expected) in [
+            ("JOURNAL_MARKER_CTL", gap),
+            ("p11_journal_marker_reserve", gap),
+            ("p11_journal_marker_dirty", gap),
+            ("p11_journal_marker_publish", birth),
+        ] {
+            assert_eq!(undefined.contains(name), expected, "{mode}: {name}");
+        }
+        // Actual emitted type/debug strings corroborate the preprocessor:
+        // GAP has neither an exec-id field nor a path to the READY publisher.
+        let bytes = fs::read(&object).unwrap();
+        assert_eq!(
+            bytes
+                .windows(b"self_exec_id\0".len())
+                .any(|part| part == b"self_exec_id\0"),
+            birth,
+            "{mode}"
         );
     }
 }
@@ -6015,47 +8134,69 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
 fn call_start_initializer_is_straight_line_and_caller_owned() {
     let source = read("crates/ebpf/src/main.rs");
     assert!(source.contains("#[inline(always)]\nfn record_aggregate_start("));
-    let initializer = between(
-        &source,
-        "// CALL_START_INITIALIZER_BEGIN",
-        "// CALL_START_INITIALIZER_END",
-    );
-    assert_eq!(
-        initializer
-            .matches("core::ptr::write_volatile(words.add(")
-            .count(),
-        36,
-        "CallStart's full 288 bytes need 36 explicit qword stores"
-    );
-    assert!(
-        !initializer.contains("for "),
-        "initializer must stay loop-free"
-    );
-    for index in 0..36 {
-        assert!(
-            initializer.contains(&format!(
-                "core::ptr::write_volatile(words.add({index}), 0u64);"
-            )),
-            "initializer misses qword {index}"
-        );
-    }
-
+    assert!(!source.contains("fn zero_call_start("));
     let aggregate = between(
         &source,
         "fn record_aggregate_start(",
-        "#[inline(always)]\nfn p11_entry_impl",
+        "/// The probed runtime address:",
     );
     let normal = between(
         &source,
         "fn p11_entry_impl<",
         "#[uretprobe]\npub fn p11_return",
     );
-    for caller in [aggregate, normal] {
-        assert!(caller.contains("MaybeUninit::<CallStart>::uninit()"));
-        assert!(caller.contains("zero_call_start(&mut storage)"));
-        assert!(caller.contains("storage.assume_init_mut()"));
-        assert!(!caller.contains("CallStart::default()"));
-        assert!(!caller.contains("let mut start = CallStart {"));
+    // Counts deliberately seeds zero without a clock read; every timing mode
+    // passes its one original timestamp through the same native constructor.
+    assert!(aggregate.contains("#[cfg(feature = \"counter-counts\")]\n    let timestamp = 0;"));
+    assert!(aggregate.contains(
+        "#[cfg(not(feature = \"counter-counts\"))]\n    let timestamp = unsafe { helpers::bpf_ktime_get_ns() };"
+    ));
+    assert!(aggregate.contains("p11_owner_start_aggregate(key, timestamp)"));
+    assert_eq!(aggregate.matches("helpers::bpf_ktime_get_ns()").count(), 1);
+    assert!(!aggregate.contains("CallStart"));
+    assert!(!normal.contains("MaybeUninit::<CallStart>::uninit()"));
+    assert!(normal.contains("p11_owner_start_begin(&key, &seed)"));
+    assert_eq!(normal.matches("helpers::bpf_ktime_get_ns()").count(), 1);
+    // Native full-byte comparisons cover all288 bytes including padding:
+    // aggregate is zero except timestamp; normal binds its immutable seed.
+    // Failure/rollback controls exercise these actual production constructors.
+    let directory = tempfile::tempdir().expect("seeded START constructor fixture");
+    let binary = directory.path().join("seeded-start");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual native constructor");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    for case in [
+        "object_seeded_start_construction",
+        "object_seeded_start_failures",
+        "object_aggregate_start_construction",
+    ] {
+        let run = Command::new(&binary)
+            .arg(case)
+            .output()
+            .expect("run constructor control");
+        assert!(
+            run.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
     for default in [
         "start.session = SESSION_NONE;",
@@ -6204,6 +8345,31 @@ fn decode_params_narrows_output_and_reports_failure_once() {
     assert!(decode_call.contains("shape::NONE => {}"));
     assert!(decode_call.contains("_ => capture_failure(start),"));
     assert_eq!(decode_call.matches("capture_failure(start)").count(), 1);
+}
+
+#[test]
+fn unregistered_publication_bound_to_32bit_ids_at_return_path() {
+    // Per-id publication covers only ids <= 0xFFFFFFFF — the whole
+    // defined and portable mechanism space. A provider-accepted wider
+    // word on a 64-bit target is counted in
+    // `evidence.unregistered_mechanisms`, never published.
+    let source = read("crates/ebpf/src/main.rs");
+    let facts = between(
+        &source,
+        "fn capture_return_facts<const DEFER_ROUTING: bool>(",
+        "fn ordinary_return(",
+    );
+    let flat: String = facts.chars().filter(|c| !c.is_whitespace()).collect();
+    let bound = flat
+        .find("ifmember||(!DEFER_ROUTING&&value<=0xFFFF_FFFF){")
+        .expect("return-path publication must bound unregistered ids to 32 bits");
+    let bump = flat
+        .find("if!member{bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS);}")
+        .expect("membership-keyed evidence bump");
+    assert!(
+        bound < bump,
+        "the bound gates publication; the total counts every occurrence"
+    );
 }
 
 #[test]
@@ -6403,7 +8569,15 @@ fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
     let types_count = types.find("output.count += 1;").unwrap();
     assert!(types_read < types_write && types_write < types_count);
 
-    let implementation = between(&source, "fn walk_template_impl<", "fn arg_u64(");
+    // The walker's own body, through its closing brace: the next item may
+    // carry attributes or comments (arg_u64 is #[inline(always)]).
+    let implementation = {
+        let body = source
+            .split_once("fn walk_template_impl<")
+            .expect("missing section start: fn walk_template_impl<")
+            .1;
+        &body[..body.find("\n}\n").expect("walker body end") + "\n}".len()]
+    };
     assert!(source.contains(
         "#[cfg(feature = \"unsafe-unvalidated-metadata\")]\n#[inline(never)]\nfn walk_template_impl<"
     ));
@@ -6674,11 +8848,22 @@ fn policy_specific_ebpf() {
     assert_eq!(definitions["ASYNC_FUNCTIONS"][KEY_SIZE], 32);
     assert_eq!(definitions["TAIL_CALLS"][0], 3);
     assert_eq!(definitions["TAIL_CALLS"][3], 2);
+    // docs/privacy/allowlist-v1.md: the template decoders are "Unsafe
+    // diagnostic only" and "absent from the default release BPF object",
+    // so the diagnostic object carries these maps and symbols instead.
+    let diagnostic = cfg!(feature = "unsafe-unvalidated-metadata");
     for unsafe_map in ["ATTR_BOOL_BITS", "PAIR_CALLS"] {
-        assert!(
-            !definitions.contains_key(unsafe_map),
-            "default object contains unsafe-only map {unsafe_map}"
-        );
+        if diagnostic {
+            assert!(
+                definitions.contains_key(unsafe_map),
+                "diagnostic object misses unsafe-only map {unsafe_map}"
+            );
+        } else {
+            assert!(
+                !definitions.contains_key(unsafe_map),
+                "default object contains unsafe-only map {unsafe_map}"
+            );
+        }
     }
     for unsafe_symbol in [
         "p11_entry_template",
@@ -6688,10 +8873,17 @@ fn policy_specific_ebpf() {
         "walk_template",
         "decode_params",
     ] {
-        assert!(
-            !symbols.contains(unsafe_symbol),
-            "default object contains unsafe-only symbol {unsafe_symbol}"
-        );
+        if diagnostic {
+            assert!(
+                symbols.contains(unsafe_symbol),
+                "diagnostic object misses unsafe-only symbol {unsafe_symbol}"
+            );
+        } else {
+            assert!(
+                !symbols.contains(unsafe_symbol),
+                "default object contains unsafe-only symbol {unsafe_symbol}"
+            );
+        }
     }
 }
 
@@ -6838,6 +9030,29 @@ fn canary_process_custody_lifecycle() {
 }
 
 #[test]
+fn retained_ring_refusal_diagnostics_are_closed() {
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_stopped_canary_capture.py",
+            "RetainedRingDiagnosticTests",
+            "-v",
+        ])
+        .output()
+        .expect("run finite retained-ring diagnostic boundaries");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "retained-ring diagnostics: {report}"
+    );
+    assert_clean_python_suite(&report, "RetainedRingDiagnosticTests", 5);
+}
+
+#[test]
 fn stopped_canary_capture_lifecycle() {
     // Hang guard at ~4x the ~70 s isolated suite time (43-63 s plus ~4 s
     // for the widened missing_* budgets): the old 90 s (~1.5x) fired under
@@ -6894,6 +9109,59 @@ fn task_storage_canary_seed_lifecycle() {
     assert_clean_python_suite(&report, "TaskStorageCanaryTests", 34);
 }
 
+/// N5: the task-storage iterator emits the live THREAD_OWNER ABI.
+/// The reader accepts 544 B (Inventory) and 560 B (Detailed) rows and
+/// rejects any frame whose length disagrees with the reused map, so
+/// the iterator carries one program per (surface, ABI) pair with a
+/// verifier-visible constant length each. This pins the real emitted
+/// constants in the real object: each program's disassembly carries
+/// its own ABI length and never the other's.
+#[test]
+fn task_storage_iterator_dual_abi() {
+    let directory = tempfile::tempdir().unwrap();
+    let reader_build = directory.path().join("task-storage-reader");
+    let reader_build_text = reader_build.to_str().unwrap();
+    run_ok(
+        "sh",
+        &["scripts/build-task-storage-reader.sh", reader_build_text],
+    );
+    let iterator = reader_build.join("dump-task-storage.bpf.o");
+    let iterator_disassembly = run_ok(
+        "llvm-objdump",
+        &["-d", "--print-imm-hex", iterator.to_str().unwrap()],
+    );
+    for (program, own, foreign) in [
+        ("dump_task_storage_544", "0x220", "0x230"),
+        ("dump_task_storage_560", "0x230", "0x220"),
+        ("dump_task_storage_epoch_544", "0x220", "0x230"),
+        ("dump_task_storage_epoch_560", "0x230", "0x220"),
+    ] {
+        let label = format!("<{program}>:");
+        let start = iterator_disassembly.find(&label).unwrap_or_else(|| {
+            panic!("iterator object lacks program {program}: {iterator_disassembly}")
+        });
+        // Programs end at the next program label (label lines lead
+        // with an address, so match the bare `<name` prefix); local
+        // block labels (`<LBB..>:`) stay inside the chunk.
+        let rest = &iterator_disassembly[start + label.len()..];
+        let end = rest
+            .find("<dump_task_storage")
+            .map(|at| start + label.len() + at);
+        let chunk = match end {
+            Some(end) => &iterator_disassembly[start..end],
+            None => &iterator_disassembly[start..],
+        };
+        assert!(
+            chunk.contains(own),
+            "{program} must emit its {own} ABI length: {chunk}"
+        );
+        assert!(
+            !chunk.contains(foreign),
+            "{program} must never emit the foreign {foreign} length: {chunk}"
+        );
+    }
+}
+
 #[test]
 fn metadata_canary_matrix() {
     let canaries = read("scripts/verify-canaries.sh");
@@ -6901,7 +9169,7 @@ fn metadata_canary_matrix() {
     let assert_lanes = between(
         &canaries,
         "assert_lanes() {",
-        "\n}\n\nif [ \"${1-}\" = \"--self-test\" ]",
+        "\n}\n\nif [ \"$SELF_TEST\" -eq 1 ]",
     );
     assert!(
         !assert_lanes.contains("<<'PY'")
@@ -6957,7 +9225,7 @@ aggregate-only-metrics default metrics"
     let owned_lane = between(
         &canaries,
         "run_owned_lane() {",
-        "\n}\n\nwhile read -r owned_lane owned_build; do",
+        "\n}\n\nif [ \"$OBJECT_PILOT\" -eq 0 ]; then\nwhile read -r owned_lane owned_build; do",
     );
     assert!(
         owned_lane.contains("--workload-origin owned")
@@ -6978,7 +9246,7 @@ aggregate-only-metrics default metrics"
     let start_lane = between(
         &canaries,
         "run_start_lane() {",
-        "\n}\n\necho \"=== live safe START policy",
+        "\n}\n\nif [ \"$OBJECT_PILOT\" -eq 0 ]; then\necho \"=== live safe START policy",
     );
     let raw_start = start_lane
         .find("sudo python3 -I scripts/capture-stopped-canary.py")
@@ -6995,11 +9263,14 @@ aggregate-only-metrics default metrics"
     let induced = read("scripts/verify-induced-gaps.sh");
     for (name, caller, paths, entrypoint, acquisitions) in [
         (
+            // H7 slice D: run_lane, run_start_lane, run_owned_lane plus the
+            // object cell's completion and blocked acquisitions (5). Every
+            // acquisition still passes both native paths over `python3 -I`.
             "canary",
             canaries.as_str(),
             "\"$TASK_STORAGE_READER\" --obj \"$TASK_STORAGE_OBJECT\"",
             "sudo python3 -I scripts/capture-stopped-canary.py",
-            3,
+            5,
         ),
         (
             "induced-gap",
@@ -7193,7 +9464,7 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("raw policy oracle self-test: OK"));
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
     assert!(lanes.contains("scan-only hostile output contract: OK"));
-    assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
+    assert!(lanes.contains("canary baseline matrix 1056/104/208 with 16 mixed surfaces: OK"));
     // The 15 classes below run together as one native lane, so `unittest`
     // prints a single combined "Ran N tests" summary for all of them, not one
     // per class. This floor is that combined total, not a per-class count for
@@ -7309,7 +9580,9 @@ aggregate-only-metrics default metrics"
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",
     )));
-    assert_eq!(sentinels.len(), 21, "unexpected fixture sentinel inventory");
+    // H7 slice D: 21 hosted families plus the object-lane CKA_VALUE decoy
+    // (CANARY_OBJECT_*), covered by the scanner self-test like the rest.
+    assert_eq!(sentinels.len(), 22, "unexpected fixture sentinel inventory");
     for sentinel in sentinels {
         assert!(
             lanes.contains(&sentinel),
@@ -7473,6 +9746,40 @@ fn operator_docs_preserve_semantic_authority_limits() {
                 .join(" ")
                 .contains(statement),
             "{path} is missing: {statement}"
+        );
+    }
+}
+
+/// The reload-disclosure linkage publication has its own allowlist-v3 row: the
+/// status paragraph lists the section, its anchor matches the heading, and the
+/// row names the exact field, its ledger source, the labels-and-counts output
+/// and the never-published subjects.
+#[test]
+fn allowlist_v3_names_the_reload_disclosure_linkage_row() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## Reload-disclosure linkage publication (B17 leg 2, 2026-11-04)";
+    assert!(
+        text.lines().any(|line| line == heading),
+        "allowlist-v3 lost the reload-disclosure linkage section"
+    );
+    assert!(
+        text.contains(
+            "[reload-disclosure linkage publication](#reload-disclosure-linkage-publication-b17-leg-2-2026-11-04)"
+        ),
+        "the status paragraph must list the reload-disclosure linkage section"
+    );
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in [
+        "instance_reload_not_excluded",
+        "reload_not_excluded",
+        "continued_across_global",
+        "`mN`/`iN`",
+        "No router ID, file slot",
+        "absent (never null)",
+    ] {
+        assert!(
+            flat.contains(marker),
+            "the linkage row must name {marker:?}"
         );
     }
 }
@@ -7652,6 +9959,14 @@ fn k8s_entry_hardens_the_scratch_mount() {
         daemonset.contains("mountPath: /tmp"),
         "the hardened path must stay the manifest's scratch mount"
     );
+    // K3 regression: a direct `kubectl exec ... p11scope inventory --system
+    // -o /tmp/...` (the documented inventory command) runs without the entry
+    // script, so the pod itself must harden the mount at start.
+    assert!(
+        daemonset
+            .contains(r#"command: ["/bin/sh", "-c", "chmod 1777 /tmp && exec sleep infinity"]"#),
+        "the observer container must harden /tmp at pod start"
+    );
 }
 
 #[test]
@@ -7722,22 +10037,126 @@ fn block_under<'a>(source: &'a str, header: &str) -> &'a str {
 }
 
 /// The hosted check jobs that together replaced the single `checks-and-e2e`
-/// job. They run on every push and pull request, in parallel, and every one of
-/// them gates the run: `archive-log` keeps each one's log and `quarantine`
+/// job. They run on every push and pull request; the BPF comparison follows
+/// tests. Every one gates the run: `archive-log` keeps each one's log and `quarantine`
 /// fires when any one fails.
-const CHECK_JOBS: [&str; 5] = ["lint", "audit", "tests", "contracts", "scripts"];
-
-/// Every job that runs project Cargo after reconstructing the pinned
-/// dependency sources: the check jobs plus the coverage shards and report.
-const CARGO_JOBS: [&str; 7] = [
+const CHECK_JOBS: [&str; 6] = [
     "lint",
     "audit",
     "tests",
+    "bpf-noninterference",
+    "contracts",
+    "scripts",
+];
+
+/// Every job that runs project Cargo after reconstructing the pinned
+/// dependency sources: the check jobs plus the coverage shards and report.
+const CARGO_JOBS: [&str; 8] = [
+    "lint",
+    "audit",
+    "tests",
+    "bpf-noninterference",
     "contracts",
     "scripts",
     "coverage",
     "coverage-report",
 ];
+
+#[test]
+fn hosted_pipeline_requires_exact_default_bpf_comparison() {
+    let ci = read(".github/workflows/ci.yml");
+    let driver = read("scripts/check-bpf-noninterference.py");
+    assert_hosted_bpf_noninterference(&ci).unwrap();
+    assert_bpf_snapshot_dependency_preparation(&driver).unwrap();
+    assert_hosted_bpf_external_lane_calls(&ci).unwrap();
+    let comparison = job_block(&ci, "bpf-noninterference");
+    let call = r#"python3 -I scripts/check-bpf-noninterference.py \"#;
+    for changed in [
+        comparison.replacen(
+            "set -euo pipefail",
+            "set -euo pipefail\n          scripts/verify-inspect-doctor.sh",
+            1,
+        ),
+        comparison.replacen(call, &format!("sudo {call}"), 1),
+        comparison.replacen(
+            call,
+            &format!("{call} && scripts/verify-inspect-doctor.sh"),
+            1,
+        ),
+    ] {
+        let changed = ci.replacen(comparison, &changed, 1);
+        assert!(
+            assert_hosted_bpf_external_lane_calls(&changed).is_err(),
+            "an additional or altered external comparison lane must be rejected"
+        );
+    }
+    for marker in [
+        "needs: [dedupe, tests]",
+        "!cancelled() && needs.dedupe.outputs.run == 'true'",
+        "fetch-depth: 0",
+        // Pinned baseline 3681a1ab7: the keygen return-path gate
+        // (Detailed .text +128 B in the two inlined return functions;
+        // the unsafe entry flag compiles out of default builds) and the
+        // round-10 inventory ring raise (one `maps` word per Inventory
+        // object; code byte-identical), on top of 873adf5c4 (6.14
+        // exit-time mapping summaries); all enumerated in the ci.yml
+        // comment.
+        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
+        "--repeat-baseline",
+        "--candidate \"$GITHUB_SHA\"",
+        "--work \"$comparison_root/integration\"\n",
+        "test -s \"$comparison_root/integration/comparison.json\"",
+        "${{ runner.temp }}/bpf-noninterference/*/candidate/",
+    ] {
+        let block = job_block(&ci, "bpf-noninterference");
+        let changed = ci.replacen(block, &block.replacen(marker, "", 1), 1);
+        assert!(
+            assert_hosted_bpf_noninterference(&changed).is_err(),
+            "removing {marker:?} must reject the comparison job"
+        );
+    }
+    let revived = ci.replacen(
+        "--work \"$comparison_root/integration\"\n",
+        "--work \"$comparison_root/integration\" --host-compiler-transition\n",
+        1,
+    );
+    assert!(
+        assert_hosted_bpf_noninterference(&revived).is_err(),
+        "reviving the removed host compiler transition must reject the comparison job"
+    );
+    let prepare = r#"command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
+    let fetch = r#""fetch", "--locked", "--manifest-path", str(logical / "Cargo.toml")"#;
+    for marker in [
+        prepare,
+        fetch,
+        r#""fetch", "--locked", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")"#,
+        r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#,
+        r#"env["CARGO_NET_OFFLINE"] = "true""#,
+        r#"host_env["CARGO_NET_OFFLINE"] = "true""#,
+        r#"build_log = command([host_cargo, "build", "--locked", "--offline", "--lib""#,
+        "with logical_source_alias(source, logical) as verify:",
+        "\n        verify()\n        result = run_command(*args, **kwargs)",
+        "result = run_command(*args, **kwargs)\n        verify()\n",
+        r#""--no-deps", "--format-version", "1", "--manifest-path", str(logical / "Cargo.toml")]"#,
+        r#""--no-default-features", "--message-format=json", "--manifest-path", str(logical / "Cargo.toml")]"#,
+    ] {
+        assert!(
+            assert_bpf_snapshot_dependency_preparation(&driver.replacen(marker, "", 1)).is_err(),
+            "removing {marker:?} must reject snapshot preparation"
+        );
+    }
+    let moved = driver
+        .replacen(prepare, "", 1)
+        .replacen(fetch, &format!("{fetch}\n{prepare}"), 1);
+    assert!(assert_bpf_snapshot_dependency_preparation(&moved).is_err());
+    for manifest in [
+        r#"str(logical / "Cargo.toml")"#,
+        r#"str(logical / "crates/ebpf/Cargo.toml")"#,
+    ] {
+        let poisoned = driver.replacen(manifest, r#""/unreviewed/Cargo.toml""#, 1);
+        assert!(assert_bpf_snapshot_dependency_preparation(&poisoned).is_err());
+    }
+}
 
 /// The `scripts` check job: it prints the UNRUN block and runs every
 /// validator `--self-test` and every lane this pipeline runs in full, so the
@@ -7767,7 +10186,7 @@ fn script_dirs() -> Vec<String> {
     found.sort();
     assert_eq!(
         found,
-        ["fixtures", "matrix", "native"],
+        ["ci", "fixtures", "matrix", "native"],
         "a new directory under scripts/: teach the UNRUN and self-test derivations \
          about it, or a privileged lane there is invisible to both"
     );
@@ -7785,7 +10204,7 @@ fn script_dirs() -> Vec<String> {
 fn every_admitted_script_directory_is_scanned() {
     assert_eq!(
         script_dirs(),
-        ["scripts", "scripts/matrix", "scripts/native"],
+        ["scripts", "scripts/ci", "scripts/matrix", "scripts/native"],
         "every admitted non-fixture directory must participate in the lane derivations"
     );
 }
@@ -7918,7 +10337,33 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
 /// does (`receipt-fcntl-experiment.py`, positional `self-test`) is covered inside
 /// the ordinary `cargo test` gate by `tests/receipt_build_subjects.rs`. `scripts/gates.sh` is the local entry point
 /// that only invokes the others; `lib.sh`, `cleanup-traps.sh` and `fixtures/`
-/// are not validators.
+/// are not validators. `scripts/run-python-suites.py` is the suite driver whose
+/// RUN registry names other suites' flags as data, not its own argv parsing.
+fn is_self_test_capable(path: &str) -> bool {
+    if [
+        "scripts/gates.sh",
+        "scripts/lib.sh",
+        "scripts/cleanup-traps.sh",
+        // Suite-driver registry data is not capability: the RUN row
+        // `("test_h4a_prepost_userspace.py", ["--self-test"])` names another
+        // file's flag, and the driver's own argv parsing implements only
+        // `--list`/`--check` plus suite names. Without this exclusion the
+        // detector demands a hosted `run-python-suites.py --self-test` step
+        // that would fail on the runner, which has no such flag.
+        "scripts/run-python-suites.py",
+    ]
+    .contains(&path)
+    {
+        return false;
+    }
+    // A comment merely mentioning --self-test does not make the
+    // script self-test-capable; without this, a line explaining that
+    // a script has no self-test would demand a hosted step for it.
+    read(path)
+        .lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.contains("--self-test"))
+}
+
 #[test]
 fn hosted_pipeline_runs_every_unprivileged_self_test() {
     let ci = read(".github/workflows/ci.yml");
@@ -7934,19 +10379,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
                 Some((_, "py")) => "python3 -I ",
                 _ => continue,
             };
-            if [
-                "scripts/gates.sh",
-                "scripts/lib.sh",
-                "scripts/cleanup-traps.sh",
-            ]
-            .contains(&path)
-                // A comment merely mentioning --self-test does not make the
-                // script self-test-capable; without this, a line explaining that
-                // a script has no self-test would demand a hosted step for it.
-                || !read(path).lines().any(|line| {
-                    !line.trim_start().starts_with('#') && line.contains("--self-test")
-                })
-            {
+            if !is_self_test_capable(path) {
                 continue;
             }
             expected.insert(format!("- run: {interpreter}{path} --self-test"));
@@ -7972,6 +10405,45 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     assert_eq!(
         hosted, expected,
         "the hosted `--self-test` steps must be exactly the self-test-capable scripts"
+    );
+}
+
+/// Negative twin of `hosted_pipeline_runs_every_unprivileged_self_test`: a
+/// data-only `--self-test` mention must demand no hosted step. Fails pre-fix,
+/// when the detector classifies the driver's registry row as capability. The
+/// two-way guard lives on in the main test's unchanged `assert_eq`: a capable
+/// script with no step and a stale step whose oracle is gone both still fail
+/// there.
+#[test]
+fn hosted_self_test_detector_ignores_registry_data_mentions() {
+    // Premise: the registry still carries a non-comment --self-test mention,
+    // so this twin is load-bearing rather than vacuous.
+    assert!(
+        read("scripts/run-python-suites.py")
+            .lines()
+            .any(|line| { !line.trim_start().starts_with('#') && line.contains("--self-test") }),
+        "twin premise: scripts/run-python-suites.py must still carry a \
+         data-only --self-test mention"
+    );
+    // The detector must not classify registry data as capability ...
+    assert!(
+        !is_self_test_capable("scripts/run-python-suites.py"),
+        "registry data naming another file's --self-test flag must not demand \
+         a hosted step"
+    );
+    // ... and the hosted job must carry no such step.
+    let ci = read(".github/workflows/ci.yml");
+    assert!(
+        !checks_job(&ci)
+            .lines()
+            .any(|line| line.trim().contains("run-python-suites.py --self-test")),
+        "no hosted step may invoke the suite driver with --self-test"
+    );
+    // Positive control: a genuinely capable script is still detected, so the
+    // exclusion cannot silently empty the whole derivation.
+    assert!(
+        is_self_test_capable("scripts/verify-canaries.sh"),
+        "positive control: verify-canaries.sh implements --self-test"
     );
 }
 
@@ -8264,6 +10736,9 @@ fn hosted_python_privilege_covers_real_owned_launcher_call_sites() {
 /// ones the job runs
 /// in full — and the label says whether the script's `--self-test` runs in
 /// this job, so a lane whose self-test is hosted is not mislabelled as absent.
+/// The same test owns the workflow's gate pins: the lint offline gates
+/// (including the shipped musl/P0 configurations) and the release preview's
+/// FULL and P0 builds.
 #[test]
 fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let ci = read(".github/workflows/ci.yml");
@@ -8331,8 +10806,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 })
         })
     };
-    // Fail closed. This reads two forms only — `- run: <script>` is a full lane
-    // run, `- run: <script> --self-test` is not — and every other way of invoking
+    // Fail closed. `- run: <script>` is a full lane run and
+    // `- run: <script> --self-test` is not. The attach lane's exact
+    // `--diagnose-skips` call still runs both full lanes and their oracles;
+    // it only adds bounded failure attribution. Every other way of invoking
     // a lane (`bash scripts/x.sh`, `./scripts/x.sh`, a call inside a `run: |`
     // block, an extra argument) is refused rather than quietly treated as "did
     // not run in full", which would leave this job printing `UNRUN:` for a lane
@@ -8342,9 +10819,81 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // inverse of a path character rather than a list of separators: enumerating
     // separators is what let `scripts/x.sh;` through, and the list was still
     // missing backtick, brackets and comma one round later.
-    let is_lane = |token: &str| {
+    fn is_lane(token: &str) -> bool {
         token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
-    };
+    }
+    fn lane_call(line: &str) -> Option<(&str, bool)> {
+        // `- name:` above a step is an ordinary edit, so accept bare `run:` too.
+        let call = line
+            .strip_prefix("- run: ")
+            .or_else(|| line.strip_prefix("run: "))?;
+        if call == "scripts/verify-attach-e2e.sh --diagnose-skips" {
+            return Some(("scripts/verify-attach-e2e.sh", true));
+        }
+        let call = call.strip_prefix("python3 -I ").unwrap_or(call);
+        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
+        match (command.starts_with("scripts/") && is_lane(command), tail) {
+            (true, "") => Some((command, true)),
+            (true, "--self-test") => Some((command, false)),
+            _ => None,
+        }
+    }
+    // Exercise the same classifier that derives hosted_full below. Broader
+    // flag or path matching would silently change the UNRUN/scope claims.
+    for (line, command, full) in [
+        (
+            "- run: scripts/verify-attach-e2e.sh --diagnose-skips",
+            "scripts/verify-attach-e2e.sh",
+            true,
+        ),
+        (
+            "run: scripts/verify-attach-e2e.sh --diagnose-skips",
+            "scripts/verify-attach-e2e.sh",
+            true,
+        ),
+        (
+            "run: scripts/verify-attach-e2e.sh",
+            "scripts/verify-attach-e2e.sh",
+            true,
+        ),
+        (
+            "run: scripts/verify-attach-e2e.sh --self-test",
+            "scripts/verify-attach-e2e.sh",
+            false,
+        ),
+        (
+            "run: python3 -I scripts/run-python-suites.py",
+            "scripts/run-python-suites.py",
+            true,
+        ),
+        (
+            "run: python3 -I scripts/run-python-suites.py --self-test",
+            "scripts/run-python-suites.py",
+            false,
+        ),
+    ] {
+        assert_eq!(lane_call(line), Some((command, full)), "{line:?}");
+    }
+    for line in [
+        "run: scripts/verify-attach-e2e.sh --unknown",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips --unknown",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips --self-test",
+        "run: scripts/verify-attach-e2e.sh --self-test --diagnose-skips",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips --diagnose-skips",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips && scripts/verify-inspect-doctor.sh",
+        "run: echo scripts/verify-attach-e2e.sh --diagnose-skips",
+        "name: scripts/verify-attach-e2e.sh --diagnose-skips",
+        "scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: ./scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: /elsewhere/scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: scripts/fixtures/verify-attach-e2e.sh --diagnose-skips",
+        "run: bash scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: scripts/verify-inspect-doctor.sh --diagnose-skips",
+        "run: python3 -I scripts/run-python-suites.py --diagnose-skips",
+        "run: python3 -I scripts/verify-attach-e2e.sh --diagnose-skips",
+    ] {
+        assert_eq!(lane_call(line), None, "unreviewed invocation {line:?}");
+    }
     let names_lane = |line: &str| {
         line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
             .any(is_lane)
@@ -8398,8 +10947,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // with its gate pinned. None runs on the push/PR success path (manual
     // dispatch or post-failure evidence only), so the checks job's UNRUN and
     // scope: claims keep their exact meaning. A new script in any of these
-    // jobs, or a fourth script-naming job, fails here until this table is
-    // taught about it first.
+    // jobs fails here until this table is taught about it first. The required
+    // unprivileged comparison job is admitted separately below.
     let manual_jobs: [(&str, &str, &[&str]); 3] = [
         (
             "privileged-e2e",
@@ -8418,10 +10967,89 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         ),
         (
             "quarantine",
-            "if: failure()",
+            concat!(
+                "if: ${{ failure() && (needs.tests.result == 'failure' || ",
+                "needs.contracts.result == 'failure' || needs.scripts.result == 'failure' || ",
+                "needs.bpf-noninterference.result == 'failure') }}",
+            ),
             &["scripts/run-flake-quarantine.sh"],
         ),
     ];
+    fn manual_job_reference_admitted(
+        job: &str,
+        line: &str,
+        script: &str,
+        lanes: &[&str],
+        dependency_helpers: &[&str],
+    ) -> bool {
+        // Schema validation reads these two pinned assignments; it does not
+        // execute the Knative lane or add it to the job's runnable lane set.
+        let read_only_pin = job == "release-preview"
+            && script == "scripts/knative-e2e.sh"
+            && matches!(
+                line,
+                "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)"
+                    | "digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)"
+            );
+        dependency_helpers.contains(&script) || lanes.contains(&script) || read_only_pin
+    }
+    let preview_lanes = manual_jobs
+        .iter()
+        .find(|(job, _, _)| *job == "release-preview")
+        .unwrap()
+        .2;
+    for line in [
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)",
+        "digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)",
+    ] {
+        assert!(manual_job_reference_admitted(
+            "release-preview",
+            line,
+            "scripts/knative-e2e.sh",
+            preview_lanes,
+            &dependency_helpers,
+        ));
+        for job in ["checks", "privileged-e2e", "quarantine"] {
+            assert!(
+                !manual_job_reference_admitted(
+                    job,
+                    line,
+                    "scripts/knative-e2e.sh",
+                    preview_lanes,
+                    &dependency_helpers,
+                ),
+                "read-only pin extraction is not admitted in {job}"
+            );
+        }
+    }
+    for line in [
+        "scripts/knative-e2e.sh",
+        "run: scripts/knative-e2e.sh",
+        "bash scripts/knative-e2e.sh",
+        "source scripts/knative-e2e.sh",
+        ". scripts/knative-e2e.sh",
+        "version=$(scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh) && true",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh); scripts/knative-e2e.sh",
+        "digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh); bash scripts/knative-e2e.sh",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' ./scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/other.sh)",
+        "version=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)",
+        "digest=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/KNATIVE_VERSION=//p' scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh --run)",
+    ] {
+        assert!(
+            !manual_job_reference_admitted(
+                "release-preview",
+                line,
+                "scripts/knative-e2e.sh",
+                preview_lanes,
+                &dependency_helpers,
+            ),
+            "unreviewed Knative reference {line:?}"
+        );
+    }
     let mut outside = ci.replacen(checks, "", 1);
     for (job, gate, lanes) in manual_jobs {
         let block = block_under(&ci, &format!("  {job}:"));
@@ -8438,9 +11066,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 continue;
             }
             for script in named_scripts(line) {
-                let dependency_only = dependency_helpers.contains(&script.as_str());
                 assert!(
-                    dependency_only || lanes.contains(&script.as_str()),
+                    manual_job_reference_admitted(job, line, &script, lanes, &dependency_helpers),
                     "{job} names {script}, outside its documented lane set {lanes:?}: teach the \
                      table about it first",
                 );
@@ -8459,6 +11086,12 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
         outside = outside.replacen(block, "", 1);
     }
+    // This required job runs an unprivileged build comparison outside checks.
+    // Admit only its reviewed gates and two exact driver call lines; do not
+    // credit it to this checks job's hosted_full or UNRUN/scope claims.
+    assert_hosted_bpf_external_lane_calls(&ci).unwrap();
+    let comparison = block_under(&ci, "  bpf-noninterference:");
+    outside = outside.replacen(comparison, "", 1);
     // The other check jobs and the coverage jobs name two kinds of script and
     // no lane: the dependency helpers, and the test-gate partition helper,
     // which only narrows the workspace test gate's `--all-targets` (every call
@@ -8466,17 +11099,30 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // `hosted_pipeline_partitions_the_workspace_test_gate`; its own
     // `--self-test` is an ordinary step of the checks job).
     let partition_helper = "scripts/ci-test-partition.py";
-    for line in outside.lines().map(str::trim) {
-        let line = line
-            .split_once(" #")
-            .map_or(line, |(code, _)| code.trim_end());
+    let outside_line_admitted = |line: &str| {
         let scripts = named_scripts(line);
         let dependency_only = !scripts.is_empty()
             && scripts.iter().all(|script| {
                 dependency_helpers.contains(&script.as_str()) || script == partition_helper
             });
+        line.starts_with('#') || !names_lane(line) || dependency_only
+    };
+    for rejected in [
+        "python3 -I scripts/check-bpf-noninterference.py \\",
+        "run: scripts/verify-inspect-doctor.sh",
+        "run: python3 -I scripts/prepare-dependencies.py && scripts/verify-inspect-doctor.sh",
+    ] {
         assert!(
-            line.starts_with('#') || !names_lane(line) || dependency_only,
+            !outside_line_admitted(rejected),
+            "a known comparison or arbitrary lane outside its admitted job must be rejected"
+        );
+    }
+    for line in outside.lines().map(str::trim) {
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
+        assert!(
+            outside_line_admitted(line),
             "a lane is named outside the checks job: {line:?}. The UNRUN and scope \
              claims are about that job alone; running a lane elsewhere needs the \
              derivation taught about it first"
@@ -8505,26 +11151,33 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             );
             continue;
         }
-        // `- name:` above a step is an ordinary edit, so accept the bare `run:` form.
-        let call = line
-            .strip_prefix("- run: ")
-            .or_else(|| line.strip_prefix("run: "))
-            .unwrap_or_default();
-        let call = call.strip_prefix("python3 -I ").unwrap_or(call);
-        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
-        match (command.starts_with("scripts/") && is_lane(command), tail) {
-            (true, "") => {
+        match lane_call(line) {
+            Some((command, true)) => {
                 hosted_full.insert(command);
             }
-            (true, "--self-test") => {}
-            _ => panic!(
+            Some((_, false)) => {}
+            None => panic!(
                 "unreadable lane invocation {line:?}: the UNRUN derivation reads only \
                  `run: <script>` and `run: <script> --self-test`, optionally via \
-                 `python3 -I`. If this line does not invoke a lane, keep the script path \
+                 `python3 -I`, plus the exact direct call \
+                 `run: scripts/verify-attach-e2e.sh --diagnose-skips`. \
+                 If this line does not invoke a lane, keep the script path \
                  out of it; if it does, the derivation cannot tell, and the block would \
                  be wrong about what ran"
             ),
         }
+    }
+    // WP-1: lanes that run hosted in another workflow, not in ci.yml's
+    // checks job, so they are not UNRUN hosted. Each must still be named
+    // there, or the exclusion rots and this fails until the UNRUN line
+    // returns or the table is taught about the move.
+    let hosted_elsewhere = ["scripts/system-scope-measure.sh"];
+    let priv_yml = read(".github/workflows/privileged-tests.yml");
+    for lane in &hosted_elsewhere {
+        assert!(
+            priv_yml.contains(lane),
+            "{lane} no longer runs in privileged-tests.yml: re-add its UNRUN line or fix the table"
+        );
     }
     let mut expected = BTreeSet::new();
     for dir in &script_roots {
@@ -8549,6 +11202,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                     is_privileged(&path)
                 })
                 && !hosted_full.contains(path.as_str())
+                && !hosted_elsewhere.contains(&path.as_str())
             {
                 expected.insert(path);
             }
@@ -8608,14 +11262,58 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // Full strings: "test --locked" alone was also matched by the diagnostic
     // step, so deleting the workspace test gate left this claim standing.
     assert_hosted_offline_gates(&ci).unwrap();
-    assert_hosted_dependency_preparation(&ci).unwrap();
+    assert_release_preview_builds_full_and_p0(&ci).unwrap();
+    let dockerfile = read("deploy/Dockerfile.observer");
+    assert_release_preview_image_consumes_full_prebuild(&ci, &dockerfile).unwrap();
+    // A removed shipped-configuration step must fail, not silently narrow the
+    // push gate back to gnu FULL: drop each new lint gate line in turn.
+    for gate in [
+        "check --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl",
+        "clippy --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
+    ] {
+        let step = format!("- run: cargo +\"$(cat .release-rust-version)\" {gate}\n");
+        let dropped = ci.replacen(&step, "", 1);
+        assert!(
+            assert_hosted_offline_gates(&dropped).is_err(),
+            "removing the lint {gate} step must fail"
+        );
+        let online = gate.replacen(" --offline", "", 1);
+        let online_ci = ci.replacen(gate, &online, 1);
+        assert!(
+            assert_hosted_offline_gates(&online_ci).is_err(),
+            "removing --offline from the lint {gate} step must fail"
+        );
+    }
+    // The same for the preview's P0 half: without its own receipt run and
+    // packaging the job proves FULL only.
+    for marker in [
+        "scripts/build-release.sh --capture-mode p0",
+        "python3 -I scripts/package-release.py \\\n            --capture-mode p0 \\",
+    ] {
+        let dropped = ci.replacen(marker, "", 1);
+        assert!(
+            assert_release_preview_builds_full_and_p0(&dropped).is_err(),
+            "removing the preview {marker:?} step must fail"
+        );
+    }
+    // The P0 pre-build must keep its own target dir: without it the P0
+    // bytes overwrite the FULL binary the image copies.
+    let default_dir = ci.replacen(" --target-dir target/p0-preview", "", 1);
+    assert!(
+        assert_release_preview_image_consumes_full_prebuild(&default_dir, &dockerfile).is_err(),
+        "a P0 pre-build writing the default target dir must fail"
+    );
+    let bpf_driver = read("scripts/check-bpf-noninterference.py");
+    assert_hosted_dependency_preparation(&ci, &bpf_driver).unwrap();
     for marker in [
         "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
         "--metadata \"crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json\" --ledger",
     ] {
         let missing = ci.replacen(marker, "", 1);
         assert!(
-            assert_hosted_dependency_preparation(&missing).is_err(),
+            assert_hosted_dependency_preparation(&missing, &bpf_driver).is_err(),
             "removing either metadata context must fail preparation activation"
         );
     }
@@ -8628,7 +11326,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         1,
     );
     assert!(
-        assert_hosted_dependency_preparation(&moved).is_err(),
+        assert_hosted_dependency_preparation(&moved, &bpf_driver).is_err(),
         "dependency reconstruction after the first project operation must fail"
     );
     for gate in ["check", "test", "clippy"] {
@@ -8745,7 +11443,7 @@ fn hosted_pipeline_retains_the_job_log() {
     // shard. A shard added to the matrix without a log, or a check job added
     // without one, fails here.
     let shards = contracts_shard_count(&ci).unwrap();
-    for job in ["lint", "audit", "tests", "scripts"] {
+    for job in ["lint", "audit", "tests", "bpf-noninterference", "scripts"] {
         assert!(
             !job_block(&ci, job).contains("\n    name:"),
             "{job} must keep its job id as its name: archive-log finds its log by that name"
@@ -8777,9 +11475,26 @@ fn hosted_pipeline_retains_the_job_log() {
         "if-no-files-found: error\n",
         "/actions/jobs/$JOB_ID/logs\"",
         "for attempt in ",
-        // Exactly one id per name: none means the list rotted, two would splice
-        // two ids into one URL.
-        r#"test "$(printf '%s\n' "$JOB_ID" | grep -c '^[0-9][0-9]*$')" = 1"#,
+        // The jobs-list fetch retries bounded (a transient 502 killed a real
+        // run's archive); selection stays exact-name and now fetches
+        // id+created_at pairs so a rerun's duplicate name stays separable.
+        "for list_attempt in 1 2 3; do",
+        r#"select(.name == \"$job\") | \"\(.id) \(.created_at)\""#,
+        // Retry exhaustion fails LOUD with the observed rows, never silent
+        // under bash -e.
+        r#"echo "job $job: no jobs-list entry after 3 attempts; last rows observed: [${JOB_ROWS:-none}]" >&2"#,
+        // grep -c exits 1 on zero matches, which under bash -e would kill the
+        // step silently, so the count carries `|| true` while the loud check
+        // below owns the failure.
+        r#"JOB_COUNT=$(printf '%s\n' "$JOB_ROWS" | grep -c '^[0-9][0-9]* ' || true)"#,
+        // After a rerun one name can list twice: keep the latest attempt
+        // (greatest created_at, greatest id breaking a tie) and exactly one
+        // id — never splice two ids into one URL.
+        r#"JOB_ID=$(printf '%s\n' "$JOB_ROWS" | grep '^[0-9][0-9]* ' | sort -k2,2 -k1,1n | tail -n 1 | cut -d' ' -f1)"#,
+        r#"echo "job $job: no numeric job id among rows: [$JOB_ROWS]" >&2"#,
+        // Every job echoes the archived id with the listed count/ids, so the
+        // next listing-shape surprise is diagnosable from the log itself.
+        r#"echo "job $job: archiving job id $JOB_ID ($JOB_COUNT listed: $JOB_IDS)""#,
         // Without this the loop's hardcoded exit number is load-bearing: shortening
         // the attempt list would fall through with the empty file `gh api` created.
         // A simple command, not an `&&` list: only this form aborts the step.
@@ -8791,11 +11506,17 @@ fn hosted_pipeline_retains_the_job_log() {
     ] {
         assert!(archive.contains(required), "archive-log lacks {required:?}");
     }
-    // Triage evidence fires on a failure of ANY check job, never only one.
+    // Keep every dependency, but auxiliary flake triage follows test-lane
+    // failures. Lint/audit failures keep their required gates red alone.
     let quarantine = job_block(&ci, "quarantine");
+    let quarantine_gate = concat!(
+        "    if: ${{ failure() && (needs.tests.result == 'failure' || ",
+        "needs.contracts.result == 'failure' || needs.scripts.result == 'failure' || ",
+        "needs.bpf-noninterference.result == 'failure') }}\n",
+    );
     assert!(
-        quarantine.starts_with(&format!("{needs}    if: failure()\n")),
-        "quarantine must need every check job and run only on failure"
+        quarantine.starts_with(&format!("{needs}{quarantine_gate}")),
+        "quarantine must need every check job and run only on a relevant test failure"
     );
 }
 
@@ -8826,7 +11547,7 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
         );
     }
     // Exactly the two shares of the gate, and the gate in no other form.
-    let rest = format!("{PARTITION_RUN}rest -- {WORKSPACE_TEST_GATE}");
+    let rest = format!("{PARTITION_RUN}rest -- {WORKSPACE_TEST_GATE} --no-fail-fast");
     let shard = format!(
         "{PARTITION_RUN}\"contracts:${{{{ matrix.shard }}}}/{shards}\" -- {WORKSPACE_TEST_GATE}"
     );
@@ -8863,7 +11584,7 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
         (
             coverage,
             format!(
-                "{PARTITION_RUN}\"${{{{ matrix.partition }}}}\" -- cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --no-report"
+                "{PARTITION_RUN}\"${{{{ matrix.partition }}}}\" -- cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --no-report --no-fail-fast"
             ),
         ),
         (
@@ -9090,16 +11811,18 @@ fn hosted_caches_hold_only_tool_binaries_and_build_products() {
     }
 }
 
-/// One full check matrix per commit: every check and coverage job waits on
+/// One full ordinary check matrix per commit; manual delivery opts out.
+/// Every check and coverage job waits on
 /// the dedupe job and runs only when it says so (coverage-report follows the
-/// coverage shards). The dedupe job reads the Actions API and nothing else,
-/// and the workflow keeps its per-ref group that cancels a superseded run.
+/// coverage shards). Dedupe reads the manual selection or the Actions API,
+/// and the workflow keeps its per-ref group that sequences a moved branch's
+/// runs instead of cancelling them.
 #[test]
 fn hosted_pipeline_runs_one_full_matrix_per_commit() {
     let ci = read(".github/workflows/ci.yml");
     assert!(
-        ci.contains("\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n"),
-        "a branch that moves must still cancel its superseded run"
+        ci.contains("\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: false\n"),
+        "a branch that moves must sequence its runs instead of cancelling them"
     );
     let gate = "    needs: dedupe\n    if: needs.dedupe.outputs.run == 'true'\n";
     for job in CARGO_JOBS {
@@ -9110,6 +11833,8 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
             assert!(block.starts_with(&format!(
                 "    name: contracts-${{{{ matrix.shard }}}}\n{gate}"
             )));
+        } else if job == "bpf-noninterference" {
+            assert_hosted_bpf_noninterference(&ci).unwrap();
         } else {
             assert!(
                 block.starts_with(gate),
@@ -9128,35 +11853,256 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
         "dedupe holds exactly actions: read"
     );
     for marker in [
-        // Only push runs deduplicate; pull requests and dispatches run.
+        // Only push runs deduplicate; pull requests and manual checks run.
         "if [ \"$GITHUB_EVENT_NAME\" != push ]; then",
         // Only earlier push or dispatch runs of this workflow on this commit.
         "/runs?head_sha=$GITHUB_SHA&per_page=100",
         "select(.id < $GITHUB_RUN_ID and (.event == \\\"push\\\" or .event == \\\"workflow_dispatch\\\"))",
         // A covering run ran the matrix itself.
-        "select((.name == \"lint\" or .name == \"coverage-report\") and .conclusion == \"success\")",
-        "if [ \"$ran\" = 2 ]; then",
+        "select((.name == \"lint\" or .name == \"coverage-report\" or .name == \"bpf-noninterference\") and .conclusion == \"success\")",
+        "unique_by(.name) | length",
+        "if [ \"$ran\" = 3 ]; then",
         // An unfinished earlier run is waited for, never trusted.
         "sleep 60",
     ] {
         assert!(dedupe.contains(marker), "dedupe lacks {marker:?}");
     }
+    assert!(dedupe.contains("DELIVERY_TASK: ${{ inputs.delivery_task || 'checks' }}"));
+    let delivery_only = concat!(
+        "          if [ \"$GITHUB_EVENT_NAME\" = workflow_dispatch ]; then\n",
+        "            case \"$DELIVERY_TASK\" in\n",
+        "              checks) ;;\n",
+        "              packages|docker|kubernetes)\n",
+        "                decide false \"delivery task $DELIVERY_TASK selected; ordinary checks were not requested\" ;;\n",
+        "              *) echo \"invalid delivery task: $DELIVERY_TASK\" >&2; exit 1 ;;\n",
+        "            esac\n",
+        "          fi\n",
+    );
+    assert!(
+        dedupe.contains(delivery_only),
+        "only the three explicit manual delivery choices may skip ordinary checks"
+    );
+    assert!(
+        dedupe.find(delivery_only).unwrap()
+            < dedupe
+                .find("if [ \"$GITHUB_EVENT_NAME\" != push ]; then")
+                .unwrap(),
+        "manual delivery selection must precede the ordinary non-push path"
+    );
+    let covering = concat!(
+        "                if [ \"$ran\" = 3 ]; then\n",
+        "                  decide false \"commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it\"\n",
+        "                fi\n",
+    );
+    assert!(
+        dedupe.contains(covering),
+        "the other skip must remain guarded by the successful ordinary-job proof"
+    );
     assert_eq!(
         dedupe.matches("decide false ").count(),
-        1,
-        "dedupe skips the matrix on exactly one condition: a covering run"
+        2,
+        "only explicit manual delivery or a covering ordinary run skips the matrix"
     );
 }
 
 /// Bind the behavioral capture helpers to production mode-specific callbacks.
 /// Completed-root retirement is covered by terminal behavioral tests; capture
 /// facts and terminal publication retain their separate provenance checks.
+fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), String> {
+    let profile = contract_section(run, "fn capture_profile(", "fn write_json_report(")?;
+    require_contract_marker(
+        profile,
+        "let mut collection = metrics::CaptureCollection::new(counter_inputs);",
+        "profile collection owner",
+    )?;
+    let tick = contract_section(profile, "let tick = ", "let mut finish_context =")?;
+    require_before(
+        tick,
+        "profile_tick_snapshot(tick_frame, snapshot_cache, || {",
+        "collection.fresh(",
+        "profile live collection under cache gate",
+    )?;
+    require_contract_marker(
+        tick,
+        "context.1, context.0.plan(), context.0.pinned(), profile,",
+        "profile live collection uses actual Session and retained plan",
+    )?;
+    let terminal = profile
+        .split_once("fn run_terminal(")
+        .ok_or("missing profile terminal callback")?
+        .1;
+    require_contract_marker(
+        terminal,
+        "context\n                .6\n                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
+        "profile terminal collection owner",
+    )?;
+
+    let live = contract_section(
+        projection,
+        "pub(crate) fn fresh(",
+        "pub(crate) fn terminal(",
+    )?;
+    require_contract_marker(
+        live,
+        "self.acquire(session, plan, pins, profile, false)",
+        "live collection dispatch",
+    )?;
+    let terminal = contract_section(projection, "pub(crate) fn terminal(", "    fn acquire(")?;
+    require_contract_marker(
+        terminal,
+        "self.acquire(session, plan, pins, profile, true)",
+        "terminal collection dispatch",
+    )?;
+    let acquire = contract_section(projection, "    fn acquire(", "    fn fresh_with<B>(")?;
+    require_contract_marker(
+        acquire,
+        "let binding = session.counter_reader_binding();",
+        "actual Session reader binding",
+    )?;
+    require_before(
+        acquire,
+        "if terminal {",
+        "self.terminal_with(",
+        "terminal dispatch",
+    )?;
+    require_contract_marker(acquire, "self.fresh_with(", "live collection dispatch")?;
+    if acquire
+        .matches(
+            "binding,\n                super::counter_reader::read_bound,\n                legacy,",
+        )
+        .count()
+        != 2
+    {
+        return Err("live and terminal must pass the actual binding and shared reader".into());
+    }
+    let legacy = contract_section(
+        acquire,
+        "let legacy = || {",
+        "        };\n        if terminal {",
+    )?;
+    let (terminal, live) = legacy
+        .split_once("} else {")
+        .ok_or("missing legacy live reads")?;
+    require_before(
+        terminal,
+        "super::read(session, plan)?",
+        "super::kernel_evidence(session)?",
+        "legacy terminal read order",
+    )?;
+    require_before(
+        live,
+        "super::kernel_evidence(session)?",
+        "super::read(session, plan)?",
+        "legacy live read order",
+    )?;
+    let fresh = contract_section(
+        projection,
+        "    fn fresh_with<B>(",
+        "    fn terminal_with<B>(",
+    )?;
+    let ordinary = contract_section(
+        fresh,
+        "            Ok(None) => {",
+        "            binding => {",
+    )?;
+    for marker in [
+        "if self.counter.is_some()",
+        "legacy()?",
+        "if !profile {\n                    kernel.ring_loss = 0;",
+    ] {
+        require_contract_marker(
+            ordinary,
+            marker,
+            "ordinary collection preserves legacy mode",
+        )?;
+    }
+    if fresh.matches("legacy()?").count() != 1 {
+        return Err("only an absent actual binding may invoke the legacy reader".into());
+    }
+    for marker in [
+        "Ok(Some(binding)) => acquire(binding, plan, pins, limits, reserve)",
+        "Err(ReadStage::BankQuarantined)",
+        "Err(_) => Err(ReadStage::BankRouting)",
+    ] {
+        require_contract_marker(fresh, marker, "present counter binding stays closed")?;
+    }
+    let terminal = contract_section(
+        projection,
+        "    fn terminal_with<B>(",
+        "/// One collector per capture.",
+    )?;
+    require_contract_marker(
+        terminal,
+        "self.fresh_with(\n            plan, pins, profile, binding, acquire, legacy, generation, kernel,\n        )?\n        .require_terminal()",
+        "fresh terminal observation",
+    )?;
+    let terminal_acceptance = contract_section(
+        projection,
+        "    fn require_terminal(self)",
+        "/// The one collection owner",
+    )?;
+    require_contract_marker(
+        terminal_acceptance,
+        "if !self.new_acquisition || self.counter().is_some_and(|snapshot| !snapshot.is_fresh())",
+        "terminal rejects cached or unsuccessful observations",
+    )
+}
+
 #[test]
 fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
     // Ordering inside the helpers is exercised by capture_loop_tests, including
     // compiled mutation controls. This guard binds their real production callers
     // and the mode-specific publication callbacks that those tests do not invoke.
     let run = read("src/run.rs");
+    let projection = read("src/metrics/counter_projection.rs");
+    assert_profile_collection_wiring(&run, &projection).unwrap();
+    for (original, replacement, role) in [
+        (
+            "collection.fresh(",
+            "bare_collection(",
+            "profile live collection under cache gate",
+        ),
+        (
+            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
+            ".fresh(context.1, context.0.plan(), context.0.pinned(), profile)",
+            "profile terminal collection owner",
+        ),
+    ] {
+        let mutant = run.replacen(original, replacement, 1);
+        assert_ne!(mutant, run, "{role} mutation changes production source");
+        let error = assert_profile_collection_wiring(&mutant, &projection).unwrap_err();
+        assert!(error.contains(role), "{role}: {error}");
+    }
+    for (original, replacement, reason) in [
+        (
+            "            Ok(None) => {",
+            "            Ok(_) => {",
+            "Ok(None)",
+        ),
+        (
+            ".require_terminal()",
+            ".allow_cached_terminal()",
+            "fresh terminal observation",
+        ),
+        (
+            "kernel.ring_loss = 0;",
+            "kernel.ring_loss = 1;",
+            "ordinary collection preserves legacy mode",
+        ),
+        (
+            "Err(_) => Err(ReadStage::BankRouting)",
+            "Err(_) => legacy()",
+            "present counter binding stays closed",
+        ),
+    ] {
+        let mutant = projection.replacen(original, replacement, 1);
+        assert_ne!(
+            mutant, projection,
+            "{reason} mutation changes production source"
+        );
+        let error = assert_profile_collection_wiring(&run, &mutant).unwrap_err();
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
     let profile = between(&run, "fn capture_profile(", "fn write_json_report(");
     let trace = between(&run, "fn capture_trace(", "\n/// Prints (and, if given,");
     for (name, source, consumer, drain, snapshot) in [
@@ -9165,7 +12111,7 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             profile,
             "tracer: None,",
             "drain_events(",
-            "metrics::kernel_evidence(context.1)?",
+            "collection.fresh(",
         ),
         (
             "trace",
@@ -9175,7 +12121,7 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "report_trace_loss(",
         ),
     ] {
-        let tick = between(source, "let tick = {", "let mut finish_context =");
+        let tick = between(source, "let tick = ", "let mut finish_context =");
         for marker in [
             "capture_tick_with(",
             "drain_discovery_tick(",
@@ -9238,8 +12184,18 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         .unwrap()
         .1;
     for (first, second) in [
-        ("let reports = metrics::read(", "let mut kernel_evidence ="),
-        ("let mut kernel_evidence =", ".check_unchanged()"),
+        (
+            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
+            "let reports = snapshot.reports();",
+        ),
+        (
+            "let reports = snapshot.reports();",
+            "let kernel_evidence = snapshot.kernel_evidence();",
+        ),
+        (
+            "let kernel_evidence = snapshot.kernel_evidence();",
+            ".check_unchanged()",
+        ),
         (".check_unchanged()", "context.0.settle_terminal_drain();"),
         (
             "context.0.settle_terminal_drain();",
@@ -9255,8 +12211,11 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "ev.apply_stop_quiescence(consumers.stop_quiescence);",
             "ev.settle_terminal(profile);",
         ),
-        ("ev.settle_terminal(profile);", "let frame = render::live("),
-        ("let frame = render::live(", "write_stdout("),
+        (
+            "ev.settle_terminal(profile);",
+            "let frame = render::live_snapshot_scoped(",
+        ),
+        ("let frame = render::live_snapshot_scoped(", "write_stdout("),
     ] {
         require_before(
             profile_terminal,
@@ -9357,6 +12316,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             linkage: "heuristic",
             exports_agreeing: Some(0),
         }],
+        watch: None,
+        attached_at_ns: None,
+        unobserved_windows: None,
         interfaces: 0,
         skipped: vec![],
     };
@@ -9393,6 +12355,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         abi_refusals: 0,
         semantic_capture_failures: 0,
         unregistered_mechanisms: 0,
+        unpublished_mechanisms: 0,
         template_tail_failures: 0,
         process_tracking_fallbacks: 0,
         process_tracking_failures: 0,
@@ -9424,6 +12387,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         pause_attempts: 0,
         pause_confirmed: 0,
         pause_partial: 0,
+        pause_unavailable: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -9443,13 +12407,17 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             initial_set_timing: Default::default(),
             initial_set_capture: Default::default(),
             hits: 4,
+            benign_hits: 0,
             state_read_failures: 0,
         },
         interface_selection: InterfaceSelection::default(),
         attach_mechanisms: vec!["per-offset"],
         attach_backend: Default::default(),
+        object_capture: p11scope::render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
+        instance_reload_not_excluded: None,
         unprotected_live_windows: 1,
         module_unresolved_slots: 0,
         discovery: DiscoveryEvidence {
@@ -9487,6 +12455,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         module: Some(ModuleId(0)),
         module_ambiguous: false,
         module_unresolved: false,
+        mode: p11scope_ebpf_common::CounterMode::Latency,
         calls: 3,
         errors: 0,
         in_flight: 0,
@@ -9677,6 +12646,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
         "pause_attempts: pause.attempts",
         "pause_confirmed: pause.confirmed",
         "pause_partial: pause.partial",
+        "pause_unavailable: pause.unavailable",
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
@@ -10848,25 +13818,37 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
     );
 }
 
-/// Multi is optional with a whole-session singles fallback, so the
-/// self-link row is informational: it must never feed the tier (which
-/// would offline capable-but-old kernels) nor the exit code.
+/// Host eligibility is independent of the selected static backend and version.
 #[test]
-fn the_multi_self_link_row_is_not_a_capability_tier_input() {
-    let source = read("src/doctor.rs");
-    let tier = source
-        .split_once("fn capability_tier(")
-        .expect("doctor.rs must define capability_tier")
-        .1;
-    let tier = tier.split_once("\nfn ").map_or(tier, |(body, _)| body);
-    assert!(
-        !tier.contains("uprobe-multi"),
-        "capability_tier must not read the multi row: an old kernel is fully capable on singles"
-    );
-    assert!(
-        source.contains("\"uprobe-multi attach (own libc)\""),
-        "doctor must still report the row"
-    );
+fn the_multi_host_row_gates_capability_tier_and_exit() {
+    use p11scope::doctor::{Check, Status, render, verdict};
+    let mut checks = [
+        "BPF map create",
+        "uprobe attach (self)",
+        "host program preflight",
+        "target readability",
+        "lifecycle preflight",
+        "scope preflight",
+        "uprobe-multi attach (own libc)",
+    ]
+    .map(|name| Check {
+        name: name.into(),
+        status: Status::Ok("proven".into()),
+    })
+    .to_vec();
+    checks.push(Check {
+        name: "kernel release".into(),
+        status: Status::Ok("5.14 with a working Multi backport".into()),
+    });
+    assert_eq!(verdict(&checks), 0);
+    assert!(render(&checks).contains("capability tier: T4 current full"));
+    for cause in ["unavailable", "permission or policy denied", "unproven"] {
+        checks[6].status = Status::Fail(format!("uprobe-multi-required: {cause}"));
+        assert_eq!(verdict(&checks), 1);
+        let text = render(&checks);
+        assert!(text.contains("capability tier: T0 offline"));
+        assert!(text.contains("capture unavailable"));
+    }
 }
 
 fn run_native_python_suite(script: &str, class: &str) {
@@ -11228,7 +14210,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         "the return path must hold exactly one EVENTS reserve"
     );
     let gate = returned
-        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .find("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0")
         .expect("return path must gate aggregate policy");
     let reserve = returned
         .find("EVENTS.reserve::<EventRecord>(0)")
@@ -11237,9 +14219,67 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         gate < reserve,
         "aggregate gate must precede the return-path EVENTS reserve"
     );
+    // H7 slice D: each return implementation gates aggregate policy
+    // before any submit. ordinary_return retires its START row before
+    // its early return (no side row exists there); each object_return
+    // copy retires through its own checked removal inside the gate,
+    // since dispatch guarantees an object call there. The exact-text
+    // pins keep failing on any added submit site.
+    let ordinary = between(&ebpf, "fn ordinary_return(", "fn object_return_ordinary(");
+    let ordinary_retire = ordinary
+        .find("if owned_start_remove(&key, true).is_err()")
+        .expect("ordinary return must retire before its aggregate gate");
+    let ordinary_gate = ordinary
+        .find("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("ordinary return must gate aggregate policy");
+    let ordinary_reserve = ordinary
+        .find("EVENTS.reserve::<EventRecord>(0)")
+        .expect("ordinary return must hold its EVENTS reserve");
     assert!(
-        returned.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
-        "aggregate gate must return before any submit"
+        ordinary_retire < ordinary_gate && ordinary_gate < ordinary_reserve,
+        "ordinary aggregate gate must retire, then return before any submit"
+    );
+    assert!(
+        ordinary.contains("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
+        "ordinary aggregate gate must return before any submit"
+    );
+    let object_ordinary = between(
+        &ebpf,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
+    let object_ordinary_gate = object_ordinary
+        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("ordinary object return must gate aggregate policy");
+    let object_ordinary_reserve = object_ordinary
+        .find("EVENTS.reserve::<ObjectEventRecord>(0)")
+        .expect("ordinary object return must hold its EVENTS reserve");
+    assert!(
+        object_ordinary_gate < object_ordinary_reserve,
+        "ordinary object aggregate gate must return before any submit"
+    );
+    assert!(
+        object_ordinary.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        if owned_start_remove(&key, true).is_err() {\n            unsafe { p11_object_fault() };\n            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n        }\n        return 0;\n    }"),
+        "ordinary object aggregate gate must retire, then return before any submit"
+    );
+    let object = between(
+        &ebpf,
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    let object_gate = object
+        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("object return must gate aggregate policy");
+    let object_reserve = object
+        .find("EVENTS.reserve::<Record>(0)")
+        .expect("object return must hold its EVENTS reserve");
+    assert!(
+        object_gate < object_reserve,
+        "object aggregate gate must return before any submit"
+    );
+    assert!(
+        object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)\n                .is_err()\n            {\n                unsafe { p11_object_fault() };\n                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n            }\n            return 0;\n        }"),
+        "object aggregate gate must retire, then return before any submit"
     );
 
     let allowed = between(
@@ -11289,8 +14329,10 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 //   `GPL-3.0-or-later` elsewhere.
 //
 // Documented exemptions (each pinned below so it cannot silently rot):
-// test-input C fixtures remain headerless, and generated third-party source
-// trees remain untracked. Internal plans and agent guides live outside the
+// test-input C fixtures remain headerless, `include!`d Rust files carry
+// the `//` form with their include site pinned (E0753 rejects `//!`
+// across `include!`), and generated third-party source trees remain
+// untracked. Internal plans and agent guides live outside the
 // public repository and need no source-tree license exemptions.
 
 // Test-input C fixtures: each is consumed by the test named
@@ -11327,6 +14369,21 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
 ];
 
+// Rust files joined through `include!` cannot carry the `//!`
+// inner-doc header: rustc E0753 rejects it across the macro
+// boundary (the comment cannot annotate the enclosing module).
+// Each listed file must carry the `//` form on line 1 instead,
+// and each entry pins its exact `include!` site, checked below,
+// so the exemption cannot silently rot or spread.
+const LICENSE_RUST_INCLUDE_FILES: &[(&str, &str, &str)] = &[
+    // (exempt file, include-site file, exact `include!` snippet).
+    (
+        "src/inventory/joint_cells_tests.rs",
+        "src/inventory/mod.rs",
+        "include!(\"joint_cells_tests.rs\")",
+    ),
+];
+
 // Pre-relicense markers. Spelled via concat! so this very file (which the
 // scan below reads) never contains them contiguously.
 const LICENSE_REMOVED_TEXTS: &[&str] = &[concat!("LICENSE-", "MIT"), concat!("LICENSE-", "APACHE")];
@@ -11359,6 +14416,12 @@ fn license_expected_header(path: &str) -> Option<&'static str> {
         return Some("/* SPDX-License-Identifier: GPL-3.0-or-later */");
     }
     if path.ends_with(".rs") {
+        if LICENSE_RUST_INCLUDE_FILES
+            .iter()
+            .any(|(file, _, _)| *file == path)
+        {
+            return Some("// SPDX-License-Identifier: GPL-3.0-or-later");
+        }
         if path.starts_with("crates/ebpf/src/") {
             return Some("//! SPDX-License-Identifier: GPL-2.0-only");
         }
@@ -11553,6 +14616,19 @@ const LICENSE_PROVENANCE_LINES: &[(&str, &str)] = &[
         "tests/python/test_offline_dependencies.py",
         "c5dfe15f3b79d887884126f2a1a6366a46c5b017793fb50643bbfecf9e0c3c1f",
     ),
+    // Tiny upstream source fixture and its exact tree assertion.
+    (
+        "tests/python/test_offline_dependencies.py",
+        "dadb209b8189d054bf657e24679e167387a8fa09a4eaf7af8193f6550441838b",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "fc94905bd22b51afdc6bada2b30be615c0e8032756d1be4e6bc223054ad0fab7",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "0e5ac5e5afc9473dd51c98b4ac462fb239470e7402e8fbef03c0a47e95a8821d",
+    ),
 ];
 
 fn license_line_digest(line: &str) -> String {
@@ -11695,6 +14771,26 @@ fn license_headers_cover_every_tracked_source_file() {
         assert!(
             !first.contains("SPDX-License-Identifier"),
             "exempt fixture {fixture} gained a header; move it in scope"
+        );
+    }
+
+    // Every exempt `include!`d Rust file is still tracked (a stale
+    // entry fails), still `//`-headed (a real module file moves back
+    // in scope), and still really included from its named site (a
+    // moved include drops the exemption).
+    for (file, site, snippet) in LICENSE_RUST_INCLUDE_FILES {
+        assert!(
+            tracked.iter().any(|path| path == file),
+            "exempt include file {file} is no longer tracked; drop its exemption"
+        );
+        let first = read(file).lines().next().unwrap_or("").to_string();
+        assert_eq!(
+            first, "// SPDX-License-Identifier: GPL-3.0-or-later",
+            "exempt include file {file} must carry the `//` header on line 1"
+        );
+        assert!(
+            read(site).contains(snippet),
+            "exempt include file {file} is no longer included from {site}; drop its exemption"
         );
     }
 
@@ -11846,6 +14942,30 @@ fn license_header_checker_rejects_bad_fixtures() {
 }
 
 #[test]
+fn license_rust_include_exemption_is_exact_path() {
+    // The `//`-header allowance for `include!`d Rust files covers
+    // only the pinned exact paths: an unrelated Rust file with the
+    // `//` form still fails, while the pinned include target
+    // accepts it (rustc E0753 rejects `//!` across `include!`).
+    let unlisted = license_header_error(
+        "src/not_an_include_target.rs",
+        b"// SPDX-License-Identifier: GPL-3.0-or-later\nfn f() {}\n",
+    );
+    assert!(
+        unlisted.is_some(),
+        "an unlisted Rust file must still require the `//!` header"
+    );
+    let pinned = license_header_error(
+        "src/inventory/joint_cells_tests.rs",
+        b"// SPDX-License-Identifier: GPL-3.0-or-later\nfn f() {}\n",
+    );
+    assert!(
+        pinned.is_none(),
+        "the pinned include target must accept the `//` header"
+    );
+}
+
+#[test]
 fn license_legal_surface_checker_rejects_bad_fixtures() {
     // A stub tree missing LICENSE, carrying a wrong manifest license, an
     // on-disk removed text, and a file naming a pre-relicense text.
@@ -11967,21 +15087,518 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     }
 }
 
+const SEMANTIC_CAPTURE_TESTS: &str = "src/semantic_capture/tests.rs";
+const SEMANTIC_VALIDATION_TEST_CHILD: &str =
+    "src/semantic_capture/tests/custody_chain_tests/semantic_validation.rs";
+const OWNER_ADMISSION_TEST_CHILD: &str =
+    "src/semantic_capture/tests/custody_chain_tests/owner_admission.rs";
+const SUCCESSOR_REPLAY_TEST_CHILD: &str =
+    "src/semantic_capture/tests/custody_chain_tests/owner_admission/successor_replay.rs";
+const NATIVE_PRODUCER_TEST_CHILD: &str = transport_boundaries::NATIVE_PRODUCER_TEST_CHILD;
+const ROOT_PROOF_TEST_CHILD: &str = transport_boundaries::ROOT_PROOF_TEST_CHILD;
+
+fn semantic_capture_private_test_child_references_are_canonical(path: &str, source: &str) -> bool {
+    // The newly external root has a common basename. Resolve literal path
+    // aliases from each source file instead of banning every `tests.rs`.
+    let parent = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    // Inspect both sides of quotes so an unmatched quote in a comment cannot
+    // hide a later literal inclusion from this conservative source sentinel.
+    for reference in source.split('"') {
+        if std::path::Path::new(reference).file_name() != Some(std::ffi::OsStr::new("tests.rs")) {
+            continue;
+        }
+        let mut resolved = std::path::PathBuf::new();
+        for component in parent.join(reference).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => match resolved.components().next_back() {
+                    Some(std::path::Component::Normal(_)) => {
+                        resolved.pop();
+                    }
+                    Some(std::path::Component::RootDir) => {}
+                    _ => resolved.push(".."),
+                },
+                _ => resolved.push(component.as_os_str()),
+            }
+        }
+        if resolved == std::path::Path::new(SEMANTIC_CAPTURE_TESTS) {
+            return false;
+        }
+    }
+    // Strip only the approved source sites. Concrete filename references
+    // elsewhere also catch differently named #[path] aliases and include!.
+    let remainder = match path {
+        "src/semantic_capture.rs" => {
+            let remainder = source.replacen("\n#[cfg(test)]\nmod tests;\n", "", 1);
+            if remainder.contains("mod tests;") || remainder.contains("tests.rs") {
+                return false;
+            }
+            remainder
+        }
+        SEMANTIC_CAPTURE_TESTS => source.replacen("\n    mod semantic_validation;\n", "", 1),
+        SEMANTIC_VALIDATION_TEST_CHILD => source.replacen(
+            "\n#[path = \"owner_admission.rs\"]\nmod owner_admission;\n",
+            "",
+            1,
+        ),
+        OWNER_ADMISSION_TEST_CHILD => source.replacen(
+            "\n#[path = \"owner_admission/successor_replay.rs\"]\nmod successor_replay;\n",
+            "",
+            1,
+        ),
+        _ => source.to_owned(),
+    };
+    ![
+        "semantic_capture/tests.rs",
+        "semantic_validation.rs",
+        "owner_admission.rs",
+        "successor_replay.rs",
+        "mod semantic_validation;",
+        "mod owner_admission;",
+        "mod successor_replay;",
+    ]
+    .iter()
+    .any(|reference| remainder.contains(reference))
+}
+
+fn semantic_capture_private_test_children_are_isolated(
+    capture: &str,
+    tests: &str,
+    validation: &str,
+    owner_admission_present: bool,
+) -> bool {
+    if !semantic_capture_private_test_child_references_are_canonical(
+        "src/semantic_capture.rs",
+        capture,
+    ) || !semantic_capture_private_test_child_references_are_canonical(
+        SEMANTIC_CAPTURE_TESTS,
+        tests,
+    ) || !semantic_capture_private_test_child_references_are_canonical(
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        validation,
+    ) {
+        return false;
+    }
+    // The unique external module gate protects the whole tests.rs file.
+    // Its canonical, rustfmt-indented custody boundary then proves ancestry;
+    // an unrelated cfg(test) elsewhere cannot license a private-field reader.
+    let Some((production, tail)) = capture.split_once("\n#[cfg(test)]\nmod tests;\n") else {
+        return false;
+    };
+    // No path attribute may redirect this declaration to a different file.
+    if !production.trim_end().ends_with('}') || !tail.trim().is_empty() {
+        return false;
+    }
+    let Some((_, custody)) = tests.split_once("\nmod custody_chain_tests {\n") else {
+        return false;
+    };
+    let Some((custody, _)) = custody.split_once("\n}") else {
+        return false;
+    };
+    if !custody.contains("\n    mod semantic_validation;\n")
+        || tests.matches("mod semantic_validation;").count() != 1
+    {
+        return false;
+    }
+    !owner_admission_present
+        || (validation.contains("\n#[path = \"owner_admission.rs\"]\nmod owner_admission;\n")
+            && validation.matches("mod owner_admission;").count() == 1)
+}
+
+fn successor_replay_test_child_is_isolated(
+    capture: &str,
+    tests: &str,
+    validation: &str,
+    owner: &str,
+) -> bool {
+    semantic_capture_private_test_children_are_isolated(capture, tests, validation, true)
+        && semantic_capture_private_test_child_references_are_canonical(
+            OWNER_ADMISSION_TEST_CHILD,
+            owner,
+        )
+        && owner.contains(
+            "\n#[path = \"owner_admission/successor_replay.rs\"]\nmod successor_replay;\n",
+        )
+        && owner.matches("mod successor_replay;").count() == 1
+}
+
+#[test]
+fn successor_replay_record_consumer_requires_exact_test_ancestry() {
+    let capture = read("src/semantic_capture.rs");
+    let tests = read(SEMANTIC_CAPTURE_TESTS);
+    let validation = read(SEMANTIC_VALIDATION_TEST_CHILD);
+    let owner = read(OWNER_ADMISSION_TEST_CHILD);
+    assert!(successor_replay_test_child_is_isolated(
+        &capture,
+        &tests,
+        &validation,
+        &owner,
+    ));
+    for (capture, validation, owner) in [
+        (
+            capture.replacen("#[cfg(test)]\nmod tests;", "mod tests;", 1),
+            validation.clone(),
+            owner.clone(),
+        ),
+        (
+            capture.clone(),
+            validation.replace("mod owner_admission;", ""),
+            owner.clone(),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            owner.replace("mod successor_replay;", ""),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            owner.replace("owner_admission/successor_replay.rs", "other.rs"),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            format!("{owner}\n#[path = \"owner_admission/successor_replay.rs\"]\nmod alias;\n"),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            format!("{owner}\ninclude!(\"owner_admission/successor_replay.rs\");\n"),
+        ),
+    ] {
+        assert!(
+            !successor_replay_test_child_is_isolated(&capture, &tests, &validation, &owner),
+            "an alternate inclusion must not license private-record consumption",
+        );
+    }
+    for path in [
+        "src/lib.rs",
+        "src/render.rs",
+        "src/semantic_capture/tests/custody_chain_tests/owner_admission/other.rs",
+    ] {
+        for reference in [
+            "#[path = \"owner_admission/successor_replay.rs\"]\nmod alias;",
+            "include!(\"successor_replay.rs\");",
+            "mod successor_replay;",
+        ] {
+            assert!(
+                !semantic_capture_private_test_child_references_are_canonical(path, reference),
+                "{path} must refuse alternate replay inclusion {reference:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_capture_private_record_test_children_remain_test_only() {
+    let capture = read("src/semantic_capture.rs");
+    let tests = read(SEMANTIC_CAPTURE_TESTS);
+    let validation = read(SEMANTIC_VALIDATION_TEST_CHILD);
+    let owner_admission_present = std::path::Path::new(OWNER_ADMISSION_TEST_CHILD).is_file();
+    assert!(
+        semantic_capture_private_test_children_are_isolated(
+            &capture,
+            &tests,
+            &validation,
+            owner_admission_present,
+        ),
+        "private-record test children must inherit semantic_capture's cfg(test) gate"
+    );
+
+    let without_cfg = capture.replacen("#[cfg(test)]\nmod tests;", "mod tests;", 1);
+    assert!(
+        !semantic_capture_private_test_children_are_isolated(
+            &without_cfg,
+            &tests,
+            &validation,
+            owner_admission_present,
+        ),
+        "removing the actual test-module gate must revoke child exemptions"
+    );
+    for redirected in [
+        capture.replace(
+            "#[cfg(test)]\nmod tests;",
+            "#[path = \"other.rs\"]\n#[cfg(test)]\nmod tests;",
+        ),
+        capture.replace("#[cfg(test)]\nmod tests;", "#[cfg(any())]\nmod tests;"),
+        format!("{capture}\nmod tests;\n"),
+    ] {
+        assert!(
+            !semantic_capture_private_test_children_are_isolated(
+                &redirected,
+                &tests,
+                &validation,
+                owner_admission_present,
+            ),
+            "only the actual, uniquely gated external test module licenses the fixture",
+        );
+    }
+    let outside_custody = format!(
+        "{}\nmod semantic_validation;\n",
+        tests.replace("    mod semantic_validation;\n", ""),
+    );
+    assert!(
+        !semantic_capture_private_test_children_are_isolated(
+            &capture,
+            &outside_custody,
+            &validation,
+            owner_admission_present,
+        ),
+        "the external test file must retain the child's exact custody ancestry",
+    );
+    let moved_child = format!(
+        "{}\n#[path = \"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\"]\nmod semantic_validation;\n",
+        capture,
+    );
+    assert!(
+        !semantic_capture_private_test_children_are_isolated(
+            &moved_child,
+            &tests.replace("    mod semantic_validation;\n", ""),
+            &validation,
+            owner_admission_present,
+        ),
+        "moving the child outside the cfg(test) module must revoke its exemption"
+    );
+
+    // Retaining the canonical cfg(test) chain cannot license a second
+    // production inclusion of the same private-field fixture.
+    for inclusion in [
+        "#[path = \"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\"]\nmod production_validation;",
+        "include!(\"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\");",
+        "#[path = \"semantic_capture/tests/custody_chain_tests/owner_admission.rs\"]\nmod production_owner;",
+        "include!(\"semantic_capture/tests/custody_chain_tests/owner_admission.rs\");",
+        "#[path = \"semantic_capture/tests.rs\"]\nmod production_tests;",
+        "include!(\"semantic_capture/tests.rs\");",
+    ] {
+        let alias = format!("{capture}\n{inclusion}\n");
+        assert!(
+            !semantic_capture_private_test_children_are_isolated(
+                &alias,
+                &tests,
+                &validation,
+                owner_admission_present,
+            ),
+            "an alternate production inclusion must revoke the child exemption: {inclusion}"
+        );
+    }
+
+    for (path, reference) in [
+        ("src/semantic_capture/other.rs", "tests.rs"),
+        ("src/semantic_capture/other.rs", "./tests.rs"),
+        ("src/semantic_capture/tests/other.rs", "../tests.rs"),
+        (
+            "src/semantic_capture/tests/custody_chain_tests/other.rs",
+            "../../tests.rs",
+        ),
+        (
+            "src/lib.rs",
+            "semantic_capture/../semantic_capture/./tests.rs",
+        ),
+    ] {
+        for inclusion in [
+            format!("#[path = {reference:?}]\nmod alias;"),
+            format!("include!({reference:?});"),
+            format!("// unmatched quote: \"\n#[path = {reference:?}]\nmod alias;"),
+        ] {
+            assert!(
+                !semantic_capture_private_test_child_references_are_canonical(path, &inclusion),
+                "{path} must refuse another inclusion of the external root: {inclusion}",
+            );
+        }
+    }
+    for (path, reference) in [
+        ("src/lib.rs", "tests.rs"),
+        ("src/semantic_capture/other.rs", "other_tests.rs"),
+        ("src/semantic_capture/tests/other.rs", "tests.rs"),
+        ("src/lib.rs", "../../src/semantic_capture/./tests.rs"),
+    ] {
+        assert!(
+            semantic_capture_private_test_child_references_are_canonical(
+                path,
+                &format!("#[path = {reference:?}]\nmod ordinary_tests;"),
+            )
+        );
+    }
+
+    for path in [
+        "src/lib.rs",
+        "src/render.rs",
+        "src/semantic_capture.rs",
+        SEMANTIC_CAPTURE_TESTS,
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        OWNER_ADMISSION_TEST_CHILD,
+        SUCCESSOR_REPLAY_TEST_CHILD,
+    ] {
+        for inclusion in [
+            "#[path = \"semantic_validation.rs\"]\nmod alias_validation;",
+            "#[path = \"owner_admission.rs\"]\nmod alias_owner;",
+            "include!(\"../custody_chain_tests/semantic_validation.rs\");",
+            "include!(\"../custody_chain_tests/owner_admission.rs\");",
+            "mod semantic_validation;",
+            "mod owner_admission;",
+        ] {
+            assert!(
+                !semantic_capture_private_test_child_references_are_canonical(path, inclusion),
+                "{path} must refuse alternate fixture reference {inclusion:?}"
+            );
+        }
+    }
+
+    // Calibrate the second exact child even before it is integrated. Its path
+    // override is relative to semantic_validation.rs, not a new top-level module.
+    let owner_parent =
+        format!("{validation}\n#[path = \"owner_admission.rs\"]\nmod owner_admission;\n");
+    let owner_parent = if owner_admission_present {
+        validation.as_str()
+    } else {
+        owner_parent.as_str()
+    };
+    assert!(semantic_capture_private_test_children_are_isolated(
+        &capture,
+        &tests,
+        owner_parent,
+        true,
+    ));
+    for invalid_parent in [
+        owner_parent.replace("mod owner_admission;", ""),
+        owner_parent.replace("owner_admission.rs", "other.rs"),
+        format!("{owner_parent}\n#[path = \"owner_admission.rs\"]\nmod alias_owner;\n"),
+        format!("{owner_parent}\ninclude!(\"owner_admission.rs\");\n"),
+    ] {
+        assert!(
+            !semantic_capture_private_test_children_are_isolated(
+                &capture,
+                &tests,
+                &invalid_parent,
+                true,
+            ),
+            "the owner-admission child must retain its exact parent inclusion"
+        );
+    }
+}
+
 /// Task 3 Stage A privacy contract: the private entry IP and the continuity
 /// stamps are read from CALL records only by the instance router plumbing and
-/// its tests. A renderer, reducer, or report that names them is a leak path.
+/// its tests, plus the journal's two exact internal corroboration guards.
+/// Other reducer reads and any rendering/reporting use remain leak paths.
 #[test]
 fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
+    assert!(
+        transport_boundaries::native_producer_test_child_is_isolated(&read(
+            "src/semantics_objects/journal.rs"
+        )),
+        "the exact native fixture requires its unique direct cfg(test) inclusion"
+    );
+    assert!(
+        transport_boundaries::root_proof_test_child_is_isolated(&read(
+            "src/semantics_objects/journal.rs"
+        )),
+        "the root proof fixture requires its unique direct test AND proof inclusion"
+    );
     let allowed = [
         "src/attach/instance.rs",
         "src/attach/instance_tests.rs",
         "src/events.rs",
         "src/run/capture_loop_tests.rs",
+        // H0's retained evidence adapter owns private CALL routing/continuity;
+        // this grants no renderer or public projection a raw-field consumer.
+        "src/semantic_capture.rs",
+        SEMANTIC_CAPTURE_TESTS,
+        // Exact fixtures under its cfg(test) ancestry, guarded below. This
+        // grants no sibling directory or production consumer an exemption.
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        OWNER_ADMISSION_TEST_CHILD,
+        SUCCESSOR_REPLAY_TEST_CHILD,
+        NATIVE_PRODUCER_TEST_CHILD,
+        ROOT_PROOF_TEST_CHILD,
+        // Test-only assertions that the public projection omits private fields.
+        "src/s1_tests.rs",
     ];
+    let refuses = |path: &str, source: &str| {
+        !allowed.contains(&path) && transport_boundaries::uses_private_record_fields(path, source)
+    };
+    for path in [
+        SEMANTIC_CAPTURE_TESTS,
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        OWNER_ADMISSION_TEST_CHILD,
+        SUCCESSOR_REPLAY_TEST_CHILD,
+        NATIVE_PRODUCER_TEST_CHILD,
+        ROOT_PROOF_TEST_CHILD,
+    ] {
+        assert!(
+            !refuses(path, "record.entry_ip"),
+            "the exact isolated test fixture must be accepted: {path}"
+        );
+    }
+    for path in [
+        "src/render.rs",
+        "src/output.rs",
+        "src/semantic_capture/tests/custody_chain_tests/render.rs",
+        "src/semantic_capture/tests/custody_chain_tests/owner_admission_helpers.rs",
+        "src/semantic_capture/tests/custody_chain_tests/owner_admission/other.rs",
+        "src/semantic_capture/semantic_validation.rs",
+        "src/semantic_capture/owner_admission.rs",
+        "src/semantics_objects/journal/producer.rs",
+        "src/semantics_objects/journal/native_producer_tests_helpers.rs",
+        "src/semantics_objects/journal/native_producer_tests/other.rs",
+        "src/semantics_objects/journal/root_proof_tests_helpers.rs",
+        "src/semantics_objects/journal/root_proof_tests/other.rs",
+    ] {
+        for source in [
+            "record.continuity",
+            "let data = record.continuity;",
+            "render(record.continuity)",
+            "render(record.entry_ip)",
+            "report.entry_stamp = record.entry_stamp;",
+            "report.return_stamp = record.return_stamp;",
+            "let records = poll_records(&mut reader);",
+            "let record = decode_record(bytes);",
+            "render(outcome.continuity_rounds, record.entry_ip)",
+            "if engine.continuity_deferred { render(record.continuity); }",
+        ] {
+            assert!(refuses(path, source), "{path} must refuse {source:?}");
+        }
+        for source in [
+            "let rounds = outcome.continuity_rounds;",
+            "if engine.continuity_deferred {}",
+            "let cuts = report.continuity_cuts;",
+            "let events = poll_records_to_position();",
+        ] {
+            assert!(!refuses(path, source), "{path} must accept {source:?}");
+        }
+    }
+    assert!(
+        read("src/lib.rs").contains("#[cfg(test)]\nmod s1_tests;"),
+        "the public projection privacy sentinel must remain test-only"
+    );
+    assert!(
+        semantic_capture_private_test_children_are_isolated(
+            &read("src/semantic_capture.rs"),
+            &read(SEMANTIC_CAPTURE_TESTS),
+            &read(SEMANTIC_VALIDATION_TEST_CHILD),
+            std::path::Path::new(OWNER_ADMISSION_TEST_CHILD).is_file(),
+        ),
+        "the exact semantic fixture exemptions require their cfg(test) ancestry"
+    );
+    assert!(
+        successor_replay_test_child_is_isolated(
+            &read("src/semantic_capture.rs"),
+            &read(SEMANTIC_CAPTURE_TESTS),
+            &read(SEMANTIC_VALIDATION_TEST_CHILD),
+            &read(OWNER_ADMISSION_TEST_CHILD),
+        ),
+        "the exact replay consumer requires its whole cfg(test) ancestry",
+    );
     // `decode_record`/`poll_records` hand the whole record only to the
     // router; every other consumer gets the bare `Event` from `decode`.
     let events = read("src/events.rs");
     assert!(events.contains("decode_record(bytes).map(|record| record.event)"));
+    assert!(
+        events.contains("fn poll_records_to_position"),
+        "the sanctioned same-consumer drain spelling must stay deliberate"
+    );
     let mut stack = vec![std::path::PathBuf::from("src")];
     let mut users = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -11995,17 +15612,31 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                 continue;
             }
             let source = fs::read_to_string(&path).expect("read source");
-            if [
-                "entry_ip",
-                "entry_stamp",
-                "return_stamp",
-                ".continuity",
-                "poll_records",
-                "decode_record",
-            ]
-            .iter()
-            .any(|field| source.contains(field))
-            {
+            assert!(
+                semantic_capture_private_test_child_references_are_canonical(
+                    &path.to_string_lossy(),
+                    &source,
+                ),
+                "{} references a private semantic fixture outside its canonical test inclusion",
+                path.display(),
+            );
+            assert!(
+                transport_boundaries::native_producer_test_child_references_are_canonical(
+                    &path.to_string_lossy(),
+                    &source,
+                ),
+                "{} references the native fixture outside its canonical test inclusion",
+                path.display(),
+            );
+            assert!(
+                transport_boundaries::root_proof_test_child_references_are_canonical(
+                    &path.to_string_lossy(),
+                    &source,
+                ),
+                "{} references the root proof outside its canonical test/proof inclusion",
+                path.display(),
+            );
+            if transport_boundaries::uses_private_record_fields(&path.to_string_lossy(), &source) {
                 users.push(path.to_string_lossy().into_owned());
             }
         }
@@ -12023,4 +15654,78 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
             .any(|user| user == "src/run/capture_loop_tests.rs"),
         "the rendering sentinel regression must stay in place"
     );
+}
+
+/// The native-suite gate must not misattribute a second failure after a
+/// first: every holder takes the lock poison-tolerantly. The static half
+/// pins the spelling; the live half really poisons the shared gate and
+/// proves it still opens. The poison persists for the rest of the binary,
+/// which is harmless — all four holders recover the same way.
+#[test]
+fn native_suite_gate_survives_a_poisoned_holder() {
+    // Static half: no bare `lock().unwrap()` on the gate (the pre-fix
+    // shape that turned the h6 native-suite timeout into a verifier
+    // misattribution). Spelled dynamically so this pin cannot match
+    // itself.
+    let source = read("tests/artifact_contracts.rs");
+    let bare = ["NATIVE_SUITE_GATE", ".lock().", "unwrap()"].concat();
+    assert!(
+        !source.contains(&bare),
+        "a holder takes the native-suite gate with a bare unwrap"
+    );
+    // Live half: really poison the shared gate, then recover it the way
+    // every holder does. Expected-panic noise from the poisoner thread.
+    let poisoner = std::thread::spawn(|| {
+        let _held = NATIVE_SUITE_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        panic!("poison the shared native-suite gate");
+    });
+    assert!(poisoner.join().is_err(), "the gate poisoner must panic");
+    let _guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+}
+
+#[test]
+fn verifier_headroom_probe_unprivileged_controls_fail_closed() {
+    // Like every other native suite: tolerate a poisoned gate so one
+    // suite's failure cannot misattribute this probe's result.
+    let _guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temporary = std::env::var_os("TMPDIR").unwrap_or_else(|| "/var/tmp/p11scope-ws-tmp".into());
+    let directory = tempfile::tempdir_in(temporary).expect("owned verifier probe build directory");
+    let output = directory.path().join("verifier-probe");
+    let built = run_ok(
+        "python3",
+        &[
+            "-I",
+            "scripts/measure-verifier-headroom.py",
+            "build",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert!(built.contains("stats/BTF refusal controls and native syscall ABI PASS"));
+    assert!(built.contains("actual shared-preload syscall forwarding PASS"));
+    let probe = output.join("verifier-stats-probe.so");
+    let checked = run_ok(
+        "python3",
+        &[
+            "-I",
+            "scripts/measure-verifier-headroom.py",
+            "self-test",
+            "--probe",
+            probe.to_str().unwrap(),
+        ],
+    );
+    for marker in [
+        "default/diagnostic boundary positives, 46 refusal controls PASS",
+        "empty observer: refused; owned child reaped",
+        "failed observer: refused; owned child reaped",
+        "timeout observer: refused; owned child reaped",
+        "descendant-fd observer: refused; owned child reaped",
+    ] {
+        assert!(checked.contains(marker), "headroom checks omitted {marker}");
+    }
 }

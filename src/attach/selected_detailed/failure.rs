@@ -1,0 +1,207 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Failed preparation retains its original native cleanup owner.
+use super::super::{ProducerDetachProgress, Session};
+use crate::inventory_semantics::SemanticRefusal;
+
+/// Only the actual joined receipt permits reuse. Pending and Unproved retain
+/// their Session; neither empty link collections nor Drop prove settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectedCleanupStatus {
+    Pending,
+    Settled,
+    Unproved,
+}
+
+pub(crate) struct SelectedPreparationFailure {
+    session: Option<Session>,
+    reason: SemanticRefusal,
+    diagnostic: anyhow::Error,
+    status: SelectedCleanupStatus,
+    /// Tests-only retention identity: the custody twin tags its own
+    /// failure so the assertion observes that specific owner surviving,
+    /// never a shared counter another test could satisfy.
+    #[cfg(test)]
+    test_id: Option<u64>,
+    /// Tests-only destruction probe: the custody twin's liveness
+    /// token, owned by this failure. A retained (forgotten) failure
+    /// keeps it alive; a destroyed failure drops it. The twin holds
+    /// only a `Weak`, so it observes this specific owner's survival —
+    /// never a recorded marker.
+    #[cfg(test)]
+    liveness: Option<std::sync::Arc<()>>,
+}
+impl SelectedPreparationFailure {
+    /// Called only before the first producer exists, after the failed local
+    /// preparation has returned and its unlinked loader resources have closed.
+    pub(super) fn before_links(diagnostic: anyhow::Error) -> Self {
+        Self {
+            session: None,
+            reason: SemanticRefusal::Attachment,
+            diagnostic,
+            status: SelectedCleanupStatus::Settled,
+            #[cfg(test)]
+            test_id: None,
+            #[cfg(test)]
+            liveness: None,
+        }
+    }
+
+    pub(super) fn retaining(session: Session, diagnostic: anyhow::Error) -> Self {
+        Self {
+            session: Some(session),
+            reason: SemanticRefusal::Attachment,
+            diagnostic,
+            status: SelectedCleanupStatus::Pending,
+            #[cfg(test)]
+            test_id: None,
+            #[cfg(test)]
+            liveness: None,
+        }
+    }
+
+    /// Failure-only custody handoff from the concrete sealed runtime factory.
+    /// This cannot extract Session, construct a usable lane, or activate it.
+    pub(crate) fn from_factory_rejection(session: Session, reason: SemanticRefusal) -> Self {
+        Self {
+            session: Some(session),
+            reason,
+            diagnostic: anyhow::anyhow!("selected provisional construction refused: {reason}"),
+            status: SelectedCleanupStatus::Pending,
+            #[cfg(test)]
+            test_id: None,
+            #[cfg(test)]
+            liveness: None,
+        }
+    }
+
+    /// Tests-only settled failure: the exact pre-producer state
+    /// (`before_links`: no Session, cleanup already settled), so the
+    /// DR37 service's disposal polling and terminal statuses run
+    /// without native maps. Production failures always retain or
+    /// settle real owners.
+    #[cfg(test)]
+    pub(crate) fn scripted_settled() -> Self {
+        Self::before_links(anyhow::anyhow!("scripted pre-link preparation failure"))
+    }
+
+    /// Tests-only unproved failure: cleanup that proved nothing, so
+    /// the DR37 service's process-lifetime retention runs without
+    /// native maps. Production unproved owners always retain real
+    /// Sessions.
+    #[cfg(test)]
+    pub(crate) fn scripted_unproved() -> Self {
+        Self {
+            session: None,
+            reason: SemanticRefusal::Attachment,
+            diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
+            status: SelectedCleanupStatus::Unproved,
+            test_id: None,
+            liveness: None,
+        }
+    }
+
+    /// Tests-only tagged failures for the custody twins: the same
+    /// settled/unproved shapes carrying the twin's own retention
+    /// identity. Untagged scripted failures (above) record nothing.
+    #[cfg(test)]
+    pub(crate) fn scripted_settled_with_id(test_id: u64) -> Self {
+        let mut failure = Self::scripted_settled();
+        failure.test_id = Some(test_id);
+        failure
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_unproved_with_id(test_id: u64) -> Self {
+        let mut failure = Self {
+            session: None,
+            reason: SemanticRefusal::Attachment,
+            diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
+            status: SelectedCleanupStatus::Unproved,
+            test_id: None,
+            liveness: None,
+        };
+        failure.test_id = Some(test_id);
+        failure
+    }
+
+    /// Tests-only destruction probe: this failure takes ownership of
+    /// the twin's liveness token, so the twin's `Weak` observes this
+    /// specific owner's survival — never a recorded marker.
+    #[cfg(test)]
+    pub(crate) fn with_liveness_probe(mut self, probe: std::sync::Arc<()>) -> Self {
+        self.liveness = Some(probe);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retention_test_id(&self) -> Option<u64> {
+        self.test_id
+    }
+
+    pub(crate) fn semantic_refusal(&self) -> SemanticRefusal {
+        self.reason
+    }
+
+    pub(crate) fn cleanup_status(&self) -> SelectedCleanupStatus {
+        self.status
+    }
+
+    pub(super) fn requires_backend_fallback(&self) -> bool {
+        self.diagnostic
+            .downcast_ref::<super::super::BackendFallbackRequired>()
+            .is_some()
+    }
+
+    /// Poll without consuming or abandoning the original cleanup worker. A
+    /// ready worker is joined once; no second-signal predicate is used as a
+    /// substitute for readiness. Unproved remains owned and cannot be retried.
+    pub(crate) fn poll_cleanup(&mut self, out: &mut dyn std::io::Write) -> SelectedCleanupStatus {
+        if self.status != SelectedCleanupStatus::Pending {
+            return self.status;
+        }
+        let session = self
+            .session
+            .as_mut()
+            .expect("pending cleanup retains Session");
+        if let Err(error) = session.begin_owned_producer_detach() {
+            self.diagnostic = anyhow::anyhow!(
+                "selected cleanup submission: {error:#}; preparation: {:#}",
+                self.diagnostic
+            );
+            self.status = SelectedCleanupStatus::Unproved;
+            return self.status;
+        }
+        match session.poll_owned_producer_detach(out) {
+            Ok(ProducerDetachProgress::Pending) => SelectedCleanupStatus::Pending,
+            Ok(ProducerDetachProgress::Complete) => {
+                self.status = SelectedCleanupStatus::Settled;
+                // Joined native owners have closed. Only now release the
+                // remaining maps, targets and query descriptors together.
+                drop(self.session.take());
+                self.status
+            }
+            Err(error) => {
+                self.diagnostic = anyhow::anyhow!(
+                    "selected cleanup settlement: {error:#}; preparation: {:#}",
+                    self.diagnostic
+                );
+                self.status = SelectedCleanupStatus::Unproved;
+                self.status
+            }
+        }
+    }
+}
+impl std::fmt::Debug for SelectedPreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedPreparationFailure")
+            .field("reason", &self.reason)
+            .field("cleanup", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for SelectedPreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (cleanup {:?})", self.reason, self.status)
+    }
+}
+impl std::error::Error for SelectedPreparationFailure {}

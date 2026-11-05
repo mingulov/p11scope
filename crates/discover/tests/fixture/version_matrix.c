@@ -26,8 +26,29 @@ typedef struct { CK_VERSION version; void *functions[104]; } Table;
 #ifndef MATRIX_INTERFACES
 #define MATRIX_INTERFACES 1
 #endif
+#ifndef SINGLE_INTERFACE
+#define SINGLE_INTERFACE 0
+#endif
 #ifndef SHORT_LEGACY
 #define SHORT_LEGACY 0
+#endif
+#ifndef MAPPED_LEGACY_WORDS
+#define MAPPED_LEGACY_WORDS -1
+#endif
+#ifndef SPARSE_LEGACY
+#define SPARSE_LEGACY -2
+#endif
+#ifndef LEGACY_PADDING
+#define LEGACY_PADDING 0
+#endif
+#ifndef MAPPED_V32_WORDS
+#define MAPPED_V32_WORDS -1
+#endif
+#ifndef INTERFACE_MAJOR
+#define INTERFACE_MAJOR 3
+#endif
+#ifndef INTERFACE_MINOR
+#define INTERFACE_MINOR 2
 #endif
 #ifndef PRIVACY_FIXTURE
 #define PRIVACY_FIXTURE 0
@@ -38,14 +59,33 @@ typedef struct { CK_VERSION version; void *functions[104]; } Table;
 #ifndef UNTRUSTED_TARGETS
 #define UNTRUSTED_TARGETS 0
 #endif
+/* Capacity-only canonical2.40 surface: one getter plus distinct stubs,
+ * with remaining slots aliasing the getter. Unused tables/entry points
+ * are not populated or exported, so the declared physical tail is exact.
+ * The ordinary ABI matrix is unchanged when this opt-in is absent. */
+#ifndef CAPACITY_UNIQUE
+#define CAPACITY_UNIQUE 0
+#endif
+#if CAPACITY_UNIQUE < 0 || CAPACITY_UNIQUE > 68
+#error "CAPACITY_UNIQUE must be0..68"
+#endif
 
 #if PRIVACY_FIXTURE
+/* Closed H7 canary sessions only. All other function-table fixtures keep
+ * their original no-write CKR_OK behavior. */
+static CK_RV object_canary_rv(const char *index, CK_ULONG session) {
+    if (strcmp(index, "24") == 0 && session >= 0x701 && session <= 0x705) {
+        static const CK_RV results[] = {17, 18, 0x150, 5, 1};
+        return results[session - 0x701];
+    }
+    return CKR_OK;
+}
 #define TEN_ARGS CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3, CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7, CK_ULONG a8, CK_ULONG a9
 #define S(n) static CK_RV s##n(TEN_ARGS) { \
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; \
     (void)a6; (void)a7; (void)a8; (void)a9; \
     if (PRIVACY_BLOCKS) sleep(60); \
-    return CKR_OK; \
+    return object_canary_rv(#n, a0); \
 }
 #else
 #define S(n) static CK_RV s##n(void) { return CKR_OK; }
@@ -61,10 +101,18 @@ static void *stubs[104] = {
 };
 
 CK_RV C_GetFunctionList(void **out);
+#if !CAPACITY_UNIQUE
 CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);
 CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags);
+#endif
 
+#if CAPACITY_UNIQUE
+#define legacy p11scope_capacity_table
+Table legacy;
+#else
 static Table legacy;
+#endif
+#if !CAPACITY_UNIQUE
 static Table t240;
 static Table t30;
 static Table t31;
@@ -72,35 +120,53 @@ static Table t32;
 static Table tfuture;
 static Table tunknown;
 static Table tbad;
+#endif
 static void *short_legacy;
+#if !CAPACITY_UNIQUE
+static void *short_v32;
 static char *boundary_name;
+#endif
 
 static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) {
     table->version = (CK_VERSION){major, minor};
     for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];
     table->functions[3] = (void *)C_GetFunctionList;
+#if CAPACITY_UNIQUE
+    (void)anchors;
+    for (int i = 0; i < 104; i++) table->functions[i] = (void *)C_GetFunctionList;
+    for (int i = 0; i < CAPACITY_UNIQUE - 1; i++)
+        table->functions[i < 3 ? i : i + 1] = stubs[i];
+#else
     if (anchors) {
         table->functions[68] = (void *)C_GetInterfaceList;
         table->functions[69] = (void *)C_GetInterface;
     }
+#endif
 #if UNTRUSTED_TARGETS
     table->functions[0] = (void *)write; /* preloaded libc, not provider-owned */
     table->functions[1] = (void *)&legacy; /* mapped, but not executable */
 #endif
 }
 
-static void make_short_legacy(void) {
+static void *mapped_table(Table *table, size_t available) {
     long page = sysconf(_SC_PAGESIZE);
-    size_t wanted = offsetof(Table, functions) + 68 * sizeof(void *);
     unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (region == MAP_FAILED) __builtin_trap();
-    unsigned char *base = region + page - (wanted - 1);
-    memcpy(base, &legacy, wanted - 1);
+    unsigned char *base = region + page - available;
+    memcpy(base, table, available);
     if (munmap(region + page, (size_t)page) != 0) __builtin_trap();
-    short_legacy = base;
+    return base;
 }
 
+static void make_short_legacy(void) {
+    size_t available = MAPPED_LEGACY_WORDS >= 0
+        ? offsetof(Table, functions) + MAPPED_LEGACY_WORDS * sizeof(void *)
+        : offsetof(Table, functions) + 68 * sizeof(void *) - 1;
+    short_legacy = mapped_table(&legacy, available);
+}
+
+#if !CAPACITY_UNIQUE
 static void make_boundary_name(void) {
     long page = sysconf(_SC_PAGESIZE);
     unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
@@ -110,30 +176,50 @@ static void make_boundary_name(void) {
     memcpy(boundary_name, "PKCS 11", sizeof("PKCS 11"));
     if (munmap(region + page, (size_t)page) != 0) __builtin_trap();
 }
+#endif
 
 static void fill(void) {
     static int done;
     if (done) return;
     done = 1;
     fill_table(&legacy, LEGACY_MAJOR, LEGACY_MINOR, 0);
+    if (LEGACY_PADDING)
+        memset((unsigned char *)&legacy + sizeof(CK_VERSION), 0xa5,
+               offsetof(Table, functions) - sizeof(CK_VERSION));
+    if (SPARSE_LEGACY >= -1) {
+        memset(legacy.functions, 0, sizeof(legacy.functions));
+        if (SPARSE_LEGACY >= 0) legacy.functions[SPARSE_LEGACY] = stubs[SPARSE_LEGACY];
+    }
+#if !CAPACITY_UNIQUE
     fill_table(&t240, 2, 40, 0);
     fill_table(&t30, 3, 0, 1);
     fill_table(&t31, 3, 1, 1);
-    fill_table(&t32, 3, 2, 1);
+    fill_table(&t32, INTERFACE_MAJOR, INTERFACE_MINOR, 1);
+    if (MAPPED_V32_WORDS >= 0)
+        short_v32 = mapped_table(&t32, offsetof(Table, functions) + MAPPED_V32_WORDS * sizeof(void *));
     fill_table(&tfuture, 3, 9, 1);
     fill_table(&tunknown, 4, 0, 1);
     fill_table(&tbad, 3, 2, 0);
     make_boundary_name();
-    if (SHORT_LEGACY) make_short_legacy();
+#endif
+    if (SHORT_LEGACY || MAPPED_LEGACY_WORDS >= 0) make_short_legacy();
 }
 
 CK_RV C_GetFunctionList(void **out) {
     fill();
     if (!out) return CKR_ARGUMENTS_BAD;
-    *out = SHORT_LEGACY ? short_legacy : (void *)&legacy;
+    *out = (SHORT_LEGACY || MAPPED_LEGACY_WORDS >= 0) ? short_legacy : (void *)&legacy;
     return CKR_OK;
 }
 
+#if CAPACITY_UNIQUE
+/* A reload must not perform an unledgered acquisition through an old probe.
+ * The controlled target can read this same published table as data, while
+ * deliberate C_GetFunctionList activity stays separately gated/ledgered. */
+__attribute__((constructor)) static void capacity_initialize(void) { fill(); }
+#endif
+
+#if !CAPACITY_UNIQUE
 static char exact[] = "PKCS 11";
 static char alternate[] = "Acme Standard ABI";
 static char deceptive[] = "Vendor Pretend";
@@ -141,23 +227,27 @@ static char deceptive[] = "Vendor Pretend";
 CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
     fill();
     if (!count) return CKR_ARGUMENTS_BAD;
-    CK_ULONG needed = MATRIX_INTERFACES ? 13 : 0;
+    CK_ULONG needed = MATRIX_INTERFACES ? (SINGLE_INTERFACE ? 1 : 13) : 0;
     if (!out) { *count = needed; return CKR_OK; }
     if (*count < needed) { *count = needed; return CKR_BUFFER_TOO_SMALL; }
     if (MATRIX_INTERFACES) {
-        out[0] = (CK_INTERFACE){exact, &t240, 0};
-        out[1] = (CK_INTERFACE){exact, &t30, 0};
-        out[2] = (CK_INTERFACE){exact, &t31, 0};
-        out[3] = (CK_INTERFACE){exact, &t32, 0};
-        out[4] = (CK_INTERFACE){exact, &tfuture, 0};
-        out[5] = (CK_INTERFACE){exact, &tunknown, 0};
-        out[6] = (CK_INTERFACE){alternate, &t32, 0};
-        out[7] = (CK_INTERFACE){0, &t30, 0};
-        out[8] = (CK_INTERFACE){(char *)(uintptr_t)1, &t31, 0};
-        out[9] = (CK_INTERFACE){deceptive, &tbad, 0};
-        out[10] = (CK_INTERFACE){alternate, &legacy, 0};
-        out[11] = (CK_INTERFACE){exact, 0, 0};
-        out[12] = (CK_INTERFACE){boundary_name, &t32, 0};
+        if (SINGLE_INTERFACE) {
+            out[0] = (CK_INTERFACE){exact, MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32, 0};
+        } else {
+            out[0] = (CK_INTERFACE){exact, &t240, 0};
+            out[1] = (CK_INTERFACE){exact, &t30, 0};
+            out[2] = (CK_INTERFACE){exact, &t31, 0};
+            out[3] = (CK_INTERFACE){exact, MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32, 0};
+            out[4] = (CK_INTERFACE){exact, &tfuture, 0};
+            out[5] = (CK_INTERFACE){exact, &tunknown, 0};
+            out[6] = (CK_INTERFACE){alternate, &t32, 0};
+            out[7] = (CK_INTERFACE){0, &t30, 0};
+            out[8] = (CK_INTERFACE){(char *)(uintptr_t)1, &t31, 0};
+            out[9] = (CK_INTERFACE){deceptive, &tbad, 0};
+            out[10] = (CK_INTERFACE){alternate, &legacy, 0};
+            out[11] = (CK_INTERFACE){exact, 0, 0};
+            out[12] = (CK_INTERFACE){boundary_name, &t32, 0};
+        }
     }
     *count = needed;
     return CKR_OK;
@@ -179,3 +269,4 @@ CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
     *out = &selected;
     return CKR_OK;
 }
+#endif

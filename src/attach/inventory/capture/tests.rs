@@ -6,11 +6,12 @@ use super::super::activation::InventoryAttachRequest;
 use super::super::callers::{BatchToken, BatchUnsupported, CallerBatchStep, CallerUseIo};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::AdmissionPolicy;
 use p11scope_ebpf_common::inventory_callers::CALLER_ENTRY_COUNT_SATURATED;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn budget(n: u64) -> InventoryBudget {
     InventoryBudget::new(n, n * 8).unwrap()
@@ -606,7 +607,7 @@ fn zero_windows_refuse() {
 #[test]
 fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
     // A start-time fallback pin is never PID-scope custody.
-    let error = InventoryCapture::prepare(
+    let error = InventoryCapture::prepare_for_proof(
         CaptureScope::Pid(PidPin::test_proc_only(std::process::id())),
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
@@ -620,7 +621,7 @@ fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
     let mut child = std::process::Command::new("true").spawn().unwrap();
     let pin = PidPin::open(child.id()).unwrap();
     child.wait().unwrap();
-    let error = InventoryCapture::prepare(
+    let error = InventoryCapture::prepare_for_proof(
         CaptureScope::Pid(pin),
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
@@ -632,13 +633,37 @@ fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
 
     // C5.11: the facade admits Multi; an unprivileged run fails only at
     // the object load, never at a backend refusal.
-    if let Err(error) = InventoryCapture::prepare(
+    if let Err(error) = InventoryCapture::prepare_for_proof(
         CaptureScope::System,
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
         AttachBackend::Multi,
     ) {
         assert!(!format!("{error:#}").contains("Singles"), "{error:#}");
+    }
+}
+
+#[test]
+fn low_level_capture_cannot_bypass_live_host_admission() {
+    use crate::attach::{MultiHostRefusal, MultiHostStage};
+    for backend in [AttachBackend::Multi, AttachBackend::Singles] {
+        for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+            let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+            let error = InventoryCapture::prepare_with_host(
+                CaptureScope::System,
+                budget(1),
+                caller_budget(budget(1), 1).unwrap(),
+                backend,
+                Err(refusal),
+            )
+            .err()
+            .expect("low-level live constructor must refuse before object preparation");
+            assert_eq!(
+                error.downcast_ref::<MultiHostRefusal>(),
+                Some(&refusal),
+                "{error:#}"
+            );
+        }
     }
 }
 
@@ -686,10 +711,29 @@ fn capture_activation_admits_pid_only_with_matching_live_custody() {
 
 #[test]
 fn the_default_caller_budget_is_p_65536_with_exact_payload() {
-    let callers = default_caller_budget(budget(4096)).unwrap();
-    assert_eq!(callers.pair_limit(), 65_536);
-    assert_eq!(callers.endpoint_budget(), budget(4096));
-    assert_eq!(callers.additional_payload_bytes(), 4096 * 8 + 65_536 * 64);
+    let mut totals = Vec::new();
+    for (n, total) in [(4096, 4_259_840), (8192, 4_325_376)] {
+        let endpoints = budget(n);
+        let callers = default_caller_budget(endpoints).unwrap();
+        assert_eq!(callers.pair_limit(), 65_536);
+        assert_eq!(callers.endpoint_budget(), endpoints);
+        assert_eq!(endpoints.payload_bytes(), n * 8);
+        assert_eq!(callers.additional_payload_bytes(), n * 8 + 65_536 * 64);
+        let payload = endpoints
+            .payload_bytes()
+            .checked_add(callers.additional_payload_bytes())
+            .unwrap();
+        assert_eq!(
+            payload,
+            n.checked_mul(16)
+                .unwrap()
+                .checked_add(65_536_u64.checked_mul(64).unwrap())
+                .unwrap()
+        );
+        assert_eq!(payload, total);
+        totals.push(payload);
+    }
+    assert_eq!(totals[1] - totals[0], 65_536);
 }
 
 #[test]
@@ -1037,6 +1081,77 @@ fn health(caller: [u64; 4], usage: [u64; 3], unavailable: u64) -> CaptureHealth 
         owner: Some(ThreadOwnerControl::default()),
         ..CaptureHealth::default()
     }
+}
+
+/// OD34: the 16,385th program image is a named, counted inventory gap, not
+/// silence. A scripted caller map at the exact ticket limit (16,384 spent,
+/// one identity refusal, one `IdentityUnavailable` pair failure) reads
+/// through the real health seam and assesses to one regression naming both
+/// counters with counts. The twin pins that a fresh budget stays quiet.
+#[test]
+fn quota_at_16384_tickets_names_identity_unavailable_with_counts() {
+    use super::super::callers::{CallerHealthIo, read_caller_health_with};
+    struct QuotaIo {
+        unavailable: u64,
+        identity_failures: u64,
+    }
+    impl CallerHealthIo for QuotaIo {
+        fn evidence_cell(&mut self, index: u32) -> Result<u64> {
+            Ok(if index == 1 {
+                self.identity_failures
+            } else {
+                0
+            })
+        }
+        fn identity_control(&mut self) -> Result<ImageIdentityControl> {
+            Ok(ImageIdentityControl {
+                limit: 16_384,
+                next_ticket: 16_384,
+                unavailable: self.unavailable,
+                create_failures: 0,
+                retry_exhausted: 0,
+            })
+        }
+    }
+    fn read(io: QuotaIo) -> CaptureHealth {
+        let mut io = io;
+        let read = read_caller_health_with(&mut io, Instant::now() + Duration::from_secs(1));
+        assert!(read.failures.is_empty());
+        CaptureHealth {
+            caller_evidence: read.evidence,
+            caller_control: read.control,
+            usage_evidence: Some([0; 3]),
+            evidence: Some([0; 9]),
+            owner: Some(ThreadOwnerControl::default()),
+            ..CaptureHealth::default()
+        }
+    }
+    let mut book = test_book(8, 8, None);
+    let fresh = read(QuotaIo {
+        unavailable: 0,
+        identity_failures: 0,
+    });
+    assert_eq!(fresh.caller_evidence, Some([0, 0, 0, 0]));
+    assert_eq!(
+        fresh.caller_control.map(|control| control.next_ticket),
+        Some(16_384)
+    );
+    assert_eq!(regression(&mut book, &fresh), None);
+    let quota = read(QuotaIo {
+        unavailable: 1,
+        identity_failures: 1,
+    });
+    let rose = regression(&mut book, &quota).expect("quota must regress");
+    assert!(rose.contains("CALLER_EVIDENCE[1] 0->1"), "{rose}");
+    assert!(
+        rose.contains("COOKIE_CTL(unavailable,create_failures,retry_exhausted)[0] 0->1"),
+        "{rose}"
+    );
+    assert_eq!(
+        regression(&mut book, &quota),
+        None,
+        "the same quota counters regress once"
+    );
 }
 
 #[test]
@@ -1410,7 +1525,7 @@ fn custody_polls_prove_the_pidfd_and_the_leader_thread() {
                 stat('S', 7)
             }
         ),
-        CustodyPoll::Lost(_)
+        CustodyPoll::Exited
     ));
     assert!(!read, "an exited pidfd is never followed by a stat read");
     let polls = std::cell::Cell::new(0);
@@ -1424,7 +1539,7 @@ fn custody_polls_prove_the_pidfd_and_the_leader_thread() {
                 },
                 || stat('Z', 7)
             ),
-            CustodyPoll::Lost(_)
+            CustodyPoll::Exited
         ),
         "an exit during the stat read voids it"
     );
@@ -1454,6 +1569,100 @@ fn custody_polls_prove_the_pidfd_and_the_leader_thread() {
     let mut system = test_book(8, 8, None);
     system.absorb_poll(CustodyPoll::Unproven("x".into()), 1);
     assert_eq!(system.custody(), ScopeCustody::System);
+}
+
+#[test]
+fn original_pid_exit_fact_requires_the_retained_pidfd_and_exact_scope() {
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let pin = PidPin::open(child.0.id()).unwrap();
+    let scope = ScopeIncarnation {
+        pid: pin.pid(),
+        start_time: pin.start_time(),
+    };
+    let budget = InventoryBudget::new(1, 8).unwrap();
+    let mut book = CaptureBook::new(budget, 1, Some(scope), 100);
+    poll_book(&mut book, Some(&pin));
+    assert_eq!(book.custody(), ScopeCustody::PidHeld);
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    poll_book(&mut book, Some(&pin));
+    let ScopeCustody::PidExited { proof, .. } = book.custody() else {
+        panic!("a successful original pidfd poll must retain the exit fact");
+    };
+    assert_eq!((proof.domain(), proof.scope()), (book.domain, scope));
+    let mut missing_after_exit = CaptureBook::new(budget, 1, Some(scope), 100);
+    poll_book(&mut missing_after_exit, Some(&pin));
+    assert!(matches!(
+        missing_after_exit.custody(),
+        ScopeCustody::PidExited { .. }
+    ));
+    poll_book(&mut missing_after_exit, None);
+    assert!(
+        matches!(missing_after_exit.custody(), ScopeCustody::PidLost { .. }),
+        "a later missing original pin must revoke the exit fact"
+    );
+    let fallback = PidPin::test_proc_only(std::process::id());
+    let fallback_scope = ScopeIncarnation {
+        pid: fallback.pid(),
+        start_time: fallback.start_time(),
+    };
+    assert!(
+        OriginalPidExit::from_poll(book.domain, fallback_scope, &fallback, &CustodyPoll::Exited)
+            .is_none()
+    );
+    for wrong in [
+        ScopeIncarnation {
+            pid: scope.pid + 1,
+            ..scope
+        },
+        ScopeIncarnation {
+            start_time: scope.start_time.map(|start| start + 1),
+            ..scope
+        },
+        ScopeIncarnation {
+            start_time: None,
+            ..scope
+        },
+    ] {
+        assert!(
+            OriginalPidExit::from_poll(book.domain, wrong, &pin, &CustodyPoll::Exited).is_none()
+        );
+    }
+    let failed_poll = poll_custody_with(
+        scope.start_time,
+        || Err("owned pidfd poll failed".into()),
+        || stat('S', scope.start_time.unwrap()),
+    );
+    assert!(matches!(failed_poll, CustodyPoll::Lost(_)));
+    assert!(OriginalPidExit::from_poll(book.domain, scope, &pin, &failed_poll).is_none());
+    // An error after the exit fact revokes it even though the first loss
+    // and its public text remain sticky.
+    book.absorb_poll(failed_poll, 200);
+    assert!(matches!(book.custody(), ScopeCustody::PidLost { .. }));
+    let mut earlier = CaptureBook::new(budget, 1, Some(scope), 100);
+    earlier.mark_unproven(90, "an earlier exec was unproven".into());
+    poll_book(&mut earlier, Some(&pin));
+    assert!(matches!(earlier.custody(), ScopeCustody::PidLost { .. }));
+    let mut missing = CaptureBook::new(budget, 1, Some(scope), 100);
+    poll_book(&mut missing, None);
+    poll_book(&mut missing, Some(&pin));
+    assert!(
+        matches!(missing.custody(), ScopeCustody::PidLost { .. }),
+        "later exit cannot upgrade an earlier missing pin"
+    );
 }
 
 #[test]
@@ -1792,6 +2001,7 @@ impl PinnedChild {
         Self(
             std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .expect("spawn sleep"),
         )
@@ -2784,17 +2994,32 @@ fn a_multi_extend_honours_the_window_and_defers_the_rest_unpublished() {
 
 #[test]
 fn the_multi_fd_preflight_needs_the_group_bound_not_n() {
-    let n = 4096;
-    let singles = n + 3 + FD_RESERVE;
-    let multi = MULTI_LINK_BOUND + 3 + FD_RESERVE;
-    assert!(fd_preflight(AttachBackend::Singles, n, singles - 1, 0).is_err());
-    assert!(fd_preflight(AttachBackend::Multi, n, singles - 1, 0).is_ok());
-    assert!(fd_preflight(AttachBackend::Multi, n, multi, 0).is_ok());
-    let refused = fd_preflight(AttachBackend::Multi, n, multi - 1, 0).unwrap_err();
-    assert!(refused.detail.contains("attach-group links"), "{refused}");
+    for n in [4096, 8192] {
+        let singles = n + 3 + FD_RESERVE;
+        let multi = MULTI_LINK_BOUND + 3 + FD_RESERVE;
+        assert!(fd_preflight(AttachBackend::Singles, n, singles, 0).is_ok());
+        assert!(fd_preflight(AttachBackend::Singles, n, singles - 1, 0).is_err());
+        assert!(fd_preflight(AttachBackend::Multi, n, singles - 1, 0).is_ok());
+        assert!(fd_preflight(AttachBackend::Multi, n, multi, 0).is_ok());
+        let refused = fd_preflight(AttachBackend::Multi, n, multi - 1, 0).unwrap_err();
+        assert!(refused.detail.contains("attach-group links"), "{refused}");
+        assert_eq!(entry_link_bound(AttachBackend::Singles, n), n);
+        // The reserve is FREE descriptors: existing descriptors count too.
+        for backend in [AttachBackend::Singles, AttachBackend::Multi] {
+            let needed = if backend == AttachBackend::Singles {
+                singles
+            } else {
+                multi
+            };
+            assert!(fd_preflight(backend, n, needed + 10, 10).is_ok());
+            assert!(fd_preflight(backend, n, needed + 10, 11).is_err());
+        }
+        if n == 8192 {
+            assert_eq!((singles, multi), (8259, 1091));
+        }
+    }
     // A small N bounds Multi too.
     assert_eq!(entry_link_bound(AttachBackend::Multi, 16), 16);
-    assert_eq!(entry_link_bound(AttachBackend::Singles, n), n);
 }
 
 /// Review R1: the loaded-host mode of the I3a cells asserts through this
@@ -3335,6 +3560,68 @@ fn count_lookup_stamp_precedes_the_batch_stamp() {
         batch.counts_read_ns,
         batch.rows_read_ns
     );
+}
+
+#[test]
+fn row_and_refresh_brackets_bound_interleaved_counts() {
+    // Independent hand-scripted instants: row PRE=100, row lookup=120,
+    // refresh PRE=140, refresh lookup=160, common POST=180. A count read
+    // during either quantum cannot be observed before that lookup.
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let delta = fixture.pass("a.so", 2);
+    for endpoint in &delta.endpoints {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    struct InterleavedRows<'a> {
+        inner: FakeRows,
+        clock: &'a std::cell::Cell<u64>,
+        lookups: std::collections::VecDeque<(u64, u64)>,
+    }
+    impl CallerUseIo for InterleavedRows<'_> {
+        fn next_key(&mut self, after: Option<&CallerObjectKey>) -> Result<Option<CallerObjectKey>> {
+            self.inner.next_key(after)
+        }
+
+        fn lookup(&mut self, key: &CallerObjectKey) -> Result<Option<CallerObjectUse>> {
+            let (lookup_ns, count) = self.lookups.pop_front().expect("scripted count lookup");
+            let mut value = self.inner.lookup(key)?;
+            value.as_mut().unwrap().entry_count = count;
+            self.clock.set(lookup_ns + 20);
+            Ok(value)
+        }
+    }
+    let clock = std::cell::Cell::new(100);
+    let mut rows = InterleavedRows {
+        inner: FakeRows::default(),
+        clock: &clock,
+        lookups: [(120, 5), (160, 6)].into(),
+    };
+    rows.inner.insert(key(1, 0), Some(value(40, 0)));
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut batch = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with_clock(&mut rows, &mut book, &mut batch, window, 8, &mut || {
+        clock.get()
+    });
+    assert_eq!(batch.rows[0].entry_count, 5);
+    assert_eq!(
+        batch.counts[0].count, 6,
+        "a call between lookups advances the count"
+    );
+    assert_eq!(batch.rows_anchor_ns, 100, "row PRE precedes its lookup");
+    assert_eq!(
+        batch.counts_read_ns, 140,
+        "refresh PRE precedes its own lookup"
+    );
+    assert!(
+        batch.counts_read_ns > 120,
+        "refresh PRE follows the row lookup"
+    );
+    assert!(
+        batch.rows_read_ns >= 160,
+        "observation POST bounds the refresh lookup"
+    );
+    assert_eq!(batch.rows_read_ns, 180);
 }
 
 #[test]

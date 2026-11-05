@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Task 3 Stage A load-instance continuity witness (Detailed only).
+/* Task 3 Stage A load-instance continuity witness (Detailed and journal).
  *
  * Every file-VMA lifecycle transition passes through the kernel's uprobe
  * bookkeeping: uprobe_mmap (creation, post-adjust), uprobe_munmap (removal,
@@ -12,6 +12,16 @@
  * stable scan. All writes are non-fetch adds or bounded compare-exchanges
  * (F1). The hooks read kernel metadata only and emit nothing. */
 #include "instance_epoch.h"
+#include "image_identity_query.h"
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
+#include "journal_marker.h"
+/* Shared loss/birth admission row. GAP alone never enables exec birth. */
+extern unsigned char JOURNAL_MARKER_CTL;
+#endif
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* PID-scope birth identity witness (main.rs), published with PID_FILTER. */
+extern unsigned char PID_START_TICK;
+#endif
 
 #ifndef P11SCOPE_INSTANCE_HOST_TEST
 #define INST_BTF __attribute__((preserve_access_index))
@@ -50,6 +60,14 @@ struct task_struct___p11inst {
     struct mm_struct___p11inst *mm;
     struct task_struct___p11inst *group_leader;
     unsigned int flags;
+#ifdef P11SCOPE_JOURNAL_MARKER
+    /* H8-D birth marker: the leader's exec generation, read at exec
+     * only. Detailed/journal only, so counter bytes stay identical. */
+    u64 self_exec_id;
+    /* I4 PID-scope birth identity: the thread-group start time, read
+     * at exec only for the in-kernel admission comparison. */
+    u64 start_boottime;
+#endif
 } INST_BTF;
 
 struct {
@@ -124,6 +142,10 @@ static long (*inst_probe_read_kernel)(void *dst, u32 size, const void *src) = (v
 static struct instance_record *(*inst_storage_get)(void *map, void *task, void *value,
                                                    u64 flags) = (void *)156;
 static void *(*inst_current_task)(void) = (void *)158;
+/* bpf_get_func_ret: the fexit return value on any arity (helper 184,
+ * 5.17+). Writes the return through the out-pointer, returns 0; the
+ * verifier inlines the call. */
+static long (*inst_get_func_ret)(void *ctx, u64 *value) = (void *)184;
 
 /* Stores LLVM must not merge into a memset call: the Rust `memset` is a
  * global function that 5.15 refuses a stack pointer argument from here. */
@@ -154,8 +176,8 @@ static INST_INLINE void inst_count(u64 *cell)
         inst_add(cell);
 }
 
-/* The fault generation ends every incarnation. A bounded CAS raise: a lost
- * race means another raise already moved the cell, which is the same fact. */
+/* The first value outside the u32 stamp representation is permanent refusal.
+ * Never increment it again or wrap a wider value into an earlier fault era. */
 static INST_INLINE void inst_fault(struct instance_counters *counters)
 {
     u32 key = INST_GEN_FAULT;
@@ -168,6 +190,8 @@ static INST_INLINE void inst_fault(struct instance_counters *counters)
 #pragma unroll
     for (int i = 0; i < INST_CAS_TRIES; i++) {
         u64 seen = *(volatile u64 *)gen;
+        if (seen > 0xffffffffULL)
+            return;
         if (__sync_val_compare_and_swap(gen, seen, seen + 1) == seen)
             return;
     }
@@ -450,12 +474,33 @@ int p11_inst_vma_unmap(u64 *ctx)
  * returns the new VMA (same vm_file, same vm_mm), or NULL when nothing was
  * created. The kernel admits no pointer-to-pointer fentry argument, so this
  * is an fexit on the return slot (ctx[5]); it still runs under mremap's mmap
- * write lock, before any locked maps reader can see the move. A different
- * argument count makes the verifier refuse the load: fail closed. */
+ * write lock, before any locked maps reader can see the move. This slot is
+ * right only for the 5-argument shape: longer prototypes verify fine (the
+ * slot exists) but hand an argument to the VMA reader instead of the
+ * return, so the resolver selects this program only for the exact
+ * 5-argument BTF shape, the ret-based program below for the exact
+ * 6/7-argument shapes, and refuses the hooks on anything else. */
 INST_SEC("fexit/copy_vma")
 int p11_inst_vma_copy(u64 *ctx)
 {
     return inst_note_vma(ctx[5], 0);
+}
+
+/* copy_vma on 6/7-argument kernels: the stable backports of 838bb60dc215
+ * append keep_source, 7.3 adds anon_pgoff too, and the fexit return slot
+ * moves with the arity (ctx[6], ctx[7]). bpf_get_func_ret reads the
+ * returned new VMA on any arity. Same note as the legacy hook above; a
+ * separate program so the legacy bytes never move. A nonzero helper
+ * return (only a wrong attach type) is a fault, never a silent no-op. */
+INST_SEC("fexit/copy_vma")
+int p11_inst_vma_retcopy(u64 *ctx)
+{
+    u64 ret = 0;
+    if (inst_get_func_ret(ctx, &ret) != 0) {
+        inst_fault(inst_counters());
+        return 0;
+    }
+    return inst_note_vma(ret, 0);
 }
 
 /* Fork: a CLONE_VM child that is not a thread shares its parent's mm, so
@@ -477,6 +522,7 @@ __attribute__((noinline)) u32 p11_instance_fork(struct task_struct *child, u64 c
         INST_PUT(init.epoch[i], 0);
     }
     INST_PUT(init.exec_attach_gen, 0);
+    INST_PUT(init.journal_bootstrap, 0);
     INST_PUT(init.flags, INST_RECORD_SHARED_MM);
     rec = child ? inst_storage_get(&PROC_EPOCH, child, &init, 1) : 0;
     if (!rec || !inst_set_flags(rec, INST_RECORD_SHARED_MM)) {
@@ -522,6 +568,240 @@ __attribute__((noinline)) u32 p11_instance_exec(void)
         *(volatile u64 *)&rec->exec_attach_gen = *(volatile u64 *)attach;
     return 1;
 }
+
+/* Exit summary: a no-create read of the leader record for the kind-7 exit
+ * record, mirroring p11_instance_exec's lookup. Copies the eight slot+1
+ * cells and ORs the record flags into the caller's word; absent record,
+ * missing task/leader, or null out contributes nothing and returns 0.
+ * Reads kernel VMA/file/mm metadata only, like every hook in this unit. */
+__attribute__((noinline)) u32 p11_instance_exit_summary(struct instance_exit_summary *out)
+{
+    struct task_struct___p11inst *current;
+    struct task_struct___p11inst *leader;
+    struct instance_record *rec;
+
+    if (!out)
+        return 0;
+#pragma unroll
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        out->slot_plus1[i] = 0;
+    current = inst_current_task();
+    if (!current)
+        return 0;
+    leader = current->group_leader;
+    if (!leader)
+        return 0;
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 0);
+    if (!rec)
+        return 0;
+#pragma unroll
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        out->slot_plus1[i] = *(volatile u64 *)&rec->slot_plus1[i];
+    out->flags |= *(volatile u64 *)&rec->flags;
+    return 1;
+}
+
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* Exec-ID read for the birth marker: the established volatile CO-RE
+ * deref (image_identity.c). The host harness counts reads through
+ * this seam to prove the gap path never reads one. */
+#ifndef INST_MARKER_EXEC_ID
+#define INST_MARKER_EXEC_ID(leader) (*(volatile u64 *)&(leader)->self_exec_id)
+#endif
+#endif
+
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
+/* Sticky failure latch: `failed` is only ever 0->1, so an exchange trips
+ * it exactly once and never needs a retry. */
+static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
+{
+    if (!ctl)
+        return;
+    __sync_lock_test_and_set(&ctl->failed, 1);
+}
+#endif
+
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* I4 PID-scope birth identity: PID scope admits the exec hook by tgid
+ * number, which a later process can reuse. Under PID scope (`pid_scope_tgid`
+ * nonzero) the marker births only the scope target itself: its
+ * thread-group leader's kernel start time in USER_HZ ticks
+ * (start_boottime / 10000000, the /proc/PID/stat field 22 userspace
+ * published into PID_START_TICK) must equal the published witness. Exec
+ * keeps it and de_thread exchanges it to the surviving leader, so the
+ * target's own exec matches, while a process that reused the number
+ * (born later, in another tick) does not. Cgroup and system scopes pass
+ * 0 and are unchanged. A missing entry, an unreadable task or a mismatch
+ * refuses without a latch, a charge or an exec-ID read: that process is
+ * simply never born. In-kernel comparison only; never exported. */
+static INST_INLINE u32 marker_pid_witness_matches(struct task_struct___p11inst *current,
+                                                  u32 pid_scope_tgid)
+{
+    struct task_struct___p11inst *leader;
+    u64 *expected;
+
+    if (!pid_scope_tgid)
+        return 1;
+    expected = inst_map_lookup(&PID_START_TICK, &pid_scope_tgid);
+    if (!expected || !current)
+        return 0;
+    leader = current->group_leader;
+    if (!leader)
+        return 0;
+    return *(volatile u64 *)&leader->start_boottime / 10000000ULL == *(volatile u64 *)expected;
+}
+
+/* H8-D post-attach birth marker, exec half (Detailed/journal):
+ * publish READY(self_exec_id) after closure on the leader row.
+ * p11_instance_exec stays unchanged and runs first; this only marks.
+ * `pid_scope_tgid` is the PID scope target's tgid, 0 under cgroup and
+ * system scope (see marker_pid_witness_matches).
+ * Returns 1 when the marker is READY for this exec, 0 when gated (a
+ * PID-scope witness mismatch included), sticky-DIRTY, latched, or left
+ * rowless by a task-storage NULL.
+ * Failures latch the control row and never raise the fault: no
+ * provider body runs at the exec root, and a fault there would wreck
+ * S1 continuity for the whole session. A storage NULL is not a
+ * failure: no row means no READY, which can never birth. */
+__attribute__((noinline)) u32 p11_instance_exec_birth(u32 pid_scope_tgid)
+{
+    struct task_struct___p11inst *current = inst_current_task();
+    struct task_struct___p11inst *leader;
+    struct instance_record *rec;
+    struct journal_admission_control *ctl;
+    u32 key = INST_GEN_ATTACH;
+    u32 ctl_key = 0;
+    u64 *attach;
+    u64 gen;
+    u64 word;
+    u64 exec;
+    int reserved = 0;
+
+    attach = inst_map_lookup(&INSTANCE_GEN, &key);
+    if (!attach)
+        return 0;
+    gen = *(volatile u64 *)attach;
+    if (!gen)
+        return 0;
+    ctl = inst_map_lookup(&JOURNAL_MARKER_CTL, &ctl_key);
+    if (!ctl)
+        return 0;
+    if (*(volatile u64 *)&ctl->failed != 0)
+        return 0;
+    /* After the generation and control gates, before any write. */
+    if (!marker_pid_witness_matches(current, pid_scope_tgid))
+        return 0;
+    if (!current)
+        goto latch;
+    leader = current->group_leader;
+    if (!leader || leader != current)
+        goto latch;
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 0);
+    if (!rec) {
+        if (!p11_journal_marker_reserve(ctl))
+            return 0;
+        rec = inst_storage_get(&PROC_EPOCH, leader, 0, 1);
+        if (!rec) {
+            /* A task-storage NULL (spurious 5.15 busy or a real
+             * failure) means no row, hence no READY and no birth:
+             * return with no latch, no refund and no fault, and
+             * without touching the storage-null continuity count. */
+            return 0;
+        }
+        /* A CREATE after a spurious lookup NULL may return an
+         * existing row: the checks below apply to it with the
+         * reservation held, so it is never charged again. */
+        reserved = 1;
+    }
+    if (*(volatile u64 *)&rec->flags & INST_RECORD_SHARED_MM)
+        goto latch;
+    word = *(volatile u64 *)&rec->journal_bootstrap;
+    if (word == P11_JOURNAL_MARKER_UNPUBLISHED) {
+        if (!reserved && !p11_journal_marker_reserve(ctl))
+            return 0;
+    } else if (word == P11_JOURNAL_MARKER_DIRTY) {
+        return 0;
+    } else if ((word & P11_JOURNAL_MARKER_STATE_MASK) != P11_JOURNAL_MARKER_READY_STATE) {
+        goto latch;
+    }
+    /* READY(old): republish below without charging. */
+    exec = INST_MARKER_EXEC_ID(leader);
+    if (exec >= (1ULL << 62))
+        goto latch;
+    *(volatile u64 *)&rec->exec_attach_gen = gen;
+    if (p11_journal_marker_publish(rec, exec))
+        return 1;
+    word = *(volatile u64 *)&rec->journal_bootstrap;
+    if (word == P11_JOURNAL_MARKER_DIRTY)
+        return 0;
+latch:
+    marker_latch(ctl);
+    return 0;
+}
+#endif
+
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
+/* H8-D scope gap (Detailed and journal): a watched call refused for
+ * scope or ABI dirties the leader's marker, so a later exec cannot
+ * claim the uncaptured prefix as born. Reads no argument, user memory, path,
+ * name, or exec ID. Returns 1 when the row is DIRTY at return
+ * (marked, or already), 0 when gated, latched, or failed. Gap
+ * failures latch and fault; later gaps no-op on the latch without
+ * faulting again. */
+__attribute__((noinline)) u32 p11_instance_scope_gap(void)
+{
+    struct task_struct___p11inst *current = inst_current_task();
+    struct task_struct___p11inst *leader;
+    struct instance_record *rec;
+    struct journal_admission_control *ctl;
+    u32 key = INST_GEN_ATTACH;
+    u32 ctl_key = 0;
+    u64 *attach;
+    u64 gen;
+    u64 word;
+
+    attach = inst_map_lookup(&INSTANCE_GEN, &key);
+    if (!attach)
+        return 0;
+    gen = *(volatile u64 *)attach;
+    if (!gen)
+        return 0;
+    ctl = inst_map_lookup(&JOURNAL_MARKER_CTL, &ctl_key);
+    if (!ctl)
+        return 0;
+    if (*(volatile u64 *)&ctl->failed != 0)
+        return 0;
+    if (!current)
+        goto latch_fault;
+    leader = current->group_leader;
+    if (!leader)
+        goto latch_fault;
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 0);
+    if (rec) {
+        word = *(volatile u64 *)&rec->journal_bootstrap;
+        if (word == P11_JOURNAL_MARKER_DIRTY)
+            return 1;
+        if (word == P11_JOURNAL_MARKER_UNPUBLISHED && !p11_journal_marker_reserve(ctl)) {
+            /* The latch is set; the gap below still marks. */
+        }
+        p11_journal_marker_dirty(rec);
+        return 1;
+    }
+    if (!p11_journal_marker_reserve(ctl)) {
+        inst_fault(inst_counters());
+        return 0;
+    }
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 1);
+    if (!rec)
+        goto latch_fault;
+    p11_journal_marker_dirty(rec);
+    return 1;
+latch_fault:
+    marker_latch(ctl);
+    inst_fault(inst_counters());
+    return 0;
+}
+#endif
 
 /* The continuity stamp for the caller of endpoint `endpoint_slot`; reads
  * only map cells and the caller's record. Inlined into the two helpers so no
@@ -607,16 +887,23 @@ static INST_INLINE void inst_copy_key(struct instance_start_key *dst,
 /* Entry half: record the private probed address and the entry stamp under
  * the call's START key (whose `slot` is the endpoint slot). A failed update
  * deletes any stale entry for the key, so the return sees absence. */
-__attribute__((noinline)) u32 p11_instance_entry(const struct instance_start_key *key, u64 ip)
+__attribute__((noinline)) u32 p11_instance_entry(const struct instance_start_key *key, u64 ip,
+                                               u64 cookie, u64 exec_id)
 {
-    struct instance_start_key k;
-    struct instance_entry entry;
-
     if (!key)
         return 0;
+    /* Gate scratch expires before either own-stack map key or stamp starts.
+     * The original caller key remains immutable throughout this invocation. */
+    u32 image_ready = p11_image_entry(key->pid_tgid >> 32, cookie, exec_id);
+    struct instance_start_key k;
     /* A global function's pointer argument is generic memory; 5.15 map
      * helpers take keys only from the stack (or a map value). */
     inst_copy_key(&k, key);
+    if (!image_ready) {
+        inst_map_delete(&INSTANCE_START, &k);
+        return 0;
+    }
+    struct instance_entry entry;
     entry.entry_ip = ip;
     inst_stamp(k.slot, &entry.entry_stamp);
     if (inst_map_update(&INSTANCE_START, &k, &entry, 0 /* BPF_ANY */)) {
@@ -659,4 +946,13 @@ __attribute__((noinline)) u32 p11_instance_return(const struct instance_start_ke
     out->entry_stamp.flags = entry->entry_stamp.flags;
     inst_map_delete(&INSTANCE_START, &k);
     return 1;
+}
+
+/* H7 slice B object custody: the narrow fault leaf. Probe roots call it
+ * sequentially after an owner/custody failure; it advances the existing
+ * checked fault cell without inventing a counter. Never nested inside an
+ * owner helper. */
+__attribute__((noinline)) void p11_object_fault(void)
+{
+    inst_fault(inst_counters());
 }

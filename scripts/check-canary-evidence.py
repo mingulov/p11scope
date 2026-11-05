@@ -56,6 +56,7 @@ def target_oracle(bits):
 ALIASES = None
 MAXIMUM = None
 UNKNOWN = None
+TARGET_BITS = None
 POLICY_BOOLEANS = {
     "CKA_TOKEN", "CKA_PRIVATE", "CKA_SENSITIVE", "CKA_ENCRYPT",
     "CKA_DECRYPT", "CKA_WRAP", "CKA_UNWRAP", "CKA_SIGN", "CKA_VERIFY",
@@ -76,7 +77,7 @@ EXPECTED_SENTINEL_FAMILIES = {
     "PIN", "KEY", "LABEL", "ID", "PLAINTEXT", "IV", "AAD", "BOOLLONG",
     "USERNAME", "CIPHERTEXT", "SIGNATURE", "WRAPPED", "RANDOM", "OUTPUT",
     "ARG7", "ARG8", "ARG9", "ASYNC", "INTERFACE", "UNTERMINATED",
-    "INTERFACEALIAS",
+    "INTERFACEALIAS", "OBJECT",
 }
 EXPECTED_SOURCE_FAMILIES = {
     "canary_workload.c": EXPECTED_SENTINEL_FAMILIES - {"ASYNC"},
@@ -112,11 +113,13 @@ SENTINELS = None
 
 def initialize(bits):
     """Initialize width-dependent policy and checked-in source inputs."""
-    global ALIASES, MAXIMUM, UNKNOWN, BPF_MAP_DEFS, SAFE_MAPS, FEATURE_MAPS, SENTINELS
+    global ALIASES, MAXIMUM, UNKNOWN, TARGET_BITS
+    global BPF_MAP_DEFS, SAFE_MAPS, FEATURE_MAPS, SENTINELS
     if bits not in (32, 64):
         raise ValueError("target bits must be 32 or 64")
     ALIASES, MAXIMUM = target_oracle(bits)
     UNKNOWN = ALIASES["mechanism"]
+    TARGET_BITS = bits
     BPF_MAP_DEFS = runpy.run_path(
         str(SCRIPT_DIR / "check-bpf-map-defs.py"), run_name="canary_map_inventory"
     )
@@ -130,24 +133,51 @@ MECH_NONE = (1 << 64) - 1
 FUNCTION_NONE = (1 << 32) - 1
 ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 288
+# H7 finite object-required markers accepted at CallStart offset 264
+# (marker = eligible function ordinal + 2). Derived from the frozen
+# standard catalog order and the closed object-policy eligible set (27
+# functions; packet 6.07c adds the KEM markers 94/95); the Rust
+# `object_producer_canary_matches_rust_marker_rule` contract
+# re-derives this set and fails on any drift.
+OBJECT_ELIGIBLE_MARKERS = frozenset({
+    19, 22, 23, 24, 25, 26, 27, 29, 31, 35, 42, 44, 48, 50, 54,
+    60, 61, 62, 63, 64, 74, 79, 84, 89, 94, 95, 96,
+})
 # One EVENTS ring record: the 328-byte Event plus its private 40-byte
-# continuity tail (ebpf-common EventRecord, Task 3 Stage A).
+# continuity tail (ebpf-common EventRecord, Task 3 Stage A). H7 slice D
+# adds the 608-byte object form (the same base plus the private 240-byte
+# validated tail) for marker-bound CALLs on the attested allowlisted lane;
+# every other lane and call keeps the 368-byte form.
 EVENT_SIZE = 368
+OBJECT_EVENT_SIZE = 608
+OBJECT_TAIL_SIZE = 240
 DISCOVERY_RECORD_SIZE = 920
-# Every owned ringbuf, with the exact record length its mmap oracle accepts.
+# Every owned ringbuf, with the exact record lengths its mmap oracle accepts
+# (a tuple: EVENTS mixes both selected forms, each walked at its own stride).
 # Keyed by name only because a record layout is per-map; which maps are
 # ringbufs is decided by `type`, from the one checked-in BPF inventory.
 RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
+RING_RECORD_LENGTHS = {
+    "EVENTS": (EVENT_SIZE, OBJECT_EVENT_SIZE),
+    "DISCOVERY": (DISCOVERY_RECORD_SIZE,),
+}
 # What one record costs a ring's byte positions: the 8-byte record header
 # plus the payload rounded up to 8, exactly as `parse_ring_records` walks it.
 # `producer_pos` and `consumer_pos` are byte counters, so every claim about
-# how many records a ring carried is a claim about a multiple of this stride.
+# how many records a ring carried is a claim about the exact per-record
+# strides below; a mixed EVENTS span is never a multiple of one stride.
 RING_RECORD_STRIDES = {
     name: (8 + size + 7) & ~7 for name, size in RING_RECORD_SIZES.items()
 }
+
+
+def ring_stride(length):
+    return (8 + length + 7) & ~7
 START_SNAPSHOT_LANES = {
     "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
+    "object-lp64-blocked", "object-ia32-blocked",
 }
+OBJECT_COMPLETION_LANES = {"object-lp64", "object-ia32"}
 OWNED_METRICS_LANES = {"owned-default-metrics", "owned-feature-metrics"}
 
 
@@ -209,7 +239,8 @@ def assert_no_loader_pause_identity(label, data, values=None):
 # identity the capture document may not carry, wherever it appears.
 PUBLISHED_LOADER_PAUSE_FIELDS = {
     "attach_gap_ms", "pause", "pause_attempts", "pause_confirmed",
-    "pause_partial", "loader_discovery", "child_still_running",
+    "pause_partial", "pause_unavailable", "loader_discovery",
+    "child_still_running",
     # SYSPLAN residual F-15: the run lane's own child, handed back alive.
     # The operator started this process; naming it leaks no target identity
     # they could not already see (mirrors check-capture-evidence.py).
@@ -230,10 +261,18 @@ STRING_IDENTITIES = [value for value in LOADER_PAUSE_IDENTITIES.values()
 # one; every observer surface is scanned for all of them.
 WORKLOAD_IDENTITIES = [value for name, value in LOADER_PAUSE_IDENTITIES.items()
                        if name != "interface_name_bytes"]
-# `HH:MM:SS.ffffff pid P tid T [sess#N] FUNCTION[ MECHANISM] → CKR_x DURATION`
-# (src/trace.rs). The two identity positions are captured so they can be
-# removed structurally rather than by exempting the whole surface.
-TRACE_EVENT = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{6} pid \d+ tid \d+ (?P<rest>.*)$")
+# Only diagnostic PID/TID positions are exempted. Named executable atoms stay
+# in the privacy scan in their raw and JSON-decoded forms.
+TRACE_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+TRACE_EVENT = re.compile(
+    r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
+    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)|"
+    rf"(?P<basename>{TRACE_JSON_STRING}) \(PID [0-9]+, TID [0-9]+\) exe=(?P<path>{TRACE_JSON_STRING})) (?P<rest>.*)$")
+TRACE_CONTEXT_LINES = frozenset((
+    "Trace — completed call events in arrival order",
+    "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+    "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+))
 
 
 def assert_json_identity_structure(label, value, path="$"):
@@ -274,6 +313,9 @@ def trace_scannable(label, text):
     """
     kept = []
     for line in text.splitlines():
+        if line in TRACE_CONTEXT_LINES:
+            kept.append(line)
+            continue
         if not line or line.startswith((
             "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
         )):
@@ -281,7 +323,28 @@ def trace_scannable(label, text):
             continue
         event = TRACE_EVENT.match(line)
         assert event, f"{label} rendered an unfrozen trace line: {line!r}"
-        kept.append(event.group("rest"))
+        rest = event.group("rest")
+        body = rest
+        # Keep the session in the scanned suffix, but validate its one reserved
+        # position deterministically before checking for a repeated identity.
+        if body.startswith("sess#"):
+            session, separator, body = body.partition(" ")
+            assert separator and re.fullmatch(r"sess#[0-9]+", session), \
+                f"{label} rendered a malformed trace session: {line!r}"
+        assert body and not body.startswith(("pid ", "Unknown executable ", "sess#", '"')) and not re.match(r"[A-Za-z_][A-Za-z0-9_]*=", body), \
+            f"{label} rendered duplicate trace identity/session: {line!r}"
+        if event.group("basename") is not None:
+            atoms = [event.group("basename"), event.group("path")]
+            values = [json.loads(atom) for atom in atoms]
+            try:
+                for value in values:
+                    value.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise AssertionError(f"{label} rendered non-UTF-8 executable identity") from error
+            kept.append(f"{atoms[0]} exe={atoms[1]} {rest}")
+            kept.extend(values)
+        else:
+            kept.append(rest)
     return "\n".join(kept)
 
 
@@ -387,10 +450,43 @@ def assert_safe_profile(doc):
     profile_terminal(doc)
     mechanisms = mechanism_map(doc)
     assert REGISTERED in mechanisms, "registered standard mechanism was not useful"
-    assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
+    assert mechanisms[REGISTERED]["registered"] is True, mechanisms[REGISTERED]
+    if TARGET_BITS == 32:
+        # Narrow unknown ids publish as approved registered:false rows:
+        # the numeric id with its call count, null params, never named.
+        for value in (UNKNOWN, MAXIMUM):
+            assert value in mechanisms, f"32-bit safe profile missed {value:#x}"
+            row = mechanisms[value]
+            assert row["registered"] is False, row
+            assert row["params"] is None and row.get("params_omitted") == "policy", row
+            assert row["calls"] == 1, row
+            assert "name" not in row, row
+            assert row.get("mechanism_hex") == f"0x{value:x}", row
+        assert {mid for mid, row in mechanisms.items()
+                if row.get("registered") is False} == {UNKNOWN, MAXIMUM}, \
+            mechanisms.keys()
+    else:
+        # Wider-than-32-bit words are counted, never published.
+        assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
+        assert all(row.get("registered") is not False for row in mechanisms.values()), \
+            mechanisms
     # F-21: the policy null names its cause.
     assert all(item["params"] is None and item.get("params_omitted") == "policy"
                for item in mechanisms.values()), mechanisms
+    cgroups = doc.get("cgroups", [])
+    assert isinstance(cgroups, list), doc.get("cgroups")
+    for entry in cgroups:
+        rows = entry.get("mechanisms", [])
+        assert isinstance(rows, list), entry
+        for row in rows:
+            assert set(row) == {"mechanism", "mechanism_hex", "registered",
+                                "calls", "errors"}, row
+            assert isinstance(row["mechanism"], int) and row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
+            if TARGET_BITS == 32:
+                if row["registered"] is False:
+                    assert row["mechanism"] in (UNKNOWN, MAXIMUM), row
+            else:
+                assert row["registered"] is True, row
     assert doc["templates"]["operations"] == [], doc["templates"]
     ev = doc["evidence"]
     assert ev["unregistered_mechanisms"] == 2, ev
@@ -407,8 +503,24 @@ def assert_safe_trace(text):
               ))]
     assert events, "safe trace has no rendered call"
     assert "C_DigestInit 0x250" in text, "registered mechanism missing from trace"
-    for value in set(ALIASES.values()) | {MAXIMUM}:
+    for value in set(ALIASES.values()) - {UNKNOWN}:
         assert str(value) not in text and f"0x{value:x}" not in text, value
+    if TARGET_BITS == 32:
+        # The narrow unknown ids may appear only as mechanism tokens
+        # (` C_<name> 0x… → `, exactly one occurrence on the line).
+        for value in (UNKNOWN, MAXIMUM):
+            assert str(value) not in text, value
+            token = f"0x{value:x}"
+            hits = [line for line in events if token in line]
+            assert hits, f"unregistered {token} missing from trace"
+            assert all(
+                re.search(rf" C_[A-Za-z]+ {token} → ", line) is not None
+                and line.count(token) == 1
+                for line in hits
+            ), hits
+    else:
+        for value in (UNKNOWN, MAXIMUM):
+            assert str(value) not in text and f"0x{value:x}" not in text, value
     assert ev["unregistered_mechanisms"] == 2, ev
     assert ev["semantic_capture_failures"] == 3, ev
     assert ev["async_target_failures"] == 2, ev
@@ -421,6 +533,10 @@ def assert_unsafe_profile(doc):
     mechanisms = mechanism_map(doc)
     for mechanism in (REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087):
         assert mechanism in mechanisms, f"diagnostic profile missed {mechanism:#x}"
+    for mechanism in (REGISTERED, 0xD, 0x1087):
+        assert mechanisms[mechanism]["registered"] is True, mechanisms[mechanism]
+    for mechanism in (UNKNOWN, MAXIMUM):
+        assert mechanisms[mechanism]["registered"] is False, mechanisms[mechanism]
     assert doc["evidence"]["unregistered_mechanisms"] == 0
 
     pss = mechanisms[0xD]["params"]
@@ -584,7 +700,9 @@ def u32(raw, offset):
 
 def decode_start(raw):
     assert len(raw) == CALL_START_SIZE
-    assert u64(raw, 264) == 0, "CallStart padding must be zero"
+    marker = u64(raw, 264)
+    assert marker == 0 or marker in OBJECT_ELIGIBLE_MARKERS, \
+        f"CallStart object marker {marker} is not finite and required"
     return {
         "raw": raw, "session": u64(raw, 8), "slot_id": u64(raw, 16),
         "mechanism": u64(raw, 24), "mechanism_ptr": u64(raw, 32),
@@ -602,10 +720,10 @@ def decode_start(raw):
 
 
 def decode_event(raw):
-    assert len(raw) == EVENT_SIZE
+    assert len(raw) in (EVENT_SIZE, OBJECT_EVENT_SIZE), len(raw)
     root_affiliation = u64(raw, 320)
     assert root_affiliation in (0, 1), f"invalid root affiliation {root_affiliation}"
-    return {
+    event = {
         "raw": raw, "pid_tgid": u64(raw, 16), "session": u64(raw, 32),
         "mechanism": u64(raw, 48), "p0": u64(raw, 72), "p1": u64(raw, 80),
         "p2": u64(raw, 88), "slot": u32(raw, 104), "target": u32(raw, 108),
@@ -618,6 +736,106 @@ def decode_event(raw):
         "capture": u32(raw, 280), "event_type": u32(raw, 284),
         "root_affiliation": root_affiliation,
     }
+    if len(raw) == OBJECT_EVENT_SIZE:
+        assert event["event_type"] == 0, "extended records are CALL-only"
+        event["object"] = decode_object_tail(raw[EVENT_SIZE:])
+    else:
+        event["object"] = None
+    return event
+
+
+# H7 slice D: descriptor indices with a request template pair (BPF marks
+# them uninspected; an unmarked all-zero first list would be a lie the
+# validator cannot see). Ordinals from the frozen standard catalog.
+OBJECT_TEMPLATE_INDICES = frozenset({21, 22, 59, 60, 63, 62, 25})
+OBJECT_GET_INDEX = 25
+OBJECT_FIND_ACTION = 10
+OBJECT_ACTION_MAX = 14
+
+
+def decode_object_tail(tail):
+    """Structural object-tail validation mirroring `validate_object_tail`.
+
+    Returns the decoded header facts. Descriptor-table agreement (which
+    positions are present) is enforced by BPF emission and userspace
+    decode; the oracle checks every table-free rule plus the canary
+    honesty rule that a template family's first request list is never
+    an unmarked all-zero list.
+    """
+    assert len(tail) == OBJECT_TAIL_SIZE, len(tail)
+    version, size = struct.unpack_from("<HH", tail, 0)
+    index, flags = struct.unpack_from("<II", tail, 4)
+    layout, action, entry_derive = tail[12], tail[13], tail[14]
+    assert (version, size) == (1, OBJECT_TAIL_SIZE), (version, size)
+    assert 1 <= index <= 104, index
+    assert index - 1 in {marker - 2 for marker in OBJECT_ELIGIBLE_MARKERS}, index
+    assert flags & ~0xFF == 0, flags
+    assert layout in (1, 2), layout
+    assert 1 <= action <= OBJECT_ACTION_MAX, action
+    assert entry_derive <= 4, entry_derive
+    assert tail[15] == 0 and tail[127] == 0 and tail[236:240] == bytes(4), "tail padding"
+
+    def check_word(status, word, where):
+        assert status <= 10, (where, status)
+        if status == 1:
+            assert word != 0, (where, "zero VALUE word")
+        else:
+            assert word == 0, (where, status, word)
+
+    input_handles = struct.unpack_from("<2Q", tail, 16)
+    result_handles = struct.unpack_from("<2Q", tail, 32)
+    find_handles = struct.unpack_from("<8Q", tail, 48)
+    for position in range(2):
+        check_word(tail[112 + position], input_handles[position], f"input{position}")
+        check_word(tail[114 + position], result_handles[position], f"result{position}")
+    find_status = tail[116:124]
+    for position in range(8):
+        check_word(find_status[position], find_handles[position], f"find{position}")
+    find_len, find_flags, find_valid = tail[124], tail[125], tail[126]
+    assert find_len <= 8 and find_flags & ~0x3F == 0 and find_valid <= 1
+    if action == OBJECT_FIND_ACTION:
+        assert not (find_valid == 0 and find_len != 0), "refused Find keeps no length"
+        for position in range(find_len, 8):
+            assert find_status[position] == 0 and find_handles[position] == 0
+    else:
+        assert (find_handles == (0,) * 8 and find_status == bytes(8)
+                and (find_len, find_flags, find_valid) == (0, 0, 0)), "Find section"
+
+    def check_list(blob, where):
+        assert len(blob) == 36, where
+        inspected, list_flags = blob[32], blob[33]
+        assert blob[34] == 0 and blob[35] == 0, (where, "list padding")
+        assert list_flags & ~0x1F == 0, (where, list_flags)
+        if list_flags & 0x10:
+            assert (inspected, list_flags) == (0, 0x10) and blob[:32] == bytes(32), \
+                (where, "dishonest uninspected marker")
+            return
+        assert inspected <= 8, (where, inspected)
+        if inspected:
+            assert list_flags & 1, (where, "present bit")
+        if list_flags & 2:
+            assert inspected == 8, (where, "truncated short list")
+        for position in range(inspected, 8):
+            assert blob[4 * position:4 * position + 3] == bytes(3), (where, position)
+        for position in range(inspected):
+            kind, status = blob[4 * position], blob[4 * position + 1]
+            value = struct.unpack_from("<H", blob, 4 * position + 2)[0]
+            assert kind <= 6 and status <= 10, (where, position, kind, status)
+            if value:
+                assert status == 1, (where, position, value)
+
+    requested = [tail[128:164], tail[164:200]]
+    check_list(requested[0], "requested0")
+    check_list(requested[1], "requested1")
+    result_list = tail[200:236]
+    if action == 11:
+        check_list(result_list, "result")
+    else:
+        assert result_list == bytes(36), "non-Get result list"
+    if index in OBJECT_TEMPLATE_INDICES and action != 11:
+        assert not (requested[0] == bytes(36)), \
+            "template family with unmarked all-zero first request list"
+    return {"index": index, "action": action, "layout": layout, "flags": flags}
 
 
 def zero_metadata(record):
@@ -736,26 +954,364 @@ def ring_raw_path(prefix, name):
     return Path(f"{prefix}.{name}.raw")
 
 
+# Object-attributes capture mode. `present` is the FULL build: inspected
+# six-field lists wherever the workload's templates authorize capture.
+# `absent` is the P0-only `stub-object-attributes` build: entry acquires
+# nothing, so stopped side rows keep allocated-zero attribute state, while
+# completion tails mark every descriptor-present pair UNINSPECTED at
+# emission (never an all-zero list passed off as inspected). Absent mode
+# flips ONLY the attribute-value expectations below; every count, shape,
+# ledger, ring, control-cell and roster assertion stays exactly as-is, so
+# an empty or unrun capture still refuses.
+OBJECT_ATTRIBUTE_MODES = ("present", "absent")
+_OBJECT_ATTRIBUTES = "present"
+# The honest never-inspected 36-byte list: 32 zero cells plus the
+# (inspected=0, flags=0x10) marker the tail validator accepts.
+OBJECT_ATTR_UNINSPECTED = bytes(32) + bytes((0, 0x10, 0, 0))
+
+
+def set_object_attributes(mode):
+    """Select the object-attributes capture mode; unknown modes refuse."""
+    global _OBJECT_ATTRIBUTES
+    if mode not in OBJECT_ATTRIBUTE_MODES:
+        raise ValueError(f"unknown object-attributes mode: {mode!r}")
+    _OBJECT_ATTRIBUTES = mode
+
+
+def object_attributes_absent():
+    """True when the stub build's zero/uninspected attribute bytes are expected."""
+    return _OBJECT_ATTRIBUTES == "absent"
+
+
+# H7 slice D object cell: every named function in workload ledger order
+# with its completion session. Sessions are 0x601 plus the ledger
+# position; the blocked phase parks (Create, Pair, Find, Get) at
+# 0x501..0x504. Ordinals from the frozen standard catalog.
+OBJECT_LEDGER = (
+    (20, "C_CreateObject"), (21, "C_CopyObject"), (22, "C_DestroyObject"),
+    (23, "C_GetObjectSize"), (24, "C_GetAttributeValue"),
+    (25, "C_SetAttributeValue"), (27, "C_FindObjects"),
+    (29, "C_EncryptInit"), (33, "C_DecryptInit"), (40, "C_DigestKey"),
+    (42, "C_SignInit"), (46, "C_SignRecoverInit"), (48, "C_VerifyInit"),
+    (52, "C_VerifyRecoverInit"), (58, "C_GenerateKey"),
+    (59, "C_GenerateKeyPair"), (60, "C_WrapKey"), (61, "C_UnwrapKey"),
+    (62, "C_DeriveKey"), (17, "C_SetOperationState"),
+    (72, "C_MessageEncryptInit"), (77, "C_MessageDecryptInit"),
+    (82, "C_MessageSignInit"), (87, "C_MessageVerifyInit"),
+    (94, "C_VerifySignatureInit"),
+)
+OBJECT_RESULT_PRESETS = {
+    20: (0x0B1E0000 + 20,), 21: (0x0B1E0000 + 21,), 58: (0x0B1E0000 + 58,),
+    59: (0x0B1E0000 + 59, 0x0B1E1000 + 59),
+    62: (0x0B1E0000 + 62,), 61: (0x0B1E0000 + 61,),
+}
+OBJECT_FIND_PRESETS = tuple(0x0B1E2000 + position for position in range(8))
+OBJECT_INPUT_PRESETS = {
+    21: (0x221,), 22: (0x222,), 23: (0x223,), 24: (0x224,), 25: (0x225,),
+    27: (), 29: (0x229,), 33: (0x233,), 40: (0x240,), 42: (0x242,),
+    46: (0x246,), 48: (0x248,), 52: (0x252,), 58: (), 59: (),
+    60: (0x260, 0x261), 61: (0x261,), 62: (0x262,), 17: (0x263, 0x264),
+    72: (0x272,), 77: (0x277,), 82: (0x282,), 87: (0x287,), 94: (0x294,),
+    20: (),
+}
+OBJECT_BLOCKED_WORKERS = (
+    (20, 0x501, 21, 1), (59, 0x502, 60, 4), (27, 0x503, 28, 10), (24, 0x504, 25, 11),
+)
+OBJECT_GET_RVS = ((0x701, 17, 2), (0x702, 18, 3), (0x703, 336, 1),
+                  (0x704, 5, None), (0x705, 1, None))
+
+
+def object_ledger_entries(workload_log):
+    """25 named functions plus five actual Get partial/error/cancel returns."""
+    lines = [line.removeprefix("P11SCOPE_OBJECT ")
+             for line in Path(workload_log).read_text().splitlines()
+             if line.startswith("P11SCOPE_OBJECT ")]
+    assert len(lines) == 30, f"object ledger has {len(lines)} entries, expected 30"
+    entries = [json.loads(line) for line in lines]
+    assert [(entry["index"], entry["name"]) for entry in entries] == \
+        list(OBJECT_LEDGER) + [(24, "C_GetAttributeValue")] * 5
+    for position, entry in enumerate(entries):
+        assert set(entry) == {"index", "name", "session", "rv", "ready"}, entry
+        session, rv = ((0x601 + position, 0) if position < 25
+                       else OBJECT_GET_RVS[position - 25][:2])
+        assert (entry["session"], entry["rv"], entry["ready"]) == (session, rv, 1), entry
+    return entries
+
+
+def assert_object_completion_records(raw_records, lane, workload_pid):
+    """All 30 actual calls completed as validated finite 608-byte CALL records."""
+    assert len(raw_records) == 30, f"{lane}: {len(raw_records)} records, expected 30"
+    events = [decode_event(raw) for raw in raw_records]
+    assert all(len(event["raw"]) == OBJECT_EVENT_SIZE for event in events), lane
+    assert all(event["pid_tgid"] >> 32 == workload_pid for event in events)
+    assert all(event["event_type"] == 0 for event in events)
+    by_session = {event["session"]: event for event in events}
+    assert set(by_session) == ({0x601 + position for position in range(25)} |
+                              {entry[0] for entry in OBJECT_GET_RVS}), \
+        {hex(session) for session in by_session}
+    for position, (ordinal, name) in enumerate(OBJECT_LEDGER):
+        tail = by_session[0x601 + position]["object"]
+        assert tail["index"] == ordinal + 1, (name, tail)
+        assert tail["layout"] == (2 if lane == "object-ia32" else 1), (name, "target width")
+        raw_tail = by_session[0x601 + position]["raw"][EVENT_SIZE:]
+        assert u64(by_session[0x601 + position]["raw"], 64) == 0, (name, "RV")
+        zero_list = bytes(36)
+        public = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+        private = object_canary_attributes((2, 3, 0, 24, 4096, 2))
+        if object_attributes_absent():
+            # The stub emits no inspected values: descriptor-present pairs
+            # carry the honest UNINSPECTED marking, absent pairs stay zero.
+            # Get's pair zero is present (marked here) though FULL never
+            # request-inspects it -- it stays zero there.
+            public = private = OBJECT_ATTR_UNINSPECTED
+        requested0_present = ordinal in {20, 21, 58, 59, 61, 62}
+        if object_attributes_absent() and ordinal == 24:
+            requested0_present = True
+        assert raw_tail[128:164] == (public if requested0_present else zero_list), \
+            (name, "requested0 six fields/absence")
+        assert raw_tail[164:200] == (private if ordinal == 59 else zero_list), \
+            (name, "pair separation/absent requested1")
+        assert raw_tail[200:236] == (public if ordinal == 24 else zero_list), \
+            (name, "Get six results/absence")
+        if ordinal in OBJECT_RESULT_PRESETS:
+            for slot, preset in enumerate(OBJECT_RESULT_PRESETS[ordinal]):
+                status = raw_tail[114 + slot]
+                word = struct.unpack_from("<Q", raw_tail, 32 + 8 * slot)[0]
+                assert (status, word) == (1, preset), (name, slot, status, hex(word))
+        if ordinal == 27:
+            assert raw_tail[124] == 8 and raw_tail[126] == 1, "Find length/valid"
+            for slot, preset in enumerate(OBJECT_FIND_PRESETS):
+                status = raw_tail[116 + slot]
+                word = struct.unpack_from("<Q", raw_tail, 48 + 8 * slot)[0]
+                assert (status, word) == (1, preset), ("C_FindObjects", slot)
+        for slot, preset in enumerate(OBJECT_INPUT_PRESETS[ordinal]):
+            status = raw_tail[112 + slot]
+            word = struct.unpack_from("<Q", raw_tail, 16 + 8 * slot)[0]
+            assert (status, word) == (1, preset), (name, slot, status, hex(word))
+    for session, rv, curve in OBJECT_GET_RVS:
+        event = by_session[session]
+        assert u64(event["raw"], 64) == rv, (session, "Get RV")
+        assert event["object"] == {"index": 25, "action": 11,
+                                   "layout": 2 if lane == "object-ia32" else 1, "flags": 0}
+        tail = event["raw"][EVENT_SIZE:]
+        if object_attributes_absent():
+            # Same present pair zero as the ledger Get: marked, with pair
+            # one absent.
+            assert tail[128:200] == OBJECT_ATTR_UNINSPECTED + bytes(36), \
+                (session, "Get requested pair marked, pair one absent")
+        else:
+            assert tail[128:200] == bytes(72), (session, "Get has no requested values")
+        if object_attributes_absent():
+            # The stub establishes no Get results at any return value; the
+            # tail keeps the fill's UNINSPECTED marking on all five returns.
+            expected = OBJECT_ATTR_UNINSPECTED
+        else:
+            expected = (object_canary_attributes((4, 16, 1, 32, 2048, curve)) if curve is not None
+                        else bytes(32) + bytes((0, 16, 0, 0)))
+        assert tail[200:236] == expected, (session, "accepted Get results or unread refusal")
+        assert (tail[112], u64(tail, 16)) == (1, 0x224), (session, "Get input")
+
+
+def object_canary_attributes(values):
+    """Independent expected finite bytes for six selected plus two forbidden slots."""
+    return (b"".join(struct.pack("<BBH", kind, 1, value)
+                     for kind, value in enumerate(values, 1))
+            + bytes(8) + bytes((8, 1, 0, 0)))
+
+
+def decode_object_start(raw):
+    assert len(raw) == 432, len(raw)
+    image = {"task_cookie": u64(raw, 0), "exec_id": u64(raw, 8)}
+    return {
+        "raw": raw, "image": image, "entry_ns": u64(raw, 16),
+        "descriptor_index": struct.unpack_from("<I", raw, 24)[0],
+        "layout": raw[28], "action": raw[29], "derive": raw[30], "phase": raw[31],
+        "inputs": struct.unpack_from("<2Q", raw, 32),
+        "result_ptrs": struct.unpack_from("<2Q", raw, 48),
+        "get_template_base": u64(raw, 64), "inspected_header_end": u64(raw, 72),
+        "find_capacity": u64(raw, 80), "find_count_ptr": u64(raw, 88),
+        "slots": raw[96:352], "requested": [raw[352:388], raw[388:424]],
+        "input_statuses": tuple(raw[424:426]),
+        "result_statuses": tuple(raw[426:428]),
+        "flags": struct.unpack_from("<H", raw, 428)[0],
+        "get_inspected": raw[430], "reserved": raw[431],
+    }
+
+
+def assert_object_starts(completed_manifest, blocked_manifest, completed_log,
+                         blocked_log, completed_pid, blocked_pid, target_bits):
+    """H7 slice D object-cell oracle: ledger, 608-byte records, stopped
+    offsets, sentinel absence and post-return cleanup."""
+    entries = object_ledger_entries(completed_log)
+    assert [entry["index"] for entry in entries] == [index for index, _ in OBJECT_LEDGER] + [24] * 5
+    # Completed phase: 25 validated 608-byte records; side storage empty.
+    completed_events = ring_raw_records(completed_manifest, "object-completed")
+    assert_object_completion_records(
+        completed_events, "object-ia32" if target_bits == 32 else "object-lp64", completed_pid)
+    completed_side = manifest_map(completed_manifest, "OBJECT_START")
+    assert read_json(completed_side["file"]) == [], "completed OBJECT_START not empty"
+    # Blocked phase: four parked calls at exact offsets; nothing emitted.
+    blocked_events = ring_raw_records(blocked_manifest, "object-blocked")
+    assert blocked_events == [], f"blocked phase emitted {len(blocked_events)} records"
+    starts = {}
+    for entry in read_json(manifest_map(blocked_manifest, "START")["file"]):
+        key = bpftool_bytes(entry["key"], 16)
+        assert u64(key, 0) >> 32 == blocked_pid
+        starts[u64(key, 0) & 0xFFFFFFFF] = decode_start(
+            bpftool_bytes(entry["value"], CALL_START_SIZE))
+    assert {start["session"] for start in starts.values()} == {0x501, 0x502, 0x503, 0x504}
+    side_rows = []
+    for entry in read_json(manifest_map(blocked_manifest, "OBJECT_START")["file"]):
+        key = bpftool_bytes(entry["key"], 16)
+        assert u64(key, 0) >> 32 == blocked_pid
+        side_rows.append((key, decode_object_start(bpftool_bytes(entry["value"], 432))))
+    lines = [line.removeprefix("P11SCOPE_OBJECT_POINTERS ")
+             for line in Path(blocked_log).read_text().splitlines()
+             if line.startswith("P11SCOPE_OBJECT_POINTERS ")]
+    assert len(lines) == 1, lines
+    assert_object_side_rows(side_rows, starts, json.loads(lines[0]), target_bits)
+    # Sentinel absence on every object surface the oracle reads itself;
+    # the final all-lane scan covers the same artifacts globally.
+    for path in (completed_log, blocked_log):
+        assert sentinel_hits(Path(path).read_bytes()) == set(), path
+
+
+def assert_object_side_rows(side_rows, starts, pointers, target_bits):
+    layout = 1 if target_bits == 64 else 2
+    assert set(pointers) == {"template", "peer_template", "out_create", "out_pub", "out_priv",
+                             "found", "found_count", "get_values"}
+    assert isinstance(pointers["get_values"], list) and len(pointers["get_values"]) == 6
+    words = [value for name, value in pointers.items() if name != "get_values"] + pointers["get_values"]
+    assert all(type(pointer) is int and 0 < pointer < 1 << target_bits for pointer in words)
+    assert len(set(words)) == 13, "fixture pointers must own disjoint starting addresses"
+    assert len(side_rows) == 4, len(side_rows)
+    expect = {session: (index, action) for _, session, index, action in OBJECT_BLOCKED_WORKERS}
+    seen = set()
+    for key, row in side_rows:
+        tid = u64(key, 0) & 0xFFFFFFFF
+        assert tid in starts, hex(tid)
+        session = starts[tid]["session"]
+        assert session in expect and session not in seen, hex(session)
+        seen.add(session)
+        index, action = expect[session]
+        assert row["descriptor_index"] == index, (hex(session), row["descriptor_index"])
+        assert (row["layout"], row["action"], row["derive"], row["phase"]) == (
+            layout, action, 0, 2), (hex(session), row["layout"], row["action"])
+        assert row["image"]["task_cookie"] != 0 and row["entry_ns"] != 0
+        # Build the exact allowed row. Only the existing image/entry clock
+        # controls vary. Every pointer/capacity exception below has its exact
+        # field, width and value; all neighbors/padding must still be zero.
+        allowed = bytearray(432)
+        allowed[:24] = row["raw"][:24]
+        struct.pack_into("<I4B", allowed, 24, index, layout, action, 0, 2)
+        stub = object_attributes_absent()
+        if session == 0x501:
+            struct.pack_into("<Q", allowed, 48, pointers["out_create"])
+            if not stub:
+                allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+        elif session == 0x502:
+            struct.pack_into("<QQ", allowed, 48, pointers["out_pub"], pointers["out_priv"])
+            if not stub:
+                allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+                allowed[388:424] = object_canary_attributes((2, 3, 0, 24, 4096, 2))
+        elif session == 0x503:
+            struct.pack_into("<Q", allowed, 48, pointers["found"])
+            struct.pack_into("<QQ", allowed, 80, 8, pointers["found_count"])
+        else:
+            width = target_bits // 8
+            struct.pack_into("<Q", allowed, 32, 0x224)
+            allowed[424] = 1
+            # Scalar input capture is ungated and stays asserted; only Get
+            # attribute retention (template base, slots, inspected count)
+            # is stub-absent, so those placements run on FULL only.
+            if not stub:
+                struct.pack_into("<QQ", allowed, 64, pointers["template"], pointers["template"] + 24 * width)
+                allowed[430] = 8
+                for slot, (pointer, capacity) in enumerate(zip(pointers["get_values"], (width, width, 1, width, width, 10))):
+                    struct.pack_into("<QQQBBB5x", allowed, 96 + 32 * slot,
+                                     pointer, capacity, 0, slot + 1, slot, 0)
+        assert row["raw"] == bytes(allowed), (hex(session), "side row field/zero-neighbor mismatch")
+
+
+def ring_raw_records(manifest, lane):
+    """Framed ring payloads from a lane's EVENTS raw surface."""
+    manifest_path = Path(manifest)
+    prefix = manifest_path.parent / manifest_path.name.removeprefix(
+        "mapdump_manifest_").removesuffix(".json")
+    raw = ring_raw_path(str(prefix), "EVENTS").read_bytes()
+    records, offset = [], 0
+    while offset < len(raw):
+        assert len(raw) - offset >= 8, f"{lane}: raw surface ends mid-header"
+        length, flags = struct.unpack_from("<II", raw, offset)
+        assert flags == 0, f"{lane}: raw surface carries flags"
+        assert length in RING_RECORD_LENGTHS["EVENTS"], f"{lane}: size {length}"
+        assert len(raw) - offset - 8 >= length, f"{lane}: raw surface ends mid-record"
+        records.append(bytes(raw[offset + 8:offset + 8 + length]))
+        offset += 8 + length
+    return records
+
+
+RING_REFUSAL_CATEGORIES = frozenset((
+    "capacity", "mapping", "positions", "overwritten", "busy", "discard",
+    "length", "truncated", "stride",
+))
+CONTINUITY_MAP_CATEGORIES = frozenset((
+    "unknown", "coverage-disabled", "coverage-failed", "slot-files-empty",
+    "slot-files-invalid", "watched-files-empty", "watched-files-invalid", "map-facts-present",
+))
+
+
+class RingRecordRefusal(AssertionError):
+    """A framing refusal with finite context for the capture sanitizer."""
+
+    def __init__(self, category, ring_name=None):
+        self.category, self.ring_name = category, ring_name
+        super().__init__("retained ring record refused")
+
+
+def ring_diagnostic(error):
+    """Render only revalidated fields from this module's exact trusted type."""
+    if type(error) is not RingRecordRefusal:
+        return None
+    name, category = getattr(error, "ring_name", None), getattr(error, "category", None)
+    if (type(name) is not str or name not in RING_RECORD_SIZES
+            or type(category) is not str or category not in RING_REFUSAL_CATEGORIES):
+        return None
+    continuity = getattr(error, "continuity_category", None)
+    if continuity is None:
+        return f"ring={name} refusal={category}"
+    if (name != "EVENTS" or category != "discard" or type(continuity) is not str
+            or continuity not in CONTINUITY_MAP_CATEGORIES):
+        return None
+    return f"ring={name} refusal={category} continuity={continuity}"
+
+
 def parse_ring_records(data, capacity, consumer_pos, producer_pos,
-                       record_length=EVENT_SIZE):
-    assert capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0
-    assert capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity
-    assert producer_pos >= consumer_pos, "ring position wrap cannot be proved"
-    assert producer_pos - consumer_pos <= capacity, "ring data was overwritten"
+                       record_lengths=(EVENT_SIZE,), *, ring_name=None):
+    def check(condition, category):
+        if not condition:
+            raise RingRecordRefusal(category, ring_name)
+
+    if isinstance(record_lengths, int):
+        record_lengths = (record_lengths,)
+    check(capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0, "capacity")
+    check(capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity, "mapping")
+    check(producer_pos >= consumer_pos, "positions")
+    check(producer_pos - consumer_pos <= capacity, "overwritten")
     records = []
     position = consumer_pos
     while position < producer_pos:
         offset = position & (capacity - 1)
         header = u32(data, offset)
-        assert not header & (1 << 31), "BUSY ring record"
-        assert not header & (1 << 30), "discarded ring record"
+        check(not header & (1 << 31), "busy")
+        check(not header & (1 << 30), "discard")
         length = header & ((1 << 30) - 1)
-        assert length == record_length, f"ring record size {length}, expected {record_length}"
-        record_size = (8 + length + 7) & ~7
-        assert position + record_size <= producer_pos
+        check(length in record_lengths, "length")
+        record_size = ring_stride(length)
+        check(position + record_size <= producer_pos, "truncated")
         records.append(bytes(data[offset + 8:offset + 8 + length]))
         position += record_size
-    assert position == producer_pos
+    check(position == producer_pos, "stride")
     return records
 
 
@@ -811,7 +1367,7 @@ class RetainedRingReader:
         page = mmap.PAGESIZE
         return parse_ring_records(
             self.producer[page:], self.item["max_entries"], *positions,
-            RING_RECORD_SIZES[self.item["name"]])
+            RING_RECORD_LENGTHS[self.item["name"]], ring_name=self.item["name"])
 
     def _close(self, *, preserve_error=False):
         cleanup_error = None
@@ -856,6 +1412,9 @@ def ring_records(manifest, name="EVENTS"):
 
 
 def assert_event_records(raw_records, lane, workload_pid):
+    if lane in OBJECT_COMPLETION_LANES:
+        assert_object_completion_records(raw_records, lane, workload_pid)
+        return
     expected = 0 if lane == "aggregate-only-metrics" or lane in OWNED_METRICS_LANES else 28
     assert len(raw_records) == expected, f"{lane}: {len(raw_records)} records, expected {expected}"
     if not raw_records:
@@ -867,8 +1426,48 @@ def assert_event_records(raw_records, lane, workload_pid):
     if "unsafe" not in lane:
         assert all(zero_metadata(event) for event in events), lane
         mechanisms = {event["mechanism"] for event in events}
-        assert mechanisms <= {MECH_NONE, REGISTERED, 0xD, 0x1087}, mechanisms
-        assert {REGISTERED, 0xD, 0x1087} <= mechanisms
+        if TARGET_BITS == 32:
+            # The narrow unknown ids publish as event mechanisms; the
+            # packed bytes may touch only the mechanism field and the
+            # three frozen-constant artifact offsets below — the final
+            # alias scan exempts this approved spill on 32-bit
+            # safe-lane EVENTS dumps (see
+            # assert_safe_lane_alias_privacy), so this oracle pins
+            # every other offset fail-closed.
+            assert mechanisms <= {MECH_NONE, REGISTERED, UNKNOWN, MAXIMUM,
+                                  0xD, 0x1087}, mechanisms
+            assert {REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087} <= mechanisms, \
+                mechanisms
+            for event in events:
+                raw = event["raw"]
+                for value in (UNKNOWN, MAXIMUM):
+                    packed = struct.pack("<Q", value)
+                    start = 0
+                    while True:
+                        found_at = raw.find(packed, start)
+                        if found_at < 0:
+                            break
+                        # The mechanism-set assertion above pins the value,
+                        # so UNKNOWN can only match at 48 and MAXIMUM only
+                        # at 48 or 52-55 (MECH_NONE followed by zeros spells
+                        # packed MAXIMUM at 52). Anything else there would
+                        # corrupt the pinned value. The three exact (offset,
+                        # value) pairs are the frozen 0xFFFFFFFF constants
+                        # abutting zeros: SESSION_NONE beside a slot_id with
+                        # a zero low half (0 for session-less calls) at 36,
+                        # FUNCTION_NONE target beside a zero user_type at 108
+                        # (synthetic zero-fields) and USER_TYPE_NONE beside
+                        # zero shape at 112 (live). A different value at those
+                        # offsets, or anything elsewhere, is a leak.
+                        if value == UNKNOWN:
+                            approved = (found_at == 48)
+                        else:
+                            approved = found_at in (36, 48, 52, 53, 54, 55, 108, 112)
+                        assert approved, (lane, hex(value), found_at)
+                        start = found_at + 1
+        else:
+            assert mechanisms <= {MECH_NONE, REGISTERED, 0xD, 0x1087}, mechanisms
+            assert {REGISTERED, 0xD, 0x1087} <= mechanisms
         return
     mechanisms = {event["mechanism"] for event in events}
     assert {REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087} <= mechanisms, mechanisms
@@ -906,13 +1505,15 @@ def assert_start_event_records(raw_records, lane):
     )
 
 
-def ring_position_fault(name, positions, record_count):
+def ring_position_fault(name, positions, records):
     """Why a ring's retained positions cannot describe its retained bytes.
 
     `None` when they can. The retained records are exactly the unconsumed tail
-    between the two kernel byte counters, so their count is fixed by the
-    positions and the record stride; anything else means the bytes on disk were
-    not read at the positions filed beside them.
+    between the two kernel byte counters, so the byte span is fixed by the
+    positions and the exact per-record strides; anything else means the bytes
+    on disk were not read at the positions filed beside them. `records` is
+    the retained record list (mixed 368/608-byte EVENTS forms each walk at
+    their own stride) or, for the single-stride DISCOVERY ring, a count.
     """
     if (not isinstance(positions, (list, tuple)) or len(positions) != 2
             or any(type(position) is not int or position < 0 for position in positions)):
@@ -920,10 +1521,16 @@ def ring_position_fault(name, positions, record_count):
     consumer, producer = positions
     if producer < consumer:
         return f"{name} producer {producer} precedes consumer {consumer}"
-    stride = RING_RECORD_STRIDES[name]
-    if producer - consumer != stride * record_count:
-        return (f"{name} retains {record_count} records but positions "
-                f"{consumer}..{producer} span {producer - consumer} bytes")
+    if isinstance(records, int):
+        records = [RING_RECORD_SIZES[name]] * records
+    lengths = [len(record) if isinstance(record, bytes) else record for record in records]
+    if any(length not in RING_RECORD_LENGTHS[name] for length in lengths):
+        return f"{name} retains a record outside {RING_RECORD_LENGTHS[name]}: {lengths}"
+    expected = sum(ring_stride(length) for length in lengths)
+    if producer - consumer != expected:
+        return (f"{name} retains {len(lengths)} records but positions "
+                f"{consumer}..{producer} span {producer - consumer} bytes, "
+                f"expected {expected}")
     return None
 
 
@@ -959,8 +1566,9 @@ def assert_retained_ring_records(retained, lane, workload_pid, positions):
     for name, expected_size in RING_RECORD_SIZES.items():
         records = retained[name]
         assert isinstance(records, list), (name, type(records).__name__)
-        assert all(type(record) is bytes and len(record) == expected_size for record in records), name
-        fault = ring_position_fault(name, positions[name], len(records))
+        assert all(type(record) is bytes and len(record) in RING_RECORD_LENGTHS[name]
+                   for record in records), name
+        fault = ring_position_fault(name, positions[name], records)
         assert fault is None, f"{lane}: {fault}"
     if lane in START_SNAPSHOT_LANES:
         assert_start_event_records(retained["EVENTS"], lane)
@@ -1076,22 +1684,26 @@ def assert_stopped_snapshot(manifest, prefix):
         names = [metadata["name"] for metadata in metadata_rows]
         require(len(set(names)) == len(names), "duplicate map names")
         require(set(api["TASK_STORAGE_NAMES"]) | {
-            "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL", "START", "EVENTS", "DISCOVERY"
+            "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL", "INSTANCE_GEN", "START", "EVENTS", "DISCOVERY"
         } <= set(names), "missing required acquisition map")
         records, maps, controls = [], [], {}
-        total = 0
+        total, record_count = 0, 0
+        epoch_raw, instance_gen = None, None
         for item, metadata in zip(manifest, metadata_rows):
             name = metadata["name"]
             context = f"stopped map id={item['id']} name={name}"
             surface = surfaces[item["id"]]
             task_storage = metadata["type"] == "task_storage"
+            sampled = name == "PROC_EPOCH"
             ring = metadata["type"] == "ringbuf"
             require(not ring or name in RING_RECORD_SIZES, "unknown ring surface")
             fields = {"id", "acquisition_id", "phase", "size", "sha256"}
-            require(set(surface) == fields | ({"records"} if task_storage else set())
+            require(set(surface) == fields | ({"record_count"} if sampled else
+                                             {"records"} if task_storage else set())
                     | ({"positions"} if ring else set()),
                     "malformed surface metadata")
-            require(surface["acquisition_id"] == acquisition and surface["phase"] == "stopped",
+            require(surface["acquisition_id"] == acquisition
+                    and surface["phase"] == ("sampled" if sampled else "stopped"),
                     "surface acquisition or phase mismatch")
             require(uint(surface["size"]) and surface["size"] <= maximum - total,
                     "surface exceeds aggregate byte bound")
@@ -1117,20 +1729,42 @@ def assert_stopped_snapshot(manifest, prefix):
                 # A drained ring retains nothing, so its bytes alone cannot say
                 # whether it ever carried a record. The positions can, and they
                 # are only evidence while they still account for those bytes.
-                record_size = RING_RECORD_SIZES[name]
-                require(len(raw) % record_size == 0, "ring surface is not whole records")
+                # The surface frames each record with its 8-byte ring header
+                # (length plus zero flags) so mixed 368/608-byte EVENTS forms
+                # split exactly; the kernel padding lives only in the stride.
+                ring_records = []
+                offset = 0
+                while offset < len(raw):
+                    require(len(raw) - offset >= 8, "ring surface ends mid-header")
+                    length, flags = struct.unpack_from("<II", raw, offset)
+                    require(flags == 0, "ring surface carries a busy/discarded record")
+                    require(length in RING_RECORD_LENGTHS[name],
+                            f"ring surface record size {length}")
+                    require(len(raw) - offset - 8 >= length, "ring surface ends mid-record")
+                    ring_records.append(bytes(raw[offset + 8:offset + 8 + length]))
+                    offset += 8 + length
                 positions = surface["positions"]
                 require(isinstance(positions, list) and len(positions) == 2
                         and all(uint(position) for position in positions),
                         "malformed ring positions")
-                require(ring_position_fault(name, positions, len(raw) // record_size) is None,
+                require(ring_position_fault(name, positions, ring_records) is None,
                         "ring positions contradict the retained ring bytes")
             if task_storage:
                 maps.append(metadata)
+                if sampled:
+                    count = surface["record_count"]
+                    require(uint(count) and count <= api["TASK_STORAGE_MAX_RECORDS"] - record_count,
+                            "invalid sampled control count bound")
+                    require(len(raw) == count * api["PROC_EPOCH_RECORD"].size,
+                            "sampled control byte count mismatch")
+                    record_count += count
+                    epoch_raw = raw
+                    continue
                 identities = surface["records"]
                 require(isinstance(identities, list)
-                        and len(identities) <= api["TASK_STORAGE_MAX_RECORDS"] - len(records),
+                        and len(identities) <= api["TASK_STORAGE_MAX_RECORDS"] - record_count,
                         "invalid record population bound")
+                record_count += len(identities)
                 size = item["value_size"]
                 require(uint(size, 32, positive=True) and len(raw) == len(identities) * size,
                         "record population byte count mismatch")
@@ -1150,10 +1784,21 @@ def assert_stopped_snapshot(manifest, prefix):
                         "malformed control cell")
                 require(byte_array(cells[0]["key"], 4) == bytes(4), "invalid control key")
                 controls[name] = {**metadata, "value": byte_array(cells[0]["value"], item["value_size"])}
+            elif name == "INSTANCE_GEN":
+                instance_gen = {**metadata, "cells": read_json_bytes(raw)}
         api["reconcile_task_storage"](
             maps, records, expected=receipt["expected"], before=receipt["before"],
-            after=receipt["after"], controls=controls, lane=receipt["lane"],
+            after=receipt["after"], controls=controls, instance_gen=instance_gen, lane=receipt["lane"],
             small_state=receipt["small_state"])
+        require(epoch_raw is not None, "missing sampled continuity control")
+        attach_generation = api["instance_attach_generation"](instance_gen)
+        size = api["PROC_EPOCH_RECORD"].size
+        # Leader/duplicate checks belong to acquisition. Discarded iterator IDs
+        # cannot support those checks or establish row origins during replay:
+        # replay validates retained values, never a frozen global population.
+        require(all(api["proc_epoch_value_valid"](epoch_raw[offset:offset + size], attach_generation)
+                    for offset in range(0, len(epoch_raw), size)),
+                "invalid sampled continuity control value")
     except RuntimeError as error:
         raise AssertionError(str(error)) from None
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
@@ -1245,6 +1890,12 @@ def assert_final_artifact_privacy(artifacts):
                     str(path), trace_scannable(str(path), rendered)
                 )
         elif path.suffix == ".json":
+            # Custody receipts carry IDs; narrow scalars also occur as single
+            # map bytes. Scan distinctive fixture identities in the raw text
+            # while retaining the existing decoded-value policy for all IDs.
+            distinctive = [value for value in LOADER_PAUSE_IDENTITIES.values()
+                           if isinstance(value, str) or abs(value) >= DISTINCTIVE_FLOOR]
+            assert_no_loader_pause_identity(str(path), content, distinctive)
             assert_no_loader_pause_identity(str(path), reconstruct(content))
         elif path.name.endswith(".workload.log"):
             assert_no_loader_pause_identity(str(path), content, WORKLOAD_IDENTITIES)
@@ -1254,15 +1905,206 @@ def assert_final_artifact_privacy(artifacts):
     leaks = {}
     for path in artifacts:
         content = path.read_bytes()
-        found = sentinel_hits(content, reconstruct(content) if path.suffix == ".json" else b"")
+        decoded = reconstruct(content) if path.suffix == ".json" else b""
+        if path.suffix == ".output" and not content.lstrip().startswith(b"{"):
+            decoded = trace_scannable(str(path), content.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
+        found = sentinel_hits(content, decoded)
         if found:
             leaks[str(path)] = sorted(found)
     assert not leaks, f"ordinary pointer canaries leaked: {leaks}"
 
 
+# Safe profile/trace lanes whose own capture document legitimately
+# carries the narrow unknown ids on 32-bit targets (approved shape
+# only: id fields in profile JSON rows, approved profile-table rows
+# in observer logs, mechanism tokens in trace text, the same trace
+# lines duplicated verbatim in observer logs, and the mechanism field
+# in retained EVENTS bytes). Every other lane and every other
+# artifact — map dumps, receipts, manifests, metrics, START and
+# object/journal lanes — gets no allowance.
+SAFE_PROFILE_TRACE_LANES = frozenset({
+    "default-safe-profile", "feature-safe-profile",
+    "default-safe-trace", "feature-safe-trace",
+})
+SAFE_TRACE_LANES = frozenset({
+    "default-safe-trace", "feature-safe-trace",
+})
+SAFE_PROFILE_LANES = frozenset({
+    "default-safe-profile", "feature-safe-profile",
+})
+
+
+def strip_approved_unregistered_rows(content):
+    """Remove only the approved id fields from approved rows.
+
+    Only `mechanism` and `mechanism_hex` are removed, and only from
+    rows whose mechanism is UNKNOWN or MAXIMUM, whose registered flag
+    is False, and whose hex spelling exactly matches the id. Every
+    other field (calls, errors, ops, params, note, any future key)
+    stays for the unchanged alias scan, in the top-level mechanisms[]
+    breakdown and in each cgroups[] entry's own breakdown. A duplicated
+    JSON key refuses the strip: the raw content is scanned instead.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+
+    try:
+        doc = json.loads(content, object_pairs_hook=unique_object)
+    except ValueError:
+        return content
+    approved = {UNKNOWN, MAXIMUM}
+
+    def strip_row(row):
+        if (isinstance(row, dict) and row.get("mechanism") in approved
+                and isinstance(row["mechanism"], int)
+                and row.get("registered") is False
+                and row.get("mechanism_hex") == f"0x{row['mechanism']:x}"):
+            return {key: value for key, value in row.items()
+                    if key not in ("mechanism", "mechanism_hex")}
+        return row
+
+    def strip_rows(rows):
+        return [strip_row(row) for row in rows]
+
+    mechanisms = doc.get("mechanisms")
+    if not isinstance(mechanisms, list):
+        return content
+    stripped = dict(doc)
+    stripped["mechanisms"] = strip_rows(mechanisms)
+    cgroups = stripped.get("cgroups")
+    if isinstance(cgroups, list):
+        stripped["cgroups"] = [
+            {**entry, "mechanisms": strip_rows(entry["mechanisms"])}
+            if isinstance(entry, dict) and isinstance(entry.get("mechanisms"), list)
+            else entry
+            for entry in cgroups
+        ]
+    return json.dumps(stripped).encode()
+
+
+def strip_approved_mechanism_tokens(content):
+    """Drop exact ` C_<name> 0x<approved> → ` tokens from trace text."""
+    stripped = content
+    for value in (UNKNOWN, MAXIMUM):
+        token = f"0x{value:x}".encode()
+        stripped = re.sub(rb" C_[A-Za-z]+ " + re.escape(token) + " → ".encode(),
+                          b" ", stripped)
+    return stripped
+
+
+def strip_approved_profile_text_rows(content):
+    """Drop only the approved id token from approved profile-table rows.
+
+    Removes the `0x<approved>` token, and only that token, from lines
+    that are exactly a profile MECHANISM table row (hex id plus calls
+    and errors counts, nothing else). The counts stay for the
+    unchanged alias scan, as with the JSON row strip. Any other
+    spelling (decimal, a non-approved id, an extra field, packed
+    bytes) survives it.
+    """
+    approved = {f"0x{value:x}".encode() for value in (UNKNOWN, MAXIMUM)}
+    stripped = []
+    for line in content.splitlines(keepends=True):
+        bare = line.rstrip(b"\r\n")
+        ending = line[len(bare):]
+        fields = bare.split()
+        if (len(fields) == 3 and fields[0] in approved
+                and fields[1].isdigit() and fields[2].isdigit()):
+            bare = bare.replace(fields[0], b" ", 1)
+        stripped.append(bare + ending)
+    return b"".join(stripped)
+
+
+def strip_approved_events_raw(content):
+    """Zero the approved mechanism field in framed EVENTS bytes.
+
+    Re-frames the raw surface (8-byte headers plus 368/608-byte
+    records) and zeroes bytes [48,56) of each record whose u64 at
+    offset 48 is UNKNOWN. A framing failure scans the raw content.
+    """
+    try:
+        raw = bytes(content)
+        out = bytearray()
+        offset = 0
+        while offset < len(raw):
+            if len(raw) - offset < 8:
+                return content
+            length, flags = struct.unpack_from("<II", raw, offset)
+            if flags != 0 or length not in RING_RECORD_LENGTHS["EVENTS"]:
+                return content
+            if len(raw) - offset - 8 < length:
+                return content
+            record = bytearray(raw[offset + 8:offset + 8 + length])
+            if len(record) >= 56 and struct.unpack_from("<Q", record, 48)[0] == UNKNOWN:
+                record[48:56] = b"\x00" * 8
+            out += raw[offset:offset + 8]
+            out += record
+            offset += 8 + length
+        return bytes(out)
+    except (ValueError, struct.error, IndexError):
+        return content
+
+
 def assert_safe_lane_alias_privacy(lane, paths):
     for path in map(Path, paths):
         content = path.read_bytes()
+        if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
+                and path.name == f"{lane}.output"):
+            if lane.endswith("-profile"):
+                content = strip_approved_unregistered_rows(content)
+            elif lane.endswith("-trace"):
+                content = strip_approved_mechanism_tokens(content)
+        elif (TARGET_BITS == 32 and lane in SAFE_TRACE_LANES
+                and path.name == f"{lane}.observer.log"):
+            # The stopped-phase harness merges the observer's stdout
+            # and stderr into this log, so it duplicates approved trace
+            # lines byte-for-byte. Strip only lines that also appear
+            # verbatim in the lane output; log-only lines are scanned
+            # whole, and a missing output strips nothing.
+            output_lines = set()
+            for candidate in map(Path, paths):
+                if candidate.name == f"{lane}.output":
+                    try:
+                        output_lines = set(candidate.read_bytes().splitlines())
+                    except OSError:
+                        output_lines = set()
+                    break
+            else:
+                try:
+                    output_lines = set(
+                        (path.parent / f"{lane}.output").read_bytes().splitlines())
+                except OSError:
+                    output_lines = set()
+            kept = []
+            for line in content.splitlines(keepends=True):
+                bare = line.rstrip(b"\r\n")
+                ending = line[len(bare):]
+                if bare in output_lines:
+                    bare = strip_approved_mechanism_tokens(bare)
+                kept.append(bare + ending)
+            content = b"".join(kept)
+        elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_LANES
+                and path.name == f"{lane}.observer.log"):
+            # The stopped-phase harness merges the observer's stdout
+            # into this log, so it duplicates the profile MECHANISM
+            # table: bare approved hex ids with call/error counts (the
+            # profile table is a documented publication surface). The
+            # JSON output has no verbatim text lines, so instead of
+            # the trace-log verbatim rule, only exact approved-shape
+            # rows are stripped, keeping their counts for the scan.
+            content = strip_approved_profile_text_rows(content)
+        elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
+                and path.name == f"{lane}.EVENTS.raw"):
+            # The retained records legitimately carry UNKNOWN at the
+            # mechanism offset; re-frame here and zero only that field,
+            # so every other spelling still fails without relying on
+            # the stop-time oracle having run in this process.
+            content = strip_approved_events_raw(content)
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
         assert not found, f"{lane}: scalar aliases {found} in {path}"
@@ -1302,10 +2144,61 @@ def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
     return paths
 
 
+def assert_object_pilot(work, target_bits):
+    """Scan the two selected object cells after their live semantic oracle."""
+    object_lane = "object-ia32" if target_bits == 32 else "object-lp64"
+    paths_by_lane = {}
+    for lane in (object_lane, object_lane + "-blocked"):
+        surfaces = assert_exact_owned_map_inventory(work, lane, SAFE_MAPS)
+        paths_by_lane[lane] = final_lane_artifacts(work, lane, surfaces)
+    assert_final_artifact_privacy(path for paths in paths_by_lane.values() for path in paths)
+    for lane, paths in paths_by_lane.items():
+        assert_safe_lane_alias_privacy(lane, paths)
+    print("object canary pilot OK: 2 cells; no ordinary or safe-policy alias leak")
+
+
+def extract_object_attributes(argv):
+    """Strip optional `--object-attributes` flags, selecting their mode.
+
+    Accepts `--object-attributes=MODE` and `--object-attributes MODE` in
+    any position; every occurrence is validated, so an earlier unknown
+    mode cannot be silently overwritten by a later one. Absent flag
+    keeps `present`, today's FULL behavior.
+    """
+    kept, mode = [], "present"
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--object-attributes":
+            index += 1
+            if index >= len(argv):
+                raise ValueError("--object-attributes requires a mode")
+            mode = argv[index]
+            set_object_attributes(mode)
+        elif token.startswith("--object-attributes="):
+            mode = token.removeprefix("--object-attributes=")
+            set_object_attributes(mode)
+        else:
+            kept.append(token)
+        index += 1
+    set_object_attributes(mode)
+    return kept
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
-        print("usage: check-canary-evidence.py MODE ... BITS", file=sys.stderr)
+        print("usage: check-canary-evidence.py [--object-attributes=MODE] MODE ... BITS",
+              file=sys.stderr)
+        return 2
+    try:
+        argv = extract_object_attributes(argv)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    if not argv:
+        print("usage: check-canary-evidence.py [--object-attributes=MODE] MODE ... BITS",
+              file=sys.stderr)
         return 2
     if argv == ["--self-test"]:
         argv.append("64")
@@ -1316,6 +2209,12 @@ def main(argv=None):
         print(error, file=sys.stderr)
         return 2
     work = argv[0]
+    if work == "--object-pilot":
+        if len(argv) != 3:
+            print("usage: check-canary-evidence.py --object-pilot WORK BITS", file=sys.stderr)
+            return 2
+        assert_object_pilot(argv[1], target_bits)
+        return 0
     if work == "--raw-events":
         assert_raw_records(argv[1], argv[2], int(argv[3]), argv[4])
         return 0
@@ -1325,9 +2224,25 @@ def main(argv=None):
     if work == "--fault-starts":
         assert_fault_starts(argv[1], int(argv[2]))
         return 0
+    if work == "--object-starts":
+        assert_object_starts(argv[1], argv[2], argv[3], argv[4], int(argv[5]),
+                             int(argv[6]), target_bits)
+        return 0
 
 
     if work == "--self-test":
+        if object_attributes_absent():
+            print("--self-test asserts FULL bytes; it runs in present mode only",
+                  file=sys.stderr)
+            return 2
+        try:
+            set_object_attributes("bogus")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unknown object-attributes mode was accepted")
+        print("object-attributes mode gate: OK")
+
         def reject(label, action):
             try:
                 action()
@@ -1412,6 +2327,11 @@ def main(argv=None):
                 "stats_entered": 7, "stats_returned": 5, "raw_calls": 3,
             }) + "\n"
 
+        # The safe profile/trace/raw sections pin both widths
+        # explicitly (64-bit rule first, then the 32-bit approved
+        # shape); the remainder of the self-test runs at entry width.
+        entry_bits = TARGET_BITS
+        initialize(64)
         safe = {
             "schema": "p11scope/observed-profile/v3",
             "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
@@ -1419,7 +2339,7 @@ def main(argv=None):
                          "completeness": "PARTIAL", "unregistered_mechanisms": 2,
                          "semantic_capture_failures": 3, "async_target_failures": 2},
             "mechanisms": [{"mechanism": REGISTERED, "params": None,
-                            "params_omitted": "policy"}],
+                            "params_omitted": "policy", "registered": True}],
             "templates": {"operations": []},
         }
         assert_safe_profile(safe)
@@ -1473,7 +2393,99 @@ def main(argv=None):
         bad_safe = json.loads(json.dumps(safe))
         bad_safe["evidence"]["semantic_capture_failures"] = 4
         reject("safe profile failure total", lambda: assert_safe_profile(bad_safe))
+        # 64-bit targets publish no unregistered row at all.
+        extra_unreg = json.loads(json.dumps(safe))
+        extra_unreg["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        reject("safe profile 64-bit extra unregistered row",
+               lambda: assert_safe_profile(extra_unreg))
+        cgroup_unreg64 = json.loads(json.dumps(safe))
+        cgroup_unreg64["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+            ],
+        }]
+        reject("safe profile 64-bit cgroup unregistered row",
+               lambda: assert_safe_profile(cgroup_unreg64))
+        cgroup_extra64 = json.loads(json.dumps(safe))
+        cgroup_extra64["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
+            "mechanisms": [
+                {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
+                 "registered": True, "calls": 1, "errors": 0, "note": "x"},
+            ],
+        }]
+        reject("safe profile 64-bit cgroup extra key",
+               lambda: assert_safe_profile(cgroup_extra64))
 
+        # 32-bit targets publish the narrow unknown ids as approved
+        # registered:false rows; 64-bit targets keep them absent (the
+        # self-test otherwise runs on 64-bit globals).
+        initialize(32)
+        safe32 = {
+            "schema": "p11scope/observed-profile/v3",
+            "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
+            "evidence": {**full_fixture, **selection_fixture,
+                         "completeness": "PARTIAL", "unregistered_mechanisms": 2,
+                         "semantic_capture_failures": 3, "async_target_failures": 2},
+            "mechanisms": [
+                {"mechanism": REGISTERED, "params": None,
+                 "params_omitted": "policy", "registered": True, "calls": 1},
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "params": None, "params_omitted": "policy",
+                 "registered": False, "calls": 1},
+                {"mechanism": MAXIMUM, "mechanism_hex": f"0x{MAXIMUM:x}",
+                 "params": None, "params_omitted": "policy",
+                 "registered": False, "calls": 1},
+            ],
+            "templates": {"operations": []},
+        }
+        assert_safe_profile(safe32)
+        param_leak = json.loads(json.dumps(safe32))
+        param_leak["mechanisms"][1]["params"] = [{
+            "shape": "rsa_pkcs_pss", "hash_alg": ALIASES["pss_hash"],
+            "hash_alg_hex": f"0x{ALIASES['pss_hash']:x}",
+            "mgf": ALIASES["pss_mgf"], "salt_len": ALIASES["pss_salt"],
+            "count": 1,
+        }]
+        reject("safe profile parameter value inside a registered:false row",
+               lambda: assert_safe_profile(param_leak))
+        # The 32-bit unregistered set is exactly {UNKNOWN, MAXIMUM}.
+        extra32 = json.loads(json.dumps(safe32))
+        extra32["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        reject("safe profile 32-bit extra unregistered row",
+               lambda: assert_safe_profile(extra32))
+        wrong_hex = json.loads(json.dumps(safe32))
+        wrong_hex["mechanisms"][1]["mechanism_hex"] = "0x0"
+        reject("safe profile 32-bit unregistered hex mismatch",
+               lambda: assert_safe_profile(wrong_hex))
+        cgood = json.loads(json.dumps(safe32))
+        cgood["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+                {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
+                 "registered": True, "calls": 1, "errors": 0},
+            ],
+        }]
+        assert_safe_profile(cgood)
+        cextra = json.loads(json.dumps(cgood))
+        cextra["cgroups"][0]["mechanisms"][0]["note"] = "x"
+        reject("safe profile 32-bit cgroup extra key",
+               lambda: assert_safe_profile(cextra))
+        cwrong = json.loads(json.dumps(cgood))
+        cwrong["cgroups"][0]["mechanisms"][0]["mechanism"] = ALIASES["pss_hash"]
+        reject("safe profile 32-bit cgroup unregistered id",
+               lambda: assert_safe_profile(cwrong))
+        initialize(64)
+
+        initialize(64)
         safe_trace = "CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n" + count_line() + \
             "EVIDENCE " + json.dumps(
             terminal("allowlisted", 3, 2)
@@ -1498,6 +2510,164 @@ def main(argv=None):
             safe_trace.replace('"raw_calls": 3', '"raw_calls_extra": 3')
         ))
 
+        # 32-bit targets render the narrow unknown ids only as mechanism
+        # tokens (` C_<name> 0x… → `); parameter values stay absent.
+        initialize(32)
+        trace32 = ("CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n"
+                   f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK 1ns\n"
+                   f"op C_DecryptInit 0x{MAXIMUM:x} → CKR_OK 1ns\n"
+                   + count_line() + "EVIDENCE " + json.dumps(
+                       terminal("allowlisted", 3, 2)))
+        assert_safe_trace(trace32)
+        reject("safe trace 32-bit parameter value", lambda: assert_safe_trace(
+            trace32.replace("C_DigestInit 0x250",
+                            f"C_DigestInit 0x250 0x{ALIASES['pss_hash']:x}")
+        ))
+        reject("safe trace 32-bit misplaced mechanism value",
+               lambda: assert_safe_trace(trace32.replace(
+                   f"0x{UNKNOWN:x} → CKR_OK",
+                   f"0x{UNKNOWN:x} → CKR_OK 0x{UNKNOWN:x}")))
+        reject("safe trace 32-bit digit in function name",
+               lambda: assert_safe_trace(trace32.replace(
+                   "C_EncryptInit", "C_Encrypt123")))
+
+        # The lane-scan strip removes only the approved positions: a
+        # parameter alias smuggled into a row, a misplaced token, or
+        # packed bytes all survive it for the unchanged alias scan.
+        stripped = strip_approved_unregistered_rows(json.dumps(safe32).encode())
+        assert alias_hits(stripped) == set(), stripped
+        smuggled = json.loads(json.dumps(safe32))
+        smuggled["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(smuggled).encode())) == {"pss_hash"}
+        cgrouped = json.loads(json.dumps(safe32))
+        cgrouped["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+                {"mechanism": ALIASES["pss_hash"], "params": None,
+                 "params_omitted": "policy", "registered": False, "calls": 1},
+            ],
+        }]
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(cgrouped).encode())) == {"pss_hash"}
+        # A leak inside an approved row survives the strip: only the id
+        # fields are removed, never the whole row.
+        for label, mutate in (
+            ("top-level calls", lambda doc: doc["mechanisms"][1].update(
+                calls=ALIASES["pss_hash"])),
+            ("top-level extra key", lambda doc: doc["mechanisms"][1].update(
+                note=f"0x{ALIASES['pss_hash']:x}")),
+        ):
+            leaky = json.loads(json.dumps(safe32))
+            mutate(leaky)
+            assert alias_hits(strip_approved_unregistered_rows(
+                json.dumps(leaky).encode())) == {"pss_hash"}, label
+        for label, mutate in (
+            ("cgroup calls", lambda row: row.update(calls=ALIASES["pss_hash"])),
+            ("cgroup extra key", lambda row: row.update(
+                note=f"0x{ALIASES['pss_hash']:x}")),
+        ):
+            cleaky = json.loads(json.dumps(safe32))
+            cleaky["cgroups"] = [{
+                "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+                "mechanisms": [
+                    {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                     "registered": False, "calls": 1, "errors": 0},
+                ],
+            }]
+            mutate(cleaky["cgroups"][0]["mechanisms"][0])
+            assert alias_hits(strip_approved_unregistered_rows(
+                json.dumps(cleaky).encode())) == {"pss_hash"}, label
+        # A wrong hex spelling is not the approved shape: the row stays
+        # whole, so the mechanism decimal still fails the scan.
+        bad_hex = json.loads(json.dumps(safe32))
+        bad_hex["mechanisms"][1]["mechanism_hex"] = "0x0"
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(bad_hex).encode())) == {"mechanism"}
+        # A duplicated JSON key refuses the strip: the raw bytes are
+        # scanned, so the approved decimal still fails.
+        dup = ('{"mechanisms": [{"mechanism": %d, "mechanism": %d, '
+               '"mechanism_hex": "0x%x", "registered": false, "calls": 1}]}'
+               % (UNKNOWN, UNKNOWN, UNKNOWN)).encode()
+        assert alias_hits(strip_approved_unregistered_rows(dup)) == {"mechanism"}
+        token_line = f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(token_line)) == set()
+        misplaced = token_line + f"note 0x{UNKNOWN:x}\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
+        packed = struct.pack("<Q", UNKNOWN)
+        assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
+        digit_name = f"op C_Encrypt123 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(digit_name)) == {"mechanism"}
+        with tempfile.TemporaryDirectory() as tmp:
+            lane_out = Path(tmp) / "default-safe-trace.output"
+            lane_log = Path(tmp) / "default-safe-trace.observer.log"
+            lane_out.write_bytes(token_line)
+            lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
+            assert_safe_lane_alias_privacy("default-safe-trace", [lane_out, lane_log])
+            lane_log.write_bytes(
+                token_line + f"leak 0x{UNKNOWN:x}\n".encode())
+            reject("observer log misplaced mechanism value",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_out, lane_log]))
+            log_only = f"diagnostic C_EncryptInit 0x{UNKNOWN:x} → note\n".encode()
+            lane_log.write_bytes(token_line + log_only)
+            reject("observer log token on a log-only line",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_out, lane_log]))
+        # The profile-text strip drops only the approved token from
+        # exact table rows: a decimal id, a non-approved id, an extra
+        # field, a smuggled count or packed bytes all survive it.
+        profile_row = f"0x{UNKNOWN:x}                          1      0\n".encode()
+        assert alias_hits(strip_approved_profile_text_rows(profile_row)) == set()
+        for label, leaked in (
+            ("decimal id", f"{UNKNOWN}                          1      0\n".encode()),
+            ("non-approved id",
+             f"0x{ALIASES['pss_hash']:x}                          1      0\n".encode()),
+            ("extra field", profile_row[:-1] + b" note\n"),
+            ("smuggled count",
+             f"0x{UNKNOWN:x}                          {UNKNOWN}      0\n".encode()),
+            ("packed bytes", struct.pack("<Q", UNKNOWN)),
+        ):
+            assert alias_hits(strip_approved_profile_text_rows(leaked)) != set(), label
+        with tempfile.TemporaryDirectory() as tmp:
+            lane_out = Path(tmp) / "default-safe-profile.output"
+            lane_log = Path(tmp) / "default-safe-profile.observer.log"
+            lane_out.write_bytes(b"{}")
+            lane_log.write_bytes(profile_row + b"p11scope: capture ended\n")
+            assert_safe_lane_alias_privacy("default-safe-profile", [lane_out, lane_log])
+            lane_log.write_bytes(profile_row + f"leak 0x{UNKNOWN:x}\n".encode())
+            reject("profile observer log misplaced mechanism value",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [lane_out, lane_log]))
+        # The EVENTS.raw final scan zeroes only the approved mechanism
+        # field: a packed parameter alias, or UNKNOWN outside [48,56),
+        # still fails.
+        def framed(mechanism, extra=()):
+            record = bytearray(EVENT_SIZE)
+            struct.pack_into("<Q", record, 48, mechanism)
+            for offset, value in extra:
+                struct.pack_into("<Q", record, offset, value)
+            return struct.pack("<II", EVENT_SIZE, 0) + bytes(record)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path = Path(tmp) / "default-safe-profile.EVENTS.raw"
+            raw_path.write_bytes(framed(UNKNOWN))
+            assert_safe_lane_alias_privacy(
+                "default-safe-profile", [raw_path])
+            raw_path.write_bytes(framed(REGISTERED, [(72, ALIASES["pss_hash"])]))
+            reject("events raw packed parameter alias",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [raw_path]))
+            raw_path.write_bytes(framed(REGISTERED, [(56, UNKNOWN)]))
+            reject("events raw mechanism outside its field",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [raw_path]))
+        initialize(entry_bits)
+
         pss = [{
             "shape": "rsa_pkcs_pss", "hash_alg": ALIASES["pss_hash"],
             "hash_alg_hex": f"0x{ALIASES['pss_hash']:x}", "mgf": ALIASES["pss_mgf"],
@@ -1515,11 +2685,11 @@ def main(argv=None):
             "evidence": {**terminal("unsafe-unvalidated-metadata", 7),
                          "templates_truncated": False},
             "mechanisms": [
-                {"mechanism": REGISTERED, "params": None},
-                {"mechanism": UNKNOWN, "params": None},
-                {"mechanism": MAXIMUM, "params": None},
-                {"mechanism": 0xD, "params": pss},
-                {"mechanism": 0x1087, "params": gcm},
+                {"mechanism": REGISTERED, "params": None, "registered": True},
+                {"mechanism": UNKNOWN, "params": None, "registered": False},
+                {"mechanism": MAXIMUM, "params": None, "registered": False},
+                {"mechanism": 0xD, "params": pss, "registered": True},
+                {"mechanism": 0x1087, "params": gcm, "registered": True},
             ],
             "templates": {"operations": [
                 {"names": ["C_CreateObject"], "requested": True,
@@ -1747,6 +2917,17 @@ def main(argv=None):
         nonzero_pad = bytearray(start_bytes(0x301))
         struct.pack_into("<I", nonzero_pad, 268, 1)
         reject("CallStart padding", lambda: decode_start(bytes(nonzero_pad)))
+        # H7 finite marker: 0 stays ordinary, eligible markers are
+        # accepted, NONE/out-of-range/high-bit markers refuse.
+        for marker in (22, 96):
+            marked = bytearray(start_bytes(0x305))
+            struct.pack_into("<Q", marked, 264, marker)
+            decode_start(bytes(marked))
+        for marker in (1, 2, 18, 106, 255, 256, 1 << 32, (1 << 64) - 1):
+            bad = bytearray(start_bytes(0x305))
+            struct.pack_into("<Q", bad, 264, marker)
+            reject(f"object marker {marker}",
+                   lambda bad=bad: decode_start(bytes(bad)))
         for session in (0x301, 0x302, 0x303, 0x304):
             mutated = [dict(record) for record in starts]
             record = next(record for record in mutated if record["session"] == session)
@@ -1827,6 +3008,7 @@ def main(argv=None):
             struct.pack_into("<Q", raw_event, 320, root_affiliation)
             return bytes(raw_event)
 
+        initialize(64)
         safe_events = [event_bytes(index) for index in range(28)]
         safe_events[0] = event_bytes(0, root_affiliation=1)
         assert_event_records(safe_events, "default-safe-profile", 0x555)
@@ -1893,6 +3075,46 @@ def main(argv=None):
             mutated[0] = bytes(record)
             reject(f"raw root affiliation {root_affiliation}", lambda mutated=mutated:
                    assert_event_records(mutated, "default-safe-profile", 0x555))
+        # 32-bit safe lanes publish the narrow ids as event mechanisms;
+        # their packed bytes may touch only the mechanism field and
+        # three frozen-constant artifact offsets (see the oracle rule).
+        initialize(32)
+        safe32_events = [event_bytes(index) for index in range(28)]
+        safe32_events[0] = event_bytes(0, root_affiliation=1)
+        safe32_events[3] = event_bytes(3, mechanism=UNKNOWN)
+        safe32_events[4] = event_bytes(4, mechanism=MAXIMUM)
+        live_user_type = bytearray(safe32_events[6])
+        struct.pack_into("<I", live_user_type, 112, 0xFFFFFFFF)
+        safe32_events[6] = bytes(live_user_type)
+        no_session = bytearray(safe32_events[9])
+        struct.pack_into("<Q", no_session, 32, 0xFFFFFFFFFFFFFFFF)
+        safe32_events[9] = bytes(no_session)
+        assert_event_records(safe32_events, "default-safe-profile", 0x555)
+        reject("raw 32-bit safe events without published ids",
+               lambda: assert_event_records(
+                   safe_events, "default-safe-profile", 0x555))
+        smuggled = list(safe32_events)
+        record = bytearray(smuggled[5])
+        struct.pack_into("<Q", record, 32, UNKNOWN)
+        smuggled[5] = bytes(record)
+        reject("raw 32-bit packed id outside the mechanism field",
+               lambda smuggled=smuggled: assert_event_records(
+                   smuggled, "default-safe-profile", 0x555))
+        mistyped = list(safe32_events)
+        record = bytearray(mistyped[7])
+        struct.pack_into("<I", record, 112, UNKNOWN & 0xFFFFFFFF)
+        mistyped[7] = bytes(record)
+        reject("raw 32-bit wrong value at an artifact offset",
+               lambda mistyped=mistyped: assert_event_records(
+                   mistyped, "default-safe-profile", 0x555))
+        forged_session = list(safe32_events)
+        record = bytearray(forged_session[10])
+        struct.pack_into("<Q", record, 32, (UNKNOWN & 0xFFFFFFFF) << 32 | 0x101)
+        forged_session[10] = bytes(record)
+        reject("raw 32-bit wrong value at the session artifact offset",
+               lambda forged_session=forged_session: assert_event_records(
+                   forged_session, "default-safe-profile", 0x555))
+        initialize(entry_bits)
         print("raw policy oracle self-test: OK")
 
         unsafe_events = list(safe_events)
@@ -2080,7 +3302,27 @@ def main(argv=None):
             name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
             if definition["type"] == RINGBUF
         }, "a new owned ringbuf needs its exact record length here"
-        assert SAFE_MAPS and FEATURE_MAPS == SAFE_MAPS | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
+        # The birth-marker maps (the control row and the PID-scope birth
+        # witness) must be in the default policy, or the subtraction below
+        # would hold vacuously; the feature build carries no birth marker.
+        birth_marker_maps = {"JOURNAL_MARKER_CTL", "PID_START_TICK"}
+        assert "JOURNAL_MARKER_CTL" in SAFE_MAPS, "default policy lacks the marker map"
+        assert "PID_START_TICK" in SAFE_MAPS, "default policy lacks the PID birth witness map"
+
+        def feature_policy_matches(safe, feature):
+            return (
+                bool(safe)
+                and birth_marker_maps <= safe
+                and not birth_marker_maps & feature
+                and feature == (safe - birth_marker_maps) | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
+            )
+
+        assert feature_policy_matches(SAFE_MAPS, FEATURE_MAPS)
+        # Refusal twins: a feature build that gains the PID witness, or a
+        # default policy that loses it, no longer matches.
+        assert not feature_policy_matches(SAFE_MAPS, FEATURE_MAPS | {"PID_START_TICK"})
+        assert not feature_policy_matches(SAFE_MAPS - {"PID_START_TICK"}, FEATURE_MAPS)
+        assert not feature_policy_matches(SAFE_MAPS, FEATURE_MAPS | {"JOURNAL_MARKER_CTL"})
         assert {
             "COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS",
             "TASK_COOKIE", "COOKIE_CTL", "THREAD_OWNER", "OWNER_CTL",
@@ -2258,10 +3500,13 @@ def main(argv=None):
         lane: assert_exact_owned_map_inventory(work, lane, expected)
         for lane, expected in lanes.items()
     }
+    object_lane = "object-lp64" if target_bits == 64 else "object-ia32"
     additional_lanes = {
         "default-safe-start": SAFE_MAPS,
         "feature-safe-start": FEATURE_MAPS,
         "feature-unsafe-fault": FEATURE_MAPS,
+        object_lane: SAFE_MAPS,
+        f"{object_lane}-blocked": SAFE_MAPS,
     }
     lane_surfaces.update({
         lane: assert_exact_owned_map_inventory(work, lane, expected)
@@ -2271,7 +3516,8 @@ def main(argv=None):
                  "feature-safe-profile", "feature-safe-trace",
                  "aggregate-only-metrics", "owned-default-metrics",
                  "owned-feature-metrics",
-                 "feature-unsafe-profile", "feature-unsafe-trace"]:
+                 "feature-unsafe-profile", "feature-unsafe-trace",
+                 object_lane, f"{object_lane}-blocked"]:
         # The worker only: TAIL_CALLS slot 1 is retired and always reads back
         # empty; the pair continuation lives in PAIR_CALLS.
         assert len(read_json(f"{work}/mapdump_TAIL_CALLS_{lane}.json")) == 1
@@ -2320,6 +3566,7 @@ def main(argv=None):
 
     safe_lanes = (set(lanes) - {"feature-unsafe-profile", "feature-unsafe-trace"}) | {
         "default-safe-start", "feature-safe-start",
+        object_lane, f"{object_lane}-blocked",
     }
     for lane in safe_lanes:
         paths = final_lane_artifacts(

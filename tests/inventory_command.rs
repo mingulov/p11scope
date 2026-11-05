@@ -7,6 +7,12 @@
 //! multi-user edges, fork/exec incarnations, unload/reload history,
 //! SIGKILL evidence freezing, and `-o`/stdout document identity.
 
+#[path = "support/multi_host.rs"]
+mod multi_host;
+
+#[allow(dead_code)]
+mod support;
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
@@ -14,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 fn serial_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -45,6 +52,41 @@ fn fixture_source(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(rel)
+}
+
+#[test]
+fn native_semantic_scan_manifest_rejects_before_sinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.json");
+    let events = dir.path().join("events.jsonl");
+    let diagnostics = dir.path().join("diagnostics.jsonl");
+    let marker = b"owned-sink-must-not-change\n";
+    for path in [&report, &events, &diagnostics] {
+        std::fs::write(path, marker).unwrap();
+    }
+    // The missing input must never be opened: this is an argument conflict.
+    let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--pid", "1", "--capture", "scan", "--manifest"])
+        .arg(dir.path().join("missing-manifest.json"))
+        .arg("-o")
+        .arg(&report)
+        .arg("--event-log")
+        .arg(&events)
+        .arg("--diagnostics")
+        .arg(&diagnostics)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let refusal = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        refusal.contains("--manifest requires --capture auto or native"),
+        "{refusal}"
+    );
+    for path in [&report, &events, &diagnostics] {
+        assert_eq!(std::fs::read(path).unwrap(), marker);
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
 }
 
 fn matrix_source() -> PathBuf {
@@ -159,7 +201,7 @@ fn e1_dance(dir: &Path) -> E1Dance {
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe.sh"))
         .arg("--system")
-        .args(["--json", "--max-scan-pids", "4096"])
+        .args(["--capture", "scan", "--json", "--max-scan-pids", "4096"])
         .env("INV_DRIVER", &driver)
         .env("INV_SET", "e1")
         .env("INV_P1", &p1)
@@ -286,6 +328,7 @@ fn pid_dance(
     let _ = std::fs::remove_file(&out);
     let mut cmd = Command::new("sh");
     cmd.arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", mode)
         .env("INV_PROV", &prov)
@@ -430,8 +473,9 @@ fn e2_unload_reload_observed_with_history() {
 /// DR-C5-EDGE through the real `run_with_writer` stream: one multi-pass
 /// reload run read by three consumers — the `-o` JSON document, the
 /// `--event-log` JSONL stream and the stdout text snapshot. The last
-/// `edge_observed` per edge equals the document's edge, every edge has
-/// one, the derived states equal the text snapshot's, the mid-run
+/// `edge_observed` per edge equals the document's edge after checking
+/// its compact identity context separately, every edge has one, the
+/// derived states equal the text snapshot's, the mid-run
 /// unload/reload streamed its own records, and the records are accounted
 /// by the pass markers plus `ended`.
 #[test]
@@ -462,6 +506,7 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     let text_path = dir.join("edges.txt");
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "reload")
         .env("INV_PROV", &prov)
@@ -503,6 +548,16 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     let mut last: BTreeMap<(String, String), &Value> = BTreeMap::new();
     let mut per_edge: BTreeMap<(String, String), usize> = BTreeMap::new();
     for record in &records {
+        let context = &record["identity_context"];
+        assert_eq!(context["version"], 1);
+        assert_eq!(context["caller"]["id"], record["caller"]);
+        assert_eq!(context["caller"]["pid"], pid);
+        assert_eq!(
+            context["caller"]["executable"]["path"],
+            driver.to_str().unwrap()
+        );
+        assert_eq!(context["module"]["id"], record["module"]);
+        assert_eq!(context["module"]["path"], prov.to_str().unwrap());
         let key = (
             record["caller"].as_str().unwrap().to_string(),
             record["module"].as_str().unwrap().to_string(),
@@ -520,8 +575,8 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
         );
         let record = last[&key];
         let mut replayed = record.clone();
-        for state in ["presence", "capture", "activity"] {
-            replayed.as_object_mut().unwrap().remove(state);
+        for field in ["presence", "capture", "activity", "identity_context"] {
+            replayed.as_object_mut().unwrap().remove(field);
         }
         assert_eq!(&replayed, edge, "JSONL replay == JSON for {key:?}");
         let line = text
@@ -635,6 +690,104 @@ fn b3_sigkill_freezes_evidence_with_exit_state() {
 }
 
 #[test]
+fn inventory_snapshot_names_the_observed_executable_and_module() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-app-first");
+    let private = private_dir();
+    let file = private.path().join("snapshot.json");
+    let ready = dir.join("app-first.ready");
+    let driver = gcc(
+        &dir,
+        "app-first-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let provider = gcc(
+        &dir,
+        "app-first-provider.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let text_file = dir.join("snapshot.txt");
+    // Like the JSON parity journey below, the shell becomes the observer,
+    // preserving parent custody of its single owned fixture under Yama.
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan", "--duration", "2s", "-o"])
+        .arg(&file)
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &provider)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &text_file)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let ready_text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = ready_text
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let _driver_guard = FixtureGuard { pids: vec![pid] };
+    assert!(output.status.success(), "{output:?}");
+    let text = std::fs::read_to_string(&text_file).unwrap();
+    assert!(!text.contains('\u{1b}'), "snapshot contains ANSI: {text}");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["scope"], format!("pid:{pid}"));
+    let callers = doc["callers"].as_array().unwrap();
+    assert_eq!(
+        callers.len(),
+        1,
+        "single-PID scope retains no unrelated caller"
+    );
+    let caller = &callers[0];
+    assert_eq!(caller["pid"], pid);
+    let exe = caller["image"]["exe"]["path"].as_str().unwrap();
+    assert_eq!(exe, driver.to_str().unwrap());
+    let module = module_for(&doc, "app-first-provider.so");
+    let path = module["paths"][0].as_str().unwrap();
+    assert_eq!(path, provider.to_str().unwrap());
+    let caller_id = caller["id"].as_str().unwrap();
+    let module_id = module["id"].as_str().unwrap();
+    let edges = edges_for(&doc, caller_id, module_id);
+    assert_eq!(edges.len(), 1);
+    assert_scan_only_entries(edges[0], "app-first owned mapping");
+    let overview = format!(
+        "application {} [{caller_id} pid {pid} incarnation {}] -> module {} [{module_id}]: Module mapped; activity not captured",
+        Path::new(exe).file_name().unwrap().to_str().unwrap(),
+        caller["incarnation"].as_u64().unwrap(),
+        Path::new(path).file_name().unwrap().to_str().unwrap(),
+    );
+    assert!(
+        text.lines().any(|line| line.starts_with(&overview)),
+        "{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("application "))
+            .count(),
+        1
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("caller ") && line.contains(exe)),
+        "full executable detail: {text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("module ") && line.contains(path)),
+        "full module detail: {text}"
+    );
+    assert!(text.contains("coverage unknown (scan only)"), "{text}");
+}
+
+#[test]
 fn out_file_matches_stdout_document() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-outfile");
@@ -662,6 +815,7 @@ fn out_file_matches_stdout_document() {
     let _ = std::fs::remove_file(&out);
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .arg("--json")
         .arg("-o")
         .arg(&file)
@@ -730,6 +884,7 @@ fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
     let _ = std::fs::remove_file(&out);
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .arg("--json")
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "plain")
@@ -894,6 +1049,7 @@ impl LiveDriver {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         Self::adopt(child, &ready, name, Duration::from_secs(30))
@@ -947,6 +1103,7 @@ fn a_driver_that_never_becomes_ready_is_reaped_after_the_panic() {
     let child = Command::new("sleep")
         .arg("120")
         .stdin(Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id() as libc::pid_t;
@@ -990,7 +1147,7 @@ fn s1_command_json_carries_semantic_schema_with_honest_unknowns() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-s1");
     let driver = LiveDriver::spawn(&dir, "s1", &["s1-p1.so", "s1-p2.so"]);
-    let output = observe(driver.pid, &["--json"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "s1 observe failed: {stderr}");
     assert!(
@@ -1054,7 +1211,7 @@ fn s1_command_degraded_run_keeps_stderr_honest() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-s1-degrade");
     let driver = LiveDriver::spawn(&dir, "s1d", &["s1d-p1.so"]);
-    let output = observe(driver.pid, &["--dashboard"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--dashboard"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "degraded run exits 0: {stderr}");
     assert!(
@@ -1086,8 +1243,8 @@ fn max_gaps_knob_defaults_to_1024_and_binds_retention() {
     let dir = tmp("inventory-command-max-gaps");
     let driver = LiveDriver::spawn(&dir, "mg", &["mg-p1.so"]);
     for (args, expected_limit) in [
-        (vec!["--json"], 1024),
-        (vec!["--json", "--max-gaps", "3"], 3),
+        (vec!["--capture", "scan", "--json"], 1024),
+        (vec!["--capture", "scan", "--json", "--max-gaps", "3"], 3),
     ] {
         let output = observe(driver.pid, &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1116,15 +1273,38 @@ fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// The observation keys the scan lane has always carried; the native lane
-/// adds `lane`, `settlement` and `retirement`.
-const SCAN_OBSERVATION_KEYS: [&str; 5] = [
+/// The observation keys the scan lane carries: the five historical keys
+/// plus the `semantic_capture` summary (disabled in the scan lane, which
+/// has no Detailed lane). The native lane adds `lane`, `settlement` and
+/// `retirement`.
+const SCAN_OBSERVATION_KEYS: [&str; 6] = [
     "ended_ns",
     "native_witnesses",
     "passes",
+    "semantic_capture",
     "started_ns",
     "usage_feed",
 ];
+
+/// The scan lane's `observation.semantic_capture` value: no Detailed lane
+/// and no startup failure, so status `disabled` with zero counts,
+/// `stop_quiescence` `not_requested`, and `final_drain` null.
+fn assert_scan_semantic_capture(doc: &Value, context: &str) {
+    assert_eq!(
+        doc["observation"]["semantic_capture"],
+        serde_json::json!({
+            "status": "disabled",
+            "admitted_endpoints": 0,
+            "refused_endpoints": 0,
+            "continuity_cuts": 0,
+            "unrouted_returns": 0,
+            "events_lost": 0,
+            "stop_quiescence": "not_requested",
+            "final_drain": null,
+        }),
+        "{context}"
+    );
+}
 
 fn observation_keys(doc: &Value) -> Vec<String> {
     let mut keys: Vec<String> = doc["observation"]
@@ -1165,15 +1345,21 @@ fn capture_native_without_privilege_is_an_error_naming_why() {
     let output = observe(driver.pid, &["--capture", "native", "--json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("--capture native: the native usage lane cannot run:"),
-        "{stderr}"
-    );
+    match multi_host::refusal() {
+        Some(reason) => assert_eq!(
+            stderr,
+            format!("p11scope: inventory --pid {}: {reason}\n", driver.pid)
+        ),
+        None => assert!(
+            stderr.contains("--capture native: the native usage lane cannot run:"),
+            "{stderr}"
+        ),
+    }
     assert!(output.stdout.is_empty(), "no document on a refused lane");
 }
 
 #[test]
-fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
+fn capture_auto_without_privilege_requires_multi_before_scan_fallback() {
     if running_as_root() {
         eprintln!("skipped: root runs the native lane under auto");
         return;
@@ -1181,9 +1367,22 @@ fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-auto-fallback");
     let driver = LiveDriver::spawn(&dir, "af", &["af-p1.so"]);
+    let host_refusal = multi_host::refusal();
     for args in [vec!["--json"], vec!["--capture", "auto", "--json"]] {
         let output = observe(driver.pid, &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(reason) = &host_refusal {
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert_eq!(
+                stderr,
+                format!("p11scope: inventory --pid {}: {reason}\n", driver.pid)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "no scan fallback on an ineligible host"
+            );
+            continue;
+        }
         assert!(output.status.success(), "{args:?}: {stderr}");
         assert!(
             stderr.contains("native usage feed unavailable, continuing with the scan lane"),
@@ -1199,6 +1398,7 @@ fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
         assert!(gap["caller"].is_null() && gap["module"].is_null() && gap["pid"].is_null());
         assert!(!gap["reason"].as_str().unwrap().is_empty());
         assert_eq!(observation_keys(&doc), SCAN_OBSERVATION_KEYS, "{args:?}");
+        assert_scan_semantic_capture(&doc, &format!("{args:?}"));
         for edge in doc["edges"].as_array().unwrap() {
             assert_eq!(edge["entries"]["coverage"]["reason"], "scan_only", "{edge}");
         }
@@ -1221,6 +1421,7 @@ fn capture_scan_keeps_the_scan_lane_document() {
     );
     let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(observation_keys(&doc), SCAN_OBSERVATION_KEYS);
+    assert_scan_semantic_capture(&doc, "--capture scan");
     assert!(
         !gap_subjects(&doc)
             .iter()
@@ -1257,6 +1458,7 @@ fn a_classic_run_interrupted_by_sigint_commits_its_report_and_stream() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = observer.id();

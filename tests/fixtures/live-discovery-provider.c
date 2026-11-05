@@ -31,11 +31,27 @@
  *   P11SCOPE_FIXTURE_INTERFACES=N
  *                                use exactly N interface records for N in
  *                                {0, 1, 16, 17}; absent/invalid values use 1.
+ *   P11SCOPE_FIXTURE_BLOCK_RELEASE=PATH
+ *   P11SCOPE_FIXTURE_BLOCK_ENTERED=PATH
+ *                                the abi-104 "blocked" handshake: slot 10
+ *                                touches ENTERED from inside the call and
+ *                                waits for RELEASE to appear. Absent paths
+ *                                keep every slot non-blocking.
+ *   P11SCOPE_FIXTURE_BLOCK_TIMEOUT_MS=N
+ *                                ceiling for that wait in milliseconds
+ *                                (default 300000); on expiry the slot
+ *                                returns CKR_OK after naming the expiry on
+ *                                stderr, so a cell whose release never
+ *                                comes fails honestly at the in-flight
+ *                                proof instead of hanging. Absent or
+ *                                invalid values keep the default.
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -61,9 +77,18 @@ typedef CK_INTERFACE_PTR *CK_INTERFACE_PTR_PTR;
 
 typedef struct {
     CK_VERSION version;
+#if __SIZEOF_POINTER__ == 8
     CK_BYTE reserved[6];
+#else
+    CK_BYTE reserved[2];
+#endif
     void *functions[104];
 } P11ScopeTable;
+
+_Static_assert(offsetof(P11ScopeTable, functions) == sizeof(void *),
+               "function pointers follow CK_VERSION at pointer alignment");
+_Static_assert(sizeof(P11ScopeTable) == sizeof(void *) * 105,
+               "version plus 104 function pointers");
 
 #define P11SCOPE_FIXTURE_MAX_INTERFACES 17
 
@@ -144,6 +169,62 @@ static const char *phase_name(void) {
     return provider_application_phase ? "app" : "ctor";
 }
 
+/* Ceiling for the slot-10 block wait: 300 s at 10 ms a step,
+ * comfortably above the driver's 60 s entry backstop plus stop time, so
+ * only a dead or released-never driver ever trips it. */
+#define BLOCK_WAIT_DEFAULT_MS 300000L
+#define BLOCK_WAIT_STEP_MS 10L
+
+static long block_wait_budget_ms(void) {
+    const char *text = getenv("P11SCOPE_FIXTURE_BLOCK_TIMEOUT_MS");
+    if (text == NULL || text[0] == '\0') {
+        return BLOCK_WAIT_DEFAULT_MS;
+    }
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value <= 0) {
+        return BLOCK_WAIT_DEFAULT_MS;
+    }
+    return value;
+}
+
+/* Blocked-cell support for the abi-104 "blocked" workload: when
+ * P11SCOPE_FIXTURE_BLOCK_RELEASE names a path, the slot-10 entry
+ * (C_InitPIN) touches P11SCOPE_FIXTURE_BLOCK_ENTERED from inside the call
+ * and waits for the release path to appear, so the driver can stop its
+ * capture with a real provider call in flight. Every other slot, and
+ * slot 10 without the handshake, returns at once. The wait is bounded:
+ * on expiry the slot names the expiry and returns CKR_OK, so the cell
+ * fails honestly at the in-flight proof (nothing in flight) instead of
+ * hanging, and a dead driver never orphans a spinner. */
+static void block_until_released(const char *slot) {
+    if (strcmp(slot, "C_InitPIN") != 0) {
+        return;
+    }
+    const char *release = getenv("P11SCOPE_FIXTURE_BLOCK_RELEASE");
+    if (release == NULL || release[0] == '\0') {
+        return;
+    }
+    const char *entered = getenv("P11SCOPE_FIXTURE_BLOCK_ENTERED");
+    if (entered != NULL && entered[0] != '\0') {
+        FILE *proof = fopen(entered, "w");
+        if (proof != NULL) {
+            fclose(proof);
+        }
+    }
+    long budget = block_wait_budget_ms();
+    long waited = 0;
+    while (access(release, F_OK) != 0) {
+        if (waited >= budget) {
+            fprintf(stderr, "P11SCOPE_FIXTURE block wait expired without release\n");
+            return;
+        }
+        usleep((useconds_t)(BLOCK_WAIT_STEP_MS * 1000));
+        waited += BLOCK_WAIT_STEP_MS;
+    }
+}
+
 #define PROVIDER_FUNCTIONS(X) \
     X(C_Initialize) X(C_Finalize) X(C_GetInfo) X(P11ScopeSlot3) X(C_GetSlotList) \
     X(C_GetSlotInfo) X(C_GetTokenInfo) X(C_GetMechanismList) \
@@ -184,6 +265,7 @@ static P11ScopeTable provider_table;
         if (out != NULL) { \
             *out = &provider_table; \
         } \
+        block_until_released(#name); \
         return CKR_OK; \
     }
 PROVIDER_FUNCTIONS(DEFINE_TABLE_FUNCTION)

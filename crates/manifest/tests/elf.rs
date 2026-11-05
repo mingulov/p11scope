@@ -1,7 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use object::elf;
 use p11scope_manifest::elf::{
-    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, read_export_facts,
+    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, needed_libraries, read_export_facts,
     read_export_facts_bounded, symbol_file_offset,
 };
 use std::os::unix::fs::FileExt as _;
@@ -835,6 +835,80 @@ fn export_facts_clamp_a_lying_dynstr_size_to_the_file() {
 }
 
 #[test]
+fn export_facts_mmap_refuses_segment_past_eof() {
+    // A LOAD segment whose file range extends past EOF must make the
+    // demand-paged path refuse byte-identically to the snapshot oracle,
+    // never answer with translated offsets past EOF. Minimized to one
+    // patched field: the executable segment's p_offset moves its file
+    // range past EOF without overflowing u64, the corrupt-header shape a
+    // fuzz seed mutation produced (offset past EOF from intact tables).
+    let d = tmp("elf-export-facts-segment-past-eof");
+    let provider = cc_so(&d, "provider", provider_source());
+    let original = std::fs::read(&provider).unwrap();
+    let mut bytes = original.clone();
+    let header = program_header(&bytes, elf::PT_LOAD, true);
+    let offset = le_u64(&bytes, header.start + 8);
+    let filesz = le_u64(&bytes, header.start + 32);
+    assert!(
+        offset
+            .checked_add(filesz)
+            .is_some_and(|end| end <= original.len() as u64),
+        "fixture segment must start in range (offset {offset:#x}, filesz {filesz:#x})"
+    );
+    let corrupted = original.len() as u64 + 0x1000;
+    bytes[header.start + 8..header.start + 16].copy_from_slice(&corrupted.to_le_bytes());
+    assert_ne!(bytes, original, "the patch must change the image");
+    let path = d.join("segment-past-eof.so");
+    std::fs::write(&path, &bytes).unwrap();
+
+    // The oracle pins the setup: the image still classifies, and refuses
+    // only on the segment range.
+    let oracle_err = oracle_facts(&path, REGISTRY).unwrap_err();
+    assert_eq!(oracle_err, "segment file range extends past the ELF bytes");
+    // The mmap path refuses byte-identically (pre-fix: Ok with offsets past EOF).
+    assert_sparse_matches_oracle(&path, REGISTRY);
+    // The bounded twin shares the same refused core.
+    let file = p11scope_manifest::identity::open_object(&path).unwrap();
+    let reserved = file.metadata().unwrap().len();
+    assert_eq!(
+        read_export_facts_bounded(&file, REGISTRY, reserved).unwrap_err(),
+        oracle_err
+    );
+}
+
+#[test]
+fn export_facts_mmap_matches_snapshot_on_valid_image() {
+    // Healthy twin of the segment-past-EOF refusal: the same seed image,
+    // unpatched, yields mmap facts equal to the snapshot oracle, with
+    // every offset inside the file and the charge within the mapped length.
+    let d = tmp("elf-export-facts-valid-twin");
+    let provider = cc_so(&d, "provider", provider_source());
+    let file_len = std::fs::metadata(&provider).unwrap().len();
+    let (abi, exports) = oracle_facts(&provider, REGISTRY).unwrap();
+    assert!(
+        !exports.is_empty(),
+        "the fixture must export hooks, or the offsets are unpinned"
+    );
+    let (sparse_abi, sparse_exports, charged) = sparse_result(&provider, REGISTRY).unwrap();
+    assert_eq!((sparse_abi, sparse_exports.clone()), (abi, exports));
+    for (name, offset) in &sparse_exports {
+        assert!(
+            *offset < file_len,
+            "{name} offset {offset} outside {file_len} bytes"
+        );
+    }
+    assert!(
+        charged <= file_len,
+        "charged {charged} exceeds mapped {file_len}"
+    );
+    let file = p11scope_manifest::identity::open_object(&provider).unwrap();
+    assert_eq!(
+        read_export_facts_bounded(&file, REGISTRY, file_len).unwrap(),
+        (abi, sparse_exports, charged)
+    );
+}
+
+#[test]
 fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
     // Mapping a 0-length file derefs to an empty slice (memmap2 documents
     // this), so the shared parser refuses it with today's exact snapshot
@@ -847,4 +921,562 @@ fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
         "an empty file must error, never answer or panic"
     );
     assert_sparse_matches_oracle(&empty, REGISTRY);
+}
+
+#[test]
+fn raw_scan_metadata_clips_loaded_headers_at_the_exact_file_extent() {
+    let dir = tmp("elf-raw-metadata-loaded-headers");
+    let path = cc_so(
+        &dir,
+        "headers",
+        "unsigned long C_GetFunctionList(void **out) { *out = 0; return 0; }",
+    );
+    let original = std::fs::read(&path).unwrap();
+    let phoff = le_u64(&original, 32) as usize;
+    let phsize = usize::from(le_u16(&original, 54));
+    let phnum = usize::from(le_u16(&original, 56));
+    let first_load = (0..phnum)
+        .map(|index| phoff + index * phsize)
+        .find(|at| original[*at..*at + 4] == 1u32.to_le_bytes() && le_u64(&original, *at + 8) == 0)
+        .unwrap();
+    assert!(le_u64(&original, first_load + 32) >= (phoff + phsize * phnum) as u64);
+    let loaded = ElfSnapshot::read(&p11scope_manifest::identity::open_object(&path).unwrap())
+        .unwrap()
+        .raw_scan_facts(&[])
+        .unwrap();
+    assert!(
+        loaded
+            .excluded_anchor_ranges
+            .iter()
+            .any(|(start, end)| { *start == 0 && *end >= (phoff + phsize * phnum) as u64 })
+    );
+
+    // Below/exactly at/above the ELF-header boundary: clipping includes
+    // the actual last byte, never a byte of the loader's zero-filled tail.
+    for filesz in [63u64, 64, 65] {
+        let mut bytes = original.clone();
+        bytes[first_load + 32..first_load + 40].copy_from_slice(&filesz.to_le_bytes());
+        let clipped = dir.join(format!("headers-{filesz}.so"));
+        std::fs::write(&clipped, bytes).unwrap();
+        let facts = ElfSnapshot::read(&p11scope_manifest::identity::open_object(&clipped).unwrap())
+            .unwrap()
+            .raw_scan_facts(&[])
+            .unwrap();
+        assert_eq!(facts.excluded_anchor_ranges[0], (0, filesz));
+        assert!(
+            facts
+                .excluded_anchor_ranges
+                .iter()
+                .all(|(start, end)| filesz < *start || *end <= filesz)
+        );
+    }
+}
+
+#[test]
+fn raw_scan_metadata_does_not_exclude_the_loader_zero_fill_tail() {
+    use object::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
+
+    let dir = tmp("elf-raw-metadata-zero-fill");
+    let path = dir.join("provider.so");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&path)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../discover/tests/fixture/version_matrix.c"
+            ))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let table = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("t240"))
+        .unwrap()
+        .address();
+    let load = object
+        .segments()
+        .find(|segment| {
+            let (_, filesz) = segment.file_range();
+            segment.address() + filesz <= table
+                && table + 69 * 8 <= segment.address() + segment.size()
+                && table + 69 * 8 <= (segment.address() + filesz).next_multiple_of(4096)
+        })
+        .expect("actual PT_LOAD must contain this table in its last file page's zero-fill");
+    let (offset, filesz) = load.file_range();
+    let projection = offset + table - load.address();
+    assert!(projection >= offset + filesz);
+    let symtab = object.section_by_name(".symtab").unwrap();
+    let (symtab_start, symtab_len) = symtab.file_range().unwrap();
+    assert!(symtab_start <= projection && projection + 8 <= symtab_start + symtab_len);
+    assert_eq!(
+        symtab.address(),
+        0,
+        "symbol metadata is not runtime storage"
+    );
+    let file = p11scope_manifest::identity::open_object(&path).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&["C_GetFunctionList"])
+        .unwrap();
+    assert_eq!(
+        facts.exports.len(),
+        1,
+        "real own-export witness remains available"
+    );
+    assert!(
+        facts
+            .excluded_anchor_ranges
+            .iter()
+            .all(|(start, end)| projection + 8 <= *start || *end <= projection),
+        "unloaded metadata cannot suppress runtime BSS: {facts:?}"
+    );
+
+    // A second valid LOAD can really map those same file offsets as
+    // metadata at another VA. Global offset exclusions still cannot prove
+    // which interpretation a file-named BSS VMA's projection represents.
+    let mut aliased = bytes.clone();
+    let phoff = le_u64(&bytes, 32) as usize;
+    let phsize = usize::from(le_u16(&bytes, 54));
+    let phnum = usize::from(le_u16(&bytes, 56));
+    let spare = (0..phnum)
+        .map(|index| phoff + index * phsize)
+        .find(|at| bytes[*at..*at + 4] == elf::PT_GNU_STACK.to_le_bytes())
+        .unwrap();
+    let metadata_va = 0x20_0000 + (symtab_start & 4095);
+    aliased[spare..spare + 4].copy_from_slice(&elf::PT_LOAD.to_le_bytes());
+    aliased[spare + 4..spare + 8].copy_from_slice(&elf::PF_R.to_le_bytes());
+    for (field, value) in [
+        (8, symtab_start),
+        (16, metadata_va),
+        (24, metadata_va),
+        (32, symtab_len),
+        (40, symtab_len),
+        (48, 4096),
+    ] {
+        aliased[spare + field..spare + field + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let shoff = le_u64(&bytes, 40) as usize;
+    let shsize = usize::from(le_u16(&bytes, 58));
+    let symtab_header = shoff + symtab.index().0 * shsize;
+    aliased[symtab_header + 8..symtab_header + 16]
+        .copy_from_slice(&u64::from(elf::SHF_ALLOC).to_le_bytes());
+    aliased[symtab_header + 16..symtab_header + 24].copy_from_slice(&metadata_va.to_le_bytes());
+    let alias_object = object::File::parse(aliased.as_slice()).unwrap();
+    assert!(alias_object.segments().any(|segment| {
+        segment.address() == metadata_va && segment.file_range() == (symtab_start, symtab_len)
+    }));
+    let alias_path = dir.join("metadata-alias.so");
+    std::fs::write(&alias_path, &aliased).unwrap();
+    let alias = ElfSnapshot::read(&p11scope_manifest::identity::open_object(&alias_path).unwrap())
+        .unwrap()
+        .raw_scan_facts(&["C_GetFunctionList"])
+        .unwrap();
+    assert_eq!(alias.exports, facts.exports);
+    assert!(
+        alias
+            .excluded_anchor_ranges
+            .iter()
+            .all(|(start, end)| projection + 8 <= *start || *end <= projection),
+        "BSS/metadata alias is not suppression authority: {alias:?}"
+    );
+    assert!(
+        alias
+            .excluded_anchor_ranges
+            .iter()
+            .any(|(start, end)| *start == 0 && *end >= 64),
+        "unambiguous loaded headers remain structural"
+    );
+}
+
+#[test]
+fn raw_scan_metadata_ranges_preserve_data_tables_for_both_abis() {
+    use object::{Object as _, ObjectSection as _};
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+
+    let dir = tmp("elf-raw-anchor-sections");
+    for bits in [32u8, 64] {
+        let source = dir.join(format!("raw-metadata-{bits}.c"));
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+int private_callback(void) { return 0; }
+int (*const ordinary_table[])(void) __attribute__((section(".data.rel.ro"))) = { private_callback };
+unsigned long C_GetFunctionList(void **out) { *out = (void *)ordinary_table; return 0; }
+int main(void) { return puts("metadata fixture"); }
+"#,
+        )
+        .unwrap();
+        let path = dir.join(format!("raw-metadata-{bits}"));
+        // Explicit lazy binding retains a separate actual .got.plt on both
+        // ABIs; this host otherwise merges it into .got under full RELRO.
+        assert!(
+            Command::new("gcc")
+                .arg(format!("-m{bits}"))
+                .args(["-rdynamic", "-Wl,-z,lazy", "-o"])
+                .arg(&path)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let file = p11scope_manifest::identity::open_object(&path).unwrap();
+        let snapshot = ElfSnapshot::read(&file).unwrap();
+        let facts = snapshot.raw_scan_facts(&["C_GetFunctionList"]).unwrap();
+        let mapped =
+            read_raw_scan_facts_bounded(&file, &["C_GetFunctionList"], bytes.len() as u64).unwrap();
+        assert_eq!(facts.excluded_anchor_ranges, mapped.excluded_anchor_ranges);
+        assert_eq!(facts.exports, mapped.exports);
+        assert!(
+            facts.work_units >= (object.sections().count() + 1 + object.segments().count()) as u64,
+            "section, LOAD indexing and clipping work must be charged"
+        );
+        assert!(facts.structural_bytes <= bytes.len() as u64);
+        assert!(read_raw_scan_facts_bounded(&file, &[], bytes.len() as u64 - 1).is_err());
+        let overlaps = |start: u64, len: u64| {
+            facts
+                .excluded_anchor_ranges
+                .iter()
+                .any(|(a, b)| start < *b && *a < start + len)
+        };
+        let mut covered = std::collections::BTreeSet::new();
+        for section in object.sections() {
+            let name = section.name().unwrap();
+            let Some((start, len)) = section.file_range().filter(|(_, len)| *len > 0) else {
+                continue;
+            };
+            if matches!(
+                name,
+                ".gnu.hash"
+                    | ".dynsym"
+                    | ".dynamic"
+                    | ".init_array"
+                    | ".fini_array"
+                    | ".got"
+                    | ".got.plt"
+            ) {
+                assert!(overlaps(start, len), "{bits}: metadata {name}");
+                covered.insert(name);
+            }
+            if matches!(name, ".data" | ".data.rel.ro" | ".rodata") {
+                assert!(!overlaps(start, len), "{bits}: ordinary {name}");
+            }
+        }
+        for required in [
+            ".gnu.hash",
+            ".dynsym",
+            ".dynamic",
+            ".init_array",
+            ".fini_array",
+            ".got",
+            ".got.plt",
+        ] {
+            assert!(
+                covered.contains(required),
+                "{bits}: the actual fixture must contain {required}"
+            );
+        }
+        let table = snapshot
+            .defined_symbol("ordinary_table")
+            .unwrap()
+            .unwrap()
+            .file_offset;
+        assert!(
+            !overlaps(table, u64::from(bits / 8)),
+            "relocated constant table stays eligible"
+        );
+
+        // No section headers is uncertainty, not a blanket raw-source ban.
+        // Only the actually loaded ELF/program headers remain structural.
+        let headers_end = if bits == 64 {
+            le_u64(&bytes, 32) + u64::from(le_u16(&bytes, 54)) * u64::from(le_u16(&bytes, 56))
+        } else {
+            u64::from(u32::from_le_bytes(bytes[28..32].try_into().unwrap()))
+                + u64::from(le_u16(&bytes, 42)) * u64::from(le_u16(&bytes, 44))
+        };
+        let mut no_sections = bytes;
+        let fields = if bits == 64 {
+            [(40, 8), (60, 2), (62, 2)]
+        } else {
+            [(32, 4), (48, 2), (50, 2)]
+        };
+        for (at, len) in fields {
+            no_sections[at..at + len].fill(0);
+        }
+        let bare_path = dir.join(format!("raw-no-sections-{bits}"));
+        std::fs::write(&bare_path, no_sections).unwrap();
+        let bare =
+            ElfSnapshot::read(&p11scope_manifest::identity::open_object(&bare_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            bare.raw_scan_facts(&[]).unwrap().excluded_anchor_ranges,
+            vec![(0, headers_end)]
+        );
+    }
+}
+
+/// File range of section-header-table entry `index` (ELF64).
+fn section_range(bytes: &[u8], index: usize) -> (usize, usize) {
+    let (start, size, count) = section_table(bytes);
+    assert!(index < count, "section {index} of {count}");
+    let header = start + index * size;
+    (
+        le_u64(bytes, header + 24).try_into().unwrap(),
+        le_u64(bytes, header + 32).try_into().unwrap(),
+    )
+}
+
+/// Header-table index of the first section of type `kind`.
+fn section_index(bytes: &[u8], kind: u32) -> Option<usize> {
+    let (start, size, count) = section_table(bytes);
+    (0..count).find(|index| {
+        let header = start + index * size;
+        u32::from_le_bytes(bytes[header + 4..header + 8].try_into().unwrap()) == kind
+    })
+}
+
+/// `.dynsym` file range plus the linked string table's file range.
+fn dynsym_ranges(bytes: &[u8]) -> ((usize, usize), (usize, usize)) {
+    let (start, size, _) = section_table(bytes);
+    let index = section_index(bytes, elf::SHT_DYNSYM).expect("fixture has .dynsym");
+    let header = start + index * size;
+    let link = u32::from_le_bytes(bytes[header + 40..header + 44].try_into().unwrap()) as usize;
+    (section_range(bytes, index), section_range(bytes, link))
+}
+
+/// File offset of the `.dynsym` entry naming `name`.
+fn dynsym_entry(bytes: &[u8], name: &str) -> Option<usize> {
+    let ((sym_off, sym_len), (str_off, str_len)) = dynsym_ranges(bytes);
+    assert_eq!(sym_len % 24, 0, "ELF64 symbols are 24 bytes");
+    (0..sym_len / 24).map(|i| sym_off + i * 24).find(|at| {
+        let name_off = u32::from_le_bytes(bytes[*at..*at + 4].try_into().unwrap()) as usize;
+        if name_off >= str_len {
+            return false;
+        }
+        let end = str_off + name_off;
+        let rest = &bytes[end..str_off + str_len];
+        let nul = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+        &rest[..nul] == name.as_bytes()
+    })
+}
+
+#[test]
+fn ifunc_getter_sets_presence_bit_but_stays_out_of_definitions() {
+    use object::{Object as _, ObjectSymbol as _};
+
+    let d = tmp("elf-ifunc-getter");
+    let so = cc_so(
+        &d,
+        "ifunc-provider",
+        "unsigned long C_Initialize(void) { return 0; }\n\
+         static unsigned long get_interface_impl(void) { return 0; }\n\
+         static void *get_interface_resolver(void) { return (void *)get_interface_impl; }\n\
+         unsigned long C_GetInterface(void) __attribute__((ifunc(\"get_interface_resolver\")));\n",
+    );
+    let bytes = std::fs::read(&so).unwrap();
+    // The fixture really exports `C_GetInterface` as an indirect function:
+    // raw type STT_GNU_IFUNC (10), which `is_definition` excludes.
+    let entry = dynsym_entry(&bytes, "C_GetInterface").expect("dynsym names the getter");
+    assert_eq!(
+        bytes[entry + 4] & 0xf,
+        10,
+        "C_GetInterface must be STT_GNU_IFUNC"
+    );
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let getter = object
+        .dynamic_symbols()
+        .find(|symbol| symbol.name() == Ok("C_GetInterface"))
+        .expect("dynamic symbols name the getter");
+    assert!(
+        !getter.is_definition(),
+        "IFUNC is not a definition: the witness filter hides it"
+    );
+
+    let wanted = [
+        "C_GetInterface",
+        "C_GetInterfaceList",
+        "C_Initialize",
+        "C_GetFunctionList",
+    ];
+    let file = p11scope_manifest::identity::open_object(&so).unwrap();
+    let snapshot = ElfSnapshot::read(&file).unwrap();
+    let facts = snapshot.raw_scan_facts(&wanted).unwrap();
+    let names: Vec<&str> = facts
+        .exports
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["C_Initialize"],
+        "definitions only: the IFUNC getter stays out of exports"
+    );
+    assert!(
+        facts.getter_present,
+        "the presence bit sees the getter whatever its symbol type"
+    );
+    assert!(!facts.witness_fault, "a healthy image walks without faults");
+
+    let inspected = p11scope_manifest::identity::inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        &wanted,
+    )
+    .unwrap();
+    assert!(
+        !inspected
+            .exports
+            .iter()
+            .any(|(name, _)| name == "C_GetInterface"),
+        "the pinned inspection lists definitions only"
+    );
+    assert!(
+        inspected.getter_present,
+        "the pinned inspection records the presence bit"
+    );
+    assert!(!inspected.witness_fault);
+
+    assert!(
+        !exports_matching(&file, &wanted)
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "C_GetInterface"),
+        "the frozen export API keeps listing definitions only"
+    );
+}
+
+#[test]
+fn per_symbol_faults_set_the_sticky_witness_flag() {
+    let d = tmp("elf-witness-fault");
+    let source = "unsigned long C_Initialize(void) { return 0; }\n\
+         unsigned long C_GetFunctionList(void **p) { (void)p; return 0; }\n";
+    let wanted = ["C_Initialize", "C_GetFunctionList"];
+    let corrupt = |name: &str, patch: &dyn Fn(&mut Vec<u8>)| {
+        let path = cc_so(&d, name, source);
+        let mut bytes = std::fs::read(&path).unwrap();
+        patch(&mut bytes);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+
+    let healthy = cc_so(&d, "healthy", source);
+    let file = p11scope_manifest::identity::open_object(&healthy).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&wanted)
+        .unwrap();
+    assert_eq!(facts.exports.len(), 2, "healthy control exports both");
+    assert!(!facts.getter_present);
+    assert!(!facts.witness_fault, "healthy control walks without faults");
+
+    // A name offset past the string table: the walk cannot read the name.
+    let bad_name = corrupt("bad-name", &|bytes| {
+        let entry = dynsym_entry(bytes, "C_Initialize").expect("dynsym names it");
+        bytes[entry..entry + 4].copy_from_slice(&0x00ff_ffff_u32.to_le_bytes());
+    });
+    let file = p11scope_manifest::identity::open_object(&bad_name).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&wanted)
+        .unwrap();
+    assert!(
+        !facts.exports.iter().any(|(name, _)| name == "C_Initialize"),
+        "the unreadable name drops out of exports"
+    );
+    assert!(
+        facts.witness_fault,
+        "an unreadable name sets the sticky fault"
+    );
+    let inspected = p11scope_manifest::identity::inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        &wanted,
+    )
+    .unwrap();
+    assert!(
+        inspected.witness_fault,
+        "the pinned inspection records the fault"
+    );
+
+    // A wanted definition outside every segment: untranslatable address.
+    let bad_address = corrupt("bad-address", &|bytes| {
+        let entry = dynsym_entry(bytes, "C_GetFunctionList").expect("dynsym names it");
+        bytes[entry + 8..entry + 16].copy_from_slice(&(u64::MAX - 4096).to_le_bytes());
+    });
+    let file = p11scope_manifest::identity::open_object(&bad_address).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&wanted)
+        .unwrap();
+    assert!(
+        !facts
+            .exports
+            .iter()
+            .any(|(name, _)| name == "C_GetFunctionList"),
+        "the untranslatable definition drops out of exports"
+    );
+    assert!(
+        facts.witness_fault,
+        "an untranslatable address sets the sticky fault"
+    );
+}
+
+#[test]
+fn needed_libraries_lists_direct_dependencies_in_dynamic_order() {
+    let d = tmp("elf-needed");
+    let dep_c = d.join("needed_dep.c");
+    std::fs::write(&dep_c, "int needed_helper(void){return 1;}\n").unwrap();
+    let dep = d.join("needed-dep.so");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-Wl,-soname,needed-dep.so", "-o"])
+            .arg(&dep)
+            .arg(&dep_c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let user_c = d.join("needed_user.c");
+    std::fs::write(&user_c, "int use_it(void){return 0;}\n").unwrap();
+    let user = d.join("needed-user.so");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&user)
+            .arg(&user_c)
+            .arg(format!("-L{}", d.display()))
+            .arg("-Wl,--no-as-needed")
+            .arg("-l:needed-dep.so")
+            .arg("-Wl,--as-needed")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = p11scope_manifest::identity::open_object(&user).unwrap();
+    let needed = needed_libraries(&file).unwrap();
+    assert!(
+        needed.contains(&"needed-dep.so".to_string()),
+        "DT_NEEDED must name the linked sibling: {needed:?}"
+    );
+    let dep_file = p11scope_manifest::identity::open_object(&dep).unwrap();
+    let dep_needed = needed_libraries(&dep_file).unwrap();
+    assert!(
+        !dep_needed.iter().any(|name| name == "needed-dep.so"),
+        "the dependency itself must not need itself: {dep_needed:?}"
+    );
+}
+
+#[test]
+fn needed_libraries_refuses_a_non_elf_file() {
+    let d = tmp("elf-needed-garbage");
+    let bad = d.join("bad.so");
+    std::fs::write(&bad, b"not an ELF object").unwrap();
+    let file = std::fs::File::open(&bad).unwrap();
+    needed_libraries(&file).unwrap_err();
 }

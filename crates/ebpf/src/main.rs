@@ -8,8 +8,46 @@
 #![feature(core_intrinsics)]
 #![allow(internal_features)]
 
+#[cfg(all(
+    p11scope_birth_marker,
+    any(feature = "inventory-only", feature = "counter-broad")
+))]
+compile_error!("birth markers require a Detailed non-bank object");
+
 #[cfg(all(feature = "inventory-only", feature = "unsafe-unvalidated-metadata"))]
 compile_error!("inventory-only cannot be combined with unsafe-unvalidated-metadata");
+
+#[cfg(any(
+    all(feature = "counter-counts", feature = "counter-timestamps"),
+    all(feature = "counter-counts", feature = "counter-latency"),
+    all(feature = "counter-timestamps", feature = "counter-latency"),
+    all(
+        feature = "counter-broad",
+        not(any(
+            feature = "counter-counts",
+            feature = "counter-timestamps",
+            feature = "counter-latency"
+        ))
+    )
+))]
+compile_error!("exactly one counter measurement flavor is required");
+
+#[cfg(all(
+    feature = "counter-broad",
+    any(
+        feature = "inventory-only",
+        feature = "wide-detailed-2112",
+        feature = "unsafe-unvalidated-metadata",
+        feature = "stub-object-attributes",
+        feature = "small-ring",
+        feature = "small-state-maps",
+        feature = "small-discovery-ring"
+    )
+))]
+compile_error!("private counter artifacts require default FULL capacities");
+
+#[cfg(p11scope_journal_roots)]
+mod journal_roots;
 
 #[cfg(feature = "inventory-only")]
 mod inventory;
@@ -18,60 +56,130 @@ mod inventory_callers;
 
 use aya_ebpf::bindings::{BPF_F_MMAPABLE, BPF_F_RDONLY_PROG};
 use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};
-use aya_ebpf::maps::ring_buf::RingBufEntry;
 #[cfg(not(feature = "inventory-only"))]
 use aya_ebpf::maps::PerCpuHashMap;
 use aya_ebpf::maps::ProgramArray;
+use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RawTracePointContext, RetProbeContext};
-use aya_ebpf::{helpers, EbpfContext as _};
+use aya_ebpf::{EbpfContext as _, helpers};
 #[cfg(not(feature = "inventory-only"))]
 use core::mem::MaybeUninit;
+#[cfg(feature = "inventory-only")]
+use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counter-counts",
+    feature = "counter-timestamps"
+)))]
+use p11scope_ebpf_common::SlotStats;
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counter-counts",
+    feature = "counter-timestamps"
+)))]
+use p11scope_ebpf_common::bucket_of;
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_capture::{
+    alias_capacity_core, alias_scan_core, decode_alias_capacity_layout, decode_alias_skip_layout,
+    decode_request_cell_tag, decode_stable_kind_layout, handle_status, object_flag,
+    pack_alias_scan, pack_stable_cell, request_cell_packed, request_cell_poison, stable_cell_core,
+    stable_cell_poison, validate_target_span,
+};
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_flow::{
+    KEM_CAPTURE_WIRED, RefusedBaseOutcome, ReturnEventFacts, adapter_attributes_entry,
+    adapter_derive_entry, adapter_emit_find_control, adapter_emit_get_control,
+    adapter_fill_return_control, adapter_kem_entry, adapter_tail_fill, continuity_joins,
+    decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
+    preserve_refused_base,
+};
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_journal::{
+    JOURNAL_REASON_ABI_REFUSED, JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_INSERT_FAILED,
+    JOURNAL_REASON_SCOPE_LOST, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+};
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_wire::{
+    OBJECT_ACTION_DECAPSULATE, OBJECT_ACTION_DERIVE, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND,
+    OBJECT_ACTION_IMPORT, OBJECT_ACTION_MAX, OBJECT_ACTION_NONE, OBJECT_GUARD_NONE,
+    OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
+    ObjectDescriptorWire, ObjectEventRecord, ObjectStart, object_result_arg7_address,
+};
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
-    bucket_of, capture, classify_task_newtask, cookie_descriptor, cookie_slot,
-    decode_export_attach_cookie, discovery_pause_coalesced, discovery_pause_enabled,
-    discovery_state_take_failed, discovery_state_take_scope_lost, discovery_table_slots,
-    discovery_usable_prefix, discovery_version_class, event_type, image_pair_matches,
-    interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
-    lifecycle, normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
-    stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
-    valid_config, valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey,
-    EventRecord, ImageIdentity, InstanceContinuity, LinuxLayout, PauseKey, RvKey, SlotSemantics,
-    SlotStats, StartKey, StartState,
-    StateKey, ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, CallStart, CallStartSeed, DISCOVERY_BYTES,
     DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
-    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_UNKNOWN, DISCOVERY_INTERFACES,
+    DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
     DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
     DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE,
-    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, EVIDENCE_ABI_REFUSALS,
-    EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
-    EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    DiscoveryRecord, EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
+    EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
-    FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
+    Event, EventRecord, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
+    FLAG_POLICY_ALLOWLISTED, FLAG_SYSTEM_FILTER, FLAG_TRACK_SHORT_LIVED,
+    FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
+    FunctionNameKey, ImageIdentity, InstanceContinuity, LOADER_STATE_PRESENT, LinuxLayout,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
-    PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, START_ENTRIES, STATE_DOMAIN_EXPORT,
-    STACK_GUARD_ENTRIES, STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES,
-    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
-    interface_flags_class,
+    PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
+    START_ENTRIES, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, StartKey,
+    StartState, StateKey, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE, capture, classify_exec_task,
+    classify_task_newtask, cookie_descriptor, cookie_slot, decode_export_attach_cookie,
+    discovery_pause_coalesced, discovery_pause_enabled, discovery_state_take_failed,
+    discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
+    discovery_version_class, event_type, finite_login_user_type, image_pair_matches,
+    interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
+    interface_flags_class, lifecycle, normalize_target_word, read_ia32_arg_with,
+    return_allows_mechanism, semantic_flags, shape, stop_gate_admit_with, target_layout_from_cs,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie, WordReader,
 };
-#[cfg(feature = "inventory-only")]
-use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
     PAIR_CALLS_ENTRIES, PAIR_CALLS_SECOND_SLOT,
 };
+// Staged token hit path (activation builds only): the pending status and
+// the token shape rule. Undeclared until the build wires the gate.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+use p11scope_ebpf_common::{DISCOVERY_STATUS_LOADER_ACK_PENDING, valid_loader_token};
+// Staged gate storage (activation builds only): the row and control
+// value types behind the real map symbols.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+use p11scope_ebpf_common::{LOADER_GATE_SLOTS, LoaderGateControl, LoaderGateRow};
 
 // Package G: the BPF slot universe and the native task-owner bound are one
 // literal. Changing either without the other corrupts START ownership.
 const _: () = assert!(MAX_SLOTS == NATIVE_OWNER_SLOT_BOUND);
+
+#[cfg(feature = "counter-broad")]
+const _: () = assert!(MAX_SLOTS == 512 && RV_ENTRIES == 4096 && START_ENTRIES == 16384);
+
+#[cfg(feature = "counter-counts")]
+type EndpointStats = p11scope_ebpf_common::CountStats;
+#[cfg(feature = "counter-timestamps")]
+type EndpointStats = p11scope_ebpf_common::TimestampStats;
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counter-counts",
+    feature = "counter-timestamps"
+)))]
+type EndpointStats = SlotStats;
+
+// Fixed private artifact ABI: two sticky per-CPU u64 cells, or 16 bytes per
+// possible CPU in addition to STATS/RV. No loader/accounting path is active.
+#[cfg(feature = "counter-broad")]
+const COUNTER_HEALTH_SATURATED: u32 = 0;
+#[cfg(feature = "counter-broad")]
+const COUNTER_HEALTH_CONTENDED: u32 = 1;
 
 #[map]
 static CONFIG: Array<u64> = Array::with_max_entries(2, BPF_F_RDONLY_PROG);
@@ -79,18 +187,55 @@ static CONFIG: Array<u64> = Array::with_max_entries(2, BPF_F_RDONLY_PROG);
 #[map]
 static PID_FILTER: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
 
+// I4 PID-scope birth identity (marker Detailed and journal objects): the
+// PID scope target's thread-group start tick, published next to the PID
+// at scope publication. The native exec birth compares it after its
+// generation and control gates; a reused PID number carries another
+// tick and is not born. Absent from every other flavor and build: no
+// map, no gate, no read.
+#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+#[map]
+static PID_START_TICK: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
+
 #[map]
 static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
-static STATS: PerCpuArray<SlotStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 0);
+static STATS: PerCpuArray<EndpointStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 0);
+
+#[cfg(feature = "counter-broad")]
+#[map]
+static COUNTER_HEALTH: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
 static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(START_ENTRIES, 0);
 
+// H7 slice B subordinate custody: one 432-byte row per required object call
+// keyed by the START key, a loader-published frozen descriptor table, and a
+// loader-verified zero template the native owner copies from (no 432-byte
+// stack temporary anywhere on the insert path).
 #[cfg(not(feature = "inventory-only"))]
+#[map]
+static OBJECT_START: HashMap<StartKey, ObjectStart> = HashMap::with_max_entries(START_ENTRIES, 0);
+
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static OBJECT_DESCRIPTORS: Array<ObjectDescriptorWire> =
+    Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
+
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static OBJECT_ZERO: Array<ObjectStart> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
+
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counts-bank-proof",
+    feature = "timestamps-bank-proof",
+    feature = "latency-bank-proof"
+)))]
 #[map]
 static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
@@ -213,6 +358,22 @@ static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
 #[map]
 static STOP_GATE: Array<u64> = Array::with_max_entries(1, BPF_F_MMAPABLE);
 
+/// T-L2c loader gate storage (activation builds only): one row per
+/// loader slot plus the single control cell the L4b producer counts
+/// in. Native `loader_gate.c` externs these symbols; host harnesses
+/// define stub bytes until activation wires the real maps.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+#[map]
+static LOADER_GATE: Array<LoaderGateRow> = Array::with_max_entries(LOADER_GATE_SLOTS, 0);
+
+/// The gate control cell. BPF alone mutates while linked; userspace
+/// publishes the limit before links and reads the counters after.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+#[map]
+static LOADER_GATE_CTL: Array<LoaderGateControl> = Array::with_max_entries(1, 0);
+
 /// Stop-gate admission for the static Detailed programs. Reads the shared
 /// word with a compare-exchange against (0, 0) and counts with a non-fetch
 /// atomic add whose result is never consumed; the object checker proves the
@@ -288,20 +449,77 @@ fn stop_gate_leave() {}
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit, and system-wide capture
 /// requires the explicit system scope bit (never a missing filter).
-/// Add to one per-CPU counter cell with a non-fetch atomic add. From Linux
+/// Add to one per-CPU counter cell atomically. From Linux
 /// 6.1 uprobe programs run migrate-disabled but preemptible, so another
 /// program can run on this CPU between a plain load and store of the same
 /// per-CPU cell and its increment is lost. The result is deliberately unused:
 /// only the non-fetch BPF ATOMIC ADD lowers on this toolchain (a consumed
-/// fetch-add does not), and the object checker rejects any other counter write.
+/// fetch-add does not). The private counter artifacts instead use the shared
+/// bounded saturating CAS policy and expose sticky loss dispositions.
 #[inline(always)]
 fn counter_add(cell: *mut u64, delta: u64) {
-    // SAFETY: `cell` is a live map-value pointer for this program run.
-    let _ = unsafe {
-        core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
-            cell, delta,
-        )
-    };
+    #[cfg(feature = "counter-broad")]
+    {
+        use p11scope_ebpf_common::counter_policy::{CounterUpdate, add_counter_with};
+        // SAFETY: `cell` is a live map-value pointer. Each actual CAS follows
+        // the shared bounded/saturating policy; a preempting writer may share
+        // this CPU, so a plain load/store increment would lose counts.
+        let update = add_counter_with(
+            delta,
+            || unsafe { cell.read_volatile() },
+            |before, after| unsafe {
+                core::intrinsics::atomic_cxchg::<
+                    u64,
+                    { core::intrinsics::AtomicOrdering::AcqRel },
+                    { core::intrinsics::AtomicOrdering::Acquire },
+                >(cell, before, after)
+                .1
+            },
+        );
+        let health = match update {
+            CounterUpdate::Added => None,
+            CounterUpdate::Saturated => Some(COUNTER_HEALTH_SATURATED),
+            CounterUpdate::Contended => Some(COUNTER_HEALTH_CONTENDED),
+        };
+        if let Some(index) = health {
+            if let Some(value) = COUNTER_HEALTH.get_ptr_mut(index) {
+                // Every writer stores the same sticky one; no read clears it.
+                unsafe { value.write_volatile(1) };
+            }
+        }
+    }
+    #[cfg(not(feature = "counter-broad"))]
+    {
+        // Preserve the ordinary/Inventory non-fetch atomic add unchanged.
+        let _ = unsafe {
+            core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
+                cell, delta,
+            )
+        };
+    }
+}
+
+#[cfg(all(feature = "counter-broad", not(feature = "counter-counts")))]
+#[inline(always)]
+fn counter_max(cell: *mut u64, candidate: u64) {
+    use p11scope_ebpf_common::counter_policy::{CounterMaxUpdate, max_counter_with};
+    let update = max_counter_with(
+        candidate,
+        || unsafe { cell.read_volatile() },
+        |before, after| unsafe {
+            core::intrinsics::atomic_cxchg::<
+                u64,
+                { core::intrinsics::AtomicOrdering::AcqRel },
+                { core::intrinsics::AtomicOrdering::Acquire },
+            >(cell, before, after)
+            .1
+        },
+    );
+    if matches!(update, CounterMaxUpdate::Contended) {
+        if let Some(value) = COUNTER_HEALTH.get_ptr_mut(COUNTER_HEALTH_CONTENDED) {
+            unsafe { value.write_volatile(1) };
+        }
+    }
 }
 
 fn bump_evidence(index: u32) {
@@ -331,6 +549,26 @@ fn read_word(address: u64, layout: LinuxLayout) -> Result<u64, ()> {
             .map(u64::from)
             .map_err(|_| ()),
     }
+}
+
+// Zero-sized target-word reader for the shared object adapters. A plain
+// method call, not a closure: no `FnMut::call_mut` shim is instantiated,
+// so no 16-byte `Result` crosses a subprogram boundary (see `WordReader`).
+struct BpfReader;
+
+impl WordReader for BpfReader {
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()> {
+        read_word(addr, layout)
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn read_bytes_user(address: u64, buf: &mut [u8], layout: LinuxLayout) -> Result<(), ()> {
+    validate_target_span(address, buf.len() as u64, layout).ok_or(())?;
+    unsafe { helpers::bpf_probe_read_user_buf(address as *const u8, buf) }.map_err(|_| ())
 }
 
 #[inline(always)]
@@ -365,54 +603,6 @@ fn read_word_pair(address: u64, layout: LinuxLayout) -> Result<[u64; 2], ()> {
 }
 
 const _: [(); 288] = [(); core::mem::size_of::<CallStart>()];
-
-#[cfg(not(feature = "inventory-only"))]
-#[inline(always)]
-fn zero_call_start(start: &mut MaybeUninit<CallStart>) {
-    let words = start.as_mut_ptr().cast::<u64>();
-    // Keep this straight-line, as with DiscoveryRecord: LLVM otherwise lowers
-    // the full initialization to verifier-hostile memset/memcpy backtracking.
-    unsafe {
-        // CALL_START_INITIALIZER_BEGIN
-        core::ptr::write_volatile(words.add(0), 0u64);
-        core::ptr::write_volatile(words.add(1), 0u64);
-        core::ptr::write_volatile(words.add(2), 0u64);
-        core::ptr::write_volatile(words.add(3), 0u64);
-        core::ptr::write_volatile(words.add(4), 0u64);
-        core::ptr::write_volatile(words.add(5), 0u64);
-        core::ptr::write_volatile(words.add(6), 0u64);
-        core::ptr::write_volatile(words.add(7), 0u64);
-        core::ptr::write_volatile(words.add(8), 0u64);
-        core::ptr::write_volatile(words.add(9), 0u64);
-        core::ptr::write_volatile(words.add(10), 0u64);
-        core::ptr::write_volatile(words.add(11), 0u64);
-        core::ptr::write_volatile(words.add(12), 0u64);
-        core::ptr::write_volatile(words.add(13), 0u64);
-        core::ptr::write_volatile(words.add(14), 0u64);
-        core::ptr::write_volatile(words.add(15), 0u64);
-        core::ptr::write_volatile(words.add(16), 0u64);
-        core::ptr::write_volatile(words.add(17), 0u64);
-        core::ptr::write_volatile(words.add(18), 0u64);
-        core::ptr::write_volatile(words.add(19), 0u64);
-        core::ptr::write_volatile(words.add(20), 0u64);
-        core::ptr::write_volatile(words.add(21), 0u64);
-        core::ptr::write_volatile(words.add(22), 0u64);
-        core::ptr::write_volatile(words.add(23), 0u64);
-        core::ptr::write_volatile(words.add(24), 0u64);
-        core::ptr::write_volatile(words.add(25), 0u64);
-        core::ptr::write_volatile(words.add(26), 0u64);
-        core::ptr::write_volatile(words.add(27), 0u64);
-        core::ptr::write_volatile(words.add(28), 0u64);
-        core::ptr::write_volatile(words.add(29), 0u64);
-        core::ptr::write_volatile(words.add(30), 0u64);
-        core::ptr::write_volatile(words.add(31), 0u64);
-        core::ptr::write_volatile(words.add(32), 0u64);
-        core::ptr::write_volatile(words.add(33), 0u64);
-        core::ptr::write_volatile(words.add(34), 0u64);
-        core::ptr::write_volatile(words.add(35), 0u64);
-        // CALL_START_INITIALIZER_END
-    }
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -486,9 +676,27 @@ fn scope_auth() -> Option<ScopeAuth> {
     None
 }
 
+// A valid scope receipt always carries one nonzero scope bit. Keep its
+// full flags as a scalar across the call boundary, so the entry/return
+// callers do not each materialize Option<ScopeAuth>'s 32-byte output.
+// Receipt consumers still call scope_auth directly for tgid/generation.
 #[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn scope_flags_word() -> u64 {
+    let receipt = scope_auth();
+    match receipt.as_ref() {
+        // Volatile access must remain inside Some: LLVM may otherwise
+        // speculate a load of the uninitialized None payload on BPF.
+        Some(scope) => unsafe { core::ptr::addr_of!(scope.flags).read_volatile() },
+        None => 0,
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
 fn scope_flags() -> Option<u64> {
-    scope_auth().map(|scope| scope.flags)
+    let flags = scope_flags_word();
+    (flags != 0).then_some(flags)
 }
 
 fn bump_discovery_counter(index: u32) {
@@ -914,24 +1122,22 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
         read_version = true;
     }
     if read_version {
+        // The getter has already published a table. An unreadable or unusual
+        // version cannot erase readable common slots; failures remain explicit.
+        if read_table {
+            walk_slots = discovery_table_slots(kind, 0, 0);
+        }
         match unsafe { helpers::bpf_probe_read_user(payload.table_ptr as *const [u8; 2]) } {
             Ok(version) => {
                 if selection.binding_id != 0 {
                     selection_version_class = discovery_version_class(version[0], version[1]);
-                    if name_class == DISCOVERY_NAME_EXACT_STANDARD
-                        && matches!(
-                            selection_version_class,
-                            DISCOVERY_VERSION_V3_0
-                                | DISCOVERY_VERSION_V3_1
-                                | DISCOVERY_VERSION_V3_2
-                        )
-                    {
-                        walk_slots = discovery_table_slots(version[0], version[1]);
+                    if name_class == DISCOVERY_NAME_EXACT_STANDARD {
+                        walk_slots = discovery_table_slots(kind, version[0], version[1]);
                     }
                 } else {
                     version_major = version[0];
                     version_minor = version[1];
-                    walk_slots = discovery_table_slots(version_major, version_minor);
+                    walk_slots = discovery_table_slots(kind, version_major, version_minor);
                 }
             }
             Err(_) => {
@@ -942,27 +1148,43 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
             }
         }
     }
+    // Keep the width and address index opaque so LLVM cannot remove the
+    // constant bound or advance a separate output pointer. Older verifiers
+    // cannot recover the maximum width from every classifier lowering.
+    let walk_slots = core::hint::black_box(walk_slots);
     let mut pointer_index = 0usize;
     while pointer_index < 104 {
-        if pointer_index >= walk_slots as usize {
+        let slot_index = core::hint::black_box(pointer_index);
+        if slot_index >= 104 || slot_index >= walk_slots as usize {
             break;
         }
         attempted += 1;
         let Some(address) = payload
             .table_ptr
             .checked_add(layout.word_bytes() as u64)
-            .and_then(|base| base.checked_add(pointer_index as u64 * layout.word_bytes() as u64))
+            .and_then(|base| base.checked_add(slot_index as u64 * layout.word_bytes() as u64))
         else {
             read_failed = true;
             break;
         };
         match read_word(address, layout) {
             Ok(pointer) => {
-                // SAFETY: pointer_index is statically bounded below
+                // Keep the destination bound visible after a probe read can
+                // make LLVM reload the spilled index in Inventory.
+                let slot_index = core::hint::black_box(slot_index);
+                if slot_index >= 104 {
+                    read_failed = true;
+                    break;
+                }
+                // SAFETY: slot_index is explicitly bounded below
                 // DISCOVERY_POINTERS and the record is initialized.
+                // Raw element arithmetic after that guard avoids an implicit
+                // array-bounds panic subprogram in the BPF object.
                 unsafe {
                     core::ptr::write_volatile(
-                        core::ptr::addr_of_mut!((*raw).pointers[pointer_index]),
+                        core::ptr::addr_of_mut!((*raw).pointers)
+                            .cast::<u64>()
+                            .add(slot_index),
                         pointer,
                     );
                 }
@@ -1697,12 +1919,34 @@ fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
         return 0;
     };
     bump_discovery_counter(DISCOVERY_COUNTER_LOADER_HITS);
+    let cookie = loader_cookie_of(&ctx);
+    // Path selection before any reservation (activation builds only):
+    // once the gate latch flips, hits decode as tokens and the token
+    // emitter reserves its own entry. Before the latch the old decode
+    // runs unchanged, and nothing admits. Neither arm holds a
+    // reservation across this branch, so none can leak.
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    if loader_gate_latched_for_producer() {
+        return emit_loader_token_record(ctx, scope, layout, cookie);
+    }
+    emit_loader_legacy_record(ctx, scope, layout, cookie)
+}
+
+/// Legacy loader hit path: old-cookie decode with its own reservation.
+/// Split from the impl so path selection precedes every reserve.
+#[inline(always)]
+fn emit_loader_legacy_record(
+    ctx: ProbeContext,
+    scope: ScopeAuth,
+    layout: LinuxLayout,
+    cookie: u64,
+) -> u32 {
     let Some(mut entry) = reserve_discovery() else {
         return 0;
     };
     let raw = entry.as_mut_ptr();
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    let cookie = loader_cookie_of(&ctx);
     let state_present = cookie & LOADER_STATE_PRESENT != 0;
     if !valid_loader_cookie(cookie) {
         // SAFETY: invalid-cookie records stay zero outside these finite fields.
@@ -1754,14 +1998,125 @@ fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
             core::ptr::addr_of_mut!((*raw).case_id),
             (cookie & 0xff) as u8,
         );
+        // The full cookie word rides along for the token path; the old
+        // decode still keys on the slot byte above.
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), cookie);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), r_state);
     }
     finish_discovery_record(entry, scope, true, pid_tgid, 0);
     0
 }
 
+/// Staged producer latch read (activation builds only): true once the
+/// gate cutover has flipped, selecting token decode in the hit path.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+fn loader_gate_latched_for_producer() -> bool {
+    // SAFETY: the latch entry point only reads the control word.
+    unsafe { p11_loader_gate_cutover_latched() == 1 }
+}
+
+/// Staged token hit path (activation builds only): one native
+/// transaction resolves the token with exactly-once accounting, so the
+/// probe never touches a counting lookup. Nonnegative resolves to a
+/// healthy record, -2 waits as acknowledgement-pending, anything else
+/// negative stays an invalid record.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+fn emit_loader_token_record(
+    ctx: ProbeContext,
+    scope: ScopeAuth,
+    layout: LinuxLayout,
+    cookie: u64,
+) -> u32 {
+    // SAFETY: the transaction validates its arguments and fails
+    // closed; only a nonnegative return admitted or resolved a row.
+    let slot = (cookie & 0xff) as u32;
+    let generation = cookie >> 8;
+    let mut status = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+    let mut publish = false;
+    if valid_loader_token(cookie) {
+        match unsafe { p11_loader_gate_hit(slot, generation) } {
+            resolved if resolved >= 0 => {
+                status = 0;
+                publish = true;
+            }
+            -2 => {
+                status = DISCOVERY_STATUS_LOADER_ACK_PENDING;
+                publish = true;
+            }
+            _ => {}
+        }
+    }
+    if !publish {
+        let Some(mut entry) = reserve_discovery() else {
+            return 0;
+        };
+        let raw = entry.as_mut_ptr();
+        // SAFETY: invalid-cookie records stay zero outside these finite fields.
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);
+        }
+        let pid_tgid = helpers::bpf_get_current_pid_tgid();
+        finish_discovery_record(
+            entry,
+            scope,
+            false,
+            pid_tgid,
+            DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
+        );
+        return 0;
+    }
+    let hook_ip = normalize_target_word(loader_runtime_ip(&ctx), layout);
+    if hook_ip == 0 {
+        bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES);
+        return 0;
+    }
+    let Some(mut entry) = reserve_discovery() else {
+        return 0;
+    };
+    let raw = entry.as_mut_ptr();
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    // SAFETY: the shared initializer completed before every field write.
+    // Token records carry no runtime-state read: announced stays zero
+    // and the runtime signal is restored on the userspace side.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).table_ptr), hook_ip);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).case_id), slot as u8);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), cookie);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), 0);
+    }
+    finish_discovery_record(entry, scope, true, pid_tgid, status);
+    0
+}
+
+/// 6.14 Option A exit-time mapping summary. Mirrors `struct
+/// instance_exit_summary` in native/instance_epoch.h: eight slot+1
+/// cells then the record flag word, all u64. Detailed only; the
+/// kind-7 arm below is the sole user.
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+#[repr(C)]
+struct InstanceExitSummary {
+    slot_plus1: [u64; p11scope_ebpf_common::instance::RECORD_SLOTS],
+    flags: u64,
+}
+
+/// Native record flag bits, aliased from the canonical
+/// `instance::RECORD_*` consts (pinned against the C header by the
+/// ebpf-common remap contract test): the exit hook projects each set
+/// bit to the ABI status bit one position higher and drops the rest.
+/// Detailed only; no kernel state means "hooks refused", so the
+/// 0x40 bit is never projected here.
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+const EXIT_MAP_NATIVE_SHARED_MM: u64 = p11scope_ebpf_common::instance::RECORD_SHARED_MM;
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+const EXIT_MAP_NATIVE_OVERFLOW: u64 = p11scope_ebpf_common::instance::RECORD_OVERFLOW;
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+const EXIT_MAP_NATIVE_LOCAL_FAULT: u64 = p11scope_ebpf_common::instance::RECORD_LOCAL_FAULT;
+
 #[inline(never)]
-fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
+fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool) {
     let Some(mut entry) = reserve_discovery() else {
         return;
     };
@@ -1769,9 +2124,88 @@ fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
     // SAFETY: the shared initializer completed before every field write.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), kind);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).case_id), case_id);
     }
+    // ScopeAuth was admitted by the lifecycle root and this reservation
+    // succeeded. Only EXEC owns this private word; all other kinds retain
+    // the initializer's zero. InventoryGlobal carries no identity allocator.
+    // PID scope admits a lifecycle record on the tgid number alone, which a
+    // process that later reuses the target's PID also passes (only the
+    // entries' kernel pid filter holds the original task), so PID scope
+    // never acquires a ticket: its EXEC carries zero, unavailable.
+    // The ticket is stamped only where a consumer reads it: unconditionally
+    // in InventoryCallers, and in Detailed only while short-lived tracking
+    // is armed outside aggregate captures. Counter flavors compile it out.
+    #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
+    #[cfg(not(feature = "counter-broad"))]
+    if kind == DISCOVERY_KIND_EXEC && scope.flags & FLAG_PID_FILTER == 0 {
+        #[cfg(feature = "inventory-callers")]
+        let armed = true;
+        #[cfg(not(feature = "inventory-callers"))]
+        let armed = scope.flags & FLAG_TRACK_SHORT_LIVED != 0
+            && scope.flags & FLAG_POLICY_AGGREGATE == 0;
+        if armed {
+            let ticket = unsafe { p11_link_current_cookie() };
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), ticket);
+            }
+        }
+    }
+    // 6.14 Option B: the exe (s_dev, i_ino) pair rides pointers[0..2]
+    // only when extensive mode is armed for this capture. In every
+    // flavor (the ticket above stays flavor-gated): the kernel read
+    // never happens otherwise — not captured but unclassified is
+    // forbidden — and inventory-only never arms the bit. A failed
+    // kernel read keeps the initializer's zeroed pair, which
+    // userspace treats as absent.
+    if kind == DISCOVERY_KIND_EXEC && scope.flags & FLAG_TRACK_SHORT_LIVED != 0 {
+        let mut dev = 0u64;
+        let mut ino = 0u64;
+        if unsafe { p11_exe_identity(&mut dev, &mut ino) } != 0 {
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).pointers[0]), dev);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).pointers[1]), ino);
+            }
+        }
+    }
+    // 6.14 Option A: the exit-time mapping summary rides
+    // pointers[0..8] (slot+1 cells) and status_flags (the remapped
+    // record bits) only for kind 7, only in Detailed objects. The
+    // helper reads the exiting leader's existing record and nothing
+    // else; a missing record contributes zero cells and no flags.
+    // All other kinds retain the initializer's zeros, so their
+    // records are byte-identical with or without this arm.
+    #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+    let mut exit_map_status = 0u8;
+    #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+    if kind == p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS {
+        let mut summary = InstanceExitSummary {
+            slot_plus1: [0; p11scope_ebpf_common::instance::RECORD_SLOTS],
+            flags: 0,
+        };
+        let _ = unsafe { p11_instance_exit_summary(&mut summary) };
+        if summary.flags & EXIT_MAP_NATIVE_SHARED_MM != 0 {
+            exit_map_status |= p11scope_ebpf_common::DISCOVERY_STATUS_EXIT_MAP_SHARED_MM;
+        }
+        if summary.flags & EXIT_MAP_NATIVE_OVERFLOW != 0 {
+            exit_map_status |= p11scope_ebpf_common::DISCOVERY_STATUS_EXIT_MAP_OVERFLOW;
+        }
+        if summary.flags & EXIT_MAP_NATIVE_LOCAL_FAULT != 0 {
+            exit_map_status |= p11scope_ebpf_common::DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT;
+        }
+        for (index, cell) in summary.slot_plus1.iter().enumerate() {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!((*raw).pointers[index]),
+                    *cell,
+                );
+            }
+        }
+    }
+    #[cfg(any(feature = "inventory-only", feature = "counter-broad"))]
+    let exit_map_status = 0u8;
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
+    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, exit_map_status);
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
@@ -1784,17 +2218,57 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
     rc
 }
 
+/// I4 PID-scope birth identity: the tgid the native exec birth checks
+/// against `PID_START_TICK`. Under PID scope it is the target `scope_auth`
+/// admitted by number; cgroup and system scopes pass 0 and are unchanged.
+#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+#[inline(always)]
+fn pid_scope_tgid(scope: &ScopeAuth) -> u32 {
+    if scope.flags & FLAG_PID_FILTER != 0 {
+        scope.tgid
+    } else {
+        0
+    }
+}
+
 #[inline(always)]
 fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     // Mandatory current-physical-task cleanup precedes all capture filters.
-    unsafe { p11_owner_cleanup() };
+    // A failed custody settlement is capture loss: invalidate the audit
+    // before lifecycle bookkeeping, then continue mandatorily. Only 1 is
+    // failure; 2 (a healthy settle that abandoned a live START) is not.
+    #[cfg(not(feature = "inventory-only"))]
+    if unsafe { p11_owner_cleanup() } == 1 {
+        unsafe { p11_object_fault() };
+    }
+    #[cfg(feature = "inventory-only")]
+    let _ = unsafe { p11_owner_cleanup() };
     // Task 3 Stage A: a new mm ends CLONE_VM sharing for this process.
     #[cfg(not(feature = "inventory-only"))]
     unsafe {
         p11_instance_exec()
     };
     if let Some(scope) = scope_auth() {
-        emit_lifecycle(DISCOVERY_KIND_EXEC, scope, true);
+        // H8-D birth marker: an in-scope exec after closure publishes
+        // READY (Detailed and journal share; scope-gated, never charged
+        // outside scope). I4: under PID scope the native body births only
+        // the target process itself (start-time witness after the gen
+        // gate); a reused PID number gains no row, charge or exec-ID read.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+        unsafe {
+            p11_instance_exec_birth(pid_scope_tgid(&scope));
+        }
+        let old_pid = _ctx.arg::<u64>(1);
+        let pid_tgid = helpers::bpf_get_current_pid_tgid();
+        // Replacement/invalid IDs need no kernel dumpability read. Equal
+        // leader IDs still require the checked current-kernel predicate.
+        let mut class = classify_exec_task(old_pid, pid_tgid, 1);
+        if class == DISCOVERY_EXEC_SAME_TASK_CANDIDATE {
+            class = classify_exec_task(old_pid, pid_tgid, unsafe { p11_exec_dumpability() });
+        }
+        emit_lifecycle(DISCOVERY_KIND_EXEC, class, scope, true);
     }
     0
 }
@@ -1809,10 +2283,37 @@ pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
     rc
 }
 
+/// Cleanup outcome for a healthy settle that abandoned at least one live
+/// START (mirrors `P11_OWNER_CLEANUP_ABANDONED_START` in task_owner.h;
+/// pinned by test). Only 1 is failure.
+#[cfg(p11scope_birth_marker)]
+#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+const OWNER_CLEANUP_ABANDONED_START: u32 = 2;
+
 #[inline(always)]
 fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
     // Retained original keys also cover fatal nonleader post-de_thread exit.
-    unsafe { p11_owner_cleanup() };
+    // A failed custody settlement is capture loss: invalidate the audit
+    // before lifecycle bookkeeping, then continue mandatorily. Only 1 is
+    // failure; 2 (a healthy settle that abandoned a live START) is not.
+    #[cfg(not(feature = "inventory-only"))]
+    let cleanup = unsafe { p11_owner_cleanup() };
+    #[cfg(not(feature = "inventory-only"))]
+    if cleanup == 1 {
+        unsafe { p11_object_fault() };
+    }
+    // H8-D birth marker: a call that entered in scope but never returned,
+    // reclaimed here at thread exit, is an uncaptured call, so it dirties
+    // the leader row.
+    #[cfg(p11scope_birth_marker)]
+    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+    if cleanup == OWNER_CLEANUP_ABANDONED_START {
+        unsafe {
+            p11_instance_scope_gap();
+        }
+    }
+    #[cfg(feature = "inventory-only")]
+    let _ = unsafe { p11_owner_cleanup() };
     #[cfg(not(feature = "inventory-only"))]
     unsafe {
         p11_root_current_exit()
@@ -1822,7 +2323,19 @@ fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
         return 0;
     }
     if let Some(scope) = scope_auth() {
-        emit_lifecycle(DISCOVERY_KIND_LEADER_EXIT, scope, false);
+        // 6.14 Option A: extensive mode replaces the bare leader-exit
+        // record with the exit-time mapping summary (kind 7). Every
+        // other capture keeps byte-identical kind 6; non-Detailed
+        // objects never select kind 7 (their arm is compiled out).
+        #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+        let kind = if scope.flags & FLAG_TRACK_SHORT_LIVED != 0 {
+            p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+        } else {
+            DISCOVERY_KIND_LEADER_EXIT
+        };
+        #[cfg(any(feature = "inventory-only", feature = "counter-broad"))]
+        let kind = DISCOVERY_KIND_LEADER_EXIT;
+        emit_lifecycle(kind, DISCOVERY_EXEC_UNKNOWN, scope, false);
     }
     0
 }
@@ -2266,6 +2779,10 @@ fn walk_template_impl<const IS_ILP32: bool>(
     0
 }
 
+// Always inlined: a 16-byte `Result` return must never cross a BPF
+// subprogram boundary (the 7.4 verifier rejects the caller-stack
+// out-pointer in R2). The `subprog_return_shape` test enforces this.
+#[inline(always)]
 fn arg_u64(ctx: &ProbeContext, index: u8, layout: LinuxLayout) -> Result<u64, ()> {
     if layout == LinuxLayout::Ilp32 {
         let rsp = unsafe { (*ctx.regs).rsp as u64 };
@@ -2299,13 +2816,143 @@ pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
     })
 }
 
+// Request-cell global boundary: the complete one-slot selector/header/alias/
+// stable-read sequence is verified once, outside the root's eight-slot loop.
+// Five scalars in and finite packed facts out; the caller owns publication.
+// Neither a map row, reservation, target word nor reader pointer crosses.
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_request_cell(
+    base: u64,
+    count: u64,
+    tag: u64,
+    peer_base: u64,
+    peer_count: u64,
+) -> u64 {
+    let Some((_, layout, _)) = decode_request_cell_tag(tag) else {
+        return request_cell_poison();
+    };
+    match layout {
+        LinuxLayout::Lp64 => request_cell_packed(
+            base,
+            count,
+            tag,
+            peer_base,
+            peer_count,
+            &mut BpfReader,
+            &mut |address, buf| read_bytes_user(address, buf, LinuxLayout::Lp64),
+        ),
+        LinuxLayout::Ilp32 => request_cell_packed(
+            base,
+            count,
+            tag,
+            peer_base,
+            peer_count,
+            &mut BpfReader,
+            &mut |address, buf| read_bytes_user(address, buf, LinuxLayout::Ilp32),
+        ),
+    }
+}
+
+// Stable-cell global boundary (E1a): classify one authorized value plus its
+// header recheck behind a scalar-only subprogram the verifier explores once
+// instead of once per capture-loop call-site state. Five scalar arguments in,
+// one packed scalar out; the root reservation stays local (the caller
+// publishes the unpacked facts). Reads, order, and failure priority are the
+// shared `stable_cell_core` sequence with BPF-local readers bound inside.
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_stable_cell(
+    base: u64,
+    index: u64,
+    kind_layout: u64,
+    ptr: u64,
+    len: u64,
+) -> u64 {
+    let Some((kind, layout)) = decode_stable_kind_layout(kind_layout) else {
+        return stable_cell_poison();
+    };
+    let (status, value, write_value, contrib) = stable_cell_core(
+        base,
+        index,
+        kind,
+        ptr,
+        len,
+        layout,
+        &mut BpfReader,
+        &mut |address, buf| read_bytes_user(address, buf, layout),
+    );
+    pack_stable_cell(status, value, write_value, contrib)
+}
+
+// Neighbor-rescan global boundary (E1b): the per-value bounded header rescan
+// as a scalar-only subprogram the verifier explores once instead of once per
+// entry-loop call-site state. Five scalar arguments in (the skip index shares
+// its argument with the layout tag), one packed scalar out; no reads are
+// dropped, added, or reordered (the shared `alias_scan_core` sequence with a
+// BPF-local reader bound inside).
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_alias_scan(base: u64, count: u64, skip_tag: u64, ptr: u64, len: u64) -> u64 {
+    let (skip, layout) = decode_alias_skip_layout(skip_tag);
+    // Bind the word width before the loop so its W/2W/3W address facts do
+    // not each occupy a spill slot across the selected header reads.
+    let (alias, flags) = match layout {
+        LinuxLayout::Lp64 => alias_scan_core(
+            base,
+            count,
+            skip,
+            ptr,
+            len,
+            LinuxLayout::Lp64,
+            &mut BpfReader,
+        ),
+        LinuxLayout::Ilp32 => alias_scan_core(
+            base,
+            count,
+            skip,
+            ptr,
+            len,
+            LinuxLayout::Ilp32,
+            &mut BpfReader,
+        ),
+    };
+    pack_alias_scan(alias, flags)
+}
+
+// Retained-capacity global boundary (E1c): the return loop's per-neighbor
+// span check as a pure scalar subprogram the verifier explores once. Five
+// scalar arguments in (the layout crosses as its word width), one scalar
+// verdict out; no helper calls inside.
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_alias_capacity(
+    ptr: u64,
+    len: u64,
+    other_ptr: u64,
+    other_cap: u64,
+    wb: u64,
+) -> u64 {
+    let Some(layout) = decode_alias_capacity_layout(wb) else {
+        return 0;
+    };
+    u64::from(alias_capacity_core(ptr, len, other_ptr, other_cap, layout))
+}
+
 #[cfg(not(feature = "inventory-only"))]
 fn capture_failure(start: &mut CallStart) {
     start.capture |= capture::ARG_READ_FAILURE;
     bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
 }
 
+// Always inlined: a 16-byte `Option` return must never cross a BPF
+// subprogram boundary (see `arg_u64`).
 #[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
 fn capture_scalar(
     ctx: &ProbeContext,
     index: u8,
@@ -2427,6 +3074,7 @@ const ENTRY_ABI_LP64: u8 = 1;
 const ENTRY_ABI_ILP32: u8 = 2;
 
 #[cfg(not(feature = "inventory-only"))]
+#[cfg(not(p11scope_journal_roots))]
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
     keep_endpoint_stack(&ctx);
@@ -2434,9 +3082,9 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
         return 0;
     }
     #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
-    let rc = p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     #[cfg(feature = "unsafe-unvalidated-metadata")]
-    let rc = p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_LP64, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2448,7 +3096,7 @@ pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_ILP32, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2460,7 +3108,7 @@ pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<1, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2472,7 +3120,7 @@ pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<2, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2486,7 +3134,7 @@ pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<3, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2513,6 +3161,14 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
 fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     let Some(flags) = scope_flags() else {
+        // H8-D birth marker: a watched call outside the scope dirties
+        // the leader row, so a later exec cannot claim an uncaptured
+        // prefix as born.
+        #[cfg(p11scope_birth_marker)]
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         return 0;
     };
     if slot >= MAX_SLOTS || flags & FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA == 0 {
@@ -2524,7 +3180,7 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
         _pad: 0,
     };
     let Some(layout) = probe_layout(&ctx) else {
-        let _ = owned_start_remove(&key, false);
+        owned_start_discard(&key);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
@@ -2545,28 +3201,70 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
 }
 
 unsafe extern "C" {
+    fn p11_exec_dumpability() -> u32;
+    // 6.14 Option B: exec-time exe-file identity. Out-words are stack
+    // slots; nonzero return means both words were written.
+    fn p11_exe_identity(dev: *mut u64, ino: *mut u64) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_tag() -> u64;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_exit();
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
     fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
+    #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
+    #[cfg(not(feature = "counter-broad"))]
+    fn p11_link_current_cookie() -> u64;
     /// Task 3 Stage A continuity halves (native instance_epoch.c): the entry
     /// half records the private probed address and entry stamp under the
     /// call's START key; the return half fills an `EventRecord`'s private
     /// tail in place. Both own their stack frames, so no probe frame grows.
     #[cfg(not(feature = "inventory-only"))]
-    fn p11_instance_entry(key: *const StartKey, ip: u64) -> u32;
+    fn p11_instance_entry(key: *const StartKey, ip: u64, cookie: u64, exec_id: u64) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_return(key: *const StartKey, out: *mut InstanceContinuity) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_exec() -> u32;
+    /// 6.14 Option A exit-time mapping summary (native
+    /// instance_epoch.c, linked into Detailed and counter flavors):
+    /// a no-create read of the exiting leader's record into the
+    /// caller's summary. Only the Detailed kind-7 arm calls it.
+    #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+    fn p11_instance_exit_summary(out: *mut InstanceExitSummary) -> u32;
+    /// H8-D post-attach birth marker (native instance_epoch.c, Detailed
+    /// and journal): the exec half publishes READY on the leader row after
+    /// closure; the gap half dirties it on an out-of-scope or refused
+    /// call. Both own their frames; failures latch the control row.
+    /// `pid_scope_tgid` is the PID scope target's tgid (0 under cgroup
+    /// and system scope), checked against `PID_START_TICK` natively.
+    #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+    fn p11_instance_exec_birth(pid_scope_tgid: u32) -> u32;
+    #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+    fn p11_instance_scope_gap() -> u32;
     fn p11_owner_healthy() -> u32;
-    fn p11_owner_cleanup();
+    fn p11_owner_cleanup() -> u32;
+    /// H7 slice B subordinate custody (native task_owner.c): the query row
+    /// hands a validated live side row to the return terminal drain (which
+    /// checks agreement, then retires through the ordinary removal) and to
+    /// return-phase fill; only ready authorizes reads.
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_object_side_get(
+        key: *const StartKey,
+        descriptor: u32,
+        required: u32,
+    ) -> *mut ObjectStart;
+    /// H7 slice B fault leaf (native instance_epoch.c): advances the
+    /// existing checked fault cell. Probe roots call it sequentially after
+    /// an owner/custody failure, never nested inside an owner helper.
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_object_fault();
     #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_get(key: *const StartKey, required: u32) -> *mut CallStart;
     #[cfg(not(feature = "inventory-only"))]
-    fn p11_owner_start_insert(key: *const StartKey, value: *const CallStart) -> i64;
+    fn p11_owner_start_aggregate(key: *const StartKey, timestamp: u64) -> u32;
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_owner_start_begin(key: *const StartKey, seed: *const CallStartSeed) -> *mut CallStart;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_remove(key: *const StartKey, required: u32) -> i64;
     fn p11_owner_discovery_get(key: *const StateKey, required: u32) -> *mut StartState;
@@ -2576,6 +3274,15 @@ unsafe extern "C" {
         flags: u64,
     ) -> i64;
     fn p11_owner_discovery_remove(key: *const StateKey, required: u32) -> i64;
+    /// Staged loader gate (native loader_gate.c, activation builds only):
+    /// the probe-hit transaction plus the latch read that selects the
+    /// producer decode. Both entry points validate and fail closed.
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_hit(slot: u32, generation: u64) -> i64;
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_cutover_latched() -> i64;
 }
 
 // All pairing map access is mediated by the native current-task owner. These
@@ -2601,6 +3308,505 @@ fn owned_start_remove(key: &StartKey, required: bool) -> Result<(), ()> {
         .ok_or(())
 }
 
+// Raw removal result for terminal drains: 0 retired, -2 healthy absence,
+// anything else a custody failure the caller must fault on.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn owned_start_remove_rc(key: &StartKey, required: bool) -> i64 {
+    unsafe { p11_owner_start_remove(key, u32::from(required)) }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn start_remove_rc_for<const JOURNAL: bool>(key: &StartKey, required: bool, reason: u32) -> i64 {
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL {
+        return journal_roots::program::remove(key, required, reason);
+    }
+    let _ = reason;
+    owned_start_remove_rc(key, required)
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn start_remove_for<const JOURNAL: bool>(
+    key: &StartKey,
+    required: bool,
+    reason: u32,
+) -> Result<(), ()> {
+    (start_remove_rc_for::<JOURNAL>(key, required, reason) == 0)
+        .then_some(())
+        .ok_or(())
+}
+
+// Required-object marker for this attachment cookie: the frozen descriptor
+// row must be an exact non-NONE object row for the attached descriptor,
+// else the call stays ordinary. Mirrors object_wire::validate_start_marker.
+// Out of line on purpose: entry has no frame to spare, and this helper
+// only makes map-helper calls (which consume no BPF frame), so its level
+// costs the chain a single rounding quantum.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_marker_for(cookie: u64) -> u64 {
+    let descriptor = cookie_descriptor(cookie);
+    if descriptor == 0 || descriptor >= MAX_DESCRIPTORS {
+        return 0;
+    }
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return 0;
+    };
+    if row.function != descriptor - 1
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return 0;
+    }
+    u64::from(descriptor) + 1
+}
+
+// Record the entry ABI on the subordinate row through the query row:
+// return requires it unset or equal to the return layout. Out of line on
+// purpose: entry has no frame to spare, and this level only queries (its
+// chain costs a single rounding quantum). The caller abandons the
+// invocation loudly on false.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_record_entry_abi(key: &StartKey, descriptor: u32, layout: LinuxLayout) -> bool {
+    let side = unsafe { p11_object_side_get(key, descriptor, 0).as_mut() };
+    match side {
+        // SAFETY: a validated live map row; the layout byte is ours.
+        Some(side) => unsafe {
+            core::ptr::addr_of_mut!((*side).layout).write(match layout {
+                LinuxLayout::Lp64 => OBJECT_LAYOUT_LP64,
+                LinuxLayout::Ilp32 => OBJECT_LAYOUT_ILP32,
+            });
+            true
+        },
+        None => false,
+    }
+}
+
+// H7 adapters tail: entry-fill advances ENTRY to READY after writing the
+// entry verdicts; return-fill advances READY to RETURNING after the
+// return-phase reads. Both are outlined like the marker/ABI helpers so the
+// hot roots keep their frames. The caller abandons (entry) or drains
+// (return) loudly on false.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_fill_entry(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+    null_cancel: bool,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    // KEM actions acquire through the shared KEM adapter below (FULL
+    // gate, query and span guards); the generic path must not fetch
+    // their arguments.
+    if row.action == OBJECT_ACTION_ENCAPSULATE || row.action == OBJECT_ACTION_DECAPSULATE {
+        return true;
+    }
+    // Entry input handles as data, applying the `capture_entry_inputs`
+    // rules against the frozen map row directly. The core entry takes a
+    // function ordinal through the name table (which would carry .rodata
+    // string tables the BPF object forbids); the map row is already the
+    // validated descriptor, so the same pure rules run without the lookup.
+    // Written per input straight into the side row: holding both verdicts
+    // across the argument reads costs a frame quantum the 512-byte chain
+    // cannot spare.
+    let import = row.action == OBJECT_ACTION_IMPORT;
+    let input0 = row.input_args[0];
+    let input1 = row.input_args[1];
+    let mut flags = 0u32;
+    let mut i = 0;
+    while i < 2 {
+        let arg = if i == 0 { input0 } else { input1 };
+        let (status, word) = if arg == ARG_NONE {
+            (handle_status::ABSENT, 0)
+        } else {
+            match arg_u64(ctx, arg, layout).ok() {
+                None => {
+                    flags |= object_flag::ARG_READ_FAILURE;
+                    (handle_status::UNREADABLE, 0)
+                }
+                Some(0) if import => (handle_status::ABSENT, 0),
+                Some(0) => (handle_status::INVALID_ZERO, 0),
+                Some(word) => {
+                    if layout == LinuxLayout::Ilp32 && word > u64::from(u32::MAX) {
+                        (handle_status::INVALID_SPAN, 0)
+                    } else {
+                        (handle_status::VALUE, word)
+                    }
+                }
+            }
+        };
+        // SAFETY: a validated live map row; these cells are ours.
+        unsafe {
+            core::ptr::addr_of_mut!((*side).inputs[i]).write(word);
+            core::ptr::addr_of_mut!((*side).input_statuses[i]).write(status);
+        }
+        i += 1;
+    }
+    // Null-mechanism cancel, mirroring `apply_null_mechanism_cancel`: value
+    // inputs already written above are suppressed in place.
+    if null_cancel {
+        let mut j = 0;
+        while j < 2 {
+            // SAFETY: a validated live map row; these cells are ours.
+            let status = unsafe { core::ptr::addr_of!((*side).input_statuses[j]).read() };
+            if status == handle_status::VALUE {
+                unsafe {
+                    core::ptr::addr_of_mut!((*side).input_statuses[j])
+                        .write(handle_status::SUPPRESSED);
+                    core::ptr::addr_of_mut!((*side).inputs[j]).write(0);
+                }
+            }
+            j += 1;
+        }
+        flags |= object_flag::NULL_MECHANISM_CANCEL;
+    }
+    // SAFETY: a validated live map row; these fields are ours.
+    unsafe {
+        let old = core::ptr::addr_of!((*side).flags).read();
+        core::ptr::addr_of_mut!((*side).flags).write(old | flags as u16);
+        core::ptr::addr_of_mut!((*side).phase).write(2);
+    }
+    true
+}
+
+// H7 adapters tail: derive entry guard. Only the Derive family retains a
+// result pointer here (after the single mechanism-word check); other
+// families succeed trivially. Outlined separately: the inputs helper above
+// already fills its 32-byte quantum. Sequencing lives in the shared
+// `adapter_derive_entry`; this wrapper only binds BPF-local readers.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_derive(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    // BPF-local: the descriptor lookup plus probe argument/word readers. All
+    // sequencing lives in the shared adapter, executed by host tests with
+    // injected readers.
+    let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    let mut fetch_arg = |index: u8| arg_u64(ctx, index, layout).ok();
+    adapter_derive_entry(side, descriptor, row, layout, &mut fetch_arg, BpfReader)
+}
+
+// H7 adapters tail: T0 KEM entry acquisition (key input arg 2 plus
+// scalar result arg 7) for exactly the two KEM actions. The generic
+// input and result paths skip KEM, so this wrapper is the only KEM
+// fetch site. BPF-local bindings only: probe registers/stack, the
+// owned call's validated S1 output verdict, the build FULL gate. All
+// sequencing lives in the shared adapter, executed by host tests
+// with injected readers.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_kem(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+    entry_capture: u32,
+    null_cancel: bool,
+) -> bool {
+    let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    let stack_pointer = unsafe { (*ctx.regs).rsp as u64 };
+    // Negative query gate from the owned call's validated S1
+    // output-pointer state: only a positively non-null entry
+    // ciphertext pointer authorizes the result. The bit alone is
+    // never object authority.
+    let output_non_null = entry_capture & capture::OUTPUT_MASK == capture::OUTPUT_NON_NULL;
+    let mut fetch_arg = |index: u8| arg_u64(ctx, index, layout).ok();
+    adapter_kem_entry(
+        side,
+        descriptor,
+        row,
+        layout,
+        stack_pointer,
+        KEM_CAPTURE_WIRED,
+        output_non_null,
+        null_cancel,
+        &mut fetch_arg,
+        BpfReader,
+    )
+}
+
+// H7 adapters tail: result-pointer retention for non-Derive families.
+// Derive retains through its mechanism guard above and skips here, so the
+// guard cannot be bypassed by a raw argument read. Arg 7 (pair second,
+// unwrap) lives on the userspace stack via the frozen helper.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_results(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action == OBJECT_ACTION_DERIVE {
+        return true;
+    }
+    // KEM actions retain through the shared KEM adapter below (FULL
+    // gate, query and span guards); the generic path must not fetch
+    // their result pointer.
+    if row.action == OBJECT_ACTION_ENCAPSULATE || row.action == OBJECT_ACTION_DECAPSULATE {
+        return true;
+    }
+    let arg0 = row.result_args[0];
+    let arg1 = row.result_args[1];
+    let mut i = 0;
+    while i < 2 {
+        let arg = if i == 0 { arg0 } else { arg1 };
+        let ptr = if arg == ARG_NONE {
+            0
+        } else if arg == 7 {
+            let rsp = unsafe { (*ctx.regs).rsp as u64 };
+            match object_result_arg7_address(row, rsp, layout) {
+                Some(addr) => read_word(addr, layout).ok().unwrap_or(0),
+                None => return false,
+            }
+        } else {
+            arg_u64(ctx, arg, layout).ok().unwrap_or(0)
+        };
+        // SAFETY: a validated live map row; this cell is ours.
+        unsafe {
+            core::ptr::addr_of_mut!((*side).result_ptrs[i]).write(ptr);
+        }
+        i += 1;
+    }
+    true
+}
+
+// H7 adapters tail: Find scalar retention (capacity value plus count
+// pointer). Only the Find family retains here; others succeed trivially.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_find(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action != OBJECT_ACTION_FIND {
+        return true;
+    }
+    let capacity = if row.find_capacity_arg == ARG_NONE {
+        0
+    } else {
+        arg_u64(ctx, row.find_capacity_arg, layout)
+            .ok()
+            .unwrap_or(0)
+    };
+    let count_ptr = if row.find_count_arg == ARG_NONE {
+        0
+    } else {
+        arg_u64(ctx, row.find_count_arg, layout).ok().unwrap_or(0)
+    };
+    // SAFETY: a validated live map row; these fields are ours.
+    unsafe {
+        core::ptr::addr_of_mut!((*side).find_capacity).write(capacity);
+        core::ptr::addr_of_mut!((*side).find_count_ptr).write(count_ptr);
+    }
+    true
+}
+
+// H7 adapters tail: entry attribute inspection and Get header retention.
+// Creation families inspect authorized template pairs into the side
+// row's request lists; Get retains entry headers into the side row's Get
+// fields; other families succeed trivially. Outlined after the Find
+// retention: each entry adapter re-queries its side row so the helpers
+// stay leaf-flat. Sequencing lives in the shared
+// `adapter_attributes_entry`, executed by host tests with injected
+// readers; this wrapper only binds BPF-local readers. The wired adapter
+// inspects authorized pairs into the side request lists (or retains Get
+// headers); refused pairs keep the honest uninspected marking.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn object_entry_attributes(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    // BPF-local: the descriptor lookup plus probe argument/word readers. All
+    // sequencing lives in the shared adapter, executed by host tests with
+    // injected readers.
+    let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    let mut fetch_arg = |index: u8| arg_u64(ctx, index, layout).ok();
+    adapter_attributes_entry(
+        side,
+        descriptor,
+        row,
+        layout,
+        &mut fetch_arg,
+        BpfReader,
+        |addr, buf| read_bytes_user(addr, buf, layout),
+    )
+}
+
+// H7 adapters tail: return-fill reads both result handles at their
+// retained pointers and advances READY to RETURNING. Sequencing lives in
+// the shared `adapter_fill_return` (slot gates included), executed by host
+// tests with injected readers; this wrapper only binds BPF-local state.
+// `gate` carries layout and the explicit root continuity verdict; full-width
+// RV and mechanism scalars remain separate. Five parameters fit BPF registers.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_fill_return(
+    side: Option<&mut ObjectStart>,
+    rv: u64,
+    mech_status: u32,
+    mech: u64,
+    gate: u32,
+) -> bool {
+    let Some((layout, _)) = decode_return_gate(gate) else {
+        return false;
+    };
+    let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    adapter_fill_return_control(side, descriptor, row, rv, mech_status, mech, gate, BpfReader)
+}
+
+// Slice D emission: fill the reserved 240-byte object tail in place
+// from the RETURNING side row. Outlined: the return root has no frame
+// to spare, and this level costs one rounding quantum. Sequencing lives
+// in the shared `adapter_tail_fill`, executed by host tests.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_tail_fill(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+) -> bool {
+    // BPF-local: the descriptor lookup. All sequencing lives in the shared
+    // adapter (volatile stores included), executed by host tests.
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    // SAFETY: `tail` is the exclusively owned reserved tail by contract.
+    unsafe { adapter_tail_fill(tail, side, descriptor, row) }
+}
+
+// Slice D emission: stream the bounded Find protocol straight into the
+// reserved tail. Outlined like the tail fill. Sequencing lives in the
+// shared `adapter_emit_find`, executed by host tests with injected
+// readers.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_emit_find(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    rv: u64,
+    gate: u32,
+) -> bool {
+    let Some((layout, _)) = decode_return_gate(gate) else {
+        return false;
+    };
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    // SAFETY: `tail` is the exclusively owned reserved tail by contract.
+    unsafe {
+        adapter_emit_find_control(tail, side, descriptor, row, rv, gate, BpfReader)
+    }
+}
+
+// Slice D emission: establish inspected Get results from retained entry
+// state into the reserved tail's result list. Outlined like the Find
+// emission: each emission level re-queries its side row so the helpers
+// stay leaf-flat. Sequencing lives in the shared
+// `adapter_emit_get_attributes`, executed by host tests with injected
+// readers; this wrapper only binds BPF-local state. The wired adapter
+// establishes retained Get results into the reserved tail's result
+// list; refused returns keep the honest uninspected marking.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_emit_get_attributes(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    rv: u64,
+    gate: u32,
+) -> bool {
+    let Some((layout, _)) = decode_return_gate(gate) else {
+        return false;
+    };
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    // SAFETY: `tail` is the exclusively owned reserved tail by contract.
+    unsafe {
+        adapter_emit_get_control(
+            tail,
+            side,
+            descriptor,
+            row,
+            rv,
+            gate,
+            BpfReader,
+            |addr, buf| read_bytes_user(addr, buf, layout),
+        )
+    }
+}
+
+// Discard a possibly stale START row on a refusal path; a failed discard
+// is capture loss and faults.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn owned_start_discard(key: &StartKey) {
+    start_discard_for::<false>(key, 0);
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn start_discard_for<const JOURNAL: bool>(key: &StartKey, reason: u32) {
+    if !matches!(start_remove_rc_for::<JOURNAL>(key, false, reason), 0 | -2) {
+        unsafe { p11_object_fault() };
+    }
+}
+
 #[inline(always)]
 fn owned_discovery_get(key: &StateKey, required: bool) -> Option<&'static StartState> {
     unsafe { p11_owner_discovery_get(key, u32::from(required)).as_ref() }
@@ -2622,25 +3828,16 @@ fn owned_discovery_remove(key: &StateKey, required: bool) -> Result<(), ()> {
 
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn store_start(key: &StartKey, start: &CallStart) -> bool {
-    if unsafe { p11_owner_start_insert(key, start) } == 0 {
-        return true;
-    }
-    // Native NOEXIST handling invalidates the ambiguous invocation and settles
-    // its count/index before reporting failure. Never delete by numeric key here.
-    bump_evidence(EVIDENCE_START_INSERT_FAILURES);
-    false
-}
-
-#[cfg(not(feature = "inventory-only"))]
-#[inline(always)]
 fn record_aggregate_start(key: &StartKey) {
-    let mut storage = MaybeUninit::<CallStart>::uninit();
-    zero_call_start(&mut storage);
-    // SAFETY: zero_call_start initialized every byte, including padding.
-    let start = unsafe { storage.assume_init_mut() };
-    start.ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
-    let _ = store_start(key, start);
+    // No image mint, side row or 288-byte scratch: native construction copies
+    // the verified zero prefix and writes only this original entry timestamp.
+    #[cfg(feature = "counter-counts")]
+    let timestamp = 0;
+    #[cfg(not(feature = "counter-counts"))]
+    let timestamp = unsafe { helpers::bpf_ktime_get_ns() };
+    if unsafe { p11_owner_start_aggregate(key, timestamp) } != 1 {
+        bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+    }
 }
 
 /// The probed runtime address: the uprobe `pt_regs` IP is `bp_vaddr`
@@ -2653,13 +3850,56 @@ fn entry_ip(ctx: &ProbeContext, layout: LinuxLayout) -> u64 {
 }
 
 #[cfg(not(feature = "inventory-only"))]
+#[repr(C)]
+struct CompletedEntry {
+    key: StartKey,
+    descriptor: u32,
+    layout: u8,
+    completed: u8,
+    reserved: u16,
+}
+
+#[cfg(not(feature = "inventory-only"))]
+impl Default for CompletedEntry {
+    fn default() -> Self {
+        Self {
+            key: StartKey {
+                pid_tgid: 0,
+                slot: 0,
+                _pad: 0,
+            },
+            descriptor: 0,
+            layout: 0,
+            completed: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+const _: () = assert!(core::mem::size_of::<CompletedEntry>() == 24);
+
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {
+fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(
+    ctx: ProbeContext,
+    completed: *mut CompletedEntry,
+) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
         return 0;
     }
     let Some(flags) = scope_flags() else {
+        // H8-D birth marker: a watched call outside the scope dirties
+        // the leader row, so a later exec cannot claim an uncaptured
+        // prefix as born.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
         return 0;
     };
     let key = StartKey {
@@ -2668,20 +3908,44 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         _pad: 0,
     };
     let Some(actual_layout) = probe_layout(&ctx) else {
-        let _ = owned_start_remove(&key, false);
+        // H8-D birth marker: a refused ABI is an uncaptured call.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
     let layout = if ENTRY_ABI == ENTRY_ABI_LP64 {
         if !matches!(actual_layout, LinuxLayout::Lp64) {
-            let _ = owned_start_remove(&key, false);
+            // H8-D birth marker: a refused ABI is an uncaptured call.
+            #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+            #[cfg(not(feature = "counter-broad"))]
+            if JOURNAL || cfg!(p11scope_birth_marker) {
+                unsafe {
+                    p11_instance_scope_gap();
+                }
+            }
+            let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED);
             bump_evidence(EVIDENCE_ABI_REFUSALS);
             return 0;
         }
         LinuxLayout::Lp64
     } else if ENTRY_ABI == ENTRY_ABI_ILP32 {
         if !matches!(actual_layout, LinuxLayout::Ilp32) {
-            let _ = owned_start_remove(&key, false);
+            // H8-D birth marker: a refused ABI is an uncaptured call.
+            #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+            #[cfg(not(feature = "counter-broad"))]
+            if JOURNAL || cfg!(p11scope_birth_marker) {
+                unsafe {
+                    p11_instance_scope_gap();
+                }
+            }
+            let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED);
             bump_evidence(EVIDENCE_ABI_REFUSALS);
             return 0;
         }
@@ -2694,20 +3958,28 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         // add is atomic because a preempting program can share this CPU.
         counter_add(unsafe { core::ptr::addr_of_mut!((*stats).entered) }, 1);
     }
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
+    if cfg!(feature = "counter-broad") || flags & FLAG_POLICY_AGGREGATE != 0 {
         record_aggregate_start(&key);
         return 0;
     }
-    let semantics = semantics_of(&ctx);
-    let mut storage = MaybeUninit::<CallStart>::uninit();
-    zero_call_start(&mut storage);
-    // SAFETY: zero_call_start initialized every byte, including padding.
-    let start = unsafe { storage.assume_init_mut() };
-    start.ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
-    // Write into caller-owned initialized storage: a second live identity
-    // temporary would increase diagnostic entry call-chain stack usage.
-    if unsafe { p11_link_current_identity(&mut start.image) } != 1 || start.image.task_cookie == 0 {
-        let _ = owned_start_remove(&key, false);
+    // One original entry timestamp: the native constructor binds this same
+    // value to START and its side row, and S1 return duration uses it unchanged.
+    let mut seed = CallStartSeed {
+        ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
+        image: ImageIdentity::default(),
+        object_required: 0,
+    };
+    if unsafe { p11_link_current_identity(&mut seed.image) } != 1 || seed.image.task_cookie == 0 {
+        // H8-D birth marker: a call lost to identity failure is an
+        // uncaptured call, so it dirties the leader row.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_IDENTITY_REFUSED);
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         return 0;
     }
@@ -2716,7 +3988,36 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     // not grow). A failure leaves no entry, which the return half reports as
     // an invalid, never-joining stamp. An entry orphaned by a later refusal
     // is overwritten by the key's next call or reclaimed by the LRU.
-    let _ = unsafe { p11_instance_entry(&key, entry_ip(&ctx, layout)) };
+    let _ = unsafe {
+        p11_instance_entry(
+            &key,
+            entry_ip(&ctx, layout),
+            seed.image.task_cookie,
+            seed.image.exec_id,
+        )
+    };
+    if flags & FLAG_POLICY_ALLOWLISTED != 0 {
+        seed.object_required = object_marker_for(cookie_of(&ctx));
+    }
+    // The final immutable seed is bound before native side allocation. No
+    // pointer escapes a failed transaction; its native cleanup owns rollback.
+    let start_pointer = unsafe { p11_owner_start_begin(&key, &seed) };
+    if start_pointer.is_null() {
+        // H8-D birth marker: a call lost to START refusal is an
+        // uncaptured call, so it dirties the leader row.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+        return 0;
+    }
+    // SAFETY: this task owns the new map row. This projection ends before
+    // native custody queries/removal can read the same row through an alias.
+    let start = unsafe { &mut *start_pointer };
     start.session = SESSION_NONE;
     start.mechanism = MECH_NONE;
     start.user_type = USER_TYPE_NONE;
@@ -2724,6 +4025,10 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     start.capture = capture::MECHANISM_NONE | capture::OUTPUT_NONE;
     start.target_function = FUNCTION_NONE;
 
+    // Materialized late on purpose: its fields stay out of entry's live set
+    // across the marker call above. The descriptor table is frozen, so this
+    // reads the same row it would have read earlier.
+    let semantics = semantics_of(&ctx);
     if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {
         start.session = value;
     }
@@ -2737,7 +4042,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         }
     }
     if let Some(value) = capture_scalar(&ctx, semantics.user_type_arg, layout, start) {
-        start.user_type = value as u32;
+        start.user_type = finite_login_user_type(value);
     }
 
     if semantics.mechanism_arg != ARG_NONE {
@@ -2762,6 +4067,18 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
                             let parameter_shape = unsafe { MECH_SHAPE.get(&mechanism) }
                                 .copied()
                                 .unwrap_or(shape::NONE);
+                            // Unsafe diagnostic entry publishes any
+                            // readable id (the allowlisted return gate
+                            // is off in this policy): flag membership
+                            // misses like the return path does. A
+                            // second lookup — the statement above is
+                            // pinned by the decode-params source
+                            // contract. Unsafe builds never carry the
+                            // journal object, so no BEGIN can carry
+                            // this bit.
+                            if unsafe { MECH_SHAPE.get(&mechanism) }.is_none() {
+                                start.capture |= capture::MECHANISM_UNREGISTERED;
+                            }
                             if parameter_shape != shape::NONE {
                                 // Project the narrow output from the whole
                                 // CallStart pointer. No additional stack object
@@ -2850,6 +4167,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
                 if let Some(value) = capture_scalar(&ctx, semantics.async_value_arg, layout, start)
                 {
                     start.async_value = value;
+                } else {
+                    // The id argument could not be read (capture_scalar
+                    // already counted the failure): mark the value
+                    // unreadable so no join runs on the default id.
+                    start.capture |= capture::ASYNC_VALUE_UNREADABLE;
                 }
             }
             lifecycle::ASYNC_GET_ID => {
@@ -2863,9 +4185,98 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         }
     }
 
-    if !store_start(&key, start) {
-        return 0;
+    let object_required = start.object_required;
+    let entry_capture = start.capture;
+    // No mutable START projection remains live beyond this point. Native
+    // queries below re-read the same immutable binding, then may remove it.
+    if object_required != 0 {
+        // Record the entry ABI on the subordinate row through the query
+        // row: return requires it unset or equal to the return layout. The
+        // marker is descriptor-plus-one by construction, so the query
+        // descriptor derives from it without another cookie read. A
+        // missing row here contradicts the just-committed transaction, so
+        // abandon the invocation loudly instead of running half-bound.
+        let recorded = object_record_entry_abi(&key, (object_required - 1) as u32, layout);
+        if !recorded {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        // H7 adapters tail: entry-fill after the ABI record.
+        let null_cancel = semantics_of(&ctx).semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL
+            != 0
+            && entry_capture & capture::MECHANISM_MASK == capture::MECHANISM_NULL;
+        let fill_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_fill_entry(&ctx, fill_side, layout, null_cancel) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let derive_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_derive(&ctx, derive_side, layout) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let results_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_results(&ctx, results_side, layout) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let kem_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_kem(&ctx, kem_side, layout, entry_capture, null_cancel) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let find_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_find(&ctx, find_side, layout) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let attributes_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_attributes(&ctx, attributes_side, layout) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
     }
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL {
+        // Only the fully successful construction reaches this write. Failed
+        // entry arms leave the root's initialized NONE token untouched.
+        unsafe {
+            // Write directly into the caller's token: an aggregate copy can
+            // materialize a second token in this tightly bounded frame.
+            core::ptr::addr_of_mut!((*completed).key.pid_tgid).write(key.pid_tgid);
+            core::ptr::addr_of_mut!((*completed).key.slot).write(key.slot);
+            core::ptr::addr_of_mut!((*completed).key._pad).write(0);
+            core::ptr::addr_of_mut!((*completed).descriptor)
+                .write(cookie_descriptor(cookie_of(&ctx)));
+            core::ptr::addr_of_mut!((*completed).layout).write(match layout {
+                LinuxLayout::Lp64 => 1,
+                LinuxLayout::Ilp32 => 2,
+            });
+            core::ptr::addr_of_mut!((*completed).reserved).write(0);
+            core::ptr::addr_of_mut!((*completed).completed).write(1);
+        }
+    }
+    let _ = completed;
     #[cfg(feature = "unsafe-unvalidated-metadata")]
     if TEMPLATE_MODE == 3 {
         // Success never returns. Failure leaves template0 as usable partial
@@ -2909,72 +4320,164 @@ fn rv_count_add(key: &RvKey) -> bool {
 }
 
 #[cfg(not(feature = "inventory-only"))]
+#[cfg(not(p11scope_journal_roots))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
     keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_return_impl(ctx);
+    let rc = p11_return_impl::<false>(ctx);
     stop_gate_leave();
     rc
 }
 
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn p11_return_impl(ctx: RetProbeContext) -> u32 {
+fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
         return 0;
     }
+    let Some(flags) = scope_flags() else {
+        let key = StartKey {
+            pid_tgid: helpers::bpf_get_current_pid_tgid(),
+            slot,
+            _pad: 0,
+        };
+        // H8-D birth marker: a return that lost its scope loses the
+        // completion, so it dirties the leader row.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        // Entry-time scope owns this pairing record. If a task migrates out
+        // of a selected cgroup mid-call, clean it up without emitting an
+        // out-of-scope event and disclose the lost completion.
+        match start_remove_rc_for::<JOURNAL>(&key, false, JOURNAL_REASON_SCOPE_LOST) {
+            0 => bump_evidence(EVIDENCE_UNMATCHED_RETURNS),
+            -2 => {}
+            _ => {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
+        }
+        return 0;
+    };
     let key = StartKey {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         slot,
         _pad: 0,
     };
-    let Some(flags) = scope_flags() else {
-        // Entry-time scope owns this pairing record. If a task migrates out
-        // of a selected cgroup mid-call, clean it up without emitting an
-        // out-of-scope event and disclose the lost completion.
-        if owned_start_remove(&key, false).is_ok() {
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-        }
-        return 0;
-    };
     let Some(layout) = ret_probe_layout(&ctx) else {
-        let _ = owned_start_remove(&key, false);
+        // H8-D birth marker: a return with a refused ABI loses the
+        // completion, so it dirties the leader row.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        start_discard_for::<JOURNAL>(&key, JOURNAL_REASON_ABI_REFUSED);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
-    // No start entry means the entry probe filtered this call out (or the
-    // process was already inside the function at attach time). Either way
-    // there is nothing to attribute.
-    let Some(&start) = owned_start_get(&key) else {
+    // Dispatch under the same physical owner. No START reference crosses
+    // an outlined call: the object branch receives only a raw live pointer.
+    let start = unsafe { p11_owner_start_get(&key, 0) };
+    if start.is_null() {
+        // H8-D birth marker: a return without START loses the
+        // completion. Absence and owner-custody refusal share this NULL,
+        // so both dirty the leader row.
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+        #[cfg(not(feature = "counter-broad"))]
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
         return 0;
-    };
-    if owned_start_remove(&key, true).is_err() {
+    }
+    if cfg!(feature = "counter-broad") && unsafe { (*start).object_required } != 0 {
+        start_discard_for::<JOURNAL>(&key, JOURNAL_REASON_ABI_REFUSED);
+        unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
+    // H8-D birth marker: the outlined return halves gap the leader row
+    // in place at their own lost-call arms (a 12-byte global frame at
+    // depth 3, inside the 512-byte chain). No lost code crosses to the
+    // root: the 6.1/5.15 verifiers explore the pre-marker tail shape.
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL {
+        return if unsafe { (*start).object_required } == 0 {
+            journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)
+        } else {
+            object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(
+                ctx, &key, start, flags, layout,
+            )
+        };
+    }
+    if unsafe { (*start).object_required } == 0 {
+        ordinary_return(ctx, &key, start, flags, layout)
+    } else {
+        object_return_ordinary(ctx, &key, start, flags, layout)
+    }
+}
 
+#[cfg(not(feature = "inventory-only"))]
+#[derive(Clone, Copy)]
+struct ReturnAccounting {
+    now: u64,
+    delta: u64,
+    rv: u64,
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn account_return(
+    ctx: &RetProbeContext,
+    slot: u32,
+    entry_ns: u64,
+    layout: LinuxLayout,
+) -> ReturnAccounting {
+    #[cfg(feature = "counter-counts")]
+    let (now, delta) = (0, 0);
+    #[cfg(feature = "counter-counts")]
+    let _ = entry_ns;
+    #[cfg(not(feature = "counter-counts"))]
     let now = unsafe { helpers::bpf_ktime_get_ns() };
-    let delta = now.saturating_sub(start.ts_ns);
+    #[cfg(not(feature = "counter-counts"))]
+    let delta = now.saturating_sub(entry_ns);
     let rv = normalize_target_word(ctx.ret(), layout);
 
     if let Some(stats) = STATS.get_ptr_mut(slot) {
         // SAFETY: a live per-CPU cell; only field addresses are taken. Every
         // sum is an atomic add (a preempting program can share this CPU).
-        // `max_ns` stays a plain best-effort maximum: a lost update can only
-        // keep a smaller maximum, never add or drop a counted call.
+        // Ordinary `max_ns` stays best-effort. Private counter timing uses
+        // the shared bounded exact-maximum policy and sticky health instead.
         unsafe {
             counter_add(core::ptr::addr_of_mut!((*stats).returned), 1);
-            counter_add(core::ptr::addr_of_mut!((*stats).total_ns), delta);
-            if delta > (*stats).max_ns {
-                (*stats).max_ns = delta;
-            }
-            let b = bucket_of(delta) as usize;
-            if b < (*stats).buckets.len() {
-                counter_add(core::ptr::addr_of_mut!((*stats).buckets[b]), 1);
+            #[cfg(not(feature = "counter-counts"))]
+            {
+                counter_add(core::ptr::addr_of_mut!((*stats).total_ns), delta);
+                #[cfg(feature = "counter-broad")]
+                counter_max(core::ptr::addr_of_mut!((*stats).max_ns), delta);
+                #[cfg(not(feature = "counter-broad"))]
+                if delta > (*stats).max_ns {
+                    (*stats).max_ns = delta;
+                }
+                #[cfg(not(feature = "counter-timestamps"))]
+                {
+                    let b = bucket_of(delta) as usize;
+                    if b < (*stats).buckets.len() {
+                        counter_add(core::ptr::addr_of_mut!((*stats).buckets[b]), 1);
+                    }
+                }
             }
             if rv != 0 && rv != 0x204 {
                 counter_add(core::ptr::addr_of_mut!((*stats).errors), 1);
@@ -2987,34 +4490,88 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         bump_evidence(EVIDENCE_RV_UPDATE_FAILURES);
     }
 
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
+    ReturnAccounting { now, delta, rv }
+}
+
+// C_AsyncGetID return facts. Only an OK GetID is examined: a null
+// output pointer produced no id, and an unreadable one leaves no trusted
+// id; both mark the value unreadable with exactly one evidence bump
+// (a failed entry arg read also leaves out_ptr zeroed, so that
+// unreachable corner double-counts). A readable id is written through
+// `out`; the caller's default stays otherwise. Outlined so the verifier
+// explores this branch tree once instead of at every inlined return
+// site; the scalar u32 return keeps the BTF prototype register-sized.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn async_get_id_fact(
+    out_ptr: u64,
+    rv: u64,
+    lifecycle: u8,
+    layout: LinuxLayout,
+    out: &mut u64,
+) -> u32 {
+    if rv != 0 || lifecycle != lifecycle::ASYNC_GET_ID {
         return 0;
     }
-
-    // Physical ownership and successful settlement above guard aggregate pairing.
-    // Image equality additionally guards retained semantic pointer reads.
-    let mut image = ImageIdentity::default();
-    if unsafe { p11_link_current_identity(&mut image) } != 1
-        || !image_pair_matches(start.image, image)
-    {
+    if out_ptr == 0 {
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-        return 0;
+        return capture::ASYNC_VALUE_UNREADABLE;
     }
+    match read_word(out_ptr, layout) {
+        Ok(value) => {
+            *out = value;
+            0
+        }
+        Err(_) => {
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            capture::ASYNC_VALUE_UNREADABLE
+        }
+    }
+}
 
-    let semantics = semantics_of(&ctx);
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn capture_return_facts<const DEFER_ROUTING: bool>(
+    ctx: &RetProbeContext,
+    start: &CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+    accounting: ReturnAccounting,
+) -> ReturnEventFacts {
+    let semantics = semantics_of(ctx);
     let mut mechanism = start.mechanism;
     let mut capture_flags = start.capture;
     if flags & FLAG_POLICY_ALLOWLISTED != 0
-        && return_allows_mechanism(rv)
+        && return_allows_mechanism(accounting.rv)
         && start.mechanism_ptr != 0
     {
         match read_word(start.mechanism_ptr, layout) {
-            Ok(value) if unsafe { MECH_SHAPE.get(&value) }.is_some() => {
-                mechanism = value;
-                capture_flags =
-                    (capture_flags & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+            Ok(value) => {
+                // Mechanism ids are public constants: outside the
+                // journal lane, publish the id with its call/error
+                // counts even without registry membership, flagged
+                // unregistered — but only when the value fits the
+                // portable 32-bit mechanism space. A wider word is
+                // not a public constant (a truncating provider could
+                // pass through uninitialized upper bytes); it stays
+                // unpublished. The journal lane keeps withholding
+                // (its validator pins the capture transition set).
+                // Parameters stay undecoded in both; the evidence
+                // total counts every occurrence in both, including
+                // wider-than-32-bit values.
+                let member = unsafe { MECH_SHAPE.get(&value) }.is_some();
+                if member || (!DEFER_ROUTING && value <= 0xFFFF_FFFF) {
+                    mechanism = value;
+                    capture_flags = (capture_flags & !capture::MECHANISM_MASK)
+                        | capture::MECHANISM_VALUE;
+                    if !member {
+                        capture_flags |= capture::MECHANISM_UNREGISTERED;
+                    }
+                }
+                if !member {
+                    bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS);
+                }
             }
-            Ok(_) => bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS),
             Err(_) => {
                 capture_flags = (capture_flags & !capture::MECHANISM_MASK)
                     | capture::MECHANISM_UNREADABLE
@@ -3026,7 +4583,7 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     let mut session = start.session;
     if semantics.lifecycle == lifecycle::OPEN_SESSION
         && start.out_ptr != 0
-        && (rv == 0 || rv == 0x204)
+        && (accounting.rv == 0 || accounting.rv == 0x204)
     {
         // C_OpenSession wrote the handle by now. Only trust it on success.
         match read_word(start.out_ptr, layout) {
@@ -3035,66 +4592,523 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         }
     }
     let mut async_value = start.async_value;
-    if rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
-        match read_word(start.out_ptr, layout) {
-            Ok(value) => async_value = value,
-            Err(_) => {
-                capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-            }
-        }
-    }
+    // The GetID return facts run in one outlined helper (verified once,
+    // not at every inlined return site); the entry default stays unless
+    // a successful read overwrites it.
+    capture_flags |= async_get_id_fact(
+        start.out_ptr,
+        accounting.rv,
+        semantics.lifecycle,
+        layout,
+        &mut async_value,
+    );
 
-    let ev = Event {
-        ts_ns: now,
-        duration_ns: delta,
-        pid_tgid: helpers::bpf_get_current_pid_tgid(),
-        cgroup_id: unsafe { helpers::bpf_get_current_cgroup_id() },
-        session,
-        slot_id: start.slot_id,
+    ReturnEventFacts {
+        ts_ns: accounting.now,
+        duration_ns: accounting.delta,
+        rv: accounting.rv,
         mechanism,
-        flags: start.flags,
-        rv,
-        p0: start.p0,
-        p1: start.p1,
-        p2: start.p2,
+        session,
         async_value,
-        slot,
-        target_function: start.target_function,
-        user_type: start.user_type,
-        shape: start.shape,
-        attr_types: start.attr_types,
-        attr_count: start.attr_count,
-        attr_total: start.attr_total,
-        attr_bools: start.attr_bools,
-        attr_bools_seen: start.attr_bools_seen,
-        attr_types1: start.attr_types1,
-        attr_count1: start.attr_count1,
-        attr_total1: start.attr_total1,
-        attr_bools1: start.attr_bools1,
-        attr_bools_seen1: start.attr_bools_seen1,
-        capture: capture_flags,
-        event_type: event_type::CALL,
-        image: start.image,
-        child_image: ImageIdentity::default(),
-        root_affiliation: unsafe { p11_root_current_tag() },
-    };
+        capture_flags,
+        pid_tgid: if DEFER_ROUTING {
+            0
+        } else {
+            helpers::bpf_get_current_pid_tgid()
+        },
+        cgroup_id: if DEFER_ROUTING {
+            0
+        } else {
+            unsafe { helpers::bpf_get_current_cgroup_id() }
+        },
+        root_affiliation: if DEFER_ROUTING {
+            0
+        } else {
+            unsafe { p11_root_current_tag() }
+        },
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn ordinary_return(
+    ctx: RetProbeContext,
+    key: &StartKey,
+    start: *const CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+) -> u32 {
+    let ctx = &ctx;
+    let key = *key;
+    // Preserve the ordinary snapshot and checked early retirement. The copy
+    // is the only START data used after removal; no map reference survives.
+    let start = unsafe { *start };
+    if owned_start_remove(&key, true).is_err() {
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let accounting = account_return(ctx, key.slot, start.ts_ns, layout);
+    if cfg!(feature = "counter-broad") || flags & FLAG_POLICY_AGGREGATE != 0 {
+        return 0;
+    }
+    let mut image = ImageIdentity::default();
+    if unsafe { p11_link_current_identity(&mut image) } != 1
+        || !image_pair_matches(start.image, image)
+    {
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        // H8-D birth marker: an identity-mismatched return loses the
+        // completion, so it gaps here in place at depth 3.
+        #[cfg(p11scope_birth_marker)]
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
+        return 0;
+    }
+    let facts = capture_return_facts::<false>(ctx, &start, flags, layout, accounting);
     match EVENTS.reserve::<EventRecord>(0) {
         Some(mut e) => {
             let raw = e.as_mut_ptr();
-            // SAFETY: `raw` is the reserved, exclusively owned record. The
-            // event is written as before; the native return half then fills
-            // every byte of the private continuity tail in place.
             unsafe {
-                core::ptr::write(core::ptr::addr_of_mut!((*raw).event), ev);
+                fill_call_event(
+                    core::ptr::addr_of_mut!((*raw).event),
+                    &start,
+                    key.slot,
+                    &facts,
+                );
                 let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
             }
             e.submit(0);
+            0
         }
         None => {
             bump_evidence(EVIDENCE_RING_LOSS);
+            // H8-D birth marker: a ring-loss return loses the
+            // completion. The gap runs here in place.
+            #[cfg(p11scope_birth_marker)]
+            #[cfg(not(feature = "counter-broad"))]
+            unsafe {
+                p11_instance_scope_gap();
+            }
+            0
         }
     }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+trait ReturnPayload: Sized + 'static {
+    unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord;
+}
+
+#[cfg(not(feature = "inventory-only"))]
+impl ReturnPayload for ObjectEventRecord {
+    #[inline(always)]
+    unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord {
+        record
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_return_ordinary(
+    ctx: RetProbeContext,
+    key: &StartKey,
+    start: *const CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+) -> u32 {
+    let ctx = &ctx;
+    let key = *key;
+    // Slice D activation: query the validated side row and require
+    // ready phase, attached-descriptor and retained-ABI agreement.
+    // The drain retire moves after emission below: the side row must
+    // stay alive while the 608-byte record is reserved and filled.
+    // Query plus retire stays the drain (a monolithic native drain
+    // nests too deep for return's 512-byte call-chain budget; see
+    // object_producer_compiled_frames_are_bounded). Any failure
+    // discards the record: no ring reservation, no facts.
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => u32::from(OBJECT_LAYOUT_LP64),
+        LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
+    };
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
+    if ready.is_none() {
+        // H7-E2: every refusal retires identifiable owned state
+        // through the checked removal before returning; the fault
+        // below fires whether or not the retire settles.
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let agreed = side.is_some_and(|row| {
+        row.descriptor_index == descriptor
+            && (row.layout == 0 || u32::from(row.layout) == layout_code)
+    });
+    if !agreed {
+        // H7-E2: retire before returning, as on every refusal arm.
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let accounting = account_return(ctx, key.slot, unsafe { (*start).ts_ns }, layout);
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
+        if owned_start_remove(&key, true).is_err() {
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
+        return 0;
+    }
+    let mut image = ImageIdentity::default();
+    if unsafe { p11_link_current_identity(&mut image) } != 1
+        || !image_pair_matches(unsafe { (*start).image }, image)
+    {
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return 0;
+    }
+    // This short immutable borrow ends before reservation/native continuity
+    // or side-row helpers. All retained START reads finish before removal.
+    let facts = unsafe { capture_return_facts::<false>(ctx, &*start, flags, layout, accounting) };
+    // Slice D emission: reserve the complete 608-byte record BEFORE
+    // any result/attribute read. Reservation failure performs no new
+    // reads: disclose loss, clean ownership, keep the aggregate
+    // return/RV accounting recorded above, and return.
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let rv = accounting.rv;
+    let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
+        // The fault below already refuses births; gap only when the
+        // START removal settles. The gap runs here in place; the root
+        // stays a plain tail dispatch for the 6.1/5.15 verifiers.
+        let failed = owned_start_remove(&key, true).is_err();
+        if failed {
+            unsafe { p11_object_fault() };
+        }
+        bump_evidence(EVIDENCE_RING_LOSS);
+        // H8-D birth marker: a ring-loss return whose START removal
+        // settled loses the completion, so it gaps here in place.
+        #[cfg(p11scope_birth_marker)]
+        #[cfg(not(feature = "counter-broad"))]
+        if !failed {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        return 0;
+    };
+    // H7-E1: populate in place under ownership with the base event
+    // and its continuity landing in the reserved record FIRST, then
+    // the join gate before any object result read, then (with the S1
+    // return-time mechanism evidence the return body just captured)
+    // the result fills and tail sections. A refused join preserves only
+    // the ordinary base. A found continuity entry is not a join: only the full
+    // stamp predicate authorizes result/Find/attribute reads.
+    let raw = entry.as_mut_ptr();
+    unsafe {
+        fill_call_event(
+            core::ptr::addr_of_mut!((*raw).base.event),
+            &*start,
+            key.slot,
+            &facts,
+        );
+        let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+    }
+    let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
+    if !joined {
+        let outcome = preserve_refused_base(
+            || owned_start_remove(&key, true).is_ok(),
+            || unsafe { p11_object_fault() },
+            // SAFETY: fill_call_event and p11_instance_return initialized
+            // every byte of this 368-byte base while the reservation was
+            // owned. Copy it before discard; the unfilled object tail is
+            // never read, and the original failing stamps remain unchanged.
+            || EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok(),
+        );
+        entry.discard(0);
+        if outcome == RefusedBaseOutcome::OutputFailed {
+            bump_evidence(EVIDENCE_RING_LOSS);
+        }
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
+    let filled = object_fill_return(
+        ready,
+        rv,
+        facts.capture_flags & capture::MECHANISM_MASK,
+        facts.mechanism,
+        encode_return_gate(layout, joined),
+    );
+    // Each emission level re-queries its side row like the entry
+    // adapters: the helpers stay leaf-flat (no nested native query)
+    // and their measured frames count in the complete 512-byte chain.
+    let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
+    let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let emitted = tailed
+        && object_emit_find(
+            tail,
+            find_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        )
+        && object_emit_get_attributes(
+            tail,
+            get_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        );
+    // Submit the completed ring record only after successful
+    // removal; otherwise discard it and fault. H7-E2: the shared
+    // cleanup decision evaluates the retirement independently of
+    // emission success, so a failed fill/emission still retires owned
+    // state and no read runs after either failure.
+    let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
+    if !outcome.submitted {
+        unsafe { p11_object_fault() };
+        entry.discard(0);
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    entry.submit(0);
+    0
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
+    ctx: RetProbeContext,
+    key: &StartKey,
+    start: *const CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+) -> u32 {
+    let ctx = &ctx;
+    let key = *key;
+    // Slice D activation: query the validated side row and require
+    // ready phase, attached-descriptor and retained-ABI agreement.
+    // The drain retire moves after emission below: the side row must
+    // stay alive while the 608-byte record is reserved and filled.
+    // Query plus retire stays the drain (a monolithic native drain
+    // nests too deep for return's 512-byte call-chain budget; see
+    // object_producer_compiled_frames_are_bounded). Any failure
+    // discards the record: no ring reservation, no facts.
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => u32::from(OBJECT_LAYOUT_LP64),
+        LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
+    };
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
+    if ready.is_none() {
+        // H7-E2: every refusal retires identifiable owned state
+        // through the checked removal before returning; the fault
+        // below fires whether or not the retire settles.
+        let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let agreed = side.is_some_and(|row| {
+        row.descriptor_index == descriptor
+            && (row.layout == 0 || u32::from(row.layout) == layout_code)
+    });
+    if !agreed {
+        // H7-E2: retire before returning, as on every refusal arm.
+        let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_ABI_REFUSED);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    // Finish the accounting/facts storage lifetime before deep object
+    // readers. Only the owned reservation and three return scalars leave
+    // this block; no duplicate aggregate survives into attribute capture.
+    let (mut entry, rv, mechanism, capture_flags) = {
+        let accounting = account_return(ctx, key.slot, unsafe { (*start).ts_ns }, layout);
+        if flags & FLAG_POLICY_AGGREGATE != 0 {
+            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+                .is_err()
+            {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
+            return 0;
+        }
+        let mut image = ImageIdentity::default();
+        if unsafe { p11_link_current_identity(&mut image) } != 1
+            || !image_pair_matches(unsafe { (*start).image }, image)
+        {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            return 0;
+        }
+        // This short immutable borrow ends before reservation/native continuity
+        // or side-row helpers. All retained START reads finish before removal.
+        let facts =
+            unsafe { capture_return_facts::<JOURNAL>(ctx, &*start, flags, layout, accounting) };
+        // Slice D emission: reserve the complete 608-byte record BEFORE
+        // any result/attribute read. Reservation failure performs no new
+        // reads: disclose loss, clean ownership, keep the aggregate
+        // return/RV accounting recorded above, and return.
+        let Some(mut entry) = EVENTS.reserve::<Record>(0) else {
+            // The fault below already refuses births; gap only when the
+            // START removal settles. The gap runs here in place; the root
+            // stays a plain tail dispatch for the 6.1/5.15 verifiers.
+            let failed =
+                start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+                    .is_err();
+            if failed {
+                unsafe { p11_object_fault() };
+            }
+            bump_evidence(EVIDENCE_RING_LOSS);
+            // H8-D birth marker: a ring-loss return whose START removal
+            // settled loses the completion, so it gaps here in place.
+            #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+            #[cfg(not(feature = "counter-broad"))]
+            if !failed && (JOURNAL || cfg!(p11scope_birth_marker)) {
+                unsafe {
+                    p11_instance_scope_gap();
+                }
+            }
+            return 0;
+        };
+        // H7-E1: populate in place under ownership with the base event
+        // and its continuity landing in the reserved record FIRST, then
+        // the join gate before any object result read, then (with the S1
+        // return-time mechanism evidence the return body just captured)
+        // the result fills and tail sections. A refused join preserves only
+        // the ordinary base. A found continuity entry is not a join: only the full
+        // stamp predicate authorizes result/Find/attribute reads.
+        let reservation = entry.as_mut_ptr();
+        let raw = unsafe { Record::payload(reservation) };
+        unsafe {
+            fill_call_event(
+                core::ptr::addr_of_mut!((*raw).base.event),
+                &*start,
+                key.slot,
+                &facts,
+            );
+            #[cfg(p11scope_journal_roots)]
+            if JOURNAL {
+                journal_roots::program::route(core::ptr::addr_of_mut!((*raw).base.event));
+            }
+            let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+        }
+        (entry, accounting.rv, facts.mechanism, facts.capture_flags)
+    };
+    let reservation = entry.as_mut_ptr();
+    let raw = unsafe { Record::payload(reservation) };
+    let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
+    if !joined {
+        let outcome = preserve_refused_base(
+            || start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED).is_ok(),
+            || unsafe { p11_object_fault() },
+            // SAFETY: fill_call_event and p11_instance_return initialized
+            // every byte of this 368-byte base while the reservation was
+            // owned. Copy it before discard; the unfilled object tail is
+            // never read, and the original failing stamps remain unchanged.
+            || {
+                EVENTS
+                    .output::<EventRecord>(unsafe { &(*raw).base }, 0)
+                    .is_ok()
+            },
+        );
+        entry.discard(0);
+        if outcome == RefusedBaseOutcome::OutputFailed {
+            bump_evidence(EVIDENCE_RING_LOSS);
+        }
+        #[cfg(p11scope_journal_roots)]
+        if JOURNAL {
+            journal_roots::program::gap();
+        }
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
+    let filled = object_fill_return(
+        ready,
+        rv,
+        capture_flags & capture::MECHANISM_MASK,
+        mechanism,
+        encode_return_gate(layout, joined),
+    );
+    // Each emission level re-queries its side row like the entry
+    // adapters: the helpers stay leaf-flat (no nested native query)
+    // and their measured frames count in the complete 512-byte chain.
+    let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
+    let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let emitted = tailed
+        && object_emit_find(
+            tail,
+            find_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        )
+        && object_emit_get_attributes(
+            tail,
+            get_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        );
+    // Submit the completed ring record only after successful
+    // removal; otherwise discard it and fault. H7-E2: the shared
+    // cleanup decision evaluates the retirement independently of
+    // emission success, so a failed fill/emission still retires owned
+    // state and no read runs after either failure.
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL && !emitted {
+        journal_roots::program::gap();
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+    }
+    let reason = JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    #[cfg(p11scope_journal_roots)]
+    let reason = if JOURNAL && emitted {
+        let Some(reason) =
+            (unsafe { journal_roots::program::complete(reservation.cast(), &key, false) })
+        else {
+            // The flag conversion refused: the reservation holds no
+            // header, so it can never submit. Retire the call like a
+            // lost result, then gap, mirroring the reserve-failure arm.
+            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+                .is_err()
+            {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
+            entry.discard(0);
+            journal_roots::program::gap();
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            return 0;
+        };
+        reason
+    } else {
+        reason
+    };
+    let outcome = emission_finalize(emitted, || {
+        start_remove_for::<JOURNAL>(&key, true, reason).is_ok()
+    });
+    if !outcome.submitted {
+        unsafe { p11_object_fault() };
+        entry.discard(0);
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    entry.submit(0);
     0
 }
 
@@ -3166,3 +5180,20 @@ pub unsafe extern "C" fn p11_link_emit_fork(
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+// Appended so disabled proof preparation does not move ordinary BPF lines.
+#[cfg(any(
+    feature = "counts-bank-proof",
+    feature = "timestamps-bank-proof",
+    feature = "latency-bank-proof"
+))]
+mod counter_bank_proof;
+#[cfg(any(
+    feature = "counts-bank-proof",
+    feature = "timestamps-bank-proof",
+    feature = "latency-bank-proof"
+))]
+use counter_bank_proof::RV_COUNTS;
+// Appended so disabled proof preparation does not move ordinary BPF lines.
+#[cfg(feature = "image-bank-proof")]
+mod image_bank_proof;

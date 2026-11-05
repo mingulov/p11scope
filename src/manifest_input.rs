@@ -39,7 +39,10 @@ pub fn read_manifest(path: &Path) -> Result<String, String> {
 /// as a shorter manifest (J-manifest_input#1). A same-length rewrite is not
 /// detected: the manifest is trusted operator input, and the provider
 /// identities it names are still checked against the pinned objects.
-fn read_bounded(reader: impl std::io::Read, expected_len: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(
+    reader: impl std::io::Read,
+    expected_len: u64,
+) -> Result<Vec<u8>, String> {
     if expected_len > MAX_MANIFEST_BYTES {
         return Err(format!(
             "manifest is {expected_len} bytes; limit is {MAX_MANIFEST_BYTES}"
@@ -106,41 +109,74 @@ fn validate_identity(label: &str, identity: &ObjectIdentity, problems: &mut Vec<
     }
 }
 
-fn expected_surface(surface: &SurfaceRecord) -> Result<(Vec<&'static str>, &'static str), String> {
-    let version = surface
-        .version
-        .ok_or_else(|| "walked surface has no version".to_string())?;
-    let version = cryptoki_sys::CK_VERSION {
-        major: version.major,
-        minor: version.minor,
-    };
-    let source = match surface.source {
-        SurfaceSource::LegacyFunctionList => Surface::LegacyFunctionList { version },
-        SurfaceSource::Interface { .. } => Surface::StandardInterface { version },
-    };
-    let (spans, normal_walk) = match tables_for(source) {
-        TableSet::Walk(spans) => (spans, "full"),
-        TableSet::WalkKnownPrefix(spans) => (spans, "known_prefix"),
-        TableSet::Refuse => return Ok((Vec::new(), "refused")),
-    };
-    let forced_prefix = matches!(
-        surface.source,
-        SurfaceSource::Interface {
-            classification: InterfaceClassification::CorroboratedStandardPrefix,
-            ..
+fn surface_spans(surface: &SurfaceRecord) -> &'static [pkcs11_module::TableSpan] {
+    if matches!(surface.source, SurfaceSource::Interface { .. })
+        && let Some(version) = surface.version
+    {
+        match tables_for(Surface::StandardInterface {
+            version: cryptoki_sys::CK_VERSION {
+                major: version.major,
+                minor: version.minor,
+            },
+        }) {
+            TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => return spans,
+            TableSet::Refuse => {}
         }
-    );
-    Ok((
-        spans
-            .iter()
-            .flat_map(|span| span.fields().iter().map(|field| field.name))
-            .collect(),
-        if forced_prefix {
-            "known_prefix"
-        } else {
-            normal_walk
+    }
+    // This selects the fixed common catalogue, never replacement metadata.
+    let TableSet::Walk(spans) = tables_for(Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
         },
-    ))
+    }) else {
+        unreachable!("the legacy ABI has a bounded field catalogue");
+    };
+    spans
+}
+
+fn expected_surface(surface: &SurfaceRecord) -> Vec<&'static str> {
+    surface_spans(surface)
+        .iter()
+        .flat_map(|span| span.fields().iter().map(|field| field.name))
+        .collect()
+}
+
+/// Function-word completeness for a structurally validated surface. An
+/// unreadable metadata header is independent of the observed ordinal extent.
+pub(crate) fn surface_function_inventory_complete(surface: &SurfaceRecord) -> bool {
+    matches!(surface.acquisition, Acquisition::Ok)
+        && surface.functions.len()
+            == surface_spans(surface)
+                .iter()
+                .map(|span| span.fields().len())
+                .sum::<usize>()
+        && match surface.walk {
+            WalkOutcome::Full | WalkOutcome::KnownPrefix => true,
+            WalkOutcome::Unreadable { .. } => surface.version.is_none(),
+            WalkOutcome::Refused | WalkOutcome::NotWalked => false,
+        }
+}
+
+/// Normalize obsolete `Full` claims without dropping their observed prefix.
+pub(crate) fn effective_surface_walk(surface: &SurfaceRecord) -> String {
+    let normalized_prefix = matches!(surface.walk, WalkOutcome::Full)
+        && surface.functions.len()
+            < surface_spans(surface)
+                .iter()
+                .map(|span| span.fields().len())
+                .sum::<usize>();
+    let mut label = match &surface.walk {
+        WalkOutcome::Full if normalized_prefix => "known_prefix".into(),
+        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
+        walk => walk_name(walk).into(),
+    };
+    if surface.version.is_none()
+        && matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+    {
+        label.push_str("; version metadata unavailable");
+    }
+    label
 }
 
 fn walk_name(walk: &WalkOutcome) -> &'static str {
@@ -192,22 +228,140 @@ fn selection_result_readable(result: &SelectionRequest) -> bool {
     )
 }
 
-fn selection_table_names(version: Version) -> Option<Vec<&'static str>> {
+fn selection_table_names(version: Version) -> Vec<&'static str> {
     let cryptoki_version = cryptoki_sys::CK_VERSION {
         major: version.major,
         minor: version.minor,
     };
-    match tables_for(Surface::StandardInterface {
+    let spans = match tables_for(Surface::StandardInterface {
         version: cryptoki_version,
     }) {
-        TableSet::Walk(spans) => Some(
+        TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => spans,
+        TableSet::Refuse => {
+            let TableSet::Walk(spans) = tables_for(Surface::LegacyFunctionList {
+                version: cryptoki_sys::CK_VERSION {
+                    major: 2,
+                    minor: 40,
+                },
+            }) else {
+                unreachable!("fixed common ABI catalogue");
+            };
             spans
-                .iter()
-                .flat_map(|span| span.fields().iter().map(|field| field.name))
-                .collect(),
-        ),
-        TableSet::WalkKnownPrefix(_) | TableSet::Refuse => None,
+        }
+    };
+    spans
+        .iter()
+        .flat_map(|span| span.fields().iter().map(|field| field.name))
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMetadata {
+    Observed,
+    Unavailable,
+    Changed,
+}
+
+fn selection_table_metadata(
+    evidence: &SelectionEvidence,
+    table: &SelectionTable,
+) -> SelectionMetadata {
+    let WalkOutcome::Unreadable { detail } = &table.walk else {
+        return SelectionMetadata::Observed;
+    };
+    let references: Vec<_> = evidence
+        .queries
+        .iter()
+        .filter(|query| query.selection_table == Some(table.id))
+        .collect();
+    if references.is_empty()
+        || !references.iter().all(|query| {
+            query.rv == 0
+                && query.authority == SelectionAuthority::SelectionCountOnly
+                && query.helper_failure == Some(SelectionFailure::UnreadableVersion)
+                && query.inventory_matches.is_empty()
+        })
+    {
+        return SelectionMetadata::Observed;
     }
+    if table.version == (Version { major: 0, minor: 0 })
+        && detail.starts_with("version header unreadable:")
+        && references.iter().all(|query| {
+            query
+                .result
+                .is_some_and(|result| result.version == SelectionVersionClass::Unreadable)
+        })
+    {
+        return SelectionMetadata::Unavailable;
+    }
+    if detail.starts_with("version metadata changed:")
+        && references.iter().all(|query| {
+            query
+                .result
+                .is_some_and(|result| selection_version_matches(table.version, result.version))
+        })
+    {
+        return SelectionMetadata::Changed;
+    }
+    SelectionMetadata::Observed
+}
+
+pub(crate) fn selection_table_inventory_incomplete(
+    evidence: &SelectionEvidence,
+    table: &SelectionTable,
+) -> bool {
+    table.functions.len() != selection_table_names(table.version).len()
+        || (!matches!(table.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+            && selection_table_metadata(evidence, table) == SelectionMetadata::Observed)
+        || table.functions.iter().any(|function| {
+            !matches!(
+                function.resolution,
+                Resolution::Resolved { .. } | Resolution::NullPointer
+            )
+        })
+}
+
+/// Naming stays at the existing fixed-query witness strength; count-only
+/// observation admission is deliberately independent of this predicate.
+pub(crate) fn selection_table_name_authorized(manifest: &Manifest, table_id: u8) -> bool {
+    if manifest
+        .selection_evidence
+        .tables
+        .iter()
+        .find(|table| table.id == table_id)
+        .is_none_or(|table| {
+            selection_table_metadata(&manifest.selection_evidence, table)
+                != SelectionMetadata::Observed
+        })
+    {
+        return false;
+    }
+    manifest.selection_evidence.queries.iter().any(|query| {
+        query.selection_table == Some(table_id)
+            && query.authority == SelectionAuthority::SelectionCountOnly
+            && query.request.name == SelectionNameClass::ExactStandard
+            && query.result.is_some_and(|result| {
+                result.name == SelectionNameClass::ExactStandard
+                    && matches!(
+                        result.version,
+                        SelectionVersionClass::V3_0
+                            | SelectionVersionClass::V3_1
+                            | SelectionVersionClass::V3_2
+                    )
+                    && matches!(result.flags, 0 | 1)
+            })
+    })
+}
+
+fn selection_version_matches(version: Version, class: SelectionVersionClass) -> bool {
+    let expected = match (version.major, version.minor) {
+        (2, 40) => SelectionVersionClass::V2_40,
+        (3, 0) => SelectionVersionClass::V3_0,
+        (3, 1) => SelectionVersionClass::V3_1,
+        (3, 2) => SelectionVersionClass::V3_2,
+        _ => SelectionVersionClass::Other,
+    };
+    class == expected
 }
 
 fn selection_name_agrees(result: &SelectionResult, surface: &SurfaceRecord) -> bool {
@@ -255,35 +409,38 @@ fn selection_version_agrees(result: &SelectionResult, surface: &SurfaceRecord) -
 }
 
 pub(crate) fn selection_surface_usable(surface: &SurfaceRecord) -> bool {
-    if !matches!(surface.acquisition, Acquisition::Ok) {
+    if !surface_function_inventory_complete(surface) {
         return false;
     }
-    let Ok((_, expected_walk)) = expected_surface(surface) else {
+    let Some(version) = surface.version else {
         return false;
     };
-    matches!(
-        (&surface.walk, expected_walk),
-        (WalkOutcome::Full, "full") | (WalkOutcome::KnownPrefix, "known_prefix")
-    )
+    let version = cryptoki_sys::CK_VERSION {
+        major: version.major,
+        minor: version.minor,
+    };
+    let source = match surface.source {
+        SurfaceSource::LegacyFunctionList => Surface::LegacyFunctionList { version },
+        SurfaceSource::Interface { .. } => Surface::StandardInterface { version },
+    };
+    if matches!(tables_for(source), TableSet::Refuse) {
+        return false;
+    }
+    matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
 }
 
 fn validate_selection_table(
     table: &SelectionTable,
+    evidence: &SelectionEvidence,
     object_ids: &BTreeSet<u32>,
     problems: &mut Vec<String>,
 ) {
     if table.id as usize >= MAX_SELECTION_TABLES {
         problems.push(format!("selection table id {} is out of range", table.id));
     }
-    if table.version.major != 3 || table.version.minor > 2 {
+    if matches!(table.walk, WalkOutcome::Refused | WalkOutcome::NotWalked) {
         problems.push(format!(
-            "selection table {} has unsupported version {}.{}",
-            table.id, table.version.major, table.version.minor
-        ));
-    }
-    if !matches!(table.walk, WalkOutcome::Full) {
-        problems.push(format!(
-            "selection table {} must have a full walk outcome",
+            "selection table {} has no acquired function inventory",
             table.id
         ));
     }
@@ -293,18 +450,44 @@ fn validate_selection_table(
             table.id
         ));
     }
-    if let Some(expected) = selection_table_names(table.version) {
-        let actual: Vec<&str> = table
-            .functions
-            .iter()
-            .map(|function| function.name.as_str())
-            .collect();
-        if actual != expected {
+    let expected = selection_table_names(table.version);
+    let metadata = selection_table_metadata(evidence, table);
+    let actual: Vec<&str> = table
+        .functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    if expected.get(..actual.len()) != Some(actual.as_slice()) {
+        problems.push(format!(
+            "selection table {} does not match its canonical function layout",
+            table.id
+        ));
+    }
+    if let WalkOutcome::Unreadable { detail } = &table.walk {
+        bounded("selection walk error", detail, MAX_DETAIL_BYTES, problems);
+        if detail.trim().is_empty()
+            || (actual.len() >= expected.len() && metadata == SelectionMetadata::Observed)
+        {
             problems.push(format!(
-                "selection table {} does not match its canonical function layout",
+                "selection table {} has an invalid unreadable prefix",
                 table.id
             ));
         }
+        if metadata == SelectionMetadata::Observed
+            && (detail.starts_with("version header unreadable:")
+                || detail.starts_with("version metadata changed:"))
+        {
+            problems.push(format!(
+                "selection table {} has inconsistent version-metadata evidence",
+                table.id
+            ));
+        }
+    }
+    if matches!(table.walk, WalkOutcome::Full) && actual.len() != expected.len() {
+        problems.push(format!(
+            "selection table {} full walk is shorter than its bounded layout",
+            table.id
+        ));
     }
     if table.functions.len() > 104 {
         problems.push(format!(
@@ -314,18 +497,23 @@ fn validate_selection_table(
     }
     for function in &table.functions {
         bounded("selection function name", &function.name, 128, problems);
-        match function.resolution {
-            Resolution::NullPointer => {}
-            Resolution::Resolved { object, .. } if object_ids.contains(&object) && object == 0 => {}
+        match &function.resolution {
+            Resolution::NullPointer | Resolution::NonFileBacked | Resolution::Unmapped => {}
+            Resolution::Resolved { object, .. } if object_ids.contains(object) => {}
             Resolution::Resolved { object, .. } => problems.push(format!(
-                "selection function {} refers to dependency object {}",
+                "selection function {} refers to missing object {}",
                 function.name, object
             )),
-            Resolution::NonFileBacked | Resolution::Unmapped | Resolution::UnusableFile { .. } => {
-                problems.push(format!(
-                    "selection function {} has an unresolved resolution",
-                    function.name
-                ));
+            Resolution::UnusableFile { reason, path_hex } => {
+                bounded(
+                    "selection unusable-file reason",
+                    reason,
+                    MAX_DETAIL_BYTES,
+                    problems,
+                );
+                if path_hex.len() > MAX_PATH_BYTES * 2 || !valid_hex(path_hex) {
+                    problems.push("selection unusable file has invalid path_hex".into());
+                }
             }
         }
     }
@@ -348,7 +536,7 @@ fn validate_selection_evidence(
         if !table_ids.insert(table.id) {
             problems.push(format!("duplicate selection table id {}", table.id));
         }
-        validate_selection_table(table, object_ids, problems);
+        validate_selection_table(table, evidence, object_ids, problems);
     }
 
     match evidence.acquisition {
@@ -467,7 +655,10 @@ fn validate_selection_evidence(
                     continue;
                 };
                 if query.helper_failure.is_some()
-                    && !matches!(query.authority, SelectionAuthority::None)
+                    && !matches!(
+                        query.authority,
+                        SelectionAuthority::None | SelectionAuthority::SelectionCountOnly
+                    )
                 {
                     problems.push(format!(
                         "selection query {position} with helper failure has authority"
@@ -490,7 +681,14 @@ fn validate_selection_evidence(
                         ));
                     }
                     Some(SelectionFailure::UnreadableVersion)
-                        if result.version != SelectionVersionClass::Unreadable =>
+                        if result.version != SelectionVersionClass::Unreadable
+                            && !query
+                                .selection_table
+                                .and_then(|id| evidence.tables.iter().find(|table| table.id == id))
+                                .is_some_and(|table| {
+                                    selection_table_metadata(evidence, table)
+                                        == SelectionMetadata::Changed
+                                }) =>
                     {
                         problems.push(format!(
                             "selection query {position} unreadable-version failure disagrees with result"
@@ -500,6 +698,8 @@ fn validate_selection_evidence(
                         if !matches!(
                             result.version,
                             SelectionVersionClass::Null
+                                | SelectionVersionClass::V2_40
+                                | SelectionVersionClass::Other
                                 | SelectionVersionClass::V3_0
                                 | SelectionVersionClass::V3_1
                                 | SelectionVersionClass::V3_2
@@ -509,12 +709,9 @@ fn validate_selection_evidence(
                             "selection query {position} unreadable-table failure disagrees with result"
                         ));
                     }
-                    Some(
-                        SelectionFailure::UnreadableTable
-                        | SelectionFailure::OutsideProvider
-                        | SelectionFailure::UnresolvedFunction
-                        | SelectionFailure::ProviderChanged,
-                    ) if query.selection_table.is_some() => {
+                    Some(SelectionFailure::OutsideProvider | SelectionFailure::ProviderChanged)
+                        if query.selection_table.is_some() =>
+                    {
                         problems.push(format!(
                             "selection query {position} helper failure has a selection table"
                         ));
@@ -530,29 +727,26 @@ fn validate_selection_evidence(
                         continue;
                     };
                     if !query.inventory_matches.is_empty()
-                        || query.helper_failure.is_some()
-                        || query.request.name != SelectionNameClass::ExactStandard
                         || !matches!(query.authority, SelectionAuthority::SelectionCountOnly)
-                        || result.name != SelectionNameClass::ExactStandard
-                        || !matches!(
-                            result.version,
-                            SelectionVersionClass::V3_0
-                                | SelectionVersionClass::V3_1
-                                | SelectionVersionClass::V3_2
+                        || matches!(
+                            query.helper_failure,
+                            Some(
+                                SelectionFailure::NullOutput
+                                    | SelectionFailure::UnreadableInterface
+                                    | SelectionFailure::ProviderChanged
+                                    | SelectionFailure::OutsideProvider
+                            )
                         )
-                        || !matches!(result.flags, 0 | 1)
                     {
                         problems.push(format!(
                             "selection query {position} has invalid selection-table authority"
                         ));
                     }
-                    let result_version = match result.version {
-                        SelectionVersionClass::V3_0 => Some(Version { major: 3, minor: 0 }),
-                        SelectionVersionClass::V3_1 => Some(Version { major: 3, minor: 1 }),
-                        SelectionVersionClass::V3_2 => Some(Version { major: 3, minor: 2 }),
-                        _ => None,
-                    };
-                    if result_version != Some(table.version) {
+                    if !(selection_version_matches(table.version, result.version)
+                        || (selection_table_metadata(evidence, table)
+                            == SelectionMetadata::Unavailable
+                            && result.version == SelectionVersionClass::Unreadable))
+                    {
                         problems.push(format!(
                             "selection query {position} table version disagrees with result"
                         ));
@@ -563,9 +757,6 @@ fn validate_selection_evidence(
                         && previous != table_id
                     {
                         conflict_pair = true;
-                        problems.push(format!(
-                            "selection query {position} conflicts for version/flags pair"
-                        ));
                     }
                 } else if matches!(query.authority, SelectionAuthority::Inventory)
                     && (query.inventory_matches.is_empty()
@@ -631,12 +822,24 @@ fn validate_selection_evidence(
     if conflict_pair && !evidence.selection_truncated {
         problems.push("selection semantic-pair conflict is not truncated".into());
     }
+    if evidence
+        .tables
+        .iter()
+        .any(|table| selection_table_inventory_incomplete(evidence, table))
+        && !evidence.selection_truncated
+    {
+        problems.push("incomplete selection table is not marked truncated".into());
+    }
     if evidence.selection_truncated
         && !conflict_pair
         && !evidence
             .queries
             .iter()
             .any(|query| query.inventory_matches.len() == MAX_SELECTION_MATCHES)
+        && !evidence
+            .tables
+            .iter()
+            .any(|table| selection_table_inventory_incomplete(evidence, table))
     {
         problems
             .push("selection truncation has no bounded alias or semantic conflict evidence".into());
@@ -801,6 +1004,11 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             );
         }
         if let WalkOutcome::Unreadable { detail } = &surface.walk {
+            if detail.trim().is_empty() {
+                problems.push(format!(
+                    "surface {surface_index} unreadable walk has no detail"
+                ));
+            }
             bounded(
                 "surface walk error",
                 detail,
@@ -919,7 +1127,18 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
         }
         if matches!(surface.walk, WalkOutcome::Unreadable { .. }) {
             if !surface.functions.is_empty() {
-                problems.push(format!("unreadable surface {surface_index} must be empty"));
+                let expected = expected_surface(surface);
+                let actual: Vec<_> = surface
+                    .functions
+                    .iter()
+                    .map(|function| function.name.as_str())
+                    .collect();
+                if actual.len() > expected.len()
+                    || (actual.len() == expected.len() && surface.version.is_some())
+                    || expected.get(..actual.len()) != Some(actual.as_slice())
+                {
+                    problems.push(format!("unreadable surface {surface_index} does not match canonical partial function order"));
+                }
             }
             continue;
         }
@@ -931,28 +1150,23 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             }
             continue;
         }
-        match expected_surface(surface) {
-            Ok((expected, expected_walk)) => {
-                if walk_name(&surface.walk) != expected_walk {
-                    problems.push(format!(
-                        "surface {surface_index} walk {:?} disagrees with its source/version; expected {expected_walk}",
-                        surface.walk
-                    ));
-                }
-                let actual: Vec<&str> = surface
-                    .functions
-                    .iter()
-                    .map(|function| function.name.as_str())
-                    .collect();
-                if actual != expected {
-                    problems.push(format!(
-                        "surface {surface_index} does not match canonical function order (got {}, expected {})",
-                        actual.len(),
-                        expected.len()
-                    ));
-                }
+        if matches!(surface.walk, WalkOutcome::Refused) {
+            if !surface.functions.is_empty() {
+                problems.push(format!("refused surface {surface_index} must be empty"));
             }
-            Err(error) => problems.push(format!("surface {surface_index}: {error}")),
+            continue;
+        }
+        let expected = expected_surface(surface);
+        let actual: Vec<_> = surface
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        if expected.get(..actual.len()) != Some(actual.as_slice()) {
+            problems.push(format!(
+                "surface {surface_index} does not match canonical function order (got {}, maximum {})",
+                actual.len(), expected.len()
+            ));
         }
     }
 

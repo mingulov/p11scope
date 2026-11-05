@@ -1,0 +1,1921 @@
+{
+  "schema": "p11scope/ignored-tests/v1",
+  "cells": {
+    "privileged": "ignored lib test curated in scripts/run-privileged-lib-tests.sh (default, long, btrfs, overlay, expected-failure, skip or alternative list)",
+    "live-kernel": "ignored integration test needing a real kernel/verifier lane outside the lib runner",
+    "feature": "ignored test needing a cargo feature or a dedicated build configuration; `owner` names the lane that runs it",
+    "performance": "ignored timing loop with no pass/fail bar, run by hand",
+    "helper": "ignored private helper re-executed by its owning test; never a standalone cell"
+  },
+  "sites": [
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::collected_partial_group_real_session_guards_refuse_until_terminal_lp64",
+      "reason": "R1 lane; privileged: real Detailed Session native retirement (partial-group deferral guards)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::collected_retirement_singles_session_defers_close_to_terminal_detach_lp64",
+      "reason": "R1 lane; privileged: real Detailed Session native retirement (Singles defers close to terminal detach)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::collected_retirement_stopped_session_q_closes_original_lp64",
+      "reason": "R1 lane; privileged: real Detailed Session native retirement (Multi close at Q, then mint)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::full_root_load_refusal_is_classified",
+      "reason": "root-owned BPF lane; FULL root load refusal is classified",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::stubbed_roots_load",
+      "reason": "root-owned BPF lane; stubbed p11_entry/p11_return load on 1M kernels",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel",
+      "reason": "live-kernel BPF lane; reports bpf_loop helper presence without asserting it",
+      "cell": "privileged",
+      "until": {
+        "item": "old-kernel live lanes in CI",
+        "owner": "WP-9"
+      }
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::sealed_session_drain_linkage_is_behavioral",
+      "reason": "privileged: real Session seal-to-drain linkage (installed linked control); standalone hand-run cell, fail-loud-unprivileged by design",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::gate_session_binds_live_gate_and_bank_cells",
+      "reason": "loader-gate activation; privileged: live self-preflight session binds the gate and bank cells",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/counter_banks.rs",
+      "path": "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
+      "reason": "requires the default build with embedded counter objects; run as root in an authorized BPF lane with LP64 map/program load and uprobe_multi",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/counter_banks.rs",
+      "path": "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",
+      "reason": "C1 live twin; privileged: every counter object loads through Session preparation (gate-1 must accept gate-free counter objects)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/counter_banks.rs",
+      "path": "attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels",
+      "reason": "historical/private opt-in control outside current live-positive qualification: pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
+      "cell": "privileged",
+      "until": {
+        "item": "pre-5.17 kernel lane in CI",
+        "owner": "WP-9"
+      }
+    },
+    {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::anchor_maps_validate_real_handles",
+      "reason": "privileged: creates real BPF maps for handle validation",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none",
+      "reason": "privileged: functional probe proves hardlink-match vs copy-NONE",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::whole_system_run_covers_all_children",
+      "reason": "privileged: small-scale whole-system run shape",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm",
+      "reason": "privileged: WRONLY anchor fds refuse all syscall reads with EPERM",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
+      "reason": "privileged: nonleader anchor run installs nothing live (root strict BPF load; run by hand on a live kernel lane, outside the lib runner)",
+      "cell": "live-kernel",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32",
+      "reason": "privileged: explicit Multi, same-object iterator and nonempty ia32 successor proof",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_full_image_native_multi_query_and_scan_lp64",
+      "reason": "privileged: explicit Multi, same-object iterator and nonempty LP64 successor proof",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_b17_counters_observe_sharer_churn",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes; live marker twin, fail-loud-unprivileged by design, run by hand",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_b17_drain_yields_identity_once_live",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes; live drain twin, fail-loud-unprivileged by design, run by hand",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_continuity_experiment_softhsm",
+      "reason": "privileged: 60 s SoftHSM2 continuity experiment",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_cross_process_punch_hole_renews",
+      "reason": "privileged: loads BPF; needs punch-hole-capable TMPDIR, run by hand",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_exec_renews_the_instance",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_hooks_attach_for_profile_but_not_metrics",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_mapping_controls_never_join_old_state",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_mremap_dontunmap_keeps_both_and_renews",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_nonleader_exec_detaches_without_misrouting",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_overflow_at_ninth_file_is_unknown",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_pre_attachment_sharer_globalizes",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins",
+      "reason": "privileged: same-address reload race against a second calling thread",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir",
+      "reason": "privileged: needs TMPDIR on btrfs, run by hand",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins",
+      "reason": "privileged: needs a small-state build, run by hand",
+      "cell": "privileged",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_vfork_unmap_globalizes",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties",
+      "reason": "privileged: birth marker abandoned call at thread exit dirties",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec",
+      "reason": "privileged: birth marker cgroup gap sticks across re-entry and exec",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row",
+      "reason": "privileged: birth marker cgroup-outsider call creates a DIRTY row",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready",
+      "reason": "privileged: birth marker dirty non-leader exec publishes fresh READY",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready",
+      "reason": "privileged: birth marker exec after closure publishes READY",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready",
+      "reason": "privileged: birth marker fork without exec publishes no READY",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row",
+      "reason": "privileged: birth marker non-leader exec creates a fresh READY row",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_ordinary_capture_mints_no_birth",
+      "reason": "privileged: birth marker ordinary capture mints no birth",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved",
+      "reason": "privileged: birth marker PID outsider stays unobserved",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_pid_reuse_exec_creates_no_row",
+      "reason": "privileged: birth marker PID reuse exec creates no row",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties",
+      "reason": "privileged: birth marker return outside scope dirties",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_ready_exec_after_closure_publishes_ready",
+      "reason": "privileged: journal READY exec after closure publishes READY",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_semantic_capture_multi_reload_and_rebound_successor",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_system_identity_anchor_preserves_watched_instance",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_object_continuity_refusal_preserves_s1_base",
+      "reason": "privileged: default FULL LP64, working uprobe_multi/native instance hooks; Session-owned INSTANCE_START deletion at a held object call, healthy 608/refused 368 S1 conservation twins",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::detailed_sweep_test!",
+      "reason": "root-owned BPF lane; bounded physical Detailed sweep",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::inventory_sweep_test!",
+      "reason": "root-owned BPF lane; bounded physical Inventory sweep",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_bench_overhead_detailed_calls",
+      "reason": "root-owned BPF lane; Detailed per-call overhead bench, timed 1-thread CALL and 8-thread FANOUT batches",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_auto_excludes_foreign_and_reused_pid_lp64",
+      "reason": "root-owned BPF lane; classic --pid auto keeps foreign and reused-PID processes out at the kernel",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_forced_multi_names_the_target_or_refuses_lp64",
+      "reason": "root-owned BPF lane; classic --pid forced multi names the target or is refused",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_singles_excludes_foreign_and_reused_pid_lp64",
+      "reason": "root-owned BPF lane; classic --pid singles keeps foreign and reused-PID processes out at the kernel",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup",
+      "reason": "root-owned BPF lane; 2112-slot Detailed stop publishes before cleanup",
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_detailed_auto_backend_same_cpu_preemption_keeps_frames",
+      "reason": "root-owned BPF lane; the Auto backend loads and keeps frames under same-CPU preemption",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_detailed_multithread_owner_accounting_exact",
+      "reason": "root-owned BPF lane; multi-thread owner accounting never poisons and counts exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_detailed_multithread_same_slot_allowlisted_exact",
+      "reason": "root-owned BPF lane; one-slot contended multi-thread Allowlisted capture stays exact",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_detailed_owner_poison_is_disclosed",
+      "reason": "root-owned BPF lane; a poisoned native owner halts capture and is disclosed",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_detailed_same_cpu_preemption_keeps_frames",
+      "reason": "root-owned BPF lane; same-CPU preempted probe invocations keep their own frames",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_activation_cgroup_separates_owned_callers",
+      "reason": "parent-owned BPF/cgroup lane; owned in/out callers and retained cgroup descriptor",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_activation_failure_preserves_usage_and_releases_resources",
+      "reason": "parent-owned BPF lane; real partial activation and preserved positive failure evidence",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_activation_stop_with_owned_calls_in_progress",
+      "reason": "parent-owned BPF lane; bounded owned calls overlap producer stop, no quiescence claim",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_activation_system_ia32",
+      "reason": "parent-owned privileged BPF lane plus cc -m32; actual IA32 entry links and workload",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_activation_system_lp64",
+      "reason": "parent-owned privileged BPF lane; actual links, physical owned GO ledger and cleanup",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_caller_cgroup_lp64",
+      "reason": "root-owned live BPF/cgroup lane; included/excluded image pairs and release",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_caller_partial_activation_lp64",
+      "reason": "root-owned live BPF lane; partial caller activation retains binding, pair, IDs and pin",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_caller_system_ia32",
+      "reason": "root-owned live BPF lane; exact IA32 caller images, pair exhaustion and release",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_caller_system_lp64",
+      "reason": "root-owned live BPF lane; exact LP64 caller images, pair exhaustion and release",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64",
+      "reason": "root-owned BPF lane; 8192-endpoint Multi population admits every endpoint with no refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8193_refuses_lp64",
+      "reason": "root-owned BPF lane; 8193-endpoint Multi population refuses the 8193rd whole and keeps the 8192 prefix",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn",
+      "reason": "root-owned BPF lane and external lifecycle ledger; explicit controlled worker/synchronous comparison",
+      "cell": "privileged",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_stop_gate_freezes_capture_state_after_quiescence",
+      "reason": "root-owned BPF lane; Detailed stop gate freezes capture state after quiescence",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_stop_gate_keeps_calls_in_flight_as_residual",
+      "reason": "root-owned BPF lane; Detailed stop keeps in-flight calls as residual evidence",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64",
+      "reason": "root-owned BPF lane; third RV key on a hot Detailed slot with exact per-plane rows",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64",
+      "reason": "root-owned BPF lane; bounded physical Inventory sweep with envelope refusal branch",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64",
+      "reason": "root-owned BPF lane; 2112 distinct physical Detailed slots, 4224 CALL events and exact raw RV rows",
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_task4_detailed_physical_identity_controls",
+      "reason": "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Detailed targets",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec",
+      "reason": "root-owned BPF lane; 2049 physical endpoints and slot 2048 nonleader-exec START cleanup",
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit",
+      "reason": "root-owned BPF lane; 2049 physical endpoints and slot 2048 worker-exit START cleanup",
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_task4_inventory_2112_lp64",
+      "reason": "root-owned BPF lane; 2112 distinct physical Inventory entry probes and exact all-ID ledger",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_task4_inventory_physical_identity_controls",
+      "reason": "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Inventory targets",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_dr37_selected_promotion_full_loop",
+      "reason": "privileged DR37 full loop: root BPF lane over an owned fixture provider with live calls, serial",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_active_spawn_exec_ticket_without_provider_call_lp64",
+      "reason": "root-owned live BPF lane; post-activation EXEC allocates distinct owned tickets without any provider call",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64",
+      "reason": "root-owned live BPF lane; pidfd TASK_COOKIE answer equals the row and changes on nonleader exec",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64",
+      "reason": "root-owned live BPF lane; a provider extended after activation is witnessed only after extend",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_leader_exec_ticket_and_delayed_drain_lp64",
+      "reason": "root-owned live BPF lane; leader EXEC tickets survive queued delayed drain and match the original pidfd",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_active_spawn_exec_ticket_without_provider_call_lp64",
+      "reason": "root-owned live BPF lane; Multi post-activation EXEC allocates distinct owned tickets without any provider call",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64",
+      "reason": "root-owned live BPF lane; Multi EXEC record ticket equals the original pidfd before provider use",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_leader_exec_ticket_and_delayed_drain_lp64",
+      "reason": "root-owned live BPF lane; Multi leader EXEC tickets survive queued delayed drain and match the original pidfd",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64",
+      "reason": "root-owned live BPF lane; PID-scoped uprobe-multi excludes a foreign caller and a reused-PID process",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_leader_exit_probe_lp64",
+      "reason": "root-owned live BPF lane; probe: do PID-named uprobe-multi entries keep firing after the leader exits",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64",
+      "reason": "root-owned live BPF lane; PID scope excludes a foreign caller and a reused-PID process",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_leader_exit_probe_lp64",
+      "reason": "root-owned live BPF lane; probe: do OneProcess entries keep firing after the PID target's leader thread exits",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_before_activation_repolls_custody_lp64",
+      "reason": "root-owned live BPF lane; a PID capture stopped before activation keeps its pin and re-polls custody",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64",
+      "reason": "root-owned live BPF lane; stop with a held call completes retirement and reports unsettled reads",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/privileged_tests.rs",
+      "path": "attach::inventory::privileged_tests::privileged_inventory_caller_preparation_faults_release_exact_resources",
+      "reason": "root-owned BPF lane; each caller native preparation fault retains source and releases IDs",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/privileged_tests.rs",
+      "path": "attach::inventory::privileged_tests::privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_binding",
+      "reason": "root-owned BPF lane; exact caller map/freeze and private ENDPOINT_OBJECT publication",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/privileged_tests.rs",
+      "path": "attach::inventory::privileged_tests::privileged_inventory_preparation_failure_releases_owned_resources",
+      "reason": "requires privileged BPF; serial bounded failure/drop FD and exact object-ID accounting",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/privileged_tests.rs",
+      "path": "attach::inventory::privileged_tests::privileged_inventory_preparation_freezes_all_nine_protected_maps",
+      "reason": "requires privileged BPF; verifies every frozen map with valid observer-owned inputs",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/privileged_tests.rs",
+      "path": "attach::inventory::privileged_tests::privileged_inventory_preparation_loads_multi_without_links",
+      "reason": "requires privileged BPF and a kernel supporting the selected multi load backend",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/privileged_tests.rs",
+      "path": "attach::inventory::privileged_tests::privileged_inventory_preparation_loads_runtime_capacity_and_zero_links",
+      "reason": "requires privileged BPF, vmlinux BTF, exact-object verifier and cleanup accounting",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/lifecycle_tests.rs",
+      "path": "attach::lifecycle_tests::privileged_detailed_nonleader_exit_preserves_same_slot_sibling_start",
+      "reason": "root-owned BPF lane; real Detailed Singles, two held STARTs and selective thread cleanup",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/lifecycle_tests.rs",
+      "path": "attach::lifecycle_tests::privileged_detailed_nonleader_exit_reclaims_start_and_preserves_leader",
+      "reason": "root-owned BPF lane; real Detailed Singles, raw nonleader exit and surviving leader",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/lifecycle_tests/exec_tests.rs",
+      "path": "attach::lifecycle_tests::exec_tests::privileged_detailed_failed_nonleader_exec_preserves_start_and_image",
+      "reason": "root-owned BPF lane; failed raw exec preserves held Detailed START and actual function RV",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/lifecycle_tests/exec_tests.rs",
+      "path": "attach::lifecycle_tests::exec_tests::privileged_detailed_nonleader_exec_cleans_old_tid_before_same_session_rebind",
+      "reason": "root-owned BPF lane; actual nonleader exec cleanup before explicit same-Session rebinding",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/object_stop.rs",
+      "path": "attach::object_stop::tests::object_stop_refuses_real_unproven_q_without_mutation",
+      "reason": "privileged: actual STOP_GATE no-Q and admitted-body refusal controls",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/object_stop.rs",
+      "path": "attach::object_stop::tests::object_stop_reports_real_scrub_failure",
+      "reason": "privileged: frozen real OBJECT_START must not produce false scrub success",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/object_stop.rs",
+      "path": "attach::object_stop::tests::object_stop_scrubs_real_retained_map_after_q",
+      "reason": "privileged: creates actual native BPF map definitions and retains map FDs",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/confirm_shards_tests.rs",
+      "path": "discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe",
+      "reason": "root (map_files): proves real children's ranges",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_ext4_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity",
+      "reason": "root: loop ext4 mounts plus eligible BTF/task_vma identity (fails closed without it, including 5.15)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity",
+      "reason": "root: loop overlay mounts (mkfs.ext4, mount, umount) plus eligible BTF/task_vma identity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
+      "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); copy-up no-re-edge positive, fail-loud off lane B by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins",
+      "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); fresh-positive twin, fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses",
+      "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); stale-negative twin, fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_population_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_zombie_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; zombie survivor collision parity, run by hand on a live kernel lane, outside the lib runner",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "src/discovery/d4_zombie_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; cold zombie admission parity, run by hand on a live kernel lane, outside the lib runner",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap",
+      "reason": "privileged: stamped legacy 3.x verdict cell, BPF-free",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+      "reason": "private manifest helper; invoked by DiscoveryLifecycleFixture",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale",
+      "reason": "scale: system-population graph sizing, time measured not gated (R-40); run by exact selector at V2 and L",
+      "cell": "performance",
+      "until": {
+        "item": "permanent: hand-run sizing gate, not a campaign cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
+      "reason": "R57 future positive, expected RED until a provider-free transaction receipt lands (docs/notes/2026-10-29-r57-exit-receipt-boundary.md); draft has not been run; settlement is always a counted truncation; un-ignore when a settlement receipt lands",
+      "cell": "performance"
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::exit_mappings_live_cgroup_split_and_default_twin",
+      "reason": "6.14A exit-mapping lane; privileged: live BPF exit-mapping split over owned short-lived children with a default twin (cgroup scope, host BTF + gcc, ~25 s). Known-fail on 6.6.157: pre-existing planner scan/manifest merge divergence (candidate contains the same exact provider more than once), reproduced at the lane base; green on host/6.12/6.18/Fedora",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/identity.rs",
+      "path": "discovery::identity::tests::map_files_name_timing_per_thousand",
+      "reason": "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded",
+      "cell": "performance",
+      "until": {
+        "item": "permanent: timing loop with no pass/fail bar",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/identity.rs",
+      "path": "discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance",
+      "reason": "private count-manifest cache helper; invoked by count_manifest_full_and_tail_share_the_scan_inspection_cache",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/inventory_workload_tests.rs",
+      "path": "discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097",
+      "reason": "controller lane: privileged BPF load plus attach-scale projection at 4097 endpoints",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/inventory_workload_tests.rs",
+      "path": "discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530",
+      "reason": "controller lane: privileged BPF load plus attach-scale projection at 6530 endpoints",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/inventory_workload_tests.rs",
+      "path": "discovery::inventory_workload::tests::privileged_inventory_attach_projection_n8192",
+      "reason": "controller lane: privileged BPF load plus attach-scale projection at 8192 endpoints",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through sh -c exec with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64",
+      "reason": "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64",
+      "reason": "privileged: run --pause never through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once",
+      "reason": "privileged: live BPF all-blocked negative twin; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head",
+      "reason": "privileged: live BPF 256-request pressure episode; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control_admits",
+      "reason": "privileged: live BPF unparked-head control; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::pressure_live_ticket_spend_control_refuses_ambient",
+      "reason": "privileged: live BPF system capture; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_view_capacity_gap",
+      "reason": "privileged: live BPF cgroup-scoped 257-provider-load view-capacity gap; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_identity_refusals",
+      "reason": "privileged: live BPF 16385-image ticket-quota gap; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/publication_tests.rs",
+      "path": "discovery::engine::publication_tests::broad_p11kit_admission_arithmetic",
+      "reason": "manual: needs host libp11-kit + python3; run filtered with --ignored --nocapture",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/scan.rs",
+      "path": "discovery::scan::tests::maps_reuse_timing_per_thousand_reads",
+      "reason": "manual: indicative maps-reuse timing loop, no pass/fail bar; run by hand single-threaded",
+      "cell": "performance",
+      "until": {
+        "item": "permanent: timing loop with no pass/fail bar",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/scan.rs",
+      "path": "discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path",
+      "reason": "requires a root-owned target with two private cross-device mounts",
+      "cell": "privileged",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge",
+      "reason": "root (map_files) on a btrfs TMPDIR: creates two subvolumes there",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4",
+      "reason": "root: mounts a loop ext4 image (mkfs.ext4, mount, umount)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file",
+      "reason": "root (map_files) on a btrfs TMPDIR: creates two subvolumes there",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4",
+      "reason": "root: mounts a loop ext4 image (mkfs.ext4, mount, umount)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_parity",
+      "reason": "root Btrfs disk TMPDIR, private mount namespaces and eligible BTF/task_vma identity; actual bind alias parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_deleted_mapping_backend_parity",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual deleted-mapping parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual hardlink alias parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_same_line_remap_backend_parity",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual same-line remap parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_subvolume_collision_backend_parity",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual kernel/userspace parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity",
+      "reason": "root Btrfs disk TMPDIR, worker CLONE_FILES unshare and eligible BTF/task_vma identity; actual live-thread parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::d4_thread_mapping_helper",
+      "reason": "private D4 thread fixture entrypoint; invoked only by its owning parity test with an owned socket/configuration",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity",
+      "reason": "root x86-64 LP64 Btrfs disk TMPDIR, literal private-files clone and eligible BTF/task_vma identity; actual backend parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper",
+      "reason": "private D4 literal-clone fixture entrypoint; requires its owning parity test socket/configuration",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity",
+      "reason": "root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required zombie-leader positive baseline",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper",
+      "reason": "private D4 zombie fixture entrypoint; requires owning socket and source configuration",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/events/runtime_tests.rs",
+      "path": "events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains",
+      "reason": "requires privileged BPF map creation on a supported kernel",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/events/runtime_tests.rs",
+      "path": "events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map",
+      "reason": "requires privileged BPF map creation on a supported kernel",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/events/runtime_tests.rs",
+      "path": "events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict",
+      "reason": "loads the cheap self-probe return program and probes a fresh owned seccomp-confined child",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/first_use_probe/native.rs",
+      "path": "first_use_probe::native::system_capture_observer_facts",
+      "reason": "owned root first-use observer; frozen config, supervisor and exclusive BPF lane required",
+      "cell": "privileged",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/inspect_system.rs",
+      "path": "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed",
+      "reason": "privileged: real kernel BTF identity-denial disclosure; lane-classified",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
+      "reason": "root-owned live BPF lane; D3d forced-kernel multi-pass session reuse over a btrfs fixture",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
+      "reason": "root-owned live BPF lane; D3d forced-kernel sweep cell over a btrfs fixture",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64",
+      "reason": "privileged: live Joint absence and S1Only siblings beside a post-attach exec",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64",
+      "reason": "root-owned live BPF lane; live joint machine begin to Published to WoundDown through the finish driver",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64",
+      "reason": "privileged: live Joint first birth through a held q1 to q2 and stop",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_init_latches_producer_linkage",
+      "reason": "privileged: joint init latches producer linkage before traffic (serial; plain build asserts the linked refusal)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64",
+      "reason": "privileged: live Joint promotion retires A before B is admitted",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_edges_lp64",
+      "reason": "privileged: inventory --system --manifest end to end with a SoftHSM workload exits 0 with populated S1 edges or named route-loss gaps",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64",
+      "reason": "privileged: inventory --system --manifest over 4097+ endpoints stops finitely with S1 edges for a long-running caller and the journal_unavailable disclosure",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
+      "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_pid_lp64",
+      "reason": "root-owned live BPF lane; native lane --pid: stamps, witnessed edge, no foreign caller",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_pid_provider_retirement_diagnostics_lp64",
+      "reason": "root-owned live BPF lane; real provider retirement recovers B and exports diagnostics",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64",
+      "reason": "root-owned live BPF lane; SIGINT during activation still gets one full pass",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64",
+      "reason": "root-owned live BPF lane; native lane stop with a held call reads unsettled",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_system_ab_first_count_lp64",
+      "reason": "root-owned live BPF lane; native lane --system counts a late second module's first call exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64",
+      "reason": "root-owned live BPF lane; native --system under 100 and 1,000 execs/s exec churn",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64",
+      "reason": "root-owned live BPF lane; native lane --system witnesses a late dlopen",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64",
+      "reason": "root-owned live BPF lane; native --system over 400+ endpoints retires closed",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_prearm_reaches_armed_pid",
+      "reason": "pre-arm live cell (pid scope); declared proved set attaches through the activating extend, watch reaches armed live, ends terminally; privileged lock + sudo -n (~4 s)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64",
+      "reason": "root-owned BPF lane; real3-round accelerated10ms cadence pilot, bounded90s",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64",
+      "reason": "root-owned BPF lane; real3-round default-cadence control, bounded90s",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64",
+      "reason": "root-owned BPF lane; real3-round gate-cadence probe, bounded90s",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64",
+      "reason": "root-owned BPF lane; source-matched prebuilt3-round probe, bounded90s",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64",
+      "reason": "root-owned BPF lane; parameterized C=32/S=4 full-transition pilot at default cadence, bounded540s",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64",
+      "reason": "root-owned BPF lane; prebuilt32-object fixture, paired default-ring wrap (~22min)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
+      "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64",
+      "reason": "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair (~22min+)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/present/reload_disclosure_privileged_tests.rs",
+      "path": "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_lists_churned_identity",
+      "reason": "privileged: installed inventory capture over a fixture; the disclosure names the churned identity with exact counts",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/present/reload_disclosure_privileged_tests.rs",
+      "path": "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_omits_key_without_churn",
+      "reason": "privileged: installed inventory capture over a fixture; the clean control omits the disclosure key",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, selected format2 object, and authorized 513-endpoint native attachment",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, selected format2 object, proven kernel Multi PID filtering, and authorized 513-endpoint native Multi attachment",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64",
+      "reason": "requires explicitly prebuilt LP64 counter-banks fixtures and authorized native attach",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, proven kernel Multi PID filtering, and authorized Engine-driven first-512 native Multi staging",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized Engine-driven growth to 8192 plus an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, a high hard RLIMIT_NOFILE, and authorized Engine-driven Multi staging from a soft-1024 start",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, a high hard RLIMIT_NOFILE, and authorized native BPF for the bypassed-preparation FD-exhaustion twin",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized Engine-driven Multi staging for live and terminal collection",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",
+      "reason": "requires an explicitly granted native map-only BPF lane; no attach/program load",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health",
+      "reason": "requires an explicitly granted native map-only BPF lane; no attach/program load",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64",
+      "reason": "requires explicitly prebuilt LP64 counter-banks fixtures, validated timestamps and latency format2 objects, and authorized native attach; runs a counts-null twin first",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated timestamps format2 object, functional kernel Multi attachment, and authorized native Multi staging",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated latency format2 object, functional kernel Multi attachment, and authorized native Multi staging",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated timestamps format2 object, proven kernel Multi PID filtering, and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated latency format2 object, proven kernel Multi PID filtering, and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64",
+      "reason": "historical/private opt-in control outside current live-positive qualification: 6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
+      "cell": "privileged",
+      "until": {
+        "item": "6.1 verifier-budget lane in CI",
+        "owner": "WP-9"
+      }
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, selected format2 object, and separate FD/memory/native admission for 8192 distinct endpoints after the qualified Multi513 pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures, a cgroup v2 hierarchy, and authorized native Multi staging as root: Engine-driven cgroup growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven system growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven Multi stop prints no one-at-a-time detach estimate",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: a second stop signal abandons a Singles counter detach promptly with the typed interruption",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven timestamps growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven latency growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64",
+      "reason": "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode timestamps to -o JSON with exact workload-ledger numbers",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode latency to -o JSON with exact workload-ledger numbers",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
+      "reason": "requires authorized native Multi staging as root: run --counter-mode counts with an owned child to -o JSON",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
+      "reason": "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures as root: 6.15 selection stage against the live plan refuses system scope by name",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts voids as caller-changed when the SoftHSM workload execs mid-window",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_run_exit_in_window_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts whose owned child does four C_Sign calls and exits inside the window",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --pid --select-endpoint counts whose target does four C_Sign calls and exits before the duration ends",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a gate-less short owned child that signs four times and exits at once",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/process.rs",
+      "path": "process::tests::pidfd_denial::pidfd_denial_helper",
+      "reason": "private seccomp helper; invoked by real_pidfd_denial_preserves_proc_identity_without_signal_authority",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/run/root_fence_runtime.rs",
+      "path": "run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending",
+      "reason": "requires separately reviewed native stage, capture activation derivative, and kernel privileges",
+      "cell": "privileged",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/s1_tests/resource_probe.rs",
+      "path": "s1_tests::resource_probe::native_semantic_resource_final_probe",
+      "reason": "explicit controller-granted host measurement; spawns bounded children",
+      "cell": "privileged",
+      "until": {
+        "item": "controller-authorized measurement plan",
+        "owner": "controller"
+      }
+    },
+    {
+      "file": "src/s1_tests/resource_probe.rs",
+      "path": "s1_tests::resource_probe::native_semantic_resource_registry_probe",
+      "reason": "explicit controller-granted host measurement; spawns bounded children",
+      "cell": "privileged",
+      "until": {
+        "item": "controller-authorized measurement plan",
+        "owner": "controller"
+      }
+    },
+    {
+      "file": "src/semantics_edge/resource_tests.rs",
+      "path": "semantics_edge::resource_tests::native_semantic_resource_probe",
+      "reason": "explicit controller-granted host measurement; spawns bounded children",
+      "cell": "privileged",
+      "until": {
+        "item": "controller-authorized measurement plan",
+        "owner": "controller"
+      }
+    },
+    {
+      "file": "tests/bpf_load_feasibility.rs",
+      "path": "per_program_load_times",
+      "reason": "privileged: per-program BPF load cost matrix; run as root with --ignored --test-threads=1",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/bpf_load_feasibility.rs",
+      "path": "parallel_load_measures_kernel_overlap",
+      "reason": "privileged: parallel BPF load overlap probe; run as root with --ignored --test-threads=1",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/bpf_load_feasibility.rs",
+      "path": "parallel_load_partial_failure_retains_cleanup_owner",
+      "reason": "privileged: parallel-load partial-failure cleanup twin; run as root with --ignored --test-threads=1",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/bpf_load_feasibility.rs",
+      "path": "resident_service_cost_parts",
+      "reason": "privileged: resident-service cost parts; run as root with --ignored --test-threads=1",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/entry_object_paired.rs",
+      "path": "paired_default_and_unsafe_objects_satisfy_the_entry_contract",
+      "reason": "needs default and unsafe-unvalidated-metadata target dirs from the paired-build lane; static object analysis, no BPF load; run by hand, about 2 hours (measured 6,915 s on the current objects)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/exec_task_continuity.rs",
+      "path": "exec_task_core_shapes_kernel_load_without_attachment",
+      "reason": "requires the root-owned privileged verifier lane",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/identity_iter_standalone.rs",
+      "path": "identity_loader_strict_gate_requires_btf_and_both_programs",
+      "reason": "privileged: verifies both identity programs through the kernel verifier",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/inventory_identity.rs",
+      "path": "d4_btrfs_scan_backends_match_exact_fixture_population",
+      "reason": "development-host Btrfs/privileged lane; gcc-builds fixtures and rejects every refusal",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/inventory_identity.rs",
+      "path": "kernel_identity_positive_cell_rejects_refusal",
+      "reason": "privileged capable lane with btrfs fixtures; fails on any kernel refusal",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/object_producer_activation.rs",
+      "path": "counter_artifact_modes_have_exact_maps_and_root_work",
+      "reason": "requires P11SCOPE_COUNTER_ARTIFACTS=1 in its own build configuration",
+      "cell": "feature",
+      "owner": "counter-artifacts build"
+    },
+    {
+      "file": "tests/object_producer_activation.rs",
+      "path": "counter_artifact_mutations_are_causally_rejected",
+      "reason": "requires P11SCOPE_COUNTER_ARTIFACTS=1 in its own build configuration",
+      "cell": "feature",
+      "owner": "counter-artifacts build"
+    },
+    {
+      "file": "tests/object_producer_activation.rs",
+      "path": "counter_bank_btf_maps_and_programs_load",
+      "reason": "requires the default build with embedded counter objects and an authorized BTF/map/program-load lane",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/run_abandon_report.rs",
+      "path": "second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
+      "reason": "privileged: loads BPF; run as root with --ignored --test-threads=1",
+      "cell": "live-kernel"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_verifier_stats",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N1-N4 verifier/object cells",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_exhaustion_16384_then_quota",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N6 exhaustion and N16 saturation cells",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_cut_16385th_leader_in_b",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_concurrent_cut_counts_once",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 concurrent cut counting cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_held_return_across_cut",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N9 held-return-across-cut cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_late_incarnation_refused",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N10 late-incarnation refusal cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_failure_modes_refuse_and_balance",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 failure-modes cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_fork_burn_sentinel",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N12 fork-burn and N4 memlock cells",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_second_rollover",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 second-rollover cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_omitted_route_refuses",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N13 omitted-route cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N14 exec/query-span cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N15 attach-cookie cell",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 in-flight cut counting cell (flip while calling)",
+      "until": "0.7.0"
+    },
+    {
+      "cell": "performance",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane on a quiet host (E4); N5 per-call overhead cell",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery",
+      "reason": "privileged: live linked lane pumps discovery through the live arm (serial; omitted journal build asserts the refusal)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
+      "reason": "privileged: live discovery transport fault refuses without latching (serial; omitted journal build asserts the refusal)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag",
+      "reason": "privileged: live seal generation publishes only with the journal pair (serial)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
+      "reason": "privileged: live linked fault fails coverage without latching, finish publishes (serial; omitted journal build asserts the refusal)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
+      "reason": "privileged: healthy linked control routes normally without CoverageFailed",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/async_value_flags_tests.rs",
+      "path": "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
+      "reason": "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (LP64)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/async_value_flags_tests.rs",
+      "path": "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
+      "reason": "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (ia32)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/async_value_flags_tests.rs",
+      "path": "attach::async_value_flags_tests::privileged_async_getid_valid_output_reads_id_lp64",
+      "reason": "privileged: OK C_AsyncGetID with a valid output reads the id with no flag (LP64)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/async_value_flags_tests.rs",
+      "path": "attach::async_value_flags_tests::privileged_async_getid_valid_output_reads_id_ia32",
+      "reason": "privileged: OK C_AsyncGetID with a valid output reads the id with no flag (ia32)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/async_value_flags_tests.rs",
+      "path": "attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_lp64",
+      "reason": "privileged: C_AsyncJoin carries the detached id with no flag and the op completes (LP64)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/async_value_flags_tests.rs",
+      "path": "attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia32",
+      "reason": "privileged: C_AsyncJoin carries the detached id with no flag and the op completes (ia32)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/joint_stop_races_privileged_tests.rs",
+      "path": "inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64",
+      "reason": "privileged: live Joint stop after the last waiter resolves; run by hand via scripts/ci/stop-races.sh (results.jsonl entry), unscheduled in CI",
+      "cell": "privileged",
+      "until": "0.7.0"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_map_and_call_after_finalize_is_clean",
+      "reason": "privileged: pre-arm witness P2-7 map_and_call_after_finalize_is_clean cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_observer_self_map_during_startup_is_clean",
+      "reason": "privileged: pre-arm witness P2-7 observer_self_map_during_startup_is_clean cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_readonly_mapped_before_start_is_found",
+      "reason": "privileged: pre-arm witness P2-7 readonly_mapped_before_start_is_found cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_mprotect_dance_before_finalize_is_found",
+      "reason": "privileged: pre-arm witness P2-7 mprotect_dance_before_finalize_is_found cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_map_unmap_inside_window_is_latched",
+      "reason": "privileged: pre-arm witness P2-7 map_unmap_inside_window_is_latched cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_zombie_leader_holding_file_is_found",
+      "reason": "privileged: pre-arm witness P2-7 zombie_leader_holding_file_is_found cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_held_teardown_is_pending",
+      "reason": "privileged: pre-arm witness P2-7 held_teardown_is_pending cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_exec_departure_under_holder_is_pending",
+      "reason": "privileged: pre-arm witness P2-7 exec_departure_under_holder_is_pending cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_cgroup_member_migrated_out_is_migration",
+      "reason": "privileged: pre-arm witness P2-7 cgroup_member_migrated_out_is_migration cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_nested_pidns_observer_is_unavailable",
+      "reason": "privileged: pre-arm witness P2-7 nested_pidns_observer_is_unavailable cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_walk_scale_completes",
+      "reason": "privileged: pre-arm witness P2-7 walk_scale_completes cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_prearm_witness_loads_and_attaches",
+      "reason": "privileged: loads the witness object on the host kernel",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_cgroup_id_matches_kernfs_id",
+      "reason": "privileged: cgroup id matches kernfs id via witness walk",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_start_activates_on_host",
+      "reason": "privileged: live witness start on the host",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_finalize_clears_clean_start",
+      "reason": "privileged: live witness finalize on the host",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_finalize_settles_under_churn",
+      "reason": "privileged: witness quiesce under maps churn",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::witness_fixture_entrypoint",
+      "reason": "private witness fixture helper; invoked by P2-7 cells",
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_pid_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_cgroup_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_system_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_metrics_system_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_pid_prearm_twin_exact_window",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_trace_system_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses",
+      "reason": "root: loop overlay mounts drive the production original-file witness",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves",
+      "reason": "root: loop overlay mounts drive the production original-file witness",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback",
+      "reason": "root: loop overlay mounts drive the sweep-side overlay no-fallback",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses",
+      "reason": "root: loop overlay mounts drive the sweep-side witness cell",
+      "cell": "privileged"
+    }
+  ]
+}

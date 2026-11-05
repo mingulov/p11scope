@@ -29,20 +29,47 @@ macro_rules! eprint {
 }
 
 pub mod attach;
+// DR04's private parser/acquisition packet is staged; the opt-in coordinator
+// must validate image/sample authority before these values can be published.
+#[allow(dead_code)]
+pub(crate) mod caller_metadata;
 pub mod capacity;
+pub(crate) mod cgroup_stop_acceptance;
 pub mod cli;
 pub mod discovery;
 pub mod doctor;
 pub mod events;
 #[cfg(test)]
 mod first_use_probe;
+#[cfg(test)]
+pub(crate) mod fixture_guard;
 pub mod inspect;
+pub(crate) mod inspect_identity;
 pub mod inspect_system;
 pub mod inventory;
+#[path = "inventory/capture.rs"]
 pub(crate) mod inventory_capture;
+#[path = "inventory/dashboard.rs"]
 pub mod inventory_dashboard;
+#[path = "inventory/diagnostics.rs"]
+pub(crate) mod inventory_diagnostics;
+#[path = "inventory/diagnostics_output.rs"]
+pub(crate) mod inventory_diagnostics_output;
+#[path = "inventory/diff/mod.rs"]
+pub mod inventory_diff;
+#[path = "inventory/event_identity.rs"]
+pub(crate) mod inventory_event_identity;
+#[path = "inventory/events.rs"]
 pub mod inventory_events;
+#[path = "inventory/output.rs"]
+pub(crate) mod inventory_output;
+#[path = "inventory/present.rs"]
 pub mod inventory_present;
+#[path = "inventory/promotion.rs"]
+pub(crate) mod inventory_promotion;
+#[path = "inventory/semantics.rs"]
+pub(crate) mod inventory_semantics;
+pub(crate) mod key_operation_projection;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;
@@ -51,18 +78,36 @@ pub mod metrics;
 pub mod output;
 pub mod pidns;
 pub mod plan;
+pub(crate) mod prearm_module;
 pub mod process;
 pub mod render;
 pub(crate) mod run;
 pub mod scope;
+pub(crate) mod semantic_capture;
 pub mod semantics;
 pub mod semantics_edge;
+// Guarded H9 feed (N1): the feed driver, key-use reducer and receipt
+// pipeline ship in production behind the install guard — the
+// registry owns per-instance feeds and a capture-wide reducer, but
+// feeds stay S1Only until a Joint receipt is installed (only the
+// staged driver and tests install today; the live loop will supply
+// H8 grants when the joint seal tick lands).
+pub(crate) mod semantics_key_use;
 pub(crate) mod semantics_objects;
 pub mod shapes;
 pub(crate) mod sink;
 pub mod timing;
 pub mod trace;
+pub(crate) mod trace_identity;
 pub(crate) mod uretprobe_hazard;
+pub mod vendor_mechanisms;
+
+/// Best-effort frontend diagnostic through the existing bounded stderr sink.
+/// A full or closed descriptor may drop some or all text; successful return
+/// does not guarantee delivery. Diagnostic delivery never determines exit status.
+pub fn try_stderr_line(line: &str) -> std::io::Result<()> {
+    sink::try_stderr_line(line).map(|_| ())
+}
 
 /// The whole public production surface of the capture loops. `run` stays a
 /// crate-private module: the owned child, the pause coordinator, its clocks,
@@ -87,7 +132,51 @@ pub static EBPF_INVENTORY_OBJECT: &[u8] =
 pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory-callers"));
 
+/// Counter bank objects, built and embedded by the ordinary FULL build
+/// (`P11SCOPE_COUNTER_OBJECTS` unset or `1`). `=0`, SMALL and WIDE builds
+/// omit them; the statics below are then empty and preparation refuses
+/// every mode with `counter-mode-unavailable-in-build` before any work.
+#[cfg(p11scope_counter_objects)]
+pub static EBPF_COUNTER_COUNTS_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"
+));
+#[cfg(p11scope_counter_objects)]
+pub static EBPF_COUNTER_TIMESTAMPS_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/counter-bank-growth-v2/p11scope-ebpf-timestamps-bank-growth-v2"
+));
+#[cfg(p11scope_counter_objects)]
+pub static EBPF_COUNTER_LATENCY_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/counter-bank-growth-v2/p11scope-ebpf-latency-bank-growth-v2"
+));
+#[cfg(not(p11scope_counter_objects))]
+pub static EBPF_COUNTER_COUNTS_OBJECT: &[u8] = &[];
+#[cfg(not(p11scope_counter_objects))]
+pub static EBPF_COUNTER_TIMESTAMPS_OBJECT: &[u8] = &[];
+#[cfg(not(p11scope_counter_objects))]
+pub static EBPF_COUNTER_LATENCY_OBJECT: &[u8] = &[];
+
+/// Production journal object, built and embedded by default in FULL and P0
+/// builds that can carry it (P0 stubs its attribute capture, like its
+/// Detailed object). `P11SCOPE_JOURNAL=0` omits it, as do SMALL, WIDE and
+/// unsafe builds silently; the static below is then empty and journal
+/// preparation refuses with `journal-pair-unavailable-in-build` before any
+/// work. Explicit `P11SCOPE_JOURNAL=1` with an incompatible build refuses
+/// instead of omitting the object. The private journal-proof ELF is never
+/// embedded here.
+#[cfg(p11scope_journal)]
+pub static EBPF_JOURNAL_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/journal-v1/p11scope-ebpf-journal-v1"
+));
+#[cfg(not(p11scope_journal))]
+pub static EBPF_JOURNAL_OBJECT: &[u8] = &[];
+
 pub(crate) mod history;
+#[cfg(test)]
+mod key_operation_tests;
 #[cfg(test)]
 mod s1_tests;
 #[cfg(test)]

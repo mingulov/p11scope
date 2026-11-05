@@ -11,12 +11,40 @@ use crate::discovery::identity::{PinnedObjects, pin_scanned_view_objects};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
 };
+use crate::inspect_identity::{
+    InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
+    application_detail, application_json, application_label, begin_application, finish_application,
+};
 use crate::process::{ProcessView, ProcessViewId};
 use anyhow::Result;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 const DOC_ID: &str = "p11scope/inspect/v1";
+
+/// Writes `lines`, naming each run of consecutive identical lines once with
+/// its count (`  (×N identical)`). A proxy such as p11-kit carries dozens of
+/// identical closure tables; the text keeps their order and count while
+/// `--json` still lists every table.
+pub(crate) fn push_collapsed_lines(out: &mut String, lines: impl IntoIterator<Item = String>) {
+    let mut run: Option<(String, usize)> = None;
+    let flush = |out: &mut String, run: Option<(String, usize)>| {
+        if let Some((line, count)) = run {
+            if count > 1 {
+                let _ = writeln!(out, "{line}  (×{count} identical)");
+            } else {
+                let _ = writeln!(out, "{line}");
+            }
+        }
+    };
+    for line in lines {
+        match &mut run {
+            Some((previous, count)) if *previous == line => *count += 1,
+            _ => flush(out, run.replace((line, 1))),
+        }
+    }
+    flush(out, run);
+}
 
 /// The scan's refusal when it could not take the target's mapping snapshot
 /// at all (`/proc/<pid>/maps` unreadable, empty, or unparseable). No module
@@ -27,6 +55,24 @@ const INITIAL_MAPS_REFUSAL: &str = "memory scan refused: initial mapping validat
 /// Renders a completed scan. Pure: takes the scan result and the pinned identities,
 /// returns the text — so the layout is unit-testable without a target process.
 pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> String {
+    render_text_with_application(
+        pid,
+        outcome,
+        pinned,
+        &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+        &[],
+        &[],
+    )
+}
+
+fn render_text_with_application(
+    pid: u32,
+    outcome: &ScanOutcome,
+    pinned: &PinnedObjects,
+    application: &InspectApplicationResult,
+    excluded: &[crate::render::ExcludedOut],
+    unmatched: &[String],
+) -> String {
     let modules = outcome.modules();
     let word = if modules.len() == 1 {
         "module"
@@ -34,6 +80,10 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
         "modules"
     };
     let mut out = String::new();
+    let _ = writeln!(out, "{}", application_label(application, pid));
+    if let Some(detail) = application_detail(application) {
+        out.push_str(&detail);
+    }
     let _ = write!(out, "pid {pid} — {} PKCS#11 {word} mapped", modules.len());
     match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
@@ -65,7 +115,7 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
             }
         }
     }
-    out.push('\n');
+    out.push_str("Mapped modules only; activity was not captured by inspect.\n\n");
 
     for module in modules {
         render_module(&mut out, module, pinned);
@@ -78,6 +128,35 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
             "skipped: {} — {}",
             crate::render::escape_controls(&skipped.subject),
             crate::render::escape_controls(&skipped.reason)
+        );
+    }
+    if !excluded.is_empty() {
+        let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        for item in excluded {
+            let processes = if item.processes == 1 {
+                "1 process mapped it".to_string()
+            } else {
+                format!("{} processes mapped it", item.processes)
+            };
+            let _ = writeln!(
+                out,
+                "  {}: excluded by you (device {} inode {}, {processes}); calls into this file were not observed",
+                crate::render::escape_controls(&item.path),
+                item.dev,
+                item.ino,
+            );
+        }
+    }
+    if !unmatched.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unmatched exclusions ({}): {}",
+            unmatched.len(),
+            unmatched
+                .iter()
+                .map(|input| crate::render::escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     out
@@ -101,7 +180,7 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
 
     let _ = writeln!(out, "  exports    {}", module.exports.join(", "));
 
-    for table in &module.tables {
+    let table_lines = module.tables.iter().map(|table| {
         let count = table.entries.len();
         let entry_word = if count == 1 { "entry" } else { "entries" };
         let nulls = if table.null_entries.is_empty() {
@@ -109,12 +188,12 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
         } else {
             format!("  (NULL: {})", table.null_entries.join(", "))
         };
-        let _ = writeln!(
-            out,
+        format!(
             "  table      {}.{}  {}  {count} {entry_word}{nulls}",
             table.version.0, table.version.1, table.walk
-        );
-    }
+        )
+    });
+    push_collapsed_lines(out, table_lines);
 
     for interface in &module.interfaces {
         let name = interface
@@ -165,6 +244,24 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
 
 /// Renders a completed scan as JSON. Document id: `p11scope/inspect/v1`.
 pub fn render_json(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> serde_json::Value {
+    render_json_with_application(
+        pid,
+        outcome,
+        pinned,
+        &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+        &[],
+        &[],
+    )
+}
+
+fn render_json_with_application(
+    pid: u32,
+    outcome: &ScanOutcome,
+    pinned: &PinnedObjects,
+    application: &InspectApplicationResult,
+    excluded: &[crate::render::ExcludedOut],
+    unmatched: &[String],
+) -> serde_json::Value {
     let scan = match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
             serde_json::json!({ "status": "scanned", "scan_ms": scan_ms })
@@ -183,13 +280,23 @@ pub fn render_json(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> s
         .iter()
         .map(|s| serde_json::json!({ "subject": s.subject, "reason": s.reason }))
         .collect();
-    serde_json::json!({
+    let mut application = application_json(application);
+    let mut document = serde_json::json!({
         "schema": DOC_ID,
         "pid": pid,
+        "application": application["application"].take(),
+        "application_status": application["application_status"].take(),
         "scan": scan,
         "modules": modules,
         "skipped": skipped,
-    })
+    });
+    if !excluded.is_empty() {
+        document["excluded_modules"] = serde_json::to_value(excluded).unwrap_or_default();
+    }
+    if !unmatched.is_empty() {
+        document["unmatched_excludes"] = serde_json::to_value(unmatched).unwrap_or_default();
+    }
+    document
 }
 
 fn module_json(module: &ScannedModule, pinned: &PinnedObjects) -> serde_json::Value {
@@ -292,23 +399,62 @@ fn scan_and_pin_retained_with<C, S, P>(
     Ok((scanned, pinned))
 }
 
+// Both samples use this same retained context. Application validation does
+// not alter the physical scan's result, provider pins or refusal semantics.
+fn scan_and_pin_application_with<C: InspectImageReader, P>(
+    context: &mut C,
+    still_the_same: impl FnMut(&mut C) -> bool,
+    scan: impl FnOnce(&mut C) -> Result<ScanOutcome, String>,
+    pin: impl FnOnce(&mut C, &ScanOutcome) -> Result<P, String>,
+) -> Result<(ScanOutcome, P, InspectApplicationResult), String> {
+    let pending = begin_application(context);
+    let (scanned, pinned) = scan_and_pin_retained_with(context, still_the_same, scan, pin)?;
+    let application = if scanned.mapping_scan_completed() {
+        finish_application(pending, context)
+    } else {
+        InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined)
+    };
+    Ok((scanned, pinned, application))
+}
+
+impl InspectImageReader for (ProcessViewImageReader<'_>, CaptureWorkBudget) {
+    fn exe_identity(&mut self) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+        self.0.exe_identity()
+    }
+    fn start_time(&mut self) -> Option<u64> {
+        self.0.start_time()
+    }
+    fn still_same(&mut self) -> bool {
+        self.0.still_same()
+    }
+    fn validate_generation(&mut self) -> Result<(), InspectIdentityUnknown> {
+        self.0.validate_generation()
+    }
+}
+
 /// `p11scope inspect` — scans, pins, prints. Exit code: 0 when the scan ran
 /// (even with zero modules), 1 when the target could not be read at all.
-/// `--pid` keeps the single-process scan below byte-compatible; `--system`
+/// `--pid` retains scan-local application presentation; `--system`
 /// catalogs every process on the machine (see `inspect_system`).
 pub fn run(
     scope: crate::cli::InspectScope,
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
 ) -> Result<i32> {
     match scope {
-        crate::cli::InspectScope::Pid(pid) => {
-            run_with_writer(pid, hints, hooks, json, &mut std::io::stdout().lock())
-        }
+        crate::cli::InspectScope::Pid(pid) => run_with_writer(
+            pid,
+            hints,
+            excludes,
+            hooks,
+            json,
+            &mut std::io::stdout().lock(),
+        ),
         crate::cli::InspectScope::System => {
-            crate::inspect_system::run(hints, hooks, json, max_scan_pids)
+            crate::inspect_system::run(hints, excludes, hooks, json, max_scan_pids)
         }
     }
 }
@@ -316,6 +462,7 @@ pub fn run(
 fn run_with_writer(
     pid: u32,
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     out: &mut dyn std::io::Write,
@@ -323,6 +470,7 @@ fn run_with_writer(
     run_with_view(
         pid,
         hints,
+        excludes,
         hooks,
         json,
         out,
@@ -333,26 +481,33 @@ fn run_with_writer(
 fn run_with_view(
     pid: u32,
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     out: &mut dyn std::io::Write,
     view: Result<ProcessView, String>,
 ) -> Result<i32> {
     let view = view.map_err(|reason| unreadable_target_error(pid, &reason))?;
-    let mut context = (&view, CaptureWorkBudget::default());
-    let result = scan_and_pin_retained_with(
+    let mut budget = CaptureWorkBudget::default();
+    budget.set_excludes(excludes.to_vec());
+    let mut context = (ProcessViewImageReader::new(&view), budget);
+    let result = scan_and_pin_application_with(
         &mut context,
-        |context| context.0.still_the_same(),
+        |context| context.0.view().still_the_same(),
         |context| {
             scan_process_view(
                 &ScanRequest { pid, hints, hooks },
-                context.0,
+                context.0.view(),
                 &mut context.1,
             )
         },
-        |context, outcome| pin_scanned_view_objects(context.0, outcome.modules(), &mut context.1),
+        |context, outcome| {
+            pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+        },
     );
-    emit_diagnosis(pid, json, out, result)
+    let (excluded, unmatched) =
+        crate::render::aggregate_excluded(context.1.excluded(), context.1.excludes());
+    emit_application_diagnosis(pid, json, out, result, &excluded, &unmatched)
 }
 
 /// Renders a finished — or failed — diagnosis to `out`. Pure over the
@@ -362,13 +517,44 @@ fn run_with_view(
 /// breaking the JSON stream with a text line (F-20). Hard failures (the
 /// view never opened) never reach here: they return `Err`, which `main`
 /// reports on stderr with stdout left empty.
+#[cfg(test)]
 fn emit_diagnosis(
     pid: u32,
     json: bool,
     out: &mut dyn std::io::Write,
     result: Result<(ScanOutcome, (PinnedObjects, Vec<Skipped>)), String>,
 ) -> Result<i32> {
-    let (outcome, (pinned, pin_skips)) = match result {
+    emit_application_diagnosis(
+        pid,
+        json,
+        out,
+        result.map(|(outcome, pins)| {
+            (
+                outcome,
+                pins,
+                InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+            )
+        }),
+        &[],
+        &[],
+    )
+}
+
+type ApplicationDiagnosis = (
+    ScanOutcome,
+    (PinnedObjects, Vec<Skipped>),
+    InspectApplicationResult,
+);
+
+fn emit_application_diagnosis(
+    pid: u32,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    result: Result<ApplicationDiagnosis, String>,
+    excluded: &[crate::render::ExcludedOut],
+    unmatched: &[String],
+) -> Result<i32> {
+    let (outcome, (pinned, pin_skips), application) = match result {
         Ok(result) => result,
         Err(error) => {
             if json {
@@ -389,10 +575,21 @@ fn emit_diagnosis(
     let outcome = with_extra_skips(outcome, pin_skips);
 
     if json {
-        let document = serde_json::to_string_pretty(&render_json(pid, &outcome, &pinned))?;
+        let document = serde_json::to_string_pretty(&render_json_with_application(
+            pid,
+            &outcome,
+            &pinned,
+            &application,
+            excluded,
+            unmatched,
+        ))?;
         writeln!(out, "{document}")?;
     } else {
-        write!(out, "{}", render_text(pid, &outcome, &pinned))?;
+        write!(
+            out,
+            "{}",
+            render_text_with_application(pid, &outcome, &pinned, &application, excluded, unmatched)
+        )?;
     }
     Ok(0)
 }
@@ -433,6 +630,8 @@ fn failure_json(pid: u32, reason: &str) -> serde_json::Value {
     serde_json::json!({
         "schema": DOC_ID,
         "pid": pid,
+        "application": null,
+        "application_status": "not_examined",
         "scan": { "status": "failed", "reason": reason },
         "modules": [],
         "skipped": [],
@@ -481,41 +680,52 @@ mod tests {
     /// HIGH-2: when the scan could not read the target's mappings at all
     /// (another user's process: `/proc/<pid>/maps` is EACCES), inspect knows
     /// nothing about its modules. That is the documented hard error — one
-    /// stderr line naming the cause and the fix, empty stdout, exit 1 — never
+    /// stderr line naming the cause (and a permission fix when applicable),
+    /// empty stdout, exit 1 — never
     /// "0 PKCS#11 modules mapped" with `scan.status: scanned` and exit 0.
     #[test]
     fn unreadable_target_mappings_are_a_hard_error_not_zero_modules() {
-        let unreadable = || {
-            Ok((
-                ScanOutcome::Scanned {
-                    modules: Vec::new(),
-                    skipped: vec![Skipped {
-                        subject: "capture discovery".into(),
-                        reason: "memory scan refused: initial mapping validation unavailable: \
-                                 Permission denied (os error 13)"
-                            .into(),
-                    }],
-                    scan_ms: 0,
-                },
-                (PinnedObjects::empty(), Vec::new()),
-            ))
-        };
-        for json in [false, true] {
-            let mut stdout = Vec::new();
-            let result = emit_diagnosis(1379, json, &mut stdout, unreadable());
-            assert!(
-                stdout.is_empty(),
-                "json={json}: {}",
-                String::from_utf8_lossy(&stdout)
-            );
-            let error = format!("{:#}", result.expect_err("an unreadable target must fail"));
-            assert!(error.contains("/proc/1379/maps"), "{error}");
-            assert!(error.contains("Permission denied"), "{error}");
-            assert!(
-                error.contains("sudo p11scope inspect --pid 1379"),
-                "{error}"
-            );
-            assert!(!error.contains("0 PKCS#11 modules"), "{error}");
+        for (reason, permission_guidance) in [
+            ("Permission denied (os error 13)", true),
+            ("reversed or overlapping /proc/<pid>/maps intervals", false),
+        ] {
+            let unreadable = || {
+                Ok((
+                    ScanOutcome::Scanned {
+                        modules: Vec::new(),
+                        skipped: vec![Skipped {
+                            subject: "capture discovery".into(),
+                            reason: format!(
+                                "memory scan refused: initial mapping validation unavailable: {reason}"
+                            ),
+                        }],
+                        scan_ms: 0,
+                    },
+                    (PinnedObjects::empty(), Vec::new()),
+                ))
+            };
+            for json in [false, true] {
+                let mut stdout = Vec::new();
+                let result = emit_diagnosis(1379, json, &mut stdout, unreadable());
+                assert!(
+                    stdout.is_empty(),
+                    "json={json}: {}",
+                    String::from_utf8_lossy(&stdout)
+                );
+                let error = format!("{:#}", result.expect_err("an unreadable target must fail"));
+                assert!(error.contains("/proc/1379/maps"), "{error}");
+                assert!(error.contains(reason), "{error}");
+                if permission_guidance {
+                    assert!(
+                        error.contains("sudo p11scope inspect --pid 1379"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(!error.contains("sudo "), "{error}");
+                }
+                assert!(error.contains("unknown, not absent"), "{error}");
+                assert!(!error.contains("0 PKCS#11 modules"), "{error}");
+            }
         }
     }
 
@@ -526,6 +736,7 @@ mod tests {
             let mut stdout = Vec::new();
             let error = run_with_view(
                 1379,
+                &[],
                 &[],
                 &HookRegistry::builtin(),
                 json,
@@ -605,20 +816,30 @@ mod tests {
     #[test]
     fn hard_errors_write_nothing_to_stdout() {
         let mut stdout = Vec::new();
-        let error = run_with_writer(u32::MAX, &[], &HookRegistry::builtin(), true, &mut stdout)
-            .unwrap_err();
+        let error = run_with_writer(
+            u32::MAX,
+            &[],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            &mut stdout,
+        )
+        .unwrap_err();
         assert!(stdout.is_empty(), "hard errors must not touch stdout");
         assert!(!format!("{error:#}").is_empty());
     }
 
-    /// The full success wiring through the writer: scanning this
-    /// process always succeeds (its pidfd generation is stable) and
-    /// prints a parseable success document.
+    /// The full success wiring through the writer with a stable real target.
+    /// A pidfd fixes process generation, not mappings: parallel libtest threads
+    /// can remap this process between reads of the streamed procfs maps file.
     #[test]
     fn successful_inspect_writes_a_parseable_success_document() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
         let mut stdout = Vec::new();
-        let pid = std::process::id();
-        let code = run_with_writer(pid, &[], &HookRegistry::builtin(), true, &mut stdout).unwrap();
+        let pid = child.id();
+        let code =
+            run_with_writer(pid, &[], &[], &HookRegistry::builtin(), true, &mut stdout).unwrap();
         assert_eq!(code, 0);
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(document["schema"], DOC_ID);
@@ -701,8 +922,10 @@ mod tests {
     fn sample() -> ScanOutcome {
         ScanOutcome::Scanned {
             modules: vec![ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,
@@ -727,6 +950,7 @@ mod tests {
                     file_offset: Some(0),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![ScannedInterface {
                     index: 0,
@@ -740,6 +964,45 @@ mod tests {
             skipped: vec![],
             scan_ms: 3,
         }
+    }
+
+    #[test]
+    fn text_and_json_list_excluded_modules_and_unmatched_inputs() {
+        let application = InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined);
+        let excluded = vec![crate::render::ExcludedOut {
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            processes: 2,
+        }];
+        let unmatched = vec!["nope.so".to_string()];
+        let out = render_text_with_application(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            &application,
+            &excluded,
+            &unmatched,
+        );
+        assert!(out.contains("Excluded by you (1 files):"), "{out}");
+        assert!(
+            out.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 2 processes mapped it)"),
+            "{out}"
+        );
+        assert!(out.contains("Unmatched exclusions (1): nope.so"), "{out}");
+        let value = render_json_with_application(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            &application,
+            &excluded,
+            &unmatched,
+        );
+        assert_eq!(
+            value["excluded_modules"][0]["path"],
+            "/opt/libp11-kit.so.0.4.8"
+        );
+        assert_eq!(value["unmatched_excludes"][0], "nope.so");
     }
 
     #[test]
@@ -759,6 +1022,42 @@ mod tests {
         assert!(
             out.contains("PKCS 11"),
             "inspect may show interface names: {out}"
+        );
+    }
+
+    /// Consecutive identical tables (a proxy's closure array) print once
+    /// with their count; a different table between them breaks the run.
+    #[test]
+    fn text_collapses_consecutive_identical_tables() {
+        let mut outcome = sample();
+        let ScanOutcome::Scanned { modules, .. } = &mut outcome else {
+            unreachable!()
+        };
+        let base = modules[0].tables[0].clone();
+        let mut other = base.clone();
+        other.version = (3, 2);
+        modules[0].tables = vec![
+            base.clone(),
+            base.clone(),
+            base.clone(),
+            other,
+            base.clone(),
+        ];
+        modules[0].interfaces.clear();
+
+        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.trim_start().starts_with("table "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)  (×3 identical)",
+                "  table      3.2  full  1 entry  (NULL: C_GetFunctionStatus)",
+                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)",
+            ],
+            "{out}"
         );
     }
 
@@ -810,8 +1109,10 @@ mod tests {
         let outcome = ScanOutcome::Unavailable {
             reason: "ptrace",
             modules: vec![ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,
@@ -849,5 +1150,351 @@ mod tests {
         );
         assert_eq!(value["modules"][0]["tables"][0]["version"], "2.40");
         assert_eq!(value["modules"][0]["tables"][0]["entries"], 1);
+    }
+    struct ImageStage {
+        image: Option<crate::discovery::caller_registry::ExeIdentity>,
+        start: Option<u64>,
+        alive: bool,
+    }
+    impl ImageStage {
+        fn new() -> Self {
+            Self {
+                image: Some(crate::discovery::caller_registry::ExeIdentity {
+                    dev: 2,
+                    ino: 3,
+                    mtime_secs: 4,
+                    mtime_nanos: 5,
+                    path: Some("/opt/alpha/python3".into()),
+                }),
+                start: Some(101),
+                alive: true,
+            }
+        }
+    }
+    impl InspectImageReader for ImageStage {
+        fn exe_identity(&mut self) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+            self.image.clone()
+        }
+        fn start_time(&mut self) -> Option<u64> {
+            self.start
+        }
+        fn still_same(&mut self) -> bool {
+            self.alive
+        }
+    }
+    fn staged_diagnosis(
+        state: &mut ImageStage,
+        before_scan: impl FnOnce(&mut ImageStage),
+        during_pin: impl FnOnce(&mut ImageStage),
+    ) -> (serde_json::Value, String) {
+        let result = scan_and_pin_application_with(
+            state,
+            |state| state.alive,
+            |state| {
+                before_scan(state);
+                Ok(sample())
+            },
+            |state, _| {
+                during_pin(state);
+                Ok((PinnedObjects::empty(), Vec::new()))
+            },
+        )
+        .unwrap();
+        let mut json = Vec::new();
+        let mut text = Vec::new();
+        let (outcome, pins, application) = result;
+        assert_eq!(
+            emit_application_diagnosis(
+                4242,
+                true,
+                &mut json,
+                Ok((
+                    outcome.clone(),
+                    (PinnedObjects::empty(), Vec::new()),
+                    application.clone()
+                )),
+                &[],
+                &[]
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            emit_application_diagnosis(
+                4242,
+                false,
+                &mut text,
+                Ok((outcome, pins, application)),
+                &[],
+                &[]
+            )
+            .unwrap(),
+            0
+        );
+        (
+            serde_json::from_slice(&json).unwrap(),
+            String::from_utf8(text).unwrap(),
+        )
+    }
+    fn assert_changed(json: &serde_json::Value, text: &str) {
+        assert!(json["application"].is_null());
+        assert_eq!(json["application_status"], "changed");
+        assert!(text.starts_with("Unknown executable (PID 4242)"), "{text}");
+        assert!(!text.contains("/opt/alpha/python3"));
+        assert_eq!(
+            json["modules"][0]["path"],
+            "/usr/lib/softhsm/libsofthsm2.so"
+        );
+        assert!(text.contains("libsofthsm2.so"));
+    }
+
+    // Mutations caught: sampling only after scan, finishing before provider pin,
+    // ignoring live-pidfd exec, or discarding modules when naming is rejected.
+    #[test]
+    fn pid_inspect_exec_before_scan_with_live_pin_is_unknown() {
+        let (json, text) = staged_diagnosis(
+            &mut ImageStage::new(),
+            |s| {
+                s.image.as_mut().unwrap().path = Some("/opt/beta/java".into());
+                s.image.as_mut().unwrap().ino = 88;
+            },
+            |_| {},
+        );
+        assert_changed(&json, &text);
+    }
+    #[test]
+    fn pid_inspect_exec_during_pin_is_unknown() {
+        let (json, text) = staged_diagnosis(
+            &mut ImageStage::new(),
+            |_| {},
+            |s| {
+                s.image.as_mut().unwrap().path = Some("/opt/beta/java".into());
+                s.image.as_mut().unwrap().ino = 88;
+            },
+        );
+        assert_changed(&json, &text);
+    }
+    #[test]
+    fn pid_inspect_final_exe_unreadable_is_unknown() {
+        let (json, text) = staged_diagnosis(&mut ImageStage::new(), |_| {}, |s| s.image = None);
+        assert!(json["application"].is_null());
+        assert_eq!(json["application_status"], "unavailable");
+        assert!(text.starts_with("Unknown executable (PID 4242)"));
+        assert_eq!(json["modules"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn pid_inspect_unchanged_executable_is_named() {
+        let (json, text) = staged_diagnosis(&mut ImageStage::new(), |_| {}, |_| {});
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["application"]["path"], "/opt/alpha/python3");
+        assert_eq!(json["application"]["start_time"], 101);
+        assert!(text.starts_with("python3 (PID 4242)"), "{text}");
+        assert!(text.contains("/opt/alpha/python3"));
+    }
+    #[test]
+    fn inspect_mapping_is_not_usage() {
+        let (json, text) = staged_diagnosis(&mut ImageStage::new(), |_| {}, |_| {});
+        assert!(
+            text.contains("activity was not captured by inspect"),
+            "{text}"
+        );
+        assert!(json.get("calls").is_none());
+        assert!(json["modules"][0].get("entries_observed").is_none());
+        assert_eq!(json["modules"][0]["tables"][0]["entries"], 1);
+    }
+    #[test]
+    fn pid_inspect_os_reader_names_the_owned_process() {
+        // Parallel libtest threads can remap this test process while /proc
+        // streams its maps. The stopped owned child has a stable image/maps.
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut bytes = Vec::new();
+        run_with_writer(pid, &[], &[], &HookRegistry::builtin(), true, &mut bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let expected = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["application"]["path"], expected);
+        assert_eq!(
+            json["application"]["start_time"],
+            crate::process::process_start_time(pid).unwrap()
+        );
+    }
+
+    #[test]
+    fn pid_inspect_initial_exe_unreadable_is_never_repaired() {
+        let mut state = ImageStage::new();
+        state.image = None;
+        let (json, text) =
+            staged_diagnosis(&mut state, |s| s.image = ImageStage::new().image, |_| {});
+        assert!(json["application"].is_null());
+        assert_eq!(json["application_status"], "unavailable");
+        assert!(text.starts_with("Unknown executable (PID 4242)"));
+    }
+    #[test]
+    fn pid_inspect_unavailable_memory_preserves_named_mapping() {
+        let mut state = ImageStage::new();
+        let result = scan_and_pin_application_with(
+            &mut state,
+            |s| s.alive,
+            |_| {
+                Ok(ScanOutcome::Unavailable {
+                    reason: "ptrace",
+                    modules: sample().modules().to_vec(),
+                    skipped: Vec::new(),
+                })
+            },
+            |_, _| Ok((PinnedObjects::empty(), Vec::new())),
+        );
+        let mut bytes = Vec::new();
+        assert_eq!(
+            emit_application_diagnosis(4242, true, &mut bytes, result, &[], &[]).unwrap(),
+            0
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["scan"]["status"], "unavailable");
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["application"]["path"], "/opt/alpha/python3");
+        assert_eq!(json["modules"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn pid_inspect_same_path_distinct_provider_inodes_remain_separate() {
+        let mut state = ImageStage::new();
+        let mut outcome = sample();
+        if let ScanOutcome::Scanned { modules, .. } = &mut outcome {
+            let mut second = modules[0].clone();
+            second.key = key(22);
+            modules.push(second);
+        }
+        let result = scan_and_pin_application_with(
+            &mut state,
+            |s| s.alive,
+            |_| Ok(outcome),
+            |_, _| Ok((PinnedObjects::empty(), Vec::new())),
+        );
+        let mut bytes = Vec::new();
+        assert_eq!(
+            emit_application_diagnosis(4242, true, &mut bytes, result, &[], &[]).unwrap(),
+            0
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(json["modules"][0]["inode"], 11);
+        assert_eq!(json["modules"][1]["inode"], 22);
+        assert_eq!(json["modules"][0]["path"], json["modules"][1]["path"]);
+    }
+
+    #[test]
+    fn pid_inspect_final_mapping_failure_with_stable_exe_withholds_identity() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        for read_failure in [false, true] {
+            let mut context = (
+                ProcessViewImageReader::new(&view),
+                CaptureWorkBudget::default(),
+            );
+            let (outcome, (pins, skips), application) = scan_and_pin_application_with(
+                &mut context,
+                |context| context.0.view().still_the_same(),
+                |context| {
+                    Ok(crate::discovery::scan::final_maps_refusal_for_test(
+                        context.0.view(),
+                        &mut context.1,
+                        read_failure,
+                    ))
+                },
+                |context, outcome| {
+                    pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+                },
+            )
+            .unwrap();
+            assert!(view.still_the_same());
+            assert!(outcome.modules().is_empty());
+            assert!(
+                outcome
+                    .skipped()
+                    .iter()
+                    .any(|gap| gap.reason.contains("final mapping validation unavailable"))
+            );
+            let mut json = Vec::new();
+            let mut text = Vec::new();
+            assert_eq!(
+                emit_application_diagnosis(
+                    view.pid(),
+                    true,
+                    &mut json,
+                    Ok((
+                        outcome.clone(),
+                        (PinnedObjects::empty(), skips.clone()),
+                        application.clone(),
+                    )),
+                    &[],
+                    &[]
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                emit_application_diagnosis(
+                    view.pid(),
+                    false,
+                    &mut text,
+                    Ok((outcome, (pins, skips), application)),
+                    &[],
+                    &[]
+                )
+                .unwrap(),
+                0
+            );
+            let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            let text = String::from_utf8(text).unwrap();
+            assert_eq!(json["application_status"], "not_examined");
+            assert!(json["application"].is_null());
+            assert!(text.starts_with(&format!("Unknown executable (PID {})", view.pid())));
+            assert!(text.contains("final mapping validation unavailable"));
+        }
+    }
+
+    #[test]
+    fn pid_inspect_completed_empty_scans_retain_observed_identity() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        for outcome in [
+            ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: Vec::new(),
+                scan_ms: 0,
+            },
+            ScanOutcome::Unavailable {
+                reason: "ptrace",
+                modules: Vec::new(),
+                skipped: Vec::new(),
+            },
+        ] {
+            let mut context = (
+                ProcessViewImageReader::new(&view),
+                CaptureWorkBudget::default(),
+            );
+            let (_, _, application) = scan_and_pin_application_with(
+                &mut context,
+                |context| context.0.view().still_the_same(),
+                |_| Ok(outcome),
+                |context, outcome| {
+                    pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+                },
+            )
+            .unwrap();
+            let json = application_json(&application);
+            assert_eq!(json["application_status"], "observed");
+            assert_eq!(
+                json["application"]["path"],
+                crate::discovery::caller_registry::read_exe_identity(view.pid())
+                    .unwrap()
+                    .path
+                    .unwrap()
+            );
+        }
     }
 }

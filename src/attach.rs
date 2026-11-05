@@ -6,7 +6,7 @@ use crate::discovery::hooks::HookAbi;
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::discovery::loader::LoaderContextId;
 use crate::events;
-use crate::plan::{AttachPlan, Slot};
+use crate::plan::{AttachPlan, ObjectSlotEligibility, Slot};
 use crate::run::OwnedChild;
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
@@ -15,28 +15,75 @@ use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
-use p11scope_bpf_multi::{GroupHalt, attach_group, bisect_attach};
+use p11scope_bpf_multi::{
+    BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, GroupHalt, attach_group, bisect_attach,
+};
+use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_ebpf_common::{
-    ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    ARG_NONE, CounterMode, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
-    EVIDENCE_ABI_REFUSALS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
-    PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
-    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
-    ThreadOwnerControl, attach_cookie,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
+    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT, PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE,
+    RootAffiliationControl, SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT, ThreadOwnerControl, attach_cookie,
 };
 use p11scope_manifest::elf::ElfAbi;
-use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) mod reexec_diagnostic;
+#[cfg(feature = "h6-reexec-diagnostic")]
+use reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use std::fs::File;
 use std::io;
 use std::mem::size_of_val;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[allow(dead_code)] // Unselected Counts bank transaction; no public loader/selector.
+pub(crate) mod counter_banks;
+mod counter_generation;
+pub(crate) mod detailed_identity;
+mod ended_pid_retirement;
+mod global_retirement;
+pub(crate) mod journal;
+mod multi_host;
+#[allow(dead_code)] // Collected carrier is staged before its coordinator activation.
+mod native_retirement;
+#[cfg(test)]
+pub(crate) use multi_host::{MultiCapableHost, MultiHostStage};
+pub(crate) use multi_host::{MultiHostRefusal, MultiHostVerdict, require_multi_capable_host};
+mod object_stop;
+#[cfg(test)]
+pub(crate) use native_retirement::fixture::RetirementFixture;
+#[allow(unused_imports)] // Shared crate-private ports consumed by the next Engine packet.
+pub(crate) use native_retirement::{
+    CollectedGroupDeferral, CollectedRetirementState, CollectedRetirementTicket, DeferralProgress,
+    RetainedInputMeasure, RetainedRetirementInput, RetainedRetirementInputRefusal,
+    RetirementProgress,
+};
+pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
+#[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
+mod pid_continuity;
+pub(crate) use ended_pid_retirement::EndedPidRetirement;
+#[cfg(test)]
+pub(crate) use pid_continuity::clock_origins_comparable_with;
+#[cfg(test)]
+pub(crate) use pid_continuity::engine_fixture::{
+    AttachmentBoundaryChange, PidSessionFixture, PreflightChange,
+};
+pub(crate) use pid_continuity::{
+    CompletedRearmReceipt, ExecBinding, LifecycleFacts, PhysicalGapSummary, PidContinuityRefusal,
+    PidLifecycleTap, PreservationReceipt, clock_origins_comparable,
+    clock_origins_incomparable_reason,
+};
 
 // I3 will consume this preparation capability; I2b installs no callers or links.
 #[allow(dead_code)]
@@ -45,26 +92,66 @@ pub(crate) use inventory::EXPECTED_INVENTORY_DISCOVERY_BYTES;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
 pub(crate) use inventory::capture;
+#[allow(dead_code)] // Closed preparation; activation CAS is native, its promotion proof is joint.
+pub(crate) mod selected_detailed;
 mod stop_gate;
-pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
+pub(crate) use stop_gate::{FirstStop, StopGate, stop_gate_map_data, validate_stop_gate};
 // Task 3 Stage A: the readers are consumed by the Task 6 native seam
 // (`stage_native`, DR-T3A-1) and today by the privileged instance gates.
+pub(crate) mod host_btf;
+#[allow(dead_code)]
+pub(crate) mod image_query;
 #[allow(dead_code)]
 mod instance;
+pub(crate) mod prearm_witness;
+#[cfg(test)]
+pub(crate) fn raise_fault_test_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
+    instance::raise_fault_cell(cell)
+}
+#[cfg(test)]
+pub(crate) fn semantic_receipt_readback_test(
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+    semantic_receipt_readback(policy, descriptors)
+}
+#[cfg(test)]
+pub(crate) fn semantic_receipt_query_refusal_test(
+    error: image_query::ImageQueryRefusal,
+) -> crate::semantic_capture::CurrentReceiptRefusal {
+    semantic_receipt_query_refusal(error)
+}
+#[cfg(test)]
+pub(crate) use instance::{AbsenceBirthSource, observe_absence_birth};
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveScan, WatchedFile,
+    BirthAdmissionBinding, BirthObservationRefusal, BirthRowError, BirthRowReader,
+    COPY_VMA_RET_PROGRAM, CopyVmaTarget, EXEC_RELEASE_MMAP_PROGRAM, ExecBirthSource,
+    ExecReleaseTarget, HookStats, HookTargets, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking,
+    LiveBirthRows, SessionGrantToken, WatchedFile, active_instance_programs, observe_exec_birth,
+    observe_retained_birth,
 };
 mod cleanup_worker;
+pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
 pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink, drive_cleanup};
+#[cfg(test)]
+mod async_value_flags_tests;
 #[cfg(test)]
 mod instance_tests;
 
 #[cfg(test)]
 mod continuation_guard_tests;
+/// Private image-bank feasibility driver, present only in opt-in lib tests.
+#[cfg(all(test, p11scope_image_bank_proof))]
+mod image_bank_proof;
+#[cfg(test)]
+#[path = "attach/joint_cells_native_tests.rs"]
+mod joint_cells;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod native_completion_tests;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 const BPF_F_MMAPABLE: u32 = 1024;
@@ -118,7 +205,7 @@ const fn map_metadata(
     }
 }
 
-const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 8] = [
+const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 10] = [
     (
         "CONFIG",
         map_metadata(MapType::Array, 4, 8, 2, BPF_F_RDONLY_PROG),
@@ -160,6 +247,18 @@ const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 8] = [
     (
         "STACK_GUARD",
         map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
+    ),
+    // H7 slice B subordinate custody: the loader-published frozen object
+    // descriptor table (multi-entry read-only array: freezing defers past
+    // load like DESCRIPTORS) and the verified zero template (frozen with
+    // the published maps before any program loads).
+    (
+        "OBJECT_DESCRIPTORS",
+        map_metadata(MapType::Array, 4, 16, MAX_DESCRIPTORS, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "OBJECT_ZERO",
+        map_metadata(MapType::Array, 4, 432, 1, BPF_F_RDONLY_PROG),
     ),
 ];
 const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 2] = [
@@ -255,7 +354,9 @@ const IDENTITY_MAPS: [(&str, ExactMapMetadata); 6] = [
     ),
     (
         "THREAD_OWNER",
-        map_metadata(MapType::TaskStorage, 4, 544, 0, 1),
+        // Detailed includes H8's two retained journal words. Inventory's
+        // separate objects intentionally keep the 544-byte base owner.
+        map_metadata(MapType::TaskStorage, 4, 560, 0, 1),
     ),
     (
         "ROOT_AFFILIATION",
@@ -266,37 +367,114 @@ const IDENTITY_MAPS: [(&str, ExactMapMetadata); 6] = [
     ("ROOT_CTL", map_metadata(MapType::Array, 4, 64, 1, 0)),
 ];
 
-fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) -> Result<()> {
+/// True when this build wires the loader gate (`P11SCOPE_LOADER_GATE=1`,
+/// emitted by build.rs as `P11SCOPE_LOADER_GATE_ENABLED`). Only gate-1
+/// Detailed objects carry [`GATE_IDENTITY_MAPS`]; every other flavor and
+/// every gate-0 object stays gate-free.
+pub(crate) const LOADER_GATE_BUILD: bool = {
+    // Byte comparison: `matches!` on `str` is not const.
+    let bytes = env!("P11SCOPE_LOADER_GATE_ENABLED").as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+};
+
+/// Per-object gate requirement: only Detailed and journal sessions load a
+/// gate-carrying object in gate-1 builds. Counter objects never carry the
+/// gate maps (build.rs gates `BpfFlavor::Detailed` only), so a gate-1
+/// build requires no gate for them; requiring it refused every counter
+/// mode (C1) while doctor reported them available.
+fn identity_gate_required(is_counter_object: bool) -> bool {
+    LOADER_GATE_BUILD && !is_counter_object
+}
+
+/// Exact metadata for every map a gate-1 Detailed object adds, read from
+/// the built object (BTF DATASEC plus the Rust `maps` section). Counter
+/// and inventory objects never carry these; a gate-0 build refuses them.
+const GATE_IDENTITY_MAPS: [(&str, ExactMapMetadata); 5] = [
+    (
+        "TASK_COOKIE_B",
+        map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
+    ),
+    ("COOKIE_CTL_B", map_metadata(MapType::Array, 4, 40, 1, 0)),
+    (
+        "IMAGE_BANK_SELECT",
+        map_metadata(MapType::Array, 4, 96, 1, 0),
+    ),
+    ("LOADER_GATE", map_metadata(MapType::Array, 4, 32, 256, 0)),
+    ("LOADER_GATE_CTL", map_metadata(MapType::Array, 4, 72, 1, 0)),
+];
+
+fn validate_identity_inventory<'a>(
+    maps: impl Iterator<Item = (&'a str, bool)>,
+    gate: bool,
+) -> Result<()> {
     let mut storage = BTreeSet::new();
     for (name, unsupported) in maps {
+        if !gate
+            && GATE_IDENTITY_MAPS
+                .iter()
+                .any(|(candidate, _)| *candidate == name)
+        {
+            bail!("unexpected gate-1 map {name} in a gate-0 inventory");
+        }
         if unsupported {
             // Task 3 Stage A's process-epoch task storage is not an identity
             // map; the instance tracker validates its own metadata.
             if name == "PROC_EPOCH" {
                 continue;
             }
-            if !matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+            let known = matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION")
+                || (gate && name == "TASK_COOKIE_B");
+            if !known {
                 bail!("unexpected Unsupported map {name}");
             }
             storage.insert(name);
-        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION")
+            || (gate && name == "TASK_COOKIE_B")
+        {
             bail!("{name} must be an Unsupported task-storage map");
         }
     }
-    if storage != BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]) {
+    let mut required = BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]);
+    if gate {
+        required.insert("TASK_COOKIE_B");
+    }
+    if storage != required {
         bail!("missing required task-storage maps: {storage:?}");
     }
     Ok(())
 }
 
+/// Presence gate for the gate-1 identity maps: every name in
+/// [`GATE_IDENTITY_MAPS`] must exist before per-map validation.
+/// `prepare_identity` runs it ahead of the metadata checks so a
+/// missing gate map refuses naming the map.
+fn validate_gate_map_presence<'a>(names: impl Iterator<Item = &'a str>) -> Result<()> {
+    let names: BTreeSet<&'a str> = names.collect();
+    for (name, _) in GATE_IDENTITY_MAPS {
+        if !names.contains(name) {
+            bail!("missing {name} map");
+        }
+    }
+    Ok(())
+}
+
 fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapData> {
-    let (_, expected) = IDENTITY_MAPS
+    let expected = IDENTITY_MAPS
         .iter()
+        .chain(GATE_IDENTITY_MAPS.iter())
         .find(|(candidate, _)| *candidate == name)
+        .map(|(_, expected)| expected)
         .with_context(|| format!("unexpected identity map {name}"))?;
     let data = match (name, map) {
-        ("TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION", Map::Unsupported(data)) => data,
-        ("COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL", Map::Array(data)) => data,
+        (
+            "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION" | "TASK_COOKIE_B",
+            Map::Unsupported(data),
+        ) => data,
+        (
+            "COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL" | "COOKIE_CTL_B" | "IMAGE_BANK_SELECT"
+            | "LOADER_GATE" | "LOADER_GATE_CTL",
+            Map::Array(data),
+        ) => data,
         _ => bail!("unexpected {name} identity map variant"),
     };
     validate_map_metadata(name, data, *expected)?;
@@ -307,6 +485,8 @@ fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapD
 enum IdentityPreparation {
     WriteCookie,
     ReadCookie,
+    WriteBankSelect,
+    ReadBankSelect,
     WriteOwner,
     ReadOwner,
     WriteRoot,
@@ -318,22 +498,33 @@ enum IdentityPreparation {
 
 fn prepare_identity_with(
     owned: bool,
+    gate: bool,
     mut operation: impl FnMut(IdentityPreparation) -> Result<()>,
 ) -> Result<()> {
-    let controls = [
+    let image = [
         IdentityPreparation::WriteCookie,
         IdentityPreparation::ReadCookie,
+    ];
+    let bank = gate.then_some([
+        IdentityPreparation::WriteBankSelect,
+        IdentityPreparation::ReadBankSelect,
+    ]);
+    let rest = [
         IdentityPreparation::WriteOwner,
         IdentityPreparation::ReadOwner,
         IdentityPreparation::WriteRoot,
         IdentityPreparation::ReadRoot,
     ];
-    for step in controls
+    let bank_storage = gate.then_some(IdentityPreparation::Freeze("TASK_COOKIE_B"));
+    for step in image
         .into_iter()
+        .chain(bank.into_iter().flatten())
+        .chain(rest)
         .chain(owned.then_some(IdentityPreparation::SeedRoot))
         .chain(owned.then_some(IdentityPreparation::ReadSeed))
+        .chain([IdentityPreparation::Freeze("TASK_COOKIE")])
+        .chain(bank_storage)
         .chain([
-            IdentityPreparation::Freeze("TASK_COOKIE"),
             IdentityPreparation::Freeze("THREAD_OWNER"),
             IdentityPreparation::Freeze("ROOT_AFFILIATION"),
             IdentityPreparation::Freeze("COOKIE_CTL"),
@@ -398,6 +589,44 @@ fn initial_root_control(owned: bool) -> RootAffiliationControl {
     }
 }
 
+/// The bank-A prepared select image every gate-1 load publishes before
+/// links: bank A current and prepared, every count and incarnation zero.
+/// The bank-aware allocator refuses all issuance until this exists, so no
+/// gate-1 identity can precede it. Bank B stays unprepared here; its
+/// preparation (fresh `COOKIE_CTL_B` plus the `prepared[1]` flip before
+/// bank A fills) has no owner yet and lands with the cutover work.
+fn initial_bank_select() -> ImageBankSelect {
+    ImageBankSelect {
+        bank: 0,
+        prepared: [1, 0],
+        ..Default::default()
+    }
+}
+
+fn bank_select_fields(c: ImageBankSelect) -> [u64; 12] {
+    [
+        c.bank,
+        c.prepared[0],
+        c.prepared[1],
+        c.cuts,
+        c.refusals,
+        c.incarnation[0],
+        c.incarnation[1],
+        c.folded[0],
+        c.folded[1],
+        c.folds,
+        c.folded_issued,
+        c.update_losses,
+    ]
+}
+
+fn validate_bank_select_readback(expected: ImageBankSelect, actual: ImageBankSelect) -> Result<()> {
+    if bank_select_fields(actual) != bank_select_fields(expected) {
+        bail!("IMAGE_BANK_SELECT exact readback differs from initial select");
+    }
+    Ok(())
+}
+
 fn root_seed_authority<'fd>(
     scope: &Scope,
     child_pid: u32,
@@ -455,10 +684,24 @@ fn test_seeded_owner_poison() -> u64 {
     }
 }
 
-fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) -> Result<()> {
+fn owner_limit_from_start(ebpf: &Ebpf) -> Result<u64> {
+    let map = ebpf.map("START").context("START map")?;
+    let Map::HashMap(data) = map else {
+        bail!("unexpected START map variant");
+    };
+    owner_limit_for_start(read_map_metadata("START", data)?)
+}
+
+fn prepare_identity(
+    ebpf: &mut Ebpf,
+    scope: &Scope,
+    child: Option<&OwnedChild>,
+    gate: bool,
+) -> Result<()> {
     validate_identity_inventory(
         ebpf.maps()
             .map(|(name, map)| (name, matches!(map, Map::Unsupported(_)))),
+        gate,
     )?;
     for (name, _) in IDENTITY_MAPS {
         identity_map_data(
@@ -467,18 +710,22 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
                 .with_context(|| format!("missing {name} map"))?,
         )?;
     }
+    if gate {
+        validate_gate_map_presence(ebpf.maps().map(|(name, _)| name))?;
+        for (name, _) in GATE_IDENTITY_MAPS {
+            identity_map_data(
+                name,
+                ebpf.map(name)
+                    .with_context(|| format!("missing {name} map"))?,
+            )?;
+        }
+    }
     let cookie = ImageIdentityControl {
         limit: IMAGE_IDENTITY_TICKET_LIMIT,
         ..Default::default()
     };
     let owner = ThreadOwnerControl {
-        limit: {
-            let map = ebpf.map("START").context("START map")?;
-            let Map::HashMap(data) = map else {
-                bail!("unexpected START map variant");
-            };
-            owner_limit_for_start(read_map_metadata("START", data)?)?
-        },
+        limit: owner_limit_from_start(ebpf)?,
         poison: test_seeded_owner_poison(),
         ..Default::default()
     };
@@ -486,7 +733,8 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         .map(|child| root_seed_authority(scope, child.pid(), child.pin().pidfd()))
         .transpose()?;
     let root = initial_root_control(root_pidfd.is_some());
-    prepare_identity_with(root_pidfd.is_some(), |step| {
+    let bank_select = initial_bank_select();
+    prepare_identity_with(root_pidfd.is_some(), gate, |step| {
         match step {
             IdentityPreparation::WriteCookie => {
                 let mut control: Array<_, ImageIdentityControl> =
@@ -499,6 +747,20 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
                 if cookie_control_fields(control.get(&0, 0)?) != cookie_control_fields(cookie) {
                     bail!("COOKIE_CTL exact readback differs from initial control");
                 }
+            }
+            IdentityPreparation::WriteBankSelect => {
+                let mut select: Array<_, ImageBankSelect> = Array::try_from(
+                    ebpf.map_mut("IMAGE_BANK_SELECT")
+                        .context("IMAGE_BANK_SELECT map")?,
+                )?;
+                select.set(0, bank_select, 0)?;
+            }
+            IdentityPreparation::ReadBankSelect => {
+                let select: Array<_, ImageBankSelect> = Array::try_from(
+                    ebpf.map("IMAGE_BANK_SELECT")
+                        .context("IMAGE_BANK_SELECT map")?,
+                )?;
+                validate_bank_select_readback(bank_select, select.get(&0, 0)?)?;
             }
             IdentityPreparation::WriteOwner => {
                 let mut control: Array<_, ThreadOwnerControl> =
@@ -552,7 +814,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
 /// that authority internally.
 #[doc(hidden)]
 pub fn prepare_qualification_identity(ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {
-    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)
+    prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD)
 }
 
 fn validate_policy_map(ebpf: &Ebpf, name: &str, expected: ExactMapMetadata) -> Result<()> {
@@ -574,16 +836,74 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
     Ok(())
 }
 
-fn freeze_map(name: &str, map: &Map) -> Result<()> {
-    let data = if IDENTITY_MAPS
+/// I4: the PID witness map verdict behind `validate_pid_start_tick_map`:
+/// a Detailed session requires the map exactly when this build enabled
+/// the birth marker; counter banks forbid it independently of the
+/// Detailed build selection.
+fn pid_start_tick_verdict(present: bool, roots: StaticRoots, expected: bool) -> Result<()> {
+    const NAME: &str = "PID_START_TICK";
+    match (roots, expected, present) {
+        (StaticRoots::CounterBanks, _, true) => {
+            bail!("{NAME} present in a counter bank object")
+        }
+        (StaticRoots::CounterBanks, _, false) | (StaticRoots::Detailed, false, false) => Ok(()),
+        (StaticRoots::Detailed, false, true) => {
+            bail!("{NAME} present in a marker-off Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, false) => {
+            bail!("{NAME} missing from the Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, true) => Ok(()),
+    }
+}
+
+/// I4: whether a Detailed-roots session's object carries the PID
+/// witness. The journal object always runs the exec birth, so it always
+/// carries the map; the Detailed object carries it exactly in marker
+/// builds.
+fn pid_witness_expected(journal: bool, marker_build: bool) -> bool {
+    journal || marker_build
+}
+
+/// I4: requires `PID_START_TICK` exactly where the session's object runs
+/// the exec birth (every journal object; the Detailed object of marker
+/// builds), and validates its exact metadata. A present map always
+/// validates exactly; absence is decided by the verdict above.
+fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots, journal: bool) -> Result<()> {
+    const NAME: &str = "PID_START_TICK";
+    let expected = pid_witness_expected(journal, cfg!(p11scope_birth_marker));
+    let map = ebpf.map(NAME);
+    pid_start_tick_verdict(map.is_some(), roots, expected)?;
+    if let Some(map) = map {
+        validate_map_metadata(
+            NAME,
+            policy_map_data(NAME, map)?,
+            map_metadata(MapType::Hash, 4, 8, 1_024, BPF_F_RDONLY_PROG),
+        )?;
+    }
+    Ok(())
+}
+
+fn is_identity_map(name: &str) -> bool {
+    IDENTITY_MAPS
         .iter()
+        .chain(GATE_IDENTITY_MAPS.iter())
         .any(|(candidate, _)| *candidate == name)
-    {
+}
+
+fn freeze_map(name: &str, map: &Map) -> Result<()> {
+    let data = if is_identity_map(name) {
         identity_map_data(name, map)
     } else {
         policy_map_data(name, map)
     }
     .with_context(|| format!("refusing to freeze unexpected {name} map variant"))?;
+    freeze_map_data(name, data)
+}
+
+/// Issue the freeze only after the owning object's exact map contract was
+/// checked. Inventory and Detailed have distinct THREAD_OWNER value layouts.
+fn freeze_map_data(name: &str, data: &aya::maps::MapData) -> Result<()> {
     let attr = BpfMapFreezeAttr {
         map_fd: data.fd().as_fd().as_raw_fd() as u32,
     };
@@ -780,6 +1100,7 @@ pub enum CapturePolicy {
     Allowlisted,
     UnsafeUnvalidatedMetadata,
     AggregateOnly,
+    Counter(CounterMode),
 }
 
 impl CapturePolicy {
@@ -802,7 +1123,7 @@ impl CapturePolicy {
         match self {
             Self::Allowlisted => FLAG_POLICY_ALLOWLISTED,
             Self::UnsafeUnvalidatedMetadata => FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
-            Self::AggregateOnly => FLAG_POLICY_AGGREGATE,
+            Self::AggregateOnly | Self::Counter(_) => FLAG_POLICY_AGGREGATE,
         }
     }
 
@@ -811,11 +1132,35 @@ impl CapturePolicy {
             Self::Allowlisted => "allowlisted",
             Self::UnsafeUnvalidatedMetadata => "unsafe-unvalidated-metadata",
             Self::AggregateOnly => "aggregate-only",
+            Self::Counter(_) => "aggregate-only",
         }
     }
 
     pub const fn uses_events(self) -> bool {
-        !matches!(self, Self::AggregateOnly)
+        !self.is_aggregate()
+    }
+
+    pub const fn is_aggregate(self) -> bool {
+        matches!(self, Self::AggregateOnly | Self::Counter(_))
+    }
+
+    pub const fn counter_mode(self) -> Option<CounterMode> {
+        match self {
+            Self::Counter(mode) => Some(mode),
+            Self::Allowlisted | Self::UnsafeUnvalidatedMetadata | Self::AggregateOnly => None,
+        }
+    }
+
+    /// Whether this policy may arm extensive mode (`--track-short-lived`,
+    /// 6.14 Option B): the exe-identity read arms Detailed-object
+    /// captures only, never a counter object. Explicit match, not
+    /// `counter_mode().is_none()`: a future variant must decide here
+    /// at compile time.
+    pub const fn allows_track_short_lived(self) -> bool {
+        match self {
+            Self::Allowlisted | Self::UnsafeUnvalidatedMetadata | Self::AggregateOnly => true,
+            Self::Counter(_) => false,
+        }
     }
 
     /// Whether the policy can consume load-instance continuity (Task 3 Stage
@@ -829,7 +1174,7 @@ impl CapturePolicy {
     pub const fn wants_instance_hooks(self) -> bool {
         match self {
             Self::Allowlisted | Self::UnsafeUnvalidatedMetadata => true,
-            Self::AggregateOnly => false,
+            Self::AggregateOnly | Self::Counter(_) => false,
         }
     }
 
@@ -899,28 +1244,6 @@ impl std::error::Error for BackendFallbackRequired {
     }
 }
 
-/// Release floor the doctor's diagnostics still quote: `uprobe_multi`
-/// landed in 6.6 and the session once attempted it only on 6.9+. The
-/// capture no longer reads it: [`select_session_backend`] decides by
-/// functional probes (owner directive "kernel tiers", DR-CLASSIC-PID0).
-pub(crate) const MULTI_KERNEL_FLOOR: (u32, u32) = (6, 9);
-
-/// Pure predicate over a `/proc/sys/kernel/osrelease` release string: at
-/// or above [`MULTI_KERNEL_FLOOR`]; an unparseable release is below it.
-/// Doctor diagnostics only.
-pub(crate) fn multi_allowed_on(release: &str) -> bool {
-    crate::doctor::parse_major_minor(release).is_some_and(|version| version >= MULTI_KERNEL_FLOOR)
-}
-
-/// The running release against [`MULTI_KERNEL_FLOOR`], for the doctor's
-/// `perf_event_paranoid` row hint only (it may run unprivileged, where no
-/// functional probe can answer). The capture never consults it.
-pub(crate) fn kernel_supports_multi() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|release| multi_allowed_on(release.trim()))
-        .unwrap_or(false)
-}
-
 /// Whether the running kernel's uprobe_multi pid filter covers every
 /// thread of the named process, proven once per run by a functional probe
 /// (`p11scope_bpf_multi::probe_pid_filter_hits`: a counting link with
@@ -967,27 +1290,272 @@ pub(crate) struct SessionBackend {
 /// one-offset uprobe-multi probe at the observer's own anchor (the doctor
 /// row's self-link), dropped at once. It never fires a capture program.
 pub(crate) fn multi_functional_probe() -> std::result::Result<(), String> {
-    // The anchor error names local paths (libc, the observer's own
-    // executable); the published reason stays pathless (the doctor's row
-    // keeps the detail).
-    let (path, offset) = crate::doctor::self_probe_anchor()
-        .map_err(|_| "the self-probe anchor is unavailable".to_string())?;
-    let program = p11scope_bpf_multi::prog_load_scratch_multi()
-        .map_err(|error| format!("loading the scratch uprobe-multi program: {error}"))?;
-    p11scope_bpf_multi::attach_group(
-        program.as_raw_fd(),
-        std::process::id(),
-        &path,
-        &[offset],
-        &[1],
-        false,
-    )
-    .map(drop)
-    .map_err(|error| format!("linking the scratch uprobe-multi probe: {error}"))
+    require_multi_capable_host()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Verdict of the functional bpf_loop (helper 181) probe that gates counter
+/// preparation: the 8192 owner cleanup calls helper 181, first shipped in
+/// Linux 5.17. Proven by the verifier's words on a minimal program that
+/// calls it, never by the errno alone and never by the kernel version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BpfLoopVerdict {
+    /// The probe program loaded: counter bank objects can load here.
+    Available,
+    /// A control program loaded but the verifier named an unknown helper
+    /// 181: this kernel cannot run counter bank objects.
+    Unavailable(String),
+    /// Neither outcome was proven (no BPF privilege, unexpected errors):
+    /// preparation proceeds and the real load reports its own failure.
+    Unknown(String),
+}
+
+/// Minimal bpf_loop probe: `call 181; exit`, two instructions, never
+/// attached. A callback-carrying probe cannot load anywhere: the pseudo-func
+/// callback load demands BTF func_info on every kernel, so errno-only
+/// classification would refuse counter modes everywhere. The bare call is
+/// instead classified by the verifier's own words (see
+/// [`classify_bpf_loop_probe_with_log`]): kernels that know the helper name
+/// `bpf_loop#181` before rejecting the uninitialized registers, kernels
+/// without it report `invalid func unknown#181`.
+static BPF_LOOP_PROBE_INSNS: [u8; 16] = [
+    0x85, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 0x00, // call 181 (bpf_loop)
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+];
+
+/// Control load: `r0 = 0; exit`, the same two-instruction shape as the
+/// multi scratch control. Plain kprobe type with no attach type, so it
+/// loads on every kernel back to the 5.15 floor when BPF privilege holds
+/// (the multi scratch's attach type 48 is itself rejected there).
+static BPF_LOOP_CONTROL_INSNS: [u8; 16] = [
+    0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+];
+
+/// Kernel-visible probe names (bpftool inventory). Underscores, not dashes:
+/// the kernel rejects `-` in object names with a logless EINVAL.
+const BPF_LOOP_PROBE_NAME: &str = "p11scope_bpf181";
+const BPF_LOOP_CONTROL_NAME: &str = "p11scope_bpfctl";
+
+/// `BPF_PROG_LOAD` attr, the same 152-byte shape as the multi scratch
+/// loader (field offsets verified against `linux/bpf.h` there). Duplicated
+/// rather than shared: that loader is multi-typed and cannot serve as the
+/// 5.15-floor control.
+#[repr(C)]
+struct BpfLoopProgAttr {
+    prog_type: u32,
+    insn_cnt: u32,
+    insns: u64,
+    license: u64,
+    log_level: u32,
+    log_size: u32,
+    log_buf: u64,
+    kern_version: u32,
+    prog_flags: u32,
+    prog_name: [u8; 16],
+    prog_ifindex: u32,
+    expected_attach_type: u32,
+    prog_btf_fd: u32,
+    func_info_rec_size: u32,
+    func_info: u64,
+    func_info_cnt: u32,
+    line_info_rec_size: u32,
+    line_info: u64,
+    line_info_cnt: u32,
+    attach_btf_id: u32,
+    attach_prog_fd: u32,
+    core_relo_cnt: u32,
+    fd_array: u64,
+    core_relos: u64,
+    core_relo_rec_size: u32,
+    log_true_size: u32,
+    prog_token_fd: i32,
+    fd_array_cnt: u32,
+}
+
+// UAPI layout, checked at compile time in every profile: a drift must fail
+// the build that loads BPF, not only a debug run.
+const _: () = assert!(size_of::<BpfLoopProgAttr>() == 152);
+const _: () = assert!(std::mem::offset_of!(BpfLoopProgAttr, prog_name) == 48);
+const _: () = assert!(std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type) == 68);
+const _: () = assert!(std::mem::offset_of!(BpfLoopProgAttr, prog_btf_fd) == 72);
+const _: () = assert!(BPF_LOOP_PROBE_INSNS.len().is_multiple_of(8));
+const _: () = assert!(BPF_LOOP_CONTROL_INSNS.len().is_multiple_of(8));
+const _: () = assert!(BPF_LOOP_PROBE_NAME.len() < 16);
+const _: () = assert!(BPF_LOOP_CONTROL_NAME.len() < 16);
+
+/// Load one logless probe program (plain kprobe type, never attached): the
+/// fd drops at the caller, unloading it. Serves the control load, whose
+/// verdict needs no verifier words; the helper-identity probe loads through
+/// [`bpf_loop_prog_load_with_log`].
+fn bpf_loop_prog_load(insns: &[u8], name: &str) -> io::Result<OwnedFd> {
+    let mut attr: BpfLoopProgAttr = unsafe { std::mem::zeroed() };
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insn_cnt = (insns.len() / 8) as u32;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    let bytes = name.as_bytes();
+    attr.prog_name[..bytes.len()].copy_from_slice(bytes);
+    // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_LOAD as libc::c_long,
+            std::ptr::addr_of_mut!(attr).cast::<libc::c_void>(),
+            size_of::<BpfLoopProgAttr>(),
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: bpf() returned a fresh owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+    }
+}
+
+/// Helper-identity probe load: the same kprobe-type, never-attached load as
+/// [`bpf_loop_prog_load`], but with `log_level = 1` and a bounded local
+/// 4096-byte verifier log so the classifier reads the kernel's own words.
+/// The fd drops at the caller, unloading the program; the log is cut at the
+/// first NUL and never printed to the user.
+fn bpf_loop_prog_load_with_log(insns: &[u8], name: &str) -> (io::Result<OwnedFd>, String) {
+    let mut log = [0u8; 4096];
+    let mut attr: BpfLoopProgAttr = unsafe { std::mem::zeroed() };
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insn_cnt = (insns.len() / 8) as u32;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    attr.log_level = 1;
+    attr.log_size = log.len() as u32;
+    attr.log_buf = log.as_mut_ptr() as u64;
+    let bytes = name.as_bytes();
+    attr.prog_name[..bytes.len()].copy_from_slice(bytes);
+    // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_LOAD as libc::c_long,
+            std::ptr::addr_of_mut!(attr).cast::<libc::c_void>(),
+            size_of::<BpfLoopProgAttr>(),
+        )
+    };
+    let end = log.iter().position(|byte| *byte == 0).unwrap_or(log.len());
+    let text = String::from_utf8_lossy(&log[..end]).into_owned();
+    if ret < 0 {
+        (Err(io::Error::last_os_error()), text)
+    } else {
+        // SAFETY: bpf() returned a fresh owned fd.
+        (Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) }), text)
+    }
+}
+
+/// Frozen errno-only predecessor of [`classify_bpf_loop_probe_with_log`],
+/// kept for its contract test below: a loaded probe proves availability
+/// outright; a rejected probe proves absence only when the control loaded
+/// (otherwise privilege or the environment, not the kernel, refused);
+/// anything unexpected defers to the real load instead of claiming absence.
+/// Production classifies by the verifier's words, never by the errno alone.
+#[cfg(test)]
+pub(crate) fn classify_bpf_loop_probe(
+    control: &io::Result<()>,
+    probe: &io::Result<()>,
+) -> BpfLoopVerdict {
+    if probe.is_ok() {
+        return BpfLoopVerdict::Available;
+    }
+    let probe_error = probe.as_ref().unwrap_err();
+    match control {
+        Ok(()) => {
+            if probe_error.raw_os_error() == Some(libc::EINVAL) {
+                BpfLoopVerdict::Unavailable(format!(
+                    "the kernel loads BPF programs but rejects the bpf_loop (helper 181) \
+                     probe ({probe_error}); counter bank objects need Linux 5.17+"
+                ))
+            } else {
+                BpfLoopVerdict::Unknown(format!(
+                    "the bpf_loop (helper 181) probe failed unexpectedly ({probe_error}) \
+                     while the control load succeeded"
+                ))
+            }
+        }
+        Err(control_error) => BpfLoopVerdict::Unknown(format!(
+            "bpf_loop (helper 181) support is unproven (control load: {control_error}; \
+             probe load: {probe_error})"
+        )),
+    }
+}
+
+/// Pure helper-identity verdict over the control result, the probe result
+/// and the probe's verifier log, so the word rules are unit-testable: a
+/// loaded probe proves availability outright; `invalid func` in the log
+/// proves absence, but only when the control loaded (otherwise privilege or
+/// the environment, not the kernel, refused); a log that names `bpf_loop#181`
+/// with none of the `unknown func`, `cannot use helper` or `not allowed`
+/// refusal wordings treats the helper as usable even though the bare call
+/// itself is rejected (the name comes from the kernel's static helper
+/// table, printed before the program-type check, so a refusal wording in
+/// the same log means this program type cannot use the helper and defers
+/// instead); anything else (empty or truncated log, failed control,
+/// unrecognized words) defers to the real load instead of claiming absence.
+/// Verdict details stay finite sentences (errno allowed); the raw log is
+/// never surfaced.
+pub(crate) fn classify_bpf_loop_probe_with_log(
+    control: &io::Result<()>,
+    probe: &io::Result<()>,
+    log: &str,
+) -> BpfLoopVerdict {
+    if probe.is_ok() {
+        return BpfLoopVerdict::Available;
+    }
+    let probe_error = probe.as_ref().unwrap_err();
+    if log.contains("invalid func") {
+        if control.is_ok() {
+            return BpfLoopVerdict::Unavailable(format!(
+                "the kernel loads BPF programs but rejects the bpf_loop (helper 181) \
+                 probe ({probe_error}); counter bank objects need Linux 5.17+"
+            ));
+        }
+        let control_error = control.as_ref().unwrap_err();
+        return BpfLoopVerdict::Unknown(format!(
+            "bpf_loop (helper 181) support is unproven (control load: {control_error}; \
+             probe load: {probe_error})"
+        ));
+    }
+    if log.contains("bpf_loop#181")
+        && !log.contains("unknown func")
+        && !log.contains("cannot use helper")
+        && !log.contains("not allowed")
+    {
+        return BpfLoopVerdict::Available;
+    }
+    match control {
+        Ok(()) => BpfLoopVerdict::Unknown(format!(
+            "the bpf_loop (helper 181) probe failed unexpectedly ({probe_error}) \
+             while the control load succeeded"
+        )),
+        Err(control_error) => BpfLoopVerdict::Unknown(format!(
+            "bpf_loop (helper 181) support is unproven (control load: {control_error}; \
+             probe load: {probe_error})"
+        )),
+    }
+}
+
+/// Functional bpf_loop (helper 181) probe: a control no-op load plus the
+/// helper-identity `call 181` load with its verifier log. Neither program
+/// is ever attached; both fds drop before return, unloading them. Helper
+/// presence is read from the verifier's own words, never from the errno
+/// alone and never from the kernel version.
+pub(crate) fn kernel_bpf_loop_probe() -> BpfLoopVerdict {
+    let control = bpf_loop_prog_load(&BPF_LOOP_CONTROL_INSNS, BPF_LOOP_CONTROL_NAME).map(|_| ());
+    let (probe, log) = bpf_loop_prog_load_with_log(&BPF_LOOP_PROBE_INSNS, BPF_LOOP_PROBE_NAME);
+    classify_bpf_loop_probe_with_log(&control, &probe.map(|_| ()), &log)
 }
 
 /// First backend attempted for a classic session, decided by functional
 /// probes, never by the kernel version (owner directive "kernel tiers").
+/// Public live callers establish required host eligibility before this
+/// separate scoped backend decision, including for explicit Singles.
 ///
 /// - `singles`: per-offset links, never probed.
 /// - PID scope (`pid_scope`): uprobe-multi only where `pid_probe` proves
@@ -1186,9 +1754,13 @@ impl RootSeed {
 /// use p11scope::attach::OwnedPauseGeneration;
 /// ```
 pub struct Session {
+    return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     /// Mmap of the STOP_GATE cell. Declared first so the mapping unmaps
     /// before the map FDs owned by `ebpf` close.
     stop_gate: StopGate,
+    native_selection: Option<selected_detailed::NativeSelection>,
+    image_coverage: image_query::CoverageControl,
+    image_query: Option<image_query::ImageQueryOwner>,
     pub(crate) ebpf: Ebpf,
     events_domain: events::EventsDomain,
     /// The session's single retained `EVENTS` consumer, built once from
@@ -1198,6 +1770,8 @@ pub struct Session {
     /// metrics-mode sessions (which never drain) free of reader setup.
     events_consumer: Option<events::OwnedDrain>,
     discovery_domain: events::DiscoveryDomain,
+    trace_coverage: Option<detailed_identity::TraceCoverage>,
+    trace_proof: Option<detailed_identity::ProofSession>,
     /// One cursor over DISCOVERY for all dequeues. The owned mapping is
     /// created lazily and then lives until this Session is dropped.
     discovery_consumer: Option<events::OwnedDiscoveryDrain>,
@@ -1206,6 +1780,14 @@ pub struct Session {
     root_seed: Option<RootSeed>,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
+    /// Attach units whose detach failed (ruling JK-22a): only these refuse
+    /// future attachment, through [`attachment_admission_for`]. Unrelated
+    /// targets keep admitting; a [`DetachQuarantine::Global`] entry refuses
+    /// everything, as before.
+    detach_quarantine: BTreeSet<DetachQuarantine>,
+    /// The first recorded detach reason per quarantined unit, for the
+    /// refusal the unit carries.
+    quarantine_reasons: BTreeMap<DetachQuarantine, String>,
     /// Every producer detach succeeded without retained ownership uncertainty.
     /// This permits the existing best-effort terminal poll, not callback
     /// settlement or exact root retirement.
@@ -1218,9 +1800,22 @@ pub struct Session {
     /// so a session that never reached its loop reports no attach time —
     /// never 0, never an estimate.
     attach_mono_ns: Option<u64>,
+    /// Per-slot attach-complete instants (packet 6.13, R2-D1-5): the first
+    /// real per-slot completion stamp per slot, retained from every
+    /// `attach_targets` call. First wins: re-attachment never rewrites the
+    /// instant coverage began. Detach never removes these: they are
+    /// historical facts, and capture-held ordering evidence reads them.
+    slot_attached_at: BTreeMap<u32, u64>,
+    /// Reserved once before BPF preparation, in process-local allocation order.
+    /// Collection identity only; this grants no capture or lifetime authority.
+    counter_collection_generation: NonZeroU64,
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
+    /// The embedded flavor this session was set up with, checked at the
+    /// gate before anything loaded. Grouping and output evidence read
+    /// this, never a re-read of the global cache.
+    embedded_flavor: EmbeddedFlavor,
     /// Load-time backend: static endpoint twins load with attach type 48
     /// under multi, so the attach path must match the load decision.
     backend: AttachBackend,
@@ -1228,6 +1823,11 @@ pub struct Session {
     /// per-offset links (DR-CLASSIC-PID0).
     selection: BackendSelection,
     backend_fallback: Option<String>,
+    /// Approved mechanism ids the `MECH_SHAPE` publication could not fit
+    /// (ruling JK-22a): the official-first subset published instead of
+    /// refusing the session, and this count gapped them. Zero unless the
+    /// approval union exceeded the map.
+    unpublished_mechanisms: u64,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
@@ -1237,6 +1837,20 @@ pub struct Session {
     /// multi-group rebuild can reattach surviving siblings; pruned as the
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
+    pid_pairs: pid_continuity::PairBook,
+    global_retirements: global_retirement::Retirements,
+    native_retirement: native_retirement::NativeRetirement,
+    /// Removed members of partially covered shared-Multi groups. Their
+    /// links stay in `links` until the terminal detach closes them; every
+    /// selective mutation guard refuses while this is nonempty, and the
+    /// native mint requires these slots proven terminally submitted.
+    deferred_group_slots: BTreeSet<u32>,
+    /// Slots of the links the terminal detach actually submitted. The
+    /// mint proves `deferred_group_slots` against this set.
+    submitted_terminal_slots: BTreeSet<u32>,
+    pid_health: pid_continuity::OwnerHealth,
+    prepared_owner_limit: u64,
+    pid_lifecycle: Option<PidLifecycleTap>,
     links: Vec<RegisteredLink>,
     /// Task 3 Stage A continuity witness: hook links, watched files and the
     /// refusal reason when instance routing is unavailable.
@@ -1246,12 +1860,259 @@ pub struct Session {
     /// driven it to completion; a fresh worker is created if links ever
     /// need closing afterwards.
     cleanup_worker: Option<CleanupWorker>,
+    /// Terminal transfer and settlement belong to this exact Session. An
+    /// interrupted/failed drive can never infer success from empty links.
+    producer_detach: OwnedProducerDetach,
+    /// Sticky native-completion mint refusal: set once a mint attempt
+    /// fails after its terminal poll consumed records, after which the
+    /// Session can never mint (see [`NativeCompletionMint`]).
+    native_completion_mint: NativeCompletionMint,
+    /// H7 slice D: receipt-bound object rows for 608-byte decode, frozen
+    /// by `Session::start_attested` only. `None` everywhere else keeps
+    /// those lanes 368-byte-only.
+    object_decode: Option<ObjectDecodeTable>,
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    reexec_diagnostic: Option<reexec_diagnostic::Diagnostic>,
+    /// Check name for the last counter staging call when it refused a bare
+    /// `Topology`, `None` otherwise. Lets an Engine counter start say which
+    /// check failed; refusal values are unchanged.
+    last_counter_stage_check: Option<&'static str>,
+    /// This session prepared with the production journal object (entry/return
+    /// roots swapped for the journal pair). Retained from the successful
+    /// preparation; attach naming resolves the journal pair for journal
+    /// sessions. Nothing selects journal yet, so this stays false until the
+    /// activation packet threads a journal selection.
+    journal: bool,
+    /// Linkage of the attachment the attested start sealed: `None` until a
+    /// successful native seal retains its derived linkage. The producers
+    /// drain derives its linkage from this retained sealed fact, never from
+    /// a literal.
+    sealed_journal_linked: Option<bool>,
+    /// Last: synchronous Aya links/maps/pins drop before the reservation.
+    /// Every asynchronous transferred link also carries the same keepalive.
+    counter_banks: Option<counter_banks::CounterBanks>,
 }
 
-/// A detach error leaves this Session's ownership bookkeeping inconsistent.
-/// It does not prove a kernel producer survived or that the kernel is quiet;
-/// recovery is a new Session. Refusing unrelated additions is the accepted
-/// availability cost, while capture and cleanup of existing ownership continue.
+/// Move-only terminal work, stored inside its original Session. Submission is
+/// not settlement; only the joined worker receipt can reach Complete.
+#[derive(Default)]
+enum OwnedProducerDetach {
+    #[default]
+    NotStarted,
+    Pending {
+        worker: CleanupWorker,
+        started: std::time::Instant,
+        had_work: bool,
+        progress: cleanup_worker::DetachPollPrinter,
+    },
+    Unproved,
+    Complete,
+}
+
+/// Non-consuming reap progress: `Pending` keeps the SAME worker thread
+/// and every original lease in place; only a joined receipt reaches
+/// `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProducerDetachProgress {
+    Pending,
+    Complete,
+}
+
+impl OwnedProducerDetach {
+    fn started(&self) -> bool {
+        !matches!(self, Self::NotStarted)
+    }
+
+    /// Snapshot-only readiness. Attempted is not settled: only returned
+    /// closes count, and this never moves a worker. Production reaps
+    /// through `poll`; only tests still snapshot readiness.
+    #[cfg(test)]
+    fn ready_to_finish(&self) -> bool {
+        match self {
+            Self::Pending { worker, .. } => {
+                let progress = worker.progress();
+                !worker.running()
+                    || progress
+                        .released
+                        .checked_add(progress.uncertain)
+                        .is_some_and(|settled| settled >= progress.total)
+            }
+            Self::Complete => true,
+            Self::NotStarted | Self::Unproved => false,
+        }
+    }
+
+    fn drive(
+        &mut self,
+        failures: &mut Vec<String>,
+        detached: &mut bool,
+        wall_ms: &mut u64,
+        second_signal: impl Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let prior = std::mem::replace(self, Self::Unproved);
+        let Self::Pending {
+            worker,
+            started,
+            had_work,
+            ..
+        } = prior
+        else {
+            if matches!(prior, Self::Complete) {
+                *self = Self::Complete;
+                return finish_producer_detach(detached, failures, Ok(()));
+            }
+            *detached = false;
+            bail!("producer detach has no unsettled owned job; completion remains unproven");
+        };
+        // Empty workers still join honestly, without adding an empty-cleanup
+        // notice to captures which owned no native producers.
+        let mut quiet = std::io::sink();
+        let output: &mut dyn std::io::Write = if had_work { out } else { &mut quiet };
+        let exit = drive_cleanup(
+            worker,
+            second_signal,
+            output,
+            std::time::Duration::from_secs(1),
+        );
+        *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
+        let complete =
+            matches!(&exit, cleanup_worker::CleanupExit::Completed(receipt) if receipt.completed);
+        let result = match cleanup_worker::settle_cleanup_exit(exit) {
+            Ok(joined_failures) => {
+                failures.extend(joined_failures);
+                if !complete && failures.is_empty() {
+                    failures
+                        .push("joined producer cleanup did not prove complete settlement".into());
+                }
+                Ok(())
+            }
+            Err(interrupted) => Err(interrupted.into()),
+        };
+        let result = finish_producer_detach(detached, failures, result);
+        if result.is_ok() {
+            *self = Self::Complete;
+        }
+        result
+    }
+
+    /// Non-consuming reap: while the worker thread is still closing,
+    /// `try_join` reports pending and the SAME worker stays in place
+    /// with every original lease. Only a joined receipt settles, through
+    /// the same `settle_cleanup_exit` + `finish_producer_detach` path as
+    /// `drive`. Pending polls print the one-shot estimate and the ~1/s
+    /// progress line through `out`, same text as the blocking `drive`.
+    fn poll(
+        &mut self,
+        failures: &mut Vec<String>,
+        detached: &mut bool,
+        wall_ms: &mut u64,
+        out: &mut dyn std::io::Write,
+    ) -> Result<ProducerDetachProgress> {
+        let Self::Pending {
+            worker,
+            started,
+            had_work,
+            progress,
+        } = self
+        else {
+            if matches!(self, Self::Complete) {
+                finish_producer_detach(detached, failures, Ok(()))?;
+                return Ok(ProducerDetachProgress::Complete);
+            }
+            if matches!(self, Self::NotStarted) {
+                bail!("owned producer detach not begun");
+            }
+            *detached = false;
+            bail!("producer detach has no unsettled owned job; completion remains unproven")
+        };
+        let started = *started;
+        let had_work = *had_work;
+        let Some(receipt) = worker.try_join() else {
+            progress.poll_pending(worker, had_work, out);
+            return Ok(ProducerDetachProgress::Pending);
+        };
+        *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
+        let complete = receipt.completed;
+        let result = match cleanup_worker::settle_cleanup_exit(
+            cleanup_worker::CleanupExit::Completed(receipt),
+        ) {
+            Ok(joined_failures) => {
+                failures.extend(joined_failures);
+                if !complete && failures.is_empty() {
+                    failures
+                        .push("joined producer cleanup did not prove complete settlement".into());
+                }
+                Ok(())
+            }
+            Err(interrupted) => Err(interrupted.into()),
+        };
+        let result = finish_producer_detach(detached, failures, result);
+        if result.is_ok() {
+            *self = Self::Complete;
+        } else {
+            *self = Self::Unproved;
+        }
+        result?;
+        Ok(ProducerDetachProgress::Complete)
+    }
+}
+
+/// Substituted native I/O drives the same terminal state/receipt consumer.
+#[cfg(test)]
+pub(crate) fn drive_owned_producer_detach_for_test(
+    worker: CleanupWorker,
+    second_signal: &dyn Fn() -> bool,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let had_work = worker.has_submissions();
+    let mut job = OwnedProducerDetach::Pending {
+        worker,
+        started: std::time::Instant::now(),
+        had_work,
+        progress: cleanup_worker::DetachPollPrinter::new(),
+    };
+    job.drive(&mut Vec::new(), &mut false, &mut 0, second_signal, out)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalProducerFamily {
+    Registered,
+    InstanceHooks,
+}
+
+/// The terminal submission boundary over the Session's original owner
+/// registries. Tests replace native take I/O while using its actual worker.
+fn submit_terminal_ownership(
+    worker: &CleanupWorker,
+    leases: cleanup_worker::FileLeases,
+    mut take: impl FnMut(TerminalProducerFamily) -> Vec<Result<(OwnedLink, ProducerProgram)>>,
+) -> Vec<String> {
+    let mut owned = Vec::new();
+    let mut failures = Vec::new();
+    for family in [
+        TerminalProducerFamily::Registered,
+        TerminalProducerFamily::InstanceHooks,
+    ] {
+        for outcome in take(family) {
+            match outcome {
+                Ok(link) => owned.push(link),
+                Err(error) => failures.push(format!("{error:#}")),
+            }
+        }
+    }
+    worker.note_transfer_failed(failures.len());
+    worker.submit(owned, leases, DetachOrder);
+    failures
+}
+
+/// A detach error leaves a Session's ownership bookkeeping inconsistent.
+/// It does not prove a kernel producer survived or that the kernel is quiet.
+/// Session-wide refusal is kept for the scripted test sessions;
+/// production Sessions admit per target through
+/// [`attachment_admission_for`], while capture and cleanup of existing
+/// ownership continue either way.
+#[cfg(test)]
 pub(crate) fn attachment_admission(
     detach_failures: &[String],
     proposed_additions: bool,
@@ -1262,6 +2123,270 @@ pub(crate) fn attachment_admission(
         );
     }
     Ok(())
+}
+
+/// What one detach failure quarantines (ruling JK-22a): only the failed
+/// link's own attach unit refuses future attachment, with its reason;
+/// unrelated targets keep admitting. Unattributed failures (terminal
+/// transfer, worker drive, diagnostic/raw/btf links) quarantine globally
+/// and keep the previous session-wide refusal.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DetachQuarantine {
+    /// A static slot whose detach failed; refuses only that slot index.
+    Slot(u32),
+    /// A dynamic hook whose detach failed; refuses only that identity.
+    /// The key omits program/ABI by design, so entry/return (and a loader
+    /// hook with an identical tuple) share it; over-refusal only,
+    /// fail-closed, never a double attach.
+    Dynamic {
+        context: u16,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    },
+    /// An unattributed failure; refuses every future attachment.
+    Global,
+}
+
+impl DetachQuarantine {
+    /// The attach units one detached link quarantines when its detach
+    /// fails. Static links quarantine their slots; dynamic links their
+    /// hook identity; links with neither quarantine globally.
+    fn of_link(link: &RegisteredLink) -> Vec<DetachQuarantine> {
+        match link {
+            RegisteredLink::UProbe { slot, .. } => vec![DetachQuarantine::Slot(*slot)],
+            RegisteredLink::MultiUProbe { slots, .. } => slots
+                .iter()
+                .map(|slot| DetachQuarantine::Slot(*slot))
+                .collect(),
+            RegisteredLink::DynamicUProbe {
+                context,
+                object,
+                file_offset,
+                cookie,
+                ..
+            } => vec![DetachQuarantine::Dynamic {
+                context: context.get(),
+                object: *object,
+                file_offset: *file_offset,
+                cookie: *cookie,
+            }],
+            RegisteredLink::RawTracePoint { .. }
+            | RegisteredLink::BtfTracePoint { .. }
+            | RegisteredLink::DiagnosticUProbe { .. } => vec![DetachQuarantine::Global],
+        }
+    }
+}
+
+/// What one attach entry point proposes to add, for quarantine admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProposedAttachment {
+    /// No addition (idempotent no-op); always admitted.
+    None,
+    /// Static slot indices (preflight, attach).
+    Slots(Vec<u32>),
+    /// One dynamic hook identity (loader, export).
+    Dynamic {
+        context: u16,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    },
+    /// A diagnostic probe.
+    Diagnostic,
+}
+
+/// Per-target admission over the detach quarantine: a proposal is refused
+/// only when it touches a quarantined unit, naming the unit and the
+/// recorded detach reason; unrelated targets are admitted. A global
+/// quarantine refuses every addition, as before.
+pub(crate) fn attachment_admission_for(
+    quarantine: &BTreeSet<DetachQuarantine>,
+    reasons: &BTreeMap<DetachQuarantine, String>,
+    proposed: &ProposedAttachment,
+) -> Result<()> {
+    if matches!(proposed, ProposedAttachment::None) {
+        return Ok(());
+    }
+    if quarantine.contains(&DetachQuarantine::Global) {
+        bail!(
+            "new producer attachment is refused after a detach bookkeeping failure; start a new session"
+        );
+    }
+    let reason_of = |key: &DetachQuarantine| {
+        reasons
+            .get(key)
+            .map(|reason| crate::render::escape_controls(reason).into_owned())
+            .unwrap_or_else(|| "unknown detach failure".to_string())
+    };
+    match proposed {
+        ProposedAttachment::None => Ok(()),
+        ProposedAttachment::Slots(proposed) => {
+            let hit: Vec<u32> = proposed
+                .iter()
+                .copied()
+                .filter(|slot| quarantine.contains(&DetachQuarantine::Slot(*slot)))
+                .collect();
+            if let Some(first) = hit.first() {
+                let slots = hit
+                    .iter()
+                    .map(|slot| format!("slot {slot}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "attachment refused: {slots} quarantined after detach failure: {}",
+                    reason_of(&DetachQuarantine::Slot(*first))
+                );
+            }
+            Ok(())
+        }
+        ProposedAttachment::Dynamic {
+            context,
+            object,
+            file_offset,
+            cookie,
+        } => {
+            let key = DetachQuarantine::Dynamic {
+                context: *context,
+                object: *object,
+                file_offset: *file_offset,
+                cookie: *cookie,
+            };
+            if quarantine.contains(&key) {
+                bail!(
+                    "attachment refused: dynamic hook (context {context}, object {}, \
+                     offset {file_offset:#x}, cookie {cookie:#x}) quarantined after detach \
+                     failure: {}",
+                    object.0,
+                    reason_of(&key)
+                );
+            }
+            Ok(())
+        }
+        ProposedAttachment::Diagnostic => Ok(()),
+    }
+}
+
+/// Quarantines attach units under one reason into owned collections (first
+/// reason per unit wins). Shared by the record path and the unattributed
+/// worker path; production `Session::quarantine_units` delegates here.
+fn quarantine_units_into(
+    quarantine: &mut BTreeSet<DetachQuarantine>,
+    reasons: &mut BTreeMap<DetachQuarantine, String>,
+    keys: Vec<DetachQuarantine>,
+    reason: &str,
+) {
+    for key in keys {
+        reasons
+            .entry(key.clone())
+            .or_insert_with(|| reason.to_string());
+        quarantine.insert(key);
+    }
+}
+
+/// Records one detach failure into owned quarantine collections: the message
+/// plus the quarantined units. Production `Session::record_detach_failure`
+/// delegates here; tests call this directly (no Session/BPF needed).
+fn record_detach_quarantine(
+    quarantine: &mut BTreeSet<DetachQuarantine>,
+    reasons: &mut BTreeMap<DetachQuarantine, String>,
+    failures: &mut Vec<String>,
+    keys: Vec<DetachQuarantine>,
+    message: String,
+) {
+    quarantine_units_into(quarantine, reasons, keys, &message);
+    failures.push(message);
+}
+
+/// Partitions proposed slot indices by quarantine: quarantined indices are
+/// returned separately for per-slot failure records while unrelated targets
+/// proceed; a global quarantine refuses the whole batch, as before.
+fn partition_slots(
+    quarantine: &BTreeSet<DetachQuarantine>,
+    reasons: &BTreeMap<DetachQuarantine, String>,
+    proposed: &[u32],
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    if proposed.is_empty() {
+        attachment_admission_for(quarantine, reasons, &ProposedAttachment::None)?;
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if quarantine.contains(&DetachQuarantine::Global) {
+        // Whole-batch, as before: reuse the exact global refusal.
+        return attachment_admission_for(
+            quarantine,
+            reasons,
+            &ProposedAttachment::Slots(proposed.to_vec()),
+        )
+        .map(|()| (Vec::new(), Vec::new()));
+    }
+    let mut admitted = Vec::new();
+    let mut quarantined = Vec::new();
+    for slot in proposed {
+        if quarantine.contains(&DetachQuarantine::Slot(*slot)) {
+            quarantined.push(*slot);
+        } else {
+            admitted.push(*slot);
+        }
+    }
+    Ok((admitted, quarantined))
+}
+
+/// Whether the quarantine stops all future attachment: only a global
+/// quarantine does (unattributed failures keep the session-wide refusal);
+/// per-target Slot/Dynamic quarantines admit unrelated targets.
+fn is_quarantine_stopped(quarantine: &BTreeSet<DetachQuarantine>) -> bool {
+    quarantine.contains(&DetachQuarantine::Global)
+}
+
+/// Refuse fresh attachment once the Session is stopping or detached: a
+/// post-terminal link would silently extend capture past the joined
+/// detach a saved completion attests. Refusal (never silent invalidation)
+/// is the codebase semantic — static attach inlines the same check, the
+/// group rebuild re-checks it after its baseline read, and a new Session
+/// is the recovery. Every path that adds a link past static attach
+/// funnels through here before touching BPF; idempotent no-ops
+/// (already-attached dedup) still succeed.
+fn stopped_attachment_admission(mutation_stopped: bool, path: &str) -> Result<()> {
+    if mutation_stopped {
+        bail!("{path} attachment refused while Session is stopping or detached");
+    }
+    Ok(())
+}
+
+fn static_attachment_baseline_with<S>(
+    state: &mut S,
+    acquire: impl FnOnce(&mut S) -> Option<pid_continuity::AttachBaseline>,
+    mutation_stopped: impl FnOnce(&S) -> bool,
+) -> Result<Option<pid_continuity::AttachBaseline>> {
+    let baseline = acquire(state);
+    // The fresh read may have latched terminal poison after the caller's
+    // earlier admission. Healthy unavailable proof still permits cold/global
+    // attachment; explicit stop, terminal or detach state never does.
+    if mutation_stopped(state) {
+        bail!("static attachment refused while Session is stopping or detached");
+    }
+    Ok(baseline)
+}
+
+fn refused_group_rebuild(
+    members: impl IntoIterator<Item = u32>,
+    rebuilt_groups: u64,
+    reason: &str,
+) -> DetachOutcome {
+    DetachOutcome {
+        pending: None,
+        recompleted: Vec::new(),
+        rebuild_failures: members
+            .into_iter()
+            .map(|member| {
+                (
+                    member,
+                    format!("slot {member} was not reattached: {reason}"),
+                )
+            })
+            .collect(),
+        rebuilt_groups,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1307,15 +2432,31 @@ pub(crate) enum ProducerProgram {
     UProbe(&'static str),
     RawTracePoint(&'static str),
     BtfTracePoint(&'static str),
+    InstanceHook(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ProbeSide {
+pub(crate) enum ProbeSide {
     Return,
     Entry,
 }
 
-type StaticEndpoint = (u32, ProbeSide);
+pub(crate) type StaticEndpoint = (u32, ProbeSide);
+
+fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoint> {
+    links
+        .iter()
+        .flat_map(|link| {
+            let side = match link.producer() {
+                ProducerProgram::UProbe(program) => static_probe_side(program),
+                _ => None,
+            };
+            link.slots()
+                .iter()
+                .filter_map(move |slot| side.map(|side| (*slot, side)))
+        })
+        .collect()
+}
 
 /// One link whose lifetime this session owns. Static, loader/export, and
 /// lifecycle links all remain in this one registry.
@@ -1324,6 +2465,7 @@ enum RegisteredLink {
         program: &'static str,
         slot: u32,
         id: UProbeLinkId,
+        registration: Option<pid_continuity::RegistrationId>,
     },
     /// One attached multi group side outside Aya's link table: the
     /// program, its member slots, and the live link fds (one per bisect
@@ -1332,6 +2474,7 @@ enum RegisteredLink {
         program: &'static str,
         slots: Vec<u32>,
         fds: Vec<OwnedFd>,
+        registration: Option<pid_continuity::RegistrationId>,
     },
     RawTracePoint {
         program: &'static str,
@@ -1444,6 +2587,13 @@ fn find_partial_multi_member(links: &[RegisteredLink], slots: &BTreeSet<u32>) ->
 /// entry-refused member shares its sibling's entry bundle). Returns `None`
 /// when no multi bundle is partially covered, i.e. the plain detach path
 /// applies: whole bundles, singles, and unlinked slots.
+/// True when every deferred group slot was terminally submitted.
+/// The mint proves the deferred set against the submitted set; an empty
+/// deferral proves vacuously.
+fn deferred_slots_proven(deferred: &BTreeSet<u32>, submitted: &BTreeSet<u32>) -> bool {
+    deferred.iter().all(|slot| submitted.contains(slot))
+}
+
 fn plan_group_rebuild(
     links: &[RegisteredLink],
     requested: &BTreeSet<u32>,
@@ -1539,21 +2689,30 @@ fn counter_snapshot_with(
 /// Detaches each concrete registered link in producer order. A program can
 /// own many links (one per static or dynamic slot), so ordering the producers
 /// is not enough: every individual link must receive one best-effort attempt.
-fn detach_selected_with<T>(
-    mut selected: Vec<(ProducerProgram, T)>,
-    mut detach: impl FnMut(T) -> Result<()>,
-) -> Vec<anyhow::Error> {
-    selected.sort_by_key(|(producer, _)| match producer {
-        ProducerProgram::UProbe("p11_entry") => 0,
+/// Detach order shared by the test helper below and the production
+/// selective-detach loop: entries before returns, lifecycle hooks with
+/// the entries, raw tracepoints and instance hooks last.
+fn detach_producer_order(producer: &ProducerProgram) -> u8 {
+    match producer {
+        ProducerProgram::UProbe("p11_entry" | "p11_counter_bank_entry") => 0,
         ProducerProgram::UProbe("p11_entry_ia32") => 1,
         ProducerProgram::UProbe("p11_entry_template") => 2,
         ProducerProgram::UProbe("p11_entry_template_types") => 3,
         ProducerProgram::UProbe("p11_entry_template_pair") => 4,
         ProducerProgram::BtfTracePoint("task_newtask") => 5,
-        ProducerProgram::UProbe("p11_return") => 6,
+        ProducerProgram::UProbe("p11_return" | "p11_counter_bank_return") => 6,
         ProducerProgram::RawTracePoint(_) => 8,
+        ProducerProgram::InstanceHook(_) => 9,
         _ => 7,
-    });
+    }
+}
+
+#[cfg(test)]
+fn detach_selected_with<T>(
+    mut selected: Vec<(ProducerProgram, T)>,
+    mut detach: impl FnMut(T) -> Result<()>,
+) -> Vec<anyhow::Error> {
+    selected.sort_by_key(|(producer, _)| detach_producer_order(producer));
     selected
         .into_iter()
         .filter_map(|(_, link)| detach(link).err())
@@ -1644,10 +2803,11 @@ fn entry_program(
 }
 
 #[derive(Debug)]
-struct AttachOutcome {
+pub(crate) struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
     completed: Vec<SlotCompletion>,
+    continuity_rounds: Vec<pid_continuity::AttachRound>,
     /// The run stopped early on fd exhaustion: members without a success
     /// or failure entry were never attempted. Fresh attach reports the one
     /// shared summary; the group rebuild records every remainder explicitly.
@@ -1675,6 +2835,8 @@ pub struct ReplacementOutcome {
 /// group needed a rebuild (singles detach, whole-bundle detach).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetachOutcome {
+    /// Only the ordinary global candidate consumer may defer publication.
+    pub(crate) pending: Option<RetirementTicket>,
     /// (slot, reactivation timestamp) for every survivor fully reattached,
     /// including unchanged siblings.
     pub recompleted: Vec<(u32, Option<u64>)>,
@@ -1695,12 +2857,14 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
 
 fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" => Some(ProbeSide::Return),
+        "p11_return" | "p11_counter_bank_return" | "p11_return_journal" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
-        | "p11_entry_template_pair" => Some(ProbeSide::Entry),
+        | "p11_entry_template_pair"
+        | "p11_entry_journal"
+        | "p11_counter_bank_entry" => Some(ProbeSide::Entry),
         _ => None,
     }
 }
@@ -1725,6 +2889,7 @@ struct StaticGroupMember {
 struct StaticGroup {
     path: PathBuf,
     entry_program: &'static str,
+    return_program: &'static str,
     members: Vec<StaticGroupMember>,
 }
 
@@ -1732,17 +2897,1037 @@ struct StaticGroup {
 /// attach used plus the pinned path/ABI it resolved. Retained so a
 /// multi-group rebuild can reattach surviving siblings without re-deriving
 /// identity; facts survive exactly while a link does.
-#[derive(Debug, Clone)]
-struct RetainedStaticTarget {
+#[derive(Debug)]
+pub(crate) struct RetainedStaticTarget {
     slot: Slot,
     path: PathBuf,
     abi: ElfAbi,
+    held: Option<crate::discovery::identity::RetainedInventoryTarget>,
 }
+
+impl Clone for RetainedStaticTarget {
+    fn clone(&self) -> Self {
+        Self {
+            slot: self.slot.clone(),
+            path: self.path.clone(),
+            abi: self.abi,
+            held: self.held.as_ref().map(|target| target.share()),
+        }
+    }
+}
+
+impl RetainedStaticTarget {
+    fn retirement_lease(&self) -> Option<Arc<std::fs::File>> {
+        self.held.as_ref().map(|target| target.retirement_lease())
+    }
+}
+
+/// Test-only interim attachment generation: every successful test
+/// sealing mints the next value, so the closure generation the
+/// journal observes always names a real sealed endpoint set. Fenced
+/// from production (which mints from the mmapable attach cell): the
+/// interim counter alone never feeds production authority.
+#[cfg(test)]
+static ATTACHMENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Session-owned attachment authority. Fields and constructor stay private.
+pub(crate) struct AttachedSemanticSet {
+    domain: crate::attach::capture::NativeDomainId,
+    subset: crate::inventory_semantics::AttestedSubset,
+    generation: u64,
+    /// Whether a journal producer is linked for this attachment: only a
+    /// linked attachment may install key-operation (Joint) feeds. The
+    /// production seal derives this from the actually loaded journal pair;
+    /// the test sealer marks its attachments linked for the Joint suites.
+    journal_linked: bool,
+}
+
+impl std::fmt::Debug for AttachedSemanticSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttachedSemanticSet(<retained>)")
+    }
+}
+
+impl AttachedSemanticSet {
+    /// The native identity domain this attachment was sealed under.
+    pub(crate) fn domain(&self) -> crate::attach::capture::NativeDomainId {
+        self.domain
+    }
+
+    /// The attachment's sealing generation: minted only by a
+    /// successful sealing, observed (never supplied) by the journal's
+    /// closure install, grant and audit.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether a journal producer is linked for this attachment. The
+    /// attested start retains the sealed value on the Session, and the
+    /// producers drain derives its linkage from that retained fact.
+    pub(crate) fn journal_linked(&self) -> bool {
+        self.journal_linked
+    }
+}
+
+/// One Session's retained drain producers: its native identity
+/// domain plus its retained EVENTS domain. Private fields:
+/// production builds one only through [`Session::drain_producers`]
+/// (which retains both); the drain grant mints through the pair, so
+/// a spliced foreign admission refuses at mint instead of pairing.
+#[derive(Clone)]
+pub(crate) struct SessionDrainProducers {
+    native: crate::attach::capture::NativeDomainId,
+    events: events::EventsDomain,
+    /// Whether a journal producer is linked for this lane: only a
+    /// linked lane may install key-operation (Joint) feeds. The producers
+    /// drain derives this from the Session's retained sealed fact. A
+    /// capability, not identity: [`SessionDrainProducers::same_producers`]
+    /// ignores it.
+    journal_linked: bool,
+}
+
+/// Session-owned Q metadata. No constructor, Clone or Copy permits a caller
+/// to manufacture quiescence from ring positions or a terminal summary.
+/// This records producer bounds, not a clean prefix, completed drain, process
+/// death, or permission to detach. Later reads must remain within the bounds.
+pub(crate) struct CollectedFinishQ {
+    producers: SessionDrainProducers,
+    discovery: events::DiscoveryDomain,
+    events: events::EventsConsumptionCut,
+    discovery_positions: aya::maps::ring_buf::RingBufPositions,
+    grant: Option<crate::semantics_objects::journal::SessionDrainGrant>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Staged Q API; no machine/terminal consumer is active.
+impl CollectedFinishQ {
+    pub(crate) fn matches_owner(
+        &self,
+        producers: &SessionDrainProducers,
+        discovery: &events::DiscoveryDomain,
+    ) -> bool {
+        self.producers.same_producers(producers) && self.discovery.same_allocation(discovery)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_discovery_drain<S: events::RecordSource>(
+        &self,
+        producers: &SessionDrainProducers,
+        drain: &events::DiscoveryDrain<S>,
+    ) -> bool {
+        self.producers.same_producers(producers) && drain.same_domain(&self.discovery)
+    }
+
+    pub(crate) fn matches_retained_grant(
+        &self,
+        grant: &crate::semantics_objects::journal::SessionDrainGrant,
+    ) -> bool {
+        self.grant.as_ref().is_some_and(|retained| {
+            retained == grant && retained.matches_producers(&self.producers)
+        })
+    }
+
+    /// Observation metadata only: Q does not acquire a later admission grant.
+    pub(crate) fn observed_without_grant(&self) -> bool {
+        self.grant.is_none()
+    }
+
+    pub(crate) fn events_stop(&self) -> usize {
+        self.events.producer_bound()
+    }
+
+    pub(crate) fn discovery_stop(&self) -> usize {
+        self.discovery_positions.producer
+    }
+
+    pub(crate) fn covers_events_bounds(&self, cut: &events::EventsConsumptionCut) -> bool {
+        cut.within_producer_bound(&self.events)
+    }
+
+    pub(crate) fn events_at_bound(&self, cut: &events::EventsConsumptionCut) -> bool {
+        cut.at_producer_bound(&self.events)
+    }
+}
+
+/// Private borrowed view. Production supplies only the owning Session's
+/// retained fields; tests substitute the native read leaves beneath it.
+struct CollectedFinishQOwner<'a> {
+    gate: &'a StopGate,
+    producers: &'a SessionDrainProducers,
+    discovery: &'a events::DiscoveryDomain,
+    detach: &'a OwnedProducerDetach,
+}
+
+fn validate_collected_finish_q_owner(
+    owner: &CollectedFinishQOwner<'_>,
+    expected: &SessionDrainProducers,
+    grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+) -> Result<()> {
+    anyhow::ensure!(
+        owner.producers.same_producers(expected),
+        "collected Finish Q requires the original Session producers"
+    );
+    anyhow::ensure!(
+        matches!(owner.detach, OwnedProducerDetach::NotStarted),
+        "collected Finish Q cannot follow producer detach"
+    );
+    anyhow::ensure!(
+        grant.is_none_or(|retained| retained.matches_producers(owner.producers)),
+        "collected Finish Q refuses a foreign retained drain grant"
+    );
+    Ok(())
+}
+
+fn observe_collected_finish_q_with(
+    owner: CollectedFinishQOwner<'_>,
+    expected: &SessionDrainProducers,
+    grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+    read_events: impl FnOnce() -> Result<events::EventsConsumptionCut>,
+    read_discovery: impl FnOnce() -> Result<aya::maps::ring_buf::RingBufPositions>,
+) -> Result<Option<CollectedFinishQ>> {
+    validate_collected_finish_q_owner(&owner, expected, grant)?;
+    if !owner.gate.quiescent() {
+        return Ok(None);
+    }
+    let events = read_events()?;
+    anyhow::ensure!(
+        owner.producers.matches_events(events.events()),
+        "collected Finish Q refuses another EVENTS allocation"
+    );
+    let discovery_positions = read_discovery()?;
+    anyhow::ensure!(
+        discovery_positions.consumer.is_multiple_of(8)
+            && discovery_positions.producer.is_multiple_of(8)
+            && discovery_positions.capacity != 0
+            && discovery_positions.capacity.is_power_of_two()
+            && discovery_positions.consumer != usize::MAX
+            && discovery_positions.producer != usize::MAX
+            && discovery_positions
+                .producer
+                .checked_sub(discovery_positions.consumer)
+                .is_some_and(|unread| unread <= discovery_positions.capacity),
+        "collected Finish Q refuses invalid DISCOVERY positions"
+    );
+    // Q must still hold after BOTH original ring observations. No dequeue,
+    // callback, OBJECT_START scrub or lifecycle proof occurs in this observer.
+    if !owner.gate.quiescent() {
+        return Ok(None);
+    }
+    Ok(Some(CollectedFinishQ {
+        producers: owner.producers.clone(),
+        discovery: owner.discovery.clone(),
+        events,
+        discovery_positions,
+        grant: grant.copied(),
+    }))
+}
+
+impl SessionDrainProducers {
+    pub(crate) fn same_producers(&self, other: &Self) -> bool {
+        self.native == other.native && self.events.same_allocation(&other.events)
+    }
+
+    pub(crate) fn matches_events(&self, events: &events::EventsDomain) -> bool {
+        self.events.same_allocation(events)
+    }
+
+    /// The retained native domain the admission is checked against.
+    pub(crate) fn native_domain(&self) -> crate::attach::capture::NativeDomainId {
+        self.native
+    }
+
+    /// The retained EVENTS-map identity the grant binds.
+    pub(crate) fn events_id(&self) -> u64 {
+        self.events.id()
+    }
+
+    /// Whether a journal producer is linked for this lane, as derived by
+    /// the producers drain from the Session's retained sealed fact.
+    pub(crate) fn journal_linked(&self) -> bool {
+        self.journal_linked
+    }
+
+    /// Pair one scene's genuine test producers: its fixture's minted
+    /// native domain plus its retained test EVENTS domain. The
+    /// common-owner check still runs at mint — this pairs values, it
+    /// never authorizes a splice. Linked, like the test sealer, so the
+    /// Joint suites keep exercising the linked 0.6.0 world.
+    #[cfg(test)]
+    pub(crate) fn test_pair(
+        native: crate::attach::capture::NativeDomainId,
+        events: events::EventsDomain,
+    ) -> Self {
+        Self {
+            native,
+            events,
+            journal_linked: true,
+        }
+    }
+
+    /// Pair one scene's genuine test producers for the unlinked v0.5.0
+    /// world: no journal producer, so the Joint birth path bars and the
+    /// lane stays S1-only with one disclosure.
+    #[cfg(test)]
+    pub(crate) fn test_pair_unlinked(
+        native: crate::attach::capture::NativeDomainId,
+        events: events::EventsDomain,
+    ) -> Self {
+        Self {
+            native,
+            events,
+            journal_linked: false,
+        }
+    }
+}
+
+/// Native-owned terminal completion: the joined proof that a Session's
+/// terminal sequence actually ran — joined producer detach, proven Q, a
+/// backlog-free bounded terminal EVENTS drain and a completed
+/// OBJECT_START scrub. Only [`Session::mint_native_completion`] mints one
+/// (tests adjudicate explicit evidence through `from_joined_evidence`);
+/// there is no other constructor, so joint lanes consume but never
+/// manufacture it.
+///
+/// Single-session consumption contract: the completion binds the
+/// minting Session's retained EVENTS identity (`events_id`), not just
+/// counts, so a well-formed completion from another session is
+/// recognizable as foreign. The DR37 1C/1F joint promotion wiring must,
+/// at consumption: (1) consume each completion at most once for its
+/// minting Session; (2) refuse when
+/// `!completion.binds_events(&session.events_domain())` — a foreign
+/// session's completion never promotes here; (3) never persist or replay
+/// a completion past its Session's lifetime — the retained FD pins the
+/// kernel map ID against reuse only while that history survives, and
+/// only within that lifetime is the binding meaningful.
+#[allow(dead_code)] // The completion minter consumes the mint; per-field evidence reads stay test-pinned.
+#[derive(Debug)]
+pub(crate) struct SessionNativeCompletion {
+    terminal_events: u64,
+    terminal_malformed: u64,
+    scrubbed_objects: usize,
+    detach_wall_ms: u64,
+    selected_terminal: bool,
+    events_id: u64,
+}
+
+#[allow(dead_code)] // The completion minter consumes the mint; the evidence getters stay test-pinned.
+impl SessionNativeCompletion {
+    /// The join gates both ends of the mint enforce: the fail-fast at the
+    /// top of [`Session::mint_native_completion`] (before the terminal
+    /// poll, so a refused mint consumes nothing and no retry can mint
+    /// over a split backlog) and the end adjudication here (defense in
+    /// depth with the post-poll Q re-check). One shared check, so the two
+    /// can never drift.
+    fn join_gates(detach_complete: bool, quiescent: bool) -> Result<()> {
+        anyhow::ensure!(
+            detach_complete,
+            "native completion requires joined producer detach"
+        );
+        anyhow::ensure!(quiescent, "native completion requires proven quiescence");
+        Ok(())
+    }
+
+    /// Adjudicate observed native evidence into a completion. Every gate
+    /// must hold: joined detach, proven quiescence, no terminal-drain
+    /// backlog, no reserved-but-uncommitted EVENTS head. Counts ride along
+    /// untouched; an empty scrub (nothing retained) or an ordinary session
+    /// (no selection) still mints, since the completed scrub and the
+    /// joined detach are the proof, not the counts. `events_id` is the
+    /// minting Session's retained EVENTS identity the joint promotion
+    /// lane re-checks at consumption (see the struct contract).
+    /// (Too many arguments is the honest shape: every gate is injected,
+    /// none supplied.)
+    #[allow(clippy::too_many_arguments)]
+    fn from_joined_evidence(
+        detach_complete: bool,
+        quiescent: bool,
+        backlog: bool,
+        head_pending: bool,
+        terminal_events: u64,
+        terminal_malformed: u64,
+        scrubbed_objects: usize,
+        detach_wall_ms: u64,
+        selected_terminal: bool,
+        events_id: u64,
+    ) -> Result<Self> {
+        Self::join_gates(detach_complete, quiescent)?;
+        Self::refuse_drain_verdict(backlog, head_pending)?;
+        Ok(Self {
+            terminal_events,
+            terminal_malformed,
+            scrubbed_objects,
+            detach_wall_ms,
+            selected_terminal,
+            events_id,
+        })
+    }
+
+    /// EVENTS records the mint's own bounded terminal poll consumed:
+    /// post-semantic-drain leftovers and post-Q arrivals, never the
+    /// semantic lane's routed batches.
+    pub(crate) fn terminal_events(&self) -> u64 {
+        self.terminal_events
+    }
+
+    /// Malformed records met by the mint's own terminal poll.
+    pub(crate) fn terminal_malformed(&self) -> u64 {
+        self.terminal_malformed
+    }
+
+    /// OBJECT_START rows the mint's scrub zeroed and removed.
+    pub(crate) fn scrubbed_objects(&self) -> usize {
+        self.scrubbed_objects
+    }
+
+    /// Wall time the joined producer detach took, in whole milliseconds.
+    pub(crate) fn detach_wall_ms(&self) -> u64 {
+        self.detach_wall_ms
+    }
+
+    /// True only when a native selection existed and read back TERMINAL
+    /// at mint. Ordinary sessions mint with false.
+    pub(crate) fn selected_terminal(&self) -> bool {
+        self.selected_terminal
+    }
+
+    /// The minting Session's retained EVENTS identity.
+    pub(crate) fn events_id(&self) -> u64 {
+        self.events_id
+    }
+
+    /// True only for the retained EVENTS domain this completion was minted
+    /// from. The joint promotion lane checks this at consumption: a
+    /// completion never promotes a foreign session (see the struct
+    /// contract).
+    pub(crate) fn binds_events(&self, domain: &events::EventsDomain) -> bool {
+        self.events_id == domain.id()
+    }
+
+    /// Refuse a terminal poll verdict that already proves the mint
+    /// cannot join: backlog past the bound, or a reserved-but-
+    /// uncommitted EVENTS head. The pre-scrub fail-fast in
+    /// [`Session::mint_native_completion`] and the end adjudication in
+    /// `from_joined_evidence` share this one check, so the two can never
+    /// drift — and a known-bad verdict refuses before the scrub, whose
+    /// error can therefore neither run on doomed evidence nor preempt
+    /// the by-name diagnostic.
+    fn refuse_drain_verdict(backlog: bool, head_pending: bool) -> Result<()> {
+        anyhow::ensure!(
+            !backlog,
+            "native completion refused: terminal drain left backlog past its bound"
+        );
+        anyhow::ensure!(
+            !head_pending,
+            "native completion refused: EVENTS head reserved but uncommitted"
+        );
+        Ok(())
+    }
+}
+
+/// Sticky refusal for the native completion mint: once an attempt fails
+/// after its terminal poll consumed records, the Session can never mint
+/// again — a retry would drain only the leftover tail and mint over the
+/// consumed prefix the refusal ate (65,537 queued: attempt 1 eats 65,536
+/// and refuses for backlog; attempt 2 would mint terminal_events=1 over
+/// the forgotten attempt 1). Pre-consumption refusals — the admission
+/// and join gates, the selected gate, consumer setup — ate nothing and
+/// leave the mint admissible.
+#[derive(Default)]
+struct NativeCompletionMint {
+    failed_after_consumption: bool,
+}
+
+impl NativeCompletionMint {
+    /// Fail-fast admission at the top of the mint, before the terminal
+    /// poll: a Session poisoned by a destructive mint failure refuses
+    /// without consuming anything further.
+    fn admit(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.failed_after_consumption,
+            "native completion refused: a prior mint attempt failed after consuming terminal evidence"
+        );
+        Ok(())
+    }
+
+    /// Record a failure after the terminal poll consumed: the mint is
+    /// terminally refused for this Session.
+    fn record_destructive_failure(&mut self) {
+        self.failed_after_consumption = true;
+    }
+}
+
+/// Bound on the completion minter's preserved first mint failure:
+/// generous over one-line mint refusals, and the gap path reports
+/// each preserved failure exactly once.
+pub(crate) const COMPLETION_FIRST_FAILURE_MAX: usize = 512;
+
+/// The production native completion minter (DR37 D4/A→B): owns
+/// wound-down Sessions and mints one lifecycle completion per
+/// genuinely disposed domain. Each poll attempts the held Session's
+/// own terminal proof (joined detach, proven quiescence,
+/// backlog-free terminal drain, object-start scrub); unmet gates
+/// poll `None` and the namespace holds, never forced. A minted
+/// Session is spent (its terminal evidence consumed) and drops with
+/// its maps; a domain/Session pairing that disagrees drops closed
+/// instead of retiring the wrong namespace. A failed mint polls
+/// `None` too, but its cause is preserved (first failure, bounded)
+/// for the driver's diagnostic take instead of vanishing.
+#[derive(Default)]
+pub(crate) struct NativeCompletionMinter {
+    pending: std::collections::HashMap<capture::NativeDomainId, Session>,
+    first_failure: Option<String>,
+}
+
+impl NativeCompletionMinter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Preserve a mint failure for the diagnostic take: first one
+    /// wins, truncated to [`COMPLETION_FIRST_FAILURE_MAX`] on a
+    /// character boundary. Later failures never displace it, so the
+    /// reported cause is always the original refusal.
+    fn record_first_failure(&mut self, mut failure: String) {
+        if self.first_failure.is_some() {
+            return;
+        }
+        if failure.len() > COMPLETION_FIRST_FAILURE_MAX {
+            let mut end = COMPLETION_FIRST_FAILURE_MAX;
+            while !failure.is_char_boundary(end) {
+                end -= 1;
+            }
+            failure.truncate(end);
+        }
+        self.first_failure = Some(failure);
+    }
+}
+
+impl crate::inventory_promotion::lifecycle::NativeCompletionSource for NativeCompletionMinter {
+    fn poll_completion(
+        &mut self,
+        domain: capture::NativeDomainId,
+    ) -> Option<crate::inventory_promotion::lifecycle::SessionNativeCompletion> {
+        let session = self.pending.get_mut(&domain)?;
+        if session.native_domain() != Some(domain) {
+            // The driver mislabeled this pairing: drop the Session
+            // closed rather than retire the wrong namespace. The
+            // namespace holds, honestly unproven.
+            self.pending.remove(&domain);
+            return None;
+        }
+        if let Err(error) = session.mint_native_completion() {
+            self.record_first_failure(format!("{error:#}"));
+            return None;
+        }
+        self.pending.remove(&domain);
+        Some(crate::inventory_promotion::lifecycle::SessionNativeCompletion::completed(domain))
+    }
+
+    fn note_wound_down(&mut self, domain: capture::NativeDomainId, session: Session) {
+        self.pending.insert(domain, session);
+    }
+
+    fn take_first_failure(&mut self) -> Option<String> {
+        self.first_failure.take()
+    }
+}
+
+/// The completion mint's bounded terminal EVENTS poll over the retained
+/// consumer: counts consumed records and the malformed delta, and reports
+/// `backlog` when the poll stopped with records queued, plus a separate
+/// `head_pending` when positions still show unread bytes after an empty
+/// read (the head is reserved but uncommitted — the unbounded `poll` maps
+/// that Pending head to `None`, so positions are the verdict, per
+/// `events_head_pending`). Generic over the source so tests pin the exact
+/// verdict the mint consumes.
+struct TerminalPollVerdict {
+    backlog: bool,
+    head_pending: bool,
+    terminal_events: u64,
+    terminal_malformed: u64,
+}
+
+fn terminal_poll_verdict<S>(drain: &mut events::EventDrain<S>) -> TerminalPollVerdict
+where
+    S: events::RecordSource + events::BoundedRecordSource,
+{
+    let malformed_before = drain.malformed();
+    let mut terminal_events = 0u64;
+    let backlog = drain.poll(Some(events::TERMINAL_DRAIN_BOUND), |_| {
+        terminal_events = terminal_events.saturating_add(1);
+        std::ops::ControlFlow::Continue(())
+    });
+    TerminalPollVerdict {
+        backlog,
+        head_pending: events::events_head_pending(drain),
+        terminal_events,
+        terminal_malformed: drain.malformed().saturating_sub(malformed_before),
+    }
+}
+
+/// Whether a loaded program inventory carries the actually linked journal
+/// pair: BOTH journal roots present. The production seal derives its linkage
+/// from the live loaded inventory through this predicate, so a missing root
+/// (partial attach) seals unlinked; naming a missing root stays the inventory
+/// seams' job.
+fn journal_pair_present(programs: &BTreeSet<&str>) -> bool {
+    journal::PROGRAMS.iter().all(|root| programs.contains(root))
+}
+
+/// Doctor-facing journal-pair availability, derived from the same
+/// loaded-pair predicate and flavor contract the production seal
+/// consumes — never from a build flag or a second inventory read.
+/// Preflight only: this fact loads nothing, seals nothing and
+/// authorizes nothing; it only names why the pair is or is not
+/// available in this build's production journal object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JournalPairPreflight {
+    /// Both journal roots are present and the object flavor is clean.
+    Available,
+    /// This build omits the production journal object entirely.
+    UnavailableInBuild,
+    /// The object parses but one or both journal roots are missing;
+    /// the payload names the missing roots.
+    PairMissing(String),
+    /// The embedded bytes do not parse as a BPF object.
+    LoadError(String),
+    /// Both roots are present but the object is not a clean journal
+    /// object (ordinary roots present, or a journal map mismatch).
+    WrongDomain(String),
+}
+
+/// Pair availability for this build's production journal object: the
+/// build gate resolves the embedded bytes, then the same parsed-object
+/// derivation as the seal decides. Doctor renders this verbatim.
+pub(crate) fn journal_pair_preflight() -> JournalPairPreflight {
+    match journal::JournalSpec.prepare() {
+        Ok(prepared) => journal_pair_preflight_from_bytes(prepared.object),
+        // Preparation refuses only through the build gate today, so a
+        // refusal here means the build omits the production object.
+        Err(_) => JournalPairPreflight::UnavailableInBuild,
+    }
+}
+
+/// Pair availability over candidate object bytes: unparseable bytes
+/// are a load error, never a missing pair.
+pub(crate) fn journal_pair_preflight_from_bytes(object: &[u8]) -> JournalPairPreflight {
+    match aya_obj::Object::parse(object) {
+        Ok(parsed) => journal_pair_preflight_from_parsed(&parsed),
+        Err(_) => JournalPairPreflight::LoadError("journal object unparseable".into()),
+    }
+}
+
+/// Pair availability over one parsed object: missing roots are named
+/// through the seal's own pair predicate, and a present pair must
+/// still pass the full journal flavor contract (no ordinary roots,
+/// exact journal maps) before it reads as available.
+pub(crate) fn journal_pair_preflight_from_parsed(parsed: &aya_obj::Object) -> JournalPairPreflight {
+    let programs: BTreeSet<&str> = parsed.programs.keys().map(String::as_str).collect();
+    if !journal_pair_present(&programs) {
+        let missing: Vec<&str> = journal::PROGRAMS
+            .iter()
+            .copied()
+            .filter(|root| !programs.contains(root))
+            .collect();
+        return JournalPairPreflight::PairMissing(missing.join(", "));
+    }
+    match journal::journal_flavor_from_parsed(parsed) {
+        Ok(_) => JournalPairPreflight::Available,
+        Err(error) => JournalPairPreflight::WrongDomain(format!("{error:#}")),
+    }
+}
+
+/// Seal one operator-attested subset into Session-owned attachment
+/// authority with a NATIVE mint: validates exactly like the test
+/// sealer, then mints the generation from the mmapable attach cell
+/// (BPF stamps exec'ing records from it as `exec_attach_gen`), so a
+/// journal seal's generation always names a natively published
+/// endpoint set. A failed native mint refuses the sealing. Production
+/// seals here; the interim userspace counter never feeds production
+/// authority.
+/// The mint publishes closure only when the loaded object carries the
+/// journal pair (the only journal loader is the `--key-operations`
+/// lane): ordinary seals keep generation 0 with the attach cell
+/// untouched, so marker hooks stop at the gated read. No production
+/// consumer needs a nonzero ordinary closure — every generation check
+/// is same-seal equality — and the kernel exec stamp needs no gate.
+/// (Too many arguments is the honest shape: every seal input is
+/// injected, none supplied.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_attached_subset_native(
+    ebpf: &Ebpf,
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    // Native reads for the seal core: the actually loaded program inventory
+    // and the attach-cell mint. Derivation, validation and construction live
+    // in the core, shared with the host twins' scripted inventory and mint.
+    let programs: BTreeSet<&str> = ebpf.programs().map(|(name, _)| name).collect();
+    let maps = instance::InstanceMaps { ebpf };
+    // Closure publishes only under the loaded journal pair: ordinary
+    // objects seal with generation 0 and never touch the attach cell.
+    let journal_pair = journal_pair_present(&programs);
+    seal_attached_subset_from_programs(
+        subset,
+        domain,
+        policy,
+        descriptors,
+        retained,
+        owned_sides,
+        watched,
+        &programs,
+        || {
+            if !journal_pair {
+                return Ok(0);
+            }
+            maps.mint_attach_generation()
+                .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)
+        },
+    )
+}
+
+/// Production seal core over an already-read loaded program inventory with an
+/// injected generation mint. The native wrapper reads the inventory from the
+/// live object and mints from the attach cell; host twins substitute a
+/// scripted inventory (parsed from the real embedded bytes) and a scripted
+/// mint. Validation, linkage derivation and construction are production in
+/// both cases; only the two native reads differ.
+#[allow(clippy::too_many_arguments)]
+fn seal_attached_subset_from_programs(
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    programs: &BTreeSet<&str>,
+    mint: impl FnOnce() -> std::result::Result<u64, crate::inventory_semantics::SemanticRefusal>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    let mut attached = AttachedSemanticSet {
+        domain,
+        subset,
+        generation: 0,
+        // Derived from the actually loaded pair, never a literal or a
+        // copied flag: only a session whose loaded object carries both
+        // journal roots seals linked.
+        journal_linked: journal_pair_present(programs),
+    };
+    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Only a successful sealing mints: the generation always names a
+    // complete validated endpoint set, never a refused one or a bare
+    // counter value. Production mints from the attach cell; host twins
+    // observe their scripted mint.
+    attached.generation = mint()?;
+    Ok(attached)
+}
+
+/// Retain a successful seal's derived linkage in the Session's sealed cell:
+/// only a successful attested seal retains; a refused seal keeps no linkage.
+/// `Session::start_attested` retains through this; host twins retain the same
+/// sealed fact through this.
+fn retain_sealed_linkage(cell: &mut Option<bool>, attached: &AttachedSemanticSet) {
+    *cell = Some(attached.journal_linked());
+}
+
+/// Derive producers-drain linkage from the Session's retained sealed fact: a
+/// sealed attachment carries its derived linkage to the drain, while a
+/// never-sealed session drains unlinked. `Session::drain_producers` derives
+/// through this; host twins derive the same returned linkage through this.
+fn drain_linkage_from_sealed(sealed: Option<bool>) -> bool {
+    sealed.unwrap_or(false)
+}
+
+/// Test-only seal over fixture-built maps through the same validation:
+/// host tests seal their successful-attachment evidence here (and via
+/// `seal_test_attachment`). Fenced from production, which seals
+/// through `seal_attached_subset_native` with a native mint. The
+/// sealed receipt is the successful-attachment evidence birth
+/// observation requires.
+#[cfg(test)]
+pub(crate) fn seal_attached_subset_with(
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    let mut attached = AttachedSemanticSet {
+        domain,
+        subset,
+        generation: 0,
+        // The test seal models the linked 0.6.0 world, so the Joint
+        // suites keep exercising birth-to-grant mapping.
+        journal_linked: true,
+    };
+    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Only a successful sealing mints: the generation always names a
+    // complete validated endpoint set, never a refused one.
+    attached.generation = ATTACHMENT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    Ok(attached)
+}
+
+/// Test-only sealed attachment over a fixture subset: actual attach
+/// scheduling and retention through the Session seams; only link I/O
+/// is scripted. Birth observation tests seal their
+/// successful-attachment evidence here.
+#[cfg(test)]
+pub(crate) fn seal_test_attachment(
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    pins: &crate::discovery::identity::PinnedObjects,
+) -> AttachedSemanticSet {
+    let outcome = attach_targets_with(
+        subset.plan().slots.as_slice(),
+        CapturePolicy::Allowlisted,
+        false,
+        |slot| Ok(subset.pins().abi_for(slot.object).unwrap()),
+        |_, _, _| Ok(()),
+        |_| Some(1),
+    )
+    .unwrap();
+    let targets = subset
+        .plan()
+        .slots
+        .iter()
+        .map(|slot| {
+            (
+                slot.index,
+                (
+                    subset.pins().attach_path_for(slot.object).unwrap(),
+                    subset.pins().abi_for(slot.object).unwrap(),
+                ),
+            )
+        })
+        .collect();
+    let mut retained = BTreeMap::new();
+    retain_from_successful(
+        &mut retained,
+        &subset.plan().slots,
+        &targets,
+        &outcome.successful,
+    );
+    seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &outcome.successful,
+        |id| pins.retain_inventory_target(id).ok(),
+    )
+    .expect("fixture attachment seals")
+}
+
+/// Closure-change fixture: consume the SAME retained envelope, rerun the
+/// normal successful test sealing/validate_with path, then mint its next
+/// generation. No pathname reopen or bare generation setter is involved.
+#[cfg(test)]
+pub(crate) fn reseal_test_attachment(
+    attached: AttachedSemanticSet,
+    pins: &crate::discovery::identity::PinnedObjects,
+) -> AttachedSemanticSet {
+    let AttachedSemanticSet { domain, subset, .. } = attached;
+    seal_test_attachment(subset, domain, pins)
+}
+
+fn semantic_receipt_readback(
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+    use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+    if policy != CapturePolicy::Allowlisted
+        || descriptors.map_err(|_| Refusal::Attachment)? != *crate::kinds::DESCRIPTORS
+    {
+        return Err(Refusal::Attachment);
+    }
+    Ok(())
+}
+
+fn semantic_receipt_query_refusal(
+    error: image_query::ImageQueryRefusal,
+) -> crate::semantic_capture::CurrentReceiptRefusal {
+    use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+    match error {
+        image_query::ImageQueryRefusal::Unknown | image_query::ImageQueryRefusal::Unstable => {
+            Refusal::Epoch
+        }
+        image_query::ImageQueryRefusal::Deadline => Refusal::Deadline,
+        image_query::ImageQueryRefusal::Custody => Refusal::Custody,
+        _ => Refusal::Audit,
+    }
+}
+
+impl AttachedSemanticSet {
+    fn validate_with(
+        &self,
+        domain: crate::attach::capture::NativeDomainId,
+        policy: CapturePolicy,
+        descriptors: Result<Vec<SlotSemantics>>,
+        retained: &BTreeMap<u32, RetainedStaticTarget>,
+        owned_sides: &BTreeSet<StaticEndpoint>,
+        watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    ) -> std::result::Result<(), crate::inventory_semantics::SemanticRefusal> {
+        use crate::inventory_semantics::SemanticRefusal;
+        if domain != self.domain || policy != CapturePolicy::Allowlisted {
+            return Err(SemanticRefusal::Attachment);
+        }
+        if descriptors.map_err(|_| SemanticRefusal::Descriptor)? != *crate::kinds::DESCRIPTORS {
+            return Err(SemanticRefusal::Descriptor);
+        }
+        let plan = self.subset.plan();
+        let pins = self.subset.pins();
+        if plan.validate_slot_index().is_err() || self.subset.required().is_empty() {
+            return Err(SemanticRefusal::IncompleteProvider);
+        }
+        if pins.check_unchanged() != Ok(true) {
+            return Err(SemanticRefusal::ProviderInstanceUnproven);
+        }
+        let mut checked = BTreeSet::new();
+        for (provider, required) in self.subset.required() {
+            if required.is_empty() {
+                return Err(SemanticRefusal::IncompleteProvider);
+            }
+            for index in required {
+                let slot = plan
+                    .slots
+                    .get(*index as usize)
+                    .ok_or(SemanticRefusal::Attachment)?;
+                let actual = retained.get(index).ok_or(SemanticRefusal::Attachment)?;
+                if actual.slot != *slot
+                    || !owned_sides.contains(&(*index, ProbeSide::Entry))
+                    || !owned_sides.contains(&(*index, ProbeSide::Return))
+                    || Some(actual.abi) != pins.abi_for(slot.object)
+                    || Some(&actual.path) != pins.attach_path_for(slot.object).as_ref().ok()
+                {
+                    return Err(SemanticRefusal::Attachment);
+                }
+                // One watched dependency image cannot establish the provider's
+                // load instance. Equal digests/local IDs never replace held custody.
+                let target =
+                    watched(slot.object).ok_or(SemanticRefusal::ProviderInstanceUnproven)?;
+                if slot.object != *provider
+                    || !target.same_object_as(pins, *provider)
+                    || target.check_unchanged() != Ok(true)
+                {
+                    return Err(SemanticRefusal::ProviderInstanceUnproven);
+                }
+                checked.insert(*index);
+            }
+        }
+        if checked.len() != plan.slots.len() {
+            return Err(SemanticRefusal::IncompleteProvider);
+        }
+        Ok(())
+    }
+
+    /// Bind a frozen object table to this attested receipt: the publication
+    /// domain must match, the receipt revalidates against fresh facts, and
+    /// every required slot records its object eligibility plus retained ABI.
+    /// Inactive in slice A.
+    #[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+    fn freeze_object_table_with<S>(
+        self,
+        frozen: FrozenObjectDescriptors<S>,
+        readback: SemanticAttachmentReadback<'_>,
+        watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    ) -> ObjectResult<FrozenObjectTable<S>> {
+        use crate::inventory_semantics::SemanticRefusal;
+        if frozen.domain != self.domain {
+            return Err(SemanticRefusal::Attachment);
+        }
+        self.validate_with(
+            readback.domain,
+            readback.policy,
+            readback.descriptors,
+            readback.retained,
+            readback.owned_sides,
+            watched,
+        )?;
+        let plan = self.subset.plan();
+        let pins = self.subset.pins();
+        let mut slots = BTreeMap::new();
+        for indices in self.subset.required().values() {
+            for index in indices {
+                let slot = plan
+                    .slots
+                    .get(*index as usize)
+                    .ok_or(SemanticRefusal::IncompleteProvider)?;
+                let abi = pins
+                    .abi_for(slot.object)
+                    .ok_or(SemanticRefusal::IncompleteProvider)?;
+                slots.insert(*index, (plan.object_slot_eligibility(*index), abi));
+            }
+        }
+        Ok(FrozenObjectTable {
+            descriptors: frozen,
+            attached: self,
+            slots,
+        })
+    }
+}
+
+/// An object table frozen against one attested receipt: the published rows,
+/// the consumed receipt and per-required-slot eligibility plus retained ABI.
+/// Inactive in slice A: no production path builds this yet.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C admit markers from this.
+pub(crate) struct FrozenObjectTable<S> {
+    descriptors: FrozenObjectDescriptors<S>,
+    attached: AttachedSemanticSet,
+    slots: BTreeMap<u32, (ObjectSlotEligibility, ElfAbi)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C admit markers from this.
+impl<S> FrozenObjectTable<S> {
+    /// Revalidate the receipt against fresh facts, then serve the stored
+    /// eligibility: the frozen cookie plus retained ABI, or the recorded
+    /// refusal. Slots outside the frozen binding refuse.
+    fn eligible_slot_with(
+        &self,
+        slot: u32,
+        readback: SemanticAttachmentReadback<'_>,
+        watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    ) -> ObjectResult<(u32, ElfAbi)> {
+        use crate::inventory_semantics::SemanticRefusal;
+        self.attached.validate_with(
+            readback.domain,
+            readback.policy,
+            readback.descriptors,
+            readback.retained,
+            readback.owned_sides,
+            watched,
+        )?;
+        match self.slots.get(&slot) {
+            Some((ObjectSlotEligibility::Eligible { descriptor_index }, abi)) => {
+                Ok((*descriptor_index, *abi))
+            }
+            Some((ObjectSlotEligibility::Refused { reason, .. }, _)) => Err(*reason),
+            None => Err(SemanticRefusal::Attachment),
+        }
+    }
+
+    /// The attested receipt this table is frozen against.
+    pub(crate) fn semantic_set(&self) -> &AttachedSemanticSet {
+        &self.attached
+    }
+}
+
+#[cfg(test)]
+#[path = "inventory/semantics_tests.rs"]
+mod inventory_semantics_tests;
 
 /// Retains exact reattach facts for every requested slot that gained a
 /// link. Reattach overwrites: a replacement's new descriptor supersedes
 /// the frozen one the rebuild pruned.
-fn retain_from_successful(
+/// Retain the successfully attached static targets. Production and host
+/// tests share this retention over their own attach outcomes.
+pub(crate) fn retain_from_successful(
     retained: &mut BTreeMap<u32, RetainedStaticTarget>,
     targets: &[Slot],
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
@@ -1762,6 +3947,7 @@ fn retain_from_successful(
                 slot: slot.clone(),
                 path: path.clone(),
                 abi: *abi,
+                held: None,
             },
         );
     }
@@ -1777,12 +3963,82 @@ fn prune_linkless_retained(
     retained.retain(|slot, _| links_cover_slot(links, *slot));
 }
 
+/// Ordinary Detailed grouping for host tests: production regroups through
+/// [`group_static_slots_with_roots`] with the session's journal selection.
+#[cfg(test)]
 fn group_static_slots(
     slots: &[Slot],
     policy: CapturePolicy,
     object_has_unsafe: bool,
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
 ) -> Vec<StaticGroup> {
+    group_static_slots_with_roots(
+        slots,
+        policy,
+        object_has_unsafe,
+        attach_targets,
+        StaticRoots::Detailed,
+        None,
+        false,
+    )
+    .expect("every selected Detailed target has retained pinned facts")
+}
+
+// An opened Linux FD has at most ten decimal digits. Include the CString NUL
+// in the bound; only the original pinned /proc/self/fd path reaches Counts.
+const COUNTER_ATTACH_PATH_BYTES: usize = b"/proc/self/fd/".len() + 10 + 1;
+const COUNTER_GROUP_DIAGNOSTIC_BYTES: usize = 256;
+
+fn counter_attach_path_is_valid(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .strip_prefix(b"/proc/self/fd/")
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.len() <= 10 && digits.iter().all(u8::is_ascii_digit)
+        })
+}
+
+fn group_static_slots_with_roots(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+    roots: StaticRoots,
+    expected_counter_mode: Option<CounterMode>,
+    journal: bool,
+) -> Result<Vec<StaticGroup>> {
+    if roots == StaticRoots::CounterBanks {
+        if policy.counter_mode() != expected_counter_mode || object_has_unsafe {
+            bail!(
+                "private counter grouping requires the prepared mode's fixed aggregate-only roots"
+            );
+        }
+        // The guard above pinned the policy and the prepared mode together;
+        // name that mode in per-slot refusals (every mode reaches here).
+        let mode_name = policy
+            .counter_mode()
+            .or(expected_counter_mode)
+            .map_or("counter", CounterMode::name);
+        for slot in slots {
+            let (path, abi) = attach_targets.get(&slot.index).with_context(|| {
+                format!("private {mode_name} target facts missing before grouping")
+            })?;
+            if *abi != ElfAbi::Lp64 || !counter_attach_path_is_valid(path) {
+                bail!("private {mode_name} grouping requires an LP64 retained-FD attach path");
+            }
+        }
+    }
+    // Journal sessions reuse Detailed roots with the pair swapped: the
+    // journal build carries no unsafe/ia32 entry variants, so every slot
+    // resolves the single journal entry program. A counter/journal
+    // combination is refused at preparation; journal takes precedence here.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else if roots == StaticRoots::CounterBanks {
+        "p11_counter_bank_return"
+    } else {
+        "p11_return"
+    };
     let mut by_key: BTreeMap<(PathBuf, &'static str), Vec<StaticGroupMember>> = BTreeMap::new();
     for slot in slots {
         let (path, abi) = attach_targets
@@ -1795,7 +4051,13 @@ fn group_static_slots(
         else {
             unreachable!("static attach points are absolute with cookies");
         };
-        let program = entry_program(&slot.semantics, policy, object_has_unsafe, *abi);
+        let program = if journal {
+            "p11_entry_journal"
+        } else if roots == StaticRoots::CounterBanks {
+            "p11_counter_bank_entry"
+        } else {
+            entry_program(&slot.semantics, policy, object_has_unsafe, *abi)
+        };
         by_key
             .entry((path.clone(), program))
             .or_default()
@@ -1805,17 +4067,133 @@ fn group_static_slots(
                 cookie,
             });
     }
-    by_key
+    Ok(by_key
         .into_iter()
         .map(|((path, entry_program), mut members)| {
             members.sort_by_key(|member| member.slot.index);
             StaticGroup {
                 path,
                 entry_program,
+                return_program,
                 members,
             }
         })
-        .collect()
+        .collect())
+}
+
+fn reserve_counter_multi_link_capacity(
+    links: &mut Vec<RegisteredLink>,
+    fresh_len: usize,
+) -> std::result::Result<(), counter_banks::BankRefusal> {
+    let extra = fresh_len
+        .checked_mul(2)
+        .ok_or(counter_banks::BankRefusal::Budget)?;
+    links
+        .len()
+        .checked_add(extra)
+        .ok_or(counter_banks::BankRefusal::Budget)?;
+    links
+        .try_reserve_exact(extra)
+        .map_err(|_| counter_banks::BankRefusal::Budget)
+}
+
+fn retain_counter_multi_leaf(
+    links: &mut Vec<RegisteredLink>,
+    pairs: &mut pid_continuity::PairBook,
+    program: &'static str,
+    sites: &[(u64, u64)],
+    slots_by_cookie: &BTreeMap<u64, u32>,
+    attach: impl FnOnce() -> io::Result<OwnedFd>,
+) -> io::Result<()> {
+    if sites.is_empty()
+        || !matches!(
+            program,
+            "p11_counter_bank_entry" | "p11_counter_bank_return"
+        )
+    {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    if links.len() == links.capacity() {
+        return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+    }
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(sites.len())
+        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    for &(_, cookie) in sites {
+        let slot = slots_by_cookie
+            .get(&cookie)
+            .copied()
+            .filter(|slot| *slot == p11scope_ebpf_common::cookie_slot(cookie))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if slots.last().is_some_and(|old| *old >= slot) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        slots.push(slot);
+    }
+    let mut fds = Vec::new();
+    fds.try_reserve_exact(1)
+        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    // All fallible allocation/validation precedes acquisition. The acquired
+    // FD enters this already-paid registry before a later bisect can fail.
+    let fd = attach()?;
+    fds.push(fd);
+    links.push(RegisteredLink::MultiUProbe {
+        program,
+        slots,
+        fds,
+        registration: pairs.register(),
+    });
+    Ok(())
+}
+
+fn validate_counter_group_retirement(
+    links: &[RegisteredLink],
+    requested: &BTreeSet<u32>,
+) -> Result<()> {
+    if let Some(slot) = find_partial_multi_member(links, requested) {
+        bail!(
+            "private Counts slot {slot} requires whole-group retirement; published groups cannot rebuild"
+        );
+    }
+    Ok(())
+}
+
+fn group_site_failure(
+    program: &'static str,
+    path: &Path,
+    offset: u64,
+    error: &io::Error,
+) -> String {
+    if matches!(
+        program,
+        "p11_counter_bank_entry" | "p11_counter_bank_return"
+    ) {
+        use std::fmt::Write as _;
+        let shown = if counter_attach_path_is_valid(path) {
+            path
+        } else {
+            Path::new("<invalid FD path>")
+        };
+        // At most 23 ASCII program bytes, 24 FD-path bytes, 18 offset bytes,
+        // 11 errno bytes and 13 separators: 89 UTF-8 bytes total. The fallback
+        // path/error labels are shorter. No intermediate String is allocated.
+        let mut message = String::with_capacity(COUNTER_GROUP_DIAGNOSTIC_BYTES);
+        write!(message, "{program} at {}+{offset:#x}: ", shown.display())
+            .expect("String formatting");
+        match error.raw_os_error() {
+            Some(errno) => write!(message, "errno {errno}"),
+            None => write!(message, "errno unavailable"),
+        }
+        .expect("String formatting");
+        message
+    } else {
+        format!(
+            "{program} at {}+{offset:#x}: {}",
+            path.display(),
+            error_chain(error)
+        )
+    }
 }
 
 /// One attached group side: the program, its member slots, and the live
@@ -1826,6 +4204,59 @@ struct MultiLinkBundle<T> {
     program: &'static str,
     slots: Vec<u32>,
     links: Vec<T>,
+}
+
+/// Publish the kept bundles through the same registry path used by initial
+/// attachment and survivor rebuilds. Retained facts follow live links.
+fn publish_kept_multi_bundles(
+    links: &mut Vec<RegisteredLink>,
+    retained: &mut BTreeMap<u32, RetainedStaticTarget>,
+    bundles: Vec<MultiLinkBundle<OwnedFd>>,
+    targets: &[RetainedStaticTarget],
+    pairs: &mut pid_continuity::PairBook,
+) {
+    for bundle in bundles {
+        links.push(RegisteredLink::MultiUProbe {
+            program: bundle.program,
+            slots: bundle.slots,
+            fds: bundle.links,
+            registration: pairs.register(),
+        });
+    }
+    for target in targets {
+        if links_cover_slot(links, target.slot.index) {
+            retained.insert(target.slot.index, target.clone());
+        }
+    }
+    prune_linkless_retained(retained, links);
+}
+
+/// Invalidate selected registration facts before taking ownership out of the
+/// live registry. The native detach callback cannot see an old valid stamp.
+fn extract_selected_links(
+    links: &mut Vec<RegisteredLink>,
+    pairs: &mut pid_continuity::PairBook,
+    mut select: impl FnMut(&RegisteredLink) -> bool,
+) -> Vec<RegisteredLink> {
+    let selected: Vec<_> = links.iter().map(&mut select).collect();
+    let affected = links
+        .iter()
+        .zip(&selected)
+        .filter(|(_, selected)| **selected)
+        .flat_map(|(link, _)| link.slots().iter().copied())
+        .collect();
+    pairs.invalidate(&affected);
+    let mut taken = Vec::new();
+    let mut retained = Vec::new();
+    for (link, selected) in std::mem::take(links).into_iter().zip(selected) {
+        if selected {
+            taken.push(link);
+        } else {
+            retained.push(link);
+        }
+    }
+    *links = retained;
+    taken
 }
 
 /// Explicit failure for a slot left without a completed pair when fd exhaustion
@@ -1859,10 +4290,28 @@ fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
 /// with one summary like singles; an unsupported kernel aborts with
 /// [`BackendFallbackRequired`]. Returns the live links (one bundle per
 /// attached side) plus the singles-shaped [`AttachOutcome`].
+#[cfg(test)]
 fn attach_target_groups_with<T>(
     groups: &[StaticGroup],
     completed_at: impl FnMut(&Slot) -> Option<u64>,
-    attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
+    attach_target_groups_observed_with(groups, completed_at, |program, path, sites, is_return| {
+        pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+            attach_link(program, path, sites, is_return)
+        })
+    })
+}
+
+fn attach_target_groups_observed_with<T>(
+    groups: &[StaticGroup],
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+    attach_link: impl FnMut(
+        &'static str,
+        &Path,
+        &[(u64, u64)],
+        bool,
+    ) -> pid_continuity::NativeAttempt<T, io::Error>,
 ) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
     let (bundles, mut outcome) = attach_target_groups_unsettled(groups, completed_at, attach_link)?;
     if outcome.exhausted {
@@ -1887,21 +4336,32 @@ fn attach_target_groups_with<T>(
 fn attach_target_groups_unsettled<T>(
     groups: &[StaticGroup],
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
-    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    mut attach_link: impl FnMut(
+        &'static str,
+        &Path,
+        &[(u64, u64)],
+        bool,
+    ) -> pid_continuity::NativeAttempt<T, io::Error>,
 ) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut continuity_rounds = Vec::new();
     let mut bundles = Vec::new();
     let mut links_attached = 0usize;
     for group in groups {
+        let mut timing = pid_continuity::RoundClock::default();
         let sites: Vec<(u64, u64)> = group
             .members
             .iter()
             .map(|member| (member.offset, member.cookie))
             .collect();
         let (return_links, return_refused) = match bisect_attach(
-            &mut |slice| attach_link("p11_return", &group.path, slice, true),
+            &mut |slice| {
+                let attempt = attach_link(group.return_program, &group.path, slice, true);
+                timing.observe_call(attempt.started_ns);
+                attempt.result
+            },
             &sites,
         ) {
             Ok(ok) => ok,
@@ -1921,6 +4381,7 @@ fn attach_target_groups_unsettled<T>(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted: true,
                     },
                 ));
@@ -1932,11 +4393,11 @@ fn attach_target_groups_unsettled<T>(
             let member = &group.members[site.index];
             failures.push((
                 member.slot.index,
-                format!(
-                    "p11_return at {}+{:#x}: {}",
-                    group.path.display(),
+                group_site_failure(
+                    group.return_program,
+                    &group.path,
                     member.offset,
-                    error_chain(&site.error)
+                    &site.error,
                 ),
             ));
         }
@@ -1949,13 +4410,13 @@ fn attach_target_groups_unsettled<T>(
             .collect();
         for member in &paired {
             successful.insert(
-                static_endpoint("p11_return", member.slot.index)
-                    .expect("p11_return is a static endpoint"),
+                static_endpoint(group.return_program, member.slot.index)
+                    .expect("selected return program is a static endpoint"),
             );
         }
         if !return_links.is_empty() {
             bundles.push(MultiLinkBundle {
-                program: "p11_return",
+                program: group.return_program,
                 slots: paired.iter().map(|member| member.slot.index).collect(),
                 links: return_links,
             });
@@ -1968,7 +4429,11 @@ fn attach_target_groups_unsettled<T>(
             .map(|member| (member.offset, member.cookie))
             .collect();
         let (entry_links, entry_refused) = match bisect_attach(
-            &mut |slice| attach_link(group.entry_program, &group.path, slice, false),
+            &mut |slice| {
+                let attempt = attach_link(group.entry_program, &group.path, slice, false);
+                timing.observe_call(attempt.started_ns);
+                attempt.result
+            },
             &entry_sites,
         ) {
             Ok(ok) => ok,
@@ -1987,6 +4452,7 @@ fn attach_target_groups_unsettled<T>(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted: true,
                     },
                 ));
@@ -1998,13 +4464,7 @@ fn attach_target_groups_unsettled<T>(
             let member = paired[site.index];
             failures.push((
                 member.slot.index,
-                format!(
-                    "{} at {}+{:#x}: {}",
-                    group.entry_program,
-                    group.path.display(),
-                    member.offset,
-                    error_chain(&site.error)
-                ),
+                group_site_failure(group.entry_program, &group.path, member.offset, &site.error),
             ));
         }
         let mut entry_slots = Vec::new();
@@ -2020,6 +4480,7 @@ fn attach_target_groups_unsettled<T>(
             entry_slots.push(member.slot.index);
         }
         if !entry_links.is_empty() {
+            continuity_rounds.push(timing.finish(entry_slots.clone()));
             bundles.push(MultiLinkBundle {
                 program: group.entry_program,
                 slots: entry_slots,
@@ -2033,6 +4494,7 @@ fn attach_target_groups_unsettled<T>(
             successful,
             failures,
             completed,
+            continuity_rounds,
             exhausted: false,
         },
     ))
@@ -2075,16 +4537,41 @@ fn detach_rebuild_round<T>(
 /// kept links contribute successes or completions; fd exhaustion and an
 /// unsupported kernel stop the run with every remainder recorded
 /// explicitly. Terminates: every dirty round strictly shrinks its group.
+#[cfg(test)]
 fn reattach_rebuilt_groups_with<T>(
     groups: &[StaticGroup],
-    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
     mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    detach_bundles: impl FnMut(Vec<MultiLinkBundle<T>>),
+) -> (Vec<MultiLinkBundle<T>>, AttachOutcome) {
+    reattach_rebuilt_groups_observed_with(
+        groups,
+        completed_at,
+        |program, path, sites, is_return| {
+            pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                attach_link(program, path, sites, is_return)
+            })
+        },
+        detach_bundles,
+    )
+}
+
+fn reattach_rebuilt_groups_observed_with<T>(
+    groups: &[StaticGroup],
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    mut attach_link: impl FnMut(
+        &'static str,
+        &Path,
+        &[(u64, u64)],
+        bool,
+    ) -> pid_continuity::NativeAttempt<T, io::Error>,
     mut detach_bundles: impl FnMut(Vec<MultiLinkBundle<T>>),
 ) -> (Vec<MultiLinkBundle<T>>, AttachOutcome) {
     let mut kept = Vec::new();
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut continuity_rounds = Vec::new();
     let mut exhausted = false;
     for (position, group) in groups.iter().enumerate() {
         let later = || {
@@ -2097,6 +4584,7 @@ fn reattach_rebuilt_groups_with<T>(
             let round = StaticGroup {
                 path: group.path.clone(),
                 entry_program: group.entry_program,
+                return_program: group.return_program,
                 members: std::mem::take(&mut remaining),
             };
             let (bundles, outcome) = match attach_target_groups_unsettled(
@@ -2121,6 +4609,7 @@ fn reattach_rebuilt_groups_with<T>(
                             successful,
                             failures,
                             completed,
+                            continuity_rounds,
                             exhausted,
                         },
                     );
@@ -2152,6 +4641,7 @@ fn reattach_rebuilt_groups_with<T>(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted,
                     },
                 );
@@ -2173,6 +4663,7 @@ fn reattach_rebuilt_groups_with<T>(
             if partials.is_empty() {
                 successful.extend(outcome.successful);
                 completed.extend(outcome.completed);
+                continuity_rounds.extend(outcome.continuity_rounds);
                 kept.extend(bundles);
             } else {
                 // The round's links all drop, so none of its successes or
@@ -2196,6 +4687,7 @@ fn reattach_rebuilt_groups_with<T>(
             successful,
             failures,
             completed,
+            continuity_rounds,
             exhausted,
         },
     )
@@ -2279,12 +4771,110 @@ fn static_attach_error(
     ))
 }
 
-fn attach_targets_with(
+#[cfg(test)]
+/// Attach scheduling and retention over injected link I/O: production
+/// passes the live linker, host tests a scripted one. The scheduling,
+/// pairing and completion rules are identical either way.
+pub(crate) fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
     object_has_unsafe: bool,
-    mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(&'static str, &Slot, UProbeAttachPoint<'static>) -> Result<()>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+) -> Result<AttachOutcome> {
+    attach_targets_observed_with(
+        slots,
+        policy,
+        object_has_unsafe,
+        abi_for,
+        |program, slot, point| {
+            pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                attach(program, slot, point)
+            })
+        },
+        completed_at,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaticRoots {
+    Detailed,
+    CounterBanks,
+}
+
+#[cfg(test)]
+fn attach_targets_observed_with(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    attach: impl FnMut(
+        &'static str,
+        &Slot,
+        UProbeAttachPoint<'static>,
+    ) -> pid_continuity::NativeAttempt<(), anyhow::Error>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+) -> Result<AttachOutcome> {
+    attach_targets_observed_with_roots(
+        slots,
+        policy,
+        object_has_unsafe,
+        StaticRoots::Detailed,
+        None,
+        abi_for,
+        attach,
+        completed_at,
+    )
+}
+
+/// Ordinary/counter attach scheduling over injected link I/O, without a
+/// journal selection: every caller through this entry stays on ordinary
+/// roots. Production singles sessions and journal tests call
+/// [`attach_targets_observed_with_roots_journal`] with the session's
+/// journal selection instead.
+#[allow(clippy::too_many_arguments)] // Same explicit seam as the journal entry below.
+fn attach_targets_observed_with_roots(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    roots: StaticRoots,
+    expected_counter_mode: Option<CounterMode>,
+    abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    attach: impl FnMut(
+        &'static str,
+        &Slot,
+        UProbeAttachPoint<'static>,
+    ) -> pid_continuity::NativeAttempt<(), anyhow::Error>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+) -> Result<AttachOutcome> {
+    attach_targets_observed_with_roots_journal(
+        slots,
+        policy,
+        object_has_unsafe,
+        roots,
+        expected_counter_mode,
+        false,
+        abi_for,
+        attach,
+        completed_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // The prepared counter mode joins the existing explicit attach seam; bundling would churn both ends for no gain.
+fn attach_targets_observed_with_roots_journal(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    roots: StaticRoots,
+    expected_counter_mode: Option<CounterMode>,
+    journal: bool,
+    mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    mut attach: impl FnMut(
+        &'static str,
+        &Slot,
+        UProbeAttachPoint<'static>,
+    ) -> pid_continuity::NativeAttempt<(), anyhow::Error>,
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
 ) -> Result<AttachOutcome> {
     // Resolve every retained target ABI before the first return attachment.
@@ -2293,9 +4883,31 @@ fn attach_targets_with(
         .iter()
         .map(|slot| abi_for(slot).map(|abi| (slot, abi)))
         .collect::<Result<Vec<_>>>()?;
+    if roots == StaticRoots::CounterBanks
+        && (policy.counter_mode() != expected_counter_mode
+            || object_has_unsafe
+            || targets.iter().any(|(_, abi)| *abi != ElfAbi::Lp64))
+    {
+        bail!("private counter bank attachment requires the LP64 aggregate-only fixed pair");
+    }
+    let return_program = if roots == StaticRoots::CounterBanks {
+        "p11_counter_bank_return"
+    } else {
+        "p11_return"
+    };
+    // Journal sessions reuse Detailed roots with the pair swapped: the
+    // journal return overrides the pinned ordinary selection above. A
+    // counter/journal combination is refused at preparation.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else {
+        return_program
+    };
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut continuity_rounds = Vec::new();
+    let mut timings = BTreeMap::<u32, pid_continuity::RoundClock>::new();
     let mut return_attached = BTreeSet::new();
     // EMFILE ends the run with one summary: links are retained, so no later
     // slot could succeed once the table is full.
@@ -2324,10 +4936,15 @@ fn attach_targets_with(
         }
     };
     for (slot, _) in &targets {
-        match attach("p11_return", slot, slot_attach_point(slot)) {
+        let attempt = attach(return_program, slot, slot_attach_point(slot));
+        timings
+            .entry(slot.index)
+            .or_default()
+            .observe_call(attempt.started_ns);
+        match attempt.result {
             Ok(()) => {
                 successful.insert(
-                    static_endpoint("p11_return", slot.index)
+                    static_endpoint(return_program, slot.index)
                         .expect("p11_return is a static endpoint"),
                 );
                 return_attached.insert(slot.index);
@@ -2340,6 +4957,7 @@ fn attach_targets_with(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted: true,
                     });
                 }
@@ -2348,7 +4966,11 @@ fn attach_targets_with(
         }
     }
 
-    let entry_programs: &[&str] = if object_has_unsafe {
+    let entry_programs: &[&str] = if journal {
+        &["p11_entry_journal"]
+    } else if roots == StaticRoots::CounterBanks {
+        &["p11_counter_bank_entry"]
+    } else if object_has_unsafe {
         &[
             "p11_entry",
             "p11_entry_ia32",
@@ -2362,17 +4984,30 @@ fn attach_targets_with(
     for program in entry_programs {
         for (slot, abi) in &targets {
             if !return_attached.contains(&slot.index)
-                || entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program
+                || (!journal
+                    && roots == StaticRoots::Detailed
+                    && entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program)
             {
                 continue;
             }
-            match attach(program, slot, slot_attach_point(slot)) {
+            let attempt = attach(program, slot, slot_attach_point(slot));
+            timings
+                .entry(slot.index)
+                .or_default()
+                .observe_call(attempt.started_ns);
+            match attempt.result {
                 Ok(()) => {
                     successful.insert(
                         static_endpoint(program, slot.index)
                             .expect("selected entry program is a static endpoint"),
                     );
                     completed.push((slot.index, completed_at(slot)));
+                    continuity_rounds.push(
+                        timings
+                            .remove(&slot.index)
+                            .expect("return timing exists")
+                            .finish(vec![slot.index]),
+                    );
                 }
                 Err(error) => {
                     if is_fd_exhaustion(&error) {
@@ -2382,6 +5017,7 @@ fn attach_targets_with(
                             successful,
                             failures,
                             completed,
+                            continuity_rounds,
                             exhausted: true,
                         });
                     }
@@ -2394,6 +5030,7 @@ fn attach_targets_with(
         successful,
         failures,
         completed,
+        continuity_rounds,
         exhausted: false,
     })
 }
@@ -2422,6 +5059,72 @@ fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
     Ok(catalog)
 }
 
+/// Exact bytes of one frozen object descriptor row for map publication.
+/// `ObjectDescriptorWire` is 16 bytes of plain data with no padding; the
+/// encoding spells every field so a layout drift fails loudly here rather
+/// than in the kernel.
+fn object_descriptor_row_bytes(row: &ObjectDescriptorWire) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&row.function.to_le_bytes());
+    bytes[4..6].copy_from_slice(&row.input_args);
+    bytes[6..8].copy_from_slice(&row.result_args);
+    bytes[8..12].copy_from_slice(&row.template_args);
+    bytes[12] = row.find_capacity_arg;
+    bytes[13] = row.find_count_arg;
+    bytes[14] = row.action;
+    bytes[15] = row.guard;
+    bytes
+}
+
+/// Publish the subordinate-custody maps before links: every canonical
+/// object descriptor row with exact readback, the zero template verified
+/// clean, and the side table capacity tied to START (no cap increase).
+/// Freezing stays with the standard freeze machinery through
+/// BASE_POLICY_MAPS.
+fn publish_object_custody_maps(ebpf: &mut Ebpf) -> Result<()> {
+    let expected = publish_object_descriptors();
+    let mut table: Array<_, [u8; 16]> = Array::try_from(
+        ebpf.map_mut("OBJECT_DESCRIPTORS")
+            .context("OBJECT_DESCRIPTORS map")?,
+    )?;
+    for (index, row) in expected.iter().enumerate() {
+        table
+            .set(index as u32, object_descriptor_row_bytes(row), 0)
+            .with_context(|| format!("publishing OBJECT_DESCRIPTORS row {index}"))?;
+    }
+    for (index, row) in expected.iter().enumerate() {
+        let actual: [u8; 16] = table
+            .get(&(index as u32), 0)
+            .with_context(|| format!("reading OBJECT_DESCRIPTORS row {index}"))?;
+        if actual != object_descriptor_row_bytes(row) {
+            bail!("OBJECT_DESCRIPTORS exact readback differs at row {index}");
+        }
+    }
+    let zero: Array<_, [u8; 432]> =
+        Array::try_from(ebpf.map("OBJECT_ZERO").context("OBJECT_ZERO map")?)?;
+    let template: [u8; 432] = zero.get(&0, 0).context("reading OBJECT_ZERO row 0")?;
+    if template != [0u8; 432] {
+        bail!("OBJECT_ZERO row 0 is not clean");
+    }
+    let start_max = {
+        let map = ebpf.map("START").context("START map")?;
+        let Map::HashMap(data) = map else {
+            bail!("unexpected START map variant");
+        };
+        read_map_metadata("START", data)?.max_entries
+    };
+    let map = ebpf.map("OBJECT_START").context("OBJECT_START map")?;
+    let Map::HashMap(data) = map else {
+        bail!("unexpected OBJECT_START map variant");
+    };
+    validate_map_metadata(
+        "OBJECT_START",
+        data,
+        map_metadata(MapType::Hash, 16, 432, start_max, 0),
+    )?;
+    Ok(())
+}
+
 fn publish_descriptors<S>(
     state: &mut S,
     mut set: impl FnMut(&mut S, u32, SlotSemantics) -> Result<()>,
@@ -2436,6 +5139,120 @@ fn publish_descriptors<S>(
         bail!("DESCRIPTORS exact readback differs from the fixed inventory");
     }
     Ok(())
+}
+
+type ObjectRows = [ObjectDescriptorWire; MAX_DESCRIPTORS as usize];
+type ObjectResult<T> = std::result::Result<T, crate::inventory_semantics::SemanticRefusal>;
+
+/// Verified frozen object descriptor rows. Ordinary consumers may validate the
+/// producer's full record before discarding its tail; only start_attested places
+/// a table in Session::object_decode for the semantic admission lane.
+pub(crate) struct ObjectDecodeTable {
+    rows: Arc<ObjectRows>,
+}
+
+impl ObjectDecodeTable {
+    pub(crate) fn rows(&self) -> &ObjectRows {
+        &self.rows
+    }
+}
+
+/// Select wire decoding independently of attested semantic eligibility. A
+/// producer-enabled ordinary session requires its own verified map readback;
+/// an attested session can share its already verified immutable rows.
+pub(crate) fn object_transport_rows_with(
+    policy: CapturePolicy,
+    attested: Option<&Arc<ObjectRows>>,
+    readback: impl FnOnce() -> Result<Arc<ObjectRows>>,
+) -> Result<Option<Arc<ObjectRows>>> {
+    match policy {
+        CapturePolicy::Allowlisted => match attested {
+            Some(rows) => Ok(Some(Arc::clone(rows))),
+            None => readback().map(Some),
+        },
+        CapturePolicy::AggregateOnly
+        | CapturePolicy::UnsafeUnvalidatedMetadata
+        | CapturePolicy::Counter(_) => Ok(None),
+    }
+}
+
+/// Verify the frozen transport rows: read back every live
+/// OBJECT_DESCRIPTORS row and require the exact canonical table the
+/// loader published and froze. Any absence or disagreement refuses the
+/// session rather than decoding tails against wrong rows. This verification
+/// does not itself attest an attachment or authorize semantic admission.
+fn freeze_object_decode_table(ebpf: &Ebpf) -> Result<ObjectDecodeTable> {
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    let expected = publish_object_descriptors();
+    let table: Array<_, [u8; 16]> = Array::try_from(
+        ebpf.map("OBJECT_DESCRIPTORS")
+            .context("OBJECT_DESCRIPTORS map")?,
+    )?;
+    for (index, row) in expected.iter().enumerate() {
+        let actual: [u8; 16] = table
+            .get(&(index as u32), 0)
+            .with_context(|| format!("reading OBJECT_DESCRIPTORS row {index}"))?;
+        if actual != object_descriptor_row_bytes(row) {
+            bail!("OBJECT_DESCRIPTORS transport readback differs at row {index}");
+        }
+    }
+    Ok(ObjectDecodeTable {
+        rows: Arc::new(expected),
+    })
+}
+
+/// Exact inputs for one attested-receipt validation, bundled so the object
+/// freeze and later eligibility checks revalidate against the same facts.
+/// Inactive in slice A.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+struct SemanticAttachmentReadback<'a> {
+    domain: capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &'a BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &'a BTreeSet<StaticEndpoint>,
+}
+
+/// Object rows published, read back and frozen on one state for one domain.
+/// Inactive in slice A: no production map exists yet.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+struct FrozenObjectDescriptors<S> {
+    state: S,
+    domain: capture::NativeDomainId,
+    rows: ObjectRows,
+}
+
+/// Publish the canonical 105 rows in order, require an exact readback,
+/// freeze the same resource, then require an exact post-freeze readback.
+/// Any I/O failure or inexact table refuses; only a proven table freezes.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+fn publish_and_freeze_object_descriptors_with<S>(
+    state: S,
+    domain: capture::NativeDomainId,
+    mut set: impl FnMut(&mut S, u32, ObjectDescriptorWire) -> Result<()>,
+    mut readback: impl FnMut(&mut S) -> Result<Vec<ObjectDescriptorWire>>,
+    freeze: impl FnOnce(&mut S) -> Result<()>,
+) -> ObjectResult<FrozenObjectDescriptors<S>> {
+    use crate::inventory_semantics::SemanticRefusal;
+    let expected = publish_object_descriptors();
+    let mut state = state;
+    for (index, row) in expected.iter().copied().enumerate() {
+        set(&mut state, index as u32, row).map_err(|_| SemanticRefusal::Descriptor)?;
+    }
+    let actual = readback(&mut state).map_err(|_| SemanticRefusal::Descriptor)?;
+    if actual.as_slice() != expected.as_slice() {
+        return Err(SemanticRefusal::Descriptor);
+    }
+    freeze(&mut state).map_err(|_| SemanticRefusal::Descriptor)?;
+    let recheck = readback(&mut state).map_err(|_| SemanticRefusal::Descriptor)?;
+    if recheck.as_slice() != expected.as_slice() {
+        return Err(SemanticRefusal::Descriptor);
+    }
+    Ok(FrozenObjectDescriptors {
+        state,
+        domain,
+        rows: expected,
+    })
 }
 
 fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
@@ -2583,6 +5400,824 @@ fn validate_runtime_map(
 /// `--ring-bytes` still sizes only EVENTS.
 pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 
+/// Whether the embedded Detailed object carries stubbed attribute capture.
+/// Entry capture is inlined, so the rule proves its scalar reader is called,
+/// and identifies the return adapter exactly, without confusing its closure
+/// with its body. Panics on missing, ambiguous or half-wired evidence.
+/// One copy of the rule: this delegates to the production probe.
+#[cfg(test)]
+pub(crate) fn embedded_object_is_stubbed() -> bool {
+    let parsed =
+        aya_obj::Object::parse(crate::EBPF_OBJECT).expect("embedded Detailed object parses");
+    embedded_object_capture_is_stubbed(parsed)
+}
+
+fn embedded_adapter_symbol_matches(symbol: &str, helper: &str) -> bool {
+    let Some(path) = symbol.strip_prefix("_RNvC") else {
+        return false;
+    };
+    let path = if let Some(disambiguated) = path.strip_prefix('s') {
+        let Some((base62, path)) = disambiguated.split_once('_') else {
+            return false;
+        };
+        if base62.is_empty() || !base62.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return false;
+        }
+        path
+    } else {
+        path
+    };
+    path == format!("13p11scope_ebpf{}{helper}", helper.len())
+}
+
+/// Test-only entry lookup: one copy of the rule, panicking where the
+/// production probe refuses.
+#[cfg(test)]
+fn embedded_object_capture_entry(parsed: aya_obj::Object) -> (aya_obj::Function, u32) {
+    probed_capture_entry(parsed).expect("embedded Detailed bytes must probe")
+}
+
+/// Test-only reachability walk: one copy of the rule, panicking where
+/// the production probe refuses.
+#[cfg(test)]
+fn embedded_entry_reaches_reader(entry: &aya_obj::Function, reader_id: u32) -> bool {
+    probed_entry_reaches_reader(entry, reader_id).expect("embedded Detailed bytes must probe")
+}
+
+/// Test-only stub rule: one copy of the rule, panicking where the
+/// production probe refuses.
+#[cfg(test)]
+fn embedded_object_capture_is_stubbed(parsed: aya_obj::Object) -> bool {
+    probed_capture_is_stubbed(parsed).expect("embedded Detailed bytes must probe")
+}
+
+/// Flavor of the embedded Detailed BPF object, probed from its bytes rather
+/// than from the Cargo features the observer was built with. `stubbed` is
+/// true when object-attribute capture is stubbed (P0); `unsafe_present` is
+/// true when the unsafe-unvalidated-metadata decoders are compiled in.
+/// Output and policy report the bytes: a stale or mismatched embedded object
+/// must never let output claim P0 while the loaded program does FULL reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EmbeddedFlavor {
+    pub stubbed: bool,
+    pub unsafe_present: bool,
+}
+
+/// Why the embedded flavor could not be determined: the object does not
+/// parse, or its capture evidence is missing, ambiguous or half-wired.
+/// A production refusal, never a panic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlavorProbeError {
+    reason: String,
+}
+
+impl FlavorProbeError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for FlavorProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for FlavorProbeError {}
+
+/// Production byte probe: link the entry root and locate the request
+/// reader. The test-only `embedded_object_capture_entry` delegates here;
+/// every missing or ambiguous input is an error (a refusal), never a panic.
+fn probed_capture_entry(
+    mut parsed: aya_obj::Object,
+) -> Result<(aya_obj::Function, u32), FlavorProbeError> {
+    let reader = "p11_request_cell";
+    let mut matches = parsed
+        .functions
+        .values()
+        .filter(|function| function.name == reader);
+    let function = matches
+        .next()
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks request reader"))?;
+    if matches.next().is_some() {
+        return Err(FlavorProbeError::new("ambiguous embedded request reader"));
+    }
+    let reader_id = parsed
+        .btf
+        .as_ref()
+        .ok_or_else(|| FlavorProbeError::new("embedded object needs original BTF"))?
+        .id_by_type_name_kind(reader, aya_obj::btf::BtfKind::Func)
+        .map_err(|_| FlavorProbeError::new("embedded request reader needs original BTF FUNC"))?;
+    if function.func_info.func_info.len() != 1 {
+        return Err(FlavorProbeError::new("ambiguous request function info"));
+    }
+    if function.func_info.func_info[0].type_id != reader_id {
+        return Err(FlavorProbeError::new(
+            "request reader function info must bind its original BTF FUNC",
+        ));
+    }
+    let entry = parsed
+        .programs
+        .get("p11_entry")
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks entry"))?;
+    let key = entry.function_key();
+    if parsed
+        .functions
+        .values()
+        .filter(|function| function.name == "p11_entry")
+        .count()
+        != 1
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded entry function"));
+    }
+    if parsed
+        .functions
+        .get(&key)
+        .is_none_or(|function| function.name != "p11_entry")
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded entry function"));
+    }
+    let text_sections = parsed
+        .functions
+        .keys()
+        .map(|(section, _)| *section)
+        .collect();
+    // Link only the entry root. Inspect return size independently, so changing
+    // a return body cannot fabricate entry-reader reachability.
+    parsed.programs.retain(|name, _| name == "p11_entry");
+    parsed.relocate_calls(&text_sections).map_err(|error| {
+        FlavorProbeError::new(format!("embedded entry calls do not relocate: {error}"))
+    })?;
+    let entry = parsed
+        .functions
+        .remove(&key)
+        .ok_or_else(|| FlavorProbeError::new("linked entry went missing after relocation"))?;
+    Ok((entry, reader_id))
+}
+
+/// Production byte probe: link the return root and locate the stable
+/// reader. Mirrors `probed_capture_entry`: every missing or ambiguous
+/// input is an error (a refusal), never a panic.
+fn probed_capture_return(
+    mut parsed: aya_obj::Object,
+) -> Result<(aya_obj::Function, u32), FlavorProbeError> {
+    let reader = "p11_stable_cell";
+    let mut matches = parsed
+        .functions
+        .values()
+        .filter(|function| function.name == reader);
+    let function = matches
+        .next()
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks stable reader"))?;
+    if matches.next().is_some() {
+        return Err(FlavorProbeError::new("ambiguous embedded stable reader"));
+    }
+    let reader_id = parsed
+        .btf
+        .as_ref()
+        .ok_or_else(|| FlavorProbeError::new("embedded object needs original BTF"))?
+        .id_by_type_name_kind(reader, aya_obj::btf::BtfKind::Func)
+        .map_err(|_| FlavorProbeError::new("embedded stable reader needs original BTF FUNC"))?;
+    if function.func_info.func_info.len() != 1 {
+        return Err(FlavorProbeError::new("ambiguous stable function info"));
+    }
+    if function.func_info.func_info[0].type_id != reader_id {
+        return Err(FlavorProbeError::new(
+            "stable reader function info must bind its original BTF FUNC",
+        ));
+    }
+    let entry = parsed
+        .programs
+        .get("p11_return")
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks return"))?;
+    let key = entry.function_key();
+    if parsed
+        .functions
+        .values()
+        .filter(|function| function.name == "p11_return")
+        .count()
+        != 1
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded return function"));
+    }
+    if parsed
+        .functions
+        .get(&key)
+        .is_none_or(|function| function.name != "p11_return")
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded return function"));
+    }
+    let text_sections = parsed
+        .functions
+        .keys()
+        .map(|(section, _)| *section)
+        .collect();
+    // Link only the return root. Inspect entry size independently, so changing
+    // an entry body cannot fabricate return-reader reachability.
+    parsed.programs.retain(|name, _| name == "p11_return");
+    parsed.relocate_calls(&text_sections).map_err(|error| {
+        FlavorProbeError::new(format!("embedded return calls do not relocate: {error}"))
+    })?;
+    let entry = parsed
+        .functions
+        .remove(&key)
+        .ok_or_else(|| FlavorProbeError::new("linked return went missing after relocation"))?;
+    Ok((entry, reader_id))
+}
+
+/// Production byte probe: whether the linked root reaches its reader
+/// through real calls. The entry side links the entry root against the
+/// request reader and the return side links the return root against the
+/// stable reader; the test-only `embedded_entry_reaches_reader` delegates
+/// here: malformed function info is an error, never a panic.
+fn probed_entry_reaches_reader(
+    entry: &aya_obj::Function,
+    reader_id: u32,
+) -> Result<bool, FlavorProbeError> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let functions: BTreeMap<_, _> = entry
+        .func_info
+        .func_info
+        .iter()
+        .map(|info| (info.insn_off as usize, info.type_id))
+        .collect();
+    if functions.len() != entry.func_info.func_info.len() {
+        return Err(FlavorProbeError::new("ambiguous linked function info"));
+    }
+    if functions.first_key_value().map(|(start, _)| *start) != Some(0) {
+        return Err(FlavorProbeError::new(
+            "linked entry function info must start at 0",
+        ));
+    }
+    if !functions
+        .keys()
+        .all(|start| *start < entry.instructions.len())
+    {
+        return Err(FlavorProbeError::new(
+            "linked entry function info out of range",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![0];
+    while let Some(start) = pending.pop() {
+        if !seen.insert(start) {
+            continue;
+        }
+        let end = functions
+            .range((Excluded(start), Unbounded))
+            .next()
+            .map_or(entry.instructions.len(), |(end, _)| *end);
+        for (at, instruction) in entry.instructions.iter().enumerate().take(end).skip(start) {
+            if instruction.code == 0x85 && instruction.src_reg() == 1 {
+                let target = (at + 1)
+                    .checked_add_signed(instruction.imm as isize)
+                    .ok_or_else(|| {
+                        FlavorProbeError::new("linked entry call target is out of range")
+                    })?;
+                if !functions.contains_key(&target) {
+                    return Err(FlavorProbeError::new(
+                        "linked entry call lacks exact function info",
+                    ));
+                }
+                pending.push(target);
+            }
+        }
+    }
+    Ok(seen.iter().any(|start| functions[start] == reader_id))
+}
+
+/// Production byte probe: stubbed vs wired attribute capture from parsed
+/// bytes. The test-only `embedded_object_capture_is_stubbed` delegates
+/// here: the return adapter must match exactly, and be stubbed exactly
+/// when the entry root does not reach the request reader. A return
+/// adapter is stubbed only when it is small (under 300 instructions)
+/// and blind (its root never reaches the stable reader): outlining for
+/// verifier headroom shrinks wired adapters without unwiring them.
+/// Missing, ambiguous or half-wired evidence is an error (a refusal),
+/// never a panic.
+fn probed_capture_is_stubbed(parsed: aya_obj::Object) -> Result<bool, FlavorProbeError> {
+    let mut matches = parsed.functions.values().filter(|function| {
+        embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+    });
+    let emit = matches
+        .next()
+        .ok_or_else(|| {
+            FlavorProbeError::new("embedded Detailed object has no exact return adapter")
+        })?
+        .instructions
+        .len();
+    if matches.next().is_some() {
+        return Err(FlavorProbeError::new(
+            "embedded Detailed object has several exact return adapters",
+        ));
+    }
+    let (entry, reader_id) = probed_capture_entry(parsed.clone())?;
+    let entry_stub = !probed_entry_reaches_reader(&entry, reader_id)?;
+    // Big adapters are wired without further evidence (the historical
+    // rule); small ones must also prove blindness before they count as
+    // stubbed, so an outlined-but-wired adapter cannot misclassify.
+    let emit_stub = if emit < 300 {
+        let (ret, stable_id) = probed_capture_return(parsed)?;
+        !probed_entry_reaches_reader(&ret, stable_id)?
+    } else {
+        false
+    };
+    if entry_stub != emit_stub {
+        return Err(FlavorProbeError::new(
+            "half-wired embedded object: the entry program and the return adapter disagree about attribute capture",
+        ));
+    }
+    Ok(entry_stub)
+}
+
+/// Production byte probe: whether the unsafe-unvalidated-metadata decoders
+/// are present. Present means every unsafe entry program and every
+/// unsafe-only policy map is in the object; absent means none is. Any
+/// mixture is half-wired evidence and an error, never a guess.
+fn probed_unsafe_is_present(parsed: &aya_obj::Object) -> Result<bool, FlavorProbeError> {
+    let mut present = Vec::new();
+    let mut absent = Vec::new();
+    for name in UNSAFE_PROGRAMS {
+        if parsed.programs.contains_key(name) {
+            present.push(name);
+        } else {
+            absent.push(name);
+        }
+    }
+    for (name, _) in FEATURE_POLICY_MAPS {
+        if parsed.maps.contains_key(name) {
+            present.push(name);
+        } else {
+            absent.push(name);
+        }
+    }
+    if absent.is_empty() {
+        Ok(true)
+    } else if present.is_empty() {
+        Ok(false)
+    } else {
+        Err(FlavorProbeError::new(format!(
+            "half-wired embedded object (unsafe markers present: {}, absent: {})",
+            present.join(","),
+            absent.join(",")
+        )))
+    }
+}
+
+/// Probe the flavor of one Detailed object's bytes: parse, then derive
+/// stubbed-vs-wired capture and unsafe-decoder presence from the bytes.
+/// Unparseable bytes and missing, ambiguous or half-wired evidence are
+/// errors (a refusal), never a panic.
+pub(crate) fn embedded_flavor_from_bytes(
+    object: &[u8],
+) -> Result<EmbeddedFlavor, FlavorProbeError> {
+    let parsed = aya_obj::Object::parse(object).map_err(|error| {
+        FlavorProbeError::new(format!("embedded Detailed object does not parse: {error}"))
+    })?;
+    let unsafe_present = probed_unsafe_is_present(&parsed)?;
+    let stubbed = probed_capture_is_stubbed(parsed)?;
+    Ok(EmbeddedFlavor {
+        stubbed,
+        unsafe_present,
+    })
+}
+
+static EMBEDDED_FLAVOR: OnceLock<Result<EmbeddedFlavor, FlavorProbeError>> = OnceLock::new();
+
+/// The embedded Detailed object's flavor, parsed once per process and cached.
+/// Test builds honor a held override first (see
+/// [`hold_embedded_flavor_for_test`]); every other read shares the cache.
+pub(crate) fn embedded_flavor() -> Result<EmbeddedFlavor, FlavorProbeError> {
+    #[cfg(test)]
+    if let Some(overridden) = test_flavor_override() {
+        return overridden;
+    }
+    EMBEDDED_FLAVOR
+        .get_or_init(|| embedded_flavor_from_bytes(crate::EBPF_OBJECT))
+        .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FLAVOR_OVERRIDE: std::cell::RefCell<
+        Option<Result<EmbeddedFlavor, FlavorProbeError>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: hold a planted flavor (or probe error) on this thread while
+/// the guard lives. The injection is per thread (the pidns test-seam
+/// shape), so a test sees it on its own thread only and no other test is
+/// affected. The previous value restores on drop, also on a panic; nested
+/// holders compose.
+#[cfg(test)]
+pub(crate) struct FlavorOverrideGuard {
+    previous: Option<Result<EmbeddedFlavor, FlavorProbeError>>,
+}
+
+#[cfg(test)]
+impl Drop for FlavorOverrideGuard {
+    fn drop(&mut self) {
+        TEST_FLAVOR_OVERRIDE.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hold_embedded_flavor_for_test(
+    flavor: Result<EmbeddedFlavor, FlavorProbeError>,
+) -> FlavorOverrideGuard {
+    let previous = TEST_FLAVOR_OVERRIDE.with(|cell| cell.borrow_mut().replace(flavor));
+    FlavorOverrideGuard { previous }
+}
+
+#[cfg(test)]
+fn test_flavor_override() -> Option<Result<EmbeddedFlavor, FlavorProbeError>> {
+    TEST_FLAVOR_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+/// The probed flavor must match the build features: a stale or mismatched
+/// embedded object refuses with one plain message naming both values.
+/// Pure over its argument so tests plant flavors without touching bytes.
+pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<EmbeddedFlavor> {
+    let expect_stubbed = cfg!(feature = "stub-object-attributes");
+    if probed.stubbed != expect_stubbed {
+        let (expected, actual) = if expect_stubbed {
+            ("stubbed (P0)", "wired (FULL)")
+        } else {
+            ("FULL", "stubbed (P0)")
+        };
+        bail!(
+            "embedded BPF object flavor mismatch: build expects {expected} object-attribute capture, embedded bytes are {actual} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)"
+        );
+    }
+    let expect_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
+    if probed.unsafe_present != expect_unsafe {
+        let (expected, actual) = if expect_unsafe {
+            ("with", "lack")
+        } else {
+            ("without", "contain")
+        };
+        bail!(
+            "embedded BPF object flavor mismatch: build was compiled {expected} unsafe-unvalidated-metadata, embedded bytes {actual} its decoders (stale or mismatched embedded object; rebuild p11scope from a clean target directory)"
+        );
+    }
+    Ok(probed)
+}
+
+/// The cached probed flavor, refused unless it matches the build features.
+/// Missing, ambiguous or half-wired evidence refuses here, before any
+/// attach or load.
+pub(crate) fn checked_embedded_flavor() -> Result<EmbeddedFlavor> {
+    match embedded_flavor() {
+        Ok(probed) => check_flavor_against_build(probed),
+        Err(error) => bail!(
+            "cannot determine embedded BPF object flavor: {} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            error.reason()
+        ),
+    }
+}
+
+/// Flavor of one embedded counter bank object, from its parsed bytes.
+/// Counter flavors never take the stub or unsafe features, so unsafe
+/// decoders present (or half-wired evidence) refuse with the mode named.
+/// Only the unsafe dimension is probed — the Detailed stub probe needs
+/// the return adapter, which bank objects do not carry — while FULL is
+/// the build-construction fact (counter objects are identical across
+/// FULL, P0 and unsafe builds) and counter sessions never publish
+/// object facts.
+pub(crate) fn counter_flavor_from_parsed(
+    mode: CounterMode,
+    parsed: &aya_obj::Object,
+) -> Result<EmbeddedFlavor> {
+    match probed_unsafe_is_present(parsed) {
+        Ok(false) => Ok(EmbeddedFlavor {
+            stubbed: false,
+            unsafe_present: false,
+        }),
+        Ok(true) => bail!(
+            "counter BPF object flavor mismatch for --counter-mode {}: embedded bytes contain unsafe-unvalidated-metadata decoders, which counter objects never take (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            mode.name()
+        ),
+        Err(error) => bail!(
+            "cannot determine counter BPF object flavor for --counter-mode {}: {} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            mode.name(),
+            error.reason()
+        ),
+    }
+}
+
+/// Flavor of one embedded counter bank object, from its bytes: parse,
+/// then [`counter_flavor_from_parsed`]. Unparseable bytes refuse with
+/// the mode named.
+pub(crate) fn checked_counter_flavor(mode: CounterMode, object: &[u8]) -> Result<EmbeddedFlavor> {
+    let parsed = aya_obj::Object::parse(object).map_err(|error| {
+        anyhow!(
+            "cannot determine counter BPF object flavor for --counter-mode {}: {error:#} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            mode.name()
+        )
+    })?;
+    counter_flavor_from_parsed(mode, &parsed)
+}
+
+/// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
+/// what BPF_PROG_LOAD returns when the program exceeds the complexity
+/// limit. Every other errno keeps its own meaning.
+pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
+    errno == Some(libc::E2BIG)
+}
+
+/// Load-refusal detector for doctor/diagnostics: true only for a genuine
+/// BPF program-load refusal on verifier budget (E2BIG from BPF_PROG_LOAD,
+/// or ENOSPC when the verifier log fills before the complexity limit).
+/// Permission, map-policy, identity and malformed-object failures — and
+/// every non-load error — return false and keep their own errors.
+pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
+    match error {
+        aya::programs::ProgramError::LoadError { io_error, .. } => {
+            // ENOSPC joins E2BIG only here, at the attach/doctor seam: a
+            // too-complex program whose verbose log fills the load buffer
+            // first. The shared errno predicate above stays E2BIG-only so
+            // the counter mapping keeps rewriting genuine E2BIG alone.
+            matches!(io_error.raw_os_error(), Some(libc::E2BIG | libc::ENOSPC))
+        }
+        _ => false,
+    }
+}
+
+/// The errno name a verifier-budget load refusal carries for hint text:
+/// E2BIG when the program exceeds the complexity limit, ENOSPC when
+/// verbose verification logging fills the load log buffer first
+/// (observed on 5.15 for an over-budget worker: the same refusal
+/// through a different errno). `None` unless
+/// `is_verifier_budget_refusal` holds — the one routing — so hints
+/// name the real errno without re-classifying.
+pub(crate) fn verifier_budget_refusal_errno_name(
+    error: &aya::programs::ProgramError,
+) -> Option<&'static str> {
+    if !is_verifier_budget_refusal(error) {
+        return None;
+    }
+    match error {
+        aya::programs::ProgramError::LoadError { io_error, .. } => {
+            match io_error.raw_os_error() {
+                Some(libc::ENOSPC) => Some("ENOSPC"),
+                // The routing above holds, so any other load errno here is E2BIG.
+                _ => Some("E2BIG"),
+            }
+        }
+        // Unreachable: non-load errors never classify; stay total anyway.
+        _ => None,
+    }
+}
+
+/// Upper bound for a user-visible native-preparation reason: far below the
+/// 16,384-byte `inventory diff` per-string limit.
+pub(crate) const NATIVE_PREPARATION_REASON_MAX_BYTES: usize = 1024;
+
+/// Upper bound for a program-load refusal on stderr: the hint plus the
+/// fixed `main`/`run` wrappers must still fit the 1024-byte stderr bound
+/// (see `stderr_bound_leaves_room_for_hint_and_wrappers`).
+pub(crate) const STDERR_LOAD_REFUSAL_MAX_BYTES: usize = 512;
+
+/// Truncate to at most `max` bytes on a char boundary.
+pub(crate) fn truncate_to_char_boundary(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// The program a preparation context names, if any:
+/// `preparing Inventory: LoadProgram("NAME", MODE)`,
+/// `Inventory program NAME`, or a Detailed/counter `loading ...` stage.
+/// Bounded and line-local; never a log excerpt.
+pub(crate) fn program_name_in_preparation_context(context: &str) -> Option<String> {
+    for prefix in ["LoadProgram(\"", "Inventory program "] {
+        if let Some(rest) = context.split_once(prefix).map(|(_, rest)| rest) {
+            let end = rest
+                .find(|c: char| c == '"' || c.is_whitespace() || c.is_control())
+                .unwrap_or(rest.len());
+            let name = rest[..end].trim();
+            if !name.is_empty() && name.len() <= 128 {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // Detailed and counter loads name the program in `loading ...` stages
+    // (`loading {prog}`, `loading {prog} for multi attach`,
+    // `loading required raw|typed {prog}`,
+    // `loading private counter root {prog}`); only those shapes qualify,
+    // so a BTF or object stage never yields a program name.
+    if let Some(rest) = context.split_once("loading ").map(|(_, rest)| rest) {
+        let line = rest.lines().next().unwrap_or_default();
+        let candidate = line.strip_suffix(" for multi attach").unwrap_or(line);
+        let candidate = candidate
+            .strip_prefix("required raw ")
+            .or_else(|| candidate.strip_prefix("required typed "))
+            .or_else(|| candidate.strip_prefix("private counter root "))
+            .unwrap_or(candidate);
+        if !candidate.is_empty()
+            && candidate.len() <= 64
+            && candidate
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Short errno name for a load refusal; unknown errnos stay numeric.
+pub(crate) fn load_refusal_errno_name(errno: i32) -> Option<&'static str> {
+    match errno {
+        libc::E2BIG => Some("E2BIG"),
+        libc::EACCES => Some("EACCES"),
+        libc::EINVAL => Some("EINVAL"),
+        libc::EPERM => Some("EPERM"),
+        libc::ENOSPC => Some("ENOSPC"),
+        libc::EAGAIN => Some("EAGAIN"),
+        libc::ENOMEM => Some("ENOMEM"),
+        libc::EBUSY => Some("EBUSY"),
+        libc::ENOENT => Some("ENOENT"),
+        _ => None,
+    }
+}
+
+/// The verifier's `processed N insns (limit M)` summary, scanned from the
+/// log tail where the kernel prints it. Pure parsing: the log itself is
+/// never copied into the reason.
+pub(crate) fn verifier_processed_counts(log: &str) -> Option<(u64, u64)> {
+    let rest = log
+        .rfind("processed ")
+        .map(|at| &log[at + "processed ".len()..])?;
+    let processed: u64 = rest.split_whitespace().next()?.parse().ok()?;
+    let limit_key = "insns (limit ";
+    let limit_rest = rest
+        .find(limit_key)
+        .map(|at| &rest[at + limit_key.len()..])?;
+    let limit: u64 = limit_rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (processed > 0 && limit > 0).then_some((processed, limit))
+}
+
+/// The first program-load refusal in the chain, scanning outermost first:
+/// the program a preparation context names, the load errno, and the raw
+/// verifier log. `None` when no chain link is a program-load failure.
+pub(crate) fn find_program_load_refusal(
+    error: &anyhow::Error,
+) -> Option<(Option<String>, Option<i32>, String)> {
+    let mut program: Option<String> = None;
+    let mut refusal: Option<(Option<i32>, String)> = None;
+    for cause in error.chain() {
+        if let Some(load) = cause.downcast_ref::<aya::programs::ProgramError>() {
+            if let aya::programs::ProgramError::LoadError {
+                io_error,
+                verifier_log,
+            } = load
+            {
+                refusal.get_or_insert((io_error.raw_os_error(), verifier_log.to_string()));
+            }
+            continue;
+        }
+        if program.is_none() {
+            program = program_name_in_preparation_context(&cause.to_string());
+        }
+    }
+    refusal.map(|(errno, log)| (program, errno, log))
+}
+
+/// Named summary of a BPF program-load refusal: the stage, program, errno,
+/// and processed count when known, plus a pointer at doctor. The raw log
+/// is never embedded; its withheld size is named instead.
+pub(crate) fn summarize_program_load_refusal(
+    error: &anyhow::Error,
+    program: Option<String>,
+    errno: Option<i32>,
+    log: &str,
+) -> String {
+    let stage =
+        truncate_to_char_boundary(error.to_string().lines().next().unwrap_or_default(), 256);
+    let program = program.as_deref().unwrap_or("unknown program");
+    let errno_text = match errno {
+        Some(errno) => match load_refusal_errno_name(errno) {
+            Some(name) => format!("{name} (os error {errno})"),
+            None => format!("os error {errno}"),
+        },
+        None => "unknown errno".to_string(),
+    };
+    let counts = verifier_processed_counts(log).map_or(String::new(), |(processed, limit)| {
+        format!("; verifier processed {processed} insns (limit {limit})")
+    });
+    let summary = format!(
+        "{stage}: program \"{program}\" refused: BPF_PROG_LOAD failed with {errno_text}{counts}; \
+         run `p11scope doctor` to diagnose this host ({} verifier-log bytes withheld)",
+        log.len()
+    );
+    truncate_to_char_boundary(&summary, NATIVE_PREPARATION_REASON_MAX_BYTES)
+}
+
+/// Bounded, named summary of a native-lane preparation failure for the
+/// user-visible gap reason, stderr line, and native-mode error.
+///
+/// A program-load refusal carries the kernel verifier's full log inside
+/// [`aya::programs::ProgramError::LoadError`]; formatting the chain with
+/// `{error:#}` once embedded a 267 KiB dump in the gap reason and broke
+/// `inventory diff`. This summary names the refusing program, the errno,
+/// and the processed count when the chain carries them, points at
+/// `p11scope doctor`, and never embeds the raw log. Short failures without
+/// a load refusal pass through verbatim.
+pub(crate) fn summarize_native_preparation_error(error: &anyhow::Error) -> String {
+    match find_program_load_refusal(error) {
+        Some((program, errno, log)) => summarize_program_load_refusal(error, program, errno, &log),
+        None => {
+            let full = format!("{error:#}");
+            if full.len() <= NATIVE_PREPARATION_REASON_MAX_BYTES {
+                full
+            } else {
+                let head = truncate_to_char_boundary(
+                    full.lines().next().unwrap_or_default(),
+                    NATIVE_PREPARATION_REASON_MAX_BYTES / 2,
+                );
+                format!(
+                    "{head} …({} bytes withheld; run `p11scope doctor` to diagnose this host)",
+                    full.len()
+                )
+            }
+        }
+    }
+}
+
+/// Bounded summary of a program-load refusal for stderr: the stage,
+/// program, errno, processed count when known, and a short tail of the
+/// verifier log, with the truncation named by the log's original byte
+/// count. `None` when the chain carries no program-load refusal, in
+/// which case the caller keeps the error untouched.
+///
+/// The accompanying hint always points at `p11scope doctor`, so this
+/// summary spends its budget on the failure itself. Component budgets
+/// (stage 64, program 64, errno 29, counts 64, tail 128, naming 56, fixed
+/// template 69) keep it within [`STDERR_LOAD_REFUSAL_MAX_BYTES`] by
+/// construction; the final truncation is unreachable defense.
+pub(crate) fn summarize_load_refusal_for_stderr(error: &anyhow::Error) -> Option<String> {
+    let (program, errno, log) = find_program_load_refusal(error)?;
+    let stage = truncate_to_char_boundary(error.to_string().lines().next().unwrap_or_default(), 64);
+    let program = program.map(|name| truncate_to_char_boundary(&name, 64));
+    let program = program.as_deref().unwrap_or("unknown program");
+    let errno_text = match errno {
+        Some(errno) => match load_refusal_errno_name(errno) {
+            Some(name) => format!("{name} (os error {errno})"),
+            None => format!("os error {errno}"),
+        },
+        None => "unknown errno".to_string(),
+    };
+    let counts = verifier_processed_counts(&log)
+        .map(|(processed, limit)| format!("; verifier processed {processed} insns (limit {limit})"))
+        .filter(|clause| clause.len() <= 64)
+        .unwrap_or_default();
+    // The last bytes of the log, escaped to one line: the kernel prints
+    // the decisive refusal at the end.
+    let mut tail = log.as_str();
+    if tail.len() > 128 {
+        let mut start = tail.len() - 128;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail = &tail[start..];
+    }
+    let escaped = crate::render::escape_controls(tail);
+    let tail = truncate_to_char_boundary(&escaped, 128);
+    let tail_clause = if tail.is_empty() {
+        String::new()
+    } else {
+        format!("; verifier tail: {tail}")
+    };
+    let naming = if log.len() <= 128 {
+        format!("{} verifier-log bytes total", log.len())
+    } else {
+        format!("{} verifier-log bytes total, tail shown", log.len())
+    };
+    let summary = format!(
+        "{stage}: program \"{program}\" refused: BPF_PROG_LOAD failed with {errno_text}{counts}{tail_clause}; ({naming})"
+    );
+    Some(truncate_to_char_boundary(
+        &summary,
+        STDERR_LOAD_REFUSAL_MAX_BYTES,
+    ))
+}
+
 /// The DISCOVERY ring size this scope loads with.
 /// The one loader configuration of the capture object, shared by capture
 /// sessions and the uretprobe-hazard self-probe (J-DOSSIER#28): vmlinux BTF
@@ -2593,12 +6228,40 @@ pub(crate) fn load_capture_object(
     events_bytes: u32,
     discovery_bytes: u32,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
+    load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)
+}
+
+fn load_capture_object_with_images(
+    btf: &Btf,
+    events_bytes: u32,
+    discovery_bytes: u32,
+    full_images: bool,
+) -> std::result::Result<Ebpf, aya::EbpfError> {
+    load_capture_object_bytes_with_images(
+        btf,
+        events_bytes,
+        discovery_bytes,
+        full_images,
+        crate::EBPF_OBJECT,
+    )
+}
+
+fn load_capture_object_bytes_with_images(
+    btf: &Btf,
+    events_bytes: u32,
+    discovery_bytes: u32,
+    full_images: bool,
+    object: &[u8],
+) -> std::result::Result<Ebpf, aya::EbpfError> {
     EbpfLoader::new()
         .btf(Some(btf))
         .allow_unsupported_maps()
         .map_max_entries("EVENTS", events_bytes)
         .map_max_entries("DISCOVERY", discovery_bytes)
-        .load(crate::EBPF_OBJECT)
+        .map_max_entries("IMAGE_CONTINUITY", if full_images { 16_384 } else { 1 })
+        .map_max_entries("IMAGE_TGID_INDEX", if full_images { 16_384 } else { 1 })
+        .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 })
+        .load(object)
 }
 
 pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
@@ -2615,12 +6278,22 @@ pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
 /// emptied into this FIFO on every capture tick and between startup phases,
 /// so a slow frame or a long startup no longer overflows it. Every consumer
 /// dequeues through the session, which serves this FIFO first: ring order
-/// is preserved and no item is ever dropped here. Staging stops at
-/// `CAPACITY`; beyond it records wait in the kernel ring, where overflow is
-/// counted by the producer as ring loss.
+/// is preserved and no item is ever dropped here. Staging stops at the
+/// shared allowance; beyond it records wait in the kernel ring, where
+/// overflow is counted by the producer as ring loss.
 #[derive(Default)]
 pub(crate) struct DiscoveryStage {
     items: std::collections::VecDeque<events::DiscoveryItem>,
+}
+
+/// What one staging call moved: how many items entered the FIFO, and
+/// whether staging stopped at the shared allowance with the quantum
+/// unspent (the ring still holds whatever it holds; only the next drain
+/// settles the FIFO and frees the allowance).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveryStageOutcome {
+    pub(crate) staged: usize,
+    pub(crate) capacity_blocked: bool,
 }
 
 impl DiscoveryStage {
@@ -2628,20 +6301,43 @@ impl DiscoveryStage {
     /// ring.
     pub(crate) const CAPACITY: usize = 4096;
 
-    /// Moves up to `quantum` items from `next` into the FIFO; returns how
-    /// many were staged.
+    /// Moves up to `quantum` items from `next` into the FIFO without
+    /// letting the FIFO exceed `shared_cap` — the shared 4,096-item
+    /// allowance minus whatever the Engine already holds, computed by the
+    /// caller. The cap is enforced here, structurally: no caller quantum
+    /// can stage past it, and the outcome reports whether the allowance
+    /// (rather than the quantum or an empty ring) stopped the move.
     pub(crate) fn stage(
         &mut self,
         quantum: usize,
+        shared_cap: usize,
         mut next: impl FnMut() -> Option<events::DiscoveryItem>,
-    ) -> usize {
+    ) -> DiscoveryStageOutcome {
         let mut staged = 0;
-        while staged < quantum && self.items.len() < Self::CAPACITY {
-            let Some(item) = next() else { break };
+        while staged < quantum && self.items.len() < shared_cap.min(Self::CAPACITY) {
+            let Some(item) = next() else {
+                return DiscoveryStageOutcome {
+                    staged,
+                    capacity_blocked: false,
+                };
+            };
             self.items.push_back(item);
             staged += 1;
         }
-        staged
+        let capacity_blocked =
+            staged < quantum && self.items.len() >= shared_cap.min(Self::CAPACITY);
+        DiscoveryStageOutcome {
+            staged,
+            capacity_blocked,
+        }
+    }
+
+    /// Whether the idle wait polls DISCOVERY beside EVENTS: only while
+    /// the staged FIFO plus what the Engine still holds leaves room under
+    /// the shared allowance. A snapshot per call: staging past the call
+    /// flips the next decision, never the returned set.
+    pub(crate) fn poll_discovery(staged_len: usize, engine_held: usize) -> bool {
+        staged_len.saturating_add(engine_held) < Self::CAPACITY
     }
 
     pub(crate) fn pop(&mut self) -> Option<events::DiscoveryItem> {
@@ -2655,6 +6351,78 @@ impl DiscoveryStage {
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
+}
+
+/// Both lazy Session routes create and wire the one retained consumer here.
+pub(crate) fn ensure_pid_discovery_consumer_with<S: events::RecordSource>(
+    consumer: &mut Option<events::DiscoveryDrain<S>>,
+    tap: Option<&PidLifecycleTap>,
+    create: impl FnOnce() -> Result<events::DiscoveryDrain<S>>,
+) -> Result<bool> {
+    let created = consumer.is_none();
+    if created {
+        let mut drain = create().inspect_err(|_| {
+            if let Some(tap) = tap {
+                tap.observe_failure();
+            }
+        })?;
+        if let Some(tap) = tap {
+            drain
+                .attach_pid_lifecycle_tap(tap.clone())
+                .map_err(|reason| anyhow!("PID lifecycle consumer: {reason:?}"))?;
+        }
+        *consumer = Some(drain);
+    } else if let Some(tap) = tap {
+        consumer
+            .as_mut()
+            .expect("checked consumer")
+            .attach_pid_lifecycle_tap(tap.clone())
+            .map_err(|reason| anyhow!("PID lifecycle consumer: {reason:?}"))?;
+    }
+    Ok(created)
+}
+
+fn invalidate_pid_session(pairs: &mut pid_continuity::PairBook, tap: Option<&PidLifecycleTap>) {
+    pairs.invalidate_all();
+    if let Some(tap) = tap {
+        tap.invalidate_terminal();
+    }
+}
+
+/// The terminal collection's staged branch must refuse continuity before its
+/// early return, just as the raw bounded poll does before touching the ring.
+pub(crate) fn collect_staged_discovery_to_position<S: events::BoundedRecordSource>(
+    staged: &mut DiscoveryStage,
+    consumer: &mut events::DiscoveryDrain<S>,
+    stop: usize,
+    quantum: usize,
+) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
+    consumer.invalidate_pid_lifecycle_terminal();
+    let mut records = Vec::new();
+    let mut malformed = 0u64;
+    let mut left = quantum;
+    while left > 0 {
+        let Some(item) = staged.pop() else {
+            break;
+        };
+        match item {
+            events::DiscoveryItem::Record(record) => records.push(record),
+            events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+        }
+        left -= 1;
+    }
+    if left == 0 {
+        return Ok((records, malformed, false, true));
+    }
+    let (post_q_record, backlog) =
+        events::poll_discovery_to_position(consumer, stop, Some(left), |item| {
+            match item {
+                events::DiscoveryItem::Record(record) => records.push(record),
+                events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+    Ok((records, malformed, post_q_record, backlog))
 }
 
 fn validate_runtime_maps(ebpf: &Ebpf, discovery_bytes: u32) -> Result<()> {
@@ -2684,10 +6452,26 @@ fn expected_programs(unsafe_enabled: bool) -> BTreeSet<&'static str> {
 }
 
 fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
+    validate_program_inventory_with_roots(ebpf, unsafe_enabled, StaticRoots::Detailed)
+}
+
+fn validate_program_inventory_with_roots(
+    ebpf: &Ebpf,
+    unsafe_enabled: bool,
+    roots: StaticRoots,
+) -> Result<()> {
     let mut expected = expected_programs(unsafe_enabled);
     // The continuity hooks are present in every Detailed object but load
-    // after activation, optionally (`InstanceTracking::start`).
+    // before deferred freezes, optionally (`InstanceTracking::prepare`).
+    // Both variants of each hook slot are present; one loads per kernel.
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
+    expected.insert(instance::COPY_VMA_RET_PROGRAM);
+    expected.insert(instance::EXEC_RELEASE_MMAP_PROGRAM);
+    expected.insert("p11_image_query");
+    expected.extend(selected_detailed::PROGRAMS);
+    if roots == StaticRoots::CounterBanks {
+        expected.extend(counter_banks::PROGRAMS);
+    }
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
     if actual != expected {
         bail!("eBPF program inventory {actual:?} differs from {expected:?}");
@@ -2707,9 +6491,13 @@ enum SessionPreparation {
     PublishAsync,
     PublishShapes,
     PublishAttributes,
+    PublishObjects,
+    PublishJournalClasses,
     FreezePublished,
     SelectScope,
     LoadProgram(&'static str),
+    LoadImagePrograms,
+    LoadCounterPrograms,
     FreezeDeferred(&'static str),
     PublishTailCalls,
     PrepareEventsDomain,
@@ -2719,6 +6507,8 @@ enum SessionPreparation {
 // preparation order used by startup; activation cannot bypass a preparation failure.
 fn prepare_session_with(
     object_has_unsafe: bool,
+    roots: StaticRoots,
+    journal: bool,
     mut operation: impl FnMut(SessionPreparation) -> Result<()>,
 ) -> Result<()> {
     use SessionPreparation::*;
@@ -2733,18 +6523,37 @@ fn prepare_session_with(
         PublishAsync,
         PublishShapes,
         PublishAttributes,
+        PublishObjects,
         FreezePublished,
         SelectScope,
     ] {
+        // The journal class array is RDONLY_PROG like DESCRIPTORS: userspace
+        // fill runs before the published freeze, and only for journal roots.
+        if journal && step == FreezePublished {
+            operation(PublishJournalClasses)?;
+        }
         operation(step)?;
     }
-    for name in expected_programs(object_has_unsafe) {
-        operation(LoadProgram(name))?;
+    if journal {
+        for name in journal::journal_expected_programs() {
+            operation(LoadProgram(name))?;
+        }
+    } else {
+        for name in expected_programs(object_has_unsafe) {
+            operation(LoadProgram(name))?;
+        }
+    }
+    operation(LoadImagePrograms)?;
+    if roots == StaticRoots::CounterBanks {
+        operation(LoadCounterPrograms)?;
     }
     for (name, meta) in BASE_POLICY_MAPS {
         if defers_freeze_until_loaded(name, &meta) && name != TAIL_POLICY_MAP {
             operation(FreezeDeferred(name))?;
         }
+    }
+    if journal {
+        operation(FreezeDeferred("JOURNAL_CLASSES"))?;
     }
     operation(PublishTailCalls)?;
     operation(PrepareEventsDomain)?;
@@ -2868,28 +6677,160 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 /// or the mechanism registry step never reaches that far) — never at
 /// the per-slot attach loop, which is reached only after those succeed.
 /// Every realistic cause at that point is an unsupported-environment
-/// one, so every early failure gets the same actionable hint appended,
-/// naming the concrete things to check instead of leaving a bare
-/// syscall error for the operator to diagnose alone.
+/// one, so every early failure gets an actionable hint appended, naming
+/// the concrete things to check instead of leaving a bare syscall error
+/// for the operator to diagnose alone. A verifier-budget refusal (E2BIG
+/// from a program load, or ENOSPC when the verifier log fills first) is
+/// the one exception: it gets the verifier hint, since privileges are
+/// not the cause.
 pub(crate) const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
 attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
-lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
+lockdown mode, unavailable required BPF features, missing BTF \
 (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \
 docs/notes/phase5-unsupported.md for what each looks like when observed. Run \
 `p11scope doctor` to see which cause applies on this host.";
 
+pub(crate) const VERIFIER_BUDGET_HINT: &str = "hint: the kernel's verifier found a p11scope program too \
+complex and refused it (E2BIG) — this is a p11scope bug on this kernel, not a privilege \
+problem. Report it with the `p11scope doctor` output.";
+
+pub(crate) const VERIFIER_BUDGET_HINT_LOG_EXHAUSTION: &str = "hint: the verifier log filled during a very long check, \
+so the load was refused (ENOSPC) — usually the complexity limit; this is a \
+p11scope bug on this kernel, not a privilege problem. Report it with the `p11scope doctor` output.";
+
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
-    error.context(UNSUPPORTED_ENV_HINT)
+    let budget_errno = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<aya::programs::ProgramError>()
+            .and_then(verifier_budget_refusal_errno_name)
+    });
+    // A program-load refusal carries the kernel's whole verifier log; the
+    // bounded summary replaces the chain before the hint is added, so
+    // stderr never dumps the raw log. Any other failure keeps its chain.
+    let error = match summarize_load_refusal_for_stderr(&error) {
+        Some(summary) => anyhow::anyhow!("{summary}"),
+        None => error,
+    };
+    match budget_errno {
+        Some("ENOSPC") => error.context(VERIFIER_BUDGET_HINT_LOG_EXHAUSTION),
+        Some(_) => error.context(VERIFIER_BUDGET_HINT),
+        None => error.context(UNSUPPORTED_ENV_HINT),
+    }
+}
+
+fn read_pid_health_with(
+    ebpf: &Ebpf,
+    health: &mut pid_continuity::OwnerHealth,
+    prepared_owner_limit: u64,
+    tap: &PidLifecycleTap,
+) -> std::result::Result<u64, PidContinuityRefusal> {
+    let owner = (|| -> Result<ThreadOwnerControl> {
+        let control: Array<_, ThreadOwnerControl> =
+            Array::try_from(ebpf.map("OWNER_CTL").context("OWNER_CTL map")?)?;
+        Ok(control.get(&0, 0)?)
+    })()
+    .map_err(|_| PidContinuityRefusal::Unavailable);
+    let loss = (|| -> Result<u64> {
+        let counters: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(ebpf.map("COUNTERS").context("COUNTERS map")?)?;
+        pid_continuity::checked_discovery_loss(
+            counters
+                .get(&DISCOVERY_COUNTER_RING_LOSS, 0)?
+                .iter()
+                .copied(),
+        )
+        .map_err(|reason| anyhow!("PID continuity loss: {reason:?}"))
+    })()
+    .map_err(|_| PidContinuityRefusal::Loss);
+    health.check(owner, loss, prepared_owner_limit, tap)
 }
 
 impl Session {
+    fn require_return_probe_admission(&mut self) -> Result<()> {
+        crate::uretprobe_hazard::ensure_admission(&mut self.return_probe_admission)
+            .map_err(crate::uretprobe_hazard::refusal_error)
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    pub(crate) fn reexec_diagnostic(&self) -> Option<reexec_diagnostic::Diagnostic> {
+        self.reexec_diagnostic.clone()
+    }
+
     pub(crate) const fn capture_policy(&self) -> CapturePolicy {
         self.policy
+    }
+
+    #[allow(dead_code)] // Staged for the Session-bound complete counter reader.
+    pub(crate) const fn counter_collection_generation(&self) -> NonZeroU64 {
+        self.counter_collection_generation
     }
 
     /// The session's stop-gate mapping.
     pub(crate) fn stop_gate(&self) -> &StopGate {
         &self.stop_gate
+    }
+
+    /// Observe this Session's actual producer Q without consuming either
+    /// retained ring. A pending result retains all Session ownership.
+    #[allow(dead_code)] // No machine/terminal activation in this slice.
+    pub(crate) fn observe_collected_finish_q(
+        &mut self,
+        expected: &SessionDrainProducers,
+        grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+    ) -> Result<Option<CollectedFinishQ>> {
+        let producers = self
+            .drain_producers()
+            .context("collected Finish Q has no retained native domain")?;
+        {
+            let owner = CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            };
+            validate_collected_finish_q_owner(&owner, expected, grant)?;
+            if !owner.gate.quiescent() {
+                return Ok(None);
+            }
+        }
+        self.ensure_events_consumer()?;
+        self.ensure_discovery_consumer()?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("retained EVENTS consumer vanished during Q observation")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("retained DISCOVERY consumer vanished during Q observation")?;
+        observe_collected_finish_q_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            expected,
+            grant,
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected Finish EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+        )
+    }
+
+    /// Same retained Session and current native Q only. This is not evidence
+    /// of completed drain, clean prefix, process death or detach permission.
+    #[allow(dead_code)] // Pending-at-Q forwarding remains inactive in the ordinary driver.
+    pub(crate) fn matches_collected_finish_q(&self, q: &CollectedFinishQ) -> bool {
+        matches!(self.producer_detach, OwnedProducerDetach::NotStarted)
+            && self.stop_gate.quiescent()
+            && self
+                .drain_producers()
+                .as_ref()
+                .is_some_and(|producers| q.matches_owner(producers, &self.discovery_domain))
     }
 
     /// Stamps attach completion with one CLOCK_MONOTONIC read (T2, G-14).
@@ -2905,6 +6846,10 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // The attested start threads the shared factory directly now (it
+    // carries the journal request `start` pins to `None`); only tests
+    // keep the direct constructor.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(
         plan: &AttachPlan,
         scope: &Scope,
@@ -2915,14 +6860,135 @@ impl Session {
         owned_child: Option<&OwnedChild>,
         selection: BackendSelection,
     ) -> Result<Self> {
+        Self::start_with_selected(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_generation,
+            ring_bytes,
+            owned_child,
+            selection,
+            None,
+            None,
+            None,
+            false,
+            require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
+        )
+    }
+
+    /// Direct counter start with default return-probe admission. The Engine
+    /// shares `start_for_capture` so it can retain its CLI admission.
+    #[allow(dead_code)] // Retain the direct constructor; Engine uses start_for_capture.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_counter(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
+        counter: &counter_banks::CounterSpec,
+    ) -> Result<Self> {
+        Self::start_with_selected(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_generation,
+            ring_bytes,
+            owned_child,
+            selection,
+            None,
+            Some(counter),
+            None,
+            false,
+            require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
+        )
+    }
+
+    /// The Engine passes only the authority already warned and recorded by
+    /// its CLI preflight. Other factories continue to request default safety.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_for_capture(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
+        counter: Option<&counter_banks::CounterSpec>,
+        admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
+        track_short_lived: bool,
+    ) -> Result<Self> {
+        Self::start_with_selected(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_generation,
+            ring_bytes,
+            owned_child,
+            selection,
+            None,
+            counter,
+            None,
+            track_short_lived,
+            require_multi_capable_host(),
+            || match admission {
+                Some(admission) => Ok(admission),
+                None => crate::uretprobe_hazard::admit(None, false),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_selected(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
+        selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
+        host: MultiHostVerdict,
+        admission: impl FnOnce() -> std::result::Result<
+            crate::uretprobe_hazard::ReturnProbeAdmission,
+            crate::uretprobe_hazard::Action,
+        >,
+    ) -> Result<Self> {
+        // 6.14 Option B: no factory path starts a counter session
+        // with the exe-identity read armed (Detailed objects only).
+        if track_short_lived && !policy.allows_track_short_lived() {
+            bail!(
+                "--track-short-lived arms Detailed captures only; refusing it for counter mode {}",
+                policy
+                    .counter_mode()
+                    .expect("non-Detailed policy here is a counter policy")
+                    .name()
+            );
+        }
+        let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
+        let _host = host?;
+        let admission = admission().map_err(crate::uretprobe_hazard::refusal_error)?;
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
         let _ = crate::process::raise_nofile();
-        let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         let SessionBackend { backend, fallback } = select_session_backend(
             selection,
-            matches!(scope, Scope::Pid(_)),
+            matches!(scope, Scope::Pid(_)) || selected.is_some(),
             multi_functional_probe,
             kernel_multi_pid_filter,
         )?;
@@ -2935,6 +7001,11 @@ impl Session {
             ring_bytes,
             owned_child,
             backend,
+            selected,
+            counter,
+            journal,
+            track_short_lived,
+            &admission,
         ) {
             Ok(session) => Ok((session, fallback)),
             Err(error)
@@ -2962,6 +7033,11 @@ impl Session {
                     ring_bytes,
                     owned_child,
                     AttachBackend::Singles,
+                    selected,
+                    counter,
+                    journal,
+                    track_short_lived,
+                    &admission,
                 )
                 .map(|session| (session, Some(reason)))
             }
@@ -2970,7 +7046,110 @@ impl Session {
         let (mut session, fallback) = started?;
         session.selection = selection;
         session.backend_fallback = fallback;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        {
+            session.reexec_diagnostic = reexec_diagnostic::Diagnostic::selected(
+                matches!(scope, Scope::Pid(_)),
+                selection == BackendSelection::Singles,
+            );
+        }
         Ok(session)
+    }
+
+    /// The receipt is minted from this new Session's maps and retained links;
+    /// the caller supplies only the coordinator's move-only accepted subset.
+    pub(crate) fn start_attested(
+        subset: crate::inventory_semantics::AttestedSubset,
+        scope: &Scope,
+        selection: BackendSelection,
+        journal: Option<&journal::JournalSpec>,
+    ) -> Result<(Self, AttachedSemanticSet)> {
+        // Gate the journal request before any host probe or load:
+        // builds that omit the production object refuse here with the
+        // finite build reason. (The preparation re-resolves the same
+        // bytes; resolution is side-effect-free.)
+        if let Some(spec) = journal {
+            spec.prepare().map(|_| ())?;
+        }
+        // Thread through the shared factory directly: `Self::start`
+        // pins the journal request to `None`, which would silently
+        // drop the opt-in. Defaults match `Self::start` exactly.
+        let mut session = Self::start_with_selected(
+            subset.plan(),
+            scope,
+            subset.pins(),
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            selection,
+            None,
+            None,
+            journal,
+            false,
+            require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
+        )?;
+        // H7 slice D: freeze the receipt-bound object rows before minting
+        // the receipt. A readback disagreement refuses the attested
+        // session; without verified rows no 608-byte record decodes.
+        session.object_decode = Some(freeze_object_decode_table(&session.ebpf)?);
+        let domain = session
+            .native_domain()
+            .context("Detailed image domain unavailable")?;
+        let attached = seal_attached_subset_native(
+            &session.ebpf,
+            subset,
+            domain,
+            session.policy,
+            session.semantic_descriptors(),
+            &session.retained_static,
+            &session.current_static_sides(),
+            |object| {
+                session
+                    .instance
+                    .watched(object)
+                    .map(|watched| watched.retained_target())
+            },
+        )
+        .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))?;
+        // Only a successful seal retains: the producers drain derives its
+        // linkage from this sealed fact. A refused seal keeps no linkage.
+        retain_sealed_linkage(&mut session.sealed_journal_linked, &attached);
+        Ok((session, attached))
+    }
+
+    fn semantic_descriptors(&self) -> Result<Vec<SlotSemantics>> {
+        let descriptors: Array<_, SlotSemantics> =
+            Array::try_from(self.ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?)?;
+        descriptors
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)
+    }
+
+    fn current_static_sides(&self) -> BTreeSet<StaticEndpoint> {
+        current_static_sides_from(&self.links)
+    }
+
+    pub(crate) fn validate_semantic_set(&self, attached: &AttachedSemanticSet) -> Result<()> {
+        let domain = self
+            .native_domain()
+            .context("Detailed image domain unavailable")?;
+        attached
+            .validate_with(
+                domain,
+                self.policy,
+                self.semantic_descriptors(),
+                &self.retained_static,
+                &self.current_static_sides(),
+                |object| {
+                    self.instance
+                        .watched(object)
+                        .map(|watched| watched.retained_target())
+                },
+            )
+            .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2983,26 +7162,57 @@ impl Session {
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
+        admission: &crate::uretprobe_hazard::ReturnProbeAdmission,
     ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session =
-            Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child, backend)
-                .map_err(unsupported_environment_context)?;
+        let mut session = Self::start_inner(
+            scope,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+            selected,
+            counter,
+            journal,
+            track_short_lived,
+        )
+        .map_err(|error| {
+            if counter.is_some() {
+                counter_banks::map_counter_start_error(error)
+            } else {
+                unsupported_environment_context(error)
+            }
+        })?;
+        session.return_probe_admission = Some(admission.clone());
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
             crate::first_use_probe::DiscoveryStage::LifecycleActive,
             &session,
         );
-        session
-            .attach_plan(plan, objects)
-            .map_err(unsupported_environment_context)?;
+        // Counter sessions stage banks through the Engine after start; the
+        // bank guard refuses Detailed slot attach once banks exist.
+        if policy.counter_mode().is_none() {
+            session
+                // Watches cannot have ended before the initial attach (ends
+                // happen at capture end or on detected change, both after
+                // start), so the start path enforces an empty ended set.
+                .attach_plan(plan, objects, &BTreeSet::new())
+                .map_err(unsupported_environment_context)?;
+        }
         // The lifecycle producers ran through the whole static attach: stage
         // what they produced before the Engine's per-view phases (RB-2).
-        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+        // The Engine holds nothing yet; whatever does not fit waits in the
+        // kernel ring for the next staging call after the first batch.
+        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM, 0)?;
         // The error path drops `session`, which detaches every probe.
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -3028,6 +7238,10 @@ impl Session {
             None,
             None,
             AttachBackend::Singles,
+            None,
+            None,
+            None,
+            false,
         )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
@@ -3035,6 +7249,7 @@ impl Session {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         scope: &Scope,
         policy: CapturePolicy,
@@ -3042,22 +7257,213 @@ impl Session {
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
     ) -> Result<Self> {
-        if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
+        let (mut session, prepared_instance) = Self::prepare_inner_unlinked(
+            scope,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+            selected,
+            counter,
+            journal,
+            track_short_lived,
+        )?;
+        session.links = activate_after_preparation_with(Ok(()), || {
+            attach_lifecycle_with(
+                &mut session.ebpf,
+                Self::attach_lifecycle_program,
+                |ebpf, _, link| detach_registered_link(ebpf, link),
+            )
+        })?;
+        // Preserve ordinary activation order: mandatory lifecycle first,
+        // then image continuity, and endpoint attachment only afterwards.
+        session.trace_coverage =
+            detailed_identity::TraceCoverage::after_activation(scope, monotonic_ns());
+        session.instance = InstanceTracking::start(
+            &mut session.ebpf,
+            &session.image_coverage,
+            prepared_instance,
+        );
+        Ok(session)
+    }
+
+    fn attach_lifecycle_program(ebpf: &mut Ebpf, program: &'static str) -> Result<RegisteredLink> {
+        if program == "task_newtask" {
+            let hook: &mut BtfTracePoint = ebpf
+                .program_mut(program)
+                .context("required task_newtask program")?
+                .try_into()?;
+            Ok(RegisteredLink::BtfTracePoint {
+                program,
+                id: hook.attach()?,
+            })
+        } else {
+            let hook: &mut RawTracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("required raw {program} program"))?
+                .try_into()?;
+            Ok(RegisteredLink::RawTracePoint {
+                program,
+                id: hook.attach(program)?,
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_inner_unlinked(
+        scope: &Scope,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
+    ) -> Result<(Self, instance::PreparedInstanceTracking)> {
+        match (counter, journal) {
+            (None, None) => Self::prepare_inner_unlinked_with_object(
+                scope,
+                policy,
+                pause_key,
+                ring_bytes,
+                owned_child,
+                backend,
+                selected,
+                None,
+                None,
+                track_short_lived,
+            ),
+            (Some(spec), None) => {
+                let prepared = spec.prepare(backend)?;
+                Self::prepare_inner_unlinked_with_object(
+                    scope,
+                    policy,
+                    pause_key,
+                    ring_bytes,
+                    owned_child,
+                    backend,
+                    selected,
+                    Some(prepared),
+                    None,
+                    track_short_lived,
+                )
+            }
+            (None, Some(spec)) => {
+                let prepared = spec.prepare()?;
+                Self::prepare_inner_unlinked_with_object(
+                    scope,
+                    policy,
+                    pause_key,
+                    ring_bytes,
+                    owned_child,
+                    backend,
+                    selected,
+                    None,
+                    Some(prepared),
+                    track_short_lived,
+                )
+            }
+            (Some(_), Some(_)) => {
+                bail!("journal preparation refuses alongside counter preparation: select one")
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private common preparation adds a closed unselected object profile"
+    )]
+    fn prepare_inner_unlinked_with_object(
+        scope: &Scope,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
+        counter: Option<counter_banks::CounterPreparation<'_>>,
+        journal: Option<journal::JournalPreparation<'_>>,
+        track_short_lived: bool,
+    ) -> Result<(Self, instance::PreparedInstanceTracking)> {
+        if counter.is_some() && journal.is_some() {
+            bail!("journal preparation refuses alongside counter preparation: select one");
+        }
+        // The bytes rule before anything loads or attaches: a stale or
+        // mismatched embedded object refuses here with both values named.
+        // Counter sessions check their own object's flavor, never the
+        // Detailed bytes, and journal sessions check the journal pair.
+        let flavor = match (policy.counter_mode(), journal.as_ref()) {
+            (Some(mode), None) => {
+                let prepared = counter
+                    .as_ref()
+                    .context("counter policy requires its preparation")?;
+                checked_counter_flavor(mode, prepared.object)?
+            }
+            (None, None) => checked_embedded_flavor()?,
+            (None, Some(prepared)) => journal::checked_journal_flavor(prepared.object)?,
+            (Some(_), Some(_)) => {
+                bail!("journal preparation refuses alongside counter preparation: select one")
+            }
+        };
+        if policy.uses_unsafe_decoders() && !flavor.unsafe_present {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
+        let counter_collection_generation = counter_generation::allocate()?;
         // `--ring-bytes` resizes the EVENTS ringbuf at load (aya rounds to a
         // page-sized power of two like libbpf); omission resolves to the
         // baked-in default, which is a no-op override of the ELF value.
-        let btf =
-            Btf::from_sys_fs().context("loading required vmlinux BTF for typed task_newtask")?;
-        let mut ebpf = load_capture_object(
-            &btf,
-            crate::run::resolve_ring_bytes(ring_bytes),
+        // The required vmlinux BTF parse populates the process-wide
+        // host_btf cache, so no budgeted job tick pays the cold sysfs
+        // re-read, parse, or selector scan.
+        let host =
+            host_btf::shared().context("loading required vmlinux BTF for typed task_newtask")?;
+        let domain = if policy.wants_instance_hooks() {
+            Some(capture::NativeDomainId::try_mint()?)
+        } else {
+            None
+        };
+        let roots = if counter.is_some() {
+            StaticRoots::CounterBanks
+        } else {
+            StaticRoots::Detailed
+        };
+        // Journal sessions reuse Detailed roots: the journal object retains
+        // every ordinary program and map, with the entry/return pair
+        // swapped. The flavor check above already refused a counter/journal
+        // combination, so at most one preparation selects here.
+        let object = match journal.as_ref() {
+            Some(prepared) => prepared.object,
+            None => counter
+                .as_ref()
+                .map_or(crate::EBPF_OBJECT, |prepared| prepared.object),
+        };
+        // A journal (Joint) capture holds a larger EVENTS ring: its START
+        // and END records cost about 0.86 KiB a call, and the ring is read
+        // only between seals. Every other capture keeps the default.
+        let events_bytes = if journal.is_some() {
+            crate::run::resolve_journal_ring_bytes(ring_bytes)
+        } else {
+            crate::run::resolve_ring_bytes(ring_bytes)
+        };
+        let mut ebpf = load_capture_object_bytes_with_images(
+            host.btf(),
+            events_bytes,
             discovery_ring_bytes(scope),
+            policy.wants_instance_hooks(),
+            object,
         )
         .context("loading BPF object with required task storage")?;
-        let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
+        let native_selection =
+            selected_detailed::NativeSelection::publish(&mut ebpf, scope, selected)?;
+        let object_has_unsafe = flavor.unsafe_present;
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
         let generation_token = pause_key.map(|key| key.generation_token);
         let mut uprobe_scope = UProbeScope::AllProcesses;
@@ -3065,15 +7471,36 @@ impl Session {
         let mut prepared_domain = None;
         let mut prepared_discovery_domain = None;
         let mut root_seed = None;
-        let preparation = prepare_session_with(object_has_unsafe, |step| {
+        let mut image_query = None;
+        let mut prepared_instance = None;
+        let mut prepared_owner_limit = None;
+        let mut unpublished_mechanisms = 0u64;
+        // The option served selection above; only the flag reaches preparation.
+        let journal = journal.is_some();
+        let preparation = prepare_session_with(object_has_unsafe, roots, journal, |step| {
             match step {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
                         .context("validating exact policy-map metadata")?;
+                    validate_pid_start_tick_map(&ebpf, roots, journal)
+                        .context("validating exact PID witness map metadata")?;
+                    if journal {
+                        journal::validate_journal_maps(&ebpf)
+                            .context("validating exact journal map metadata")?;
+                    }
                 }
                 SessionPreparation::ValidateRuntime => {
                     validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
                         .context("validating live-discovery runtime maps")?;
+                    image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
+                    // The journal object always carries its marker control
+                    // map; the birth-marker feature verdict stays Detailed.
+                    if !journal {
+                        instance::prepare_marker_control(&ebpf, roots)?;
+                    } else {
+                        journal::prepare_journal_marker_control(&ebpf)?;
+                    }
+                    selected_detailed::validate_maps(&ebpf)?;
                 }
                 SessionPreparation::ValidateStopGate => {
                     validate_stop_gate(&ebpf).context("stop gate unavailable")?;
@@ -3084,17 +7511,50 @@ impl Session {
                     );
                 }
                 SessionPreparation::ValidatePrograms => {
-                    validate_program_inventory(&ebpf, object_has_unsafe)
-                        .context("validating exact eBPF program inventory")?;
+                    (if journal {
+                        journal::validate_journal_inventory(&ebpf)
+                    } else if roots == StaticRoots::Detailed {
+                        validate_program_inventory(&ebpf, object_has_unsafe)
+                    } else {
+                        validate_program_inventory_with_roots(&ebpf, object_has_unsafe, roots)
+                    })
+                    .context("validating exact eBPF program inventory")?;
                 }
                 SessionPreparation::PublishScope => {
-                    crate::scope::publish(&mut ebpf, scope, policy, generation_token)
-                        .context("publishing scope and capture policy")?;
+                    // I4: the witness binds only when the object carries
+                    // its map; anything else skips the /proc read. The
+                    // selected pin, or the owned child's, anchors the
+                    // read against a PID reused during the object load.
+                    let pid_start = if crate::scope::reads_pid_witness(
+                        scope,
+                        ebpf.map("PID_START_TICK").is_some(),
+                    ) {
+                        let pin = selected.or_else(|| owned_child.map(|child| child.pin()));
+                        crate::scope::pid_start_tick_of(scope, pin)
+                            .context("publishing scope and capture policy")?
+                    } else {
+                        None
+                    };
+                    crate::scope::publish(
+                        &mut ebpf,
+                        scope,
+                        policy,
+                        generation_token,
+                        track_short_lived,
+                        pid_start,
+                    )
+                    .context("publishing scope and capture policy")?;
                     debug_assert!(process_creation_capture_enabled(scope, policy));
                 }
                 SessionPreparation::PrepareIdentity => {
-                    prepare_identity(&mut ebpf, scope, owned_child)
+                    // Per-object gate (C1): counter sessions load the
+                    // gate-free counter object even in gate-1 builds.
+                    let gate = identity_gate_required(counter.is_some());
+                    prepare_identity(&mut ebpf, scope, owned_child, gate)
                         .context("preparing required image identity and thread ownership")?;
+                    // START metadata is immutable. Retain the same validated
+                    // capacity-derived limit initialized and read back above.
+                    prepared_owner_limit = Some(owner_limit_from_start(&ebpf)?);
                 }
                 SessionPreparation::PublishDescriptors => {
                     let mut semantics: Array<_, SlotSemantics> =
@@ -3117,30 +7577,71 @@ impl Session {
                     publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
                 }
                 SessionPreparation::PublishShapes => {
-                    // Embedded defaults: this binary ships statically and has no
-                    // config-file plumbing yet, so `None` is the only reachable
-                    // path today. A future task can thread a path through here
+                    // Embedded defaults plus the p11scope vendor overlay: this
+                    // binary ships statically and has no config-file plumbing
+                    // yet. A future task can thread a path through here
                     // without touching the publish-before-attach placement.
-                    let registry = MechanismRegistry::load(None)
+                    let registry = crate::vendor_mechanisms::load_registry()
                         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
-                    crate::shapes::publish(&mut ebpf, &registry)
+                    let publication = crate::shapes::publish(&mut ebpf, &registry)
                         .context("publishing MECH_SHAPE")?;
+                    unpublished_mechanisms = publication.unpublished;
                 }
                 SessionPreparation::PublishAttributes => {
                     publish_attribute_catalog(&mut ebpf, unsafe_enabled)
                         .context("publishing ATTR_BOOL_BITS")?;
                 }
+                SessionPreparation::PublishObjects => {
+                    publish_object_custody_maps(&mut ebpf)
+                        .context("publishing OBJECT_DESCRIPTORS")?;
+                }
+                SessionPreparation::PublishJournalClasses => {
+                    let mut classes: Array<_, u32> = Array::try_from(
+                        ebpf.map_mut("JOURNAL_CLASSES")
+                            .context("JOURNAL_CLASSES map")?,
+                    )?;
+                    journal::publish_journal_classes(
+                        &mut classes,
+                        |classes, index, value| {
+                            classes.set(index, value, 0).map_err(anyhow::Error::from)
+                        },
+                        |classes| {
+                            classes
+                                .iter()
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(anyhow::Error::from)
+                        },
+                    )
+                    .context("publishing JOURNAL_CLASSES")?;
+                }
                 SessionPreparation::FreezePublished => {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
+                    // I4: the witness content publishes at PublishScope
+                    // above; freeze it with the published maps exactly where
+                    // the object binds births (the journal object, or a
+                    // marker build's Detailed object). Validation already
+                    // required the map here, so a miss errors loudly.
+                    if roots == StaticRoots::Detailed
+                        && pid_witness_expected(journal, cfg!(p11scope_birth_marker))
+                    {
+                        let map = ebpf.map("PID_START_TICK").context("PID_START_TICK map")?;
+                        freeze_map("PID_START_TICK", map)?;
+                    }
                 }
                 SessionPreparation::SelectScope => {
-                    uprobe_scope = match scope {
-                        Scope::Pid(pid) => UProbeScope::OneProcess(
-                            std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
-                        ),
-                        // Cgroup and system scoping are enforced in BPF, so the
-                        // probe itself is process-wide and the CONFIG bit decides.
-                        Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+                    uprobe_scope = if let Some(pin) = selected {
+                        UProbeScope::OneProcess(
+                            NonZeroU32::new(pin.pid()).context("selected pid must be nonzero")?,
+                        )
+                    } else {
+                        match scope {
+                            Scope::Pid(pid) => UProbeScope::OneProcess(
+                                std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
+                            ),
+                            // Cgroup and system scoping are enforced in BPF, so the
+                            // probe itself is process-wide and the CONFIG bit decides.
+                            Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+                        }
                     };
                 }
                 SessionPreparation::LoadProgram(prog_name) => {
@@ -3156,7 +7657,7 @@ impl Session {
                             .program_mut(prog_name)
                             .context("program task_newtask missing from object")?
                             .try_into()?;
-                        prog.load("task_newtask", &btf)
+                        prog.load("task_newtask", host.btf())
                             .context("loading required typed task_newtask")?;
                     } else {
                         let prog: &mut UProbe = ebpf
@@ -3171,6 +7672,40 @@ impl Session {
                                 .with_context(|| format!("loading {prog_name}"))?;
                         }
                     }
+                }
+                SessionPreparation::LoadImagePrograms => {
+                    if selected.is_some() {
+                        selected_detailed::load_bootstrap(&mut ebpf, host.btf())?;
+                    }
+                    let query_refusal = match domain {
+                        Some(domain) => {
+                            match image_query::ImageQueryOwner::load(
+                                &mut ebpf,
+                                host.btf(),
+                                domain,
+                                host.supports_pidfd_iter_selector(),
+                            ) {
+                                Ok(owner) => {
+                                    image_query = Some(owner);
+                                    None
+                                }
+                                Err(error) => Some(format!("{error:#}")),
+                            }
+                        }
+                        None => None,
+                    };
+                    prepared_instance = Some(InstanceTracking::prepare(
+                        &mut ebpf,
+                        host.btf(),
+                        policy,
+                        query_refusal,
+                    ));
+                }
+                SessionPreparation::LoadCounterPrograms => {
+                    counter
+                        .as_ref()
+                        .context("counter preparation requires its selected profile")?
+                        .validate_and_load(&mut ebpf, backend)?;
                 }
                 SessionPreparation::FreezeDeferred(name) => {
                     freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
@@ -3193,74 +7728,108 @@ impl Session {
             }
             Ok(())
         });
-        let (events_domain, discovery_domain, links) =
-            activate_after_preparation_with(preparation, || {
-                let events_domain =
-                    prepared_domain.expect("preparation established the events domain");
-                let discovery_domain = prepared_discovery_domain
-                    .expect("preparation established the discovery domain");
-                let links = attach_lifecycle_with(
-                    &mut ebpf,
-                    |ebpf, program| {
-                        if program == "task_newtask" {
-                            let hook: &mut BtfTracePoint = ebpf
-                                .program_mut(program)
-                                .context("required task_newtask program")?
-                                .try_into()?;
-                            Ok(RegisteredLink::BtfTracePoint {
-                                program,
-                                id: hook.attach()?,
-                            })
-                        } else {
-                            let hook: &mut RawTracePoint = ebpf
-                                .program_mut(program)
-                                .with_context(|| format!("required raw {program} program"))?
-                                .try_into()?;
-                            Ok(RegisteredLink::RawTracePoint {
-                                program,
-                                id: hook.attach(program)?,
-                            })
-                        }
-                    },
-                    |ebpf, _, link| detach_registered_link(ebpf, link),
-                )?;
-                Ok((events_domain, discovery_domain, links))
-            })?;
-        // After the mandatory lifecycle links and before any endpoint link
-        // (ordering I1). A failure refuses instance routing, not capture.
-        // Metrics sessions skip the hooks (Task 1d overhead gate): they
-        // never join per-call records, so their slots stay unmapped.
-        let instance = InstanceTracking::start(&mut ebpf, &btf, policy);
+        // No producer has been attached yet. A selected attempt takes custody
+        // of this complete owner before attaching its first lifecycle link.
+        preparation?;
+        let events_domain = prepared_domain.expect("preparation established the events domain");
+        let discovery_domain =
+            prepared_discovery_domain.expect("preparation established the discovery domain");
+        let image_coverage = image_query::CoverageControl::new(&ebpf)?;
 
-        Ok(Self {
-            stop_gate: stop_gate.expect("preparation established the stop gate"),
-            ebpf,
-            events_domain,
-            events_consumer: None,
-            discovery_domain,
-            discovery_consumer: None,
-            discovery_staged: DiscoveryStage::default(),
-            root_seed,
-            attach_failures: vec![],
-            detach_failures: vec![],
-            producers_detached: false,
-            detach_wall_ms: 0,
-            attach_mono_ns: None,
-            successful_static: BTreeSet::new(),
-            dynamic_attach_evidence: DynamicAttachEvidence::default(),
-            policy,
-            backend,
-            selection: BackendSelection::Auto,
-            backend_fallback: None,
-            uprobe_scope,
-            pause_key,
-            lifecycle_tracking_unavailable: None,
-            process_creation_tracking_unavailable: None,
-            retained_static: BTreeMap::new(),
-            links,
-            instance,
-            cleanup_worker: Some(CleanupWorker::pre_start()),
-        })
+        let pid_lifecycle = match uprobe_scope {
+            UProbeScope::OneProcess(pid) => {
+                Some(PidLifecycleTap::new(pid, discovery_domain.clone()))
+            }
+            UProbeScope::AllProcesses | UProbeScope::CallingProcess => None,
+        };
+
+        Ok((
+            Self {
+                return_probe_admission: None,
+                stop_gate: stop_gate.expect("preparation established the stop gate"),
+                native_selection,
+                image_coverage,
+                image_query,
+                ebpf,
+                events_domain,
+                events_consumer: None,
+                discovery_domain,
+                trace_coverage: None,
+                trace_proof: None,
+                discovery_consumer: None,
+                discovery_staged: DiscoveryStage::default(),
+                root_seed,
+                attach_failures: vec![],
+                detach_failures: vec![],
+                detach_quarantine: BTreeSet::new(),
+                quarantine_reasons: BTreeMap::new(),
+                producers_detached: false,
+                detach_wall_ms: 0,
+                attach_mono_ns: None,
+                slot_attached_at: BTreeMap::new(),
+                counter_collection_generation,
+                successful_static: BTreeSet::new(),
+                dynamic_attach_evidence: DynamicAttachEvidence::default(),
+                policy,
+                embedded_flavor: flavor,
+                backend,
+                selection: BackendSelection::Auto,
+                backend_fallback: None,
+                unpublished_mechanisms,
+                uprobe_scope,
+                pause_key,
+                lifecycle_tracking_unavailable: None,
+                process_creation_tracking_unavailable: None,
+                retained_static: BTreeMap::new(),
+                pid_pairs: pid_continuity::PairBook::default(),
+                global_retirements: global_retirement::Retirements::default(),
+                native_retirement: native_retirement::NativeRetirement::default(),
+                deferred_group_slots: BTreeSet::new(),
+                submitted_terminal_slots: BTreeSet::new(),
+                pid_health: pid_continuity::OwnerHealth::default(),
+                prepared_owner_limit: prepared_owner_limit
+                    .expect("identity preparation retained exact owner limit"),
+                pid_lifecycle,
+                links: Vec::new(),
+                instance: InstanceTracking::default(),
+                cleanup_worker: Some(CleanupWorker::pre_start()),
+                producer_detach: OwnedProducerDetach::NotStarted,
+                native_completion_mint: NativeCompletionMint::default(),
+                object_decode: None,
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                reexec_diagnostic: None,
+                last_counter_stage_check: None,
+                journal,
+                sealed_journal_linked: None,
+                counter_banks: counter.map(|prepared| prepared.banks),
+            },
+            prepared_instance.expect("preparation established image program load result"),
+        ))
+    }
+
+    /// Cumulative EVENTS ring reserve failures (EVIDENCE_RING_LOSS,
+    /// all CPUs): records the kernel dropped because the ring was
+    /// full. The inventory lane polls this every commit; rises are
+    /// disclosed, never silent.
+    pub(crate) fn events_ring_loss(&self) -> Result<u64> {
+        let evidence: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+        Ok(evidence
+            .get(&EVIDENCE_RING_LOSS, 0)?
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add))
+    }
+
+    /// The live fault/sticky generation cells (INSTANCE_GEN fault,
+    /// sticky), for the stuck-transaction diagnostic only: sticky
+    /// names a host-wide fork-marking failure, fault counts BPF plus
+    /// userspace raises. Test-visible; production behavior never
+    /// reads it.
+    #[cfg(test)]
+    pub(crate) fn instance_fault_cells_for_test(&self) -> Result<(u64, u64)> {
+        let maps = self.instance_maps();
+        Ok((maps.fault()?, maps.sticky()?))
     }
 
     pub(crate) fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -3283,16 +7852,447 @@ impl Session {
         counter_snapshot_with(read, abi_refusals)
     }
 
+    /// One gate-1 `Array` cell, when this build carries the gate and the
+    /// loaded object carries the map. A gate-0 session binds nothing; a
+    /// malformed map errors like every other control read.
+    fn gate_cell<T: aya::Pod>(&self, name: &str) -> Result<Option<T>> {
+        if !LOADER_GATE_BUILD {
+            return Ok(None);
+        }
+        let Some(map) = self.ebpf.map(name) else {
+            return Ok(None);
+        };
+        let cell: Array<_, T> = Array::try_from(map).with_context(|| format!("{name} gate map"))?;
+        Ok(Some(
+            cell.get(&0, 0)
+                .with_context(|| format!("{name} gate cell"))?,
+        ))
+    }
+
+    /// The loader-gate control cell for the snapshot read path. Unpublished
+    /// (zero) cells read back as real zero bytes; the snapshot mapping
+    /// refuses them honestly.
+    pub(crate) fn loader_gate_control(&self) -> Result<Option<LoaderGateControl>> {
+        self.gate_cell("LOADER_GATE_CTL")
+    }
+
+    /// The published bank-select word for the snapshot read path.
+    pub(crate) fn image_bank_select(&self) -> Result<Option<ImageBankSelect>> {
+        self.gate_cell("IMAGE_BANK_SELECT")
+    }
+
+    /// The bank-B control cell for the snapshot read path. Unpublished
+    /// until bank-B preparation lands.
+    pub(crate) fn bank_b_control(&self) -> Result<Option<ImageIdentityControl>> {
+        self.gate_cell("COOKIE_CTL_B")
+    }
+
+    /// The gate rows map for the native acknowledgement: the acknowledgement
+    /// wiring arms per-row reuse through it. Borrowed from the session;
+    /// `None` wherever the gate is not built in.
+    #[allow(dead_code)] // staged: the acknowledgement wiring is the first caller
+    pub(crate) fn loader_gate_rows(&self) -> Option<&Map> {
+        if !LOADER_GATE_BUILD {
+            return None;
+        }
+        self.ebpf.map("LOADER_GATE")
+    }
+
+    fn read_pid_health(&mut self) -> std::result::Result<u64, PidContinuityRefusal> {
+        let tap = self
+            .pid_lifecycle
+            .as_ref()
+            .ok_or(PidContinuityRefusal::Unavailable)?;
+        read_pid_health_with(
+            &self.ebpf,
+            &mut self.pid_health,
+            self.prepared_owner_limit,
+            tap,
+        )
+    }
+
+    pub(crate) fn mutation_stopped(&self) -> bool {
+        self.stop_gate.stop_requested()
+            || self.producer_detach.started()
+            || self.producers_detached
+            || is_quarantine_stopped(&self.detach_quarantine)
+            || self.pid_health.terminal()
+            || self
+                .pid_lifecycle
+                .as_ref()
+                .is_some_and(|tap| tap.facts().is_err())
+    }
+
+    fn pid_attach_baseline(&mut self) -> Option<pid_continuity::AttachBaseline> {
+        if !matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) || self.mutation_stopped() {
+            return None;
+        }
+        let loss = self.read_pid_health();
+        let fault = self
+            .pid_lifecycle
+            .as_ref()
+            .and_then(|tap| tap.facts().ok())
+            .map(|facts| facts.fault_serial);
+        let baseline = self.pid_pairs.prepare_baseline(loss, fault);
+        if baseline.is_none()
+            && let Some(tap) = &self.pid_lifecycle
+        {
+            tap.observe_failure();
+        }
+        baseline
+    }
+
+    pub(crate) fn physical_gap_summary(&self) -> PhysicalGapSummary {
+        global_retirement::merge_summaries(
+            self.pid_pairs.gap_summary(),
+            self.global_retirements.summary(),
+        )
+    }
+
+    /// Snapshot the PID-scope exec witness for K0 selected detail:
+    /// the broad tap's lifecycle facts, `None` when this session
+    /// watches no single original, `Err` when the witness failed.
+    /// Read-only; the DISCOVERY drains keep feeding the tap.
+    pub(crate) fn pid_lifecycle_facts(
+        &self,
+    ) -> Result<Option<LifecycleFacts>, PidContinuityRefusal> {
+        self.pid_lifecycle
+            .as_ref()
+            .map(|tap| tap.facts())
+            .transpose()
+    }
+
+    pub(crate) fn prepare_ended_pid_retirement(
+        &self,
+        view: &crate::process::ProcessView,
+        slots: &[Slot],
+    ) -> Option<EndedPidRetirement> {
+        if self.mutation_stopped() {
+            return None;
+        }
+        EndedPidRetirement::prepare(
+            &self.discovery_domain,
+            self.uprobe_scope,
+            view,
+            slots,
+            &self.links,
+            &self.retained_static,
+        )
+    }
+
+    pub(crate) fn bind_exec(
+        &self,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        record: &p11scope_ebpf_common::DiscoveryRecord,
+    ) -> Option<ExecBinding> {
+        if self.mutation_stopped()
+            || !matches!(self.uprobe_scope, UProbeScope::OneProcess(pid) if pid.get() == view.pid())
+        {
+            return None;
+        }
+        ExecBinding::bind(
+            self.pid_lifecycle.as_ref()?,
+            &self.discovery_domain,
+            view,
+            serial,
+            record,
+        )
+    }
+
+    pub(crate) fn prepare_preservation(
+        &mut self,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        slots: &[Slot],
+        ordinary: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Option<PreservationReceipt> {
+        if self.mutation_stopped() {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::Stopped,
+                    [None; 4],
+                );
+            });
+            return None;
+        }
+        let loss = match self.read_pid_health() {
+            Ok(loss) => loss,
+            Err(_) => {
+                reexec_diagnostic::observe!(self, |diag| {
+                    diag.note(
+                        DiagnosticPhase::Rearm,
+                        DiagnosticOutcome::NoHealth,
+                        [None; 4],
+                    );
+                });
+                return None;
+            }
+        };
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let Some(tap) = self.pid_lifecycle.as_ref() else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::Unavailable,
+                    [None; 4],
+                );
+            });
+            return None;
+        };
+        let Some(receipt) = pairs.prepare(
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            slots,
+            ordinary,
+            objects,
+            loss,
+        ) else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoPairs,
+                    [
+                        Some(slots.len() as u64),
+                        Some(ordinary.len() as u64),
+                        None,
+                        None,
+                    ],
+                );
+            });
+            return None;
+        };
+        let valid = pairs.validate(
+            &receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            loss,
+            || {
+                self.discovery_consumer
+                    .as_ref()
+                    .map(events::discovery_drain_positions)
+            },
+        );
+        reexec_diagnostic::observe!(self, |diag| {
+            diag.note(
+                DiagnosticPhase::Rearm,
+                if valid {
+                    DiagnosticOutcome::Preserved
+                } else {
+                    DiagnosticOutcome::NoValidation
+                },
+                [Some(slots.len() as u64), None, None, None],
+            );
+        });
+        valid.then_some(receipt)
+    }
+
+    pub(crate) fn prepare_completed_rearm(
+        &mut self,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        slots: &[Slot],
+        ordinary: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Option<CompletedRearmReceipt> {
+        if self.mutation_stopped() {
+            return None;
+        }
+        let loss = self.read_pid_health().ok()?;
+        let tap = self.pid_lifecycle.as_ref()?;
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let receipt = pairs.prepare_completed_rearm(
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            slots,
+            ordinary,
+            objects,
+            loss,
+        )?;
+        let health = &mut self.pid_health;
+        let ebpf = &self.ebpf;
+        let limit = self.prepared_owner_limit;
+        let consumer = &self.discovery_consumer;
+        let valid = pairs.validate_completed_rearm(
+            &receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            || {
+                let loss = read_pid_health_with(ebpf, health, limit, tap).ok()?;
+                Some((
+                    loss,
+                    consumer.as_ref().map(events::discovery_drain_positions)?,
+                ))
+            },
+        );
+        (valid && !self.mutation_stopped()).then_some(receipt)
+    }
+
+    pub(crate) fn validate_completed_rearm(
+        &mut self,
+        receipt: &CompletedRearmReceipt,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        if self.mutation_stopped() {
+            return false;
+        }
+        let Some(tap) = self.pid_lifecycle.as_ref() else {
+            return false;
+        };
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let health = &mut self.pid_health;
+        let ebpf = &self.ebpf;
+        let limit = self.prepared_owner_limit;
+        let consumer = &self.discovery_consumer;
+        pairs.validate_completed_rearm(
+            receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            || {
+                let loss = read_pid_health_with(ebpf, health, limit, tap).ok()?;
+                Some((
+                    loss,
+                    consumer.as_ref().map(events::discovery_drain_positions)?,
+                ))
+            },
+        ) && !self.mutation_stopped()
+    }
+
+    pub(crate) fn validate_preservation(
+        &mut self,
+        receipt: &PreservationReceipt,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        if self.mutation_stopped() {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Preflight,
+                    DiagnosticOutcome::Stopped,
+                    [None; 4],
+                );
+            });
+            return false;
+        }
+        let Ok(loss) = self.read_pid_health() else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Preflight,
+                    DiagnosticOutcome::NoHealth,
+                    [None; 4],
+                );
+            });
+            return false;
+        };
+        let Some(tap) = self.pid_lifecycle.as_ref() else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Preflight,
+                    DiagnosticOutcome::Unavailable,
+                    [None; 4],
+                );
+            });
+            return false;
+        };
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let valid = pairs.validate(
+            receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            loss,
+            || {
+                self.discovery_consumer
+                    .as_ref()
+                    .map(events::discovery_drain_positions)
+            },
+        );
+        reexec_diagnostic::observe!(self, |diag| {
+            diag.note(
+                DiagnosticPhase::Preflight,
+                if valid {
+                    DiagnosticOutcome::Preserved
+                } else {
+                    DiagnosticOutcome::NoValidation
+                },
+                [None; 4],
+            );
+        });
+        valid
+    }
+
     pub(crate) fn preflight_targets(
         &self,
         targets: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<()> {
-        attachment_admission(&self.detach_failures, !targets.is_empty())?;
+        // Quarantined indices split out for per-slot failure records at
+        // attach; only admitted targets preflight here. A global quarantine
+        // refuses the whole batch, as before.
+        let (admitted, _) = partition_slots(
+            &self.detach_quarantine,
+            &self.quarantine_reasons,
+            &targets.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+        )?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned provider object changed before live attachment");
         }
-        for target in targets {
+        let admitted: BTreeSet<u32> = admitted.into_iter().collect();
+        for target in targets.iter().filter(|slot| admitted.contains(&slot.index)) {
             objects
                 .attach_path_for(target.object)
                 .map_err(anyhow::Error::msg)?;
@@ -3324,7 +8324,9 @@ impl Session {
         if self.has_dynamic_link(context, "dl_debug_state", object, file_offset, cookie) {
             return Ok(false);
         }
-        attachment_admission(&self.detach_failures, true)
+        stopped_attachment_admission(self.mutation_stopped(), "dynamic")
+            .map_err(DynamicLoaderAttachFailure::Registry)?;
+        self.admit_dynamic(context.get(), object, file_offset, cookie)
             .map_err(DynamicLoaderAttachFailure::Registry)?;
         let path = objects
             .attach_path_for(object)
@@ -3380,6 +8382,7 @@ impl Session {
         abi: HookAbi,
         objects: &PinnedObjects,
     ) -> Result<(bool, Option<u64>)> {
+        self.require_return_probe_admission()?;
         let (object, file_offset) = target;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned export object changed before dynamic attach");
@@ -3388,7 +8391,11 @@ impl Session {
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
             return Ok((false, None));
         }
-        attachment_admission(&self.detach_failures, true)?;
+        // A provider export's hooks go live here: their completion dates
+        // pause thread births, stamped on every return path.
+        let _attach_window = crate::discovery::pause::hook_attach_window();
+        stopped_attachment_admission(self.mutation_stopped(), "dynamic")?;
+        self.admit_dynamic(context.get(), object, file_offset, cookie)?;
         let path = objects
             .attach_path_for(object)
             .map_err(anyhow::Error::msg)?;
@@ -3399,8 +8406,8 @@ impl Session {
         let scope = UProbeScope::OneProcess(
             std::num::NonZeroU32::new(pid).context("dynamic export PID must be non-zero")?,
         );
-        let detach_failures = &mut self.detach_failures;
-        let (entry_id, return_id) = attach_dynamic_export_with(
+        let mut partial_detach_failures = Vec::new();
+        let outcome = attach_dynamic_export_with(
             &mut self.ebpf,
             &mut self.dynamic_attach_evidence,
             |ebpf, is_return| {
@@ -3432,10 +8439,26 @@ impl Session {
                         probe.detach(return_id).map_err(Into::into)
                     });
                 if let Err(error) = result {
-                    detach_failures.push(format!("detaching partial {return_program}: {error:#}"));
+                    partial_detach_failures
+                        .push(format!("detaching partial {return_program}: {error:#}"));
                 }
             },
-        )?;
+        );
+        // A failed partial detach quarantines this hook's own identity,
+        // recorded before the outcome propagates so the failure is kept
+        // even when the attach itself fails too.
+        for message in partial_detach_failures {
+            self.record_detach_failure(
+                vec![DetachQuarantine::Dynamic {
+                    context: context.get(),
+                    object,
+                    file_offset,
+                    cookie,
+                }],
+                message,
+            );
+        }
+        let (entry_id, return_id) = outcome?;
         // Register entry first so selective and terminal drains stop new state
         // before removing the matching return consumer.
         self.links.extend(
@@ -3465,7 +8488,7 @@ impl Session {
         self.has_dynamic_link(context, return_program, target.0, target.1, cookie)
     }
 
-    fn has_dynamic_link(
+    pub(crate) fn has_dynamic_link(
         &self,
         context: LoaderContextId,
         program: &'static str,
@@ -3496,6 +8519,10 @@ impl Session {
         &mut self,
         context: LoaderContextId,
     ) -> (Vec<DynamicExportIdentity>, bool) {
+        if self.native_retirement.collected_blocking() {
+            // No snapshot/copy or false acknowledgement of a refused detach.
+            return (Vec::new(), true);
+        }
         let snapshot = dynamic_export_snapshot_with(&self.links, context, |link| match link {
             RegisteredLink::DynamicUProbe {
                 context,
@@ -3527,7 +8554,12 @@ impl Session {
     /// Attaches every active target that this session has not already linked.
     /// The static `start` wrapper calls this once; live discovery supplies the
     /// same complete plan snapshot later without reloading or republishing maps.
-    pub(crate) fn attach_plan(&mut self, plan: &AttachPlan, objects: &PinnedObjects) -> Result<()> {
+    pub(crate) fn attach_plan(
+        &mut self,
+        plan: &AttachPlan,
+        objects: &PinnedObjects,
+        ended: &BTreeSet<crate::plan::AttachKey>,
+    ) -> Result<()> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
@@ -3539,7 +8571,7 @@ impl Session {
             .filter(|slot| plan.is_active(slot.index) && !self.has_slot_link(slot.index))
             .cloned()
             .collect();
-        let _ = self.attach_targets(&targets, objects)?;
+        let _ = self.attach_targets(&targets, objects, ended)?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed while attaching; refusing to observe changed bytes"
@@ -3554,7 +8586,51 @@ impl Session {
         &mut self,
         targets: &[Slot],
         objects: &PinnedObjects,
+        ended: &BTreeSet<crate::plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
+        // No probe attaches after its watch's `until_ns` (packet 6.13,
+        // R2-D1-7): ended-watch targets skip (with a stderr note each) so
+        // the rest of the batch still attaches. The engine also deactivates
+        // ended slots, so reaching here with one is the re-lowered-same-key
+        // edge the key-based check exists for.
+        let filtered: Vec<Slot>;
+        let targets: &[Slot] = if ended.is_empty() {
+            targets
+        } else {
+            filtered = targets
+                .iter()
+                .filter(|slot| {
+                    if ended.contains(&crate::plan::AttachKey::of(slot)) {
+                        eprintln!(
+                            "p11scope: slot {} not attached: its pre-arm watch ended before this attach",
+                            slot.index
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect();
+            &filtered
+        };
+        if !targets.is_empty() {
+            self.require_return_probe_admission()?;
+        }
+        // Provider hooks go live here: their completion dates pause thread
+        // births, stamped on every return path.
+        let _attach_window =
+            (!targets.is_empty()).then(crate::discovery::pause::hook_attach_window);
+        if self.native_retirement.collected_blocking() && targets.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if self
+            .counter_banks
+            .as_ref()
+            .is_some_and(|banks| !banks.permits_link_stage(targets))
+        {
+            bail!("private counter links require their exact inactive bank transaction");
+        }
         let mut requested = BTreeSet::new();
         if let Some(slot) = targets.iter().find(|slot| !requested.insert(slot.index)) {
             bail!("slot {} was requested for attachment twice", slot.index);
@@ -3562,7 +8638,52 @@ impl Session {
         if let Some(slot) = targets.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!("slot {} already has an owned probe link", slot.index);
         }
-        attachment_admission(&self.detach_failures, !targets.is_empty())?;
+        if !targets.is_empty() && self.mutation_stopped() {
+            bail!("static attachment refused while Session is stopping or detached");
+        }
+        if !targets.is_empty() && self.native_retirement.blocking() {
+            bail!(
+                "static attachment refused while old global native ownership is pending or uncertain"
+            );
+        }
+        if !targets.is_empty() && !self.deferred_group_slots.is_empty() {
+            bail!("static attachment refused while a collected group deferral owns removals");
+        }
+        self.pid_pairs.retarget_gap(targets, objects);
+        self.global_retirements.select(targets, objects);
+        // Quarantined indices fail per slot, with their reason, into the
+        // same attach-failures evidence ordinary attach failures use, while
+        // unrelated targets proceed; a global quarantine refuses the whole
+        // batch, as before.
+        let (admitted, quarantined) = partition_slots(
+            &self.detach_quarantine,
+            &self.quarantine_reasons,
+            &targets.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+        )?;
+        let mut quarantined_failed: Vec<u32> = Vec::new();
+        for index in &quarantined {
+            let key = DetachQuarantine::Slot(*index);
+            let reason = self
+                .quarantine_reasons
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| "unknown detach failure".to_string());
+            self.attach_failures.push((
+                *index,
+                format!("slot {index} quarantined after detach failure: {reason}"),
+            ));
+            quarantined_failed.push(*index);
+        }
+        if admitted.is_empty() {
+            return Ok((quarantined_failed, Vec::new()));
+        }
+        let admitted_set: BTreeSet<u32> = admitted.into_iter().collect();
+        let admitted_targets: Vec<Slot> = targets
+            .iter()
+            .filter(|slot| admitted_set.contains(&slot.index))
+            .cloned()
+            .collect();
+        let targets: &[Slot] = &admitted_targets;
         let attach_targets: BTreeMap<_, _> = targets
             .iter()
             // By capture-local pinned ID only. There is deliberately no by-path
@@ -3577,26 +8698,77 @@ impl Session {
                 Ok((slot.index, (path, abi)))
             })
             .collect::<Result<_>>()?;
+        let held_objects: BTreeMap<_, _> = targets
+            .iter()
+            .map(|slot| slot.object)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|object| (object, objects.retain_inventory_target(object).ok()))
+            .collect();
+        let prepared_targets: Vec<_> = targets
+            .iter()
+            .map(|slot| {
+                let (path, abi) = &attach_targets[&slot.index];
+                RetainedStaticTarget {
+                    slot: slot.clone(),
+                    path: path.clone(),
+                    abi: *abi,
+                    held: held_objects
+                        .get(&slot.object)
+                        .and_then(Option::as_ref)
+                        .map(|target| target.share()),
+                }
+            })
+            .collect();
+        if self.native_selection.is_some() || self.counter_banks.is_some() {
+            // Selected failure cleanup must retain the actual provider closure
+            // even if the first endpoint side or a later multi leaf fails.
+            for target in &prepared_targets {
+                if target.held.is_none() {
+                    bail!("selected provider target custody unavailable before attachment");
+                }
+            }
+            for target in &prepared_targets {
+                self.retained_static
+                    .insert(target.slot.index, target.clone());
+            }
+        }
+        let continuity_baseline = static_attachment_baseline_with(
+            self,
+            Session::pid_attach_baseline,
+            Session::mutation_stopped,
+        )?;
         // Ordering I1: watched-file keys and SLOT_FILE before any link.
         self.instance
             .prepare_targets(&mut self.ebpf, targets, objects);
         let scope = self.uprobe_scope;
+        let roots = if self.counter_banks.is_some() {
+            StaticRoots::CounterBanks
+        } else {
+            StaticRoots::Detailed
+        };
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic = self.reexec_diagnostic();
+        let counter_mode = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| banks.geometry_mode());
         let outcome = if self.backend == AttachBackend::Multi {
-            self.attach_targets_multi(targets, &attach_targets)?
+            self.attach_targets_multi(targets, &attach_targets, roots, self.journal)?
         } else {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
-            attach_targets_with(
-                targets,
-                self.policy,
-                cfg!(feature = "unsafe-unvalidated-metadata"),
-                |slot| {
-                    Ok(attach_targets
-                        .get(&slot.index)
-                        .expect("every selected target has retained pinned facts")
-                        .1)
-                },
-                |program, slot, point| {
+            let pairs = &mut self.pid_pairs;
+            // Named once: both scheduler entries below share this link
+            // I/O; only the selected roots differ.
+            let abi_for = |slot: &Slot| {
+                Ok(attach_targets
+                    .get(&slot.index)
+                    .expect("every selected target has retained pinned facts")
+                    .1)
+            };
+            let attach = |program: &'static str, slot: &Slot, point: UProbeAttachPoint<'static>| {
+                let prepared = (|| -> Result<pid_continuity::NativeAttempt<(), anyhow::Error>> {
                     let path = &attach_targets
                         .get(&slot.index)
                         .expect("every selected target has retained pinned facts")
@@ -3605,25 +8777,85 @@ impl Session {
                         .program_mut(program)
                         .with_context(|| format!("program {program} missing from object"))?
                         .try_into()?;
-                    match prog.attach([point], path, scope) {
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    let diagnostic_span =
+                        diagnostic
+                            .as_ref()
+                            .filter(|diag| diag.active())
+                            .map(|diag| {
+                                diag.begin(
+                                    if program == "p11_return" || program == "p11_return_journal" {
+                                        DiagnosticPhase::NativeReturn
+                                    } else {
+                                        DiagnosticPhase::NativeEntry
+                                    },
+                                    [
+                                        Some(1),
+                                        Some(u64::from(
+                                            slot.names.iter().any(|name| name == "C_GetInfo"),
+                                        )),
+                                        None,
+                                        None,
+                                    ],
+                                )
+                            });
+                    let attempt = pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || prog.attach([point], path, scope),
+                    );
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    if let Some(span) = diagnostic_span {
+                        span.finish_result(&attempt.result);
+                    }
+                    let result = match attempt.result {
                         Ok(id) => {
                             links.push(RegisteredLink::UProbe {
                                 program,
                                 slot: slot.index,
                                 id,
+                                registration: pairs.register(),
                             });
                             Ok(())
                         }
                         Err(error) => Err(static_attach_error(program, slot, error)),
-                    }
-                },
-                |_| monotonic_ns(),
-            )?
+                    };
+                    Ok(pid_continuity::NativeAttempt {
+                        started_ns: attempt.started_ns,
+                        result,
+                    })
+                })();
+                prepared.unwrap_or_else(pid_continuity::NativeAttempt::not_attempted)
+            };
+            if self.journal {
+                attach_targets_observed_with_roots_journal(
+                    targets,
+                    self.policy,
+                    self.embedded_flavor.unsafe_present,
+                    roots,
+                    counter_mode,
+                    true,
+                    abi_for,
+                    attach,
+                    |_| monotonic_ns(),
+                )?
+            } else {
+                attach_targets_observed_with_roots(
+                    targets,
+                    self.policy,
+                    self.embedded_flavor.unsafe_present,
+                    roots,
+                    counter_mode,
+                    abi_for,
+                    attach,
+                    |_| monotonic_ns(),
+                )?
+            }
         };
         let AttachOutcome {
             successful,
             failures,
             completed,
+            continuity_rounds,
             exhausted: _,
         } = outcome;
         retain_from_successful(
@@ -3632,11 +8864,65 @@ impl Session {
             &attach_targets,
             &successful,
         );
+        for target in prepared_targets {
+            if let Some(retained) = self.retained_static.get_mut(&target.slot.index) {
+                retained.held = target.held;
+            }
+        }
+        let current_sides = self.current_static_sides();
+        self.pid_pairs.seal(
+            &continuity_rounds,
+            continuity_baseline,
+            self.pid_lifecycle
+                .as_ref()
+                .and_then(|tap| tap.facts().ok())
+                .map(|facts| facts.fault_serial),
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
+        self.global_retirements.seal(
+            &continuity_rounds,
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
         self.successful_static.extend(successful);
-        let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
+        let mut failed: Vec<_> = quarantined_failed;
+        failed.extend(failures.iter().map(|(slot, _)| *slot));
         self.attach_failures.extend(failures);
+        reexec_diagnostic::observe!(self, |diag| {
+            let sides = self.current_static_sides();
+            let paired = self
+                .retained_static
+                .keys()
+                .filter(|slot| {
+                    sides.contains(&(**slot, ProbeSide::Entry))
+                        && sides.contains(&(**slot, ProbeSide::Return))
+                })
+                .count();
+            diag.note(
+                DiagnosticPhase::AttachState,
+                DiagnosticOutcome::Ok,
+                [
+                    Some(targets.len() as u64),
+                    Some(failed.len() as u64),
+                    Some(completed.len() as u64),
+                    Some(paired as u64),
+                ],
+            );
+        });
         #[cfg(test)]
         crate::first_use_probe::attached(&self.events_domain, targets, objects, &completed);
+        // Retain the first real per-slot completion stamp per slot (packet
+        // 6.13, R2-D1-5): per-provider evidence reads these.
+        for (slot, stamp) in &completed {
+            if let Some(stamp) = stamp {
+                self.slot_attached_at.entry(*slot).or_insert(*stamp);
+            }
+        }
         Ok((failed, completed))
     }
 
@@ -3655,22 +8941,114 @@ impl Session {
         &mut self,
         targets: &[Slot],
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+        roots: StaticRoots,
+        journal: bool,
     ) -> Result<AttachOutcome> {
-        let groups = group_static_slots(
+        let counter_mode = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| banks.geometry_mode());
+        let groups = group_static_slots_with_roots(
             targets,
             self.policy,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
+            self.embedded_flavor.unsafe_present,
             attach_targets,
-        );
+            roots,
+            counter_mode,
+            journal,
+        )?;
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
-        programs.insert("p11_return");
+        programs.extend(groups.iter().map(|group| group.return_program));
         let mut prog_fds = BTreeMap::new();
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
         let pid = multi_link_pid(self.uprobe_scope);
-        let (bundles, outcome) = attach_target_groups_with(
+        if roots == StaticRoots::CounterBanks {
+            // NativeIo checked the complete grouping/registry envelope before
+            // the floor advanced. Its retained extent charge is already in
+            // CounterKeepalive and survives even a confirmed clean rollback.
+            reserve_counter_multi_link_capacity(&mut self.links, targets.len())
+                .map_err(|_| anyhow!("private counter registry capacity refused"))?;
+            let slots_by_cookie: BTreeMap<_, _> = groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let links = &mut self.links;
+            let pairs = &mut self.pid_pairs;
+            let (_resource_free_bundles, outcome) = attach_target_groups_observed_with(
+                &groups,
+                |_| monotonic_ns(),
+                |program, path, slice, is_return| {
+                    let prog_fd = prog_fds
+                        .get(program)
+                        .copied()
+                        .expect("every Counts group side pre-resolved its program fd");
+                    let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                    pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || {
+                            retain_counter_multi_leaf(
+                                links,
+                                pairs,
+                                program,
+                                slice,
+                                &slots_by_cookie,
+                                || attach_group(prog_fd, pid, path, &offsets, &cookies, is_return),
+                            )
+                        },
+                    )
+                },
+            )?;
+            // The generic bundles carry only unit acknowledgements. Every
+            // acquired FD already belongs to Session, even on a late halt.
+            return Ok(outcome);
+        }
+        if self.native_selection.is_some() {
+            let slots_by_cookie: BTreeMap<_, _> = groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let links = &mut self.links;
+            let pairs = &mut self.pid_pairs;
+            let (_resource_free_bundles, outcome) = attach_target_groups_observed_with(
+                &groups,
+                |_| monotonic_ns(),
+                |program, path, slice, is_return| {
+                    let prog_fd = prog_fds
+                        .get(program)
+                        .copied()
+                        .expect("every selected group side pre-resolved its program fd");
+                    let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                    let attempt = pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || attach_group(prog_fd, pid, path, &offsets, &cookies, is_return),
+                    );
+                    let result = selected_detailed::multi::retain_success(attempt.result, |fd| {
+                        links.push(RegisteredLink::MultiUProbe {
+                            program,
+                            slots: slice
+                                .iter()
+                                .map(|(_, cookie)| slots_by_cookie[cookie])
+                                .collect(),
+                            fds: vec![fd],
+                            registration: pairs.register(),
+                        });
+                    });
+                    pid_continuity::NativeAttempt {
+                        started_ns: attempt.started_ns,
+                        result,
+                    }
+                },
+            )?;
+            // Every actual fd is already in Session. Unit bundles can be
+            // dropped on any later Unsupported without losing native custody.
+            return Ok(outcome);
+        }
+        let (bundles, outcome) = attach_target_groups_observed_with(
             &groups,
             |_| monotonic_ns(),
             |program, path, slice, is_return| {
@@ -3679,16 +9057,18 @@ impl Session {
                     .copied()
                     .expect("every group side pre-resolved its program fd");
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
-                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                    attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                })
             },
         )?;
-        for bundle in bundles {
-            self.links.push(RegisteredLink::MultiUProbe {
-                program: bundle.program,
-                slots: bundle.slots,
-                fds: bundle.links,
-            });
-        }
+        publish_kept_multi_bundles(
+            &mut self.links,
+            &mut self.retained_static,
+            bundles,
+            &[],
+            &mut self.pid_pairs,
+        );
         Ok(outcome)
     }
 
@@ -3701,13 +9081,19 @@ impl Session {
         replace: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<ReplacementOutcome> {
+        if !replace.is_empty() && self.native_retirement.blocking() {
+            bail!("replacement refused while old global native ownership is pending or uncertain");
+        }
         if let Some(slot) = replace.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!(
                 "replacement slot {} still has an old link; detach and synchronize it before reattach",
                 slot.index
             );
         }
-        let (failed, completed) = match self.attach_targets(replace, objects) {
+        // The rebuild replace path has no engine access for the ended-watch
+        // set; unreachable in-packet (ends happen at capture end, after all
+        // attaches) — mid-capture evaluation threads the real set here.
+        let (failed, completed) = match self.attach_targets(replace, objects, &BTreeSet::new()) {
             Ok(outcome) => outcome,
             Err(error) => {
                 for slot in replace {
@@ -3726,7 +9112,7 @@ impl Session {
             .collect();
         // An entry failure still leaves a successful return link behind. Remove
         // it before retiring the slot so failed replacement evidence is exact.
-        let detach = self.detach_slots(&failed_slots);
+        let detach = self.detach_failed_slots(&failed_slots);
         for slot in &failed_slots {
             plan.deactivate(slot.index);
         }
@@ -3746,19 +9132,364 @@ impl Session {
     /// is made even if an earlier one failed; the report carries per-member
     /// rebuild evidence for the caller to apply.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
+        self.detach_slots_with_ended(slots, None, false)
+    }
+
+    /// Opt-in ownership handoff for the ordinary whole-candidate consumer.
+    /// Generic selective detach remains synchronous.
+    pub(crate) fn begin_global_static_retirement(
+        &mut self,
+        slots: &[Slot],
+    ) -> Result<Option<RetirementTicket>> {
+        let stopped = self.mutation_stopped();
+        if !matches!(self.uprobe_scope, UProbeScope::AllProcesses) || stopped {
+            return Ok(None);
+        }
+        if self.native_retirement.blocking() {
+            bail!("an earlier global native retirement is pending or uncertain");
+        }
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        if plan_group_rebuild(&self.links, &requested).is_some() {
+            return Ok(None);
+        }
+        // Resolve every fallible singles program/type lookup before the gap
+        // ledger or live registry can change, as the synchronous path does.
+        for link in &self.links {
+            if let RegisteredLink::UProbe { program, slot, .. } = link
+                && requested.contains(slot)
+            {
+                let _: &mut UProbe = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing before static retirement"))?
+                    .try_into()?;
+            }
+        }
+        let Some(worker) = self.cleanup_worker.as_ref() else {
+            return Ok(None);
+        };
+        let counter_keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
+        let ebpf = &mut self.ebpf;
+        self.native_retirement.begin_with(
+            self.uprobe_scope,
+            stopped,
+            false,
+            false,
+            slots,
+            &mut self.links,
+            &mut self.retained_static,
+            &mut self.pid_pairs,
+            &mut self.global_retirements,
+            worker,
+            |link| {
+                take_owned_links(ebpf, link).map(|links| {
+                    links
+                        .into_iter()
+                        .map(|link| counter_banks::retain_link(link, counter_keepalive.as_ref()))
+                        .collect()
+                })
+            },
+            pid_continuity::comparable_monotonic_ns,
+        )
+    }
+
+    pub(crate) fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
+        let Some(worker) = &self.cleanup_worker else {
+            return RetirementPoll::Refused;
+        };
+        self.native_retirement.poll(ticket, worker)
+    }
+
+    /// Bounded collected retirement on this original stopped Session. STOP
+    /// prevents fresh attachment; the exact original Q separately permits
+    /// this removal-only carrier. No live-only stopped refusal is reused.
+    pub(crate) fn prepare_collected_static_retirement(
+        &mut self,
+        q: &CollectedFinishQ,
+        input: &mut Option<RetainedRetirementInput>,
+        reserver: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        // The current item alone is resolved. There is no registry-wide
+        // program lookup hidden inside one preparation credit.
+        if let Some(program) = self.native_retirement.program_to_validate(&self.links) {
+            let _: &mut UProbe = self
+                .ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing before collected retirement"))?
+                .try_into()?;
+        }
+        let producers = self
+            .drain_producers()
+            .context("collected retirement has no original producers")?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("collected retirement needs retained EVENTS")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("collected retirement needs retained DISCOVERY")?;
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected retirement needs its prestarted worker")?;
+        self.native_retirement.prepare_collected_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            q,
+            self.uprobe_scope,
+            input,
+            reserver,
+            &self.links,
+            &self.retained_static,
+            &self.pid_pairs,
+            worker,
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+            work,
+        )
+    }
+
+    pub(crate) fn begin_collected_static_retirement(
+        &mut self,
+        q: &CollectedFinishQ,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        let producers = self
+            .drain_producers()
+            .context("collected retirement has no original producers")?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("collected retirement needs retained EVENTS")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("collected retirement needs retained DISCOVERY")?;
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected retirement needs its prestarted worker")?;
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
+        let ebpf = &mut self.ebpf;
+        self.native_retirement.begin_collected_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            q,
+            self.uprobe_scope,
+            ticket,
+            &mut self.links,
+            &mut self.retained_static,
+            &mut self.pid_pairs,
+            &mut self.global_retirements,
+            worker,
+            |original| {
+                take_collected_owned_link(ebpf, original)
+                    .map(|owned| vec![counter_banks::retain_link(owned, keepalive.as_ref())])
+            },
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+            &self.deferred_group_slots,
+            work,
+        )
+    }
+
+    pub(crate) fn poll_collected_static_retirement(
+        &mut self,
+        q: &CollectedFinishQ,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        let producers = self
+            .drain_producers()
+            .context("collected retirement has no original producers")?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("collected retirement needs retained EVENTS")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("collected retirement needs retained DISCOVERY")?;
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected retirement needs its prestarted worker")?;
+        self.native_retirement.poll_collected_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            q,
+            ticket,
+            worker,
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+            work,
+        )
+    }
+
+    pub(crate) fn cancel_collected_static_retirement(
+        &mut self,
+        input: Option<&RetainedRetirementInput>,
+        ticket: Option<&CollectedRetirementTicket>,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected cancellation needs its original worker")?;
+        self.native_retirement
+            .cancel_collected_with(input, ticket, worker, work)
+    }
+
+    /// Partition one collected removal into whole groups (which proceed
+    /// natively) and partial shared-Multi members, recorded in
+    /// `deferred_group_slots` for the terminal detach. Only a requested
+    /// stop with proven quiescence may park removals this way.
+    pub(crate) fn defer_collected_partial_groups(
+        &mut self,
+        q: &CollectedFinishQ,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        if work == 0 {
+            return Ok(DeferralProgress::Yielded);
+        }
+        anyhow::ensure!(
+            self.stop_gate.stop_requested() && self.stop_gate.quiescent(),
+            native_retirement::DEFER_ENTRY_REFUSAL
+        );
+        self.native_retirement.defer_collected_with(
+            q as *const CollectedFinishQ as usize,
+            input,
+            &self.links,
+            &self.retained_static,
+            &self.pid_pairs,
+            &mut self.deferred_group_slots,
+            reserve,
+            work,
+        )
+    }
+
+    /// Whether this Session retires collected removals physically at Q.
+    /// Multi lanes close links natively; Singles lanes retire logically
+    /// only and the terminal detach closes everything.
+    pub(crate) fn collected_retirement_is_physical(&self) -> bool {
+        Self::collected_retirement_is_physical_for(self.backend)
+    }
+
+    pub(crate) fn collected_retirement_is_physical_for(backend: AttachBackend) -> bool {
+        backend == AttachBackend::Multi
+    }
+
+    /// Cleanup of an uncompleted new attachment is not coverage retirement.
+    /// Healthy siblings actually detached by a partial Multi rebuild still
+    /// retain their own physical retirement and reselection evidence.
+    pub(crate) fn detach_failed_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
+        self.detach_slots_with_ended(slots, None, true)
+    }
+
+    pub(crate) fn detach_ended_pid_slots(
+        &mut self,
+        slots: &[Slot],
+        owner: &crate::process::ProcessView,
+        ended: &EndedPidRetirement,
+    ) -> Result<DetachOutcome> {
+        self.detach_slots_with_ended(slots, Some((owner, ended)), false)
+    }
+
+    fn detach_slots_with_ended(
+        &mut self,
+        slots: &[Slot],
+        ended: Option<(&crate::process::ProcessView, &EndedPidRetirement)>,
+        failed_cleanup: bool,
+    ) -> Result<DetachOutcome> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "selective detach refused while original native retirement owns the registry"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "selective detach refused while a collected group deferral owns removals"
+        );
+        let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        if let Some(banks) = &self.counter_banks {
+            banks
+                .validate_backend(self.backend)
+                .map_err(|_| anyhow!("private counter retirement backend mismatch"))?;
+            if self.backend == AttachBackend::Multi {
+                // A Counts group's original cookies and published routes stay
+                // immutable. Whole fresh groups can roll back, but an existing
+                // group's surviving members must never be detached/rebuilt.
+                validate_counter_group_retirement(&self.links, &requested)?;
+            }
+        }
+        let excluded = if failed_cleanup {
+            requested.clone()
+        } else {
+            BTreeSet::new()
+        };
         let Some(affected) = plan_group_rebuild(&self.links, &requested) else {
-            let detached = self.detach_links(|link| match link {
-                // A group link drops only with all its members.
-                RegisteredLink::MultiUProbe { slots, .. } => {
-                    !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
-                }
-                _ => link.slots().iter().any(|slot| requested.contains(slot)),
-            });
+            self.pid_pairs.invalidate(&requested);
+            let detached = self.detach_links_with_ended(
+                |link| match link {
+                    // A group link drops only with all its members.
+                    RegisteredLink::MultiUProbe { slots, .. } => {
+                        !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
+                    }
+                    _ => link.slots().iter().any(|slot| requested.contains(slot)),
+                },
+                ended.map(|(owner, proof)| (owner, proof, slots)),
+                &excluded,
+            );
             prune_linkless_retained(&mut self.retained_static, &self.links);
             return detached.map(|()| DetachOutcome::default());
         };
-        self.rebuild_affected_groups(&requested, &affected)
+        self.rebuild_affected_groups(&requested, &affected, &excluded)
     }
 
     /// Explicit multi-group rebuild for a partially covered retirement:
@@ -3766,13 +9497,14 @@ impl Session {
     /// entries before returns, then reattach surviving siblings returns
     /// before entries. A detach failure aborts before any reattach — a
     /// maybe-live old link must never overlap a replacement, and the
-    /// ownership uncertainty blocks additions through the existing
-    /// [`attachment_admission`] refusal. Reattach evidence is per member:
+    /// failed members stay quarantined through the existing
+    /// [`attachment_admission_for`] refusal. Reattach evidence is per member:
     /// only fully paired survivors count as multi-attached.
     fn rebuild_affected_groups(
         &mut self,
         requested: &BTreeSet<u32>,
         affected: &BTreeSet<u32>,
+        excluded: &BTreeSet<u32>,
     ) -> Result<DetachOutcome> {
         let mut survivors = Vec::new();
         let mut missing = Vec::new();
@@ -3785,6 +9517,13 @@ impl Session {
         // Regroup and resolve program fds before the first link mutation:
         // a failure here leaves every old link untouched.
         let regrouped: Vec<Slot> = survivors.iter().map(|target| target.slot.clone()).collect();
+        if !regrouped.is_empty() {
+            self.require_return_probe_admission()?;
+        }
+        // Surviving siblings' hooks go live again here: the rebuild counts
+        // as an attach for pause thread-birth dating.
+        let _attach_window =
+            (!regrouped.is_empty()).then(crate::discovery::pause::hook_attach_window);
         #[cfg(test)]
         if !regrouped.is_empty() {
             crate::first_use_probe::unsupported_rebuild();
@@ -3793,29 +9532,61 @@ impl Session {
             .iter()
             .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
             .collect();
-        let groups = group_static_slots(
+        let groups = group_static_slots_with_roots(
             &regrouped,
             self.policy,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
+            self.embedded_flavor.unsafe_present,
             &targets,
-        );
+            StaticRoots::Detailed,
+            None,
+            self.journal,
+        )
+        .expect("every selected Detailed target has retained pinned facts");
         let rebuilt_groups = affected_group_count(&self.links, affected);
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
-        programs.insert("p11_return");
+        programs.insert(if self.journal {
+            "p11_return_journal"
+        } else {
+            "p11_return"
+        });
         let mut prog_fds = BTreeMap::new();
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
-        self.detach_links(|link| match link {
-            RegisteredLink::MultiUProbe { slots, .. } => {
-                slots.iter().any(|slot| affected.contains(slot))
-            }
-            _ => link.slots().iter().any(|slot| requested.contains(slot)),
-        })?;
+        self.pid_pairs.invalidate(affected);
+        let detached = self.detach_links_with_ended(
+            |link| match link {
+                RegisteredLink::MultiUProbe { slots, .. } => {
+                    slots.iter().any(|slot| affected.contains(slot))
+                }
+                _ => link.slots().iter().any(|slot| requested.contains(slot)),
+            },
+            None,
+            excluded,
+        );
+        self.global_retirements.select_retained(&survivors);
+        detached?;
         prune_linkless_retained(&mut self.retained_static, &self.links);
+        let continuity_baseline = match static_attachment_baseline_with(
+            self,
+            Session::pid_attach_baseline,
+            Session::mutation_stopped,
+        ) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                let report = refused_group_rebuild(
+                    affected.difference(requested).copied(),
+                    rebuilt_groups,
+                    &error.to_string(),
+                );
+                self.attach_failures
+                    .extend(report.rebuild_failures.iter().cloned());
+                return Ok(report);
+            }
+        };
         let pid = multi_link_pid(self.uprobe_scope);
-        let (bundles, outcome) = reattach_rebuilt_groups_with(
+        let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
             &groups,
             |_| monotonic_ns(),
             |program, path, slice, is_return| {
@@ -3824,24 +9595,47 @@ impl Session {
                     .copied()
                     .expect("every rebuilt side pre-resolved its program fd");
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
-                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                    attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                })
             },
             // Closing the owned fds detaches the rolled-back links.
             drop,
         );
-        for bundle in bundles {
-            self.links.push(RegisteredLink::MultiUProbe {
-                program: bundle.program,
-                slots: bundle.slots,
-                fds: bundle.links,
-            });
-        }
+        publish_kept_multi_bundles(
+            &mut self.links,
+            &mut self.retained_static,
+            bundles,
+            &survivors,
+            &mut self.pid_pairs,
+        );
         let AttachOutcome {
             successful,
             failures: mut rebuild_failures,
             completed: recompleted,
+            continuity_rounds,
             exhausted: _,
         } = outcome;
+        let current_sides = self.current_static_sides();
+        self.pid_pairs.seal(
+            &continuity_rounds,
+            continuity_baseline,
+            self.pid_lifecycle
+                .as_ref()
+                .and_then(|tap| tap.facts().ok())
+                .map(|facts| facts.fault_serial),
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
+        self.global_retirements.seal(
+            &continuity_rounds,
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
         self.successful_static.extend(successful);
         for member in missing {
             rebuild_failures.push((
@@ -3856,6 +9650,7 @@ impl Session {
             .extend(rebuild_failures.iter().cloned());
         prune_linkless_retained(&mut self.retained_static, &self.links);
         Ok(DetachOutcome {
+            pending: None,
             recompleted,
             rebuild_failures,
             rebuilt_groups,
@@ -3871,71 +9666,247 @@ impl Session {
         self.detach_producers_driven(|| false, &mut std::io::stderr())
     }
 
-    /// Move every producer link out of Aya into the background cleanup
-    /// worker, print progress to `out` about once a second until it joins,
-    /// then report. `second_signal` interrupts the wait: the progress and
-    /// "cleanup incomplete" are printed and this returns
-    /// [`CleanupInterrupted`] for the caller to propagate (exit 130) — the
-    /// kernel finishes the remaining closes at exit.
+    /// Submit this Session's original producer ownership once, without
+    /// waiting for native close. Maps, readers and targets remain in Session.
+    /// Prior live submissions stay in the same worker and cumulative receipt.
+    pub(crate) fn begin_owned_producer_detach(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "terminal handoff waits for the original native retirement disposition"
+        );
+        match self.producer_detach {
+            OwnedProducerDetach::Pending { .. } | OwnedProducerDetach::Complete => return Ok(()),
+            OwnedProducerDetach::Unproved => bail!("producer detach ownership remains unproven"),
+            OwnedProducerDetach::NotStarted => {}
+        }
+        // Mark terminal before any fallible transfer, so missing/partial
+        // ownership never reopens attachment or mints an empty success later.
+        self.producer_detach = OwnedProducerDetach::Unproved;
+        if let Some(selected) = &self.native_selection {
+            self.stop_gate.request_stop();
+            self.image_coverage.fail();
+            if let Err(error) = selected.close() {
+                // Terminal failure cannot skip transfer of already owned links.
+                self.record_global_detach_failure(format!(
+                    "closing selected native admission: {error:#}"
+                ));
+            }
+        }
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
+        // No owner proof may survive retirement of the continuity hooks.
+        self.image_coverage.fail();
+        let started = std::time::Instant::now();
+        let worker = self.take_cleanup_worker()?;
+        let had_work = !self.links.is_empty()
+            || self.instance.hook_link_count() != 0
+            || worker.has_submissions();
+        let leases = Arc::new(
+            self.retained_static
+                .values()
+                .filter_map(RetainedStaticTarget::retirement_lease)
+                .collect(),
+        );
+        worker.begin_terminal();
+        let failures = submit_terminal_ownership(&worker, leases, |family| {
+            self.take_terminal_ownership(family)
+        });
+        for failure in failures {
+            self.record_global_detach_failure(failure);
+        }
+        self.producer_detach = OwnedProducerDetach::Pending {
+            worker,
+            started,
+            had_work,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        Ok(())
+    }
+
+    fn take_terminal_ownership(
+        &mut self,
+        family: TerminalProducerFamily,
+    ) -> Vec<Result<(OwnedLink, ProducerProgram)>> {
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
+        match family {
+            TerminalProducerFamily::Registered => {
+                let mut outcomes = Vec::new();
+                for link in std::mem::take(&mut self.links) {
+                    let producer = link.producer();
+                    let slots: Vec<u32> = link.slots().to_vec();
+                    match take_owned_links(&mut self.ebpf, link) {
+                        Ok(links) => {
+                            // Only a take that yields owned handles submits
+                            // the link: failed or empty takes prove nothing
+                            // for the deferred mint gate.
+                            if !links.is_empty() {
+                                self.submitted_terminal_slots.extend(slots);
+                            }
+                            outcomes.extend(links.into_iter().map(|link| {
+                                Ok((
+                                    counter_banks::retain_link(link, keepalive.as_ref()),
+                                    producer,
+                                ))
+                            }))
+                        }
+                        Err(error) => outcomes.push(Err(error)),
+                    }
+                }
+                outcomes
+            }
+            TerminalProducerFamily::InstanceHooks => self
+                .instance
+                .take_owned_hooks(&mut self.ebpf)
+                .into_iter()
+                .map(|outcome| {
+                    outcome.map(|(link, producer)| {
+                        (
+                            counter_banks::retain_link(link, keepalive.as_ref()),
+                            producer,
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// Drive only the original owned job. A second signal returns its typed
+    /// interruption without a foreground close/join. Neither that result nor
+    /// a failed transfer can later be promoted by observing empty links.
+    pub(crate) fn finish_owned_producer_detach_driven(
+        &mut self,
+        second_signal: impl Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let failures = self.detach_failures.len();
+        let outcome = self.producer_detach.drive(
+            &mut self.detach_failures,
+            &mut self.producers_detached,
+            &mut self.detach_wall_ms,
+            second_signal,
+            out,
+        );
+        self.quarantine_worker_failures(failures);
+        outcome
+    }
+
+    /// Non-consuming reap of the owned producer detach over this
+    /// Session's exact detach fields. `Pending` keeps the SAME worker;
+    /// only a joined receipt settles the Session.
+    pub(crate) fn poll_owned_producer_detach(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<ProducerDetachProgress> {
+        let failures = self.detach_failures.len();
+        let outcome = self.producer_detach.poll(
+            &mut self.detach_failures,
+            &mut self.producers_detached,
+            &mut self.detach_wall_ms,
+            out,
+        );
+        self.quarantine_worker_failures(failures);
+        outcome
+    }
+
+    /// Quarantines globally under the first failure the detach worker
+    /// added past `before`: worker failures are unattributed, so they
+    /// keep the session-wide refusal.
+    fn quarantine_worker_failures(&mut self, before: usize) {
+        if let Some(reason) = self.detach_failures.get(before).cloned() {
+            self.quarantine_units(vec![DetachQuarantine::Global], &reason);
+        }
+    }
+
+    /// Existing one-step callers submit and then drive that exact job.
     pub(crate) fn detach_producers_driven(
         &mut self,
         second_signal: impl Fn() -> bool,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
-        let had_links = !self.links.is_empty();
-        let mut first_error = None;
-        if had_links {
-            let mut owned = Vec::new();
-            let mut transfer_failed = 0;
-            for link in std::mem::take(&mut self.links) {
-                let producer = link.producer();
-                match take_owned_links(&mut self.ebpf, link) {
-                    Ok(links) => owned.extend(links.into_iter().map(|link| (link, producer))),
-                    Err(error) => {
-                        transfer_failed += 1;
-                        let message = format!("{error:#}");
-                        self.detach_failures.push(message.clone());
-                        if first_error.is_none() {
-                            first_error = Some(anyhow!(message));
-                        }
-                    }
-                }
-            }
-            let worker = self.take_cleanup_worker();
-            worker.note_transfer_failed(transfer_failed);
-            worker.submit(owned, DetachOrder);
-            // A second SIGINT abandons the wait: the worker keeps closing
-            // in the background and the kernel finishes at exit. The typed
-            // outcome travels up the stop path to `main` (exit 130).
-            let failures = cleanup_worker::settle_cleanup_exit(drive_cleanup(
-                worker,
-                second_signal,
-                out,
-                std::time::Duration::from_secs(1),
-            ))?;
-            for failure in failures {
-                if first_error.is_none() {
-                    first_error = Some(anyhow!(failure.clone()));
-                }
-                self.detach_failures.push(failure);
-            }
-        } else {
-            let _ = (second_signal, out);
-        }
-        self.detach_wall_ms =
-            record_detach_wall_ms(self.detach_wall_ms, had_links, detach_wall_ms_since(start));
-        finish_producer_detach(
-            &mut self.producers_detached,
-            &self.detach_failures,
-            first_error.map_or(Ok(()), Err),
-        )
+        self.begin_owned_producer_detach()?;
+        self.finish_owned_producer_detach_driven(second_signal, out)
     }
 
-    fn take_cleanup_worker(&mut self) -> CleanupWorker {
+    /// Mint the native-owned terminal completion after the terminal
+    /// sequence. Gates, in order: no prior destructive mint failure (a
+    /// poisoned Session refuses before its poll, consuming nothing
+    /// further), the producer detach worker joined (Complete, never an
+    /// observed empty link set), the stop gate still proves Q, and every
+    /// deferred group slot proven terminally submitted — all enforced
+    /// fail-fast before the terminal poll, so a refused mint
+    /// consumes nothing — then the selected gate (when present) reads
+    /// back TERMINAL, one explicitly bounded terminal EVENTS poll runs,
+    /// its known drain failures (backlog past the bound, reserved-but-
+    /// uncommitted head) refuse before the scrub — so a failing scrub can
+    /// neither run on doomed evidence nor preempt the by-name diagnostic
+    /// — and the OBJECT_START scrub completes. The end adjudication
+    /// re-checks the join gates with the post-poll Q read as defense in
+    /// depth. Any post-poll failure poisons the mint: the poll ate a
+    /// prefix a retry can never see again, so the refused Session can
+    /// never mint afterwards. No partial completion exists.
+    pub(crate) fn mint_native_completion(&mut self) -> Result<SessionNativeCompletion> {
+        self.native_completion_mint.admit()?;
+        let detach_complete = matches!(self.producer_detach, OwnedProducerDetach::Complete);
+        let quiescent = self.stop_gate.quiescent();
+        // Fail fast before the terminal poll consumes anything: a refused
+        // mint must leave the backlog whole, or a retry could mint over
+        // the split the refusal ate. (The selected gate below already
+        // refuses fail-fast the same way.)
+        SessionNativeCompletion::join_gates(detach_complete, quiescent)?;
+        if !deferred_slots_proven(&self.deferred_group_slots, &self.submitted_terminal_slots) {
+            bail!(
+                "native completion unproved: deferred group slots were not all terminally submitted"
+            );
+        }
+        let selected_terminal = match &self.native_selection {
+            Some(selected) => {
+                selected.require_terminal()?;
+                true
+            }
+            None => false,
+        };
+        self.ensure_events_consumer()?;
+        let verdict = {
+            let consumer = self
+                .events_consumer
+                .as_mut()
+                .context("retained EVENTS consumer vanished after creation")?;
+            terminal_poll_verdict(consumer)
+        };
+        // Reject known drain failures BEFORE scrubbing: the verdict
+        // already proves the mint cannot join. The refusal poisons the
+        // mint — the poll consumed a prefix no retry can recover — and
+        // the by-name diagnostic survives, never preempted by a scrub
+        // that must not run on doomed evidence.
+        SessionNativeCompletion::refuse_drain_verdict(verdict.backlog, verdict.head_pending)
+            .inspect_err(|_| self.native_completion_mint.record_destructive_failure())?;
+        let scrubbed_objects = object_stop::scrub_after_quiescence(&mut self.ebpf, &self.stop_gate)
+            .inspect_err(|_| self.native_completion_mint.record_destructive_failure())
+            .context("scrubbing object START for native completion")?;
+        let completion = SessionNativeCompletion::from_joined_evidence(
+            detach_complete,
+            quiescent && self.stop_gate.quiescent(),
+            verdict.backlog,
+            verdict.head_pending,
+            verdict.terminal_events,
+            verdict.terminal_malformed,
+            scrubbed_objects,
+            self.detach_wall_ms,
+            selected_terminal,
+            self.events_domain.id(),
+        );
+        // The end adjudication re-checks the join gates with the post-poll
+        // Q read: a refusal here still follows a consuming poll, so it
+        // poisons the mint like any destructive failure.
+        completion.inspect_err(|_| self.native_completion_mint.record_destructive_failure())
+    }
+
+    fn take_cleanup_worker(&mut self) -> Result<CleanupWorker> {
         self.cleanup_worker
             .take()
-            .unwrap_or_else(CleanupWorker::pre_start)
+            .context("the prestarted cleanup worker has already been consumed")
     }
 
     /// Wall time the producer detach took, in whole milliseconds; zero
@@ -3961,41 +9932,146 @@ impl Session {
         self.root_seed.take()
     }
 
-    fn has_slot_link(&self, slot: u32) -> bool {
+    pub(crate) fn has_slot_link(&self, slot: u32) -> bool {
         links_cover_slot(&self.links, slot)
     }
 
+    /// The retained attach-complete instant for one slot, if it ever
+    /// attached in this session (packet 6.13: per-provider evidence reads
+    /// these, never the once-only session stamp).
+    pub(crate) fn slot_attached_at(&self, slot: u32) -> Option<u64> {
+        self.slot_attached_at.get(&slot).copied()
+    }
+
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
-        let mut selected = Vec::new();
-        let mut retained = Vec::new();
-        for link in std::mem::take(&mut self.links) {
-            if select(&link) {
-                selected.push(link);
-            } else {
-                retained.push(link);
+        self.detach_links_with_ended(&mut select, None, &BTreeSet::new())
+    }
+
+    fn detach_links_with_ended(
+        &mut self,
+        mut select: impl FnMut(&RegisteredLink) -> bool,
+        ended: Option<(&crate::process::ProcessView, &EndedPidRetirement, &[Slot])>,
+        excluded: &BTreeSet<u32>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "native registry mutation refused during original retirement preparation"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "native registry mutation refused while a collected group deferral owns removals"
+        );
+        // Resolve singles' fallible program lookup before extracting any
+        // ownership. A refused lookup keeps all native handles untouched and
+        // therefore opens no physical detach episode.
+        let choices: Vec<_> = self.links.iter().map(&mut select).collect();
+        for (link, chosen) in self.links.iter().zip(&choices) {
+            if !chosen {
+                continue;
+            }
+            if let RegisteredLink::UProbe { program, .. } = link {
+                let _: &mut UProbe = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing before static detach"))?
+                    .try_into()?;
             }
         }
-        self.links = retained;
-
+        let ended = ended
+            .filter(|_| !self.mutation_stopped())
+            .and_then(|(owner, proof, slots)| {
+                proof.check(
+                    &self.discovery_domain,
+                    self.uprobe_scope,
+                    owner,
+                    slots,
+                    &self.links,
+                    &self.retained_static,
+                )
+            });
+        // Program/group preflight has succeeded. Preserve the held physical
+        // points immediately before these exact owned links enter retirement,
+        // while the old complete entry/return pair can still be verified.
+        let stopped = self.mutation_stopped();
+        self.global_retirements.retire_selected(
+            self.uprobe_scope,
+            stopped,
+            &self.links,
+            &choices,
+            excluded,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
+        let mut choices = choices.into_iter();
+        let selected = extract_selected_links(&mut self.links, &mut self.pid_pairs, |_| {
+            choices.next().expect("one choice per original link")
+        });
+        let affected: BTreeSet<_> = selected
+            .iter()
+            .filter(|link| {
+                matches!(
+                    link,
+                    RegisteredLink::UProbe { .. } | RegisteredLink::MultiUProbe { .. }
+                )
+            })
+            .flat_map(|link| link.slots().iter().copied())
+            .collect();
+        // All fallible group/program preparation has finished; these exact
+        // owned handles are about to enter the first actual detach attempt.
+        if matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) {
+            ended_pid_retirement::begin_detach_gap(
+                &mut self.pid_pairs,
+                &affected,
+                pid_continuity::comparable_monotonic_ns(),
+                &self.retained_static,
+                ended,
+            );
+        }
         let mut first_error = None;
-        for error in detach_selected_with(
-            selected
-                .into_iter()
-                .map(|link| (link.producer(), link))
-                .collect(),
-            |link| self.detach_link(link),
-        ) {
-            let message = format!("{error:#}");
-            self.detach_failures.push(message.clone());
-            if first_error.is_none() {
-                first_error = Some(anyhow!(message));
+        // The production loop keeps each link's identity beside its
+        // detach outcome, so a failure quarantines only that link's attach
+        // unit. Order matches `detach_selected_with`, which keeps serving
+        // the scripted tests.
+        let mut selected: Vec<(ProducerProgram, RegisteredLink)> = selected
+            .into_iter()
+            .map(|link| (link.producer(), link))
+            .collect();
+        selected.sort_by_key(|(producer, _)| detach_producer_order(producer));
+        for (_, link) in selected {
+            let keys = DetachQuarantine::of_link(&link);
+            if let Err(error) = self.detach_link(link) {
+                let message = format!("{error:#}");
+                self.record_detach_failure(keys, message.clone());
+                if first_error.is_none() {
+                    first_error = Some(anyhow!(message));
+                }
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 
     fn detach_link(&mut self, link: RegisteredLink) -> Result<()> {
-        detach_registered_link(&mut self.ebpf, link)
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic_span = self
+            .reexec_diagnostic()
+            .filter(|diag| diag.active())
+            .map(|diag| {
+                let phase = match &link {
+                    RegisteredLink::UProbe {
+                        program: "p11_return" | "p11_return_journal",
+                        ..
+                    } => DiagnosticPhase::NativeReturn,
+                    RegisteredLink::UProbe { .. } => DiagnosticPhase::NativeEntry,
+                    _ => DiagnosticPhase::NativeOther,
+                };
+                diag.begin(phase, [Some(0), None, None, None])
+            });
+        let result = detach_registered_link(&mut self.ebpf, link);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = diagnostic_span {
+            span.finish_result(&result);
+        }
+        result
     }
 
     pub(crate) fn diagnostic() -> Result<Self> {
@@ -4006,11 +10082,16 @@ impl Session {
             None,
             None,
             AttachBackend::Singles,
+            None,
+            None,
+            None,
+            false,
         )
     }
 
     pub(crate) fn attach_diagnostic_probe(&mut self, path: &Path, offset: u64) -> Result<()> {
-        attachment_admission(&self.detach_failures, true)?;
+        stopped_attachment_admission(self.mutation_stopped(), "diagnostic")?;
+        self.admit_diagnostic()?;
         let probe: &mut UProbe = self
             .ebpf
             .program_mut("p11_entry")
@@ -4035,18 +10116,112 @@ impl Session {
         self.events_domain.clone()
     }
 
+    /// The Session's retained drain producers: its native identity
+    /// domain plus its retained EVENTS domain. The drain grant mints
+    /// through this pair (never through two independently supplied
+    /// halves), so the admission is always checked against the
+    /// Session retaining the EVENTS identity it binds. `None` while
+    /// the Session retains no native domain.
+    // Per-hook linkage read for the linked-DD pump; tests pair via test_pair.
+    pub(crate) fn drain_producers(&self) -> Option<SessionDrainProducers> {
+        Some(SessionDrainProducers {
+            native: self.native_domain()?,
+            events: self.events_domain(),
+            // Derived from the retained sealed fact, never a literal: a
+            // sealed attachment carries its derived linkage to the drain,
+            // while a never-sealed session drains unlinked.
+            journal_linked: drain_linkage_from_sealed(self.sealed_journal_linked),
+        })
+    }
+
     /// The session's single retained `EVENTS` consumer, with exclusive
     /// `&mut` access: one cursor and one malformed total across every
     /// live, root-tail and terminal poll. Built once on first drain; the
     /// reader owns its mappings and never borrows this session's `Ebpf`.
     pub fn event_drain(&mut self) -> Result<&mut events::OwnedDrain> {
-        if self.events_consumer.is_none() {
-            let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
-            self.events_consumer = Some(consumer);
-        }
-        self.events_consumer
+        self.event_drain_with_object_table().map(|(drain, _)| drain)
+    }
+
+    /// The session's single retained EVENTS consumer plus, on the
+    /// attested allowlisted lane with verified object rows, the frozen
+    /// receipt-bound decode table. One call hands out both disjoint
+    /// borrows, so semantic collection retains object facts on exactly that
+    /// lane. Ordinary drains validate their producer's full transport form and
+    /// receive its base without semantic object authority.
+    pub(crate) fn event_drain_with_object_table(
+        &mut self,
+    ) -> Result<(&mut events::OwnedDrain, Option<&ObjectRows>)> {
+        self.ensure_events_consumer()?;
+        let consumer = self
+            .events_consumer
             .as_mut()
-            .context("retained EVENTS consumer vanished after creation")
+            .context("retained EVENTS consumer vanished after creation")?;
+        let table = self.object_decode.as_ref().map(ObjectDecodeTable::rows);
+        Ok((consumer, table))
+    }
+
+    /// Borrow the one retained cursor, its frozen decode rows and live fault
+    /// maps together. These disjoint borrows add no drain or admission authority.
+    /// The selected Joint caller must refuse a missing attested decode table.
+    #[allow(dead_code)] // N1 collection bridge is staged until its real grants exist.
+    pub(crate) fn joint_collection_io(
+        &mut self,
+    ) -> Result<(
+        &mut events::OwnedDrain,
+        Option<&ObjectRows>,
+        InstanceMaps<'_>,
+    )> {
+        self.ensure_events_consumer()?;
+        let consumer = self
+            .events_consumer
+            .as_mut()
+            .context("retained EVENTS consumer vanished after creation")?;
+        let table = self.object_decode.as_ref().map(ObjectDecodeTable::rows);
+        Ok((consumer, table, InstanceMaps { ebpf: &self.ebpf }))
+    }
+
+    /// Observe only the SAME retained Session/Q domains and producer bounds.
+    /// No consumer creation, polling, scrub or detach is performed here.
+    pub(crate) fn collected_finish_discovery_domain(
+        &self,
+        q: &CollectedFinishQ,
+    ) -> Result<&events::DiscoveryDomain> {
+        anyhow::ensure!(
+            self.matches_collected_finish_q(q),
+            "foreign or no-longer-current Finish Q"
+        );
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("Finish Q lost its original EVENTS cursor")?
+            .consumption_cut()
+            .map_err(|reason| anyhow!("Finish EVENTS cut refused: {reason:?}"))?;
+        let discovery = events::discovery_drain_positions(
+            self.discovery_consumer
+                .as_ref()
+                .context("Finish Q lost its original DISCOVERY cursor")?,
+        );
+        anyhow::ensure!(
+            q.covers_events_bounds(&events)
+                && events.producer_bound() == q.events_stop()
+                && discovery.producer == q.discovery_stop()
+                && discovery.consumer <= q.discovery_stop()
+                && self.matches_collected_finish_q(q),
+            "an original producer moved after Finish Q"
+        );
+        Ok(&self.discovery_domain)
+    }
+
+    pub(crate) fn joint_collection_io_at_q(
+        &mut self,
+        q: &CollectedFinishQ,
+    ) -> Result<(
+        &mut events::OwnedDrain,
+        Option<&ObjectRows>,
+        InstanceMaps<'_>,
+    )> {
+        self.collected_finish_discovery_domain(q)?;
+        self.joint_collection_io()
     }
 
     /// Borrow the EVENTS map descriptor for readiness waits. The idle
@@ -4062,27 +10237,43 @@ impl Session {
         self.discovery_domain.as_fd()
     }
 
-    /// The descriptors the idle wait polls: EVENTS always, and DISCOVERY
-    /// while the staging FIFO has room. A full FIFO leaves the discovery
-    /// ring readable until the next frame applies it; polling it then would
-    /// spin the loop.
-    pub(crate) fn readiness_fds(&self) -> Vec<BorrowedFd<'_>> {
+    /// Staged DISCOVERY items currently held in the session FIFO.
+    pub(crate) fn staged_discovery_len(&self) -> usize {
+        self.discovery_staged.len()
+    }
+
+    /// The idle-wait descriptors against the shared discovery allowance:
+    /// EVENTS always, and DISCOVERY while the staged FIFO plus what the
+    /// Engine still holds leaves room. Stopping the poll while the Engine
+    /// drains its backlog keeps the loop from spin-waking on a ring whose
+    /// records cannot be staged yet.
+    pub(crate) fn readiness_fds_with_held(&self, engine_held: usize) -> Vec<BorrowedFd<'_>> {
         let mut fds = vec![self.events_readiness_fd()];
-        if self.discovery_staged.len() < DiscoveryStage::CAPACITY {
+        if DiscoveryStage::poll_discovery(self.discovery_staged.len(), engine_held) {
             fds.push(self.discovery_readiness_fd());
         }
         fds
     }
 
     /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
-    /// session's FIFO without applying any (RB-2); returns how many.
-    pub(crate) fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
+    /// session's FIFO without applying any (RB-2), without letting staged
+    /// plus `engine_held` exceed the shared 4,096-item allowance. The cap
+    /// is enforced structurally by the FIFO; the outcome reports whether
+    /// the allowance stopped the move.
+    pub(crate) fn stage_discovery(
+        &mut self,
+        quantum: usize,
+        engine_held: usize,
+    ) -> Result<DiscoveryStageOutcome> {
         self.ensure_discovery_consumer()?;
         let consumer = self
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        Ok(self.discovery_staged.stage(quantum, || consumer.dequeue()))
+        let shared_cap = DiscoveryStage::CAPACITY.saturating_sub(engine_held);
+        Ok(self
+            .discovery_staged
+            .stage(quantum, shared_cap, || consumer.dequeue()))
     }
 
     /// Every staged item, in ring order, leaving the FIFO empty.
@@ -4090,15 +10281,24 @@ impl Session {
         self.discovery_staged.take()
     }
 
+    /// Stage a malformed discovery marker at the head of the staged
+    /// FIFO, so the live linked fault twin can fault the pump on a
+    /// running capture: the next dequeue observes the marker first,
+    /// the pump marks its sticky discovery status and refuses, and
+    /// the capture keeps running. Test-only; production markers
+    /// arrive only from the ring consumer.
+    #[cfg(test)]
+    pub(crate) fn stage_malformed_discovery_for_test(&mut self) {
+        self.discovery_staged
+            .items
+            .push_front(events::DiscoveryItem::Malformed);
+    }
+
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
         if let Some(item) = self.discovery_staged.pop() {
             return Ok(Some(item));
         }
-        if self.discovery_consumer.is_none() {
-            let consumer =
-                events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
-            self.discovery_consumer = Some(consumer);
-        }
+        self.ensure_discovery_consumer()?;
         Ok(self
             .discovery_consumer
             .as_mut()
@@ -4108,17 +10308,37 @@ impl Session {
 
     fn ensure_events_consumer(&mut self) -> Result<()> {
         if self.events_consumer.is_none() {
-            let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
+            let transport = object_transport_rows_with(
+                self.policy,
+                self.object_decode.as_ref().map(|table| &table.rows),
+                || freeze_object_decode_table(&self.ebpf).map(|table| table.rows),
+            )?;
+            let consumer = events::OwnedDrain::for_session_with_transport(
+                &self.ebpf,
+                &self.events_domain,
+                transport,
+            )?;
             self.events_consumer = Some(consumer);
+            self.wire_trace_consumers()
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
         }
         Ok(())
     }
 
     fn ensure_discovery_consumer(&mut self) -> Result<()> {
-        if self.discovery_consumer.is_none() {
-            let consumer =
-                events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
-            self.discovery_consumer = Some(consumer);
+        let created = ensure_pid_discovery_consumer_with(
+            &mut self.discovery_consumer,
+            self.pid_lifecycle.as_ref(),
+            || events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain),
+        )?;
+        if created {
+            self.wire_trace_consumers()
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))
+                .inspect_err(|_| {
+                    if let Some(tap) = &self.pid_lifecycle {
+                        tap.observe_failure();
+                    }
+                })?;
         }
         Ok(())
     }
@@ -4137,6 +10357,15 @@ impl Session {
         mut service_discovery: impl FnMut(&mut events::OwnedDiscoveryDrain),
         now: impl FnMut() -> std::time::Instant,
     ) -> Result<crate::run::StopState> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "quiescence cannot invalidate an active collected retirement registry"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "quiescence cannot invalidate while a collected group deferral owns removals"
+        );
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         if service_events.is_some() {
             self.ensure_events_consumer()?;
         }
@@ -4147,7 +10376,7 @@ impl Session {
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        Ok(crate::run::quiesce_with(
+        let state = crate::run::quiesce_with(
             gate,
             budget,
             || {
@@ -4161,7 +10390,12 @@ impl Session {
                 service_discovery(&mut *discovery);
             },
             now,
-        ))
+        );
+        if matches!(state, crate::run::StopState::Quiesced { .. }) {
+            object_stop::scrub_after_quiescence(&mut self.ebpf, gate)
+                .context("scrubbing object START after terminal quiescence")?;
+        }
+        Ok(state)
     }
 
     /// The EVENTS ring's current positions, for reading the Q stop
@@ -4196,40 +10430,21 @@ impl Session {
         stop: usize,
         quantum: usize,
     ) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "legacy discovery drain cannot invalidate an active collected retirement registry"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "legacy discovery drain cannot invalidate while a collected group deferral owns removals"
+        );
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         self.ensure_discovery_consumer()?;
-        let mut records = Vec::new();
-        let mut malformed = 0u64;
-        // Staged items left the ring before the stop was requested, so they
-        // precede Q and come first.
-        let mut left = quantum;
-        while left > 0 {
-            let Some(item) = self.discovery_staged.pop() else {
-                break;
-            };
-            match item {
-                events::DiscoveryItem::Record(record) => records.push(record),
-                events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
-            }
-            left -= 1;
-        }
-        if left == 0 {
-            return Ok((records, malformed, false, true));
-        }
         let consumer = self
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        let (post_q_record, backlog) =
-            events::poll_discovery_to_position(consumer, stop, Some(left), |item| {
-                match item {
-                    events::DiscoveryItem::Record(record) => records.push(record),
-                    events::DiscoveryItem::Malformed => {
-                        malformed = malformed.saturating_add(1);
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            })?;
-        Ok((records, malformed, post_q_record, backlog))
+        collect_staged_discovery_to_position(&mut self.discovery_staged, consumer, stop, quantum)
     }
 
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
@@ -4310,6 +10525,65 @@ impl Session {
         &self.detach_failures
     }
 
+    /// Quarantines attach units under one detach reason: the first reason
+    /// per unit wins, so a unit's refusal names the failure that
+    /// quarantined it.
+    fn quarantine_units(&mut self, keys: Vec<DetachQuarantine>, reason: &str) {
+        quarantine_units_into(
+            &mut self.detach_quarantine,
+            &mut self.quarantine_reasons,
+            keys,
+            reason,
+        );
+    }
+
+    /// Records one detach failure's message and quarantines its attach
+    /// units under it.
+    fn record_detach_failure(&mut self, keys: Vec<DetachQuarantine>, message: String) {
+        record_detach_quarantine(
+            &mut self.detach_quarantine,
+            &mut self.quarantine_reasons,
+            &mut self.detach_failures,
+            keys,
+            message,
+        );
+    }
+
+    /// Records an unattributed detach failure (terminal transfer, worker
+    /// drive): the message plus a global quarantine.
+    fn record_global_detach_failure(&mut self, message: String) {
+        self.record_detach_failure(vec![DetachQuarantine::Global], message);
+    }
+
+    /// Admits one dynamic hook identity against the detach quarantine.
+    fn admit_dynamic(
+        &self,
+        context: u16,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    ) -> Result<()> {
+        attachment_admission_for(
+            &self.detach_quarantine,
+            &self.quarantine_reasons,
+            &ProposedAttachment::Dynamic {
+                context,
+                object,
+                file_offset,
+                cookie,
+            },
+        )
+    }
+
+    /// Admits a diagnostic probe: refused only under a global quarantine.
+    fn admit_diagnostic(&self) -> Result<()> {
+        attachment_admission_for(
+            &self.detach_quarantine,
+            &self.quarantine_reasons,
+            &ProposedAttachment::Diagnostic,
+        )
+    }
+
     /// Task 3 Stage A instance tracking state (hooks, watched files).
     #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
     pub(crate) fn instance_tracking(&self) -> &InstanceTracking {
@@ -4320,6 +10594,121 @@ impl Session {
     #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
     pub(crate) fn instance_maps(&self) -> InstanceMaps<'_> {
         InstanceMaps { ebpf: &self.ebpf }
+    }
+
+    /// Exact metadata retained by the current owned static attachment, never
+    /// reconstructed from a pathname or caller-supplied offset.
+    pub(crate) fn instance_endpoint(&self, slot: u32) -> Option<crate::semantic_capture::Endpoint> {
+        let target = self.retained_static.get(&slot)?;
+        let watched = self.instance.watched(target.slot.object)?;
+        Some(crate::semantic_capture::Endpoint {
+            object: target.slot.object,
+            file_slot: watched.file_slot,
+            offset: target.slot.file_offset,
+        })
+    }
+
+    /// Retained current attachment and exact descriptor readback, obtained
+    /// by the Session itself. No caller-supplied positive attachment facts.
+    pub(crate) fn semantic_receipt_target(
+        &self,
+        slot: u32,
+    ) -> std::result::Result<
+        crate::discovery::identity::RetainedInventoryTarget,
+        crate::semantic_capture::CurrentReceiptRefusal,
+    > {
+        use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+        semantic_receipt_readback(self.policy, self.semantic_descriptors())?;
+        let sides = self.current_static_sides();
+        if !sides.contains(&(slot, ProbeSide::Entry)) || !sides.contains(&(slot, ProbeSide::Return))
+        {
+            return Err(Refusal::Attachment);
+        }
+        let retained = self.retained_static.get(&slot).ok_or(Refusal::Attachment)?;
+        if retained.slot.index != slot {
+            return Err(Refusal::Attachment);
+        }
+        let watched = self
+            .instance
+            .watched(retained.slot.object)
+            .ok_or(Refusal::Attachment)?;
+        let target = watched.retained_target();
+        if target.check_unchanged() != Ok(true) {
+            return Err(Refusal::Attachment);
+        }
+        Ok(target)
+    }
+
+    /// Read current identity and complete epochs under the original custody;
+    /// these are I/O results, not a constructor for registration authority.
+    pub(crate) fn semantic_receipt_state(
+        &mut self,
+        pin: &crate::process::PidPin,
+        image: p11scope_ebpf_common::ImageIdentity,
+        endpoint: crate::semantic_capture::Endpoint,
+        slot: u32,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<
+        (
+            p11scope_ebpf_common::ImageIdentity,
+            image_query::CompleteEpochs,
+            crate::discovery::identity::RetainedInventoryTarget,
+        ),
+        crate::semantic_capture::CurrentReceiptRefusal,
+    > {
+        use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+        let budget = || {
+            if std::time::Instant::now() < deadline {
+                Ok(())
+            } else {
+                Err(Refusal::Deadline)
+            }
+        };
+        budget()?;
+        if self.instance_endpoint(slot) != Some(endpoint) {
+            return Err(Refusal::Attachment);
+        }
+        let target = self.semantic_receipt_target(slot)?;
+        let window = capture::ReadWindow::new(16_384, deadline).map_err(|_| Refusal::Deadline)?;
+        let before = self
+            .query_images(&[pin], window)
+            .map_err(semantic_receipt_query_refusal)?;
+        let before_image = before.image(image.task_cookie).ok_or(Refusal::Epoch)?;
+        budget()?;
+        let first = self
+            .instance_maps()
+            .complete_epochs(
+                pin.pidfd().map_err(|_| Refusal::Custody)?,
+                endpoint.file_slot,
+            )
+            .map_err(|_| Refusal::Audit)?;
+        budget()?;
+        let second = self
+            .instance_maps()
+            .complete_epochs(
+                pin.pidfd().map_err(|_| Refusal::Custody)?,
+                endpoint.file_slot,
+            )
+            .map_err(|_| Refusal::Audit)?;
+        let after = self
+            .query_images(&[pin], window)
+            .map_err(semantic_receipt_query_refusal)?;
+        let after_image = after.image(image.task_cookie).ok_or(Refusal::Epoch)?;
+        budget()?;
+        let current_target = self.semantic_receipt_target(slot)?;
+        if self.instance_endpoint(slot) != Some(endpoint)
+            || !Arc::ptr_eq(
+                &target.retirement_lease(),
+                &current_target.retirement_lease(),
+            )
+            || target.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::Attachment);
+        }
+        if first != second || before_image != after_image {
+            return Err(Refusal::Epoch);
+        }
+        Ok((after_image, second, current_target))
     }
 
     /// The continuity hooks' run/miss statistics.
@@ -4366,6 +10755,23 @@ impl Session {
         self.backend_fallback.as_deref()
     }
 
+    /// Approved mechanism ids the `MECH_SHAPE` publication could not fit;
+    /// the official-first subset published instead (ruling JK-22a). Zero
+    /// unless the approval union exceeded the map.
+    pub(crate) fn unpublished_mechanisms(&self) -> u64 {
+        self.unpublished_mechanisms
+    }
+
+    /// Object-attribute capture availability in the embedded bytes this
+    /// session was set up with. Stubbed (P0) bytes disclaim attribute
+    /// coverage; FULL bytes report available. Setup already refused on
+    /// mismatch or undeterminable bytes, so this never falls back.
+    pub(crate) fn object_capture_evidence(&self) -> crate::render::ObjectCaptureEvidence {
+        // The bytes rule: report the embedded object's capture, not the
+        // build feature, from the flavor checked at setup.
+        crate::render::ObjectCaptureEvidence::for_build(self.embedded_flavor.stubbed)
+    }
+
     /// Under PID scope, what keeps other processes out of the static
     /// probes besides the in-BPF PID guard: `kernel-pid+bpf` (uprobe-multi
     /// links name the target) or `perf-task+bpf` (each per-offset link is
@@ -4380,6 +10786,24 @@ impl Session {
 
     pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
         self.dynamic_attach_evidence.successful()
+    }
+}
+
+/// One static original transfers as one owning payload. Keep the native
+/// legacy perf representation intact instead of flattening per-CPU leaves.
+fn take_collected_owned_link(ebpf: &mut Ebpf, original: RegisteredLink) -> Result<OwnedLink> {
+    match original {
+        RegisteredLink::MultiUProbe { fds, .. } => Ok(OwnedLink::Multi(fds)),
+        RegisteredLink::UProbe { program, id, .. } => {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during collected transfer"))?
+                .try_into()?;
+            Ok(OwnedLink::Probe(probe.take_link(id).with_context(
+                || format!("transferring original {program}"),
+            )?))
+        }
+        _ => bail!("collected retirement cannot transfer a nonstatic registration"),
     }
 }
 
@@ -4406,10 +10830,7 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                 .with_context(|| format!("detaching {program}"))?;
             match taken.into_fd_links() {
                 Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
-                Err(link) => {
-                    drop(link);
-                    Ok(Vec::new())
-                }
+                Err(link) => Ok(vec![OwnedLink::Probe(link)]),
             }
         })(),
         RegisteredLink::RawTracePoint { program, id } => (|| {
@@ -4442,10 +10863,7 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                 .with_context(|| format!("detaching {program}"))?;
             match taken.into_fd_links() {
                 Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
-                Err(link) => {
-                    drop(link);
-                    Ok(Vec::new())
-                }
+                Err(link) => Ok(vec![OwnedLink::Probe(link)]),
             }
         })(),
     }
@@ -4531,28 +10949,73 @@ fn finish_producer_detach(
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.counter_banks.is_some() {
+            self.stop_gate.request_stop();
+        }
+        if let Some(selected) = &self.native_selection {
+            self.stop_gate.request_stop();
+            let _ = selected.close();
+        }
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
+        // Refuse continuity before closing any owned producer/hook link.
+        self.image_coverage.fail();
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
+        let ebpf = &mut self.ebpf;
+        self.native_retirement.abandon_collected_with(
+            &self.links,
+            self.cleanup_worker.as_ref(),
+            |original| {
+                take_collected_owned_link(ebpf, original)
+                    .map(|owned| vec![counter_banks::retain_link(owned, keepalive.as_ref())])
+            },
+        );
         // Never block on a worker-owned link: leftovers move to the
         // worker and close in the background (at process exit the kernel
         // finishes). Evidence is best-effort; there is no caller to fail.
         if self.links.is_empty() {
             return;
         }
+        let leases = Arc::new(
+            self.retained_static
+                .values()
+                .filter_map(RetainedStaticTarget::retirement_lease)
+                .collect(),
+        );
         let mut owned = Vec::new();
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
         for link in std::mem::take(&mut self.links) {
             let producer = link.producer();
             if let Ok(links) = take_owned_links(&mut self.ebpf, link) {
-                owned.extend(links.into_iter().map(|link| (link, producer)));
+                owned.extend(links.into_iter().map(|link| {
+                    (
+                        counter_banks::retain_link(link, keepalive.as_ref()),
+                        producer,
+                    )
+                }));
             }
         }
-        let worker = self.take_cleanup_worker();
-        worker.submit(owned, DetachOrder);
-        drop(worker);
+        if let Some(worker) = self.cleanup_worker.take() {
+            worker.submit(owned, leases, DetachOrder);
+            drop(worker);
+        } else if !owned.is_empty() {
+            // A terminal/second-signal path already owns the sole worker.
+            // Never introduce another thread or block this destructor on
+            // native closes; process exit releases this explicit abandon.
+            std::mem::forget((owned, leases));
+        }
     }
 }
 
 #[cfg(test)]
 mod capture_policy {
-    use super::CapturePolicy;
+    use super::{CapturePolicy, StaticRoots, group_static_slots_with_roots};
+    use p11scope_ebpf_common::CounterMode;
 
     #[test]
     fn capture_policies_have_distinct_bits_and_visible_behavior() {
@@ -4571,6 +11034,17 @@ mod capture_policy {
             assert_eq!(policy.privacy_mode(), privacy_mode);
             assert_eq!(policy.uses_events(), uses_events);
             assert_eq!(policy.uses_unsafe_decoders(), uses_unsafe_decoders);
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let policy = CapturePolicy::Counter(mode);
+            assert_eq!(policy.privacy_mode(), "aggregate-only");
+            assert!(!policy.uses_events());
+            assert!(!policy.uses_unsafe_decoders());
+            assert_eq!(policy.config_bit(), super::FLAG_POLICY_AGGREGATE);
         }
         assert_ne!(
             CapturePolicy::Allowlisted.config_bit(),
@@ -4595,6 +11069,93 @@ mod capture_policy {
         assert!(CapturePolicy::Allowlisted.wants_instance_hooks());
         assert!(CapturePolicy::UnsafeUnvalidatedMetadata.wants_instance_hooks());
         assert!(!CapturePolicy::AggregateOnly.wants_instance_hooks());
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert!(!CapturePolicy::Counter(mode).wants_instance_hooks());
+        }
+    }
+
+    #[test]
+    fn counter_policies_are_aggregate_and_keep_bank_roots_exclusive() {
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let policy = CapturePolicy::Counter(mode);
+            assert!(policy.is_aggregate(), "{mode:?}");
+            assert_eq!(policy.counter_mode(), Some(mode));
+        }
+        assert!(CapturePolicy::AggregateOnly.is_aggregate());
+        assert_eq!(CapturePolicy::AggregateOnly.counter_mode(), None);
+        assert!(!CapturePolicy::Allowlisted.is_aggregate());
+        assert!(!CapturePolicy::UnsafeUnvalidatedMetadata.is_aggregate());
+        for policy in [CapturePolicy::Allowlisted, CapturePolicy::AggregateOnly] {
+            let refused = group_static_slots_with_roots(
+                &[],
+                policy,
+                false,
+                &std::collections::BTreeMap::new(),
+                StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
+                false,
+            );
+            assert!(refused.is_err(), "{policy:?} must not take bank roots");
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let accepted = group_static_slots_with_roots(
+                &[],
+                CapturePolicy::Counter(mode),
+                false,
+                &std::collections::BTreeMap::new(),
+                StaticRoots::CounterBanks,
+                Some(mode),
+                false,
+            );
+            assert!(accepted.is_ok(), "{mode:?} takes bank roots");
+            for other in [
+                CounterMode::Counts,
+                CounterMode::Timestamps,
+                CounterMode::Latency,
+            ] {
+                if other == mode {
+                    continue;
+                }
+                let refused = group_static_slots_with_roots(
+                    &[],
+                    CapturePolicy::Counter(mode),
+                    false,
+                    &std::collections::BTreeMap::new(),
+                    StaticRoots::CounterBanks,
+                    Some(other),
+                    false,
+                );
+                assert!(
+                    refused.is_err(),
+                    "{mode:?} policy must not take {other:?} bank roots"
+                );
+            }
+            let unprepared = group_static_slots_with_roots(
+                &[],
+                CapturePolicy::Counter(mode),
+                false,
+                &std::collections::BTreeMap::new(),
+                StaticRoots::CounterBanks,
+                None,
+                false,
+            );
+            assert!(
+                unprepared.is_err(),
+                "{mode:?} bank roots require a prepared mode"
+            );
+        }
     }
 }
 
@@ -4635,7 +11196,1006 @@ mod policy_output {
 }
 
 #[cfg(test)]
+pub(crate) use tests::CollectedFinishQObserverForTest;
+
+#[cfg(test)]
 mod tests {
+    use super::publish_and_freeze_object_descriptors_with;
+    use crate::attach::capture::NativeDomainId;
+    use crate::fixture_guard::DieWithParent as _;
+    use crate::inventory_semantics::SemanticRefusal;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, ObjectDescriptorWire, none_object_wire,
+        publish_object_descriptors,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn pid_start_tick_detailed_marker_present_accepts() {
+        // I4: a marker Detailed session over an object carrying the
+        // witness map validates it; the freeze seals it before any link.
+        super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, true)
+            .expect("present witness accepts");
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_absent_refuses() {
+        // I4: a marker Detailed object without the map is a stale
+        // build; the session refuses instead of binding blind.
+        assert!(super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, true).is_err());
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_off_absent_accepts() {
+        // I4: a Detailed build compiled without birth markers accepts
+        // their absence.
+        super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, false)
+            .expect("a marker-off Detailed object without the map accepts");
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_off_present_refuses() {
+        // I4: a marker-off Detailed object carrying the map is a stale
+        // build; the session refuses instead of trusting it.
+        assert!(super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, false).is_err());
+    }
+
+    #[test]
+    fn pid_start_tick_counter_present_refuses() {
+        // I4: counter bank objects must not carry the witness map,
+        // whatever the Detailed build selection is.
+        for expected in [false, true] {
+            assert!(
+                super::pid_start_tick_verdict(true, super::StaticRoots::CounterBanks, expected)
+                    .is_err(),
+                "counter banks with the map refuse (marker {expected})"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_witness_is_expected_for_every_journal_session() {
+        // I4: the journal object runs the exec birth in every build, so
+        // a journal session requires and freezes the witness even when
+        // the Detailed marker is compiled out; an ordinary session
+        // follows the marker build selection.
+        assert!(super::pid_witness_expected(true, false));
+        assert!(super::pid_witness_expected(true, true));
+        assert!(super::pid_witness_expected(false, true));
+        assert!(!super::pid_witness_expected(false, false));
+    }
+
+    #[test]
+    fn pid_start_tick_counter_absent_accepts() {
+        // I4: the healthy counter twin of the refusal above.
+        for expected in [false, true] {
+            super::pid_start_tick_verdict(false, super::StaticRoots::CounterBanks, expected)
+                .expect("counter banks without the map accept");
+        }
+    }
+
+    #[test]
+    fn return_admission_guards_cover_real_link_mutations_and_preserve_entry_only_paths() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n    }")
+                .unwrap()
+                .0
+        }
+        fn contract(source: &str) -> bool {
+            let guard = "self.require_return_probe_admission()?;";
+            for (signature, mutation) in [
+                (
+                    "    pub(crate) fn attach_targets(",
+                    "self.native_retirement.collected_blocking()",
+                ),
+                (
+                    "    pub(crate) fn attach_dynamic_export(",
+                    "let (object, file_offset) = target;",
+                ),
+                ("    fn rebuild_affected_groups(", "multi_prog_fd("),
+            ] {
+                let text = body(source, signature);
+                if text.matches(guard).count() != 1 || text.find(guard) >= text.find(mutation) {
+                    return false;
+                }
+            }
+            body(source, "    pub(crate) fn attach_targets(").contains(
+                "if !targets.is_empty() {\n            self.require_return_probe_admission()?;\n        }"
+            ) && body(source, "    fn rebuild_affected_groups(").contains(
+                "if !regrouped.is_empty() {\n            self.require_return_probe_admission()?;\n        }"
+            ) && !body(source, "    pub(crate) fn attach_diagnostic_probe(").contains(guard)
+                && !body(source, "    pub(crate) fn attach_dynamic_loader(").contains(guard)
+        }
+        let source = include_str!("attach.rs");
+        assert!(contract(source));
+        for signature in [
+            "    pub(crate) fn attach_targets(",
+            "    pub(crate) fn attach_dynamic_export(",
+            "    fn rebuild_affected_groups(",
+        ] {
+            let start = source.find(signature).unwrap();
+            let tail = source[start..].replacen(
+                "self.require_return_probe_admission()?;",
+                "Ok::<(), anyhow::Error>(())?;",
+                1,
+            );
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {signature}"
+            );
+        }
+        let inventory = include_str!("attach/inventory/activation.rs");
+        assert!(!inventory.contains("require_return_probe_admission"));
+        assert!(inventory.contains("let program = match entry.abi {"));
+        assert!(inventory.contains("ElfAbi::Lp64 => \"p11_usage_entry_lp64\""));
+        assert!(inventory.contains("ElfAbi::Ilp32 => \"p11_usage_entry_ia32\""));
+    }
+
+    /// Pause thread-birth dating trusts the attach clock: every provider
+    /// attach body must stamp it before its first link mutation, holding the
+    /// window in a named binding to the end of the body, and the loader and
+    /// diagnostic probes (no provider hooks) must not. Deleting a stamp, or
+    /// dropping its window at once (`let _ =`), would date births against an
+    /// instant before the attach, the unsafe direction.
+    #[test]
+    fn hook_attach_stamps_cover_every_provider_attach_and_skip_the_loader_and_diagnostic_probes() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n    }")
+                .unwrap()
+                .0
+        }
+        const STAMP: &str = "crate::discovery::pause::hook_attach_window";
+        const BINDING: &str = "let _attach_window =";
+        const PROVIDER_ATTACHES: [(&str, &str); 3] = [
+            (
+                "    pub(crate) fn attach_targets(",
+                "self.native_retirement.collected_blocking()",
+            ),
+            (
+                "    pub(crate) fn attach_dynamic_export(",
+                "attach_dynamic_export_with(",
+            ),
+            ("    fn rebuild_affected_groups(", "multi_prog_fd("),
+        ];
+        const UNHOOKED: [&str; 2] = [
+            "    pub(crate) fn attach_dynamic_loader(",
+            "    pub(crate) fn attach_diagnostic_probe(",
+        ];
+        fn contract(source: &str) -> bool {
+            PROVIDER_ATTACHES.iter().all(|(signature, mutation)| {
+                let text = body(source, signature);
+                let (Some(binding), Some(stamp)) = (text.find(BINDING), text.find(STAMP)) else {
+                    return false;
+                };
+                text.matches(STAMP).count() == 1
+                    && text.matches(BINDING).count() == 1
+                    && binding < stamp
+                    && !text[binding..stamp].contains(';')
+                    && text.find(mutation).is_some_and(|at| stamp < at)
+            }) && UNHOOKED
+                .iter()
+                .all(|signature| !body(source, signature).contains(STAMP))
+        }
+        let source = include_str!("attach.rs");
+        assert!(contract(source));
+        for (signature, _) in PROVIDER_ATTACHES {
+            let start = source.find(signature).unwrap();
+            let tail = source[start..].replacen(STAMP, "crate::discovery::pause::unstamped", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed the stamp from {signature}"
+            );
+            let dropped = source[start..].replacen(BINDING, "let _ =", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], dropped)),
+                "dropped the window at once in {signature}"
+            );
+        }
+        for signature in UNHOOKED {
+            let start = source.find(signature).unwrap();
+            let opened = source[start..].find('{').unwrap() + start + 1;
+            let stamped = format!(
+                "{}\n        let _window = {STAMP}();{}",
+                &source[..opened],
+                &source[opened..]
+            );
+            assert!(!contract(&stamped), "stamped {signature}");
+        }
+    }
+
+    #[test]
+    fn admission_refusals_precede_the_actual_session_factory_for_every_backend() {
+        use super::{BackendSelection, CapturePolicy, Scope, Session};
+        use crate::uretprobe_hazard::Action;
+        let plan = crate::plan::build_from_reconciled_modules(&[]);
+        let objects = crate::discovery::identity::PinnedObjects::empty();
+        for backend in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for refusal in [
+                Action::Refuse("unsafe kernel".into()),
+                Action::NotPermitted("denied".into()),
+                Action::FlavorMismatch("stale".into()),
+            ] {
+                let expected = match &refusal {
+                    Action::Refuse(_) => "unsafe kernel",
+                    Action::NotPermitted(_) => "denied",
+                    _ => "stale",
+                };
+                let error = Session::start_with_selected(
+                    &plan,
+                    &Scope::System,
+                    &objects,
+                    CapturePolicy::Allowlisted,
+                    None,
+                    None,
+                    None,
+                    backend,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Ok(super::multi_host::MultiCapableHost::for_test()),
+                    || Err(refusal),
+                )
+                .err()
+                .expect("refusal precedes backend selection and any BPF preparation");
+                assert!(format!("{error:#}").contains(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_live_session_requires_host_admission_for_every_backend() {
+        use super::{
+            BackendSelection, CapturePolicy, MultiHostRefusal, MultiHostStage, Scope, Session,
+        };
+        let objects = crate::discovery::identity::PinnedObjects::empty();
+        let plan = crate::plan::build_from_sources(&[], &[], &objects);
+        assert!(plan.slots.is_empty());
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = Session::start_with_selected(
+                    &plan,
+                    &Scope::System,
+                    &objects,
+                    CapturePolicy::Allowlisted,
+                    None,
+                    None,
+                    None,
+                    selection,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Err(refusal),
+                    || panic!("host refusal must precede the return-probe assessment"),
+                )
+                .err()
+                .expect("even an empty live plan requires a Multi-capable host");
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+
+    /// A real STOP_GATE mapping, with a second mapping standing in only for
+    /// native atomic updates. No Q receipt is constructed by the fixture.
+    struct FinishQGate {
+        gate: super::StopGate,
+        writer: std::ptr::NonNull<std::sync::atomic::AtomicU64>,
+        len: usize,
+        _file: std::fs::File,
+    }
+
+    impl FinishQGate {
+        fn new() -> Self {
+            use std::os::fd::{AsFd, AsRawFd};
+
+            let file = tempfile::tempfile().unwrap();
+            let len = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            file.set_len(u64::try_from(len).unwrap()).unwrap();
+            let gate = super::StopGate::from_map_fd(file.as_fd()).unwrap();
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+            Self {
+                gate,
+                writer: std::ptr::NonNull::new(mapping.cast()).unwrap(),
+                len,
+                _file: file,
+            }
+        }
+
+        fn native_word(&self, value: u64) {
+            // Both mappings refer to the same aligned AtomicU64 cell.
+            unsafe { self.writer.as_ref() }.store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for FinishQGate {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.writer.as_ptr().cast(), self.len) };
+        }
+    }
+
+    /// Reuse the Session's actual observer with the fanout scene's ORIGINAL
+    /// EVENTS drain. This owner retains its DISCOVERY drain and real mmap
+    /// STOP_GATE for the whole fixture; neither ring positions nor Q can be
+    /// supplied by a caller. It never polls, scrubs, or creates another EVENTS
+    /// cursor, and an observed Q leaves the DISCOVERY record undelivered.
+    pub(crate) struct CollectedFinishQObserverForTest {
+        gate: FinishQGate,
+        producers: super::SessionDrainProducers,
+        discovery_domain: crate::events::DiscoveryDomain,
+        discovery: crate::events::DiscoveryDrain<crate::events::ScriptedRecords>,
+        detach: super::OwnedProducerDetach,
+    }
+
+    impl CollectedFinishQObserverForTest {
+        pub(crate) fn new(producers: &super::SessionDrainProducers) -> Self {
+            Self::with_discovery_bytes(producers, [vec![0]])
+        }
+
+        /// Choose the original fixture records before the retained drain is
+        /// created. This does not change Q observation or accept positions.
+        pub(crate) fn with_discovery_bytes(
+            producers: &super::SessionDrainProducers,
+            records: impl IntoIterator<Item = Vec<u8>>,
+        ) -> Self {
+            let records: Vec<_> = records.into_iter().collect();
+            let bound = records.len();
+            let discovery_domain = crate::events::DiscoveryDomain::test_standin(0xf1d5);
+            Self {
+                gate: FinishQGate::new(),
+                producers: producers.clone(),
+                discovery: crate::events::DiscoveryDrain::over_domain(
+                    crate::events::ScriptedRecords::records(records, bound),
+                    discovery_domain.clone(),
+                ),
+                discovery_domain,
+                detach: super::OwnedProducerDetach::NotStarted,
+            }
+        }
+
+        pub(crate) fn request_stop(&self) {
+            self.gate.gate.request_stop();
+        }
+
+        /// The collected-deferral entry condition over the live gate word.
+        pub(crate) fn collected_defer_entry_open(&self) -> bool {
+            self.gate.gate.stop_requested() && self.gate.gate.quiescent()
+        }
+
+        /// Set the gate word directly. Production STOP never clears and
+        /// never admits a body after quiescence; the states this reaches
+        /// exist only to prove the deferral entry reads live state.
+        pub(crate) fn set_gate_word_for_test(&self, word: u64) {
+            self.gate.native_word(word);
+        }
+
+        pub(crate) fn discovery_domain(&self) -> &crate::events::DiscoveryDomain {
+            &self.discovery_domain
+        }
+
+        pub(crate) fn discovery_remaining(&self) -> usize {
+            self.discovery.source().remaining()
+        }
+
+        pub(crate) fn discovery_drain(
+            &self,
+        ) -> &crate::events::DiscoveryDrain<crate::events::ScriptedRecords> {
+            &self.discovery
+        }
+
+        pub(super) fn retained_owner(&self) -> super::CollectedFinishQOwner<'_> {
+            super::CollectedFinishQOwner {
+                gate: &self.gate.gate,
+                producers: &self.producers,
+                discovery: &self.discovery_domain,
+                detach: &self.detach,
+            }
+        }
+
+        /// Borrow the SAME original drain used by the private Q observer.
+        pub(crate) fn discovery_drain_mut(
+            &mut self,
+        ) -> &mut crate::events::DiscoveryDrain<crate::events::ScriptedRecords> {
+            &mut self.discovery
+        }
+
+        pub(crate) fn observe(
+            &self,
+            expected: &super::SessionDrainProducers,
+            grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+            events: &crate::events::EventDrain<crate::events::ScriptedRecords>,
+        ) -> anyhow::Result<Option<super::CollectedFinishQ>> {
+            super::observe_collected_finish_q_with(
+                super::CollectedFinishQOwner {
+                    gate: &self.gate.gate,
+                    producers: &self.producers,
+                    discovery: &self.discovery_domain,
+                    detach: &self.detach,
+                },
+                expected,
+                grant,
+                || {
+                    events.consumption_cut().map_err(|reason| {
+                        anyhow::anyhow!("original EVENTS cut refused: {reason:?}")
+                    })
+                },
+                || Ok(crate::events::discovery_drain_positions(&self.discovery)),
+            )
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FinishQReadControl {
+        Normal,
+        EventsError,
+        DiscoveryError,
+        LoseQuiescence,
+    }
+
+    struct FinishQFixture {
+        gate: FinishQGate,
+        producers: super::SessionDrainProducers,
+        discovery_domain: crate::events::DiscoveryDomain,
+        detach: super::OwnedProducerDetach,
+        events: crate::events::EventDrain<crate::events::ScriptedRecords>,
+        discovery: crate::events::DiscoveryDrain<crate::events::ScriptedRecords>,
+        reads: std::cell::Cell<(usize, usize)>,
+    }
+
+    impl FinishQFixture {
+        fn new(native: NativeDomainId) -> Self {
+            use crate::events::{
+                DiscoveryDomain, DiscoveryDrain, EventDrain, EventsDomain, ScriptedRecords,
+            };
+
+            let events = EventsDomain::test_standin(0xf1a1);
+            let discovery_domain = DiscoveryDomain::test_standin(0xf1d1);
+            Self {
+                gate: FinishQGate::new(),
+                producers: super::SessionDrainProducers::test_pair(native, events.clone()),
+                discovery_domain: discovery_domain.clone(),
+                detach: super::OwnedProducerDetach::NotStarted,
+                events: EventDrain::over_domain(
+                    ScriptedRecords::records([vec![0], vec![0]], 4),
+                    events,
+                ),
+                discovery: DiscoveryDrain::over_domain(
+                    ScriptedRecords::records([vec![0]], 1),
+                    discovery_domain,
+                ),
+                reads: std::cell::Cell::new((0, 0)),
+            }
+        }
+
+        fn observe(
+            &self,
+            expected: &super::SessionDrainProducers,
+            grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+            control: FinishQReadControl,
+        ) -> anyhow::Result<Option<super::CollectedFinishQ>> {
+            let owner = super::CollectedFinishQOwner {
+                gate: &self.gate.gate,
+                producers: &self.producers,
+                discovery: &self.discovery_domain,
+                detach: &self.detach,
+            };
+            // This is the SAME private observer builder that Session must
+            // supply with its own fields. Only native ring reads are leaves.
+            super::observe_collected_finish_q_with(
+                owner,
+                expected,
+                grant,
+                || {
+                    let (events, discovery) = self.reads.get();
+                    self.reads.set((events + 1, discovery));
+                    if matches!(control, FinishQReadControl::EventsError) {
+                        anyhow::bail!("injected EVENTS position failure");
+                    }
+                    self.events
+                        .consumption_cut()
+                        .map_err(|reason| anyhow::anyhow!("EVENTS cut refused: {reason:?}"))
+                },
+                || {
+                    let (events, discovery) = self.reads.get();
+                    self.reads.set((events, discovery + 1));
+                    if matches!(control, FinishQReadControl::DiscoveryError) {
+                        anyhow::bail!("injected DISCOVERY position failure");
+                    }
+                    if matches!(control, FinishQReadControl::LoseQuiescence) {
+                        self.gate
+                            .native_word(p11scope_ebpf_common::STOP_GATE_STOP | 1);
+                    }
+                    Ok(crate::events::discovery_drain_positions(&self.discovery))
+                },
+            )
+        }
+    }
+
+    /// Removing either STOP or the count-zero condition would mint authority
+    /// before the actual native producer gate has reached Q.
+    #[test]
+    fn collected_finish_q_requires_actual_stopped_quiescence() {
+        let _session_port: fn(
+            &mut super::Session,
+            &super::SessionDrainProducers,
+            Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+        ) -> anyhow::Result<Option<super::CollectedFinishQ>> =
+            super::Session::observe_collected_finish_q;
+        let fixture = FinishQFixture::new(NativeDomainId::mint());
+        for word in [0, 3, p11scope_ebpf_common::STOP_GATE_STOP | 3] {
+            fixture.gate.native_word(word);
+            assert!(
+                fixture
+                    .observe(&fixture.producers, None, FinishQReadControl::Normal)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(fixture.reads.get(), (0, 0));
+        }
+        fixture.gate.native_word(0);
+        fixture.gate.gate.request_stop();
+        let q = fixture
+            .observe(&fixture.producers, None, FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert!(q.matches_owner(&fixture.producers, &fixture.discovery_domain));
+        assert_eq!((q.events_stop(), q.discovery_stop()), (16, 8));
+        assert_eq!(fixture.events.source().remaining(), 2);
+        assert_eq!(fixture.discovery.source().remaining(), 1);
+    }
+
+    /// Numeric map IDs alone cannot splice another retained allocation;
+    /// optional drain metadata must neither be ignored nor upgraded from None.
+    #[test]
+    fn collected_finish_q_binds_producers_grant_and_detach_owner() {
+        use crate::events::{DiscoveryDomain, EventsDomain};
+        use crate::semantics_objects::journal::{SessionDrainGrant, tests::AttestationFixture};
+
+        let mut admission = AttestationFixture::new(p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        });
+        let mut fixture = FinishQFixture::new(admission.domain());
+        fixture.gate.gate.request_stop();
+        let input = admission.admit_function("C_CreateObject");
+        let grant = SessionDrainGrant::observe(&fixture.producers, &input).unwrap();
+        let foreign_events = super::SessionDrainProducers::test_pair(
+            admission.domain(),
+            EventsDomain::test_standin(0xf1a2),
+        );
+        let foreign_grant = SessionDrainGrant::observe(&foreign_events, &input).unwrap();
+        let equal_id_allocation = super::SessionDrainProducers::test_pair(
+            admission.domain(),
+            EventsDomain::test_standin(0xf1a1),
+        );
+        let foreign_native = super::SessionDrainProducers::test_pair(
+            NativeDomainId::mint(),
+            fixture.producers.events.clone(),
+        );
+        assert!(grant.matches_producers(&fixture.producers));
+        assert!(!grant.matches_producers(&foreign_events));
+        assert!(!grant.matches_producers(&foreign_native));
+        for expected in [&foreign_events, &equal_id_allocation, &foreign_native] {
+            assert!(
+                fixture
+                    .observe(expected, Some(&grant), FinishQReadControl::Normal)
+                    .is_err()
+            );
+        }
+        assert!(
+            fixture
+                .observe(
+                    &fixture.producers,
+                    Some(&foreign_grant),
+                    FinishQReadControl::Normal
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.reads.get(), (0, 0));
+        let q = fixture
+            .observe(&fixture.producers, Some(&grant), FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert!(q.matches_retained_grant(&grant));
+        assert!(!q.matches_owner(&equal_id_allocation, &fixture.discovery_domain));
+        assert!(!q.matches_owner(&fixture.producers, &DiscoveryDomain::test_standin(0xf1d1)));
+        let negative_only = fixture
+            .observe(&fixture.producers, None, FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert!(!negative_only.matches_retained_grant(&grant));
+        for detach in [
+            super::OwnedProducerDetach::Unproved,
+            super::OwnedProducerDetach::Complete,
+            super::OwnedProducerDetach::Pending {
+                worker: super::CleanupWorker::pre_start_with_spawn(
+                    Box::new(|_, _| Ok(())),
+                    std::sync::Arc::new(|| std::time::Duration::ZERO),
+                    |_| Err(std::io::Error::other("fixture starts no cleanup thread")),
+                ),
+                started: std::time::Instant::now(),
+                had_work: false,
+                progress: cleanup_worker::DetachPollPrinter::new(),
+            },
+        ] {
+            fixture.detach = detach;
+            let before = fixture.reads.get();
+            assert!(
+                fixture
+                    .observe(&fixture.producers, Some(&grant), FinishQReadControl::Normal)
+                    .is_err()
+            );
+            assert_eq!(fixture.reads.get(), before);
+        }
+    }
+
+    /// A single early gate read or swallowed position error must not mint Q.
+    #[test]
+    fn collected_finish_q_rechecks_quiescence_and_preserves_read_errors() {
+        for control in [
+            FinishQReadControl::EventsError,
+            FinishQReadControl::DiscoveryError,
+            FinishQReadControl::LoseQuiescence,
+        ] {
+            let fixture = FinishQFixture::new(NativeDomainId::mint());
+            fixture.gate.gate.request_stop();
+            let result = fixture.observe(&fixture.producers, None, control);
+            if matches!(control, FinishQReadControl::LoseQuiescence) {
+                assert!(result.unwrap().is_none());
+                assert_eq!(fixture.reads.get(), (1, 1));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(fixture.events.source().remaining(), 2);
+            assert_eq!(fixture.discovery.source().remaining(), 1);
+        }
+    }
+
+    /// Q is an upper bound, not an assertion that this original drained or
+    /// was clean. Another cursor and a post-Q write cannot fit that bound.
+    #[test]
+    fn collected_finish_q_bounds_original_cut_without_claiming_drain() {
+        use crate::events::{EventDrain, ScriptedRecords};
+        use std::ops::ControlFlow;
+
+        let mut fixture = FinishQFixture::new(NativeDomainId::mint());
+        let original = fixture.events.consumption_cut().unwrap();
+        assert!(!original.is_drained());
+        fixture.events.source_mut().push_record(vec![0]);
+        fixture.gate.gate.request_stop();
+        let q = fixture
+            .observe(&fixture.producers, None, FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.events_stop(), 24);
+        assert!(q.covers_events_bounds(&original));
+        assert!(!q.events_at_bound(&original));
+        let other_cursor = EventDrain::over_domain(
+            ScriptedRecords::records([], 0),
+            fixture.producers.events.clone(),
+        );
+        assert!(!q.covers_events_bounds(&other_cursor.consumption_cut().unwrap()));
+        fixture.events.poll(Some(1), |_| ControlFlow::Continue(()));
+        let prefix = fixture.events.consumption_cut().unwrap();
+        assert!(q.covers_events_bounds(&prefix));
+        assert!(!q.events_at_bound(&prefix));
+        assert_eq!(
+            fixture.events.malformed(),
+            1,
+            "bounds do not erase observed loss"
+        );
+        fixture.events.poll(Some(2), |_| ControlFlow::Continue(()));
+        let end = fixture.events.consumption_cut().unwrap();
+        assert!(q.covers_events_bounds(&end));
+        assert!(q.events_at_bound(&end));
+        fixture.events.source_mut().push_record(vec![0]);
+        assert!(!q.covers_events_bounds(&fixture.events.consumption_cut().unwrap()));
+    }
+
+    #[test]
+    fn object_transport_ordinary_policy_requires_verified_rows() {
+        use super::{CapturePolicy, object_transport_rows_with};
+        use std::sync::Arc;
+
+        for command in ["profile", "trace"] {
+            let policy = CapturePolicy::from_cli(command, false, false).unwrap();
+            let rows = Arc::new(publish_object_descriptors());
+            let mut reads = 0;
+            let selected = object_transport_rows_with(policy, None, || {
+                reads += 1;
+                Ok(Arc::clone(&rows))
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(reads, 1);
+            assert!(Arc::ptr_eq(&selected, &rows));
+            let refused = object_transport_rows_with(policy, None, || {
+                anyhow::bail!("injected frozen-map readback failure")
+            });
+            assert!(
+                refused.is_err(),
+                "{command} must not silently fall back to 368-byte records"
+            );
+        }
+    }
+
+    #[test]
+    fn object_transport_attested_rows_are_shared_without_new_authority() {
+        use super::{CapturePolicy, object_transport_rows_with};
+        use std::sync::Arc;
+
+        let rows = Arc::new(publish_object_descriptors());
+        let selected = object_transport_rows_with(CapturePolicy::Allowlisted, Some(&rows), || {
+            panic!("attested transport reuses its verified rows")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&selected, &rows));
+        for policy in [
+            CapturePolicy::AggregateOnly,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            assert!(
+                object_transport_rows_with(policy, Some(&rows), || {
+                    panic!("non-object policy must not acquire transport rows")
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    struct FakeObjectMap {
+        rows: BTreeMap<u32, ObjectDescriptorWire>,
+        order: Vec<u32>,
+        frozen: bool,
+        frozen_at_readback: Vec<bool>,
+        fail_set: Option<u32>,
+        fail_readbacks: usize,
+        fail_freeze: bool,
+    }
+
+    impl FakeObjectMap {
+        fn new() -> Self {
+            Self {
+                rows: BTreeMap::new(),
+                order: Vec::new(),
+                frozen: false,
+                frozen_at_readback: Vec::new(),
+                fail_set: None,
+                fail_readbacks: 0,
+                fail_freeze: false,
+            }
+        }
+
+        fn set(map: &mut Self, index: u32, row: ObjectDescriptorWire) -> anyhow::Result<()> {
+            if map.frozen {
+                anyhow::bail!("frozen map rejects writes");
+            }
+            if Some(index) == map.fail_set {
+                anyhow::bail!("injected set failure");
+            }
+            map.order.push(index);
+            map.rows.insert(index, row);
+            Ok(())
+        }
+
+        fn readback(map: &mut Self) -> anyhow::Result<Vec<ObjectDescriptorWire>> {
+            if map.fail_readbacks > 0 {
+                map.fail_readbacks -= 1;
+                anyhow::bail!("injected readback failure");
+            }
+            map.frozen_at_readback.push(map.frozen);
+            (0..105)
+                .map(|index| {
+                    map.rows
+                        .get(&index)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("missing row {index}"))
+                })
+                .collect()
+        }
+
+        fn freeze(map: &mut Self) -> anyhow::Result<()> {
+            if map.fail_freeze {
+                anyhow::bail!("injected freeze failure");
+            }
+            map.frozen = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_producer_publication_reads_freezes_and_rechecks_same_state() {
+        let domain = NativeDomainId::mint();
+        let proof = publish_and_freeze_object_descriptors_with(
+            FakeObjectMap::new(),
+            domain,
+            FakeObjectMap::set,
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        )
+        .unwrap();
+        assert_eq!(proof.rows, publish_object_descriptors());
+        assert_eq!(proof.domain, domain);
+        assert_eq!(proof.state.order, (0..105).collect::<Vec<_>>());
+        assert_eq!(proof.state.frozen_at_readback, vec![false, true]);
+        assert!(proof.state.frozen);
+    }
+
+    #[test]
+    fn object_custody_publication_encodes_canonical_rows() {
+        use super::object_descriptor_row_bytes;
+        use p11scope_ebpf_common::object_wire::{
+            OBJECT_ACTION_DESTROY, OBJECT_GUARD_NAMED, verify_object_descriptors,
+        };
+        let rows = publish_object_descriptors();
+        assert!(verify_object_descriptors(&rows));
+        assert_eq!(rows.len(), 105);
+        for (index, row) in rows.iter().enumerate() {
+            let bytes = object_descriptor_row_bytes(row);
+            assert_eq!(
+                u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                row.function,
+                "row {index} function"
+            );
+            assert_eq!(&bytes[4..6], &row.input_args, "row {index} inputs");
+            assert_eq!(&bytes[6..8], &row.result_args, "row {index} results");
+            assert_eq!(&bytes[8..12], &row.template_args, "row {index} template");
+            assert_eq!(bytes[12], row.find_capacity_arg, "row {index} capacity");
+            assert_eq!(bytes[13], row.find_count_arg, "row {index} count");
+            assert_eq!(bytes[14], row.action, "row {index} action");
+            assert_eq!(bytes[15], row.guard, "row {index} guard");
+        }
+        assert_eq!(rows[0], none_object_wire());
+        assert_eq!(object_descriptor_row_bytes(&rows[0])[14..], [0, 0]);
+        assert_eq!(rows[23].function, 22);
+        assert_eq!(rows[23].action, OBJECT_ACTION_DESTROY);
+        assert_eq!(rows[23].guard, OBJECT_GUARD_NAMED);
+    }
+
+    #[test]
+    fn object_producer_publication_stops_at_each_io_failure() {
+        for fail_at in [0, 57, 104] {
+            let mut map = FakeObjectMap::new();
+            map.fail_set = Some(fail_at);
+            let result = publish_and_freeze_object_descriptors_with(
+                map,
+                NativeDomainId::mint(),
+                FakeObjectMap::set,
+                FakeObjectMap::readback,
+                FakeObjectMap::freeze,
+            );
+            assert!(
+                matches!(result, Err(SemanticRefusal::Descriptor)),
+                "set failure at {fail_at} refuses"
+            );
+        }
+        let mut map = FakeObjectMap::new();
+        map.fail_readbacks = 1;
+        let result = publish_and_freeze_object_descriptors_with(
+            map,
+            NativeDomainId::mint(),
+            FakeObjectMap::set,
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+        let mut calls = 0;
+        let result = publish_and_freeze_object_descriptors_with(
+            FakeObjectMap::new(),
+            NativeDomainId::mint(),
+            FakeObjectMap::set,
+            |map: &mut FakeObjectMap| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(anyhow::anyhow!("second readback fails"));
+                }
+                FakeObjectMap::readback(map)
+            },
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+        let mut map = FakeObjectMap::new();
+        map.fail_freeze = true;
+        let result = publish_and_freeze_object_descriptors_with(
+            map,
+            NativeDomainId::mint(),
+            FakeObjectMap::set,
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+    }
+
+    #[test]
+    fn object_producer_publication_refuses_every_inexact_table() {
+        fn published() -> FakeObjectMap {
+            let mut map = FakeObjectMap::new();
+            for (index, row) in publish_object_descriptors().iter().copied().enumerate() {
+                FakeObjectMap::set(&mut map, index as u32, row).unwrap();
+            }
+            map
+        }
+        let canonical = publish_object_descriptors().to_vec();
+        let mut swapped = canonical.clone();
+        swapped.swap(21, 22);
+        let mut altered_eligible = canonical.clone();
+        altered_eligible[21].action = OBJECT_ACTION_COPY;
+        let mut altered_none = canonical.clone();
+        altered_none[5].action = OBJECT_ACTION_ACCESS;
+        let short = canonical[..104].to_vec();
+        let mut long = canonical.clone();
+        long.push(none_object_wire());
+        let cases: Vec<(&str, Vec<ObjectDescriptorWire>)> = vec![
+            ("swapped", swapped),
+            ("altered eligible", altered_eligible),
+            ("altered NONE", altered_none),
+            ("short", short),
+            ("long", long),
+            ("blank", vec![none_object_wire(); 105]),
+            ("empty", Vec::new()),
+        ];
+        for (label, table) in cases {
+            let result = publish_and_freeze_object_descriptors_with(
+                published(),
+                NativeDomainId::mint(),
+                FakeObjectMap::set,
+                |_: &mut FakeObjectMap| Ok(table.clone()),
+                FakeObjectMap::freeze,
+            );
+            assert!(
+                matches!(result, Err(SemanticRefusal::Descriptor)),
+                "{label} readback refuses"
+            );
+        }
+        // A corrupting write path refuses against an honest readback.
+        let result = publish_and_freeze_object_descriptors_with(
+            FakeObjectMap::new(),
+            NativeDomainId::mint(),
+            |map: &mut FakeObjectMap, index, mut row| {
+                if index == 21 {
+                    row.action = OBJECT_ACTION_COPY;
+                }
+                FakeObjectMap::set(map, index, row)
+            },
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+    }
+
     #[test]
     fn backport_multi_sections_parse_for_uprobe_twins() {
         use std::str::FromStr as _;
@@ -4713,29 +12273,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_policy_follows_the_6_9_floor_and_rejects_garbage() {
-        use super::multi_allowed_on;
-        for release in [
-            "6.9.0",
-            "6.9.12-1-generic",
-            "6.10.0",
-            "6.15.0-100-generic",
-            "7.0.0",
-        ] {
-            assert!(multi_allowed_on(release), "{release} must allow multi");
-        }
-        for release in ["6.8.0", "6.6.0", "6.5.0-15-generic", "5.15.0", "4.19.0", ""] {
-            assert!(!multi_allowed_on(release), "{release:?} must stay singles");
-        }
-        for release in ["not-a-release", "6", "6.x", "v6.9.0-"] {
-            assert!(
-                !multi_allowed_on(release),
-                "{release:?} must conservatively stay singles"
-            );
-        }
-    }
-
-    #[test]
     fn multi_links_name_the_pid_target_and_pid_zero_only_scope_wide() {
         // DR-CLASSIC-PID0: a PID-scoped uprobe-multi link names the target
         // (never pid 0); cgroup and system scope stay pid-wide behind the
@@ -4801,6 +12338,97 @@ mod tests {
         // The continuation loads with its caller's attach type but is never
         // attached: it is only installed into PAIR_CALLS.
         assert_eq!(static_probe_side("p11_entry_template_second"), None);
+    }
+
+    #[test]
+    fn journal_pair_resolves_journal_probe_sides() {
+        use super::ProbeSide;
+        use super::static_probe_side;
+        // The journal pair routes like the ordinary pair it replaces: the
+        // return root owns return links, the entry root owns entry links.
+        // Until these arms exist journal attach resolves ordinary names.
+        assert_eq!(
+            static_probe_side("p11_return_journal"),
+            Some(ProbeSide::Return)
+        );
+        assert_eq!(
+            static_probe_side("p11_entry_journal"),
+            Some(ProbeSide::Entry)
+        );
+        assert_eq!(
+            super::static_endpoint("p11_return_journal", 7),
+            Some((7, ProbeSide::Return))
+        );
+        assert_eq!(
+            super::static_endpoint("p11_entry_journal", 7),
+            Some((7, ProbeSide::Entry))
+        );
+    }
+
+    #[test]
+    fn journal_pair_takes_the_multi_load_flag() {
+        use super::AttachBackend;
+        use super::loads_with_multi_flag;
+        // The journal twins load with expected_attach_type=48 under multi so
+        // one program can own the group's return/entry links, exactly like
+        // the ordinary static endpoint twins they replace.
+        for program in ["p11_entry_journal", "p11_return_journal"] {
+            assert!(
+                loads_with_multi_flag(AttachBackend::Multi, program),
+                "{program} must load with the multi flag"
+            );
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Singles, program),
+                "{program} must load plain under singles"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_naming_covers_rebuild_and_diagnostic_sites() {
+        // The group rebuild regroups survivors through the roots-aware
+        // grouping with the session's journal selection and resolves the
+        // journal return fd on journal sessions; the two reexec-diagnostic
+        // phase maps classify the journal return as a return. All three
+        // sites need live Sessions, so this pins them in source.
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        fn body<'a>(production: &'a str, open: &str, close: &str) -> &'a str {
+            let start = production
+                .find(open)
+                .unwrap_or_else(|| panic!("{open} present"));
+            let end = production[start..]
+                .find(close)
+                .unwrap_or_else(|| panic!("{close} follows {open}"));
+            &production[start..start + end]
+        }
+        let rebuild = body(
+            production,
+            "fn rebuild_affected_groups(",
+            "pub(crate) fn begin_owned_producer_detach(",
+        );
+        assert!(
+            rebuild.contains("self.journal"),
+            "the rebuild regroups with the session's journal selection"
+        );
+        assert!(
+            rebuild.contains("p11_return_journal"),
+            "the rebuild resolves the journal return fd on journal sessions"
+        );
+        let attach = body(
+            production,
+            "pub(crate) fn attach_targets(",
+            "fn attach_targets_multi(",
+        );
+        assert!(
+            attach.contains("p11_return_journal"),
+            "the attach diagnostic phase classifies the journal return"
+        );
+        let detach = body(production, "fn detach_link(", "pub(crate) fn diagnostic(");
+        assert!(
+            detach.contains("p11_return_journal"),
+            "the detach diagnostic phase classifies the journal return"
+        );
     }
 
     /// DR-CLASSIC-PID0: the classic backend follows functional probes:
@@ -4919,6 +12547,39 @@ mod tests {
         }
     }
     #[test]
+    fn identity_metadata_matches_embedded_native_objects() {
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        for (name, expected) in IDENTITY_MAPS {
+            let actual = detailed.maps.get(name).unwrap();
+            assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
+            assert_eq!(actual.key_size(), expected.key_size, "{name} key");
+            assert_eq!(actual.value_size(), expected.value_size, "{name} value");
+            assert_eq!(actual.max_entries(), expected.max_entries, "{name} entries");
+            assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
+        }
+        let (_, detailed_owner) = IDENTITY_MAPS
+            .iter()
+            .find(|(name, _)| *name == "THREAD_OWNER")
+            .unwrap();
+        for bytes in [
+            crate::EBPF_INVENTORY_OBJECT,
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+        ] {
+            let inventory = aya_obj::Object::parse(bytes).unwrap();
+            let owner = inventory.maps.get("THREAD_OWNER").unwrap();
+            assert_eq!(owner.value_size(), 544);
+            let actual = map_metadata(
+                MapType::TaskStorage,
+                owner.key_size(),
+                owner.value_size(),
+                owner.max_entries(),
+                owner.map_flags(),
+            );
+            assert!(compare_map_metadata("THREAD_OWNER", actual, *detailed_owner).is_err());
+        }
+    }
+
+    #[test]
     fn identity_metadata_checks_every_tuple_field() {
         for (name, expected) in IDENTITY_MAPS {
             compare_map_metadata(name, expected, expected).unwrap();
@@ -4971,7 +12632,7 @@ mod tests {
 
     #[test]
     fn identity_inventory_rejects_missing_extra_and_wrong_variants() {
-        let valid = [
+        let bank_a = [
             ("TASK_COOKIE", true),
             ("THREAD_OWNER", true),
             ("ROOT_AFFILIATION", true),
@@ -4979,30 +12640,523 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        validate_identity_inventory(valid.into_iter()).unwrap();
-        for index in [0, 1, 2] {
-            assert!(
-                validate_identity_inventory(
-                    valid
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(i, v)| (i != index).then_some(v))
+        // Both arms hold in every build: a gate-1 object requires the
+        // second ticket bank on top of the bank-A set, while a gate-0
+        // object (counter, inventory, journal, or any default object)
+        // refuses it as an unexpected gate-1 map.
+        for gate in [false, true] {
+            let valid: Vec<(&str, bool)> = if gate {
+                bank_a
+                    .into_iter()
+                    .chain([("TASK_COOKIE_B", true)])
+                    .collect()
+            } else {
+                bank_a.into_iter().collect()
+            };
+            validate_identity_inventory(valid.iter().copied(), gate).unwrap();
+            let mut covered = 0;
+            for index in 0..valid.len() {
+                if !valid[index].1 {
+                    continue;
+                }
+                covered += 1;
+                assert!(
+                    validate_identity_inventory(
+                        valid
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter_map(|(i, v)| (i != index).then_some(v)),
+                        gate,
+                    )
+                    .is_err()
+                );
+                let mut wrong = valid.clone();
+                wrong[index].1 = false;
+                assert!(validate_identity_inventory(wrong.into_iter(), gate).is_err());
+            }
+            assert_eq!(covered, if gate { 4 } else { 3 });
+            for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
+                assert!(
+                    validate_identity_inventory(valid.iter().copied().chain([(extra, true)]), gate)
+                        .is_err()
+                );
+            }
+            if gate {
+                // The bank-A set alone is incomplete for a gate-1 object.
+                assert!(validate_identity_inventory(bank_a.into_iter(), gate).is_err());
+            } else {
+                // Gate-0 objects refuse the bank-B map as unexpected.
+                assert!(
+                    validate_identity_inventory(
+                        valid.iter().copied().chain([("TASK_COOKIE_B", true)]),
+                        gate
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate1_task_storage_inventory_is_accepted() {
+        // A gate-1 Detailed object carries TASK_COOKIE_B beside the three
+        // base task-storage maps; the preflight must accept that inventory.
+        // Today it refuses with `unexpected Unsupported map TASK_COOKIE_B`,
+        // which blocks every gate-1 load at doctor preflight.
+        let gate1 = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("COOKIE_CTL_B", false),
+            ("IMAGE_BANK_SELECT", false),
+            ("LOADER_GATE", false),
+            ("LOADER_GATE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        validate_identity_inventory(gate1.into_iter(), true).unwrap();
+    }
+
+    #[test]
+    fn gate0_inventory_refuses_gate1_task_storage() {
+        // The same bank-B map is refused in a gate-0 inventory: a gate-0
+        // build must never silently accept gate-1 bytes.
+        let gate1 = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error = validate_identity_inventory(gate1.into_iter(), false).unwrap_err();
+        assert!(
+            error.to_string().contains("TASK_COOKIE_B"),
+            "the refusal must name the map: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate0_inventory_refuses_every_gate1_array_map() {
+        // Every gate-1 Array map is refused in a gate-0 inventory, in
+        // either variant: a gate-0 build must never silently accept
+        // gate-1 bytes, even without the bank task storage beside them.
+        let base = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        for name in [
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            for unsupported in [false, true] {
+                let error = validate_identity_inventory(
+                    base.into_iter().chain([(name, unsupported)]),
+                    false,
                 )
-                .is_err()
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(name),
+                    "the refusal must name {name}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate1_inventory_accepts_every_gate1_array_map() {
+        // Each gate-1 Array map is individually accepted in a gate-1
+        // inventory: the gate-0 refusal above must not overreach.
+        let base = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        for name in [
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            validate_identity_inventory(base.into_iter().chain([(name, false)]), true).unwrap();
+        }
+    }
+
+    #[test]
+    fn gate_inventory_refuses_missing_gate1_task_storage() {
+        // A gate-1 Detailed object without its required bank map is
+        // refused: the gate Array maps are present but TASK_COOKIE_B is
+        // missing. (Counter-shaped inventories take gate=false via
+        // identity_gate_required and are accepted; see below.)
+        let no_bank = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("COOKIE_CTL_B", false),
+            ("IMAGE_BANK_SELECT", false),
+            ("LOADER_GATE", false),
+            ("LOADER_GATE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error = validate_identity_inventory(no_bank.into_iter(), true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required task-storage maps"),
+            "a gate-1 Detailed object without TASK_COOKIE_B is refused: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate1_counter_inventory_is_accepted() {
+        // C1: counter objects never carry the gate maps, so a gate-1
+        // build requires no gate for them. Before the per-object fix,
+        // counter sessions validated with gate=true and refused here.
+        let counter = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        validate_identity_inventory(counter.into_iter(), identity_gate_required(true)).unwrap();
+    }
+
+    #[test]
+    fn identity_gate_is_required_per_object() {
+        // Only Detailed/journal objects take the build's gate flag;
+        // counter objects never require it, in either build flavour.
+        assert!(!identity_gate_required(true));
+        assert_eq!(identity_gate_required(false), LOADER_GATE_BUILD);
+    }
+
+    #[test]
+    fn gate_preparation_refuses_each_missing_array_map() {
+        // `prepare_identity` names the missing gate map: each of the
+        // four Array gate maps is refused when absent from a gate-1
+        // object, while the complete set passes presence.
+        let full = [
+            "TASK_COOKIE_B",
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ];
+        validate_gate_map_presence(full.into_iter()).unwrap();
+        for missing in [
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            let error =
+                validate_gate_map_presence(full.into_iter().filter(|name| *name != missing))
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains(missing),
+                "the refusal must name {missing}: {error:?}"
             );
-            let mut wrong = valid;
-            wrong[index].1 = false;
-            assert!(validate_identity_inventory(wrong.into_iter()).is_err());
         }
-        for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
-            assert!(validate_identity_inventory(valid.into_iter().chain([(extra, true)])).is_err());
+    }
+
+    #[test]
+    fn gate_inventory_refuses_wrong_variant_gate1_task_storage() {
+        // Bank task storage must be an Unsupported map, like its twin.
+        let wrong_variant = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", false),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error = validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
+        assert!(
+            error.to_string().contains("TASK_COOKIE_B"),
+            "the refusal must name the map: {error:?}"
+        );
+    }
+
+    #[test]
+    fn identity_map_routing_covers_both_tables() {
+        // freeze_map routes identity names to the identity validator and
+        // every other name to the policy validator. A gate name routed to
+        // the policy side refuses live bank task storage (Fedora root
+        // cell); a policy name routed to the identity side would skip its
+        // own contract.
+        for name in [
+            "TASK_COOKIE",
+            "THREAD_OWNER",
+            "ROOT_AFFILIATION",
+            "COOKIE_CTL",
+            "OWNER_CTL",
+            "ROOT_CTL",
+            "TASK_COOKIE_B",
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            assert!(
+                super::is_identity_map(name),
+                "{name} must route to identity"
+            );
         }
+        for name in ["CONFIG", "PROC_EPOCH", "OTHER"] {
+            assert!(!super::is_identity_map(name), "{name} must route to policy");
+        }
+    }
+
+    #[test]
+    fn gate_identity_table_names_exactly_the_gate1_maps() {
+        // The preflight pins every map a gate-1 Detailed object adds: no
+        // more, no fewer. Membership only; prepare order is unconstrained.
+        let mut names: Vec<&str> = super::GATE_IDENTITY_MAPS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "COOKIE_CTL_B",
+                "IMAGE_BANK_SELECT",
+                "LOADER_GATE",
+                "LOADER_GATE_CTL",
+                "TASK_COOKIE_B",
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_identity_metadata_checks_every_tuple_field() {
+        // Wrong metadata on any gate-1 map refuses, field by field.
+        for (name, expected) in super::GATE_IDENTITY_MAPS {
+            compare_map_metadata(name, expected, expected).unwrap();
+            for actual in [
+                ExactMapMetadata {
+                    map_type: MapType::Hash,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    key_size: expected.key_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    value_size: expected.value_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    max_entries: expected.max_entries + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    flags: expected.flags ^ 1,
+                    ..expected
+                },
+            ] {
+                assert!(
+                    compare_map_metadata(name, actual, expected).is_err(),
+                    "{name}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_identity_metadata_matches_embedded_gate_object() {
+        // The build flavor and the embedded Detailed bytes agree: gate-1
+        // carries all five maps with exact metadata, gate-0 carries none.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if super::LOADER_GATE_BUILD {
+            for (name, expected) in super::GATE_IDENTITY_MAPS {
+                let actual = detailed
+                    .maps
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{name} missing from the gate-1 object"));
+                assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
+                assert_eq!(actual.key_size(), expected.key_size, "{name} key");
+                assert_eq!(actual.value_size(), expected.value_size, "{name} value");
+                assert_eq!(actual.max_entries(), expected.max_entries, "{name} entries");
+                assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
+            }
+        } else {
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    !detailed.maps.contains_key(name),
+                    "{name} must be absent from the gate-0 object"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_maps_are_absent_from_inventory_objects() {
+        // The gate wires Detailed only; inventory objects never carry it.
+        for bytes in [
+            crate::EBPF_INVENTORY_OBJECT,
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+        ] {
+            let inventory = aya_obj::Object::parse(bytes).unwrap();
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    !inventory.maps.contains_key(name),
+                    "{name} must be absent from inventory objects"
+                );
+            }
+        }
+    }
+
+    #[cfg(p11scope_counter_objects)]
+    #[test]
+    fn gate_maps_are_absent_from_counter_objects() {
+        // Counter flavors compile without the gate define; their objects
+        // stay gate-free in every flavor of this build.
+        for bytes in [
+            crate::EBPF_COUNTER_COUNTS_OBJECT,
+            crate::EBPF_COUNTER_TIMESTAMPS_OBJECT,
+            crate::EBPF_COUNTER_LATENCY_OBJECT,
+        ] {
+            let counter = aya_obj::Object::parse(bytes).unwrap();
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    !counter.maps.contains_key(name),
+                    "{name} must be absent from counter objects"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loader_gate_build_matches_embedded_object() {
+        // The build-time gate selection and the embedded Detailed bytes
+        // agree: the select map exists exactly in gate-1 builds.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::LOADER_GATE_BUILD,
+            detailed.maps.contains_key("IMAGE_BANK_SELECT"),
+            "gate selection must match the embedded object"
+        );
+    }
+
+    #[ignore = "privileged: gate session binds live gate and bank cells"]
+    #[test]
+    fn gate_session_binds_live_gate_and_bank_cells() -> anyhow::Result<()> {
+        // The doctor self-preflight session, kept alive to read the cells:
+        // gate-1 exposes the published select word and the real (still
+        // unpublished) gate/bank cells; gate-0 exposes none, and both
+        // snapshot mappings report their honest refusal.
+        let session = super::Session::start_inner(
+            &super::Scope::Pid(std::process::id()),
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::AttachBackend::Singles,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        if super::LOADER_GATE_BUILD {
+            let select = session
+                .image_bank_select()?
+                .expect("gate-1 binds IMAGE_BANK_SELECT");
+            assert_eq!(select.bank, 0);
+            assert_eq!(select.prepared, [1, 0]);
+            assert_eq!(select.cuts, 0);
+            let gate = session
+                .loader_gate_control()?
+                .expect("gate-1 binds LOADER_GATE_CTL");
+            assert_eq!(
+                gate.limit, 0,
+                "gate control is unpublished before the acknowledgement wiring"
+            );
+            let bank_b = session
+                .bank_b_control()?
+                .expect("gate-1 binds COOKIE_CTL_B");
+            assert_eq!(
+                bank_b.limit, 0,
+                "bank B is unpublished before its preparation"
+            );
+            assert!(session.loader_gate_rows().is_some());
+            assert!(
+                crate::metrics::loader_transitions(&session)?.is_none(),
+                "unpublished gate control refuses honestly"
+            );
+            assert!(
+                crate::metrics::image_transitions(&session)?.is_none(),
+                "unpublished bank B refuses honestly"
+            );
+        } else {
+            assert!(session.image_bank_select()?.is_none());
+            assert!(session.loader_gate_control()?.is_none());
+            assert!(session.bank_b_control()?.is_none());
+            assert!(session.loader_gate_rows().is_none());
+            assert!(
+                crate::metrics::loader_transitions(&session)?.is_none(),
+                "gate-0 snapshots refuse honestly"
+            );
+            assert!(
+                crate::metrics::image_transitions(&session)?.is_none(),
+                "gate-0 snapshots refuse honestly"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_object_identity_inventory_matches_build_selection() {
+        // The doctor prepares identity from the real embedded Detailed
+        // object: every task-storage map in it must be an accepted
+        // identity map, or the load fails before any program runs. Aya
+        // surfaces task-storage maps as Unsupported; mirror that
+        // classification here without kernel syscalls.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let unsupported = MapType::TaskStorage as u32;
+        let inventory: Vec<(&str, bool)> = detailed
+            .maps
+            .iter()
+            .map(|(name, map)| (name.as_str(), map.map_type() == unsupported))
+            .collect();
+        assert!(
+            inventory.iter().any(|(name, _)| *name == "TASK_COOKIE"),
+            "embedded object names no TASK_COOKIE"
+        );
+        // The preparation selects the bank-B steps from the object in
+        // hand, mirroring prepare_identity; the embedded Detailed
+        // bytes must agree with the build that embedded them.
+        let banked = inventory.iter().any(|(name, _)| *name == "TASK_COOKIE_B");
+        assert_eq!(
+            banked, LOADER_GATE_BUILD,
+            "embedded Detailed bank selection disagrees with the build"
+        );
+        validate_identity_inventory(inventory.into_iter(), banked)
+            .expect("embedded identity inventory must validate");
     }
 
     #[test]
     fn identity_preparation_stops_at_every_write_readback_and_freeze_failure() {
         let mut expected = Vec::new();
-        prepare_identity_with(true, |step| {
+        prepare_identity_with(true, false, |step| {
             expected.push(step);
             Ok(())
         })
@@ -5029,7 +13183,7 @@ mod tests {
         for fail in 0..expected.len() {
             let mut calls = Vec::new();
             let mut linked = false;
-            let result = prepare_identity_with(true, |step| {
+            let result = prepare_identity_with(true, false, |step| {
                 calls.push(step);
                 if calls.len() == fail + 1 {
                     bail!("injected setup failure");
@@ -5045,7 +13199,7 @@ mod tests {
         }
 
         let mut unowned = Vec::new();
-        prepare_identity_with(false, |step| {
+        prepare_identity_with(false, false, |step| {
             unowned.push(step);
             Ok(())
         })
@@ -5065,7 +13219,7 @@ mod tests {
         for fail in 0..unowned.len() {
             let mut calls = Vec::new();
             let mut completed = false;
-            let result = prepare_identity_with(false, |step| {
+            let result = prepare_identity_with(false, false, |step| {
                 calls.push(step);
                 if calls.len() == fail + 1 {
                     bail!("injected unowned setup failure");
@@ -5081,6 +13235,131 @@ mod tests {
             assert!(!calls.contains(&IdentityPreparation::ReadSeed));
             assert_eq!(calls, unowned[..=fail]);
         }
+    }
+
+    #[test]
+    fn initial_bank_select_publishes_bank_a_prepared() {
+        // The bank-aware allocator refuses every identity until the select
+        // word is published; the initial image is bank A prepared, zero
+        // counts, zero incarnations. Every word is pinned: a wrong bank or
+        // prepared bit would refuse or misroute all issuance.
+        let select = super::initial_bank_select();
+        assert_eq!(select.bank, 0);
+        assert_eq!(select.prepared, [1, 0]);
+        assert_eq!(select.cuts, 0);
+        assert_eq!(select.refusals, 0);
+        assert_eq!(select.incarnation, [0, 0]);
+        assert_eq!(select.folded, [0, 0]);
+        assert_eq!(select.folds, 0);
+        assert_eq!(select.folded_issued, 0);
+        assert_eq!(select.update_losses, 0);
+    }
+
+    #[test]
+    fn bank_select_readback_rejects_each_field_mismatch() {
+        let expected = super::initial_bank_select();
+        super::validate_bank_select_readback(expected, expected).unwrap();
+        // Twelve u64 words; each one alone must fail the exact readback.
+        for word in 0..12 {
+            let mut actual = expected;
+            let cell = match word {
+                0 => &mut actual.bank,
+                1 => &mut actual.prepared[0],
+                2 => &mut actual.prepared[1],
+                3 => &mut actual.cuts,
+                4 => &mut actual.refusals,
+                5 => &mut actual.incarnation[0],
+                6 => &mut actual.incarnation[1],
+                7 => &mut actual.folded[0],
+                8 => &mut actual.folded[1],
+                9 => &mut actual.folds,
+                10 => &mut actual.folded_issued,
+                _ => &mut actual.update_losses,
+            };
+            *cell = cell.wrapping_add(1);
+            assert!(
+                super::validate_bank_select_readback(expected, actual).is_err(),
+                "word {word} must fail the readback"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_preparation_publishes_bank_select_before_freeze() {
+        // Gate-1 preparation writes the bank-A select image with an exact
+        // readback, then freezes the bank task storage. The select word
+        // itself stays unfrozen: bank-B preparation and the later
+        // fold-claim cycle rewrite it from userspace.
+        let mut expected = Vec::new();
+        prepare_identity_with(true, true, |step| {
+            expected.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            expected,
+            &[
+                IdentityPreparation::WriteCookie,
+                IdentityPreparation::ReadCookie,
+                IdentityPreparation::WriteBankSelect,
+                IdentityPreparation::ReadBankSelect,
+                IdentityPreparation::WriteOwner,
+                IdentityPreparation::ReadOwner,
+                IdentityPreparation::WriteRoot,
+                IdentityPreparation::ReadRoot,
+                IdentityPreparation::SeedRoot,
+                IdentityPreparation::ReadSeed,
+                IdentityPreparation::Freeze("TASK_COOKIE"),
+                IdentityPreparation::Freeze("TASK_COOKIE_B"),
+                IdentityPreparation::Freeze("THREAD_OWNER"),
+                IdentityPreparation::Freeze("ROOT_AFFILIATION"),
+                IdentityPreparation::Freeze("COOKIE_CTL"),
+                IdentityPreparation::Freeze("OWNER_CTL"),
+                IdentityPreparation::Freeze("ROOT_CTL"),
+            ]
+        );
+        for fail in 0..expected.len() {
+            let mut calls = Vec::new();
+            let mut linked = false;
+            let result = prepare_identity_with(true, true, |step| {
+                calls.push(step);
+                if calls.len() == fail + 1 {
+                    bail!("injected gate setup failure");
+                }
+                Ok(())
+            })
+            .map(|()| {
+                linked = true;
+            });
+            assert!(result.is_err());
+            assert!(!linked);
+            assert_eq!(calls, expected[..=fail]);
+        }
+    }
+
+    #[test]
+    fn gate0_preparation_has_no_bank_steps() {
+        // Gate-0 preparation keeps exactly the historical step sequence.
+        let mut owned = Vec::new();
+        prepare_identity_with(true, false, |step| {
+            owned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!owned.contains(&IdentityPreparation::WriteBankSelect));
+        assert!(!owned.contains(&IdentityPreparation::ReadBankSelect));
+        assert!(
+            !owned.contains(&IdentityPreparation::Freeze("TASK_COOKIE_B")),
+            "gate-0 freezes no bank storage"
+        );
+        let mut unowned = Vec::new();
+        prepare_identity_with(false, false, |step| {
+            unowned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!unowned.contains(&IdentityPreparation::WriteBankSelect));
+        assert!(!unowned.contains(&IdentityPreparation::ReadBankSelect));
     }
 
     #[test]
@@ -5401,6 +13680,813 @@ mod tests {
         assert_eq!(&detached[6..], &["exit", "exec"]);
     }
 
+    fn terminal_fixture_payload(
+        file: &std::fs::File,
+        producer: ProducerProgram,
+    ) -> (OwnedLink, ProducerProgram) {
+        (
+            OwnedLink::Multi(vec![file.try_clone().unwrap().into()]),
+            producer,
+        )
+    }
+
+    #[test]
+    fn owner_terminal_hooks_registered_control_joins_actual_original_ownership() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let original = Arc::downgrade(&file);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let mut source = Some(terminal_fixture_payload(
+            &file,
+            ProducerProgram::UProbe("p11_entry"),
+        ));
+        let mut calls = Vec::new();
+        let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
+            calls.push(family);
+            match family {
+                TerminalProducerFamily::Registered => source.take().into_iter().map(Ok).collect(),
+                TerminalProducerFamily::InstanceHooks => Vec::new(),
+            }
+        });
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        let mut detached = false;
+        let mut out = Vec::new();
+        job.drive(&mut failures, &mut detached, &mut 0, || false, &mut out)
+            .unwrap();
+        assert!(source.is_none() && detached);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|family| **family == TerminalProducerFamily::Registered)
+                .count(),
+            1
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("1/1 links released")
+        );
+    }
+
+    #[test]
+    fn owner_terminal_hooks_all_original_owners_enter_the_same_receipt() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let original = Arc::downgrade(&file);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let close_log = Arc::clone(&closed);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, program| {
+                if matches!(program, ProducerProgram::InstanceHook(_)) {
+                    let prior = close_log.lock().unwrap();
+                    assert!(prior.contains(&ProducerProgram::UProbe("p11_return")));
+                    assert!(
+                        prior.contains(&ProducerProgram::RawTracePoint("sched_process_exit")),
+                        "instance hooks retire after registered endpoint/lifecycle producers"
+                    );
+                    drop(prior);
+                    entered.send(()).unwrap();
+                    let _ = released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5));
+                }
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                close_log.lock().unwrap().push(program);
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let mut registered = vec![
+            terminal_fixture_payload(&file, ProducerProgram::UProbe("p11_entry")),
+            terminal_fixture_payload(&file, ProducerProgram::UProbe("p11_return")),
+            terminal_fixture_payload(&file, ProducerProgram::RawTracePoint("sched_process_exit")),
+        ];
+        let mut hooks: Vec<_> = INSTANCE_PROGRAMS
+            .iter()
+            .map(|(program, _)| {
+                terminal_fixture_payload(&file, ProducerProgram::InstanceHook(program))
+            })
+            .collect();
+        let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
+            std::mem::take(match family {
+                TerminalProducerFamily::Registered => &mut registered,
+                TerminalProducerFamily::InstanceHooks => &mut hooks,
+            })
+            .into_iter()
+            .map(Ok)
+            .collect()
+        });
+        let hook_started = entered_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        let before = worker.progress();
+        // Always release and actually join this owned worker before asserting,
+        // including the current registered-only RED implementation.
+        for _ in INSTANCE_PROGRAMS {
+            let _ = release.send(());
+        }
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        let mut detached = false;
+        let mut out = Vec::new();
+        let result = job.drive(&mut failures, &mut detached, &mut 0, || false, &mut out);
+        assert!(
+            hooks.is_empty(),
+            "a completed worker cannot omit the four original instance-hook owners"
+        );
+        assert!(
+            hook_started && before.released < before.total,
+            "an actual hook close must remain unsettled until its leaf returns"
+        );
+        result.unwrap();
+        assert!(detached);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("7/7 links released")
+        );
+    }
+
+    #[test]
+    fn owner_terminal_hooks_partial_take_failure_cannot_claim_complete() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|payload, _| {
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let mut registered = vec![terminal_fixture_payload(
+            &file,
+            ProducerProgram::UProbe("p11_entry"),
+        )];
+        let mut hooks: Vec<_> = INSTANCE_PROGRAMS
+            .iter()
+            .map(|(program, _)| {
+                terminal_fixture_payload(&file, ProducerProgram::InstanceHook(program))
+            })
+            .collect();
+        let mut refused_original = None;
+        let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
+            if family == TerminalProducerFamily::Registered {
+                return std::mem::take(&mut registered)
+                    .into_iter()
+                    .map(Ok)
+                    .collect();
+            }
+            let mut outcomes: Vec<_> = std::mem::take(&mut hooks).into_iter().map(Ok).collect();
+            let refused =
+                std::mem::replace(&mut outcomes[1], Err(anyhow!("original hook take refused")));
+            // Exactly as a failed Aya take: original owner remains in its
+            // registry envelope; the worker never acquires that handle.
+            refused_original = refused.ok();
+            outcomes
+        });
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        let mut detached = false;
+        let mut out = Vec::new();
+        let result = job.drive(&mut failures, &mut detached, &mut 0, || false, &mut out);
+        assert!(
+            result.is_err(),
+            "one failed original hook take must refuse completed cleanup"
+        );
+        assert!(!detached && refused_original.is_some());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup incomplete") && text.contains("1 uncertain"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn owner_terminal_prior_live_work_requires_the_original_joined_receipt() {
+        let file = std::sync::Arc::new(tempfile::tempfile().unwrap());
+        let original = std::sync::Arc::downgrade(&file);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let ticket = worker
+            .submit_live(
+                vec![(
+                    OwnedLink::Multi(vec![file.try_clone().unwrap().into()]),
+                    ProducerProgram::UProbe("p11_entry"),
+                )],
+                Arc::new(vec![file]),
+                DetachOrder,
+            )
+            .unwrap();
+        assert!(worker.has_submissions());
+        worker.begin_terminal();
+        // The terminal batch can be empty while earlier actual live work
+        // still belongs to this exact coordinator and receipt.
+        worker.submit(Vec::new(), Arc::default(), DetachOrder);
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        let mut detached = false;
+        let mut failures = Vec::new();
+        let mut wall = 0;
+        let mut out = Vec::new();
+        job.drive(&mut failures, &mut detached, &mut wall, || false, &mut out)
+            .unwrap();
+        assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+        assert!(
+            String::from_utf8(out.clone())
+                .unwrap()
+                .contains("1/1 links released")
+        );
+        job.drive(&mut failures, &mut detached, &mut wall, || true, &mut out)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out)
+                .unwrap()
+                .matches("cleanup completed")
+                .count(),
+            1
+        );
+        drop(ticket);
+    }
+
+    #[test]
+    fn selected_cleanup_poll_keeps_blocked_original_worker_until_joined_receipt() {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        worker.submit(
+            vec![(
+                OwnedLink::Multi(Vec::new()),
+                ProducerProgram::UProbe("p11_entry"),
+            )],
+            Arc::default(),
+            DetachOrder,
+        );
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        for _ in 0..4 {
+            assert!(
+                !job.ready_to_finish(),
+                "started close cannot grant settlement"
+            );
+            assert!(matches!(job, OwnedProducerDetach::Pending { .. }));
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !job.ready_to_finish() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(job, OwnedProducerDetach::Pending { .. }),
+            "readiness must not consume job"
+        );
+        let mut detached = false;
+        job.drive(
+            &mut Vec::new(),
+            &mut detached,
+            &mut 0,
+            || false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+    }
+
+    #[test]
+    fn owned_detach_poll_preserves_original_worker_and_leases() {
+        // A poll before begin is refused without consuming: the Session
+        // can still begin its owned detach afterwards.
+        let mut idle = OwnedProducerDetach::NotStarted;
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall = 0;
+        let error = idle
+            .poll(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                &mut std::io::sink(),
+            )
+            .expect_err("a poll before begin is refused");
+        assert_eq!(format!("{error:#}"), "owned producer detach not begun");
+        assert!(
+            matches!(idle, OwnedProducerDetach::NotStarted),
+            "a refused poll keeps NotStarted for the later begin"
+        );
+        assert!(!detached && failures.is_empty());
+
+        // A real worker with a blocked closer and a real lease file.
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let lease = Arc::downgrade(&file);
+        let mut source = Some(terminal_fixture_payload(
+            &file,
+            ProducerProgram::UProbe("p11_entry"),
+        ));
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        worker.submit(
+            source.take().into_iter().collect(),
+            Arc::new(vec![file]),
+            DetachOrder,
+        );
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        let original = match &job {
+            OwnedProducerDetach::Pending { worker, .. } => worker.original_thread_id(),
+            _ => None,
+        };
+        assert!(original.is_some(), "the owned worker thread is prestarted");
+        assert!(source.is_none());
+        for _ in 0..3 {
+            let progress = job
+                .poll(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    &mut std::io::sink(),
+                )
+                .unwrap();
+            assert!(
+                matches!(progress, ProducerDetachProgress::Pending),
+                "a blocked close keeps the owned detach pending"
+            );
+            match &job {
+                OwnedProducerDetach::Pending { worker, .. } => assert_eq!(
+                    worker.original_thread_id(),
+                    original,
+                    "a pending poll keeps the SAME worker thread"
+                ),
+                _ => panic!("a pending poll must not consume the owned job"),
+            }
+            assert!(!detached && failures.is_empty());
+            assert!(
+                lease.upgrade().is_some_and(|file| file.metadata().is_ok()),
+                "a pending poll keeps the original leases"
+            );
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    &mut std::io::sink(),
+                )
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(detached && failures.is_empty());
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        // Completion is idempotent: a settled poll stays settled.
+        let progress = job
+            .poll(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                &mut std::io::sink(),
+            )
+            .unwrap();
+        assert!(matches!(progress, ProducerDetachProgress::Complete));
+        assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+
+        // An unproved job stays unproved and refuses idempotently.
+        let mut job = OwnedProducerDetach::Unproved;
+        let mut detached = false;
+        assert!(
+            job.poll(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                &mut std::io::sink()
+            )
+            .is_err(),
+            "an unproved poll stays a refusal"
+        );
+        assert!(!detached && matches!(job, OwnedProducerDetach::Unproved));
+    }
+
+    /// A gated detach job over `singles` single links with a scripted
+    /// worker clock: polls stay Pending until one release per link.
+    fn gated_detach_job(
+        singles: usize,
+    ) -> (
+        OwnedProducerDetach,
+        Arc<std::sync::Mutex<std::time::Duration>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let now = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+        let worker_now = Arc::clone(&now);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                released
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("one release per link");
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(move || *worker_now.lock().unwrap()),
+        );
+        worker.submit(
+            (0..singles)
+                .map(|_| (OwnedLink::TestSingle, ProducerProgram::UProbe("p11_entry")))
+                .collect(),
+            Arc::default(),
+            DetachOrder,
+        );
+        let job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        (job, now, release)
+    }
+
+    #[test]
+    fn owned_detach_poll_writes_stop_estimate_once_and_progress_on_cadence() {
+        let (mut job, now, release) = gated_detach_job(40);
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall_ms = 0;
+        let mut out = Vec::new();
+        // The first pending poll prints only the one-shot estimate.
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("progress lines are UTF-8"),
+            "p11scope: closing 40 probe links one at a time (no batched uprobe detach on this kernel); about 2 s, progress follows\n",
+            "the first pending poll prints only the one-shot estimate"
+        );
+        // Half a second in: still no progress line.
+        *now.lock().unwrap() = std::time::Duration::from_millis(500);
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            !text.contains("cleanup "),
+            "no progress before the 1 s cadence: {text:?}"
+        );
+        // Past one second: the progress line follows, the estimate
+        // stays one-shot.
+        *now.lock().unwrap() = std::time::Duration::from_secs(2);
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            text.contains("p11scope: cleanup 0/40 links released, 2 s\n"),
+            "progress follows on cadence: {text:?}"
+        );
+        assert_eq!(
+            text.matches("probe links one at a time").count(),
+            1,
+            "the estimate stays one-shot"
+        );
+        // Same second: no duplicate progress.
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert_eq!(
+            text.matches("cleanup ").count(),
+            1,
+            "no duplicate within the cadence"
+        );
+        // Release every link and drain to completion (bounded).
+        for _ in 0..40 {
+            release.send(()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert_eq!(
+            text.matches("probe links one at a time").count(),
+            1,
+            "one estimate per stop"
+        );
+        assert_eq!(
+            text.matches("cleanup ").count(),
+            1,
+            "the drain prints no further progress at the same clock"
+        );
+    }
+
+    #[test]
+    fn owned_detach_poll_writes_no_estimate_below_two_second_floor() {
+        let (mut job, now, release) = gated_detach_job(1);
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall_ms = 0;
+        let mut out = Vec::new();
+        // Below the floor and the cadence: silent.
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(text.is_empty(), "a quick stop stays silent: {text:?}");
+        // Past one second: progress follows, still no estimate.
+        *now.lock().unwrap() = std::time::Duration::from_secs(2);
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            text.contains("p11scope: cleanup 0/1 links released, 2 s\n"),
+            "progress follows on cadence: {text:?}"
+        );
+        assert!(
+            !text.contains("probe links one at a time"),
+            "no estimate below the 2 s floor: {text:?}"
+        );
+        // Release the link and drain to completion (bounded).
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            !text.contains("probe links one at a time"),
+            "no estimate below the 2 s floor: {text:?}"
+        );
+    }
+
+    #[test]
+    fn owner_terminal_interrupted_job_cannot_turn_empty_into_success() {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let worker = CleanupWorker::pre_start_with_spawn(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+            |task| {
+                Ok(std::thread::spawn(move || {
+                    task();
+                    let _ = done.send(());
+                }))
+            },
+        );
+        worker.submit(
+            vec![(
+                OwnedLink::Multi(vec![tempfile::tempfile().unwrap().into()]),
+                ProducerProgram::UProbe("p11_return"),
+            )],
+            Arc::default(),
+            DetachOrder,
+        );
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let progress = worker.progress();
+        assert_eq!(
+            (progress.attempted, progress.released, progress.remaining),
+            (1, 0, 0)
+        );
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
+        };
+        let mut detached = false;
+        let mut failures = Vec::new();
+        let mut wall = 0;
+        let result = job.drive(
+            &mut failures,
+            &mut detached,
+            &mut wall,
+            || true,
+            &mut Vec::new(),
+        );
+        // Drain every actual test-owned close/coordinator before asserting.
+        release.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(result.unwrap_err().is::<CleanupInterrupted>());
+        assert!(!detached && matches!(job, OwnedProducerDetach::Unproved));
+        assert!(
+            job.drive(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                || false,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        assert!(!detached);
+        assert!(
+            !job.ready_to_finish(),
+            "abandoned cleanup cannot become retry permission"
+        );
+    }
+
+    #[test]
+    fn owner_terminal_partial_transfer_and_close_failure_stay_unproved() {
+        for mode in 0..3 {
+            let worker = CleanupWorker::pre_start_with(
+                Box::new(move |payload, _| {
+                    drop(payload.take());
+                    match mode {
+                        0 => Ok(()),
+                        1 => Err("injected close failure".into()),
+                        _ => panic!("injected close panic"),
+                    }
+                }),
+                Arc::new(|| std::time::Duration::ZERO),
+            );
+            let mut failures = Vec::new();
+            if mode == 0 {
+                worker.note_transfer_failed(1);
+                failures.push("original Aya registry transfer refused".into());
+            }
+            worker.submit(
+                vec![(
+                    OwnedLink::Multi(Vec::new()),
+                    ProducerProgram::UProbe("p11_entry"),
+                )],
+                Arc::default(),
+                DetachOrder,
+            );
+            let mut job = OwnedProducerDetach::Pending {
+                worker,
+                started: std::time::Instant::now(),
+                had_work: true,
+                progress: cleanup_worker::DetachPollPrinter::new(),
+            };
+            let mut detached = false;
+            let mut wall = 0;
+            assert!(
+                job.drive(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    || false,
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+            assert!(!detached && !failures.is_empty());
+            assert!(
+                job.drive(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    || false,
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+            assert!(!detached);
+        }
+    }
+
     #[test]
     fn failed_then_empty_detach_stays_uncertain_and_refuses_new_links() {
         let failures = vec!["detach failed".into()];
@@ -5427,6 +14513,453 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_admits_slots_outside_the_failed_index() {
+        // Ruling JK-22a: one detach failure quarantines only its own slot.
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Slot(7)].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            DetachQuarantine::Slot(7),
+            "detaching p11_return: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        // The failed index itself stays refused, with its reason.
+        let refused =
+            attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+                .unwrap_err()
+                .to_string();
+        assert!(refused.contains("slot 7"), "{refused}");
+        assert!(refused.contains("detaching p11_return"), "{refused}");
+        // Unrelated targets admit.
+        attachment_admission_for(
+            &quarantine,
+            &reasons,
+            &ProposedAttachment::Slots(vec![8, 9]),
+        )
+        .expect("unrelated slots admit");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::None)
+            .expect("an empty proposal admits");
+    }
+
+    #[test]
+    fn quarantine_admits_dynamic_hooks_outside_the_failed_identity() {
+        let failed = DetachQuarantine::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+        };
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [failed.clone()].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            failed,
+            "detaching dl_debug_state: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let same = ProposedAttachment::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+        };
+        let refused = attachment_admission_for(&quarantine, &reasons, &same)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("quarantined"), "{refused}");
+        assert!(refused.contains("detaching dl_debug_state"), "{refused}");
+        // A different cookie is a different hook: it admits, as do slots
+        // and diagnostic probes, which share no bookkeeping with it.
+        let other_cookie = ProposedAttachment::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5556,
+        };
+        attachment_admission_for(&quarantine, &reasons, &other_cookie)
+            .expect("an unrelated hook admits");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+            .expect("slots admit beside a dynamic quarantine");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Diagnostic)
+            .expect("a diagnostic probe admits beside a dynamic quarantine");
+    }
+
+    #[test]
+    fn quarantine_maps_a_multi_group_to_its_member_slots() {
+        let link = RegisteredLink::MultiUProbe {
+            program: "p11_return",
+            slots: vec![3, 5],
+            fds: Vec::new(),
+            registration: None,
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&link),
+            vec![DetachQuarantine::Slot(3), DetachQuarantine::Slot(5)]
+        );
+    }
+
+    #[test]
+    fn global_quarantine_refuses_every_addition() {
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Global].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            DetachQuarantine::Global,
+            "closing selected native admission: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]),)
+                .is_err()
+        );
+        assert!(
+            attachment_admission_for(
+                &quarantine,
+                &reasons,
+                &ProposedAttachment::Dynamic {
+                    context: 1,
+                    object: PinnedObjectId(3),
+                    file_offset: 0x1000,
+                    cookie: 0x5555,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Diagnostic)
+                .is_err()
+        );
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::None)
+            .expect("an empty proposal admits");
+    }
+
+    #[test]
+    fn empty_quarantine_admits_everything() {
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            std::collections::BTreeSet::new();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> =
+            std::collections::BTreeMap::new();
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+            .expect("slots admit with no failures");
+        attachment_admission_for(
+            &quarantine,
+            &reasons,
+            &ProposedAttachment::Dynamic {
+                context: 1,
+                object: PinnedObjectId(3),
+                file_offset: 0x1000,
+                cookie: 0x5555,
+            },
+        )
+        .expect("hooks admit with no failures");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Diagnostic)
+            .expect("diagnostics admit with no failures");
+    }
+
+    /// A dummy aya uprobe link id for identity-projection tests. Never
+    /// attached or detached; only `DetachQuarantine::of_link` (which ignores
+    /// the id) reads these links.
+    /// SAFETY: `UProbeLinkId` (aya 0.14.0-p2) is a plain id value: nested
+    /// enums over `RawFd` integers, no `Drop`, no kernel ownership. All-zero
+    /// bytes select each enum's first variant (`One`/`FdLinkId`) with fd 0,
+    /// a valid (if meaningless) value that is safe to create, match, and
+    /// drop. These dummies never reach real attach/detach.
+    fn dummy_uprobe_link_id() -> UProbeLinkId {
+        unsafe { std::mem::MaybeUninit::<UProbeLinkId>::zeroed().assume_init() }
+    }
+
+    /// A dummy aya raw-tracepoint link id, same contract as
+    /// [`dummy_uprobe_link_id`]: `RawTracePointLinkId` wraps `FdLinkId`
+    /// (`RawFd`), so all-zero bytes are the valid id 0.
+    fn dummy_raw_link_id() -> RawTracePointLinkId {
+        unsafe { std::mem::MaybeUninit::<RawTracePointLinkId>::zeroed().assume_init() }
+    }
+
+    /// A dummy aya btf-tracepoint link id, same contract as
+    /// [`dummy_uprobe_link_id`]: `BtfTracePointLinkId` wraps `FdLinkId`
+    /// (`RawFd`), so all-zero bytes are the valid id 0.
+    fn dummy_btf_link_id() -> BtfTracePointLinkId {
+        unsafe { std::mem::MaybeUninit::<BtfTracePointLinkId>::zeroed().assume_init() }
+    }
+
+    #[test]
+    fn quarantine_of_link_maps_a_single_uprobe_to_its_slot() {
+        let link = RegisteredLink::UProbe {
+            program: "p11_return",
+            slot: 7,
+            id: dummy_uprobe_link_id(),
+            registration: None,
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&link),
+            vec![DetachQuarantine::Slot(7)]
+        );
+    }
+
+    #[test]
+    fn quarantine_of_link_maps_a_dynamic_hook_to_its_identity() {
+        let link = RegisteredLink::DynamicUProbe {
+            program: "function_list_entry",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: Some(HookAbi::FunctionList),
+            id: dummy_uprobe_link_id(),
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&link),
+            vec![DetachQuarantine::Dynamic {
+                context: 1,
+                object: PinnedObjectId(3),
+                file_offset: 0x1000,
+                cookie: 0x5555,
+            }]
+        );
+    }
+
+    #[test]
+    fn quarantine_of_link_shares_one_identity_across_loader_and_export_programs() {
+        // Entry/return and loader/export programs at the same hook tuple
+        // share one quarantine identity: the key omits program/ABI by
+        // design (fail-closed; see `DetachQuarantine::Dynamic`).
+        let loader = RegisteredLink::DynamicUProbe {
+            program: "dl_debug_state",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: None,
+            id: dummy_uprobe_link_id(),
+        };
+        let export = RegisteredLink::DynamicUProbe {
+            program: "function_list_return",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: Some(HookAbi::FunctionList),
+            id: dummy_uprobe_link_id(),
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&loader),
+            DetachQuarantine::of_link(&export)
+        );
+    }
+
+    #[test]
+    fn quarantine_of_link_maps_unattributed_links_globally() {
+        let diagnostic = RegisteredLink::DiagnosticUProbe {
+            program: "p11_entry",
+            id: dummy_uprobe_link_id(),
+        };
+        let raw = RegisteredLink::RawTracePoint {
+            program: "sched_process_exec",
+            id: dummy_raw_link_id(),
+        };
+        let btf = RegisteredLink::BtfTracePoint {
+            program: "task_newtask",
+            id: dummy_btf_link_id(),
+        };
+        for link in [&diagnostic, &raw, &btf] {
+            assert_eq!(
+                DetachQuarantine::of_link(link),
+                vec![DetachQuarantine::Global],
+                "unattributed links quarantine globally"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_partition_splits_mixed_proposals() {
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Slot(7)].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            DetachQuarantine::Slot(7),
+            "detaching p11_return: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        // Mixed: the quarantined index splits out, unrelated proceed.
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[7, 8])
+            .expect("a mixed proposal partitions instead of refusing");
+        assert_eq!(admitted, vec![8]);
+        assert_eq!(quarantined, vec![7]);
+        // All quarantined: nothing admitted, all listed.
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[7])
+            .expect("an all-quarantined proposal partitions");
+        assert!(admitted.is_empty());
+        assert_eq!(quarantined, vec![7]);
+        // Empty and healthy proposals pass through.
+        let (admitted, quarantined) =
+            partition_slots(&quarantine, &reasons, &[]).expect("an empty proposal partitions");
+        assert!(admitted.is_empty() && quarantined.is_empty());
+        let (admitted, quarantined) =
+            partition_slots(&quarantine, &reasons, &[8, 9]).expect("a healthy proposal partitions");
+        assert_eq!(admitted, vec![8, 9]);
+        assert!(quarantined.is_empty());
+    }
+
+    #[test]
+    fn quarantine_partition_keeps_global_whole_batch() {
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Global].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            DetachQuarantine::Global,
+            "closing selected native admission: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        // A global quarantine refuses every non-empty batch, as before.
+        assert!(
+            partition_slots(&quarantine, &reasons, &[7, 8]).is_err(),
+            "global stays whole-batch"
+        );
+        // An empty proposal still admits (idempotent no-op).
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[])
+            .expect("an empty proposal admits under global quarantine");
+        assert!(admitted.is_empty() && quarantined.is_empty());
+    }
+
+    #[test]
+    fn quarantine_record_then_partition_refuses_only_the_failed_slot() {
+        // Production wiring (no Session/BPF): the failed link's identity
+        // records through the shared record path, then the batch partitions.
+        let link = RegisteredLink::UProbe {
+            program: "p11_return",
+            slot: 7,
+            id: dummy_uprobe_link_id(),
+            registration: None,
+        };
+        let keys = DetachQuarantine::of_link(&link);
+        let mut quarantine = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            keys,
+            "detaching p11_return: link not found".to_string(),
+        );
+        assert_eq!(failures.len(), 1, "the failure message is kept");
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[7, 8])
+            .expect("the mixed batch partitions around the failed slot");
+        assert_eq!(admitted, vec![8]);
+        assert_eq!(quarantined, vec![7]);
+        let refused =
+            attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+                .unwrap_err()
+                .to_string();
+        assert!(refused.contains("slot 7"), "{refused}");
+        assert!(refused.contains("detaching p11_return"), "{refused}");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![8]))
+            .expect("the unrelated slot admits");
+    }
+
+    #[test]
+    fn quarantine_record_then_admit_refuses_only_the_failed_dynamic_hook() {
+        let link = RegisteredLink::DynamicUProbe {
+            program: "dl_debug_state",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: None,
+            id: dummy_uprobe_link_id(),
+        };
+        let keys = DetachQuarantine::of_link(&link);
+        let mut quarantine = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            keys,
+            "detaching dl_debug_state: link not found".to_string(),
+        );
+        let same = ProposedAttachment::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+        };
+        let refused = attachment_admission_for(&quarantine, &reasons, &same)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("quarantined"), "{refused}");
+        assert!(refused.contains("detaching dl_debug_state"), "{refused}");
+        let other_cookie = ProposedAttachment::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5556,
+        };
+        attachment_admission_for(&quarantine, &reasons, &other_cookie)
+            .expect("an unrelated hook admits");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+            .expect("slots admit beside a dynamic quarantine");
+    }
+
+    #[test]
+    fn quarantine_stop_flags_only_a_global_quarantine() {
+        let empty: std::collections::BTreeSet<DetachQuarantine> = std::collections::BTreeSet::new();
+        assert!(!is_quarantine_stopped(&empty), "empty never stops");
+        let slot: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Slot(7)].into_iter().collect();
+        assert!(
+            !is_quarantine_stopped(&slot),
+            "a per-slot quarantine admits unrelated targets"
+        );
+        let dynamic: std::collections::BTreeSet<DetachQuarantine> = [DetachQuarantine::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+        }]
+        .into_iter()
+        .collect();
+        assert!(
+            !is_quarantine_stopped(&dynamic),
+            "a per-hook quarantine admits unrelated targets"
+        );
+        let global: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Global].into_iter().collect();
+        assert!(
+            is_quarantine_stopped(&global),
+            "a global quarantine keeps the session-wide refusal"
+        );
+    }
+
+    #[test]
+    fn quarantine_record_keeps_the_first_reason_per_unit() {
+        let mut quarantine = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            vec![DetachQuarantine::Slot(7)],
+            "first failure".to_string(),
+        );
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            vec![DetachQuarantine::Slot(7)],
+            "second failure".to_string(),
+        );
+        assert_eq!(failures.len(), 2, "every message is kept");
+        assert_eq!(
+            reasons.get(&DetachQuarantine::Slot(7)).map(String::as_str),
+            Some("first failure"),
+            "the first reason wins"
+        );
+    }
+
+    #[test]
     fn unsupported_environment_hint_preserves_the_underlying_error_chain() {
         #[derive(Debug)]
         struct Injected;
@@ -5446,7 +14979,263 @@ mod tests {
         assert!(rendered.contains("injected loader failure"));
         assert!(rendered.contains(UNSUPPORTED_ENV_HINT));
     }
+
     use super::*;
+
+    #[test]
+    fn verifier_budget_refusal_gets_verifier_hint_not_privilege_hint() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new("Processed 1000001 insn".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading p11_return"), "{rendered}");
+        assert!(rendered.contains("too complex"), "{rendered}");
+        assert!(rendered.contains("p11scope doctor"), "{rendered}");
+        assert!(!rendered.contains("CAP_BPF"), "{rendered}");
+        assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+    }
+
+    #[test]
+    fn log_exhaustion_refusal_gets_verifier_hint_not_privilege_hint() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+                verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading p11_return"), "{rendered}");
+        assert!(
+            rendered.contains("verifier log filled during a very long check"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("too complex"), "{rendered}");
+        assert!(rendered.contains("p11scope doctor"), "{rendered}");
+        assert!(!rendered.contains("CAP_BPF"), "{rendered}");
+        assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+    }
+
+    #[test]
+    fn budget_hint_names_e2big_for_complexity_refusals() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new("Processed 1000001 insn".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("(E2BIG)"), "{rendered}");
+        assert!(!rendered.contains("ENOSPC"), "{rendered}");
+    }
+
+    #[test]
+    fn log_exhaustion_hint_names_enospc_not_e2big() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+                verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("verifier log filled during a very long check"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("usually the complexity limit"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("too complex"), "{rendered}");
+        assert!(rendered.contains("ENOSPC"), "{rendered}");
+        assert!(!rendered.contains("(E2BIG)"), "{rendered}");
+        assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+    }
+
+    #[test]
+    fn permission_refusal_keeps_unsupported_environment_hint() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+                verifier_log: aya_obj::VerifierLog::new("denied".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading p11_return"), "{rendered}");
+        assert!(rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+        assert!(!rendered.contains("too complex"), "{rendered}");
+    }
+
+    #[test]
+    fn refused_program_load_prints_bounded_summary_not_raw_log() {
+        // A refused Detailed program used to dump aya's whole verifier log
+        // on stderr (up to about 16 MiB after a log-exhausting refusal).
+        // The seam keeps the program name, the errno name and number, and
+        // a short tail of the log, naming the truncation with the original
+        // byte count — the same bounded shape as the inventory gap reason.
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        assert_eq!(log.len(), 300 * 1024);
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new(log),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.len() <= 1024,
+            "seam output must stay bounded: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains(r#"program "p11_return" refused"#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("E2BIG (os error 7)"), "{rendered}");
+        assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
+        assert!(rendered.contains("307200 verifier-log bytes"), "{rendered}");
+        assert!(
+            !rendered.contains(&"f".repeat(1024)),
+            "the raw log must not survive the seam"
+        );
+    }
+
+    #[test]
+    fn counter_root_refusal_names_the_program_from_its_loading_context() {
+        // Counter-root loads name the program as `loading private counter
+        // root {program}` (src/attach/counter_banks.rs:2485,
+        // `validate_and_load`); a non-budget refusal there must name the
+        // program, not "unknown program". Fails while the extractor misses
+        // that shape.
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+                verifier_log: aya_obj::VerifierLog::new("denied".to_string()),
+            })
+            .context("loading private counter root function_list_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(r#"program "function_list_return" refused"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unknown program"), "{rendered}");
+    }
+
+    /// The production wrappers the CLI-level stderr mirror reproduces: `run`
+    /// adds the start context (`run.rs`), `main` adds the `p11scope: ` prefix
+    /// (`main.rs`). Both the mirror and the pin below read these constants,
+    /// so drift in either direction fails a test.
+    const STDERR_MIRROR_START_CONTEXT: &str = "starting attach session";
+    const STDERR_MIRROR_MAIN_PREFIX: &str = "p11scope: ";
+
+    fn production_wrappers_match(main: &str, run: &str) -> bool {
+        main.contains(&format!("\"{STDERR_MIRROR_MAIN_PREFIX}{{e:#}}\""))
+            && run.contains(&format!(".context(\"{STDERR_MIRROR_START_CONTEXT}\")"))
+    }
+
+    #[test]
+    fn stderr_bound_mirror_pins_production_wrappers() {
+        // The CLI-level bound test mirrors the `run`/`main` wrappers as
+        // literals because the binary entry point is not callable from a
+        // unit test; this pin fails if production or the mirror drifts. The
+        // mutants prove the pin itself is non-vacuous.
+        let main = include_str!("main.rs");
+        let run = include_str!("run.rs");
+        assert!(
+            production_wrappers_match(main, run),
+            "the mirror must track the production wrappers"
+        );
+        let main_mutant = main.replacen("p11scope: {e:#}", "p11scope!", 1);
+        assert_ne!(main_mutant, main);
+        assert!(
+            !production_wrappers_match(&main_mutant, run),
+            "a changed main wrapper must fail the pin"
+        );
+        let run_mutant = run.replace("starting attach session", "beginning");
+        assert_ne!(run_mutant, run);
+        assert!(
+            !production_wrappers_match(main, &run_mutant),
+            "a changed run context must fail the pin"
+        );
+    }
+
+    #[test]
+    fn refused_program_start_stays_within_the_stderr_bound() {
+        // CLI level: the same wrappers `run`/`capture` (run.rs "starting
+        // attach session") and `main` ("p11scope: {e:#}") apply, mirrored
+        // here because the binary entry point is not callable from a unit
+        // test. The mirror reads the pinned constants above, so drift fails
+        // `stderr_bound_mirror_pins_production_wrappers`. The exit code
+        // stays 1.
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new(log),
+            })
+            .context("loading p11_return"),
+        );
+        let error = error.context(STDERR_MIRROR_START_CONTEXT);
+        let stderr = format!("{STDERR_MIRROR_MAIN_PREFIX}{error:#}");
+        assert!(
+            stderr.len() <= 1024,
+            "stderr must stay bounded: {} bytes",
+            stderr.len()
+        );
+        assert!(
+            stderr.contains(r#"program "p11_return" refused"#),
+            "{stderr}"
+        );
+        assert!(stderr.contains("E2BIG (os error 7)"), "{stderr}");
+        assert!(stderr.contains("TAIL-MARKER"), "{stderr}");
+        assert!(stderr.contains("307200 verifier-log bytes"), "{stderr}");
+        assert_eq!(crate::failure_exit_code(&error), 1);
+    }
+
+    #[test]
+    fn stderr_bound_leaves_room_for_hint_and_wrappers() {
+        // Premise behind the CLI-level stderr bound: every hint plus the
+        // fixed `main`/`run` wrappers must leave room for the bounded
+        // refusal summary within 1024 bytes. Lengthening a hint past this
+        // fails here instead of silently breaking the bound.
+        let wrappers = STDERR_MIRROR_MAIN_PREFIX.len()
+            + STDERR_MIRROR_START_CONTEXT.len()
+            + ": ".len()
+            + ": ".len()
+            + 1;
+        for hint in [
+            UNSUPPORTED_ENV_HINT,
+            VERIFIER_BUDGET_HINT,
+            VERIFIER_BUDGET_HINT_LOG_EXHAUSTION,
+        ] {
+            assert!(
+                hint.len() + STDERR_LOAD_REFUSAL_MAX_BYTES + wrappers <= 1024,
+                "hint too long for the stderr bound: {} bytes",
+                hint.len()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_environment_context_keeps_non_load_errors_verbatim() {
+        // Only a genuine program-load refusal is summarized; any other
+        // failure keeps its chain, with the hint added in front.
+        let before = anyhow::anyhow!("some other failure").context("starting workers");
+        let expected = format!("{before:#}");
+        let after = unsupported_environment_context(before);
+        let rendered = format!("{after:#}");
+        assert!(rendered.starts_with(UNSUPPORTED_ENV_HINT), "{rendered}");
+        assert!(rendered.ends_with(&expected), "{rendered}");
+    }
 
     fn expected_preparation(unsafe_object: bool) -> Vec<SessionPreparation> {
         use SessionPreparation::*;
@@ -5461,6 +15250,7 @@ mod tests {
             PublishAsync,
             PublishShapes,
             PublishAttributes,
+            PublishObjects,
             FreezePublished,
             SelectScope,
             LoadProgram("dl_debug_state"),
@@ -5487,8 +15277,10 @@ mod tests {
             LoadProgram("sched_process_exec"),
             LoadProgram("sched_process_exit"),
             LoadProgram("task_newtask"),
+            LoadImagePrograms,
             FreezeDeferred("CONFIG"),
             FreezeDeferred("DESCRIPTORS"),
+            FreezeDeferred("OBJECT_DESCRIPTORS"),
             PublishTailCalls,
             PrepareEventsDomain,
         ]);
@@ -5496,10 +15288,388 @@ mod tests {
     }
 
     #[test]
+    fn image_program_load_precedes_deferred_freeze_and_lifecycle_activation() {
+        for unsafe_object in [false, true] {
+            let image_loaded = std::cell::Cell::new(false);
+            let deferred_frozen = std::cell::Cell::new(0);
+            let activation_called = std::cell::Cell::new(false);
+            let preparation =
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                    if step == SessionPreparation::LoadImagePrograms {
+                        assert_eq!(deferred_frozen.get(), 0);
+                        image_loaded.set(true);
+                    }
+                    if let SessionPreparation::FreezeDeferred(_) = step {
+                        anyhow::ensure!(
+                            image_loaded.get(),
+                            "native query/hooks must load before deferred policy freeze"
+                        );
+                        deferred_frozen.set(deferred_frozen.get() + 1);
+                    }
+                    Ok(())
+                });
+            activate_after_preparation_with(preparation, || {
+                assert!(image_loaded.get());
+                assert_eq!(deferred_frozen.get(), 3);
+                activation_called.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(activation_called.get());
+        }
+    }
+
+    #[test]
+    fn counter_program_load_precedes_deferred_freeze_and_activation() {
+        for roots in [StaticRoots::Detailed, StaticRoots::CounterBanks] {
+            for fail_counter in [false, true] {
+                let mut seen = Vec::new();
+                let mut activated = false;
+                let preparation = prepare_session_with(false, roots, false, |step| {
+                    if step == SessionPreparation::LoadCounterPrograms {
+                        anyhow::ensure!(
+                            !seen.iter().any(|step| matches!(
+                                step,
+                                SessionPreparation::FreezeDeferred(_)
+                                    | SessionPreparation::PublishTailCalls
+                            )),
+                            "counter roots must load before readonly policy freezes"
+                        );
+                    }
+                    seen.push(step);
+                    if fail_counter && step == SessionPreparation::LoadCounterPrograms {
+                        anyhow::bail!("injected counter root load failure");
+                    }
+                    Ok(())
+                });
+                let result = activate_after_preparation_with(preparation, || {
+                    activated = true;
+                    Ok(())
+                });
+                if roots == StaticRoots::CounterBanks {
+                    let load = seen
+                        .iter()
+                        .position(|step| *step == SessionPreparation::LoadCounterPrograms)
+                        .unwrap();
+                    assert_eq!(
+                        seen.iter()
+                            .filter(|step| { **step == SessionPreparation::LoadCounterPrograms })
+                            .count(),
+                        1
+                    );
+                    if fail_counter {
+                        assert!(result.is_err());
+                        assert!(!activated);
+                        assert_eq!(seen.last(), Some(&SessionPreparation::LoadCounterPrograms));
+                    } else {
+                        result.unwrap();
+                        assert!(activated);
+                        let freeze = seen
+                            .iter()
+                            .position(|step| matches!(step, SessionPreparation::FreezeDeferred(_)))
+                            .unwrap();
+                        assert!(load < freeze);
+                    }
+                } else {
+                    result.unwrap();
+                    assert!(activated);
+                    assert_eq!(seen, expected_preparation(false));
+                }
+            }
+        }
+    }
+
+    fn expected_preparation_journal() -> Vec<SessionPreparation> {
+        use SessionPreparation::*;
+        let mut steps = vec![
+            ValidatePolicy,
+            ValidateRuntime,
+            ValidateStopGate,
+            ValidatePrograms,
+            PublishScope,
+            PrepareIdentity,
+            PublishDescriptors,
+            PublishAsync,
+            PublishShapes,
+            PublishAttributes,
+            PublishObjects,
+            PublishJournalClasses,
+            FreezePublished,
+            SelectScope,
+        ];
+        steps.extend(
+            super::journal::journal_expected_programs()
+                .into_iter()
+                .map(LoadProgram),
+        );
+        steps.extend([
+            LoadImagePrograms,
+            FreezeDeferred("CONFIG"),
+            FreezeDeferred("DESCRIPTORS"),
+            FreezeDeferred("OBJECT_DESCRIPTORS"),
+            FreezeDeferred("JOURNAL_CLASSES"),
+            PublishTailCalls,
+            PrepareEventsDomain,
+        ]);
+        steps
+    }
+
+    /// Journal roots add class publication immediately before the published
+    /// freeze, load the swapped pair, and freeze the class array after the
+    /// loads. The ordinary order is unchanged, and a class-fill failure
+    /// stops preparation with no activation.
+    #[test]
+    fn journal_preparation_orders_classes_before_freeze_and_pair_at_load() {
+        let mut ordinary = Vec::new();
+        prepare_session_with(false, StaticRoots::Detailed, false, |step| {
+            ordinary.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ordinary, expected_preparation(false));
+        let expected = expected_preparation_journal();
+        for unsafe_object in [false, true] {
+            let mut seen = Vec::new();
+            prepare_session_with(unsafe_object, StaticRoots::Detailed, true, |step| {
+                seen.push(step);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, expected);
+        }
+        let classes = expected
+            .iter()
+            .position(|step| *step == SessionPreparation::PublishJournalClasses)
+            .unwrap();
+        let freeze = expected
+            .iter()
+            .position(|step| *step == SessionPreparation::FreezePublished)
+            .unwrap();
+        assert_eq!(classes + 1, freeze);
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|step| **step == SessionPreparation::PublishJournalClasses)
+                .count(),
+            1
+        );
+        let loads: Vec<_> = expected
+            .iter()
+            .filter_map(|step| match step {
+                SessionPreparation::LoadProgram(name) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        assert!(loads.contains(&"p11_entry_journal"));
+        assert!(loads.contains(&"p11_return_journal"));
+        assert!(!loads.contains(&"p11_entry"));
+        assert!(!loads.contains(&"p11_return"));
+        assert_eq!(
+            loads,
+            super::journal::journal_expected_programs()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        let last_load = expected
+            .iter()
+            .rposition(|step| matches!(step, SessionPreparation::LoadProgram(_)))
+            .unwrap();
+        let classes_freeze = expected
+            .iter()
+            .position(|step| *step == SessionPreparation::FreezeDeferred("JOURNAL_CLASSES"))
+            .unwrap();
+        assert!(last_load < classes_freeze);
+        assert!(!expected.contains(&SessionPreparation::LoadCounterPrograms));
+        for fail_classes in [false, true] {
+            let mut seen = Vec::new();
+            let mut activated = false;
+            let preparation = prepare_session_with(false, StaticRoots::Detailed, true, |step| {
+                seen.push(step);
+                if fail_classes && step == SessionPreparation::PublishJournalClasses {
+                    anyhow::bail!("injected journal class fill failure");
+                }
+                Ok(())
+            });
+            let result = activate_after_preparation_with(preparation, || {
+                activated = true;
+                Ok(())
+            });
+            if fail_classes {
+                assert!(result.is_err());
+                assert!(!activated);
+                assert_eq!(
+                    seen.last(),
+                    Some(&SessionPreparation::PublishJournalClasses)
+                );
+            } else {
+                result.unwrap();
+                assert!(activated);
+                assert_eq!(seen, expected);
+            }
+        }
+    }
+
+    /// R-a: without a built production object the Session preparation
+    /// reports the finite unbuilt reason before any load or attach. The
+    /// journal-selected configuration instead resolves through the
+    /// flavor-acceptance twin; ordinary preparation is unchanged above.
+    #[test]
+    fn journal_unbuilt_reports_unlinked_through_session_preparation() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "journal-v1");
+            return;
+        }
+        let scope = Scope::System;
+        let error = Session::prepare_inner_unlinked(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(&journal::JournalSpec),
+            false,
+        )
+        .err()
+        .expect("unbuilt journal preparation refuses");
+        assert!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "{error:#}"
+        );
+    }
+
+    /// R-b: corrupt journal object bytes refuse the Session before any
+    /// load, naming the journal flavor.
+    #[test]
+    fn journal_pair_load_error_refuses_session_before_any_load() {
+        let scope = Scope::System;
+        let prepared = journal::JournalPreparation {
+            object: b"not an ELF object",
+        };
+        let error = Session::prepare_inner_unlinked_with_object(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(prepared),
+            false,
+        )
+        .err()
+        .expect("corrupt journal bytes refuse");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot determine journal BPF object flavor"),
+            "{text}"
+        );
+    }
+
+    /// R-c: journal bytes without the pair refuse with both roots named.
+    /// Ordinary bytes are the durable partial-attach fixture: they parse
+    /// but carry neither journal root.
+    #[test]
+    fn journal_pair_missing_from_inventory_refuses_with_named_roots() {
+        let scope = Scope::System;
+        let prepared = journal::JournalPreparation {
+            object: crate::EBPF_OBJECT,
+        };
+        let error = Session::prepare_inner_unlinked_with_object(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(prepared),
+            false,
+        )
+        .err()
+        .expect("pair-less journal bytes refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("missing journal roots"), "{text}");
+        assert!(text.contains("p11_entry_journal"), "{text}");
+        assert!(text.contains("p11_return_journal"), "{text}");
+    }
+
+    /// Counter and journal preparations are mutually exclusive: the
+    /// combination refuses before either preparation acquires resources.
+    #[test]
+    fn journal_and_counter_preparations_refuse_together() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use p11scope_ebpf_common::CounterMode;
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let zero = counter_banks::BankReservation {
+            retained_bytes: 0,
+            transient_bytes: 0,
+            metadata_bytes: 0,
+            file_descriptors: 0,
+        };
+        let counter = counter_banks::CounterSpec::new(CounterMode::Counts, zero, pool.reserver());
+        let scope = Scope::System;
+        let error = Session::prepare_inner_unlinked(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            Some(&counter),
+            Some(&journal::JournalSpec),
+            false,
+        )
+        .err()
+        .expect("counter/journal combination refuses");
+        assert!(
+            format!("{error:#}")
+                .contains("journal preparation refuses alongside counter preparation"),
+            "{error:#}"
+        );
+    }
+
+    /// The counter/journal combination refuses inside the Session start
+    /// before any flavor parse: even corrupt journal bytes report the
+    /// combination, never a parse error.
+    #[test]
+    fn journal_and_counter_policy_refuse_before_any_flavor_parse() {
+        use p11scope_ebpf_common::CounterMode;
+        let scope = Scope::System;
+        let prepared = journal::JournalPreparation {
+            object: b"not an ELF object",
+        };
+        let error = Session::prepare_inner_unlinked_with_object(
+            &scope,
+            CapturePolicy::Counter(CounterMode::Counts),
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(prepared),
+            false,
+        )
+        .err()
+        .expect("counter policy with journal bytes refuses");
+        assert!(
+            format!("{error:#}")
+                .contains("journal preparation refuses alongside counter preparation"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn preparation_contract_runs_every_phase_successfully() {
         for unsafe_object in [false, true] {
             let mut seen = Vec::new();
-            prepare_session_with(unsafe_object, |step| {
+            prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
                 seen.push(step);
                 Ok(())
             })
@@ -5515,10 +15685,11 @@ mod tests {
             let mut preparation = Vec::new();
             let mut activation_calls = 0;
             let mut attach_calls = Vec::new();
-            let preparation_result = prepare_session_with(unsafe_object, |step| {
-                preparation.push(step);
-                Ok(())
-            });
+            let preparation_result =
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                    preparation.push(step);
+                    Ok(())
+                });
             let (events_domain, links) =
                 activate_after_preparation_with(preparation_result, || {
                     assert_eq!(preparation, expected);
@@ -5564,13 +15735,14 @@ mod tests {
                 let mut seen = Vec::new();
                 let mut activation_calls = 0;
                 let mut attach_calls = 0;
-                let preparation_result = prepare_session_with(unsafe_object, |step| {
-                    seen.push(step);
-                    if seen.len() == fail + 1 {
-                        return Err(Injected(fail).into());
-                    }
-                    Ok(())
-                });
+                let preparation_result =
+                    prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                        seen.push(step);
+                        if seen.len() == fail + 1 {
+                            return Err(Injected(fail).into());
+                        }
+                        Ok(())
+                    });
                 let error = activate_after_preparation_with(preparation_result, || {
                     activation_calls += 1;
                     attach_lifecycle_with(
@@ -5605,7 +15777,8 @@ mod tests {
 
         for unsafe_object in [false, true] {
             let mut activation_calls = 0;
-            let preparation = prepare_session_with(unsafe_object, |_| Ok(()));
+            let preparation =
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |_| Ok(()));
             let result: Result<()> = activate_after_preparation_with(preparation, || {
                 activation_calls += 1;
                 Err(ActivationFailure.into())
@@ -6094,7 +16267,15 @@ mod tests {
             .filter(|(name, meta)| defers_freeze_until_loaded(name, meta))
             .map(|(name, _)| *name)
             .collect();
-        assert_eq!(deferred, ["CONFIG", "DESCRIPTORS", TAIL_POLICY_MAP]);
+        assert_eq!(
+            deferred,
+            [
+                "CONFIG",
+                "DESCRIPTORS",
+                TAIL_POLICY_MAP,
+                "OBJECT_DESCRIPTORS"
+            ]
+        );
         // PAIR_CALLS is the only feature map populated after the load, so it
         // is the only one that defers its freeze past publication.
         let deferred_feature: Vec<&str> = FEATURE_POLICY_MAPS
@@ -6556,6 +16737,628 @@ mod tests {
     }
 
     #[test]
+    fn counter_bank_multi_diagnostics_stay_within_precharged_utf8_bound() {
+        let path = Path::new("/proc/self/fd/2147483647");
+        for program in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
+            for errno in [i32::MIN, libc::EMFILE, i32::MAX] {
+                let message = group_site_failure(
+                    program,
+                    path,
+                    u64::MAX,
+                    &io::Error::from_raw_os_error(errno),
+                );
+                assert!(message.starts_with(program));
+                assert!(message.contains("/proc/self/fd/2147483647+0xffffffffffffffff"));
+                assert!(message.ends_with(&format!("errno {errno}")));
+                assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+                assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            }
+            let error = io::Error::other("界".repeat(COUNTER_GROUP_DIAGNOSTIC_BYTES));
+            let message = group_site_failure(program, Path::new("/tmp/界.so"), 7, &error);
+            assert!(message.contains("<invalid FD path>+0x7: errno unavailable"));
+            assert!(!message.contains('界'));
+            assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            assert!(!counter_attach_path_is_valid(Path::new("/tmp/界.so")));
+            assert!(!counter_attach_path_is_valid(Path::new(
+                "/proc/self/fd/12345678901"
+            )));
+        }
+        // These unchanged exhaustion messages also enter Counts' retained
+        // failures. Include their actual format capacity, not only text length.
+        for (_, message) in [
+            unfinished_after_exhaustion(u32::MAX),
+            exhausted_multi(u32::MAX, usize::MAX, usize::MAX),
+        ] {
+            assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+        }
+        // Detailed keeps the original path and complete error text, including
+        // UTF-8 byte growth. The bounded format belongs only to Counts roots.
+        let error = io::Error::other("provider 界 failure");
+        assert_eq!(
+            group_site_failure("p11_return", Path::new("/tmp/界.so"), 0x123, &error),
+            "p11_return at /tmp/界.so+0x123: provider 界 failure"
+        );
+    }
+
+    // Exercise actual grouping and registered ownership with real file FDs.
+    // Matching kernel-link qualification remains in the separate native cells.
+    #[test]
+    fn counter_bank_multi_groups_use_fixed_roots_and_exact_cookies() {
+        let (_fixture, pins, mut first, mut second, _) =
+            counter_banks::tests::growth_provider_fixture();
+        first.index = 511;
+        first.descriptor_index = 17;
+        first.file_offset = 0x80;
+        second.index = 512;
+        second.descriptor_index = 18;
+        second.file_offset = 0x90;
+        let mut third = first.clone();
+        third.index = 513;
+        third.descriptor_index = 19;
+        third.file_offset = 0xa0;
+        let slots = vec![second, third, first];
+        let targets: BTreeMap<_, _> = slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot.index,
+                    (
+                        pins.attach_path_for(slot.object).unwrap(),
+                        pins.abi_for(slot.object).unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let groups: Vec<StaticGroup> = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::Counter(CounterMode::Counts),
+            false,
+            &targets,
+            StaticRoots::CounterBanks,
+            Some(CounterMode::Counts),
+            false,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.entry_program == "p11_counter_bank_entry"
+                    && group.return_program == "p11_counter_bank_return")
+        );
+        type RecordedMultiCall = (&'static str, Vec<(u64, u64)>, bool);
+        let mut calls: Vec<RecordedMultiCall> = Vec::new();
+        let (bundles, outcome) = attach_target_groups_with(
+            &groups,
+            |_| Some(7),
+            |program, _, sites, is_return| {
+                calls.push((program, sites.to_vec(), is_return));
+                Ok(tempfile::tempfile().unwrap().into())
+            },
+        )
+        .unwrap();
+        let _: &Vec<MultiLinkBundle<OwnedFd>> = &bundles;
+        assert_eq!(calls.len(), 4);
+        for pair in calls.as_chunks::<2>().0 {
+            assert_eq!((pair[0].0, pair[0].2), ("p11_counter_bank_return", true));
+            assert_eq!((pair[1].0, pair[1].2), ("p11_counter_bank_entry", false));
+            assert_eq!(pair[0].1, pair[1].1);
+        }
+        let mut sites: Vec<_> = calls
+            .iter()
+            .filter(|call| !call.2)
+            .flat_map(|call| call.1.iter().copied())
+            .collect();
+        sites.sort_unstable_by_key(|site| site.1);
+        assert_eq!(
+            sites,
+            [
+                (0x80, 0x0000_0011_0000_01ff),
+                (0x90, 0x0000_0012_0000_0200),
+                (0xa0, 0x0000_0013_0000_0201),
+            ]
+        );
+        let mut completed: Vec<_> = outcome.completed.iter().map(|(index, _)| *index).collect();
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            [511, 512, 513],
+            "each original slot is acknowledged exactly once"
+        );
+        assert_eq!(outcome.successful.len(), 6);
+        assert!(outcome.failures.is_empty() && !outcome.exhausted);
+        let mut links: Vec<RegisteredLink> = Vec::new();
+        let mut pairs = pid_continuity::PairBook::default();
+        let reserved: Result<(), counter_banks::BankRefusal> =
+            reserve_counter_multi_link_capacity(&mut links, 1);
+        reserved.unwrap();
+        let called = std::cell::Cell::new(false);
+        let invalid: io::Result<()> = retain_counter_multi_leaf(
+            &mut links,
+            &mut pairs,
+            "p11_counter_bank_return",
+            &[(0x80, 0x0000_0011_0000_01ff)],
+            &BTreeMap::new(),
+            || {
+                called.set(true);
+                Ok(tempfile::tempfile().unwrap().into())
+            },
+        );
+        assert!(
+            invalid.is_err() && !called.get() && links.is_empty(),
+            "unknown cookie refuses before the native leaf"
+        );
+        for (policy, unsafe_object, bad_abi) in [
+            (CapturePolicy::Allowlisted, false, false),
+            (CapturePolicy::AggregateOnly, true, false),
+            (CapturePolicy::AggregateOnly, false, true),
+            (CapturePolicy::AggregateOnly, false, false),
+        ] {
+            let mut target_facts = targets.clone();
+            if bad_abi {
+                target_facts.get_mut(&511).unwrap().1 = ElfAbi::Ilp32;
+            }
+            let refused: Result<Vec<StaticGroup>> = group_static_slots_with_roots(
+                &slots,
+                policy,
+                unsafe_object,
+                &target_facts,
+                StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
+                false,
+            );
+            assert!(refused.is_err());
+        }
+        let detailed = group_static_slots(&slots, CapturePolicy::AggregateOnly, false, &targets);
+        assert!(
+            detailed
+                .iter()
+                .all(|group| group.entry_program == "p11_entry")
+        );
+    }
+
+    /// The ia32 twin of counter grouping: a Counter policy with bank roots
+    /// and an ia32 (Ilp32) slot refuses at the LP64 guard — past the earlier
+    /// policy-mismatch arm — naming the mode. The Lp64 twin is accepted.
+    /// All three modes reach this guard through the public CLI.
+    #[test]
+    fn counter_grouping_refuses_ia32_slots_per_mode_with_lp64_twin() {
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let (_fixture, pins, first, _, _) = counter_banks::tests::growth_provider_fixture();
+            let slots = vec![first.clone()];
+            let targets: BTreeMap<_, _> = slots
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            pins.attach_path_for(slot.object).unwrap(),
+                            pins.abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let accepted = group_static_slots_with_roots(
+                &slots,
+                CapturePolicy::Counter(mode),
+                false,
+                &targets,
+                StaticRoots::CounterBanks,
+                Some(mode),
+                false,
+            );
+            assert!(accepted.is_ok(), "{mode:?} Lp64 twin groups");
+            let mut ia32 = targets.clone();
+            ia32.get_mut(&first.index).unwrap().1 = ElfAbi::Ilp32;
+            let error = group_static_slots_with_roots(
+                &slots,
+                CapturePolicy::Counter(mode),
+                false,
+                &ia32,
+                StaticRoots::CounterBanks,
+                Some(mode),
+                false,
+            )
+            .expect_err("ia32 slot must refuse grouping");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("requires an LP64 retained-FD attach path"),
+                "{mode:?}: {text}"
+            );
+            assert!(
+                text.contains(mode.name()),
+                "{mode:?}: refusal names the mode: {text}"
+            );
+            assert!(
+                !text.contains("fixed aggregate-only roots"),
+                "{mode:?}: past the policy-mismatch arm: {text}"
+            );
+            // The missing-facts refusal names the mode too.
+            let mut missing = targets.clone();
+            missing.remove(&first.index);
+            let error = group_static_slots_with_roots(
+                &slots,
+                CapturePolicy::Counter(mode),
+                false,
+                &missing,
+                StaticRoots::CounterBanks,
+                Some(mode),
+                false,
+            )
+            .expect_err("missing facts must refuse grouping");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("target facts missing before grouping"),
+                "{mode:?}: {text}"
+            );
+            assert!(
+                text.contains(mode.name()),
+                "{mode:?}: refusal names the mode: {text}"
+            );
+        }
+        // Fallback when neither the policy nor preparation pins a mode.
+        let (_fixture, pins, first, _, _) = counter_banks::tests::growth_provider_fixture();
+        let slots = vec![first.clone()];
+        let mut ia32: BTreeMap<_, _> = slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot.index,
+                    (
+                        pins.attach_path_for(slot.object).unwrap(),
+                        pins.abi_for(slot.object).unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        ia32.get_mut(&first.index).unwrap().1 = ElfAbi::Ilp32;
+        let error = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::AggregateOnly,
+            false,
+            &ia32,
+            StaticRoots::CounterBanks,
+            None,
+            false,
+        )
+        .expect_err("fallback must refuse grouping");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("private counter grouping requires an LP64"),
+            "fallback names counter: {text}"
+        );
+    }
+
+    #[test]
+    fn counter_bank_multi_append_and_late_failure_preserve_old_groups() {
+        for refusal in [None, Some(libc::EOPNOTSUPP), Some(libc::EMFILE)] {
+            let (_fixture, pins, first, mut second, _) =
+                counter_banks::tests::growth_provider_fixture();
+            let old_slots: Vec<_> = (0..511)
+                .map(|index| {
+                    let mut slot = first.clone();
+                    slot.index = index;
+                    slot.file_offset = 0x1000 + 16 * u64::from(index);
+                    slot
+                })
+                .collect();
+            let mut addition = first.clone();
+            addition.index = 511;
+            addition.file_offset = 0x1000 + 16 * 511;
+            second.index = 512;
+            second.file_offset = 0x1000;
+            let fresh = vec![addition, second];
+            let all_targets: BTreeMap<_, _> = old_slots
+                .iter()
+                .chain(&fresh)
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            pins.attach_path_for(slot.object).unwrap(),
+                            pins.abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let old_groups: Vec<StaticGroup> = group_static_slots_with_roots(
+                &old_slots,
+                CapturePolicy::Counter(CounterMode::Counts),
+                false,
+                &all_targets,
+                StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
+                false,
+            )
+            .unwrap();
+            let fresh_groups: Vec<StaticGroup> = group_static_slots_with_roots(
+                &fresh,
+                CapturePolicy::Counter(CounterMode::Counts),
+                false,
+                &all_targets,
+                StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
+                false,
+            )
+            .unwrap();
+            assert_eq!(old_groups.len(), 1);
+            assert_eq!(fresh_groups.len(), 2);
+            let mut links: Vec<RegisteredLink> = Vec::new();
+            let mut pairs = pid_continuity::PairBook::default();
+            let reserved: Result<(), counter_banks::BankRefusal> =
+                reserve_counter_multi_link_capacity(&mut links, old_slots.len());
+            reserved.unwrap();
+            let old_index: BTreeMap<_, _> = old_groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let (_, old_outcome): (Vec<MultiLinkBundle<()>>, AttachOutcome) =
+                attach_target_groups_with(
+                    &old_groups,
+                    |_| Some(1),
+                    |program, _, sites, _| {
+                        retain_counter_multi_leaf(
+                            &mut links,
+                            &mut pairs,
+                            program,
+                            sites,
+                            &old_index,
+                            || Ok(tempfile::tempfile().unwrap().into()),
+                        )
+                    },
+                )
+                .unwrap();
+            assert_eq!(old_outcome.completed.len(), 511);
+            assert_eq!(links.len(), 2);
+            let original_fds: Vec<_> = links
+                .iter()
+                .flat_map(|link| match link {
+                    RegisteredLink::MultiUProbe { fds, .. } => fds
+                        .iter()
+                        .map(std::os::fd::AsRawFd::as_raw_fd)
+                        .collect::<Vec<_>>(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let old_members: Vec<u32> = (0..511).collect();
+            assert!(
+                links
+                    .iter()
+                    .all(|link| link.slots() == old_members.as_slice())
+            );
+            let reserved: Result<(), counter_banks::BankRefusal> =
+                reserve_counter_multi_link_capacity(&mut links, fresh.len());
+            reserved.unwrap();
+            let fresh_index: BTreeMap<_, _> = fresh_groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let mut native_calls = 0;
+            let outcome: Result<
+                (Vec<MultiLinkBundle<()>>, AttachOutcome),
+                BackendFallbackRequired,
+            > = attach_target_groups_with(
+                &fresh_groups,
+                |_| Some(2),
+                |program, _, sites, _| {
+                    assert!(sites.iter().all(|(_, cookie)| {
+                        fresh_index
+                            .get(cookie)
+                            .is_some_and(|slot| matches!(*slot, 511 | 512))
+                    }));
+                    retain_counter_multi_leaf(
+                        &mut links,
+                        &mut pairs,
+                        program,
+                        sites,
+                        &fresh_index,
+                        || {
+                            native_calls += 1;
+                            if native_calls == 3
+                                && let Some(errno) = refusal
+                            {
+                                Err(io::Error::from_raw_os_error(errno))
+                            } else {
+                                Ok(tempfile::tempfile().unwrap().into())
+                            }
+                        },
+                    )
+                },
+            );
+            match refusal {
+                None => {
+                    let (_, outcome) = outcome.unwrap();
+                    let completed: BTreeSet<_> = outcome
+                        .completed
+                        .into_iter()
+                        .map(|(index, _)| index)
+                        .collect();
+                    assert_eq!(completed, BTreeSet::from([511, 512]));
+                    assert!(!outcome.exhausted && outcome.failures.is_empty());
+                    assert_eq!(links.len(), 6);
+                }
+                Some(libc::EMFILE) => {
+                    let (_, outcome) = outcome.unwrap();
+                    assert!(outcome.exhausted);
+                    assert_eq!(
+                        links.len(),
+                        4,
+                        "the successful fresh return/entry leaves remain owned"
+                    );
+                }
+                Some(_) => {
+                    assert!(outcome.is_err());
+                    assert_eq!(
+                        links.len(),
+                        4,
+                        "late Unsupported cannot drop earlier acquired leaves inline"
+                    );
+                }
+            }
+            assert!(
+                original_fds
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            );
+            assert!(
+                links[..2]
+                    .iter()
+                    .all(|link| link.slots() == old_members.as_slice())
+            );
+            let requested = BTreeSet::from([511, 512]);
+            let candidate_check: Result<()> = validate_counter_group_retirement(&links, &requested);
+            candidate_check.unwrap();
+            let selected = extract_selected_links(&mut links, &mut pairs, |link| {
+                link.slots().iter().any(|slot| requested.contains(slot))
+            });
+            let selected = selected
+                .into_iter()
+                .map(|link| (link.producer(), link))
+                .collect();
+            let mut closed = Vec::new();
+            let failures = detach_selected_with(selected, |link: RegisteredLink| {
+                closed.push(link.producer());
+                drop(link);
+                Ok(())
+            });
+            assert!(failures.is_empty());
+            assert!(closed.windows(2).all(|pair| !matches!(
+                pair,
+                [
+                    ProducerProgram::UProbe("p11_counter_bank_return"),
+                    ProducerProgram::UProbe("p11_counter_bank_entry")
+                ]
+            )));
+            assert_eq!(links.len(), 2);
+            assert!(
+                links
+                    .iter()
+                    .all(|link| link.slots() == old_members.as_slice())
+            );
+            assert!(
+                original_fds
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            );
+        }
+    }
+
+    #[test]
+    fn counter_bank_multi_refuses_partial_published_rebuild() {
+        let mut pairs = pid_continuity::PairBook::default();
+        let mut links: Vec<_> = ["p11_counter_bank_return", "p11_counter_bank_entry"]
+            .into_iter()
+            .map(|program| RegisteredLink::MultiUProbe {
+                program,
+                slots: vec![0, 1],
+                fds: vec![tempfile::tempfile().unwrap().into()],
+                registration: pairs.register(),
+            })
+            .collect();
+        let original_fds: Vec<_> = links
+            .iter()
+            .flat_map(|link| match link {
+                RegisteredLink::MultiUProbe { fds, .. } => fds
+                    .iter()
+                    .map(std::os::fd::AsRawFd::as_raw_fd)
+                    .collect::<Vec<_>>(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let partial: Result<()> = validate_counter_group_retirement(&links, &BTreeSet::from([1]));
+        assert!(partial.is_err());
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|link| link.slots() == [0, 1]));
+        assert!(
+            original_fds
+                .iter()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+        );
+        let whole: Result<()> = validate_counter_group_retirement(&links, &BTreeSet::from([0, 1]));
+        whole.unwrap();
+        let selected = extract_selected_links(&mut links, &mut pairs, |_| true);
+        let mut closed = Vec::new();
+        assert!(
+            detach_selected_with(
+                selected
+                    .into_iter()
+                    .map(|link| (link.producer(), link))
+                    .collect(),
+                |link: RegisteredLink| {
+                    closed.push(link.producer());
+                    drop(link);
+                    Ok(())
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            closed,
+            [
+                ProducerProgram::UProbe("p11_counter_bank_entry"),
+                ProducerProgram::UProbe("p11_counter_bank_return")
+            ]
+        );
+        assert!(links.is_empty());
+        let mut links = Vec::new();
+        let overflow: Result<(), counter_banks::BankRefusal> =
+            reserve_counter_multi_link_capacity(&mut links, usize::MAX);
+        assert!(overflow.is_err());
+        assert_eq!(
+            links.capacity(),
+            0,
+            "overflow refuses before registry allocation"
+        );
+    }
+
+    #[test]
+    fn selected_multi_late_unsupported_keeps_every_acquired_group_fd() {
+        for fail_second_group in [false, true] {
+            let (slots, targets) = two_groups();
+            let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+            let mut retained: Vec<OwnedFd> = Vec::new();
+            let result = attach_target_groups_with(
+                &groups,
+                |_| Some(7),
+                |_, path, _, is_return| {
+                    let refuse = if fail_second_group {
+                        path == Path::new("/b.so") && is_return
+                    } else {
+                        !is_return
+                    };
+                    let acquired = if refuse {
+                        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+                    } else {
+                        Ok(tempfile::tempfile().unwrap().into())
+                    };
+                    selected_detailed::multi::retain_success(acquired, |fd| retained.push(fd))
+                },
+            );
+            assert!(
+                result.is_err(),
+                "real group orchestration must return fallback sentinel"
+            );
+            assert_eq!(retained.len(), if fail_second_group { 2 } else { 1 });
+            assert!(
+                retained
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0),
+                "later group failure must leave acquired native fds with their original owner"
+            );
+            // The preparation failure transfers this same retained Session to
+            // actual terminal cleanup; this test grants no joined receipt.
+        }
+    }
+
+    #[test]
     fn multi_unsupported_aborts_with_the_fallback_sentinel() {
         let (slots, targets) = two_groups();
         let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
@@ -6598,6 +17401,7 @@ mod tests {
             program,
             slots,
             fds: Vec::new(),
+            registration: None,
         }
     }
 
@@ -7029,7 +17833,513 @@ mod tests {
         let slot = group_slot(index, 1, SlotSemantics::COUNT_ONLY);
         let targets = group_targets(&[(index, path, ElfAbi::Lp64)]);
         let (path, abi) = targets.get(&index).cloned().unwrap();
-        RetainedStaticTarget { slot, path, abi }
+        RetainedStaticTarget {
+            slot,
+            path,
+            abi,
+            held: None,
+        }
+    }
+
+    #[test]
+    fn pid_continuity_attach_start_precedes_first_return_and_completion() {
+        use pid_continuity::{AttachBaseline, NativeAttempt, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let mut sibling = target.clone();
+        sibling.slot.index = 1;
+        sibling.slot.file_offset += 8;
+        let slots = [target.slot.clone(), sibling.slot.clone()];
+        let retained = BTreeMap::from([(0, target), (1, sibling)]);
+        let mut pairs = PairBook::default();
+        let mut links = Vec::new();
+        let times = std::cell::RefCell::new(std::collections::VecDeque::from([10, 20, 40, 50]));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = attach_targets_observed_with(&slots, CapturePolicy::AggregateOnly, false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, point| NativeAttempt::run(|| times.borrow_mut().pop_front(), || {
+                assert!(matches!(point.location, UProbeAttachLocation::AbsoluteOffset(offset) if offset == slot.file_offset));
+                calls.borrow_mut().push((program, slot.index));
+                links.push(RegisteredLink::MultiUProbe {
+                    program, slots: vec![slot.index],
+                    fds: vec![File::open("/dev/null")?.into()], registration: pairs.register(),
+                });
+                Ok(())
+            }), |_| Some(55)).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                ("p11_return", 0),
+                ("p11_return", 1),
+                ("p11_entry", 0),
+                ("p11_entry", 1)
+            ]
+        );
+        let completions = std::cell::Cell::new(60);
+        pairs.seal(
+            &outcome.continuity_rounds,
+            Some(AttachBaseline { loss: 7, fault: 0 }),
+            Some(0),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || {
+                let now = completions.get();
+                completions.set(now + 10);
+                Some(now)
+            },
+        );
+        let first = pairs
+            .stamp_for(
+                &slots[0],
+                &pins,
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+            )
+            .unwrap();
+        assert_eq!((first.started_ns, first.completed_ns), (10, 60));
+        assert!(
+            first.started_ns < 30 && first.completed_ns > 30,
+            "EXEC between return and entry cannot look like a completed earlier generation"
+        );
+        let second = pairs
+            .stamp_for(
+                &slots[1],
+                &pins,
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+            )
+            .unwrap();
+        assert_eq!((second.started_ns, second.completed_ns), (20, 70));
+        assert_eq!(
+            outcome.completed,
+            [(0, Some(55)), (1, Some(55))],
+            "private stamps do not replace existing public completion samples"
+        );
+    }
+
+    #[test]
+    fn pid_continuity_multi_invalidates_connected_survivors_before_detach() {
+        use pid_continuity::{AttachBaseline, AttachRound, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let targets: Vec<_> = (0..4)
+            .map(|index| {
+                let mut target = target.clone();
+                target.slot.index = index;
+                target.slot.file_offset += u64::from(index) * 8;
+                target
+            })
+            .collect();
+        let mut pairs = PairBook::default();
+        let mut links = Vec::new();
+        let mut retained = BTreeMap::new();
+        let bundles = [
+            ("p11_return", vec![0, 1]),
+            ("p11_entry", vec![0]),
+            ("p11_entry", vec![1, 2]),
+            ("p11_return", vec![2]),
+            ("p11_return", vec![3]),
+            ("p11_entry", vec![3]),
+        ]
+        .into_iter()
+        .map(|(program, slots)| MultiLinkBundle {
+            program,
+            slots,
+            links: vec![File::open("/dev/null").unwrap().into()],
+        })
+        .collect();
+        publish_kept_multi_bundles(&mut links, &mut retained, bundles, &targets, &mut pairs);
+        pairs.seal(
+            &[
+                AttachRound {
+                    slots: vec![0, 1, 2],
+                    started_ns: Some(10),
+                    last_call_ns: Some(20),
+                },
+                AttachRound {
+                    slots: vec![3],
+                    started_ns: Some(10),
+                    last_call_ns: Some(20),
+                },
+            ],
+            Some(AttachBaseline { loss: 0, fault: 0 }),
+            Some(0),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(30),
+        );
+        let requested = BTreeSet::from([0]);
+        let affected = plan_group_rebuild(&links, &requested).unwrap();
+        assert_eq!(affected, BTreeSet::from([0, 1, 2]));
+        pairs.invalidate(&affected);
+        let detached = extract_selected_links(&mut links, &mut pairs, |link| {
+            link.slots().iter().any(|slot| affected.contains(slot))
+        });
+        let failures = detach_selected_with(
+            detached
+                .into_iter()
+                .map(|link| (link.producer(), link))
+                .collect(),
+            |link| {
+                for target in targets.iter().take(3) {
+                    assert!(pairs.recorded_generation(target.slot.index).is_none());
+                    assert!(
+                        pairs
+                            .stamp_for(
+                                &target.slot,
+                                &pins,
+                                &links,
+                                &current_static_sides_from(&links),
+                                &retained
+                            )
+                            .is_none(),
+                        "all transitive survivors are invalid before the first native detach"
+                    );
+                }
+                assert!(
+                    pairs
+                        .stamp_for(
+                            &targets[3].slot,
+                            &pins,
+                            &links,
+                            &current_static_sides_from(&links),
+                            &retained
+                        )
+                        .is_some()
+                );
+                drop(link);
+                Err(io::Error::other("scripted native detach failure").into())
+            },
+        );
+        assert_eq!(failures.len(), 4);
+        assert!(
+            attachment_admission(
+                &failures.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pid_continuity_replace_partial_cleanup_and_fallback_invalidate() {
+        use pid_continuity::{AttachBaseline, AttachRound, NativeAttempt, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let mut sibling = target.clone();
+        sibling.slot.index = 1;
+        sibling.slot.file_offset += 8;
+        let targets = [target.clone(), sibling.clone()];
+        let slot = target.slot.clone();
+        let mut pairs = PairBook::default();
+        let mut links = pid_continuity::tests::pair(&mut pairs);
+        let mut retained = BTreeMap::from([(0, target.clone())]);
+        pairs.seal(
+            &[AttachRound {
+                slots: vec![0],
+                started_ns: Some(10),
+                last_call_ns: Some(20),
+            }],
+            Some(AttachBaseline { loss: 5, fault: 0 }),
+            Some(0),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(30),
+        );
+        let old_generation = pairs.recorded_generation(0).unwrap();
+        drop(extract_selected_links(&mut links, &mut pairs, |_| true));
+        assert!(pairs.recorded_generation(0).is_none());
+        prune_linkless_retained(&mut retained, &links);
+        let attach_targets = targets
+            .iter()
+            .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+            .collect();
+        let groups = group_static_slots(
+            &[slot.clone(), sibling.slot.clone()],
+            CapturePolicy::AggregateOnly,
+            false,
+            &attach_targets,
+        );
+        let (bundles, outcome) = attach_target_groups_observed_with(
+            &groups,
+            |_| Some(55),
+            |_, _, sites, is_return| {
+                NativeAttempt::run(
+                    || Some(40),
+                    || {
+                        if !is_return
+                            && sites
+                                .iter()
+                                .any(|(offset, _)| *offset == sibling.slot.file_offset)
+                        {
+                            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                        }
+                        Ok(File::open("/dev/null")?.into())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        publish_kept_multi_bundles(&mut links, &mut retained, bundles, &targets, &mut pairs);
+        pairs.seal(
+            &outcome.continuity_rounds,
+            Some(AttachBaseline { loss: 5, fault: 1 }),
+            Some(1),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(60),
+        );
+        assert!(pairs.recorded_generation(0).unwrap() > old_generation);
+        assert!(
+            pairs.recorded_generation(1).is_none(),
+            "the failed replacement entry has no pair authority"
+        );
+        let affected = plan_group_rebuild(&links, &BTreeSet::from([1])).unwrap();
+        assert_eq!(
+            affected,
+            BTreeSet::from([0, 1]),
+            "partial replacement cleanup includes its successful sibling"
+        );
+        let survivor = retained[&0].clone();
+        pairs.invalidate(&affected);
+        drop(extract_selected_links(&mut links, &mut pairs, |link| {
+            link.slots().iter().any(|slot| affected.contains(slot))
+        }));
+        assert!(pairs.recorded_generation(0).is_none());
+        prune_linkless_retained(&mut retained, &links);
+        let targets = BTreeMap::from([(0, (survivor.path.clone(), survivor.abi))]);
+        let groups = group_static_slots(
+            std::slice::from_ref(&slot),
+            CapturePolicy::AggregateOnly,
+            false,
+            &targets,
+        );
+        let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
+            &groups,
+            |_| Some(75),
+            |_, _, _, _| NativeAttempt::run(|| Some(70), || Ok(File::open("/dev/null")?.into())),
+            drop,
+        );
+        publish_kept_multi_bundles(&mut links, &mut retained, bundles, &[survivor], &mut pairs);
+        pairs.seal(
+            &outcome.continuity_rounds,
+            Some(AttachBaseline { loss: 5, fault: 1 }),
+            Some(1),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(80),
+        );
+        assert!(
+            pairs
+                .stamp_for(
+                    &slot,
+                    &pins,
+                    &links,
+                    &current_static_sides_from(&links),
+                    &retained
+                )
+                .unwrap()
+                .generation
+                > old_generation
+        );
+        let domain = events::DiscoveryDomain::test_standin(801);
+        let tap = PidLifecycleTap::test_for(7, domain.clone());
+        tap.begin_read(Some(90));
+        tap.observe_empty(Some(90), 0, 0);
+        invalidate_pid_session(&mut pairs, Some(&tap)); // shared by producer detach and Drop, even with no links
+        assert_eq!(tap.facts(), Err(PidContinuityRefusal::Terminal));
+        assert!(pairs.recorded_generation(0).is_none());
+        drop(extract_selected_links(&mut links, &mut pairs, |_| true));
+        let fallback_domain = events::DiscoveryDomain::test_standin(801);
+        assert!(!domain.same_allocation(&fallback_domain));
+        let fallback_tap = PidLifecycleTap::test_for(7, fallback_domain.clone());
+        assert!(!tap.matches_domain(&fallback_domain));
+        assert_eq!(
+            fallback_tap.facts().unwrap(),
+            pid_continuity::LifecycleFacts::default()
+        );
+        let fallback = PairBook::default();
+        assert!(
+            fallback
+                .stamp_for(
+                    &slot,
+                    &pins,
+                    &links,
+                    &current_static_sides_from(&links),
+                    &retained
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pid_continuity_multi_publishes_only_final_kept_round_and_targets() {
+        use pid_continuity::{AttachBaseline, NativeAttempt, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let (_later_dir, _later_pins, mut later) = pid_continuity::tests::fixture();
+        later.slot.index = 3;
+        let survivors: Vec<_> = (0..3)
+            .map(|index| {
+                let mut target = target.clone();
+                target.slot.index = index;
+                target.slot.file_offset += u64::from(index) * 8;
+                target
+            })
+            .chain([later.clone()])
+            .collect();
+        let slots: Vec<_> = survivors.iter().map(|target| target.slot.clone()).collect();
+        let targets = survivors
+            .iter()
+            .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+            .collect();
+        let mut groups = group_static_slots(&slots, CapturePolicy::AggregateOnly, false, &targets);
+        groups.sort_by_key(|group| group.members[0].slot.index);
+        let poison = slots[1].file_offset;
+        for error in [libc::EMFILE, libc::ENOTSUP] {
+            let times = std::cell::Cell::new(100);
+            let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
+                &groups,
+                |_| Some(190),
+                |_, path, sites, is_return| {
+                    NativeAttempt::run(
+                        || {
+                            let now = times.get();
+                            times.set(now + 1);
+                            Some(now)
+                        },
+                        || {
+                            if path == later.path {
+                                return Err(io::Error::from_raw_os_error(error));
+                            }
+                            if !is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                            }
+                            Ok(File::open("/dev/null")?.into())
+                        },
+                    )
+                },
+                drop,
+            );
+            assert_eq!(outcome.exhausted, error == libc::EMFILE);
+            assert_eq!(outcome.completed, [(0, Some(190)), (2, Some(190))]);
+            assert_eq!(outcome.continuity_rounds.len(), 1);
+            let round = &outcome.continuity_rounds[0];
+            assert_eq!(round.slots, [0, 2]);
+            assert_eq!(
+                (round.started_ns, round.last_call_ns),
+                (Some(106), Some(107)),
+                "the discarded wide round cannot lend its timing to final kept links"
+            );
+            let mut pairs = PairBook::default();
+            let mut links = Vec::new();
+            let mut retained = BTreeMap::new();
+            publish_kept_multi_bundles(&mut links, &mut retained, bundles, &survivors, &mut pairs);
+            assert_eq!(
+                retained.keys().copied().collect::<Vec<_>>(),
+                [0, 2],
+                "the actual kept survivor registry publication must restore its exact target"
+            );
+            pairs.seal(
+                &outcome.continuity_rounds,
+                Some(AttachBaseline { loss: 7, fault: 0 }),
+                Some(0),
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+                || Some(200),
+            );
+            let first = pairs
+                .stamp_for(
+                    &slots[0],
+                    &pins,
+                    &links,
+                    &current_static_sides_from(&links),
+                    &retained,
+                )
+                .unwrap();
+            let generation = first.generation;
+            assert_eq!((first.started_ns, first.completed_ns), (106, 200));
+            assert_eq!(
+                pairs
+                    .stamp_for(
+                        &slots[2],
+                        &pins,
+                        &links,
+                        &current_static_sides_from(&links),
+                        &retained
+                    )
+                    .unwrap()
+                    .generation,
+                generation
+            );
+            let second_survivor = retained[&2].clone();
+            let affected = plan_group_rebuild(&links, &BTreeSet::from([0])).unwrap();
+            assert_eq!(affected, BTreeSet::from([0, 2]));
+            pairs.invalidate(&affected);
+            drop(extract_selected_links(&mut links, &mut pairs, |link| {
+                link.slots().iter().any(|slot| affected.contains(slot))
+            }));
+            prune_linkless_retained(&mut retained, &links);
+            assert!(retained.is_empty());
+            let targets =
+                BTreeMap::from([(2, (second_survivor.path.clone(), second_survivor.abi))]);
+            let rebuilt = group_static_slots(
+                std::slice::from_ref(&second_survivor.slot),
+                CapturePolicy::AggregateOnly,
+                false,
+                &targets,
+            );
+            let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
+                &rebuilt,
+                |_| Some(209),
+                |_, _, _, _| {
+                    NativeAttempt::run(
+                        || {
+                            let now = times.get();
+                            times.set(now + 1);
+                            Some(now)
+                        },
+                        || Ok(File::open("/dev/null")?.into()),
+                    )
+                },
+                drop,
+            );
+            publish_kept_multi_bundles(
+                &mut links,
+                &mut retained,
+                bundles,
+                &[second_survivor],
+                &mut pairs,
+            );
+            pairs.seal(
+                &outcome.continuity_rounds,
+                Some(AttachBaseline { loss: 7, fault: 0 }),
+                Some(0),
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+                || Some(210),
+            );
+            assert!(
+                pairs
+                    .stamp_for(
+                        &slots[2],
+                        &pins,
+                        &links,
+                        &current_static_sides_from(&links),
+                        &retained
+                    )
+                    .unwrap()
+                    .generation
+                    > generation,
+                "restored held facts remain usable for the next survivor rebuild"
+            );
+            assert!(!retained.contains_key(&0));
+        }
     }
 
     #[test]
@@ -7107,6 +18417,63 @@ mod tests {
         assert_eq!(group_member_indices(&groups[0]), vec![0]);
         assert_eq!(groups[1].entry_program, "p11_entry_template");
         assert_eq!(group_member_indices(&groups[1]), vec![1]);
+    }
+
+    #[test]
+    fn journal_grouping_resolves_the_journal_pair() {
+        // Journal sessions group over the swapped pair: one journal entry
+        // link plus one journal return link per (path, entry program) group.
+        // The journal build carries no unsafe/ia32 entry variants, so template
+        // semantics, an unsafe policy and an Ilp32 ABI all still resolve the
+        // single journal entry program; members, offsets and cookies are the
+        // ordinary grouping facts.
+        let template = SlotSemantics {
+            template1_arg: 1,
+            ..SlotSemantics::COUNT_ONLY
+        };
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, template),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Ilp32),
+            (2, "/b.so", ElfAbi::Lp64),
+        ]);
+        for policy in [
+            CapturePolicy::Allowlisted,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            let groups = group_static_slots_with_roots(
+                &slots,
+                policy,
+                false,
+                &targets,
+                StaticRoots::Detailed,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(groups.len(), 2, "{policy:?}: one group per path");
+            for group in &groups {
+                assert_eq!(group.entry_program, "p11_entry_journal", "{policy:?}");
+                assert_eq!(group.return_program, "p11_return_journal", "{policy:?}");
+            }
+            assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
+            assert_eq!(group_member_indices(&groups[1]), vec![2]);
+            assert_eq!(groups[0].path, PathBuf::from("/a.so"));
+            assert_eq!(groups[1].path, PathBuf::from("/b.so"));
+            for member in groups.iter().flat_map(|group| &group.members) {
+                assert_eq!(
+                    member.cookie,
+                    attach_cookie(member.slot.index, member.slot.descriptor_index),
+                    "slot {}",
+                    member.slot.index
+                );
+            }
+            assert_ne!(grouped_offset(&groups, 0), grouped_offset(&groups, 1));
+        }
     }
 
     #[test]
@@ -7300,6 +18667,62 @@ mod tests {
                 [("p11_return", 0), ("p11_return", 1), (expected_entry, 1),]
             );
         }
+    }
+
+    #[test]
+    fn journal_singles_attach_attempts_the_journal_pair() {
+        // The singles half of Session::attach_targets over a journal session:
+        // every slot attempts its journal return then its journal entry, and
+        // ordinary root names are never attempted. Journal entry selection is
+        // the single journal program (no template/ia32 variants).
+        let slots = [test_slot(0), test_slot(1)];
+        let mut attempted = Vec::new();
+        let outcome = attach_targets_observed_with_roots_journal(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            StaticRoots::Detailed,
+            None,
+            true,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
+                pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                    attempted.push((program, slot.index));
+                    Ok(())
+                })
+            },
+            |_| Some(10),
+        )
+        .unwrap();
+        assert_eq!(
+            attempted,
+            [
+                ("p11_return_journal", 0),
+                ("p11_return_journal", 1),
+                ("p11_entry_journal", 0),
+                ("p11_entry_journal", 1),
+            ]
+        );
+        assert!(
+            attempted
+                .iter()
+                .all(|(program, _)| ["p11_entry_journal", "p11_return_journal"].contains(program)),
+            "no ordinary root is attempted: {attempted:?}"
+        );
+        assert_eq!(
+            outcome.successful,
+            [
+                (0, ProbeSide::Return),
+                (0, ProbeSide::Entry),
+                (1, ProbeSide::Return),
+                (1, ProbeSide::Entry),
+            ]
+            .into_iter()
+            .collect(),
+            "each slot gains its journal entry/return pair"
+        );
+        assert_eq!(outcome.completed, [(0, Some(10)), (1, Some(10))]);
+        assert!(outcome.failures.is_empty() && !outcome.exhausted);
     }
 
     #[test]
@@ -7960,6 +19383,8 @@ mod tests {
                 "MECH_SHAPE",
                 "TAIL_CALLS",
                 "STACK_GUARD",
+                "OBJECT_DESCRIPTORS",
+                "OBJECT_ZERO",
             ]
         );
         assert_eq!(
@@ -8209,17 +19634,23 @@ mod tests {
     }
 
     /// RB-2 staging keeps ring order and drops nothing: it stages at most a
-    /// quantum per call, stops at its capacity leaving the rest in the ring,
-    /// and serves every staged item before anything newer.
+    /// quantum per call, stops at the shared allowance leaving the rest in
+    /// the ring, and serves every staged item before anything newer.
     #[test]
     fn discovery_staging_keeps_ring_order_and_leaves_overflow_in_the_ring() {
         let mut ring: std::collections::VecDeque<_> = discovery_items(0, 10).into();
         ring.insert(3, events::DiscoveryItem::Malformed);
         let mut stage = DiscoveryStage::default();
 
-        assert_eq!(stage.stage(4, || ring.pop_front()), 4);
-        assert_eq!(stage.stage(100, || ring.pop_front()), 7, "the ring ran dry");
-        assert_eq!(stage.stage(100, || ring.pop_front()), 0);
+        let outcome = stage.stage(4, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 4);
+        assert!(!outcome.capacity_blocked);
+        let outcome = stage.stage(100, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 7, "the ring ran dry");
+        assert!(!outcome.capacity_blocked);
+        let outcome = stage.stage(100, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 0);
+        assert!(!outcome.capacity_blocked);
         let first = stage.pop().unwrap();
         let rest = stage.take();
         let mut all = vec![first];
@@ -8244,15 +19675,3334 @@ mod tests {
 
         let mut ring: std::collections::VecDeque<_> =
             discovery_items(0, DiscoveryStage::CAPACITY as u64 + 5).into();
-        assert_eq!(
-            stage.stage(usize::MAX, || ring.pop_front()),
-            DiscoveryStage::CAPACITY
+        let outcome = stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, DiscoveryStage::CAPACITY);
+        assert!(
+            outcome.capacity_blocked,
+            "the shared allowance stops the move, not the quantum"
         );
         assert_eq!(ring.len(), 5, "overflow waits in the ring, never dropped");
+        let outcome = stage.stage(1, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 0, "a full FIFO stages nothing");
+        assert!(outcome.capacity_blocked);
+    }
+
+    /// I2: the shared cap is enforced structurally by the FIFO, not by
+    /// caller quanta. No quantum stages past `shared_cap`, however large,
+    /// and the outcome says whether the allowance stopped the move.
+    #[test]
+    fn discovery_staging_enforces_the_shared_cap_structurally() {
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 100).into();
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(usize::MAX, 10, || ring.pop_front());
+        assert_eq!(outcome.staged, 10);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(stage.len(), 10);
+        assert_eq!(ring.len(), 90);
+        // A zero share stages nothing and reports blocked, never empty.
+        let outcome = stage.stage(usize::MAX, 0, || ring.pop_front());
+        assert_eq!(outcome.staged, 0);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(ring.len(), 90, "nothing was consumed from the ring");
+        // Draining the FIFO frees the same share again.
+        stage.pop();
+        let outcome = stage.stage(usize::MAX, 10, || ring.pop_front());
+        assert_eq!(outcome.staged, 1);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(stage.len(), 10);
+    }
+
+    /// H5 storage: staging and readiness stop exactly at the shared
+    /// allowance. One mode stages the full share in a single quantum;
+    /// the twin repeats small quanta to the same boundary with malformed
+    /// items interleaved. The readiness predicate polls DISCOVERY only
+    /// while staged plus engine-held leaves room — a snapshot per call,
+    /// so a stale decision never changes under the waiter — with exact
+    /// boundary, overflow-safe arithmetic and honest null cases. The ring
+    /// cursor advances exactly per staged item, never past the stop.
+    #[test]
+    fn discovery_shared_capacity_gates_staging_and_readiness() {
+        // Mode one: a single quantum fills the whole share exactly.
+        let mut ring: std::collections::VecDeque<_> =
+            discovery_items(0, DiscoveryStage::CAPACITY as u64 + 904).into();
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, DiscoveryStage::CAPACITY);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(ring.len(), 904, "overflow waits in the ring, never dropped");
+        assert_eq!(stage.len(), DiscoveryStage::CAPACITY);
+        // The boundary is exact, not off by one in either direction.
+        let mut stage = DiscoveryStage::default();
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 100).into();
+        let outcome = stage.stage(usize::MAX, 4_095, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (100, false));
+        let mut stage = DiscoveryStage::default();
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 5_000).into();
+        let outcome = stage.stage(usize::MAX, 4_095, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (4_095, true));
+        assert_eq!(ring.len(), 905);
+
+        // Twin: repeated small quanta reach the same boundary, malformed
+        // items holding credits like records, order preserved.
+        let mut items = discovery_items(0, 4_000);
+        for at in [10, 1_000, 2_000, 3_000, 3_999] {
+            items.insert(at, events::DiscoveryItem::Malformed);
+        }
+        let mut ring: std::collections::VecDeque<_> = items.into();
+        ring.extend(discovery_items(4_000, 1_000));
+        let mut stage = DiscoveryStage::default();
+        let mut calls = 0u32;
+        let mut total = 0usize;
+        for _ in 0..17 {
+            let outcome = stage.stage(256, DiscoveryStage::CAPACITY, || ring.pop_front());
+            calls += 1;
+            total += outcome.staged;
+            if outcome.staged < 256 {
+                assert!(
+                    outcome.capacity_blocked,
+                    "only the allowance shortens a quantum"
+                );
+            } else {
+                assert!(!outcome.capacity_blocked);
+            }
+        }
+        assert_eq!((calls, total), (17, DiscoveryStage::CAPACITY));
+        assert_eq!(ring.len(), 909, "5,005 scripted minus 4,096 staged");
+        let rest = stage.take();
+        assert_eq!(rest.len(), DiscoveryStage::CAPACITY);
+        let mut scripted = discovery_items(0, 4_000);
+        for at in [10, 1_000, 2_000, 3_000, 3_999] {
+            scripted.insert(at, events::DiscoveryItem::Malformed);
+        }
+        scripted.extend(discovery_items(4_000, 1_000));
         assert_eq!(
-            stage.stage(1, || ring.pop_front()),
-            0,
-            "a full FIFO stages nothing"
+            stamps(&rest),
+            stamps(&scripted[..DiscoveryStage::CAPACITY]),
+            "repeated quanta preserve ring order with malformed inline"
+        );
+
+        // The ring cursor advances exactly per staged item: no lookahead
+        // past the stop, even against an endless ring.
+        let mut reads = 0usize;
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(usize::MAX, 10, || {
+            reads += 1;
+            Some(events::DiscoveryItem::Malformed)
+        });
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (10, true));
+        assert_eq!(reads, 10, "the stop reads nothing past the share");
+
+        // Readiness polls DISCOVERY only while staged plus engine-held
+        // leaves room: exact boundary, overflow-safe.
+        for (staged, held, poll) in [
+            (0usize, 0usize, true),
+            (4_095, 0, true),
+            (4_096, 0, false),
+            (4_000, 95, true),
+            (4_000, 96, false),
+            (0, 4_095, true),
+            (0, 4_096, false),
+            (100, usize::MAX, false),
+            (usize::MAX, 0, false),
+            (usize::MAX, usize::MAX, false),
+        ] {
+            assert_eq!(
+                DiscoveryStage::poll_discovery(staged, held),
+                poll,
+                "staged={staged} held={held}"
+            );
+        }
+
+        // Stale readiness is a snapshot: decisions flip only on fresh
+        // calls as staging fills and draining frees the share.
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 4_200).into();
+        let mut stage = DiscoveryStage::default();
+        assert!(DiscoveryStage::poll_discovery(stage.len(), 0));
+        let outcome = stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, DiscoveryStage::CAPACITY);
+        let stale = DiscoveryStage::poll_discovery(stage.len(), 0);
+        assert!(!stale, "a full share stops the poll");
+        stage.pop();
+        assert!(
+            DiscoveryStage::poll_discovery(stage.len(), 0),
+            "one freed credit reopens the poll"
+        );
+        assert!(!stale, "the earlier decision is unchanged");
+
+        // Null cases: an empty ring stages nothing without blocking, and a
+        // null quantum is the caller's choice, never a capacity stop.
+        let mut ring: std::collections::VecDeque<events::DiscoveryItem> =
+            std::collections::VecDeque::new();
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(100, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (0, false));
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 10).into();
+        let outcome = stage.stage(0, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (0, false));
+        assert_eq!(ring.len(), 10, "a null quantum reads nothing");
+        let mut stage = DiscoveryStage::default();
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 4_100).into();
+        stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        let outcome = stage.stage(0, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(
+            (outcome.staged, outcome.capacity_blocked),
+            (0, false),
+            "a null quantum reports the caller's choice even when full"
+        );
+
+        // Both production seams use the shared helpers: staging subtracts
+        // the engine hold for its share, readiness polls through the
+        // predicate. (Real-sessions seams; the behavior above pins them.)
+        let source = include_str!("attach.rs");
+        assert!(
+            source.contains("DiscoveryStage::CAPACITY.saturating_sub(engine_held)"),
+            "staging sizes its share from the engine hold"
+        );
+        assert!(
+            source.contains("DiscoveryStage::poll_discovery("),
+            "readiness polls through the shared predicate"
+        );
+    }
+
+    #[test]
+    fn counter_start_path_raises_nofile_before_first_link() {
+        // Every Session start raises the soft FD limit before any link
+        // exists. The counter path routes through this same chain (no
+        // direct-preparation bypass), so the 1,026-FD first 512-endpoint
+        // stage is covered. The soft-1024 privileged twin proves the raise
+        // behaviorally; this pins the order in source.
+        let source = include_str!("attach.rs");
+        let chain = source
+            .split_once("    fn start_with_selected(")
+            .expect("start chain entry")
+            .1
+            .split_once("\n    }\n")
+            .expect("start chain end")
+            .0;
+        let raise = chain.find("raise_nofile()").expect("raise site");
+        let backend = chain.find("start_on_backend(").expect("backend start");
+        assert!(
+            raise < backend,
+            "the soft-limit raise must precede backend start (first links)"
+        );
+    }
+
+    #[test]
+    fn embedded_capture_adapter_symbol_match_is_exact() {
+        let helper = "object_emit_get_attributes";
+        for symbol in [
+            "_RNvCscPIs3K62KxS_13p11scope_ebpf26object_emit_get_attributes",
+            "_RNvCsburksC6UTXr_13p11scope_ebpf26object_emit_get_attributes",
+            "_RNvC13p11scope_ebpf26object_emit_get_attributes",
+        ] {
+            assert!(super::embedded_adapter_symbol_matches(symbol, helper));
+        }
+        for symbol in [
+            "_RNvXs1_NtNtNtCsoa9cz3JwRE_4core3ops8function5implsQNCNvCscPIs3K62KxS_13p11scope_ebpf26object_emit_get_attributes0INtB7_5FnMutTyEE8call_mutBR_",
+            "_RNvCscPIs3K62KxS_13p11scope_ebpf26object_emit_get_attributes_suffix",
+            "_RNvCscPIs3K62KxS_13p11scope_ebpf32prefixobject_emit_get_attributes",
+            "_RNvCs_13p11scope_ebpf26object_emit_get_attributes",
+            "_RNvCs!_13p11scope_ebpf26object_emit_get_attributes",
+        ] {
+            assert!(!super::embedded_adapter_symbol_matches(symbol, helper));
+        }
+        let misleading = "prefix13p11scope_ebpf26object_emit_get_attributes";
+        assert!(!super::embedded_adapter_symbol_matches(
+            &format!("_RNvCsa_13p11scope_ebpf{}{misleading}", misleading.len()),
+            helper
+        ));
+    }
+
+    #[test]
+    fn embedded_object_capture_probe_refuses_missing_ambiguous_and_half_wired() {
+        fn refused(parsed: aya_obj::Object, reason: &str) {
+            let error =
+                std::panic::catch_unwind(|| super::embedded_object_capture_is_stubbed(parsed))
+                    .expect_err("mutated embedded object must be refused");
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains(reason), "wrong refusal: {message}");
+        }
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let emit = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| {
+                super::embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+            })
+            .unwrap()
+            .0;
+        let reader = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| function.name == "p11_request_cell")
+            .unwrap()
+            .0;
+        let mut missing = parsed.clone();
+        missing.functions.remove(&emit);
+        refused(missing, "no exact return adapter");
+        let mut misleading = parsed.clone();
+        misleading
+            .functions
+            .get_mut(&emit)
+            .unwrap()
+            .name
+            .push_str("_suffix");
+        refused(misleading, "no exact return adapter");
+        let mut duplicate = parsed.clone();
+        let address = duplicate
+            .functions
+            .keys()
+            .map(|(_, address)| *address)
+            .max()
+            .unwrap()
+            + 8;
+        let mut clone = duplicate.functions[&emit].clone();
+        clone.name = "_RNvCsa_13p11scope_ebpf26object_emit_get_attributes".into();
+        duplicate.functions.insert((emit.0, address), clone);
+        refused(duplicate, "several exact return adapters");
+        let mut missing = parsed.clone();
+        missing.functions.remove(&reader);
+        refused(missing, "lacks request reader");
+        let mut wrong_btf = parsed.clone();
+        wrong_btf
+            .functions
+            .get_mut(&reader)
+            .unwrap()
+            .func_info
+            .func_info[0]
+            .type_id = 0;
+        refused(wrong_btf, "original BTF FUNC");
+        let mut half_wired = parsed;
+        let adapter = half_wired.functions.get_mut(&emit).unwrap();
+        if cfg!(feature = "stub-object-attributes") {
+            // Big-but-blind still disagrees with a stubbed entry.
+            let instruction = *adapter.instructions.last().unwrap();
+            adapter.instructions.resize(300, instruction);
+        } else {
+            // Blind the wired adapter: a lone exit reaches no reader, so
+            // the small return side probes stubbed against a wired entry.
+            let exit = *adapter.instructions.last().unwrap();
+            adapter.instructions.clear();
+            adapter.instructions.push(exit);
+            adapter.func_info.func_info.truncate(1);
+        }
+        refused(half_wired, "half-wired embedded object");
+    }
+
+    #[test]
+    fn embedded_object_capture_entry_requires_real_calls() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let (entry, reader_id) = super::embedded_object_capture_entry(parsed);
+        let captures = !cfg!(feature = "stub-object-attributes");
+        assert_eq!(
+            super::embedded_entry_reaches_reader(&entry, reader_id),
+            captures
+        );
+        let mut unknown = entry.clone();
+        let (at, instruction) = unknown
+            .instructions
+            .iter_mut()
+            .enumerate()
+            .find(|(_, instruction)| instruction.code == 0x85 && instruction.src_reg() == 1)
+            .unwrap();
+        instruction.imm = i32::try_from(entry.instructions.len() - at).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| super::embedded_entry_reaches_reader(&unknown, reader_id))
+                .is_err()
+        );
+        if captures {
+            let target = entry
+                .func_info
+                .func_info
+                .iter()
+                .find(|info| info.type_id == reader_id)
+                .expect("FULL entry must link the actual request reader")
+                .insn_off as usize;
+            let mut removed = entry;
+            let mut changed = 0;
+            for (at, instruction) in removed.instructions.iter_mut().enumerate() {
+                if instruction.code == 0x85
+                    && instruction.src_reg() == 1
+                    && (at + 1).checked_add_signed(instruction.imm as isize) == Some(target)
+                {
+                    instruction.code = 0xb7;
+                    instruction.set_src_reg(0);
+                    instruction.imm = 0;
+                    changed += 1;
+                }
+            }
+            assert!(changed > 0, "actual reader call mutation must be nonzero");
+            assert!(
+                !super::embedded_entry_reaches_reader(&removed, reader_id),
+                "retained reader body/BTF alone cannot prove capture"
+            );
+        }
+    }
+
+    /// Forced-refusal / no-spurious-degrade control: the status a session
+    /// reports over its setup-checked flavor agrees with the embedded
+    /// bytes' probed flavor, in every build. (The wiring pin beside this
+    /// proves the method reads the stored flavor.) A stubbed build that
+    /// claimed available — or a FULL build that claimed unavailable —
+    /// fails here.
+    #[test]
+    fn session_object_capture_status_matches_bytes() {
+        let checked = super::checked_embedded_flavor().expect("bytes agree with the build");
+        let status = crate::render::ObjectCaptureEvidence::for_build(checked.stubbed);
+        assert_eq!(status.available, !super::embedded_object_is_stubbed());
+        if status.available {
+            assert_eq!(status.reason, None);
+        } else {
+            assert_eq!(status.reason, Some("not_enabled"));
+        }
+    }
+
+    /// P0-only ship vehicle: the embedded Detailed object carries
+    /// stubbed attribute capture exactly when the `stub-object-attributes`
+    /// feature built it. Both directions: a silent unwire fails featured
+    /// builds, a silent stub fails default builds. The live load test
+    /// proves the stubbed bytes load where FULL is refused.
+    #[test]
+    fn embedded_object_stub_matches_feature() {
+        assert_eq!(
+            super::embedded_object_is_stubbed(),
+            cfg!(feature = "stub-object-attributes"),
+            "embedded Detailed bytes must follow the stub feature"
+        );
+    }
+
+    /// Production probe, positive control: the real embedded bytes report
+    /// this build's flavor in every flavor (FULL default, P0, unsafe).
+    #[test]
+    fn production_probe_matches_embedded_bytes_in_this_build() {
+        let flavor = super::embedded_flavor_from_bytes(crate::EBPF_OBJECT)
+            .expect("embedded Detailed bytes must probe");
+        assert_eq!(
+            flavor.stubbed,
+            cfg!(feature = "stub-object-attributes"),
+            "probed stub flavor must match the build feature"
+        );
+        assert_eq!(
+            flavor.unsafe_present,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            "probed unsafe presence must match the build feature"
+        );
+    }
+
+    /// Production stub rule agrees with the exact-symbol test probe on the
+    /// real bytes, in every flavor.
+    #[test]
+    fn production_stub_probe_matches_test_probe_on_embedded_bytes() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::probed_capture_is_stubbed(parsed),
+            Ok(super::embedded_object_is_stubbed())
+        );
+    }
+
+    /// Production probe, negative byte control: garbage bytes are a probe
+    /// error, never a flavor. Fails while the probe returns the feature.
+    #[test]
+    fn production_probe_rejects_garbage_bytes() {
+        let error = super::embedded_flavor_from_bytes(b"not an ELF object")
+            .expect_err("garbage bytes must not probe as any flavor");
+        assert!(
+            error.reason().contains("does not parse"),
+            "{}",
+            error.reason()
+        );
+    }
+
+    /// Production stub core, negative controls: missing, ambiguous and
+    /// half-wired evidence are errors, never a flavor and never a panic.
+    /// Mirrors the test-probe refusal matrix; fails while the core
+    /// returns the build feature.
+    #[test]
+    fn production_stub_core_refuses_missing_ambiguous_and_half_wired() {
+        fn refused(parsed: aya_obj::Object, reason: &str) {
+            let error = super::probed_capture_is_stubbed(parsed)
+                .expect_err("mutated embedded object must be refused");
+            assert!(
+                error.reason().contains(reason),
+                "wrong refusal: {}",
+                error.reason()
+            );
+        }
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let emit = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| {
+                super::embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+            })
+            .unwrap()
+            .0;
+        let reader = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| function.name == "p11_request_cell")
+            .unwrap()
+            .0;
+        let mut missing = parsed.clone();
+        missing.functions.remove(&emit);
+        refused(missing, "no exact return adapter");
+        let mut misleading = parsed.clone();
+        misleading
+            .functions
+            .get_mut(&emit)
+            .unwrap()
+            .name
+            .push_str("_suffix");
+        refused(misleading, "no exact return adapter");
+        let mut duplicate = parsed.clone();
+        let address = duplicate
+            .functions
+            .keys()
+            .map(|(_, address)| *address)
+            .max()
+            .unwrap()
+            + 8;
+        let mut clone = duplicate.functions[&emit].clone();
+        clone.name = "_RNvCsa_13p11scope_ebpf26object_emit_get_attributes".into();
+        duplicate.functions.insert((emit.0, address), clone);
+        refused(duplicate, "several exact return adapters");
+        let mut missing = parsed.clone();
+        missing.functions.remove(&reader);
+        refused(missing, "lacks request reader");
+        let mut wrong_btf = parsed.clone();
+        wrong_btf
+            .functions
+            .get_mut(&reader)
+            .unwrap()
+            .func_info
+            .func_info[0]
+            .type_id = 0;
+        refused(wrong_btf, "original BTF FUNC");
+        let mut half_wired = parsed;
+        let adapter = half_wired.functions.get_mut(&emit).unwrap();
+        if cfg!(feature = "stub-object-attributes") {
+            // Big-but-blind still disagrees with a stubbed entry.
+            let instruction = *adapter.instructions.last().unwrap();
+            adapter.instructions.resize(300, instruction);
+        } else {
+            // Blind the wired adapter: a lone exit reaches no reader, so
+            // the small return side probes stubbed against a wired entry.
+            let exit = *adapter.instructions.last().unwrap();
+            adapter.instructions.clear();
+            adapter.instructions.push(exit);
+            adapter.func_info.func_info.truncate(1);
+        }
+        refused(half_wired, "half-wired embedded object");
+    }
+
+    /// Production unsafe probe, positive control: the real bytes report
+    /// unsafe-decoder presence matching the build feature, in every flavor.
+    #[test]
+    fn production_unsafe_probe_matches_feature_in_this_build() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::probed_unsafe_is_present(&parsed),
+            Ok(cfg!(feature = "unsafe-unvalidated-metadata"))
+        );
+    }
+
+    /// Production unsafe probe reads the bytes, not the feature: planting
+    /// every unsafe marker into default bytes reports present; stripping
+    /// every marker from unsafe bytes reports absent. Fails while the
+    /// probe returns the build feature.
+    #[test]
+    fn production_unsafe_probe_reads_bytes_not_feature() {
+        let mut parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            for name in super::UNSAFE_PROGRAMS {
+                assert!(
+                    parsed.programs.remove(name).is_some(),
+                    "unsafe bytes lack {name}"
+                );
+            }
+            for (name, _) in super::FEATURE_POLICY_MAPS {
+                assert!(
+                    parsed.maps.remove(name).is_some(),
+                    "unsafe bytes lack {name}"
+                );
+            }
+            assert_eq!(super::probed_unsafe_is_present(&parsed), Ok(false));
+        } else {
+            let program = parsed
+                .programs
+                .values()
+                .next()
+                .expect("detailed bytes carry programs")
+                .clone();
+            for name in super::UNSAFE_PROGRAMS {
+                assert!(
+                    !parsed.programs.contains_key(name),
+                    "default bytes carry {name}"
+                );
+                parsed.programs.insert(name.to_string(), program.clone());
+            }
+            let map = parsed
+                .maps
+                .values()
+                .next()
+                .expect("detailed bytes carry maps")
+                .clone();
+            for (name, _) in super::FEATURE_POLICY_MAPS {
+                assert!(
+                    !parsed.maps.contains_key(name),
+                    "default bytes carry {name}"
+                );
+                parsed.maps.insert(name.to_string(), map.clone());
+            }
+            assert_eq!(super::probed_unsafe_is_present(&parsed), Ok(true));
+        }
+    }
+
+    /// Production unsafe probe, half-wired control: a single planted
+    /// marker in default bytes (or a single stripped marker in unsafe
+    /// bytes) is an error, never a flavor.
+    #[test]
+    fn production_unsafe_probe_refuses_half_wired() {
+        let mut parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            parsed.programs.remove(super::UNSAFE_PROGRAMS[0]);
+        } else {
+            let program = parsed
+                .programs
+                .values()
+                .next()
+                .expect("detailed bytes carry programs")
+                .clone();
+            parsed
+                .programs
+                .insert(super::UNSAFE_PROGRAMS[0].to_string(), program);
+        }
+        let error = super::probed_unsafe_is_present(&parsed)
+            .expect_err("half-wired unsafe evidence must be refused");
+        assert!(error.reason().contains("half-wired"), "{}", error.reason());
+    }
+
+    /// The flavor check accepts agreeing bytes in every flavor.
+    #[test]
+    fn flavor_check_accepts_agreeing_bytes() {
+        let probed = super::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        assert_eq!(super::check_flavor_against_build(probed).unwrap(), probed);
+    }
+
+    /// The Detailed-shaped byte probe does NOT apply to counter bank
+    /// objects (they carry no return adapter): this pins why counter
+    /// sessions need their own flavor check. What that check consumes —
+    /// unsafe-decoder absence from the parsed object — holds on every
+    /// embedded bank object. Omitted-object builds (WIDE, SMALL) carry
+    /// empty statics and skip.
+    #[test]
+    fn counter_objects_lack_the_detailed_flavor_adapter() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let bytes = super::counter_banks::counter_object_for_mode(mode);
+            let error = super::embedded_flavor_from_bytes(bytes)
+                .expect_err("counter bytes must not take the Detailed probe");
+            assert!(
+                error.reason().contains("no exact return adapter"),
+                "{mode:?}: {}",
+                error.reason()
+            );
+            let parsed = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+            assert!(
+                !super::probed_unsafe_is_present(&parsed).unwrap(),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// The counter flavor check accepts every embedded bank object: FULL
+    /// without unsafe decoders on every build (counter flavors never take
+    /// the stub or unsafe features). Omitted-object builds skip.
+    #[test]
+    fn counter_flavor_accepts_embedded_bank_objects() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let flavor = super::checked_counter_flavor(
+                mode,
+                super::counter_banks::counter_object_for_mode(mode),
+            )
+            .unwrap();
+            assert_eq!(
+                flavor,
+                super::EmbeddedFlavor {
+                    stubbed: false,
+                    unsafe_present: false,
+                },
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// Unparseable bytes refuse naming the mode and the reason.
+    #[test]
+    fn counter_flavor_refuses_unparseable_bytes() {
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let error = super::checked_counter_flavor(mode, b"not an ELF object").unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(&format!("--counter-mode {}", mode.name())),
+                "{text}"
+            );
+            assert!(
+                text.contains("cannot determine counter BPF object flavor"),
+                "{text}"
+            );
+            assert!(text.contains("stale or mismatched"), "{text}");
+        }
+    }
+
+    /// The parsed-object mapping: unsafe-absent yields the FULL counter
+    /// flavor; unsafe-present refuses as a mismatch; half-wired evidence
+    /// refuses as cannot-determine. Each names the mode.
+    #[test]
+    fn counter_flavor_maps_parsed_unsafe_evidence() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        let mode = p11scope_ebpf_common::CounterMode::Counts;
+        let bytes = super::counter_banks::counter_object_for_mode(mode);
+        let parsed = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+        assert_eq!(
+            super::counter_flavor_from_parsed(mode, &parsed).unwrap(),
+            super::EmbeddedFlavor {
+                stubbed: false,
+                unsafe_present: false,
+            }
+        );
+        // Half-wired: one planted marker refuses as cannot-determine.
+        let mut half = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+        let program = half
+            .programs
+            .values()
+            .next()
+            .expect("counter bytes carry programs")
+            .clone();
+        half.programs
+            .insert(super::UNSAFE_PROGRAMS[0].to_string(), program);
+        let error = super::counter_flavor_from_parsed(mode, &half).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("--counter-mode {}", mode.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains("cannot determine counter BPF object flavor"),
+            "{text}"
+        );
+        assert!(text.contains("half-wired"), "{text}");
+        // Present: every marker planted refuses as a mismatch.
+        let mut present = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+        let program = present
+            .programs
+            .values()
+            .next()
+            .expect("counter bytes carry programs")
+            .clone();
+        for name in super::UNSAFE_PROGRAMS {
+            assert!(
+                !present.programs.contains_key(name),
+                "counter bytes carry {name}"
+            );
+            present.programs.insert(name.to_string(), program.clone());
+        }
+        let map = present
+            .maps
+            .values()
+            .next()
+            .expect("counter bytes carry maps")
+            .clone();
+        for (name, _) in super::FEATURE_POLICY_MAPS {
+            assert!(
+                !present.maps.contains_key(name),
+                "counter bytes carry {name}"
+            );
+            present.maps.insert(name.to_string(), map.clone());
+        }
+        let error = super::counter_flavor_from_parsed(mode, &present).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("--counter-mode {}", mode.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains("counter BPF object flavor mismatch"),
+            "{text}"
+        );
+        assert!(text.contains("unsafe-unvalidated-metadata"), "{text}");
+    }
+
+    /// Real unsafe-present evidence refuses as a mismatch: in an
+    /// unsafe-compiled build the Detailed bytes carry every unsafe
+    /// marker, so they must fail the counter check. Unsafe lane only.
+    #[cfg(feature = "unsafe-unvalidated-metadata")]
+    #[test]
+    fn counter_flavor_refuses_unsafe_present_bytes() {
+        let mode = p11scope_ebpf_common::CounterMode::Latency;
+        let error = super::checked_counter_flavor(mode, crate::EBPF_OBJECT).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("--counter-mode {}", mode.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains("counter BPF object flavor mismatch"),
+            "{text}"
+        );
+    }
+
+    /// A stubbed parse in a wired build (or the reverse) refuses with one
+    /// plain message naming both values.
+    #[test]
+    fn flavor_check_refuses_stub_mismatch() {
+        let probed = super::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let error = super::check_flavor_against_build(probed).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("FULL"), "{message}");
+        assert!(message.contains("P0"), "{message}");
+    }
+
+    /// An unsafe-presence disagreement refuses naming both values.
+    #[test]
+    fn flavor_check_refuses_unsafe_mismatch() {
+        let probed = super::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let error = super::check_flavor_against_build(probed).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            assert!(message.contains("lack"), "{message}");
+        } else {
+            assert!(message.contains("contain"), "{message}");
+        }
+    }
+
+    /// The checked flavor honors a planted mismatch with the refusal
+    /// message, and agreeing bytes pass through.
+    #[test]
+    fn checked_flavor_honors_planted_mismatch() {
+        let planted = super::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+        let error = super::checked_embedded_flavor().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stale or mismatched"),
+            "{error:#}"
+        );
+    }
+
+    /// The test seam plants a flavor for the guard's lifetime and clears
+    /// it on drop, so ordinary reads see real bytes again.
+    #[test]
+    fn flavor_override_holds_planted_value_until_drop() {
+        let planted = super::EmbeddedFlavor {
+            stubbed: true,
+            unsafe_present: true,
+        };
+        {
+            let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+            assert_eq!(super::embedded_flavor().unwrap(), planted);
+            assert_eq!(super::embedded_flavor().unwrap(), planted);
+        }
+        assert_eq!(
+            super::embedded_flavor().unwrap().stubbed,
+            super::embedded_flavor_from_bytes(crate::EBPF_OBJECT)
+                .unwrap()
+                .stubbed
+        );
+    }
+
+    /// A planted stub mismatch refuses capture setup before any attach:
+    /// `diagnostic` fails with the mismatch message without loading BPF,
+    /// so this passes unprivileged. Fails while setup derives the flavor
+    /// from the feature.
+    #[test]
+    fn mismatched_flavor_refuses_setup_before_attach() {
+        let planted = super::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+        let error = super::Session::diagnostic()
+            .err()
+            .expect("mismatched flavor must refuse setup");
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("FULL"), "{message}");
+        assert!(message.contains("P0"), "{message}");
+    }
+
+    /// Undeterminable bytes refuse setup the same way, with the probe
+    /// reason attached. Fails while setup ignores the probe.
+    #[test]
+    fn undeterminable_flavor_refuses_setup_before_attach() {
+        let _guard = super::hold_embedded_flavor_for_test(Err(super::FlavorProbeError::new(
+            "no exact return adapter",
+        )));
+        let error = super::Session::diagnostic()
+            .err()
+            .expect("undeterminable flavor must refuse setup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot determine embedded BPF object flavor"),
+            "{message}"
+        );
+        assert!(message.contains("no exact return adapter"), "{message}");
+    }
+
+    /// Extract one top-level function body from this file's source for the
+    /// wiring pins below (the uretprobe loader-contract shape).
+    fn pin_body<'a>(
+        source: &'a str,
+        signature: &str,
+        end: &str,
+    ) -> std::result::Result<&'a str, String> {
+        source
+            .split_once(signature)
+            .ok_or_else(|| format!("{signature} not found"))?
+            .1
+            .split_once(end)
+            .map(|(body, _)| body)
+            .ok_or_else(|| format!("{signature} body end not found"))
+    }
+
+    /// The planted-flavor seam is per thread: the holder's own thread reads
+    /// the planted value while a sibling thread keeps reading the real
+    /// bytes, so planting tests never leak a mismatch into tests running
+    /// beside them. Fails while the hook is process-global.
+    #[test]
+    fn flavor_override_stays_on_the_planting_thread() {
+        let bytes = super::embedded_flavor_from_bytes(crate::EBPF_OBJECT)
+            .expect("embedded Detailed bytes must probe");
+        let planted = super::EmbeddedFlavor {
+            stubbed: !bytes.stubbed,
+            unsafe_present: !bytes.unsafe_present,
+        };
+        let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+        assert_eq!(
+            super::embedded_flavor().expect("own thread reads the planted value"),
+            planted
+        );
+        let seen = std::thread::spawn(|| super::embedded_flavor().expect("sibling reads bytes"))
+            .join()
+            .expect("sibling thread joins");
+        assert_eq!(
+            seen, bytes,
+            "a sibling thread must see bytes, not the plant"
+        );
+    }
+
+    /// The cache initializer is pinned to the object bytes: `embedded_flavor`
+    /// must initialize from `embedded_flavor_from_bytes(crate::EBPF_OBJECT)`,
+    /// and no step of the probe path may read the Cargo features. A normal
+    /// test build cannot hold mismatched bytes, so the planted twins cannot
+    /// tell a feature-reading initializer apart; this pin can. Non-vacuity:
+    /// the feature-reading mutant fails below on the mutated source, and in
+    /// the mutant build log with the test hook kept.
+    #[test]
+    fn embedded_flavor_cache_initializes_from_object_bytes() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            let flavor = pin_body(source, "pub(crate) fn embedded_flavor()", "\n}\n")?;
+            if !flavor.contains("embedded_flavor_from_bytes(crate::EBPF_OBJECT)") {
+                return Err("embedded_flavor must initialize from the object bytes".to_string());
+            }
+            for signature in [
+                "pub(crate) fn embedded_flavor()",
+                "pub(crate) fn embedded_flavor_from_bytes(",
+                "fn probed_capture_entry(",
+                "fn probed_capture_return(",
+                "fn probed_entry_reaches_reader(",
+                "fn probed_capture_is_stubbed(",
+                "fn probed_unsafe_is_present(",
+            ] {
+                let probed = pin_body(source, signature, "\n}\n")?;
+                if probed.contains("cfg!(feature") {
+                    return Err(format!("{signature} must probe bytes, not features"));
+                }
+            }
+            Ok(())
+        }
+
+        let source = include_str!("attach.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            ".get_or_init(|| embedded_flavor_from_bytes(crate::EBPF_OBJECT))",
+            ".get_or_init(|| Ok(super::EmbeddedFlavor { stubbed: cfg!(feature = \"stub-object-attributes\"), unsafe_present: cfg!(feature = \"unsafe-unvalidated-metadata\") }))",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant changes the initializer");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// Attach grouping and output evidence read the flavor the session was
+    /// set up with, never a re-read of the global cache: the three grouping
+    /// bodies pass the stored flavor and the evidence method reads it, with
+    /// no silent fallback. Fails while any site re-reads the cache.
+    #[test]
+    fn session_flavor_feeds_grouping_and_evidence() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            // Methods close indented, so each window ends at the next
+            // method's signature instead of a column-zero brace.
+            for (signature, end) in [
+                ("pub(crate) fn attach_targets(", "fn attach_targets_multi("),
+                ("fn attach_targets_multi(", "fn rebuild_affected_groups("),
+                (
+                    "fn rebuild_affected_groups(",
+                    "pub(crate) fn begin_owned_producer_detach(",
+                ),
+            ] {
+                let grouped = pin_body(source, signature, end)?;
+                if !grouped.contains("self.embedded_flavor.unsafe_present") {
+                    return Err(format!("{signature} must pass the session's flavor"));
+                }
+                if grouped.contains("probed_unsafe_for_grouping")
+                    || grouped.contains("embedded_flavor()")
+                {
+                    return Err(format!("{signature} must not re-read the global cache"));
+                }
+            }
+            let evidence = pin_body(
+                source,
+                "pub(crate) fn object_capture_evidence(",
+                "pub(crate) fn scope_filter(",
+            )?;
+            if !evidence.contains("self.embedded_flavor.stubbed") {
+                return Err("output evidence must read the session's flavor".to_string());
+            }
+            if evidence.contains("embedded_flavor()") || evidence.contains("unwrap_or") {
+                return Err("output evidence must have no silent fallback".to_string());
+            }
+            Ok(())
+        }
+
+        let source = include_str!("attach.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            "self.embedded_flavor.unsafe_present",
+            "probed_unsafe_for_grouping()",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant reverts one grouping site");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// The entry lookup refuses a detached entry key instead of panicking:
+    /// the program's key need not be in the function map. Fails (panics at
+    /// the index) while the lookup indexes the map.
+    #[test]
+    fn probed_entry_lookup_refuses_a_detached_entry_key() {
+        let mut parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let key = parsed
+            .programs
+            .get("p11_entry")
+            .expect("embedded Detailed object lacks entry")
+            .function_key();
+        let entry = parsed
+            .functions
+            .remove(&key)
+            .expect("embedded entry function present");
+        let address = parsed
+            .functions
+            .keys()
+            .map(|(_, address)| *address)
+            .max()
+            .unwrap()
+            + 8;
+        parsed.functions.insert((key.0, address), entry);
+        let error = super::probed_capture_entry(parsed)
+            .expect_err("a detached entry key must refuse, not panic");
+        assert!(
+            error.reason().contains("ambiguous embedded entry function"),
+            "{}",
+            error.reason()
+        );
+    }
+
+    /// The stub rule has one copy: the exact-symbol test helpers delegate to
+    /// the production probe, so the two cannot drift. (The agreement test
+    /// beside them keeps pinning the wiring.) Fails while the helpers carry
+    /// their own duplicated rule.
+    #[test]
+    fn stub_rule_tests_use_the_production_probe() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            for (helper, production) in [
+                ("fn embedded_object_capture_entry(", "probed_capture_entry("),
+                (
+                    "fn embedded_entry_reaches_reader(",
+                    "probed_entry_reaches_reader(",
+                ),
+                (
+                    "fn embedded_object_capture_is_stubbed(",
+                    "probed_capture_is_stubbed(",
+                ),
+            ] {
+                let delegated = pin_body(source, helper, "\n}\n")?;
+                if !(delegated.contains(production) && delegated.contains(".expect(")) {
+                    return Err(format!("{helper} must delegate to {production}"));
+                }
+            }
+            Ok(())
+        }
+
+        let source = include_str!("attach.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            "probed_capture_is_stubbed(parsed)",
+            "duplicated_stub_logic(parsed)",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant reverts one helper");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// Every flavor-mismatch refusal names the operator's fix: a clean
+    /// rebuild. Both `check_flavor_against_build` directions and the
+    /// undeterminable wrap carry the hint. Fails while the suffix names no fix.
+    #[test]
+    fn flavor_mismatch_names_a_rebuild() {
+        for probed in [
+            super::EmbeddedFlavor {
+                stubbed: !cfg!(feature = "stub-object-attributes"),
+                unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+            },
+            super::EmbeddedFlavor {
+                stubbed: cfg!(feature = "stub-object-attributes"),
+                unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+            },
+        ] {
+            let error = super::check_flavor_against_build(probed).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("stale or mismatched"), "{message}");
+            assert!(
+                message.contains("rebuild p11scope from a clean target directory"),
+                "{message}"
+            );
+        }
+        let _guard = super::hold_embedded_flavor_for_test(Err(super::FlavorProbeError::new(
+            "test probe reason",
+        )));
+        let error = super::checked_embedded_flavor().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot determine embedded BPF object flavor"),
+            "{message}"
+        );
+        assert!(
+            message.contains("rebuild p11scope from a clean target directory"),
+            "{message}"
+        );
+    }
+
+    /// The half-wired stub refusal is plain operator text, not reader/emit
+    /// jargon. (The rebuild hint rides the shared mismatch suffix pinned
+    /// beside this.) Fails while the reason names internals.
+    #[test]
+    fn half_wired_stub_refusal_is_plain_operator_text() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let emit = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| {
+                super::embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+            })
+            .unwrap()
+            .0;
+        let mut half_wired = parsed;
+        let body = &mut half_wired.functions.get_mut(&emit).unwrap().instructions;
+        let instruction = *body.last().unwrap();
+        body.resize(
+            if cfg!(feature = "stub-object-attributes") {
+                300
+            } else {
+                49
+            },
+            instruction,
+        );
+        let error =
+            super::probed_capture_is_stubbed(half_wired).expect_err("half-wired must refuse");
+        let reason = error.reason();
+        assert!(reason.contains("half-wired"), "{reason}");
+        assert!(!reason.contains("entry reader"), "{reason}");
+        assert!(!reason.contains("emit "), "{reason}");
+    }
+
+    /// Load-refusal detector matrix: the E2BIG budget errno classifies;
+    /// every other errno here — and a missing errno — stays a loud
+    /// unrelated failure. The ENOSPC log-exhaustion twin lives beside
+    /// this.
+    #[test]
+    fn verifier_budget_errno_matrix() {
+        assert!(super::is_verifier_budget_errno(Some(libc::E2BIG)));
+        for errno in [
+            libc::EINVAL,
+            libc::EACCES,
+            libc::EPERM,
+            libc::ENOMEM,
+            libc::EFAULT,
+        ] {
+            assert!(
+                !super::is_verifier_budget_errno(Some(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_errno(None));
+    }
+
+    /// Errno split: ENOSPC (log exhaustion) is NOT the verifier-budget
+    /// errno — the counter mapping rewrites E2BIG alone — it classifies
+    /// as a budget refusal only at the attach/doctor seam
+    /// (`is_verifier_budget_refusal`). Genuine non-budget errnos —
+    /// including EAGAIN — stay out everywhere.
+    #[test]
+    fn verifier_budget_errno_excludes_log_exhaustion() {
+        assert!(!super::is_verifier_budget_errno(Some(libc::ENOSPC)));
+        for errno in [
+            libc::EINVAL,
+            libc::EACCES,
+            libc::EPERM,
+            libc::ENOMEM,
+            libc::EFAULT,
+            libc::EAGAIN,
+        ] {
+            assert!(
+                !super::is_verifier_budget_errno(Some(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_errno(None));
+    }
+
+    /// Load-refusal detector on real error values, both directions: a
+    /// LoadError with E2BIG classifies; LoadErrors with other errnos —
+    /// and non-load errors — never do, whatever the verifier log says.
+    #[test]
+    fn verifier_budget_refusal_real_errors() {
+        fn load_error(errno: i32) -> aya::programs::ProgramError {
+            aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(errno),
+                verifier_log: aya_obj::VerifierLog::new("verifier spew".to_string()),
+            }
+        }
+        assert!(super::is_verifier_budget_refusal(&load_error(libc::E2BIG)));
+        for errno in [libc::EINVAL, libc::EACCES, libc::EPERM] {
+            assert!(
+                !super::is_verifier_budget_refusal(&load_error(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_refusal(
+            &aya::programs::ProgramError::NotLoaded
+        ));
+    }
+
+    /// Log-exhaustion twin on real error values: an ENOSPC LoadError
+    /// classifies; EAGAIN and permission LoadErrors — and non-load
+    /// errors — never do, whatever the verifier log says.
+    #[test]
+    fn verifier_budget_refusal_classifies_log_exhaustion() {
+        fn load_error(errno: i32) -> aya::programs::ProgramError {
+            aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(errno),
+                verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+            }
+        }
+        assert!(super::is_verifier_budget_refusal(&load_error(libc::ENOSPC)));
+        for errno in [libc::EAGAIN, libc::EINVAL, libc::EACCES, libc::EPERM] {
+            assert!(
+                !super::is_verifier_budget_refusal(&load_error(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_refusal(
+            &aya::programs::ProgramError::NotLoaded
+        ));
+    }
+
+    /// Load-refusal detector, live: a FULL root load either succeeds
+    /// (bigger-limit kernels) or fails with a classified refusal. The
+    /// classifier must agree with the real errno in both directions — a
+    /// misfire fails. Default builds only; featured builds pin the
+    /// stubbed load in `stubbed_roots_load`.
+    #[cfg(not(feature = "stub-object-attributes"))]
+    #[ignore = "root-owned BPF lane; FULL root load refusal is classified"]
+    #[test]
+    fn full_root_load_refusal_is_classified() {
+        let btf = aya::Btf::from_sys_fs().expect("vmlinux BTF for typed task storage");
+        let mut ebpf = super::load_capture_object(
+            &btf,
+            crate::run::resolve_ring_bytes(None),
+            p11scope_ebpf_common::DISCOVERY_BYTES,
+        )
+        .expect("FULL object parses and creates maps");
+        let program: &mut aya::programs::UProbe = ebpf
+            .program_mut("p11_entry")
+            .unwrap_or_else(|| panic!("FULL object missing p11_entry"))
+            .try_into()
+            .unwrap_or_else(|error| panic!("p11_entry is not an uprobe: {error}"));
+        match program.load() {
+            Ok(()) => println!("FULL p11_entry loads on this kernel"),
+            Err(error) => {
+                if let aya::programs::ProgramError::LoadError { io_error, .. } = &error {
+                    let errno = io_error
+                        .raw_os_error()
+                        .expect("a real LoadError carries the BPF_PROG_LOAD errno");
+                    assert_eq!(
+                        super::is_verifier_budget_refusal(&error),
+                        errno == libc::E2BIG || errno == libc::ENOSPC,
+                        "classifier must agree with errno {errno} in both directions"
+                    );
+                    println!("FULL p11_entry refused: errno={errno}");
+                } else {
+                    assert!(
+                        !super::is_verifier_budget_refusal(&error),
+                        "non-load errors never classify: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// P0-only ship vehicle, live: stub-featured bytes load both object
+    /// roots on 1M-budget kernels, where FULL is refused with E2BIG.
+    /// Featured builds only; the default-build refusal control is
+    /// `full_root_load_refusal_is_classified`.
+    #[cfg(feature = "stub-object-attributes")]
+    #[ignore = "root-owned BPF lane; stubbed p11_entry/p11_return load on 1M kernels"]
+    #[test]
+    fn stubbed_roots_load() {
+        let btf = aya::Btf::from_sys_fs().expect("vmlinux BTF for typed task storage");
+        let mut ebpf = super::load_capture_object(
+            &btf,
+            crate::run::resolve_ring_bytes(None),
+            p11scope_ebpf_common::DISCOVERY_BYTES,
+        )
+        .expect("stubbed object parses and creates maps");
+        for root in ["p11_entry", "p11_return"] {
+            let program: &mut aya::programs::UProbe = ebpf
+                .program_mut(root)
+                .unwrap_or_else(|| panic!("stubbed object missing {root}"))
+                .try_into()
+                .unwrap_or_else(|error| panic!("{root} is not an uprobe: {error}"));
+            program
+                .load()
+                .unwrap_or_else(|error| panic!("stubbed {root} must load: {error}"));
+        }
+    }
+
+    /// Owned provider + driver build for the real-Session retirement cells.
+    /// The child prints READY, then idles waiting for 'G' (60 s bound) while
+    /// the Session drives STOP/Q/retirement; nothing ever calls into it.
+    struct CollectedSessionCell {
+        _directory: tempfile::TempDir,
+        provider: std::path::PathBuf,
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl Drop for CollectedSessionCell {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl CollectedSessionCell {
+        fn build() -> anyhow::Result<Self> {
+            use anyhow::Context as _;
+            let directory = tempfile::tempdir()?;
+            let source = directory.path().join("retirement-cell.c");
+            std::fs::write(
+                &source,
+                include_str!("../tests/fixtures/detailed-thread-exit.c"),
+            )?;
+            let provider = directory.path().join("provider.so");
+            let driver = directory.path().join("driver");
+            for is_provider in [true, false] {
+                let mut compiler = std::process::Command::new("cc");
+                compiler.args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-fno-builtin",
+                    "-fno-stack-protector",
+                    "-fno-omit-frame-pointer",
+                ]);
+                if is_provider {
+                    compiler.args(["-fPIC", "-shared", "-DDETAILED_THREAD_EXIT_PROVIDER"]);
+                } else {
+                    compiler.arg("-ldl");
+                }
+                let output = compiler
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(if is_provider { &provider } else { &driver })
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "owned fixture compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut child = std::process::Command::new(&driver)
+                .arg(&provider)
+                .arg(std::process::id().to_string())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .die_with_parent()
+                .spawn()?;
+            let stdout = child.stdout.take().context("fixture output pipe")?;
+            let mut cell = Self {
+                _directory: directory,
+                provider,
+                child,
+                output: std::io::BufReader::new(stdout),
+            };
+            cell.expect_ready()?;
+            Ok(cell)
+        }
+
+        fn expect_ready(&mut self) -> anyhow::Result<()> {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            self.output.read_line(&mut line)?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 6 && fields[0] == "READY",
+                "owned driver READY line: {line:?}"
+            );
+            let numbers: Vec<u64> = fields[1..5]
+                .iter()
+                .map(|field| field.parse())
+                .collect::<Result<_, _>>()?;
+            let metadata = std::fs::metadata(&self.provider)?;
+            use std::os::unix::fs::MetadataExt as _;
+            anyhow::ensure!(
+                numbers
+                    == [
+                        u64::from(self.child.id()),
+                        u64::from(self.child.id()),
+                        metadata.dev(),
+                        metadata.ino()
+                    ],
+                "READY names this child and provider file: {numbers:?}"
+            );
+            Ok(())
+        }
+
+        /// Pin the owned provider in the child and plan COUNT_ONLY endpoints
+        /// at the given file offsets into the provider.
+        fn pin_and_plan(
+            &self,
+            offsets: &[u64],
+        ) -> anyhow::Result<(super::PinnedObjects, super::AttachPlan)> {
+            use anyhow::Context as _;
+            use p11scope_manifest::identity::{mapping_file_key, open_object};
+            let view = crate::process::ProcessView::open(
+                crate::process::ProcessViewId(0),
+                self.child.id(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let file = open_object(&self.provider).map_err(anyhow::Error::msg)?;
+            let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+            let elf =
+                p11scope_manifest::elf::ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(elf.abi() == super::ElfAbi::Lp64);
+            let key = p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            };
+            let module = crate::discovery::scan::ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                view: view.id(),
+                mount_namespace: view.mount_namespace(),
+                key,
+                path: self.provider.display().to_string(),
+                decoder_abi: None,
+                exports: vec![],
+                tables: vec![],
+                interfaces: vec![],
+            };
+            let (pins, skipped) = crate::discovery::identity::pin_scanned_view_objects(
+                &view,
+                &[module],
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                skipped.is_empty(),
+                "owned physical pin refused: {skipped:?}"
+            );
+            let pinned = pins.pinned().next().context("owned provider pin")?;
+            anyhow::ensure!(pinned.key == key);
+            let mut slots = Vec::new();
+            for (index, offset) in offsets.iter().enumerate() {
+                let index = u32::try_from(index)?;
+                anyhow::ensure!(elf.is_executable_offset(*offset));
+                slots.push(super::Slot {
+                    index,
+                    descriptor_index: index,
+                    object: pinned.id,
+                    object_path: self.provider.display().to_string(),
+                    file_offset: *offset,
+                    names: vec!["C_Initialize".into()],
+                    aliased: false,
+                    semantics: super::SlotSemantics::COUNT_ONLY,
+                    semantic_authorized: false,
+                    semantic_ambiguous: false,
+                    fork_safe: false,
+                    module_ids: vec![],
+                });
+            }
+            let plan = super::AttachPlan::from_slots(slots);
+            Ok((pins, plan))
+        }
+
+        fn provider_init_offset(&self) -> anyhow::Result<u64> {
+            use anyhow::Context as _;
+            use p11scope_manifest::identity::open_object;
+            let file = open_object(&self.provider).map_err(anyhow::Error::msg)?;
+            let elf =
+                p11scope_manifest::elf::ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            let symbol = elf
+                .defined_symbol("C_Initialize")
+                .map_err(anyhow::Error::msg)?
+                .context("owned provider function")?;
+            Ok(symbol.file_offset)
+        }
+    }
+
+    /// Drive STOP, quiescence and a real STOP/count0 Q on a real Session.
+    fn collected_cell_stop_to_q(
+        session: &mut super::Session,
+    ) -> anyhow::Result<super::CollectedFinishQ> {
+        use anyhow::Context as _;
+        session.stop_gate().request_stop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session.stop_gate().quiescent() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "real STOP never reached quiescence"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let producers = session
+            .drain_producers()
+            .context("real Session retains its producers")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(q) = session.observe_collected_finish_q(&producers, None)? {
+                return Ok(q);
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "real STOP/count0 never minted Q"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn collected_cell_pool() -> crate::semantics_edge::resources::SemanticResourcePool {
+        crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+            crate::semantics_edge::resources::SEMANTIC_TRANSITION_SCRATCH + 2 * 1024 * 1024,
+        )
+    }
+
+    fn collected_cell_input(
+        slots: Vec<super::Slot>,
+        storage: crate::semantics_edge::resources::ResourceLease,
+    ) -> super::RetainedRetirementInput {
+        match super::RetainedRetirementInput::from_reserved_removed(slots, storage) {
+            Ok(input) => input,
+            Err(_) => panic!("a fresh process-local input identity must be available"),
+        }
+    }
+
+    /// Prepare/begin/poll through the Session carrier to its exact verdict.
+    fn collected_cell_drive_to_closed(
+        session: &mut super::Session,
+        q: &super::CollectedFinishQ,
+        removed: Vec<super::Slot>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) -> anyhow::Result<super::RetainedRetirementInput> {
+        let mut input = Some(collected_cell_input(
+            removed,
+            reserve
+                .reserve(64 * 1024)
+                .expect("test pool pays the small removal input"),
+        ));
+        let ticket = loop {
+            let progress =
+                session.prepare_collected_static_retirement(q, &mut input, reserve, 1)?;
+            anyhow::ensure!(progress.used == 1);
+            match progress.state {
+                super::CollectedRetirementState::Preparing => {}
+                super::CollectedRetirementState::Prepared(ticket) => break ticket,
+                _ => anyhow::bail!("real preparation did not seal its input"),
+            }
+        };
+        loop {
+            let progress = session.begin_collected_static_retirement(q, &ticket, 1)?;
+            anyhow::ensure!(progress.used == 1);
+            match progress.state {
+                super::CollectedRetirementState::Transferring => {}
+                super::CollectedRetirementState::Pending => break,
+                _ => anyhow::bail!("real transfer did not reach its worker"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "real batch close did not settle"
+            );
+            let progress = session.poll_collected_static_retirement(q, &ticket, 1)?;
+            anyhow::ensure!(progress.used == 1);
+            match progress.state {
+                super::CollectedRetirementState::Pending => std::thread::yield_now(),
+                super::CollectedRetirementState::Closed(input) => return Ok(input),
+                _ => anyhow::bail!("real batch did not close exactly"),
+            }
+        }
+    }
+
+    fn collected_cell_endpoint_links(session: &super::Session, slot: u32) -> usize {
+        session
+            .links
+            .iter()
+            .filter(|link| link.slots().contains(&slot))
+            .count()
+    }
+
+    fn collected_cell_released(session: &super::Session) -> usize {
+        session
+            .cleanup_worker
+            .as_ref()
+            .expect("the prestarted worker stays until terminal detach")
+            .progress()
+            .released
+    }
+
+    #[ignore = "privileged: real Detailed Session native retirement"]
+    #[test]
+    fn collected_retirement_stopped_session_q_closes_original_lp64() -> anyhow::Result<()> {
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.backend_fallback().is_none());
+        anyhow::ensure!(session.has_slot_link(0));
+        let q = collected_cell_stop_to_q(&mut session)?;
+        anyhow::ensure!(session.mutation_stopped());
+        anyhow::ensure!(session.collected_retirement_is_physical());
+        let endpoint_links = collected_cell_endpoint_links(&session, 0);
+        anyhow::ensure!(
+            endpoint_links == 2,
+            "entry and return links: {endpoint_links}"
+        );
+        anyhow::ensure!(collected_cell_released(&session) == 0);
+        let closed = collected_cell_drive_to_closed(
+            &mut session,
+            &q,
+            plan.slots.clone(),
+            &collected_cell_pool().reserver(),
+        )?;
+        let (removed, _storage) = closed.into_removed();
+        anyhow::ensure!(removed.len() == 1 && removed[0].index == 0);
+        anyhow::ensure!(!session.has_slot_link(0), "the closed link is gone");
+        anyhow::ensure!(
+            collected_cell_released(&session) == endpoint_links,
+            "released equals the removed link count"
+        );
+        eprintln!("retirement-cell multi: closed slot 0, released {endpoint_links}");
+        session.detach_producers_driven(|| false, &mut Vec::new())?;
+        anyhow::ensure!(session.producers_detached);
+        session.mint_native_completion()?;
+        eprintln!("retirement-cell multi: terminal detach minted");
+        Ok(())
+    }
+
+    #[ignore = "privileged: real Detailed Session native retirement"]
+    #[test]
+    fn collected_retirement_singles_session_defers_close_to_terminal_detach_lp64()
+    -> anyhow::Result<()> {
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Singles,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        let _q = collected_cell_stop_to_q(&mut session)?;
+        anyhow::ensure!(session.mutation_stopped());
+        anyhow::ensure!(!session.collected_retirement_is_physical());
+        // No native retirement runs at Q on Singles: the removed link stays
+        // in Session.links until the joined terminal detach closes it.
+        anyhow::ensure!(session.has_slot_link(0));
+        anyhow::ensure!(collected_cell_released(&session) == 0);
+        eprintln!("retirement-cell singles: link stays past Q");
+        session.detach_producers_driven(|| false, &mut Vec::new())?;
+        anyhow::ensure!(session.producers_detached);
+        anyhow::ensure!(!session.has_slot_link(0));
+        session.mint_native_completion()?;
+        eprintln!("retirement-cell singles: terminal detach closed it and minted");
+        Ok(())
+    }
+
+    #[ignore = "privileged: real Detailed Session native retirement"]
+    #[test]
+    fn collected_partial_group_real_session_guards_refuse_until_terminal_lp64() -> anyhow::Result<()>
+    {
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        // Two endpoints, one provider file: one shared Multi group.
+        let (pins, plan) = cell.pin_and_plan(&[init, init + 1])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.backend_fallback().is_none());
+        // The group is really shared: every link covering slot 0 also covers
+        // slot 1, on both the entry and the return side.
+        let covering: Vec<&super::RegisteredLink> = session
+            .links
+            .iter()
+            .filter(|link| link.slots().contains(&0))
+            .collect();
+        anyhow::ensure!(covering.len() == 2, "entry and return links");
+        for link in &covering {
+            anyhow::ensure!(
+                link.slots() == [0, 1],
+                "the group is shared: {:?}",
+                link.slots()
+            );
+        }
+        let programs: std::collections::BTreeSet<&str> = covering
+            .iter()
+            .filter_map(|link| match link {
+                super::RegisteredLink::MultiUProbe { program, .. } => Some(*program),
+                _ => None,
+            })
+            .collect();
+        anyhow::ensure!(programs.len() == 2, "two Multi sides: {programs:?}");
+        let q = collected_cell_stop_to_q(&mut session)?;
+        anyhow::ensure!(session.collected_retirement_is_physical());
+        // Remove slot 0 only: a strict partial-group subset at Q.
+        let pool = collected_cell_pool();
+        let reserve = pool.reserver();
+        let mut input = Some(collected_cell_input(
+            vec![plan.slots[0].clone()],
+            reserve
+                .reserve(64 * 1024)
+                .expect("test pool pays the small removal input"),
+        ));
+        let split = loop {
+            match session.defer_collected_partial_groups(&q, &mut input, &reserve, 1)? {
+                super::DeferralProgress::Yielded | super::DeferralProgress::Scanning => {}
+                super::DeferralProgress::Split { whole, deferred } => break (whole, deferred),
+                super::DeferralProgress::NoPartial(_) => {
+                    anyhow::bail!("a strict subset must defer, not pass through")
+                }
+            }
+        };
+        anyhow::ensure!(!split.1.registrations().is_empty());
+        anyhow::ensure!(
+            session.deferred_group_slots == std::collections::BTreeSet::from([0]),
+            "slot 0 is deferred: {:?}",
+            session.deferred_group_slots
+        );
+        anyhow::ensure!(session.has_slot_link(0) && session.has_slot_link(1));
+        // Selective mutation refuses while the slot is deferred.
+        let detach_error = session
+            .detach_slots_with_ended(&[plan.slots[1].clone()], None, false)
+            .unwrap_err();
+        anyhow::ensure!(
+            detach_error
+                .to_string()
+                .contains("collected group deferral"),
+            "detach names the deferral: {detach_error:?}"
+        );
+        let attach_error = session
+            .attach_targets(&[plan.slots[1].clone()], &pins, &BTreeSet::new())
+            .unwrap_err();
+        eprintln!("retirement-cell partial: attach refuses while deferred: {attach_error:?}");
+        drop(split);
+        // The terminal owned detach closes both members and mints: the mint
+        // proves the deferred slot was terminally submitted.
+        session.detach_producers_driven(|| false, &mut Vec::new())?;
+        anyhow::ensure!(session.producers_detached);
+        anyhow::ensure!(
+            session.submitted_terminal_slots.contains(&0),
+            "the deferred slot was terminally submitted: {:?}",
+            session.submitted_terminal_slots
+        );
+        anyhow::ensure!(!session.has_slot_link(0) && !session.has_slot_link(1));
+        session.mint_native_completion()?;
+        eprintln!("retirement-cell partial: terminal detach closed both and minted");
+        Ok(())
+    }
+
+    #[test]
+    fn bpf_loop_probe_classification_proves_absence_or_defers() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A loaded probe proves availability, even if the control failed.
+        for control in [Ok(()), Err(os(libc::EPERM))] {
+            assert_eq!(
+                classify_bpf_loop_probe(&control, &Ok(())),
+                BpfLoopVerdict::Available
+            );
+        }
+        // Control loads but the probe is rejected: absence proven.
+        match classify_bpf_loop_probe(&Ok(()), &Err(os(libc::EINVAL))) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}");
+                assert!(detail.contains("5.17"), "{detail}");
+            }
+            verdict => panic!("expected Unavailable, got {verdict:?}"),
+        }
+        // Control loads but the probe fails unexpectedly: defer, never claim.
+        match classify_bpf_loop_probe(&Ok(()), &Err(os(libc::EPERM))) {
+            BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unexpectedly"), "{detail}"),
+            verdict => panic!("expected Unknown, got {verdict:?}"),
+        }
+        // A failed control proves nothing about the kernel either way.
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS] {
+            match classify_bpf_loop_probe(&Err(os(errno)), &Err(os(libc::EINVAL))) {
+                BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unproven"), "{detail}"),
+                verdict => panic!("expected Unknown for errno {errno}, got {verdict:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_loader_reaches_the_kernel() {
+        // Privileged lane: loads and drops. Anywhere else the kernel still
+        // answers (EPERM/ENOSYS/...); only local validation would surface a
+        // non-OS error, and there is none on this path.
+        for (insns, name) in [
+            (&BPF_LOOP_CONTROL_INSNS[..], BPF_LOOP_CONTROL_NAME),
+            (&BPF_LOOP_PROBE_INSNS[..], BPF_LOOP_PROBE_NAME),
+        ] {
+            match bpf_loop_prog_load(insns, name) {
+                Ok(_) => {}
+                Err(error) => assert!(
+                    error.raw_os_error().is_some(),
+                    "{name} load must reach the kernel: {error}"
+                ),
+            }
+        }
+    }
+
+    /// Real verifier log for the bare `call 181` probe on a kernel that
+    /// knows the helper (dev-host capture, load errno EACCES): the verifier
+    /// names `bpf_loop#181`, then rejects the uninitialized call registers.
+    const BPF_LOOP_LOG_HELPER_RESOLVED: &str = "0: R1=ctx() R10=fp0\n\
+         0: (85) call bpf_loop#181\n\
+         R2 !read_ok\n\
+         processed 1 insns (limit 1000000) max_states_per_insn 0 total_states 1 peak_states 1 mark_read 0\n";
+    /// Real verifier log for the same probe on a kernel without the helper
+    /// (5.15.221 capture, load errno EINVAL): the call target stays unknown.
+    const BPF_LOOP_LOG_HELPER_UNKNOWN: &str = "0: (85) call unknown#181\n\
+         invalid func unknown#181\n\
+         processed 1 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0\n";
+
+    #[test]
+    fn bpf_loop_probe_bytes_are_call_181_then_exit() {
+        // The helper-identity probe: `call 181; exit`, two instructions.
+        assert_eq!(BPF_LOOP_PROBE_INSNS.len(), 16);
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[..],
+            &[
+                0x85, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 0x00, // call 181
+                0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+            ]
+        );
+        assert_eq!(BPF_LOOP_CONTROL_INSNS.len(), 16);
+        assert_eq!(BPF_LOOP_CONTROL_INSNS[0], 0xb7, "MOV64_IMM r0, 0");
+        assert_eq!(BPF_LOOP_CONTROL_INSNS[8], 0x95, "EXIT");
+        for name in [BPF_LOOP_PROBE_NAME, BPF_LOOP_CONTROL_NAME] {
+            assert!(name.len() < 16);
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'),
+                "kernel object-name charset: {name}"
+            );
+        }
+        assert_eq!(size_of::<BpfLoopProgAttr>(), 152);
+        assert_eq!(
+            std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type),
+            68
+        );
+        assert_eq!(std::mem::offset_of!(BpfLoopProgAttr, prog_btf_fd), 72);
+        // UAPI numbers (linux/bpf.h): PROG_LOAD is 5, KPROBE is 2.
+        assert_eq!(BPF_PROG_LOAD, 5);
+        assert_eq!(BPF_PROG_TYPE_KPROBE, 2);
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_grant_presence_on_resolved_helper() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A loaded probe proves availability outright, whatever the log says.
+        for log in ["", BPF_LOOP_LOG_HELPER_UNKNOWN] {
+            for control in [Ok(()), Err(os(libc::EPERM))] {
+                assert_eq!(
+                    classify_bpf_loop_probe_with_log(&control, &Ok(()), log),
+                    BpfLoopVerdict::Available
+                );
+            }
+        }
+        // The real 7.0 capture: EACCES, but the verifier named bpf_loop#181,
+        // so the kernel resolved the helper.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EACCES)),
+            BPF_LOOP_LOG_HELPER_RESOLVED,
+        ) {
+            BpfLoopVerdict::Available => {}
+            verdict => panic!("resolved-helper log must prove Available, got {verdict:?}"),
+        }
+        // The helper name without `invalid func` proves presence whatever
+        // errno the bare call drew.
+        for errno in [libc::EPERM, libc::EINVAL, libc::E2BIG] {
+            match classify_bpf_loop_probe_with_log(
+                &Ok(()),
+                &Err(os(errno)),
+                BPF_LOOP_LOG_HELPER_RESOLVED,
+            ) {
+                BpfLoopVerdict::Available => {}
+                verdict => {
+                    panic!("errno {errno} must not hide a resolved helper, got {verdict:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_prove_absence_only_on_invalid_func_with_control() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // The errno alone never proves absence: an empty log defers even for
+        // EINVAL with a loaded control.
+        match classify_bpf_loop_probe_with_log(&Ok(()), &Err(os(libc::EINVAL)), "") {
+            BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unexpectedly"), "{detail}"),
+            verdict => panic!("errno without log words must defer, got {verdict:?}"),
+        }
+        // The real 5.15 capture: `invalid func` with a loaded control proves
+        // the kernel cannot run counter bank objects. The detail keeps the
+        // refusal wording; the raw log never surfaces.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EINVAL)),
+            BPF_LOOP_LOG_HELPER_UNKNOWN,
+        ) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}");
+                assert!(detail.contains("5.17"), "{detail}");
+                assert!(!detail.contains("unknown#181"), "{detail}");
+                assert!(!detail.contains("processed 1 insns"), "{detail}");
+                assert!(!detail.contains('\n'), "{detail}");
+            }
+            verdict => panic!("invalid-func log must prove Unavailable, got {verdict:?}"),
+        }
+        // The log words dominate the errno: `invalid func` refuses even when
+        // the bare call drew something other than EINVAL.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EACCES)),
+            BPF_LOOP_LOG_HELPER_UNKNOWN,
+        ) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}")
+            }
+            verdict => panic!("invalid-func log must refuse whatever the errno, got {verdict:?}"),
+        }
+        // `invalid func` proves nothing when the control itself failed:
+        // privilege or the environment refused, not the kernel.
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS] {
+            match classify_bpf_loop_probe_with_log(
+                &Err(os(errno)),
+                &Err(os(libc::EINVAL)),
+                BPF_LOOP_LOG_HELPER_UNKNOWN,
+            ) {
+                BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unproven"), "{detail}"),
+                verdict => panic!("errno {errno} control failure must defer, got {verdict:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_defer_without_proof() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A truncated log proves nothing, even for EINVAL with a loaded
+        // control.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EINVAL)),
+            "0: R1=ctx() R10=fp0\n0: (85) call ",
+        ) {
+            BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unexpectedly"), "{detail}"),
+            verdict => panic!("truncated log must defer, got {verdict:?}"),
+        }
+        // Unrecognized words defer as well; the detail stays a finite
+        // sentence over the errno, never the raw log.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EACCES)),
+            "some future verifier wording without either marker\n",
+        ) {
+            BpfLoopVerdict::Unknown(detail) => {
+                assert!(detail.contains("unexpectedly"), "{detail}");
+                assert!(!detail.contains("marker"), "{detail}");
+                assert!(!detail.contains('\n'), "{detail}");
+            }
+            verdict => panic!("unrecognized log must defer, got {verdict:?}"),
+        }
+        // A failed control defers whatever the probe drew, with no log at all.
+        for errno in [libc::EPERM, libc::EACCES] {
+            match classify_bpf_loop_probe_with_log(&Err(os(errno)), &Err(os(errno)), "") {
+                BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unproven"), "{detail}"),
+                verdict => panic!("errno {errno} control failure must defer, got {verdict:?}"),
+            }
+        }
+        // `invalid func` wins over a named helper: a log carrying both still
+        // refuses when the control loaded.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EINVAL)),
+            "0: (85) call bpf_loop#181\ninvalid func bpf_loop#181\n",
+        ) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}")
+            }
+            verdict => panic!("invalid func must win over a named helper, got {verdict:?}"),
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_defer_on_program_type_refusal() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A kernel that knows helper 181 but forbids it for this program
+        // type names `bpf_loop#181` (from its static helper table) and
+        // refuses in the same log: `unknown func` on v5.17-v6.6,
+        // `cannot use helper` on v6.12. The name alone must not prove
+        // availability; both wordings defer to the real load, which
+        // rejects loudly if the helper is truly unusable.
+        for log in [
+            "0: (85) call bpf_loop#181\nunknown func bpf_loop#181\n",
+            "0: (85) call bpf_loop#181\nprogram of this type cannot use helper bpf_loop#181\n",
+        ] {
+            match classify_bpf_loop_probe_with_log(&Ok(()), &Err(os(libc::EINVAL)), log) {
+                BpfLoopVerdict::Unknown(detail) => {
+                    assert!(detail.contains("unexpectedly"), "{detail}");
+                    assert!(!detail.contains("unknown func"), "{detail}");
+                    assert!(!detail.contains("cannot use helper"), "{detail}");
+                    assert!(!detail.contains('\n'), "{detail}");
+                }
+                verdict => panic!("program-type refusal must defer, got {verdict:?} for {log:?}"),
+            }
+        }
+    }
+
+    /// Live helper-identity verdict: where the running kernel predates 5.17
+    /// the real probe must prove Unavailable, elsewhere Available. Requires
+    /// BPF privilege; the running kernel only picks the expected verdict,
+    /// never the verdict itself. A vendor backport can make this
+    /// version-keyed expectation false-fail; product code never reads the
+    /// version and takes the fast path wherever the probe proves the helper.
+    #[test]
+    #[ignore = "requires BPF privilege; asserts the live helper-181 verdict"]
+    fn bpf_loop_probe_reports_helper_presence_on_live_kernel() {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("read the running kernel release");
+        let release = release.trim();
+        let (major, minor) =
+            crate::doctor::parse_major_minor(release).expect("parse the running kernel release");
+        let modern = (major, minor) >= (5, 17);
+        match kernel_bpf_loop_probe() {
+            BpfLoopVerdict::Available => {
+                assert!(modern, "helper 181 resolved below 5.17 ({release})")
+            }
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(!modern, "helper 181 missing on {release}: {detail}")
+            }
+            BpfLoopVerdict::Unknown(detail) => {
+                panic!("live probe needs BPF privilege, got Unknown: {detail}")
+            }
+        }
+    }
+
+    /// The seal-linkage predicate links only the actually loaded journal
+    /// pair: both roots present. Extra programs never unlink a present pair
+    /// (object validity is the inventory seams' job, not the predicate's),
+    /// while ordinary and empty inventories stay unlinked.
+    #[test]
+    fn journal_pair_present_links_only_the_loaded_pair() {
+        use super::journal_pair_present;
+        use std::collections::BTreeSet;
+        assert!(journal_pair_present(&BTreeSet::from([
+            "p11_entry_journal",
+            "p11_return_journal",
+        ])));
+        assert!(journal_pair_present(&BTreeSet::from([
+            "p11_entry_journal",
+            "p11_return_journal",
+            "p11_entry",
+            "task_newtask",
+        ])));
+        assert!(!journal_pair_present(&BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+        ])));
+        assert!(!journal_pair_present(&BTreeSet::new()));
+    }
+
+    /// The predicate over real object inventories: the ordinary embedded
+    /// object carries no journal root, so a seal over it derives unlinked;
+    /// the production journal object carries both roots, so a seal over it
+    /// derives linked. Omitted-object builds assert the omission and skip
+    /// (the scripted twin above pins the predicate either way).
+    #[test]
+    fn seal_derivation_reads_real_object_inventories() {
+        use super::journal_pair_present;
+        use std::collections::BTreeSet;
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let names: BTreeSet<&str> = ordinary.programs.keys().map(String::as_str).collect();
+        assert!(names.contains("p11_entry") && names.contains("p11_return"));
+        assert!(
+            !journal_pair_present(&names),
+            "no journal pair seals unlinked"
+        );
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "");
+            return;
+        }
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let names: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        assert!(
+            journal_pair_present(&names),
+            "the loaded journal pair seals linked"
+        );
+    }
+
+    /// Partial attach seals unlinked, either root missing: the derivation
+    /// side of the partial-attach twin. Naming the missing root stays the
+    /// inventory seams' job (covered beside this test).
+    #[test]
+    fn journal_pair_present_requires_both_roots() {
+        use super::journal_pair_present;
+        use std::collections::BTreeSet;
+        for present in ["p11_entry_journal", "p11_return_journal"] {
+            assert!(
+                !journal_pair_present(&BTreeSet::from([present])),
+                "{present} alone must not link"
+            );
+        }
+    }
+
+    /// The reason side of the partial-attach twin, entry-missing direction:
+    /// planting only the return root names the missing entry root. (The
+    /// return-missing direction is pinned by 6.06a's
+    /// `journal_flavor_refuses_pair_missing_from_inventory`; the
+    /// production-bytes twin covers both directions when built.)
+    #[test]
+    fn missing_journal_entry_root_is_named() {
+        let mut one = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let program = one
+            .programs
+            .values()
+            .next()
+            .expect("ordinary bytes carry programs")
+            .clone();
+        one.programs
+            .insert("p11_return_journal".to_string(), program);
+        let error = super::journal::journal_flavor_from_parsed(&one).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("missing journal roots p11_entry_journal"),
+            "{text}"
+        );
+    }
+
+    /// The one production seal derives its linkage from the actually loaded
+    /// journal pair: both roots present links, anything less seals unlinked.
+    /// A literal or copied flag must not create production authority; the
+    /// live BPF seal needs privilege, so this pins the derivation call (plus
+    /// the construction counts and fences) in the production sealer instead.
+    #[test]
+    fn production_seal_derives_journal_linkage() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn seal_attached_subset_native(")
+            .expect("production sealer present");
+        let end = production[start..]
+            .find("pub(crate) fn seal_attached_subset_with(")
+            .expect("test sealer follows the production sealer");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("journal_pair_present("),
+            "production seal must derive linkage from the loaded pair"
+        );
+        assert!(
+            !body.contains("journal_linked: false"),
+            "production seal must not carry an unlinked literal"
+        );
+        assert!(
+            !body.contains("journal_linked: true"),
+            "production seal must never mark the attachment journal-linked"
+        );
+        // The one production seal: this sealer holds one attachment
+        // construction, and the file holds exactly one more, inside the
+        // fenced test sealer. (The definition, impl headers and the
+        // resealer's destructuring `let` use other shapes.)
+        assert_eq!(
+            body.matches("= AttachedSemanticSet {").count(),
+            1,
+            "the production sealer builds the attachment once"
+        );
+        assert_eq!(
+            production.matches("= AttachedSemanticSet {").count(),
+            2,
+            "no second attachment construction may appear"
+        );
+        let fence = production
+            .find("#[cfg(test)]\npub(crate) fn seal_attached_subset_with(")
+            .expect("test sealer stays fenced");
+        let mut constructions = production.match_indices("= AttachedSemanticSet {");
+        let (first, _) = constructions
+            .next()
+            .expect("production construction present");
+        let (second, _) = constructions.next().expect("test construction present");
+        assert!(
+            first >= start && first < start + end,
+            "the first construction is the production seal"
+        );
+        assert!(
+            second > fence,
+            "the second construction is the fenced test seal"
+        );
+        // Neither attachment impl block builds `Self`: construction
+        // happens only in the two sealers above.
+        for (open, close, anchor) in [
+            (
+                "impl AttachedSemanticSet {",
+                "/// One Session's retained drain producers",
+                "fn journal_linked(",
+            ),
+            (
+                "impl AttachedSemanticSet {\n    fn validate_with(",
+                "/// An object table frozen against one attested receipt",
+                "fn validate_with(",
+            ),
+        ] {
+            let impl_start = production
+                .find(open)
+                .unwrap_or_else(|| panic!("{anchor} impl present"));
+            let impl_end = production[impl_start..]
+                .find(close)
+                .unwrap_or_else(|| panic!("next item follows the {anchor} impl"));
+            let impl_body = &production[impl_start..impl_start + impl_end];
+            assert!(
+                impl_body.contains(anchor),
+                "impl slice covers the {anchor} impl"
+            );
+            assert!(
+                !impl_body.contains("Self {"),
+                "the {anchor} impl builds no attachment"
+            );
+        }
+    }
+
+    /// The only production `SessionDrainProducers` constructor derives its
+    /// linkage from the Session's retained sealed fact: a sealed attachment
+    /// carries its derived linkage to the drain, while a never-sealed
+    /// session drains unlinked. The live guard reads this flag (via
+    /// `AttestedSemanticLane::initialize_joint` and `prepare_joint_births`),
+    /// so a literal here would install Joint feeds on wedged lanes; the live
+    /// drain needs privilege, so this pins the derivation (plus the
+    /// constructor counts and fences) in the production drain instead.
+    #[test]
+    fn production_drain_derives_journal_linkage() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn drain_producers(")
+            .expect("production drain present");
+        let end = production[start..]
+            .find("pub fn event_drain(")
+            .expect("next drain follows the producers drain");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("self.sealed_journal_linked"),
+            "production producers must derive linkage from the retained sealed fact"
+        );
+        assert!(
+            !body.contains("journal_linked: false"),
+            "production producers must not carry an unlinked literal"
+        );
+        assert!(
+            !body.contains("journal_linked: true"),
+            "production producers must never mark the lane journal-linked"
+        );
+        // The one production constructor: besides the struct definition
+        // and its impl header, the only `SessionDrainProducers {` site is
+        // this drain. The `Self`-form test pairs sit below, fenced.
+        assert!(
+            production.contains("pub(crate) struct SessionDrainProducers {"),
+            "producers definition present"
+        );
+        assert!(
+            production.contains("impl SessionDrainProducers {"),
+            "producers impl present"
+        );
+        assert!(
+            body.contains("SessionDrainProducers {"),
+            "the drain builds through the one production constructor"
+        );
+        assert_eq!(
+            production.matches("SessionDrainProducers {").count(),
+            3,
+            "no second production producers constructor may appear"
+        );
+        // Every `Self`-form constructor in the producers impl is fenced:
+        // one `#[cfg(test)]` per `Self` literal (the linked and unlinked
+        // test pairs, discounting their `-> Self` signatures). A
+        // production `Self` constructor would break the balance; a fenced
+        // test one keeps it.
+        let impl_start = production
+            .find("impl SessionDrainProducers {")
+            .expect("producers impl present");
+        let impl_end = production[impl_start..]
+            .find("/// Native-owned terminal completion")
+            .expect("next item follows the producers impl");
+        let impl_body = &production[impl_start..impl_start + impl_end];
+        assert!(
+            impl_body.contains("fn test_pair(") && impl_body.contains("fn test_pair_unlinked("),
+            "impl slice covers both test pairs"
+        );
+        let literals = impl_body.matches("Self {").count() - impl_body.matches("-> Self {").count();
+        assert_eq!(
+            literals,
+            impl_body.matches("#[cfg(test)]").count(),
+            "every Self-form producers constructor is test-fenced"
+        );
+        assert!(
+            literals >= 2,
+            "both test pairs still construct through Self"
+        );
+    }
+
+    use std::collections::BTreeSet;
+
+    /// Attested provider scene for the production seal-to-drain twins: a
+    /// genuinely attested two-slot subset over a pinned provider copy, with
+    /// the retained/static sides the production seal validates. The
+    /// scheduling/retention construction mirrors `seal_test_attachment`
+    /// (real attach scheduling, only link I/O scripted); the seal itself
+    /// goes through the production core, never the test sealer.
+    struct SealDrainScene {
+        _dir: tempfile::TempDir,
+        subset: crate::inventory_semantics::AttestedSubset,
+        pins: crate::discovery::identity::PinnedObjects,
+        domain: crate::attach::capture::NativeDomainId,
+        retained: BTreeMap<u32, super::RetainedStaticTarget>,
+        owned: BTreeSet<super::StaticEndpoint>,
+    }
+
+    impl SealDrainScene {
+        fn attest() -> Self {
+            use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+            use p11scope_manifest::manifest::*;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::copy("/bin/true", &path).unwrap();
+            let file = open_object(&path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let start = inspected
+                .executable_ranges
+                .iter()
+                .find(|(a, b)| b - a > 2)
+                .unwrap()
+                .0;
+            let offsets = [start, start + 1];
+            let functions =
+                match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }) {
+                    pkcs11_module::TableSet::Walk(spans) => spans
+                        .iter()
+                        .flat_map(|span| span.fields())
+                        .map(|field| {
+                            let resolution = match field.name {
+                                "C_SignInit" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[0],
+                                },
+                                "C_Sign" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[1],
+                                },
+                                _ => Resolution::NullPointer,
+                            };
+                            FunctionRecord {
+                                name: field.name.into(),
+                                resolution,
+                            }
+                        })
+                        .collect(),
+                    _ => panic!("2.40 is a full standard table"),
+                };
+            let path = path.to_str().unwrap().to_string();
+            let manifest = Manifest {
+                schema: SCHEMA.into(),
+                module_path: path.clone(),
+                objects: vec![ObjectRecord {
+                    id: 0,
+                    path: path.clone(),
+                    identity: inspected.identity.clone(),
+                }],
+                provenance_objects: vec![ProvenanceObject {
+                    path,
+                    device_major: mapping.device_major,
+                    device_minor: mapping.device_minor,
+                    inode: mapping.inode,
+                    identity: inspected.identity,
+                }],
+                interface_list: Acquisition::Absent,
+                surfaces: vec![SurfaceRecord {
+                    source: SurfaceSource::LegacyFunctionList,
+                    acquisition: Acquisition::Ok,
+                    version: Some(Version {
+                        major: 2,
+                        minor: 40,
+                    }),
+                    walk: WalkOutcome::Full,
+                    functions,
+                }],
+                vendor_interfaces: Vec::new(),
+                alias_groups: Vec::new(),
+                selection_evidence: Default::default(),
+            };
+            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            let pinning =
+                crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
+            assert!(pinning.stale.is_empty());
+            let pins = pinning.pins;
+            let operator = dir.path().join("operator-input.json");
+            std::fs::write(&operator, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let engine =
+                crate::discovery::engine::inventory_coordinator::semantics::engine_for_test(
+                    Vec::new(),
+                    Vec::new(),
+                    pins.clone(),
+                );
+            let prepared =
+                crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
+                    &engine,
+                    std::slice::from_ref(&operator),
+                );
+            let subset = prepared.subset.expect("nonempty validated operator subset");
+            assert_eq!(subset.plan().slots.len(), 2);
+            let domain = crate::attach::capture::NativeDomainId::mint();
+            let outcome = super::attach_targets_with(
+                subset.plan().slots.as_slice(),
+                super::CapturePolicy::Allowlisted,
+                false,
+                |slot| Ok(subset.pins().abi_for(slot.object).unwrap()),
+                |_, _, _| Ok(()),
+                |_| Some(1),
+            )
+            .unwrap();
+            let targets = subset
+                .plan()
+                .slots
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            subset.pins().attach_path_for(slot.object).unwrap(),
+                            subset.pins().abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let mut retained = BTreeMap::new();
+            super::retain_from_successful(
+                &mut retained,
+                &subset.plan().slots,
+                &targets,
+                &outcome.successful,
+            );
+            let owned = outcome.successful;
+            Self {
+                _dir: dir,
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+            }
+        }
+
+        /// Split the scene for factory twins: the attested subset plus
+        /// the tempdir that must outlive the start (pins reference it).
+        fn into_subset(
+            self,
+        ) -> (
+            crate::inventory_semantics::AttestedSubset,
+            tempfile::TempDir,
+        ) {
+            let Self { _dir, subset, .. } = self;
+            (subset, _dir)
+        }
+
+        /// Seal through the production core over `programs` with a scripted
+        /// mint. Only the loaded-inventory read and the attach-cell mint are
+        /// substituted native I/O; validation, linkage derivation and
+        /// construction are production.
+        fn seal(
+            self,
+            programs: &BTreeSet<&str>,
+            mint: impl FnOnce() -> std::result::Result<u64, SemanticRefusal>,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let Self {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = self;
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                super::CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                programs,
+                mint,
+            )
+        }
+
+        /// Seal through the production core with scripted seal inputs, for
+        /// the refusal twin: the descriptors/policy refusal still reaches
+        /// production validation before any mint.
+        fn seal_with_inputs(
+            self,
+            programs: &BTreeSet<&str>,
+            policy: super::CapturePolicy,
+            descriptors: anyhow::Result<Vec<super::SlotSemantics>>,
+            mint: impl FnOnce() -> std::result::Result<u64, SemanticRefusal>,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let Self {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = self;
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                policy,
+                descriptors,
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                programs,
+                mint,
+            )
+        }
+    }
+
+    /// Linked seal drains linked: the production core seals linked over a
+    /// loaded inventory carrying both journal roots, retention keeps the
+    /// sealed fact, and the production drain derivation returns linked. The
+    /// sealed generation observes the scripted mint exactly once.
+    #[test]
+    fn sealed_journal_pair_drains_linked() {
+        let scene = SealDrainScene::attest();
+        let programs = BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+            "p11_entry_journal",
+            "p11_return_journal",
+            "task_newtask",
+        ]);
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(41)
+            })
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the loaded journal pair seals linked"
+        );
+        assert_eq!(
+            attached.generation(),
+            41,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(true), "retention keeps the sealed fact");
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the sealed journal pair drains linked"
+        );
+    }
+
+    /// Preflight-only twin: a present journal pair never widens the
+    /// seal guards. Even with both journal roots in the loaded
+    /// inventory, a non-allowlisted (forced) activation policy refuses
+    /// at production validation before any mint, so doctor-reported
+    /// availability can never become seal authority on its own.
+    #[test]
+    fn journal_pair_presence_never_bypasses_seal_guards() {
+        let programs = BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+            "p11_entry_journal",
+            "p11_return_journal",
+            "task_newtask",
+        ]);
+        for policy in [
+            super::CapturePolicy::AggregateOnly,
+            super::CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            let scene = SealDrainScene::attest();
+            let minted = std::cell::Cell::new(0u32);
+            let refused = scene.seal_with_inputs(
+                &programs,
+                policy,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                || {
+                    minted.set(minted.get() + 1);
+                    Ok(41)
+                },
+            );
+            assert!(
+                matches!(refused, Err(SemanticRefusal::Attachment)),
+                "forced activation under {policy:?} must refuse: {refused:?}"
+            );
+            assert_eq!(minted.get(), 0, "a refused seal never mints");
+        }
+    }
+
+    /// Ordinary seal drains unlinked: the production core seals unlinked over
+    /// the real ordinary object inventory (no journal root), and the retained
+    /// fact drains unlinked.
+    #[test]
+    fn sealed_ordinary_inventory_drains_unlinked() {
+        let scene = SealDrainScene::attest();
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let programs: BTreeSet<&str> = ordinary.programs.keys().map(String::as_str).collect();
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(43)
+            })
+            .expect("a valid subset seals");
+        assert!(
+            !attached.journal_linked(),
+            "the ordinary inventory seals unlinked"
+        );
+        assert_eq!(
+            attached.generation(),
+            43,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(false), "retention keeps the sealed fact");
+        assert!(
+            !super::drain_linkage_from_sealed(cell),
+            "the ordinary seal drains unlinked"
+        );
+    }
+
+    /// Partial attach seals unlinked in both directions: either journal root
+    /// alone seals unlinked through the production core, and the retained
+    /// fact drains unlinked.
+    #[test]
+    fn sealed_partial_journal_pair_drains_unlinked() {
+        for (present, generation) in [("p11_entry_journal", 47), ("p11_return_journal", 53)] {
+            let scene = SealDrainScene::attest();
+            let programs = BTreeSet::from(["p11_entry", "p11_return", present, "task_newtask"]);
+            let minted = std::cell::Cell::new(0u32);
+            let attached = scene
+                .seal(&programs, || {
+                    minted.set(minted.get() + 1);
+                    Ok(generation)
+                })
+                .expect("a valid subset seals");
+            assert!(!attached.journal_linked(), "{present} alone seals unlinked");
+            assert_eq!(
+                attached.generation(),
+                generation,
+                "the seal observes the scripted mint"
+            );
+            assert_eq!(minted.get(), 1, "one successful seal mints once");
+            let mut cell = None;
+            super::retain_sealed_linkage(&mut cell, &attached);
+            assert_eq!(cell, Some(false), "retention keeps the sealed fact");
+            assert!(
+                !super::drain_linkage_from_sealed(cell),
+                "{present} alone drains unlinked"
+            );
+        }
+    }
+
+    /// The real journal object inventory seals linked through the
+    /// production core: the foundation the flag-on lane builds on. In
+    /// builds without the journal object the twin pins the omission.
+    #[test]
+    fn sealed_real_journal_inventory_drains_linked() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert!(super::journal::journal_object().is_empty());
+            return;
+        }
+        let scene = SealDrainScene::attest();
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let programs: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(59)
+            })
+            .expect("a valid subset seals over the journal inventory");
+        assert!(
+            attached.journal_linked(),
+            "the real journal inventory seals linked"
+        );
+        assert_eq!(
+            attached.generation(),
+            59,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(true), "retention keeps the sealed fact");
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the journal seal drains linked"
+        );
+    }
+
+    /// The attested factory gates a journal request before any host
+    /// probe or load: without the journal object the refusal names
+    /// the finite build reason. With the journal object the gate
+    /// passes — unprivileged the refusal (if any) is a later host or
+    /// load stage, never the build reason; privileged the session
+    /// starts linked with a published generation.
+    #[test]
+    fn attested_start_gates_journal_before_any_probe_or_load() {
+        let (subset, _dir) = SealDrainScene::attest().into_subset();
+        let scope = super::Scope::Pid(std::process::id());
+        let spec = super::journal::JournalSpec;
+        let attempted = super::Session::start_attested(
+            subset,
+            &scope,
+            super::BackendSelection::Singles,
+            Some(&spec),
+        );
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            let error = match attempted {
+                Ok(_) => panic!("a journal request on a non-journal build refuses"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "the refusal names the build reason: {error:#}"
+            );
+            return;
+        }
+        match attempted {
+            Ok((session, attached)) => {
+                assert!(attached.journal_linked(), "a journal session seals linked");
+                let producers = session
+                    .drain_producers()
+                    .expect("a journal session retains producers");
+                assert!(
+                    producers.journal_linked(),
+                    "a journal session drains linked"
+                );
+                assert!(
+                    attached.generation() >= 1,
+                    "a journal session publishes its generation"
+                );
+            }
+            Err(error) => assert!(
+                !format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "past the gate the build reason never fires: {error:#}"
+            ),
+        }
+    }
+
+    /// The attested factory threads its journal request into the
+    /// shared factory directly (the public start keeps its shape for
+    /// its other callers); a copied `None` or a lingering `Self::start`
+    /// call would silently drop the request.
+    #[test]
+    fn attested_start_threads_journal_into_shared_factory() {
+        let production = include_str!("attach.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let start = pin_body(production, "pub(crate) fn start_attested(", "\n    }\n").unwrap();
+        assert!(
+            start.contains("start_with_selected("),
+            "start_attested threads through the shared factory: {start}"
+        );
+        assert!(
+            !start.contains("Self::start("),
+            "start_attested no longer drops its journal request: {start}"
+        );
+    }
+
+    /// Ruling item 7: the native seal publishes the attach generation
+    /// only when the loaded object carries the journal pair (the only
+    /// journal loader is the flag-on lane). Ordinary seals keep
+    /// generation 0 with the attach cell untouched, so marker hooks
+    /// stop at the gated read.
+    #[test]
+    fn native_seal_publishes_generation_only_with_journal_pair() {
+        let production = include_str!("attach.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let native = production
+            .split_once("fn seal_attached_subset_native(")
+            .unwrap()
+            .1
+            .split_once("fn seal_attached_subset_from_programs(")
+            .unwrap()
+            .0;
+        assert!(
+            native.contains("journal_pair_present(&programs)"),
+            "the mint gates on the loaded pair: {native}"
+        );
+        assert!(
+            native.contains("mint_attach_generation()"),
+            "the gated arm still mints: {native}"
+        );
+        assert!(
+            native.contains("Ok(0)"),
+            "the ungated arm keeps generation 0: {native}"
+        );
+    }
+
+    /// B2(c): journal sessions read their marker control row back as
+    /// zero and freeze it before any link, matching the Detailed path.
+    /// The verdict over pure values is pinned in the journal tests;
+    /// this pins the wiring into the preparation step.
+    #[test]
+    fn journal_sessions_read_back_and_freeze_marker_control() {
+        let production = include_str!("attach.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let runtime = production
+            .split_once("SessionPreparation::ValidateRuntime =>")
+            .unwrap()
+            .1
+            .split_once("SessionPreparation::")
+            .unwrap()
+            .0;
+        assert!(
+            runtime.contains("instance::prepare_marker_control(&ebpf, roots)?;"),
+            "the Detailed arm keeps its control preparation: {runtime}"
+        );
+        assert!(
+            runtime.contains("journal::prepare_journal_marker_control(&ebpf)?;"),
+            "the journal arm reads back and freezes its control row: {runtime}"
+        );
+    }
+
+    /// A refused seal retains no linkage and mints nothing: the descriptor
+    /// refusal and the policy refusal each fail production validation before
+    /// the mint, keep the sealed cell empty, and drain unlinked. A valid
+    /// control seals through the same core in the same test.
+    #[test]
+    fn refused_seal_retains_no_linkage() {
+        let programs = BTreeSet::from(["p11_entry", "p11_return", "task_newtask"]);
+        let control = SealDrainScene::attest()
+            .seal(&programs, || Ok(59))
+            .expect("the valid control seals");
+        assert!(!control.journal_linked(), "the control seals unlinked");
+        for (name, policy, descriptors) in [
+            (
+                "descriptors",
+                super::CapturePolicy::Allowlisted,
+                Err(anyhow::anyhow!("scripted descriptors read failure")),
+            ),
+            (
+                "policy",
+                super::CapturePolicy::AggregateOnly,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+            ),
+        ] {
+            let minted = std::cell::Cell::new(0u32);
+            let refused =
+                SealDrainScene::attest().seal_with_inputs(&programs, policy, descriptors, || {
+                    minted.set(minted.get() + 1);
+                    Ok(61)
+                });
+            assert!(refused.is_err(), "the {name} refusal must refuse the seal");
+            assert_eq!(minted.get(), 0, "a refused seal mints nothing");
+            let cell = None;
+            assert!(
+                !super::drain_linkage_from_sealed(cell),
+                "a refused seal drains unlinked"
+            );
+        }
+    }
+
+    /// Retention is load-bearing: the same linked seal drains linked once
+    /// retained, but an unretained (never-sealed) cell drains unlinked.
+    /// Omitting the retention flips a linked seal to an unlinked drain.
+    #[test]
+    fn unretained_linked_seal_drains_unlinked() {
+        let programs = BTreeSet::from(["p11_entry_journal", "p11_return_journal"]);
+        let attached = SealDrainScene::attest()
+            .seal(&programs, || Ok(67))
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the loaded journal pair seals linked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(None),
+            "an unretained seal drains unlinked"
+        );
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the retained seal drains linked"
+        );
+    }
+
+    /// The drain derivation follows the sealed fact exactly: linked stays
+    /// linked, unlinked stays unlinked, and a never-sealed session drains
+    /// unlinked.
+    #[test]
+    fn drain_linkage_follows_the_sealed_fact() {
+        assert!(
+            super::drain_linkage_from_sealed(Some(true)),
+            "a linked seal drains linked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(Some(false)),
+            "an unlinked seal drains unlinked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(None),
+            "a never-sealed session drains unlinked"
+        );
+    }
+
+    /// Linked seal over the real journal object: when the build carries the
+    /// production journal bytes, the production core seals linked over its
+    /// parsed program inventory, and the retained fact drains linked.
+    /// Omitted-object builds assert the omission and skip.
+    #[test]
+    fn sealed_real_journal_object_drains_linked() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "");
+            return;
+        }
+        let scene = SealDrainScene::attest();
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let programs: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        let attached = scene
+            .seal(&programs, || Ok(71))
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the real journal inventory seals linked"
+        );
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the real journal seal drains linked"
+        );
+    }
+
+    /// The native production sealer delegates to the inventory core: it reads
+    /// the loaded program inventory and the attach-cell mint from native I/O
+    /// and seals through the one production core.
+    #[test]
+    fn native_seal_delegates_to_the_inventory_core() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn seal_attached_subset_native(")
+            .expect("production sealer present");
+        let end = production[start..]
+            .find("fn seal_attached_subset_from_programs(")
+            .expect("production core follows the native sealer");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("seal_attached_subset_from_programs("),
+            "the native sealer must seal through the inventory core"
+        );
+        assert!(
+            body.contains("ebpf.programs()"),
+            "the native sealer reads the loaded inventory"
+        );
+        assert!(
+            body.contains("mint_attach_generation()"),
+            "the native sealer mints from the attach cell"
+        );
+        assert!(
+            body.contains("&programs,"),
+            "the native sealer must seal the live loaded inventory"
+        );
+    }
+
+    /// The attested start retains its successful seal through the retention
+    /// seam, so the producers drain observes the sealed fact. Retention is a
+    /// single site on the sealed cell, placed after the seal's success: a
+    /// refused seal (`?`) never reaches it.
+    #[test]
+    fn attested_start_retains_through_the_seam() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn start_attested(")
+            .expect("attested start present");
+        let end = production[start..]
+            .find("fn semantic_descriptors(")
+            .expect("descriptors read follows the attested start");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("retain_sealed_linkage("),
+            "the attested start must retain through the seam"
+        );
+        assert_eq!(
+            body.matches("retain_sealed_linkage(").count(),
+            1,
+            "retention is a single site"
+        );
+        assert!(
+            body.contains("sealed_journal_linked"),
+            "the attested start retains the sealed cell"
+        );
+        let sealed = body
+            .find("seal_attached_subset_native(")
+            .expect("the attested start seals");
+        let retained = body
+            .find("retain_sealed_linkage(")
+            .expect("the attested start retains");
+        assert!(sealed < retained, "retention follows the successful seal");
+    }
+
+    /// The production producers drain derives through the linkage seam from
+    /// the Session's retained sealed fact.
+    #[test]
+    fn production_drain_uses_the_linkage_seam() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn drain_producers(")
+            .expect("production drain present");
+        let end = production[start..]
+            .find("pub fn event_drain(")
+            .expect("next drain follows the producers drain");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("drain_linkage_from_sealed("),
+            "the production drain must derive through the linkage seam"
+        );
+        assert!(
+            body.contains("journal_linked: drain_linkage_from_sealed(self.sealed_journal_linked)"),
+            "the production drain must wire the seam result into the returned linkage"
+        );
+    }
+
+    /// Behavioral drain linkage on a real Session (privileged): the
+    /// substring pins above cannot catch a dead-text copy whose live
+    /// wiring differs, so this cell seals over the actually loaded
+    /// program inventory with the native attach-cell mint and reads
+    /// the linkage back through the real `drain_producers`. A
+    /// never-sealed session drains unlinked; a session sealed over
+    /// the loaded journal pair drains linked with the same producer
+    /// identity; an ordinary session drains unlinked. Builds that
+    /// omit the journal object refuse the journal start with the
+    /// finite build reason instead. Runs in the installed linked
+    /// control cell (journal-on build, real Session).
+    #[ignore = "privileged: real Session seal-to-drain linkage (installed linked control)"]
+    #[test]
+    fn sealed_session_drain_linkage_is_behavioral() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        fn start_selected(
+            cell: &CollectedSessionCell,
+            journal: Option<&super::journal::JournalSpec>,
+        ) -> anyhow::Result<super::Session> {
+            let init = cell.provider_init_offset()?;
+            let (pins, plan) = cell.pin_and_plan(&[init])?;
+            super::Session::start_with_selected(
+                &plan,
+                &super::Scope::Pid(cell.child.id()),
+                &pins,
+                super::CapturePolicy::Allowlisted,
+                None,
+                None,
+                None,
+                super::BackendSelection::Multi,
+                None,
+                None,
+                journal,
+                false,
+                super::require_multi_capable_host(),
+                || crate::uretprobe_hazard::admit(None, false),
+            )
+        }
+
+        fn seal_over_loaded_inventory(
+            session: &super::Session,
+            scene: SealDrainScene,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let SealDrainScene {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = scene;
+            let programs: std::collections::BTreeSet<&str> =
+                session.ebpf.programs().map(|(name, _)| name).collect();
+            let maps = super::instance::InstanceMaps {
+                ebpf: &session.ebpf,
+            };
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                super::CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                &programs,
+                || {
+                    maps.mint_attach_generation()
+                        .map_err(|_| SemanticRefusal::Attachment)
+                },
+            )
+        }
+
+        let cell = CollectedSessionCell::build()?;
+        if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+            let mut session = start_selected(&cell, Some(&super::journal::JournalSpec))?;
+            anyhow::ensure!(
+                session.attach_failures().is_empty(),
+                "attach failures: {:?}",
+                session.attach_failures()
+            );
+            let unsealed = session
+                .drain_producers()
+                .context("the started session retains producers")?;
+            anyhow::ensure!(
+                !unsealed.journal_linked(),
+                "a never-sealed session drains unlinked"
+            );
+            let attached = seal_over_loaded_inventory(&session, SealDrainScene::attest())
+                .map_err(|reason| anyhow::anyhow!("journal seal refused: {reason}"))?;
+            anyhow::ensure!(
+                attached.journal_linked(),
+                "the loaded journal pair seals linked"
+            );
+            // The one retention step `start_attested` performs, through
+            // the same production seam, then the real drain readback.
+            super::retain_sealed_linkage(&mut session.sealed_journal_linked, &attached);
+            let sealed = session
+                .drain_producers()
+                .context("the sealed session retains producers")?;
+            anyhow::ensure!(
+                sealed.journal_linked(),
+                "the sealed journal pair drains linked through the live wiring"
+            );
+            anyhow::ensure!(
+                sealed.same_producers(&unsealed),
+                "linkage is capability, not producer identity"
+            );
+            anyhow::ensure!(
+                session.event_drain()?.consumption_cut().is_ok(),
+                "the S1 EVENTS cursor stays live on the linked session"
+            );
+            session.detach_producers()?;
+        } else {
+            let refused = start_selected(&cell, Some(&super::journal::JournalSpec));
+            let error = refused.err().context("omitted journal build refuses")?;
+            anyhow::ensure!(
+                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "the omitted build refuses with its finite reason: {error:#}"
+            );
+        }
+        // Ordinary arm in every build: a real ordinary session seals
+        // and drains unlinked.
+        let mut ordinary = start_selected(&cell, None)?;
+        anyhow::ensure!(
+            ordinary.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            ordinary.attach_failures()
+        );
+        let attached = seal_over_loaded_inventory(&ordinary, SealDrainScene::attest())
+            .map_err(|reason| anyhow::anyhow!("ordinary seal refused: {reason}"))?;
+        anyhow::ensure!(
+            !attached.journal_linked(),
+            "the ordinary loaded inventory seals unlinked"
+        );
+        super::retain_sealed_linkage(&mut ordinary.sealed_journal_linked, &attached);
+        let drained = ordinary
+            .drain_producers()
+            .context("the ordinary session retains producers")?;
+        anyhow::ensure!(
+            !drained.journal_linked(),
+            "the ordinary session drains unlinked through the live wiring"
+        );
+        ordinary.detach_producers()?;
+        Ok(())
+    }
+
+    /// The #[cfg(test)] sealer marks its attachment journal-linked, so
+    /// the Joint unit suites keep exercising the linked 0.6.0 world.
+    #[test]
+    fn test_seal_is_journal_linked() {
+        let fixture = crate::semantics_objects::journal::tests::AttestationFixture::new(
+            p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            },
+        );
+        assert!(
+            fixture.attachment().journal_linked(),
+            "the test sealer marks its attachment journal-linked"
+        );
+    }
+
+    /// `reseal_test_attachment` rebuilds through the test sealer, so a
+    /// resealed attachment keeps the test seal's linkage.
+    #[test]
+    fn reseal_routes_through_the_test_sealer() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn reseal_test_attachment(")
+            .expect("test resealer present");
+        let body = &production[start..];
+        let end = body.find("\n}").expect("test resealer ends");
+        assert!(
+            body[..end].contains("seal_test_attachment"),
+            "the test resealer rebuilds through the test sealer"
         );
     }
 }

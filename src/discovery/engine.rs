@@ -1,65 +1,94 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Initial and incremental provider discovery ownership.
 
-use crate::attach::{
-    BackendSelection, CapturePolicy, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
-    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, Scope, Session,
+use crate::attach::counter_banks::{
+    BankPublication, BankRefusal, BankShapeCause, COUNTER_ENDPOINT_CEILING_RESOURCE, CounterSpec,
+    check_counter_endpoints_fit,
 };
+#[cfg(feature = "h6-reexec-diagnostic")]
+use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
+use crate::attach::{
+    BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementState,
+    CollectedRetirementTicket, CounterSnapshot, DeferralProgress, DetachOutcome,
+    DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome,
+    RetainedInputMeasure, RetainedRetirementInput, RetirementPoll, RetirementProgress,
+    RetirementTicket, Scope, Session,
+};
+use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
+use crate::discovery::elf_needed;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    KernelSelfMappingProbe, ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey,
-    ReconciledModule, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
-    canonicalize_scanned_overlays, open_view_object, open_view_object_cached,
-    pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
-    preexec_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
-    view_object_key_cached,
+    ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
+    KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
+    PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
+    RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
+    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
+    open_view_executable_cached, open_view_rooted_object_cached, opened_file_matches_maps,
+    pin_manifest_objects_deferred_in_views_with_budget, pin_of,
+    pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects, preexec_object_key,
+    retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
-    ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity,
-    decode_exact_table, exact_table_addresses, exact_table_bytes, export_agreement,
-    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers,
-    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
-    table_evidence_score, table_linkage, target_layout,
+    CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
+    ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
+    ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
+    exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
+    index_maps_or_refuse, published_walk, read_elf_snapshot, read_maps_or_refuse,
+    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
+    scan_skip_truncates, table_evidence_score, table_has_only_opaque_interfaces, table_linkage,
+    target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
 };
 use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
-use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
+use crate::process::{
+    self, OriginalGenerationState, PidPin, ProcessView, ProcessViewId, ViewAdmission,
+};
 use crate::run::OwnedChild;
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourcePool, SemanticResourceReserver,
+};
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
+use p11scope_ebpf_common::instance::{FILE_SLOTS, RECORD_SLOTS};
 use p11scope_ebpf_common::{
-    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    CounterMode, DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
-    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
-    DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
+    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS, DISCOVERY_KIND_LOADER,
+    DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER,
+    DISCOVERY_NAME_UNREADABLE, DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED,
+    DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT, DISCOVERY_STATUS_EXIT_MAP_SHARED_MM,
     DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_OTHER,
     DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V2_40, DISCOVERY_VERSION_V3_0,
     DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord, export_attach_cookie,
     valid_discovery_record,
 };
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+#[cfg(test)]
+use p11scope_manifest::manifest::WalkOutcome;
 use p11scope_manifest::manifest::{
     Acquisition, Manifest, Resolution, SCHEMA, SelectionAcquisition, SelectionAuthority,
-    SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource, WalkOutcome,
+    SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use pkcs11_module::{LinuxLayout, read_function_pointer};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::Arc;
 
 #[path = "inventory.rs"]
@@ -67,12 +96,332 @@ pub(crate) mod inventory;
 #[path = "inventory_coordinator.rs"]
 pub(crate) mod inventory_coordinator;
 
+use crate::attach::detailed_identity::{
+    CgroupAction, ProofSession, SeedId, TraceCandidateBody, TraceIo, TraceProofUnknown,
+    TraceServiceProgress, TraceWorkError, VerifiedTraceSeed,
+};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CgroupWorkRefusal {
+    BudgetDeferred,
+    Refused(TraceProofUnknown),
+}
+impl From<CgroupWorkRefusal> for TraceWorkError {
+    fn from(reason: CgroupWorkRefusal) -> Self {
+        match reason {
+            CgroupWorkRefusal::BudgetDeferred => Self::Deferred,
+            CgroupWorkRefusal::Refused(reason) => Self::Unknown(reason),
+        }
+    }
+}
+/// Constructors remain inside this scheduling owner; copies share allowance.
+#[derive(Clone, Default)]
+pub(crate) struct TraceWorkTicket {
+    state: Option<std::sync::Arc<std::sync::Mutex<TraceWorkState>>>,
+    cgroup_deadline: Option<u64>,
+    cgroup_pending: Option<SeedId>,
+}
+struct TraceWorkState {
+    proof: ProofSession,
+    deadline: u64,
+    last_clock: u64,
+    visits: u32,
+    reads: u32,
+    health_attempted: bool,
+    closed: Option<CgroupWorkRefusal>,
+    terminal: bool,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+impl TraceWorkTicket {
+    fn new(
+        proof: ProofSession,
+        start: u64,
+        deadline: u64,
+        terminal: bool,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        Self {
+            cgroup_deadline: None,
+            cgroup_pending: None,
+            state: Some(std::sync::Arc::new(std::sync::Mutex::new(TraceWorkState {
+                proof,
+                deadline,
+                last_clock: start,
+                visits: 32,
+                reads: 32,
+                health_attempted: false,
+                closed: None,
+                terminal,
+                cancel,
+            }))),
+        }
+    }
+    fn same_allocation(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+    pub(crate) fn check(&self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        if let Some(deadline) = self.cgroup_deadline {
+            self.cgroup_check(proof, deadline)?;
+            if let Some(id) = self.cgroup_pending {
+                proof.cgroup_read_status(id)?;
+            }
+            return Ok(());
+        }
+        self.checked(proof, None)
+            .map(|_| ())
+            .map_err(|_| TraceWorkError::Deferred)
+    }
+    fn checked(
+        &self,
+        proof: &ProofSession,
+        candidate_deadline: Option<u64>,
+    ) -> Result<u64, CgroupWorkRefusal> {
+        use CgroupWorkRefusal::{BudgetDeferred, Refused};
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(Refused(TraceProofUnknown::Unreadable))?
+            .lock()
+            .map_err(|_| Refused(TraceProofUnknown::Unreadable))?;
+        if !state.proof.same_allocation(proof) {
+            return Err(Refused(TraceProofUnknown::DomainMismatch));
+        }
+        if state
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            state.closed = Some(Refused(TraceProofUnknown::TargetGone));
+        }
+        if let Some(reason @ Refused(_)) = state.closed {
+            return Err(reason);
+        }
+        let Some(now) = (if candidate_deadline.is_some() && proof.is_cgroup() {
+            proof.cgroup_now()
+        } else {
+            proof.now()
+        }) else {
+            state.closed = Some(Refused(TraceProofUnknown::Unreadable));
+            return Err(Refused(TraceProofUnknown::Unreadable));
+        };
+        if now < state.last_clock {
+            state.closed = Some(Refused(TraceProofUnknown::Unreadable));
+            return Err(Refused(TraceProofUnknown::Unreadable));
+        }
+        // Even an expired observation constrains the next clock. Otherwise a
+        // later regression could keep a budget-closed ticket retryable.
+        state.last_clock = now;
+        if candidate_deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(Refused(TraceProofUnknown::AfterEvent));
+        }
+        if state.closed.is_some() || now >= state.deadline {
+            state.closed = Some(BudgetDeferred);
+            return Err(BudgetDeferred);
+        }
+        Ok(now)
+    }
+    pub(crate) fn cgroup_check(
+        &self,
+        proof: &ProofSession,
+        candidate_deadline: u64,
+    ) -> Result<u64, CgroupWorkRefusal> {
+        self.checked(proof, Some(candidate_deadline))
+    }
+    pub(crate) fn external_read(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        if let Some(deadline) = self.cgroup_deadline {
+            return self
+                .cgroup_external_read(proof, deadline)
+                .map(|_| ())
+                .map_err(Into::into);
+        }
+        self.external_read_checked(proof)
+            .map_err(|_| TraceWorkError::Deferred)
+    }
+    pub(crate) fn cgroup_reader(&self, deadline: u64, pending: Option<SeedId>) -> Self {
+        Self {
+            state: self.state.clone(),
+            cgroup_deadline: Some(deadline),
+            cgroup_pending: pending,
+        }
+    }
+    pub(crate) fn cgroup_external_read(
+        &mut self,
+        proof: &ProofSession,
+        deadline: u64,
+    ) -> Result<u64, CgroupWorkRefusal> {
+        let now = self.cgroup_check(proof, deadline)?;
+        if let Some(id) = self.cgroup_pending {
+            proof
+                .cgroup_read_status(id)
+                .map_err(CgroupWorkRefusal::Refused)?;
+        }
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?
+            .lock()
+            .map_err(|_| CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?;
+        if state.reads == 0 {
+            return Err(CgroupWorkRefusal::BudgetDeferred);
+        }
+        state.reads -= 1;
+        Ok(now)
+    }
+    fn external_read_checked(&mut self, proof: &ProofSession) -> Result<(), CgroupWorkRefusal> {
+        self.checked(proof, None)?;
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?
+            .lock()
+            .map_err(|_| CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?;
+        if state.reads == 0 {
+            return Err(CgroupWorkRefusal::BudgetDeferred);
+        }
+        state.reads -= 1;
+        Ok(())
+    }
+    pub(crate) fn claim_health(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        self.check(proof)?;
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(TraceWorkError::Deferred)?
+            .lock()
+            .map_err(|_| TraceWorkError::Deferred)?;
+        if state.health_attempted {
+            return Err(TraceWorkError::Deferred);
+        }
+        state.health_attempted = true;
+        Ok(())
+    }
+    fn health_attempted(&self) -> bool {
+        self.state
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .is_none_or(|s| s.health_attempted)
+    }
+    fn visit(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        self.visit_checked(proof)
+            .map_err(|_| TraceWorkError::Deferred)
+    }
+    fn visit_checked(&mut self, proof: &ProofSession) -> Result<(), CgroupWorkRefusal> {
+        self.checked(proof, None)?;
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?
+            .lock()
+            .map_err(|_| CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?;
+        if state.visits == 0 {
+            return Err(CgroupWorkRefusal::BudgetDeferred);
+        }
+        state.visits -= 1;
+        Ok(())
+    }
+    pub(crate) fn terminal(&self) -> bool {
+        self.state
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .is_some_and(|s| s.terminal)
+    }
+    fn close(&self) {
+        if let Some(state) = &self.state
+            && let Ok(mut state) = state.lock()
+        {
+            state.closed = Some(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_new(proof: ProofSession, start: u64, deadline: u64) -> Self {
+        Self::new(proof, start, deadline, false, None)
+    }
+}
+struct TraceCandidate {
+    body: TraceCandidateBody,
+    position: usize,
+}
+#[derive(Clone, Copy)]
+enum TracePhase {
+    Arming,
+    Health,
+    Settlement,
+    Seeding,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewLogOwner {
+    Owned,
+    Ambient,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewLogArmed {
+    Armed,
+    Unarmed,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewLogKind {
+    Allocated,
+    Released,
+    Evicted,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewLogEntry {
+    pub(crate) ordinal: usize,
+    pub(crate) kind: ViewLogKind,
+    pub(crate) view: ProcessViewId,
+    pub(crate) pid: Option<u32>,
+    pub(crate) owner: ViewLogOwner,
+    pub(crate) armed: ViewLogArmed,
+}
+
+/// One finalized witness proof input (WU-13 P-C phase 2, §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WitnessProof {
+    pub(crate) verdict: crate::attach::prearm_witness::FileVerdict,
+    pub(crate) active_ns: u64,
+    /// The scope-start stamp the witness preceded, recorded by the engine
+    /// right after `set_scope_start_ns` (§6.2). A later override (run)
+    /// fails condition 3.
+    pub(crate) scope_start_ns: Option<u64>,
+    pub(crate) walk_started_ns: u64,
+    pub(crate) fd_dev: u64,
+    pub(crate) fd_ino: u64,
+}
+
 pub struct Engine {
+    return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     plan: plan::AttachPlan,
     pinned: PinnedObjects,
     discovery: render::DiscoveryEvidence,
     capture_facts: CaptureFacts,
     views: Vec<ProcessView>,
+    trace_seeds: BTreeMap<SeedId, TraceCandidate>,
+    trace_by_view: BTreeMap<ProcessViewId, SeedId>,
+    trace_owner: Option<ProofSession>,
+    trace_active: Option<TraceWorkTicket>,
+    /// Inherited frame limit; only with_live_frame activates ordinary deferral.
+    trace_frame_deadline_ns: Option<u64>,
+    trace_terminal: Option<TraceWorkTicket>,
+    trace_phase: TracePhase,
+    trace_phase_visits: u32,
+    trace_arm_cursor: Option<SeedId>,
+    trace_settle_cursor: Option<SeedId>,
+    trace_view_cursor: usize,
+    trace_provider_views: BTreeMap<ProcessViewId, ViewAdmission>,
+    trace_provider_cursor: Option<ProcessViewId>,
+    trace_provider_turn: bool,
+    trace_needs_health: bool,
+    trace_health_seed: Option<SeedId>,
     modules: Vec<ReconciledModule>,
     manifests: Vec<Manifest>,
     manifest_ordinals: Vec<u32>,
@@ -80,6 +429,19 @@ pub struct Engine {
     identity_mismatches: usize,
     scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
     manifest_inputs: Vec<ManifestInput>,
+    prearm_input: Option<PrearmInput>,
+    prearm: crate::prearm_module::PrearmState,
+    /// Pre-arm witness verdicts (WU-13 P-C phase 2): None until a non-run
+    /// start_session finalizes the witness; run sessions and failed
+    /// startups leave it None (inert builder).
+    prearm_witness: Option<BTreeMap<PinnedObjectId, WitnessProof>>,
+    /// Live pre-arm witness between `discover_plan` and `start_session`
+    /// (WU-13 P-C phase 2, §6.2): started before the scope-start stamp,
+    /// finalized after attach. None without `--prearm-module`, when
+    /// startup is unavailable, or once finalized.
+    prearm_witness_live: Option<
+        crate::attach::prearm_witness::StartupWitness<crate::attach::prearm_witness::LiveBackend>,
+    >,
     base_counters: DiscoveryCounters,
     budget: CaptureWorkBudget,
     inventory: Option<inventory::InventoryState>,
@@ -94,8 +456,116 @@ pub struct Engine {
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
+    /// A collected-Finish service call spends this at actual dispatch or
+    /// retirement boundaries. Ordinary frames leave it unset.
+    collected_finish_actions: Option<usize>,
+    /// Round-robin position among the original, still-owned exit assessments.
+    collected_finish_assessment_after: Option<ProcessViewId>,
+    /// Lap tracker for pending leader-exit assessments at Q (R-26 N1).
+    collected_assessment_lap: AssessmentLap,
+    /// Publication-input generation counter for the terminal graph fence (§1.3).
+    #[allow(dead_code)] // Consumed by T4a (the epoch compare reads it).
+    graph_inputs_epoch: u64,
+    /// A collected-Finish credit requested the bounded terminal graph (§1.4).
+    collected_graph_requested: bool,
+    /// The live bounded terminal graph, boxed on the dedicated graph pool (§1.5).
+    collected_graph: Option<Box<CollectedGraph>>,
+    /// Dedicated accounting pool for the collected graph (box, copies,
+    /// preflight, installed backing). One pool per Engine, so per capture;
+    /// the graph never charges the registry pool.
+    collected_graph_pool: SemanticResourcePool,
+    /// Dedicated accounting pool for counter captures (terminal hold,
+    /// keepalive, stages, reads). One pool per Engine, so per capture;
+    /// counter captures never charge the graph, registry or test pools.
+    counter_pool: SemanticResourcePool,
+    /// Test-only CPU count for the counter preflight seam. Production
+    /// always reads the host topology.
+    #[cfg(test)]
+    counter_cpus_override: Option<usize>,
+    /// Test-only kill switch for the unchanged-tick candidate fast path.
+    /// The equivalence twin compares both modes engine against engine.
+    #[cfg(test)]
+    disable_empty_tick_fast_path_for_test: bool,
+    /// Test-only kill switch for per-commit publication deferral. The
+    /// equivalence twin compares both modes engine against engine.
+    #[cfg(test)]
+    disable_publish_deferral_for_test: bool,
+    /// Whether the committed plan, modules, pins and evidence equal what a
+    /// full rebuild would produce, as verified by comparison at the last
+    /// commit. The rebuild reads committed-plan reuse state, so a commit can
+    /// move it and the next rebuild may differ; only a commit whose
+    /// candidate compares equal establishes this, and every direct write,
+    /// loader-context mutation, cached or hand-built commit, withdrawal or
+    /// withholding clears it. The unchanged-tick fast path runs only while
+    /// it holds.
+    plan_rebuild_stable: bool,
+    /// Installed backing of the last completed graph (T4b Install step 4).
+    #[allow(dead_code)] // Consumed by T4b.
+    graph_backing: Option<Box<GraphBacking>>,
+    /// Retired-file handoff chain awaiting the joined terminal detach (T4b).
+    retired_files: Option<Box<RetiredFileHandoff>>,
+    /// First terminal-graph refusal reason, if any (§1.9).
+    #[allow(dead_code)] // Consumed by T4b (the `failed` flag reads it).
+    collected_graph_refusal: Option<&'static str>,
+    /// Refused graphs retained instead of reclaimed (item 19, T4b).
+    #[allow(dead_code)] // Consumed by T4b.
+    collected_graph_reclaim_forgotten: u32,
     /// Set while a pause cycle applies its batch (the owned child stopped).
     pause_owned_batch: bool,
+    /// Set while a pressure service pass runs inside record dispatch. Nested
+    /// record passes observe it and dispatch normally instead of starting a
+    /// second service pass, and retirement paths shield the protected pids.
+    pressure_service_active: bool,
+    /// Set while an inventory tick runs. A tick's own leftover-record passes
+    /// dispatch normally; only live-batch dispatch parks a pressure head, so
+    /// a service pass can never nest inside the tick it is servicing.
+    in_refresh_tick: bool,
+    /// The single queued request a pressure service pass may complete. Set
+    /// only while `pressure_service_active` holds; the tick scopes every
+    /// retirement, rescan, admission and completion set to this pid and
+    /// retains every other request with its serial and age.
+    pressure_selected: Option<PressureSelection>,
+    /// What a pressure service pass must leave untouched: pids named by
+    /// undispatched owned records (parked, pending, diverted, terminal and
+    /// pause-held), plus the owner views of loader contexts, terminal
+    /// owners and selection bindings those records name. Meaningful while
+    /// `pressure_service_active` or `pressure_rotation_pending` holds. When
+    /// an owned record's ownership cannot be narrowed, `block_all` shields
+    /// every retained context instead of guessing an owner from PID alone.
+    pressure_protection: PressureProtection,
+    /// The held head's service episode: its request snapshot and the
+    /// entries one bounded rotation already ruled out. Discarded when the
+    /// head settles (dispatch or refusal); a new head starts a new episode.
+    pressure_episode: Option<PressureEpisode>,
+    /// Set when a head episode re-parks its prefix for another rotation
+    /// opportunity: the ordinary tick behind it is suppressed, and
+    /// retirement stays shielded until the head settles. Cleared at every
+    /// record-pass entry and whenever the head settles.
+    pressure_rotation_pending: bool,
+    /// Selected-request service passes run (including deferrals): the
+    /// rotation instrument. H1 fairness cursors are checkpointed around
+    /// each pass, so this — not an H1 counter — measures service.
+    pressure_service_passes: u64,
+    /// Service passes that ran a real attempt: a scan, an arm, an admission
+    /// or a completion with a working clock. Quantum/clock deferrals and
+    /// absent candidates advance no attempt.
+    pressure_attempts: u64,
+    /// The last frame collect stopped at the shared allowance with the
+    /// queue not observed empty. Sticky until the scheduler takes it: a
+    /// set flag schedules backlog service instead of a full sleep.
+    frame_fresh_blocked: bool,
+    /// One-shot scheduling hint after an older leader loss or actual global
+    /// native retirement settles. It grants no admission authority.
+    immediate_exec_recovery_frame: bool,
+    pending_global_retirement: Option<RetirementTicket>,
+    global_retirement_frame_owed: bool,
+    /// Terminal-drain quanta that stopped at the shared allowance with
+    /// terminal work unfinished. Sticky evidence, like quiescence
+    /// overflow: a terminal drain that ends here never claims complete.
+    terminal_capacity_backlog: u64,
+    /// Diagnostic high-water mark of held ordinary discovery records
+    /// (pending plus terminal plus in-flight batch records). Never evidence.
+    discovery_held_high_water: usize,
     /// The records the running pause-owned batch was handed.
     held_records: BTreeSet<(u64, u64, u8)>,
     /// Views with at least one loader hit held by a pause stop, and views
@@ -133,14 +603,21 @@ pub struct Engine {
     module_hints: Vec<PathBuf>,
     counter_snapshot: CounterSnapshot,
     malformed_discovery: u64,
-    /// Pending lifecycle/loader refresh requests: pid to its first-seen
-    /// monotonic-nanosecond arrival mark (`None` when the clock read failed).
-    /// Re-requesting an already-queued pid keeps the earliest mark. Bounded
-    /// by `MAX_PENDING_REFRESH`.
-    refresh_requested: BTreeMap<u32, Option<u64>>,
+    /// Requests retain their original age; each consumed-record renewal gets
+    /// a unique serial so an older inventory pass cannot complete newer work.
+    refresh_requested: BTreeMap<u32, RefreshRequest>,
+    last_refresh_serial: u64,
     scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
+    /// Loader hits whose records resolved benignly (accepted, scan
+    /// complete, no new provider, no suspicious close) or under pause
+    /// proof. At most one per accepted record scan, so never above
+    /// `counter_snapshot.loader_hits` by construction; the checker
+    /// refuses the report when it is.
+    loader_benign_hits: u64,
     timings: CausalTimings,
+    physical_gap: crate::attach::PhysicalGapSummary,
+    continuity_deferred: bool,
     /// Per-stage wall-time accumulation (Phase 2): scan, pin, bind, plan,
     /// merge, projection, attach, plus the terminal cleanup overhead. The
     /// run loop merges these into its own drain/cleanup spans at snapshot.
@@ -153,26 +630,84 @@ pub struct Engine {
     /// Cumulative newcomer queue-age evidence (admissions and drops sample
     /// here; pending counts fill in at snapshot time).
     newcomer_ages: crate::timing::NewcomerStats,
-    /// Publication-input revision (B1): bumped on every live-batch mutation
-    /// of the batch-tail merge inputs (plan, pins, modules, corroboration,
-    /// fallback, skips, scan time). The tail skips its publication work only
-    /// when the batch changed nothing AND this equals the last published
-    /// revision — a quiet batch republishes byte-identical facts otherwise.
+    /// Publication-input revision: bumped on every live-batch mutation of
+    /// plan, pins, modules, corroboration, fallback, skips or scan time.
     facts_revision: u64,
+    /// The revision whose complete facts were successfully projected publicly.
+    /// A staged merge is private and cannot advance this marker.
     published_facts_revision: u64,
+    /// One stationary full loader transaction's exact pre-projection plan.
+    /// Historical public surfaces can differ, so the projected plan is not
+    /// a substitute for the next unchanged planner result.
+    loader_plan_cache: Option<LoaderPlanCache>,
     /// Batch-tail publications executed (counter, not timing: the B1 proof).
     tail_publishes: u64,
     /// Batch-tail publications skipped as provably redundant (same proof).
     tail_skips: u64,
     discovery_truncated: u64,
+    /// Loader scans and loader rejects settled at a proven process
+    /// exit (a subset of `discovery_truncated`). K0's
+    /// truncation-growth rule subtracts this from the total, so a
+    /// short child that exits before its provider load is processed
+    /// leaves no voiding growth. In cgroup and system scopes a scope
+    /// departure settles here too, but K0 refuses those scopes by
+    /// name, so no consumer reads it there.
+    exit_ended_truncations: u64,
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends (fallback, RT_ADD settle, retirement
+    /// sweep), loader rejects (missing-mapping, no-retained-view),
+    /// zero-state ends]. The buckets always sum to the total.
+    exit_ended_by_route: [u64; 3],
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
     retirement_intents: PendingViewRetirements,
     ready_expected_removals: BTreeSet<ProcessViewId>,
+    // Original custody and exact Session endpoint proof survive only the
+    // existing bounded conservative retirement/replay transaction.
+    ended_pid_retirement: Option<PendingEndedPidRetirement>,
+    /// Recently ended loader origins for late-record binding (R-1):
+    /// recorded only in `Scope::Pid`, on ExpectedRemoval, as the
+    /// view's pid, admission time and pin (bounded FIFO). A loader
+    /// record with no retained view counts exit-only only when it
+    /// matches one by pid and `hook_ts_ns >= admitted_ns` with the
+    /// pin still proving exit. That test rejects stale records from
+    /// an older process; safety against a later process reusing the
+    /// pid comes from the hooks being bound to the process in Pid
+    /// scope (kernel pid filter or per-task links). Other scopes
+    /// record nothing: K0 refuses them by name, so no consumer reads
+    /// the count there.
+    ended_loader_origins: VecDeque<EndedLoaderOrigin>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
+    /// When the expected-target-exit wait armed (wall clock): bounds the
+    /// `profile --pid` wait for draining retirement cleanup, so a cleanup
+    /// that stays queued ends the capture with a named PARTIAL reason
+    /// instead of holding it open until Ctrl-C. `None` until armed;
+    /// restarted whenever the drain makes progress, so only a stall with
+    /// no progress at all trips the bound.
+    expected_target_exit_since: Option<std::time::Instant>,
+    /// Per-field low-water marks the wait above compares against:
+    /// snapshotted at the arm, set to the current snapshot on every clock
+    /// reset, left alone on stalls, cleared whenever the wait disarms. A
+    /// wait whose pending was set directly snapshots its marks on its
+    /// first observation instead.
+    expected_target_exit_blocked: Option<ExpectedTargetExitBlocked>,
+    /// Whether the expected-target-exit wait ended by tripping the
+    /// no-progress bound (a stall) rather than by draining clear. Set once
+    /// on the trip; the capture keeps it so the stop can name the stall on
+    /// stderr beside the target-exit marker. Never set on the ordinary
+    /// all-clear path.
+    expected_target_exit_tripped: bool,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
+    // Kernel lifecycle timestamps only, bounded by pending retained views.
+    // None means at least one pending EXIT has unknown ordering.
+    pending_leader_exit_order: BTreeMap<ProcessViewId, Option<u64>>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
+    /// Views with a matched EXEC whose PID-bound static links may be dead
+    /// while still recorded as attached. At most one marker per retained
+    /// view: the next refresh rearms even an unchanged plan, ordinary-delta
+    /// churn or a completed rearm clears it, and view removal prunes it.
+    exec_rearm_views: BTreeMap<ProcessViewId, Option<u64>>,
     pid_descendant_gaps: u64,
     /// Multi-group rebuild windows this capture published: one per rebuilt
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
@@ -183,6 +718,14 @@ pub struct Engine {
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
     unmatched_leader_exit_events: BTreeSet<(u32, u64)>,
     cgroup_ingress_overflow: bool,
+    /// Extensive-mode executable dependency hints (6.14 Option B):
+    /// capture-local exe stash, scan-learned paths, and hint counts.
+    /// Disabled unless the operator armed `--track-short-lived`.
+    extensive: elf_needed::ExtensiveState,
+    /// 6.14 Option A exit-time mapping split: capture-local
+    /// mapped/unknown counts over the novel unmatched-exit
+    /// subpopulation. Read only while extensive mode is armed.
+    exit_map: ExitMappingState,
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
@@ -194,13 +737,23 @@ pub struct Engine {
     /// All identity stays out: only the classification is kept, and it is all
     /// that can be rendered.
     loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
-    pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
+    /// Deferred loader memory scans: the hook timestamp plus the deferring
+    /// announcement (RT_ADD or RT_DELETE), so the resolving scan can tell
+    /// a close completing from an open completing.
+    pending_loader_scans: BTreeMap<PendingLoaderScanKey, (u64, u32)>,
+    /// One noncausal catch-up owed by each newly armed live PID context.
+    /// Context retirement bounds and prunes this independently of RT_ADD work.
+    pending_loader_arm_scans: BTreeSet<PendingLoaderScanKey>,
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
     /// Task 1.6 experiment: broad admission. Set once from
     /// `P11SCOPE_BROAD_ADMIT=1` in `discover_plan` (production) or directly
     /// by broad tests; `false` preserves selected admission everywhere.
     broad_admit: bool,
+    /// Metrics captures without an explicit `--counter-mode` name that
+    /// remedy in provider-refusal reasons. Set once from the capture args
+    /// in `discover_plan`; every live rebuild keeps it.
+    counter_hint: bool,
     /// View IDs that have ever contributed provider evidence (a scan or a
     /// live record observed modules for them). Eviction eligibility needs
     /// this history, not just the current state: the capture budget keys
@@ -221,8 +774,95 @@ pub struct Engine {
     loader_arms: u64,
     /// Cumulative exploratory views evicted by rotation.
     exploratory_evictions: u64,
+    /// Cumulative pending newcomers completed without a view by the
+    /// probationary probe (Lane-A P3): provider-freedom proven by a
+    /// generation-pinned scan, no slot consumed, nothing fabricated.
+    probationary_completions: u64,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
+    /// Test-only one-shot: the next `Memory` loader scan fails without
+    /// touching the target. Production reaches a failing resolving scan
+    /// only through a live exit race (a dead child fails earlier at maps
+    /// validation), so the zero-state negative twin forces the failure
+    /// and drives the real branch, predicate and settlement past it.
+    #[cfg(test)]
+    fail_next_loader_memory_scan: bool,
+    #[cfg(test)]
+    loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
+    /// Test-only one-shot: force the next record-path loader scan to
+    /// report incomplete, pinning the `found_complete` plumbing from
+    /// the record-path scan to the loader-timing classifier.
+    #[cfg(test)]
+    loader_force_record_scan_incomplete: bool,
+    /// Scripted pin-probe answers, consumed in order by the next matching
+    /// probe. Test-only: live pins re-observe the kernel on every call, so
+    /// a race between two reads (exit proof, then observation failure)
+    /// cannot be produced deterministically with live pins.
+    #[cfg(test)]
+    pin_probe_script: RefCell<VecDeque<PinProbeAnswer>>,
+    /// Graphs created by the barrier (test count, G12/G20/G22/G23).
+    #[cfg(test)]
+    collected_graphs_created: u32,
+    /// Intents Intake visited (test count, G23).
+    #[cfg(test)]
+    collected_intake_intents: u32,
+    /// Test-only semantic pool behind `service_collected_finish_records` (D1.2).
+    #[cfg(test)]
+    collected_test_pool: SemanticResourcePool,
+    /// Test-only transport block for `service_collected_finish_records` (G25).
+    #[cfg(test)]
+    collected_test_transport_pending: bool,
+    /// Unkeyed names examined by the latest `names_view_bounded` call (names test).
+    #[cfg(test)]
+    names_inspected: Cell<usize>,
+    /// Test-only process-view allocation/release/eviction log (R3 pressure
+    /// diagnostic): every ID minted, freed or rotated, with owned/ambient
+    /// and armed/unarmed state at the record time. Never in release bytes.
+    /// Named `--pid` views are retained, not minted: their release logs
+    /// without a matching allocation.
+    #[cfg(test)]
+    view_log: Vec<ViewLogEntry>,
+}
+
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn view_log(&self) -> &[ViewLogEntry] {
+        &self.view_log
+    }
+
+    fn view_log_owner(&self, view: ProcessViewId) -> ViewLogOwner {
+        if self
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+        {
+            ViewLogOwner::Owned
+        } else {
+            ViewLogOwner::Ambient
+        }
+    }
+
+    fn view_log_armed(&self, view: ProcessViewId) -> ViewLogArmed {
+        if self.loader_registry.ids_for_view(view).is_empty() {
+            ViewLogArmed::Unarmed
+        } else {
+            ViewLogArmed::Armed
+        }
+    }
+
+    fn record_view_log(&mut self, kind: ViewLogKind, view: ProcessViewId, pid: Option<u32>) {
+        let ordinal = self.view_log.len() + 1;
+        let owner = self.view_log_owner(view);
+        let armed = self.view_log_armed(view);
+        self.view_log.push(ViewLogEntry {
+            ordinal,
+            kind,
+            view,
+            pid,
+            owner,
+            armed,
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +908,19 @@ struct LoaderContextClass {
 struct PendingLoaderScanKey {
     view: ProcessViewId,
     context: LoaderContextId,
+}
+
+/// Which loader hit a record-driven scan classifies for benign-hit
+/// accounting: its own announcement, plus — for a completion — the
+/// announcement it resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderHitClass {
+    /// An RT_ADD/RT_DELETE record's own scan.
+    Announced(u32),
+    /// An RT_CONSISTENT scan; `resolving` is the deferred announcement
+    /// it completes, or `None` when no announcement is pending (a failed
+    /// or refcount open, which fires no RT_ADD of its own).
+    Consistent { resolving: Option<u32> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,7 +1043,7 @@ enum TableOccurrence {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct CaptureHistory {
     modules: BTreeMap<plan::ModuleId, render::DiscoveredModule>,
     decoded: BTreeSet<DecodedOccurrence>,
@@ -400,6 +1053,8 @@ struct CaptureHistory {
     losses: BTreeMap<(String, String), Skipped>,
     /// Scan gaps contradicted by a later same-path nonempty table; exact keys
     /// keep persistent counters from resurrecting them after that table retires.
+    /// Written by `record_object_skips` on suppression and by `merge_current`;
+    /// read by both through `scan_gap_key`.
     scan_gap_tombstones: BTreeSet<(String, String)>,
     refusals: BTreeMap<plan::ModuleId, Skipped>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
@@ -448,7 +1103,6 @@ struct CaptureHistory {
     selections: Vec<LiveSelectionTuple>,
     selection_truncated: bool,
     standard_exports: BTreeMap<plan::ModuleId, BTreeSet<StandardExportFact>>,
-    standard_requirements: BTreeMap<plan::ModuleId, BTreeSet<StandardRequirementFact>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -458,44 +1112,17 @@ enum StandardExportFact {
     Outside,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum StandardRequirementFact {
-    Legacy,
-    V3,
-}
-
-fn standard_export_status(
-    exports: Option<&BTreeSet<StandardExportFact>>,
-    requirements: Option<&BTreeSet<StandardRequirementFact>>,
-) -> &'static str {
-    match (exports, requirements) {
-        (Some(exports), _)
-            if exports.len() == 1 && exports.contains(&StandardExportFact::Present) =>
-        {
-            "present"
-        }
-        (Some(exports), _)
-            if exports.len() == 1 && exports.contains(&StandardExportFact::Outside) =>
-        {
-            "outside_module"
-        }
-        (Some(exports), Some(requirements))
-            if exports.len() == 1
-                && exports.contains(&StandardExportFact::Absent)
-                && requirements.len() == 1
-                && requirements.contains(&StandardRequirementFact::Legacy) =>
-        {
-            "legacy_absent"
-        }
-        (Some(exports), Some(requirements))
-            if exports.len() == 1
-                && exports.contains(&StandardExportFact::Absent)
-                && requirements.len() == 1
-                && requirements.contains(&StandardRequirementFact::V3) =>
-        {
-            "required_absent"
-        }
-        _ => "unresolved",
+/// Historical schema spelling for a proven absent optional export. Version
+/// metadata never makes an observed absence a discovery failure.
+fn standard_export_status(exports: Option<&BTreeSet<StandardExportFact>>) -> &'static str {
+    let Some(exports) = exports.filter(|facts| facts.len() == 1) else {
+        return "unresolved";
+    };
+    match exports.first() {
+        Some(StandardExportFact::Present) => "present",
+        Some(StandardExportFact::Absent) => "legacy_absent",
+        Some(StandardExportFact::Outside) => "outside_module",
+        None => "unresolved",
     }
 }
 
@@ -878,14 +1505,9 @@ fn canonical_selection_targets(
     }
     targets
         .into_iter()
-        .map(
-            |((object, file_offset, name), object_path)| plan::SelectionTableTarget {
-                object,
-                object_path,
-                file_offset,
-                name,
-            },
-        )
+        .map(|((object, file_offset, name), object_path)| {
+            plan::SelectionTableTarget::provider_local(object, object_path, file_offset, name)
+        })
         .collect()
 }
 
@@ -893,8 +1515,14 @@ fn same_selection_target_set(
     left: &[plan::SelectionTableTarget],
     right: &[plan::SelectionTableTarget],
 ) -> bool {
-    let identity =
-        |target: &plan::SelectionTableTarget| (target.object, target.file_offset, target.name);
+    let identity = |target: &plan::SelectionTableTarget| {
+        (
+            target.object,
+            target.file_offset,
+            target.name,
+            target.ordinal,
+        )
+    };
     let mut left = left.iter().map(identity).collect::<Vec<_>>();
     let mut right = right.iter().map(identity).collect::<Vec<_>>();
     left.sort();
@@ -987,7 +1615,10 @@ fn prune_selection_inventory(history: &mut CaptureHistory, live_views: &BTreeSet
         .retain(|table, _| live_views.contains(&table.view));
 }
 
-fn capture_manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &str)> {
+pub(crate) fn capture_manifest_object_key(
+    manifest: &Manifest,
+    object: u32,
+) -> Option<(ObjectKey, &str)> {
     let object = manifest.objects.iter().find(|record| record.id == object)?;
     let provenance = &manifest.provenance_objects[plan::provenance_of(manifest, object)?];
     Some((
@@ -1011,6 +1642,79 @@ fn manifest_module_object(manifest: &Manifest, pinned: &PinnedObjects) -> Option
     pinned.id_for_manifest(key, path)
 }
 
+/// The reachable count-only claims, before slot admission. Shared with the
+/// semantic completeness check; these never authorize argument decoding.
+pub(crate) fn manifest_selection_targets<'a>(
+    manifest: &'a Manifest,
+    pinned: &'a PinnedObjects,
+) -> impl Iterator<Item = (u8, Vec<plan::SelectionTableTarget>)> + 'a {
+    let provider = manifest_module_object(manifest, pinned);
+    let reachable: BTreeSet<_> = manifest
+        .selection_evidence
+        .queries
+        .iter()
+        .filter(|query| matches!(query.authority, SelectionAuthority::SelectionCountOnly))
+        .filter_map(|query| query.selection_table)
+        .collect();
+    manifest
+        .selection_evidence
+        .tables
+        .iter()
+        .filter(move |table| reachable.contains(&table.id))
+        .map(move |table| {
+            let Some(provider) = provider else {
+                return (table.id, Vec::new());
+            };
+            let name_authorized =
+                crate::manifest_input::selection_table_name_authorized(manifest, table.id);
+            let mut targets = Vec::new();
+            for (ordinal, function) in table.functions.iter().enumerate() {
+                let Resolution::Resolved {
+                    object,
+                    file_offset,
+                } = function.resolution
+                else {
+                    continue;
+                };
+                let Some((key, path)) = capture_manifest_object_key(manifest, object) else {
+                    continue;
+                };
+                let Some(object) = pinned.id_for_manifest(key, path) else {
+                    continue;
+                };
+                let Some(canonical_name) = pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+                    .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
+                    .find(|field| field.name == function.name)
+                    .map(|field| field.name)
+                else {
+                    continue;
+                };
+                let Ok(ordinal) = u16::try_from(ordinal) else {
+                    continue;
+                };
+                let name = if name_authorized {
+                    canonical_name
+                } else {
+                    plan::UNKNOWN_FUNCTION_NAME
+                };
+                if let Some(target) = plan::SelectionTableTarget::from_pinned(
+                    provider,
+                    object,
+                    path.into(),
+                    file_offset,
+                    name,
+                    ordinal,
+                    pinned,
+                ) {
+                    targets.push(target);
+                }
+            }
+            (table.id, targets)
+        })
+}
+
 fn lower_manifest_selection_tables(
     plan: &mut plan::AttachPlan,
     allocated: &plan::AttachPlan,
@@ -1032,53 +1736,10 @@ fn lower_manifest_selection_tables(
         else {
             continue;
         };
-        let reachable: BTreeSet<_> = manifest
-            .selection_evidence
-            .queries
-            .iter()
-            .filter(|query| matches!(query.authority, SelectionAuthority::SelectionCountOnly))
-            .filter_map(|query| query.selection_table)
-            .collect();
-        for table in manifest
-            .selection_evidence
-            .tables
-            .iter()
-            .filter(|table| reachable.contains(&table.id))
-        {
-            let mut targets = Vec::new();
-            for function in &table.functions {
-                let Resolution::Resolved {
-                    object,
-                    file_offset,
-                } = function.resolution
-                else {
-                    continue;
-                };
-                let Some((key, path)) = capture_manifest_object_key(manifest, object) else {
-                    continue;
-                };
-                let Some(object) = pinned.id_for_manifest(key, path) else {
-                    continue;
-                };
-                let Some(name) = pkcs11_module::FUNCTION_LIST_FIELDS
-                    .iter()
-                    .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
-                    .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
-                    .find(|field| field.name == function.name)
-                    .map(|field| field.name)
-                else {
-                    continue;
-                };
-                targets.push(plan::SelectionTableTarget {
-                    object,
-                    object_path: path.into(),
-                    file_offset,
-                    name,
-                });
-            }
+        for (table, targets) in manifest_selection_targets(manifest, pinned) {
             match plan.add_selection_table(allocated, module, targets.clone()) {
                 Ok(()) => admissions.push(ManifestSelectionAdmission {
-                    source: (*ordinal, table.id),
+                    source: (*ordinal, table),
                     targets,
                 }),
                 Err(reason) => refused.push(reason),
@@ -1086,16 +1747,6 @@ fn lower_manifest_selection_tables(
         }
     }
     (admissions, refused)
-}
-
-fn manifest_walk_label(walk: &WalkOutcome) -> String {
-    match walk {
-        WalkOutcome::Full => "full".into(),
-        WalkOutcome::KnownPrefix => "known_prefix".into(),
-        WalkOutcome::Refused => "refused".into(),
-        WalkOutcome::NotWalked => "not_walked".into(),
-        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
-    }
 }
 
 fn manifest_acquisition_label(acquisition: &Acquisition) -> String {
@@ -1458,6 +2109,7 @@ impl CaptureFacts {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge_current(
         &mut self,
         plan: &plan::AttachPlan,
@@ -1466,6 +2118,7 @@ impl CaptureFacts {
         manifests: &[Manifest],
         manifest_ordinals: &[u32],
         counters: &DiscoveryCounters,
+        prearm: &crate::prearm_module::PrearmState,
     ) -> Result<()> {
         // Proves the fallible surface before cloning: same checks, same
         // order, same first failure as the interleaved checks below.
@@ -1473,7 +2126,7 @@ impl CaptureFacts {
         let mut history = self.visible_history().clone();
         let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
         prune_selection_inventory(&mut history, &live_views);
-        let current = discovery_evidence(plan, pinned, counters);
+        let current = discovery_evidence(plan, pinned, counters, prearm);
 
         // §4.12 by capture end. Each fresh reading replaces the retained one;
         // a publication with nothing to read keeps what the capture already
@@ -1552,20 +2205,6 @@ impl CaptureFacts {
                     StandardExportFact::Absent
                 },
             );
-            for table in &module.scanned.tables {
-                let requirement = match table.version.0 {
-                    2 => Some(StandardRequirementFact::Legacy),
-                    3.. => Some(StandardRequirementFact::V3),
-                    _ => None,
-                };
-                if let Some(requirement) = requirement {
-                    history
-                        .standard_requirements
-                        .entry(owner)
-                        .or_default()
-                        .insert(requirement);
-                }
-            }
             let mut targets = BTreeMap::new();
             let mut skips = BTreeMap::new();
             let mut surfaces = BTreeMap::new();
@@ -1573,7 +2212,24 @@ impl CaptureFacts {
             for (table_index, table) in module.scanned.tables.iter().enumerate() {
                 let functions =
                     table.entries.len() + table.null_entries.len() + table.unpinned.len();
-                let surface = (table.version, table.walk.to_string(), functions);
+                // The same witness `plan::lower_scanned` scores by, so the
+                // published linkage and the plan's naming never disagree.
+                let exports = ObjectExports {
+                    object: module.scanned.key,
+                    symbols: &module.exports,
+                    getter_present: module.getter_present,
+                    witness_fault: module.witness_fault,
+                };
+                // A proven 68-slot prefix reports a full walk, like the plan.
+                // A table an interface record links keeps the raw decoder
+                // walk, like the plan: one table never publishes both.
+                let walk = published_walk(
+                    table_index,
+                    &module.scanned.tables,
+                    &module.scanned.interfaces,
+                    &exports,
+                );
+                let surface = (table.version, walk.to_string(), functions);
                 let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
                 let scan_surface = SurfaceOccurrence::Scan {
                     module: owner,
@@ -1590,7 +2246,7 @@ impl CaptureFacts {
                             "{} table {}.{}",
                             module.scanned.path, table.version.0, table.version.1
                         ),
-                        walk: table.walk.to_string(),
+                        walk: walk.to_string(),
                         acquisition: "ok".into(),
                         functions,
                     });
@@ -1661,12 +2317,6 @@ impl CaptureFacts {
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
-                // The same witness `plan::lower_scanned` scores by, so the
-                // published linkage and the plan's naming never disagree.
-                let exports = ObjectExports {
-                    object: module.scanned.key,
-                    symbols: &module.exports,
-                };
                 let table_score = table_evidence_score(
                     table_index,
                     &module.scanned.tables,
@@ -1776,19 +2426,6 @@ impl CaptureFacts {
                 .entry(owner)
                 .or_default()
                 .insert(export);
-            for surface in &manifest.surfaces {
-                if let Some(requirement) = surface.version.and_then(|version| match version.major {
-                    2 => Some(StandardRequirementFact::Legacy),
-                    3.. => Some(StandardRequirementFact::V3),
-                    _ => None,
-                }) {
-                    history
-                        .standard_requirements
-                        .entry(owner)
-                        .or_default()
-                        .insert(requirement);
-                }
-            }
             let mut manifest_surface_keys = BTreeMap::new();
             let manifest_surface_candidates: Vec<_> = manifest
                 .surfaces
@@ -1822,7 +2459,7 @@ impl CaptureFacts {
                     .entry(surface_key)
                     .or_insert_with(|| plan::SurfaceSummary {
                         source: plan::source_label(&surface.source),
-                        walk: manifest_walk_label(&surface.walk),
+                        walk: crate::manifest_input::effective_surface_walk(surface),
                         acquisition: manifest_acquisition_label(&surface.acquisition),
                         functions: surface.functions.len(),
                     });
@@ -1941,7 +2578,7 @@ impl CaptureFacts {
             history.scan_gap_tombstones.insert(key);
         }
         for skipped in &counters.object_skips {
-            let key = (skipped.subject.clone(), skipped.reason.clone());
+            let key = scan_gap_key(skipped);
             if scan_gap_this_capture_attached(&plan.modules, skipped) {
                 history.scan_gap_tombstones.insert(key);
             } else if !history.scan_gap_tombstones.contains(&key) {
@@ -1957,7 +2594,10 @@ impl CaptureFacts {
             // later shrinks never under-reports what was missed. That count
             // is a lower bound on the endpoints omitted over the capture.
             // Whole capacity refusals rank by what they needed the same way
-            // (PD-T6-1); any other whole refusal stays first-wins.
+            // (PD-T6-1); any other whole refusal stays first-wins, except an
+            // awaiting-publication gap, which any counted capacity refusal
+            // replaces: "nothing published yet" no longer describes a module
+            // whose published set names a demand.
             let rank = |reason: &str| {
                 (
                     !plan::is_growth_omission(reason),
@@ -1975,7 +2615,25 @@ impl CaptureFacts {
                 ),
                 (Some(known), Some(refused)) if refused > known
             );
+            // PA-5 I1: a later prefix record replaces an earlier whole-refusal
+            // record for the same closure module. Without this the report says
+            // "not attached" while the prefix is counting calls. JK-22a: the
+            // same holds for a later provider-prefix record replacing an
+            // earlier whole refusal for the same provider module.
+            let prefix_replaces_whole = (plan::is_closure_array_refusal(&known.reason)
+                && plan::is_closure_array_prefix(&refused.reason))
+                || (plan::whole_refusal_needed_count(&known.reason).is_some()
+                    && plan::is_provider_prefix(&refused.reason));
+            // An awaiting-publication record ranks below any counted capacity
+            // refusal for the same module: once its published set names a
+            // demand, the earlier "nothing published yet" is stale. Never the
+            // reverse: the counted refusal is the high-water mark.
+            let unpublished_replaced_by_counted =
+                plan::is_closure_awaiting_publication(&known.reason)
+                    && plan::whole_refusal_needed_count(&refused.reason).is_some();
             if larger_whole
+                || prefix_replaces_whole
+                || unpublished_replaced_by_counted
                 || (plan::is_growth_omission(&known.reason)
                     && rank(&refused.reason) >= rank(&known.reason))
             {
@@ -2028,7 +2686,12 @@ impl CaptureFacts {
         }
     }
 
-    fn discovery(&self, plan: &plan::AttachPlan) -> render::DiscoveryEvidence {
+    fn discovery(
+        &self,
+        plan: &plan::AttachPlan,
+        excluded: &[crate::discovery::scan::ExcludedRecord],
+        excludes: &[std::path::PathBuf],
+    ) -> render::DiscoveryEvidence {
         let history = self.visible_history();
         let modules = history
             .modules
@@ -2060,6 +2723,7 @@ impl CaptureFacts {
             .values()
             .filter(|outcome| corroboration_corroborates(**outcome))
             .count() as u64;
+        let (excluded_modules, unmatched_excludes) = render::aggregate_excluded(excluded, excludes);
         render::DiscoveryEvidence {
             modules,
             conflicts: history.conflicts.saturating_add(derived_conflicts),
@@ -2078,6 +2742,8 @@ impl CaptureFacts {
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
             scan_ms: history.scan_ms,
+            excluded_modules,
+            unmatched_excludes,
             ..render::DiscoveryEvidence::default()
         }
     }
@@ -2099,14 +2765,15 @@ fn extend_occurrences<T: Clone + PartialEq>(retained: &mut Vec<T>, incoming: Vec
     }
 }
 
-/// The union of two source sets in the one order the schema allows: exactly
-/// `["scan"]`, `["manifest"]`, or `["scan", "manifest"]`
-/// (docs/schema/observed-profile-v2.md, "in that canonical order"). This is the
-/// order `PinnedObjects::sources` already emits; a union that appends in
-/// arrival order does not, and a manifest-first module the scan only reaches
-/// later renders the illegal `["manifest", "scan"]`.
+/// The union of two source sets in the one order the schema allows:
+/// `scan`, `manifest`, `prearm` subsets in that canonical order
+/// (docs/schema/observed-profile-v2.md, "in that canonical order",
+/// extended by packet 6.13). This is the order `PinnedObjects::sources`
+/// already emits; a union that appends in arrival order does not, and a
+/// manifest-first module the scan only reaches later renders the illegal
+/// `["manifest", "scan"]`.
 fn canonical_sources(retained: &[&'static str], incoming: &[&'static str]) -> Vec<&'static str> {
-    ["scan", "manifest"]
+    ["scan", "manifest", "prearm"]
         .into_iter()
         .filter(|source| retained.contains(source) || incoming.contains(source))
         .collect()
@@ -2153,6 +2820,18 @@ fn merge_discovered_module(
             retained.corroboration.push(outcome);
         }
     }
+    // The incoming snapshot's interval state supersedes: a module that lost
+    // its pre-arm source is genuinely unwatched, and a live watch's current
+    // state is always fresher than the retained one. Attach keys only move
+    // forward into set, never back to unset: assembly runs once at capture
+    // end, and a later snapshot must not clobber assembled keys with `None`.
+    retained.watch = incoming.watch;
+    if incoming.attached_at_ns.is_some() {
+        retained.attached_at_ns = incoming.attached_at_ns;
+    }
+    if incoming.unobserved_windows.is_some() {
+        retained.unobserved_windows = incoming.unobserved_windows;
+    }
 }
 
 struct ScanInput {
@@ -2175,6 +2854,21 @@ type InventoryScanOutcome = (
     Vec<Skipped>,
 );
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
+struct PendingEndedPidRetirement {
+    owner: ProcessView,
+    proof: crate::attach::EndedPidRetirement,
+}
+/// One ended loader origin (R-1): the pid, admission time and pin of a
+/// view removed as ExpectedRemoval. The pin holds the original task.
+struct EndedLoaderOrigin {
+    pid: u32,
+    admitted_ns: u64,
+    pin: Arc<PidPin>,
+}
+/// Bound for the ended-loader-origin ledger: one suffices for Pid
+/// scope; cgroup/system churn evicts oldest first (fail-closed: a
+/// late record without its origin stays a real loss).
+const MAX_ENDED_LOADER_ORIGINS: usize = 32;
 type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
@@ -2185,6 +2879,16 @@ type DiscoveryCollector<'a> =
 /// injected clock can expire mid-path; the poll count and order match the
 /// direct reads it replaces exactly.
 type TickClock<'a> = dyn FnMut() -> Option<u64> + 'a;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RefreshRequest {
+    first_seen_ns: Option<u64>,
+    serial: u64,
+    owner: Option<ProcessViewId>,
+    exec_binding: Option<crate::attach::ExecBinding>,
+    // The matched, bound EXEC's kernel hook clock, never its arrival clock.
+    exec_hook_ts_ns: Option<u64>,
+}
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 
@@ -2193,12 +2897,168 @@ type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 /// BPF object; `Session` is the only production implementation and every method
 /// is a plain delegation to the existing inherent one.
 pub(crate) trait EngineSession {
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
+        None
+    }
+    fn has_slot_link(&self, _: u32) -> bool {
+        false
+    }
+    /// The session's retained attach-complete instant for one slot, if it
+    /// ever attached (packet 6.13, R2-D1-5). Scripted sessions override.
+    fn slot_attached_at(&self, _: u32) -> Option<u64> {
+        None
+    }
+    fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
+        crate::attach::PhysicalGapSummary::default()
+    }
+    fn prepare_ended_pid_retirement(
+        &self,
+        _: &ProcessView,
+        _: &[plan::Slot],
+    ) -> Option<crate::attach::EndedPidRetirement> {
+        None
+    }
+    fn mutation_stopped(&self) -> bool {
+        false
+    }
+    /// 6.14 Option A: whether the session's instance-continuity hooks
+    /// are refused (or were never wanted), so an empty exit summary is
+    /// `unknown`, never a watched-provider negative. Fail-closed
+    /// default: sessions that cannot prove live hooks classify every
+    /// kind-7 summary as hooks-refused unknown.
+    fn instance_hooks_refused(&self) -> bool {
+        true
+    }
+    fn bind_exec(
+        &self,
+        _: &ProcessView,
+        _: u64,
+        _: &DiscoveryRecord,
+    ) -> Option<crate::attach::ExecBinding> {
+        None
+    }
+    fn prepare_preservation(
+        &mut self,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &[plan::Slot],
+        _: &[plan::Slot],
+        _: &PinnedObjects,
+    ) -> Option<crate::attach::PreservationReceipt> {
+        None
+    }
+    fn validate_preservation(
+        &mut self,
+        _: &crate::attach::PreservationReceipt,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &PinnedObjects,
+    ) -> bool {
+        false
+    }
+    fn prepare_completed_rearm(
+        &mut self,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &[plan::Slot],
+        _: &[plan::Slot],
+        _: &PinnedObjects,
+    ) -> Option<crate::attach::CompletedRearmReceipt> {
+        None
+    }
+    fn validate_completed_rearm(
+        &mut self,
+        _: &crate::attach::CompletedRearmReceipt,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &PinnedObjects,
+    ) -> bool {
+        false
+    }
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
-    /// session's FIFO without applying any (RB-2). `discovery_dequeue`
-    /// serves that FIFO first, so ring order is kept.
-    fn stage_discovery(&mut self, quantum: usize) -> Result<usize>;
+    /// session's FIFO without applying any (RB-2), without letting staged
+    /// plus `engine_held` exceed the shared 4,096-item allowance.
+    /// `discovery_dequeue` serves that FIFO first, so ring order is kept.
+    fn stage_discovery(
+        &mut self,
+        quantum: usize,
+        engine_held: usize,
+    ) -> Result<crate::attach::DiscoveryStageOutcome>;
+    /// DISCOVERY items currently held in the session FIFO: staged items
+    /// hold shared-allowance credits until a dequeue transfers them.
+    fn staged_discovery_len(&self) -> usize;
+    /// One DISCOVERY quantum bounded by the Q `stop` position: the
+    /// collected records, the malformed count, and the
+    /// `(post_q_record, backlog)` contract of the bounded drains.
+    fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)>;
+
+    /// Only the actual Session implementation can expose its original
+    /// Q-bounded drain here. Other native leaves refuse by default.
+    fn collect_collected_finish_discovery(
+        &mut self,
+        _q: &crate::attach::CollectedFinishQ,
+        _quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        bail!("this native leaf has no original Q-bounded discovery drain")
+    }
+    fn prepare_collected_static_retirement(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _input: &mut Option<RetainedRetirementInput>,
+        _reserve: &SemanticResourceReserver,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn begin_collected_static_retirement(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _ticket: &CollectedRetirementTicket,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn poll_collected_static_retirement(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _ticket: &CollectedRetirementTicket,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn cancel_collected_static_retirement(
+        &mut self,
+        _input: Option<&RetainedRetirementInput>,
+        _ticket: Option<&CollectedRetirementTicket>,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn defer_collected_partial_groups(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _input: &mut Option<RetainedRetirementInput>,
+        _reserve: &SemanticResourceReserver,
+        _work: usize,
+    ) -> Result<DeferralProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    // T3's carrier predicate; consumed by T4b (G24).
+    #[allow(dead_code)]
+    fn collected_retirement_is_physical(&self) -> bool {
+        true
+    }
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
@@ -2215,7 +3075,25 @@ pub(crate) trait EngineSession {
         &mut self,
         targets: &[plan::Slot],
         objects: &PinnedObjects,
+        ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult>;
+    /// Counter growth staging for this candidate plan. Sessions without
+    /// banks refuse; scripted sessions record and replay.
+    fn stage_counter_growth(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
+    ) -> BankPublication {
+        let _ = (plan, objects, reserve);
+        BankPublication::Refused(BankRefusal::Shape(BankShapeCause::StagedWithoutBanks))
+    }
+    /// Check name for the last counter staging call when it refused a bare
+    /// `Topology`, `None` otherwise. Real sessions report the recorded
+    /// check; scripted sessions report their scripted name.
+    fn last_counter_stage_check(&self) -> Option<&'static str> {
+        None
+    }
     fn replace_targets(
         &mut self,
         plan: &mut plan::AttachPlan,
@@ -2223,6 +3101,33 @@ pub(crate) trait EngineSession {
         objects: &PinnedObjects,
     ) -> Result<ReplacementOutcome>;
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome>;
+    fn begin_global_static_retirement(
+        &mut self,
+        _: &[plan::Slot],
+    ) -> Result<Option<RetirementTicket>> {
+        Ok(None)
+    }
+    fn poll_global_retirement(&mut self, _: &RetirementTicket) -> RetirementPoll {
+        RetirementPoll::Refused
+    }
+    fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+        self.detach_slots(slots)
+    }
+    fn detach_ended_pid_slots(
+        &mut self,
+        slots: &[plan::Slot],
+        _: &ProcessView,
+        _: &crate::attach::EndedPidRetirement,
+    ) -> Result<DetachOutcome> {
+        self.detach_slots(slots)
+    }
+    fn has_dynamic_loader(
+        &self,
+        context: LoaderContextId,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    ) -> bool;
     fn has_dynamic_export(
         &self,
         context: LoaderContextId,
@@ -2257,7 +3162,87 @@ pub(crate) trait EngineSession {
     fn remove_pause(&mut self) -> Result<Option<u64>>;
 }
 
+fn require_original_q(q: Option<&CollectedFinishQ>) -> Result<&CollectedFinishQ> {
+    q.context("collected retirement needs the original Q")
+}
+
 impl EngineSession for Session {
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
+        Session::reexec_diagnostic(self)
+    }
+    fn has_slot_link(&self, slot: u32) -> bool {
+        Session::has_slot_link(self, slot)
+    }
+    fn slot_attached_at(&self, slot: u32) -> Option<u64> {
+        Session::slot_attached_at(self, slot)
+    }
+    fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
+        Session::physical_gap_summary(self)
+    }
+    fn prepare_ended_pid_retirement(
+        &self,
+        view: &ProcessView,
+        slots: &[plan::Slot],
+    ) -> Option<crate::attach::EndedPidRetirement> {
+        Session::prepare_ended_pid_retirement(self, view, slots)
+    }
+    fn mutation_stopped(&self) -> bool {
+        Session::mutation_stopped(self)
+    }
+    fn instance_hooks_refused(&self) -> bool {
+        Session::instance_tracking(self).refused().is_some()
+    }
+    fn bind_exec(
+        &self,
+        view: &ProcessView,
+        serial: u64,
+        record: &DiscoveryRecord,
+    ) -> Option<crate::attach::ExecBinding> {
+        Session::bind_exec(self, view, serial, record)
+    }
+    fn prepare_preservation(
+        &mut self,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        slots: &[plan::Slot],
+        ordinary: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Option<crate::attach::PreservationReceipt> {
+        Session::prepare_preservation(self, binding, view, serial, slots, ordinary, objects)
+    }
+    fn validate_preservation(
+        &mut self,
+        receipt: &crate::attach::PreservationReceipt,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        Session::validate_preservation(self, receipt, binding, view, serial, objects)
+    }
+    fn prepare_completed_rearm(
+        &mut self,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        slots: &[plan::Slot],
+        ordinary: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Option<crate::attach::CompletedRearmReceipt> {
+        Session::prepare_completed_rearm(self, binding, view, serial, slots, ordinary, objects)
+    }
+    fn validate_completed_rearm(
+        &mut self,
+        receipt: &crate::attach::CompletedRearmReceipt,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        Session::validate_completed_rearm(self, receipt, binding, view, serial, objects)
+    }
     fn capture_policy(&self) -> CapturePolicy {
         Session::capture_policy(self)
     }
@@ -2266,8 +3251,88 @@ impl EngineSession for Session {
         Session::discovery_dequeue(self)
     }
 
-    fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
-        Session::stage_discovery(self, quantum)
+    fn stage_discovery(
+        &mut self,
+        quantum: usize,
+        engine_held: usize,
+    ) -> Result<crate::attach::DiscoveryStageOutcome> {
+        Session::stage_discovery(self, quantum, engine_held)
+    }
+
+    fn staged_discovery_len(&self) -> usize {
+        Session::staged_discovery_len(self)
+    }
+
+    fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        Session::collect_discovery_to_position(self, stop, quantum)
+    }
+
+    fn collect_collected_finish_discovery(
+        &mut self,
+        q: &crate::attach::CollectedFinishQ,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        self.collected_finish_discovery_domain(q)?;
+        self.collect_discovery_to_position(q.discovery_stop(), quantum)
+    }
+
+    fn prepare_collected_static_retirement(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let q = require_original_q(q)?;
+        Session::prepare_collected_static_retirement(self, q, input, reserve, work)
+    }
+
+    fn begin_collected_static_retirement(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let q = require_original_q(q)?;
+        Session::begin_collected_static_retirement(self, q, ticket, work)
+    }
+
+    fn poll_collected_static_retirement(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let q = require_original_q(q)?;
+        Session::poll_collected_static_retirement(self, q, ticket, work)
+    }
+
+    fn cancel_collected_static_retirement(
+        &mut self,
+        input: Option<&RetainedRetirementInput>,
+        ticket: Option<&CollectedRetirementTicket>,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        Session::cancel_collected_static_retirement(self, input, ticket, work)
+    }
+
+    fn defer_collected_partial_groups(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        let q = require_original_q(q)?;
+        Session::defer_collected_partial_groups(self, q, input, reserve, work)
+    }
+
+    fn collected_retirement_is_physical(&self) -> bool {
+        Session::collected_retirement_is_physical(self)
     }
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -2304,8 +3369,22 @@ impl EngineSession for Session {
         &mut self,
         targets: &[plan::Slot],
         objects: &PinnedObjects,
+        ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
-        Session::attach_targets(self, targets, objects)
+        Session::attach_targets(self, targets, objects, ended)
+    }
+
+    fn stage_counter_growth(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
+    ) -> BankPublication {
+        Session::stage_counter_growth(self, plan, objects, reserve)
+    }
+
+    fn last_counter_stage_check(&self) -> Option<&'static str> {
+        Session::last_counter_stage_check(self)
     }
 
     fn replace_targets(
@@ -2319,6 +3398,36 @@ impl EngineSession for Session {
 
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_slots(self, slots)
+    }
+    fn begin_global_static_retirement(
+        &mut self,
+        slots: &[plan::Slot],
+    ) -> Result<Option<RetirementTicket>> {
+        Session::begin_global_static_retirement(self, slots)
+    }
+    fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
+        Session::poll_global_retirement(self, ticket)
+    }
+    fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+        Session::detach_failed_slots(self, slots)
+    }
+    fn detach_ended_pid_slots(
+        &mut self,
+        slots: &[plan::Slot],
+        owner: &ProcessView,
+        ended: &crate::attach::EndedPidRetirement,
+    ) -> Result<DetachOutcome> {
+        Session::detach_ended_pid_slots(self, slots, owner, ended)
+    }
+
+    fn has_dynamic_loader(
+        &self,
+        context: LoaderContextId,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    ) -> bool {
+        Session::has_dynamic_link(self, context, "dl_debug_state", object, file_offset, cookie)
     }
 
     fn has_dynamic_export(
@@ -2375,7 +3484,10 @@ impl EngineSession for Session {
     }
 }
 
-#[derive(Clone)]
+/// An incomplete terminal pull owns its exact off-ring prefix: move-only, so
+/// the prefix has exactly one owner (this error or the batch it moves
+/// into). A work-quantum stop, a shared-storage stop and a transport
+/// failure are three distinct meanings; none is ever an empty observation.
 pub(crate) struct IncompleteTerminalDrain {
     pub(crate) records: Vec<DiscoveryRecord>,
     pub(crate) malformed: u64,
@@ -2383,6 +3495,14 @@ pub(crate) struct IncompleteTerminalDrain {
     /// The drain stopped at its work quantum, not on a failure: the prefix is
     /// exact and the rest is still queued on the ring for the next drain.
     pub(crate) backlog: bool,
+    /// The drain stopped at the shared 4,096-item allowance with the queue
+    /// not observed empty: the prefix is exact, the rest stays unread, and
+    /// the operation retries only after owned items settle. Never complete.
+    pub(crate) capacity_blocked: bool,
+    /// Prefix records already moved into the terminal batch when this signal
+    /// was rebuilt after the move. `records` is empty then; the count keeps
+    /// the retry diagnostic exact without a second owned copy.
+    moved_to_batch: usize,
     cause: String,
 }
 
@@ -2398,17 +3518,37 @@ impl IncompleteTerminalDrain {
             malformed,
             unvalidated_records,
             backlog: false,
+            capacity_blocked: false,
+            moved_to_batch: 0,
             cause: cause.to_string(),
         }
     }
 
-    fn backlog(records: Vec<DiscoveryRecord>, malformed: u64) -> Self {
+    pub(crate) fn backlog(records: Vec<DiscoveryRecord>, malformed: u64) -> Self {
         Self {
             records,
             malformed,
             unvalidated_records: 0,
             backlog: true,
+            capacity_blocked: false,
+            moved_to_batch: 0,
             cause: DISCOVERY_DRAIN_BACKLOG_REASON.into(),
+        }
+    }
+
+    pub(crate) fn capacity_blocked(
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        unvalidated_records: u64,
+    ) -> Self {
+        Self {
+            records,
+            malformed,
+            unvalidated_records,
+            backlog: false,
+            capacity_blocked: true,
+            moved_to_batch: 0,
+            cause: DISCOVERY_CAPACITY_BLOCKED_REASON.into(),
         }
     }
 }
@@ -2421,6 +3561,8 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
             .field("malformed", &self.malformed)
             .field("unvalidated_records", &self.unvalidated_records)
             .field("backlog", &self.backlog)
+            .field("capacity_blocked", &self.capacity_blocked)
+            .field("moved_to_batch", &self.moved_to_batch)
             .field("cause", &self.cause)
             .finish()
     }
@@ -2428,12 +3570,13 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
 
 impl std::fmt::Display for IncompleteTerminalDrain {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let retained = self.records.len().saturating_add(self.moved_to_batch);
         write!(
             formatter,
             "{}; {} terminal record{} retained for retry",
             self.cause,
-            self.records.len(),
-            if self.records.len() == 1 { "" } else { "s" },
+            retained,
+            if retained == 1 { "" } else { "s" },
         )
     }
 }
@@ -2456,6 +3599,17 @@ impl RetirementCause {
             (ExecRefresh, ExecRefresh) => ExecRefresh,
         }
     }
+}
+
+/// One scripted pin-probe answer for `pin_probe_script`, consumed in order
+/// by the next probe of the same kind. A probe that meets an answer of the
+/// other kind panics: the script no longer matches the code's observation
+/// sequence, which is a test bug, never a fallback to the live pin.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum PinProbeAnswer {
+    Exited(Result<bool, String>),
+    State(Option<Result<OriginalGenerationState, String>>),
 }
 
 pub(crate) struct DeferredDiscoveryItem {
@@ -2483,11 +3637,110 @@ impl std::fmt::Display for DeferredDiscoveryItem {
 
 impl std::error::Error for DeferredDiscoveryItem {}
 
+/// A nested collector pulled fresh session records while a pressure service
+/// pass owned the dispatch order. The pulled prefix is stashed behind the
+/// parked records by the service pass itself; this error only tells the
+/// nested caller its operation cannot complete in this episode. It is never
+/// empty, complete, backlog or failure evidence.
+#[derive(Debug)]
+struct PressureOrderingBlocked;
+
+impl std::fmt::Display for PressureOrderingBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "a nested collection would dispatch fresh records ahead of parked discovery records",
+        )
+    }
+}
+
+impl std::error::Error for PressureOrderingBlocked {}
+
+/// A dequeue refused for shared-storage capacity: the pull stopped at the
+/// allowance with the queue not observed empty. Collectors map it to a
+/// capacity-blocked drain that retains its exact prefix; it is never
+/// empty, complete, backlog or failure evidence.
+#[derive(Debug)]
+pub(crate) struct DiscoveryCapacityBlocked;
+
+impl std::fmt::Display for DiscoveryCapacityBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the live discovery pull stopped at the shared storage allowance with records still unread",
+        )
+    }
+}
+
+impl std::error::Error for DiscoveryCapacityBlocked {}
+
+/// The single queued request a pressure service pass may complete: its pid
+/// and the snapshot serial the pass revalidates before completing. A
+/// renewed serial keeps its newer work; the pass never completes a serial
+/// it did not select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureSelection {
+    pid: u32,
+    serial: u64,
+}
+
+/// Identifies a parked pressure head across service opportunities, so one
+/// bounded rotation belongs to exactly one held head. A new head starts a
+/// new episode; the episode is discarded when the head settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureHeadKey {
+    pid_tgid: u64,
+    kind: u8,
+    case_id: u8,
+    hook_ts_ns: u64,
+}
+
+/// One held head's service episode: the request snapshot taken when the
+/// head parked (at most 256 entries, pid order) and the entries one
+/// bounded rotation already ruled out. Entries are ruled out when their
+/// selected transaction frees no slot — failed, deferred or absent — so
+/// no entry is retried within the episode and rotation ends after at most
+/// one pass over the snapshot with an honest head refusal.
+#[derive(Debug, Clone)]
+struct PressureEpisode {
+    head: PressureHeadKey,
+    snapshot: BTreeMap<u32, (u64, Option<ProcessViewId>)>,
+    ruled_out: BTreeSet<u32>,
+}
+
+/// What a pressure service pass must leave untouched. `pids` names every
+/// pid an undispatched owned record requires; `block_all` shields every
+/// retained context when some owned record's ownership cannot be narrowed
+/// to a pid at all.
+#[derive(Debug, Clone, Default)]
+struct PressureProtection {
+    pids: BTreeSet<u32>,
+    block_all: bool,
+}
+
+/// What one selected-request service transaction did: whether anything
+/// changed, and whether it ran a real attempt (a scan, an arm, an
+/// admission or a completion with a working clock). A quantum/clock
+/// deferral changes nothing and attempts nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureServiceOutcome {
+    changed: bool,
+    attempted: bool,
+}
+
 struct ManifestInput {
     path: PathBuf,
     manifest: Manifest,
     pins: PinnedObjects,
     stale: Vec<StaleManifestObject>,
+}
+
+/// The capture's `--prearm-module` pin call (packet 6.13, R2-D1-1/2/3):
+/// pinned once at startup, all-or-nothing, and retained for the capture's
+/// lifetime. One input (one pin call over every path, so the shared
+/// accounting holds), resolved fresh against the current pin set before
+/// each plan build.
+struct PrearmInput {
+    pins: PinnedObjects,
+    inputs: Vec<PrearmPinnedInput>,
 }
 
 struct LiveCandidate {
@@ -2503,6 +3756,63 @@ struct LiveCandidate {
     selection_admission: Option<PendingSelectionAdmission>,
     manifest_selection_admissions: Vec<ManifestSelectionAdmission>,
     manifest_inventory_slots: BTreeMap<plan::AttachKey, plan::Slot>,
+    loader_plan_proof: Option<LoaderPlanProof>,
+    exec_preservations: Vec<PreparedPreservation>,
+    exec_completions: Vec<PreparedCompletedRearm>,
+    /// Whether a full rebuild produced this candidate. Committing one
+    /// re-establishes rebuild stability; cached, hand-built and post-build
+    /// mutated candidates do not.
+    built_by_full_rebuild: bool,
+}
+
+impl LiveCandidate {
+    fn has_exec_receipts(&self) -> bool {
+        !self.exec_preservations.is_empty() || !self.exec_completions.is_empty()
+    }
+}
+
+struct LoaderPlanCache {
+    revision: u64,
+    broad_admit: bool,
+    counter_hint: bool,
+    plan: plan::AttachPlan,
+}
+
+/// One Engine-minted exec rearm: a single refresh request's matched owner
+/// whose rescan re-accepted the same static targets, lowered into the
+/// existing detach/replace transaction because PID-bound links may be dead
+/// while still recorded as attached. Global scopes carry no forced slots;
+/// their marker settles with the accepted context/ordinary-delta refresh.
+/// Minted only inside `Engine` from one selected request plus actual
+/// custody/scope/target preparation; consumed
+/// by the candidate path. No public scalar constructor, `Clone`, `Default`,
+/// serialized form, or authority booleans.
+struct PreparedExecRearm {
+    view: ProcessViewId,
+    serial: u64,
+    slots: Vec<plan::Slot>,
+    preservation: Option<crate::attach::PreservationReceipt>,
+    completed: Option<crate::attach::CompletedRearmReceipt>,
+}
+
+struct PreparedPreservation {
+    view: ProcessViewId,
+    serial: u64,
+    receipt: crate::attach::PreservationReceipt,
+}
+
+struct PreparedCompletedRearm {
+    view: ProcessViewId,
+    serial: u64,
+    receipt: crate::attach::CompletedRearmReceipt,
+}
+
+/// Transient baseline for one loader transaction, never a second retained
+/// history cache. Only stationary accepted publication may seed/carry a plan.
+struct LoaderPlanProof {
+    revision: u64,
+    published_plan: plan::AttachPlan,
+    discovery: render::DiscoveryEvidence,
 }
 
 struct StartPublicationSnapshot {
@@ -2528,6 +3838,9 @@ enum ApplyDisposition {
     /// and every retry intent the candidate would have consumed is retained.
     #[default]
     Refused,
+    /// The original static ownership is retiring on the Session worker. Only
+    /// its historical inactive prefix is published; all retry intent survives.
+    Deferred,
     /// Links were mutated and the Engine kept a cleaned, conservatively retired
     /// state. It consumed its retry intent but owns no positive follow-up.
     ConservativeRetirement,
@@ -2535,6 +3848,14 @@ enum ApplyDisposition {
     /// authorize positive provider/history facts, pause completeness, dynamic
     /// export work, and loader follow-up.
     Accepted,
+}
+
+fn candidate_publication_disposition(retired: bool, publication: &Result<()>) -> ApplyDisposition {
+    if retired || publication.is_err() {
+        ApplyDisposition::ConservativeRetirement
+    } else {
+        ApplyDisposition::Accepted
+    }
 }
 
 #[derive(Default)]
@@ -2560,6 +3881,793 @@ struct ApplyOutcome {
 pub(crate) struct DiscoveryBatchOutcome {
     pub(crate) changed: bool,
     pub(crate) required_complete: bool,
+}
+
+/// Outcome of one between-frames backlog opportunity: whether dispatch
+/// changed engine state (`changed`, the same resync signal a frame's batch
+/// outcome carries), whether the pass moved work forward at all
+/// (`progressed`: fresh acquisition, retained-queue shrinkage through
+/// dispatch, a selected pressure attempt, or a state change), and whether
+/// more backlog remains after it (`pending`). The run loop sleeps nothing
+/// only when work remains *and* the pass progressed; a no-progress
+/// pending outcome returns to the normal readiness wait instead of
+/// hot-looping a stuck clock/capacity condition. A parked rotation reads
+/// back through `pending`, never as a separate loop signal. Pure queue
+/// cycling — a take or pull shed back whole — is not progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BacklogOutcome {
+    pub(crate) changed: bool,
+    pub(crate) progressed: bool,
+    pub(crate) pending: bool,
+}
+
+/// One graph credit's leaf budget (system scale): a cursor phase spends up
+/// to this many leaf units per credit. Native calls stay `work = 1`.
+pub(crate) const GRAPH_STRIDE: usize = 64;
+
+/// How long a graph tolerates a no-witness native wait that observes no
+/// release before it takes the finite incomplete stop (§1.9): stay-`Pending`
+/// native polls and the owed ticket cancel share this one deadline. A
+/// wedged worker never releases, while a healthy retirement always closes
+/// within seconds. Poll counts cannot bound a healthy drain (a tight driver
+/// spins thousands of polls while the worker closes), and no production
+/// constant bounds retirement-close time, so this borrows the inventory
+/// preparation window: a bounded phase that cannot complete in 30 s fails
+/// closed rather than hanging the stop. The trip outcome is the existing
+/// disclosed incomplete stop, never a silent one.
+const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wall-time bound on the expected-target-exit wait: after the named
+/// target's exit is proven and the latch arms
+/// (`arm_expected_target_exit`), the capture ends when pending retirement
+/// cleanup drains — but a cleanup that stays queued (a conservative
+/// candidate that never applies, loader ids that never drain) must not
+/// hold a `profile --pid` capture open until Ctrl-C. When the armed wait
+/// makes no drain progress for this long, the latch trips with a named
+/// PARTIAL reason and keeps the calls collected so far. Mirrors
+/// `JOINT_FINISH_NO_PROGRESS_TIMEOUT`: the same 6 s value, kept equal so
+/// every terminal no-progress wait in the stop path ends on the one
+/// established wedge horizon instead of inventing a second magic number.
+/// Engine-local because the joint constant lives behind private inventory
+/// modules this file cannot name.
+const EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(6);
+
+/// Blocking-set fingerprint behind the expected-target-exit no-progress
+/// clock: one entry per all-clear conjunct in
+/// `finalize_expected_target_exit`. The stored snapshot is a per-field
+/// low-water mark kept since the last clock reset: any entry dropping
+/// below its mark is drain progress and restarts the clock with the marks
+/// set to the current snapshot. An out-and-back cycle that never drops
+/// below its marks is a stall and trips. The three progress signals are:
+/// a retirement settled (`views`, `retirement_intents` or
+/// `pending_retirements` shrank, or `ended_pid_retirement` cleared); a
+/// loader id cleared (`loader_registry.ids_for_view` shrank); a parked
+/// record finalized (`pending_rejected_keys` or
+/// `pending_discovery_records` shrank, or
+/// `terminal_journal`/`terminal_batch` cleared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedTargetExitBlocked {
+    views: usize,
+    intents: usize,
+    retirements: usize,
+    ended: bool,
+    rejected: usize,
+    loader_ids: usize,
+    journal: bool,
+    batch: bool,
+    records: usize,
+}
+
+impl ExpectedTargetExitBlocked {
+    /// The empty blocking set: every all-clear conjunct clear. The
+    /// all-clear compares the snapshot against this, so the two lists
+    /// cannot drift apart.
+    const CLEAR: Self = Self {
+        views: 0,
+        intents: 0,
+        retirements: 0,
+        ended: false,
+        rejected: 0,
+        loader_ids: 0,
+        journal: false,
+        batch: false,
+        records: 0,
+    };
+
+    /// True when any blocking entry dropped below its low-water mark in
+    /// `previous`: the drain moved, even if another entry grew (newly
+    /// queued work never erases observed progress).
+    fn drained_since(&self, previous: &Self) -> bool {
+        self.views < previous.views
+            || self.intents < previous.intents
+            || self.retirements < previous.retirements
+            || (previous.ended && !self.ended)
+            || self.rejected < previous.rejected
+            || self.loader_ids < previous.loader_ids
+            || (previous.journal && !self.journal)
+            || (previous.batch && !self.batch)
+            || self.records < previous.records
+    }
+}
+
+/// Fixed accounting limit for the Engine's dedicated collected-graph pool.
+/// Measured system-scale peak is 211,743,432 bytes (~202 MiB), which sits
+/// in the 192–288 MiB band and therefore selects 384 MiB (recorded with
+/// the T4c-2 sizing numbers).
+const COLLECTED_GRAPH_POOL_BYTES: usize = 384 * 1024 * 1024;
+
+/// Fixed accounting limit for the Engine's dedicated counter pool. It funds
+/// one capture's terminal hold, keepalive, stages and reads under the same
+/// envelope the growth cells prove at 512 MiB; the sizing test pins the
+/// terminal, envelope and read legs at the host CPU count.
+pub(crate) const COUNTER_POOL_BYTES: usize = 512 * 1024 * 1024;
+
+/// Shared floor for synthetic test PIDs: above the 64-bit PID_MAX_LIMIT
+/// (4,194,304), so no real process ID can ever collide with the fake
+/// range no matter where the host PID allocator sits.
+#[cfg(test)]
+pub(crate) const FAKE_PID_FLOOR: u32 = 5_000_000;
+
+/// Lap tracker for pending leader-exit assessments at Q (R-26 N1/OD-12).
+/// `dirty` when a record queued a new assessment mid-lap, `at_q` while every
+/// call of the lap observed transport at Q, `clean` counting consecutive
+/// clean passes. A write-off needs two.
+#[derive(Debug, Default)]
+struct AssessmentLap {
+    dirty: bool,
+    at_q: bool,
+    clean: u8,
+}
+
+/// Terminal-graph phases (§1.6). T4 owns Intake and the I1 error rows of the
+/// native phases; Freeze..Plan is T4a's, Handoff..Done is T4b's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphPhase {
+    Intake,
+    Freeze,
+    Selection,
+    Pins,
+    RawCopy,
+    Rebind,
+    Plan,
+    Facts,
+    Handoff,
+    RemovedCopy,
+    NativePrepare,
+    NativeBegin,
+    NativePoll,
+    Install,
+    Consume,
+    Reclaim,
+    Done,
+}
+
+/// Terminal-graph verdicts (§1.9). `Closed` is set by T4b's native flow.
+#[allow(dead_code)] // Closed is consumed by T4b.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Closed,
+    RefusedUntouched,
+    RefusedRetained,
+}
+
+/// What one graph credit did. Returned by value: the step never fails (§1.9).
+#[derive(Debug, Default)]
+struct GraphService {
+    changed: bool,
+    progressed: bool,
+    named_generation_lost: bool,
+}
+
+/// Installed backing of one completed graph (T4b Install step 4).
+#[allow(dead_code)] // Consumed by T4b.
+struct GraphBacking {
+    pins: InstalledPinsBacking,
+    modules: InstalledModulesBacking,
+    plan: plan::InstalledPlanBacking,
+    storage: Option<ResourceLease>,
+    /// Leases paying for the Facts maps Install made live (claims,
+    /// tables, corroboration, fallbacks, skips). Charged while this
+    /// backing is canonical; released when the retired handoff reclaims.
+    facts: Vec<ResourceLease>,
+}
+
+/// Raw scanned-module copy cursor (§1.6): exact-capacity clone of one
+/// `ScannedModule` per stepped pass. Every `Vec`/`String` is built with
+/// `with_capacity(source.len())`; each step clones one element (export,
+/// interface, entry, skip) or up to 4096 null entries. The cursor resets
+/// between modules.
+struct ScannedModuleCopy {
+    table: usize,
+    item: usize,
+    stage: u8,
+}
+
+impl ScannedModuleCopy {
+    fn new() -> Self {
+        Self {
+            table: 0,
+            item: 0,
+            stage: 0,
+        }
+    }
+
+    /// Copies one leaf unit of `source` into `rows`, appending the
+    /// destination shell row on the first step. Returns true when the
+    /// module is fully copied, resetting for the next module.
+    fn step(&mut self, source: &ScannedModule, rows: &mut Vec<ScannedModule>) -> bool {
+        match self.stage {
+            // Base shell: scalars plus exact-capacity vectors.
+            0 => {
+                rows.push(ScannedModule {
+                    module_hint: source.module_hint.clone(),
+                    mapped_identity: source.mapped_identity,
+                    view: source.view,
+                    mount_namespace: source.mount_namespace,
+                    key: source.key,
+                    double_loaded: source.double_loaded,
+                    same_file_loads: source.same_file_loads,
+                    path: exact_owned_string(&source.path),
+                    decoder_abi: source.decoder_abi,
+                    exports: Vec::with_capacity(source.exports.len()),
+                    tables: Vec::with_capacity(source.tables.len()),
+                    interfaces: Vec::with_capacity(source.interfaces.len()),
+                });
+                self.item = 0;
+                self.stage = 1;
+                false
+            }
+            // Exports, one per step.
+            1 => {
+                if let Some(text) = source.exports.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .exports
+                        .push(exact_owned_string(text));
+                    self.item += 1;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 2;
+                    false
+                }
+            }
+            // Interfaces, one per step.
+            2 => {
+                if let Some(face) = source.interfaces.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .interfaces
+                        .push(ScannedInterface {
+                            index: face.index,
+                            name_class: face.name_class,
+                            name_lossy: face
+                                .name_lossy
+                                .as_ref()
+                                .map(|name| exact_owned_string(name)),
+                            name_private: face.name_private.as_ref().map(|bytes| {
+                                let mut owned = Vec::with_capacity(bytes.len());
+                                owned.extend_from_slice(bytes);
+                                owned
+                            }),
+                            flags: face.flags,
+                            table: face.table,
+                        });
+                    self.item += 1;
+                    false
+                } else {
+                    self.table = 0;
+                    self.stage = 3;
+                    false
+                }
+            }
+            // Table shell.
+            3 => {
+                if let Some(table) = source.tables.get(self.table) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .tables
+                        .push(ScannedTable {
+                            version: table.version,
+                            walk: table.walk,
+                            entries: Vec::with_capacity(table.entries.len()),
+                            null_entries: Vec::with_capacity(table.null_entries.len()),
+                            unpinned: Vec::with_capacity(table.unpinned.len()),
+                            address: table.address,
+                            file_offset: table.file_offset,
+                            live_return: table.live_return,
+                            manifest_supported: table.manifest_supported,
+                            extension_impossible: table.extension_impossible,
+                        });
+                    self.item = 0;
+                    self.stage = 4;
+                    false
+                } else {
+                    self.table = 0;
+                    self.item = 0;
+                    self.stage = 0;
+                    true
+                }
+            }
+            // Entries, one per step.
+            4 => {
+                let table = source
+                    .tables
+                    .get(self.table)
+                    .expect("the table shell is pushed at stage 3");
+                if let Some(entry) = table.entries.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .tables
+                        .last_mut()
+                        .expect("the table shell is pushed at stage 3")
+                        .entries
+                        .push(ScannedEntry {
+                            name: entry.name,
+                            object: entry.object,
+                            object_path: exact_owned_string(&entry.object_path),
+                            file_offset: entry.file_offset,
+                        });
+                    self.item += 1;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 5;
+                    false
+                }
+            }
+            // Null entries, up to 4096 per step.
+            5 => {
+                let table = source
+                    .tables
+                    .get(self.table)
+                    .expect("the table shell is pushed at stage 3");
+                let end = (self.item + 4096).min(table.null_entries.len());
+                rows.last_mut()
+                    .expect("the shell row is pushed at stage 0")
+                    .tables
+                    .last_mut()
+                    .expect("the table shell is pushed at stage 3")
+                    .null_entries
+                    .extend_from_slice(&table.null_entries[self.item..end]);
+                if end < table.null_entries.len() {
+                    self.item = end;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 6;
+                    false
+                }
+            }
+            // Unpinned skips, one per step.
+            _ => {
+                let table = source
+                    .tables
+                    .get(self.table)
+                    .expect("the table shell is pushed at stage 3");
+                if let Some(skip) = table.unpinned.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .tables
+                        .last_mut()
+                        .expect("the table shell is pushed at stage 3")
+                        .unpinned
+                        .push(Skipped {
+                            subject: exact_owned_string(&skip.subject),
+                            reason: exact_owned_string(&skip.reason),
+                        });
+                    self.item += 1;
+                    false
+                } else {
+                    self.table += 1;
+                    self.stage = 3;
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Exact-capacity string clone: capacity always equals length.
+fn exact_owned_string(source: &str) -> String {
+    let mut owned = String::with_capacity(source.len());
+    owned.push_str(source);
+    owned
+}
+
+/// Removed-slot copy cursor (§1.6): exact-capacity clone of one plan
+/// [`Slot`](plan::Slot) per stepped pass. Scalars, the object path and
+/// both id vectors are copied first (vectors sized exact, module ids
+/// extended whole — `Copy` scalars the measure charges as one array);
+/// then one name per step. The cursor resets between slots.
+struct SlotCopy {
+    item: usize,
+    stage: u8,
+}
+
+impl SlotCopy {
+    fn new() -> Self {
+        Self { item: 0, stage: 0 }
+    }
+
+    /// Copies one leaf unit of `source` into `rows`, appending the
+    /// destination shell row on the first step. Returns true when the
+    /// slot is fully copied, resetting for the next slot.
+    fn step(&mut self, source: &plan::Slot, rows: &mut Vec<plan::Slot>) -> bool {
+        match self.stage {
+            // Shell: scalars plus exact vectors, module ids whole.
+            0 => {
+                let mut module_ids = Vec::with_capacity(source.module_ids.len());
+                module_ids.extend_from_slice(&source.module_ids);
+                rows.push(plan::Slot {
+                    index: source.index,
+                    descriptor_index: source.descriptor_index,
+                    object: source.object,
+                    object_path: exact_owned_string(&source.object_path),
+                    file_offset: source.file_offset,
+                    names: Vec::with_capacity(source.names.len()),
+                    aliased: source.aliased,
+                    semantics: source.semantics,
+                    semantic_authorized: source.semantic_authorized,
+                    semantic_ambiguous: source.semantic_ambiguous,
+                    fork_safe: source.fork_safe,
+                    module_ids,
+                });
+                self.item = 0;
+                self.stage = 1;
+                false
+            }
+            // Names, one per step.
+            _ => {
+                if let Some(name) = source.names.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .names
+                        .push(exact_owned_string(name));
+                    self.item += 1;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 0;
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// Generous per-entry B-tree node share for Facts map/set buffers, in
+/// bytes on top of the entry's own size. It covers the amortized node
+/// header plus allocation padding; actual nodes hold about eleven
+/// entries each.
+const FACTS_TREE_ENTRY_OVERHEAD: usize = 128;
+
+/// Generous byte bound for one lowering refusal reason. Reasons are
+/// produced at lowering time, so only their count is measured; every
+/// `add_selection_table` refusal in plan.rs is well under this.
+const FACTS_REFUSAL_REASON_BOUND: usize = 512;
+
+/// One `live_candidate_with_pending` row per step (§1.8). Each row
+/// writes only graph buffers, preallocated from a measured bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactsStep {
+    Overlay,
+    BindingSkips,
+    SelectionLowering,
+    ObjectSkips,
+    Corroboration,
+    Fallbacks,
+    Claims,
+    Tables,
+    Done,
+}
+
+/// Corroboration facts staged across the Facts phase (§1.8). Every
+/// buffer is measured, reserved and filled strided; `storage` holds one
+/// lease per reservation. Index buffers (`module_by_object`,
+/// `module_objects`, `live_views`, `module_provider_objects`,
+/// `slot_index`) keep per-entry work logarithmic.
+struct CollectedFacts {
+    step: FactsStep,
+    substep: u8,
+    index: usize,
+    measured: bool,
+    measure_bytes: usize,
+    skips: VecDeque<Skipped>,
+    table_skips: VecDeque<Skipped>,
+    plan_skipped: VecDeque<Skipped>,
+    corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
+    fallbacks: Vec<ManifestFallback>,
+    invalidated_modules: BTreeSet<plan::ModuleId>,
+    invalidated_fallbacks: BTreeSet<(u32, u32)>,
+    claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    drop_tables: BTreeSet<SelectionTableKey>,
+    active_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    drop_claims: Vec<SelectionClaimKey>,
+    drop_cursor: Option<SelectionClaimKey>,
+    claims_cursor: Option<SelectionClaimKey>,
+    tables_cursor: Option<SelectionTableKey>,
+    dedup: BTreeSet<(String, String)>,
+    plan_dedup: BTreeSet<(String, String)>,
+    module_by_object: BTreeMap<PinnedObjectId, (usize, u8)>,
+    module_objects: BTreeSet<PinnedObjectId>,
+    live_views: BTreeSet<ProcessViewId>,
+    module_provider_objects: BTreeMap<(ProcessViewId, PinnedTimingKey), PinnedObjectId>,
+    slot_index: BTreeMap<plan::AttachKey, usize>,
+    active_keys: BTreeSet<plan::AttachKey>,
+    scratch: Option<plan::AttachPlan>,
+    scratch_manifest: usize,
+    scratch_table: usize,
+    scratch_storage: Option<ResourceLease>,
+    storage: Vec<ResourceLease>,
+    /// Leases paying for buffers Install makes live (claims, tables,
+    /// corroboration, fallbacks, skips). They move into the installed
+    /// backing at Install step 4; `storage` keeps the graph-private
+    /// index leases until their Reclaim step drains them.
+    live_storage: Vec<ResourceLease>,
+}
+
+impl CollectedFacts {
+    fn new() -> Self {
+        Self {
+            step: FactsStep::Overlay,
+            substep: 0,
+            index: 0,
+            measured: false,
+            measure_bytes: 0,
+            skips: VecDeque::new(),
+            table_skips: VecDeque::new(),
+            plan_skipped: VecDeque::new(),
+            corroboration: Vec::new(),
+            fallbacks: Vec::new(),
+            invalidated_modules: BTreeSet::new(),
+            invalidated_fallbacks: BTreeSet::new(),
+            claims: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            drop_tables: BTreeSet::new(),
+            active_tables: BTreeMap::new(),
+            drop_claims: Vec::new(),
+            drop_cursor: None,
+            claims_cursor: None,
+            tables_cursor: None,
+            dedup: BTreeSet::new(),
+            plan_dedup: BTreeSet::new(),
+            module_by_object: BTreeMap::new(),
+            module_objects: BTreeSet::new(),
+            live_views: BTreeSet::new(),
+            module_provider_objects: BTreeMap::new(),
+            slot_index: BTreeMap::new(),
+            active_keys: BTreeSet::new(),
+            scratch: None,
+            scratch_manifest: 0,
+            scratch_table: 0,
+            scratch_storage: None,
+            storage: Vec::new(),
+            live_storage: Vec::new(),
+        }
+    }
+
+    /// Advance to the next row with a fresh measure/fill cursor.
+    fn advance(&mut self, step: FactsStep) {
+        self.step = step;
+        self.substep = 0;
+        self.index = 0;
+        self.measured = false;
+        self.measure_bytes = 0;
+        self.drop_cursor = None;
+        self.claims_cursor = None;
+        self.tables_cursor = None;
+    }
+}
+
+/// Byte bound for one skip record with already-measured strings.
+fn facts_skip_bound(subject_len: usize, reason_len: usize) -> Option<usize> {
+    std::mem::size_of::<Skipped>()
+        .checked_add(subject_len)?
+        .checked_add(reason_len)?
+        .checked_add(OWNED_ALLOCATION_PADDING)
+}
+
+/// Byte bound for one corroboration entry over `objects` object ids.
+fn facts_corroboration_entry_bound(objects: usize) -> Option<usize> {
+    let set = objects.checked_mul(
+        std::mem::size_of::<PinnedObjectId>().checked_add(FACTS_TREE_ENTRY_OVERHEAD * 2)?,
+    )?;
+    std::mem::size_of::<(BTreeSet<PinnedObjectId>, &'static str)>()
+        .checked_add(OWNED_ALLOCATION_PADDING)?
+        .checked_add(set)
+}
+
+/// Byte bound for one fallback entry with measured proof parts.
+fn facts_fallback_entry_bound(tables: usize, targets: usize) -> Option<usize> {
+    let tables = tables.checked_mul(std::mem::size_of::<BoundTableProof>())?;
+    let targets = targets.checked_mul(
+        std::mem::size_of::<RequiredTarget>()
+            .checked_add(std::mem::size_of::<usize>())?
+            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
+    )?;
+    std::mem::size_of::<ManifestFallback>()
+        .checked_add(OWNED_ALLOCATION_PADDING)?
+        .checked_add(tables)?
+        .checked_add(targets)
+}
+
+/// Fixed allowance for one timing key's heap strings. The key's sha
+/// field is private to identity.rs; a hex sha is 64 bytes, so 256 is a
+/// generous bound, documented here instead of measured.
+const FACTS_TIMING_KEY_STRINGS: usize = 256;
+
+/// Byte bound for one claim entry with a measured path.
+fn facts_claim_entry_bound(path_len: usize) -> Option<usize> {
+    std::mem::size_of::<SelectionClaimKey>()
+        .checked_add(std::mem::size_of::<SelectionClaim>())?
+        .checked_add(FACTS_TIMING_KEY_STRINGS)?
+        .checked_add(path_len)?
+        .checked_add(FACTS_TREE_ENTRY_OVERHEAD)
+}
+
+/// Byte bound for one table entry with measured target strings.
+fn facts_table_entry_bound(targets_bytes: usize) -> Option<usize> {
+    std::mem::size_of::<SelectionTableKey>()
+        .checked_add(std::mem::size_of::<SelectionTableFact>())?
+        .checked_add(FACTS_TIMING_KEY_STRINGS)?
+        .checked_add(targets_bytes)?
+        .checked_add(FACTS_TREE_ENTRY_OVERHEAD)
+}
+
+/// View/batch retirement cursor for Consume (§1.7). `row` stays reserved
+/// (the retire loop repeats across credits until its row completes).
+struct ConsumeCursor {
+    step: u8,
+    after_view: Option<ProcessViewId>,
+    after_binding: Option<u64>,
+    after_key: Option<ObjectKey>,
+    #[allow(dead_code)] // Reserved: the retire loop repeats across credits.
+    row: u8,
+    pending_views: PendingViewRetirements,
+}
+
+impl ConsumeCursor {
+    fn new() -> Self {
+        Self {
+            step: 0,
+            after_view: None,
+            after_binding: None,
+            after_key: None,
+            row: 0,
+            pending_views: PendingViewRetirements::new(),
+        }
+    }
+}
+
+/// The bounded terminal graph over the Engine's retained originals (§1.6).
+/// T4 owns the skeleton, Intake and the I1 error rows of the native phases;
+/// the cursor bodies are T4a (Freeze..Plan), T4b (Handoff..Done) and T5.
+#[allow(dead_code)] // Cursor fields consumed by T4a/T4b.
+struct CollectedGraph {
+    phase: GraphPhase,
+    _storage: ResourceLease,
+    intake_after: Option<ProcessViewId>,
+    unproven: u32,
+    epoch: u64,
+    pins_revision: u64,
+    plan_slots: usize,
+    sel_count: (usize, usize),
+    sel_storage: Option<ResourceLease>,
+    sel_retired: BTreeSet<ProcessViewId>,
+    sel_rejected: BTreeSet<ObjectKey>,
+    sel_after_view: Option<ProcessViewId>,
+    sel_after_key: Option<ObjectKey>,
+    selection: Option<ConservativePinSelection>,
+    pins: PinnedConservativeCursor,
+    raw_index: usize,
+    raw_included: usize,
+    raw_measure: Option<ScannedInputMeasure>,
+    raw_copy: Option<ScannedModuleCopy>,
+    raw_rows: Vec<ScannedModule>,
+    raw_storage: Option<ResourceLease>,
+    raw: Option<RetainedScannedInputs>,
+    rebind: ScannedRebindCursor,
+    plan: plan::ConservativePlanCursor,
+    facts: CollectedFacts,
+    handoff: Option<Box<RetiredFileHandoff>>,
+    backing_storage: Option<ResourceLease>,
+    removed_index: usize,
+    removed_included: usize,
+    removed_measure: Option<RetainedInputMeasure>,
+    removed_copy: Option<SlotCopy>,
+    removed_rows: Vec<plan::Slot>,
+    removed_storage: Option<ResourceLease>,
+    removed: Option<RetainedRetirementInput>,
+    ticket: Option<CollectedRetirementTicket>,
+    mutated: bool,
+    native_poll_since: Option<std::time::Instant>,
+    native_cancel_since: Option<std::time::Instant>,
+    native_cancel_owed: bool,
+    deferral_done: bool,
+    partial_deferred: bool,
+    installed: bool,
+    install_step: u8,
+    install_index: usize,
+    install_invalidated: bool,
+    retired_backing: Option<Box<GraphBacking>>,
+    old_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    old_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    old_corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
+    old_fallbacks: Vec<ManifestFallback>,
+    consume: ConsumeCursor,
+    reclaim_step: u8,
+    reclaim_forgotten: bool,
+    verdict: Option<Verdict>,
+    first_error: Option<String>,
+    partial_noted: bool,
+    retained_error: Option<anyhow::Error>,
+}
+
+impl CollectedGraph {
+    fn new(storage: ResourceLease) -> Self {
+        Self {
+            phase: GraphPhase::Intake,
+            _storage: storage,
+            intake_after: None,
+            unproven: 0,
+            epoch: 0,
+            pins_revision: 0,
+            plan_slots: 0,
+            sel_count: (0, 0),
+            sel_storage: None,
+            sel_retired: BTreeSet::new(),
+            sel_rejected: BTreeSet::new(),
+            sel_after_view: None,
+            sel_after_key: None,
+            selection: None,
+            pins: PinnedConservativeCursor::new(),
+            raw_index: 0,
+            raw_included: 0,
+            raw_measure: None,
+            raw_copy: None,
+            raw_rows: Vec::new(),
+            raw_storage: None,
+            raw: None,
+            rebind: ScannedRebindCursor::new(),
+            plan: plan::ConservativePlanCursor::new(),
+            facts: CollectedFacts::new(),
+            handoff: None,
+            backing_storage: None,
+            removed_index: 0,
+            removed_included: 0,
+            removed_measure: None,
+            removed_copy: None,
+            removed_rows: Vec::new(),
+            removed_storage: None,
+            removed: None,
+            ticket: None,
+            mutated: false,
+            native_poll_since: None,
+            native_cancel_since: None,
+            native_cancel_owed: false,
+            deferral_done: false,
+            partial_deferred: false,
+            installed: false,
+            install_step: 0,
+            install_index: 0,
+            install_invalidated: false,
+            retired_backing: None,
+            old_claims: BTreeMap::new(),
+            old_tables: BTreeMap::new(),
+            old_corroboration: Vec::new(),
+            old_fallbacks: Vec::new(),
+            consume: ConsumeCursor::new(),
+            reclaim_step: 0,
+            reclaim_forgotten: false,
+            verdict: None,
+            first_error: None,
+            partial_noted: false,
+            retained_error: None,
+        }
+    }
 }
 
 type BatchStart =
@@ -2663,6 +4771,10 @@ impl ApplyOutcome {
         self.disposition == ApplyDisposition::Refused
     }
 
+    fn retains_intent(&self) -> bool {
+        self.refused() || self.disposition == ApplyDisposition::Deferred
+    }
+
     fn required_complete(&self) -> bool {
         self.accepted()
             && self.stale_views.is_empty()
@@ -2706,6 +4818,71 @@ impl CandidateAdmission {
     fn requires_conservative_apply(&self, mutation_started: bool) -> bool {
         mutation_started && self.refuses_candidate()
     }
+}
+
+#[derive(Clone, Copy)]
+enum InventoryDiagnosticPass {
+    First,
+    Final,
+}
+
+#[cfg(feature = "h6-reexec-diagnostic")]
+impl InventoryDiagnosticPass {
+    fn candidate_phase(self) -> DiagnosticPhase {
+        match self {
+            Self::First => DiagnosticPhase::CandidateFirst,
+            Self::Final => DiagnosticPhase::CandidateFinal,
+        }
+    }
+
+    fn admission_phase(self) -> DiagnosticPhase {
+        match self {
+            Self::First => DiagnosticPhase::AdmissionFirst,
+            Self::Final => DiagnosticPhase::AdmissionFinal,
+        }
+    }
+}
+
+fn inventory_candidate_observed<T>(
+    _session: &dyn EngineSession,
+    _pass: InventoryDiagnosticPass,
+    _counts: impl FnOnce() -> [Option<u64>; 4],
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    crate::attach::reexec_diagnostic::evaluate!(
+        _session,
+        _pass.candidate_phase(),
+        _counts(),
+        operation,
+        |result: &Result<T>| {
+            if result.is_ok() {
+                DiagnosticOutcome::Ok
+            } else {
+                DiagnosticOutcome::Error
+            }
+        }
+    )
+}
+
+fn inventory_admission_observed(
+    _session: &dyn EngineSession,
+    _pass: InventoryDiagnosticPass,
+    _counts: impl FnOnce() -> [Option<u64>; 4],
+    operation: impl FnOnce() -> CandidateAdmission,
+) -> CandidateAdmission {
+    crate::attach::reexec_diagnostic::evaluate!(
+        _session,
+        _pass.admission_phase(),
+        _counts(),
+        operation,
+        |result: &CandidateAdmission| {
+            if result.refuses_candidate() {
+                DiagnosticOutcome::Refused
+            } else {
+                DiagnosticOutcome::Ok
+            }
+        }
+    )
 }
 
 #[derive(Clone)]
@@ -2795,7 +4972,12 @@ struct CollectedExportWork {
     required_seed_complete: bool,
 }
 
-#[derive(Clone)]
+/// One queued record envelope: move-only, so each record crosses dispatch
+/// through exactly one owned envelope. The payload (`DiscoveryRecord`, a
+/// frozen `Copy` ABI type) is still read by value for field checks, but a
+/// by-value read never creates a second dispatchable owner: only this
+/// envelope (or the terminal batch/error prefix it moves into) carries the
+/// record to dispatch or retention.
 struct QueuedDiscoveryRecord {
     record: DiscoveryRecord,
     terminal_owner: Option<LoaderContextId>,
@@ -2810,12 +4992,24 @@ pub(crate) struct TerminalAuthority {
 
 /// The only transfer that may carry a tombstoned loader's final exports.  It
 /// stays separate from ordinary pending records so a later generic drain
-/// cannot accidentally consume it.
-#[derive(Clone)]
+/// cannot accidentally consume it. Move-only: the batch owns its records,
+/// and journal/pause handoffs transfer that ownership instead of copying
+/// it. (`TerminalAuthority` keeps its `Clone`: it carries only the owner
+/// id and export identities, never records.)
 pub(crate) struct TerminalBatch {
     pub(crate) authority: TerminalAuthority,
     records: Vec<QueuedDiscoveryRecord>,
     complete: bool,
+    /// The ordinary dispatcher used to keep these accumulators on its stack.
+    /// A bounded Finish keeps them with the SAME batch until its last original
+    /// has run: a later EXEC can still explain an earlier loader mismatch.
+    dispatch: Option<TerminalDispatch>,
+}
+
+#[derive(Default)]
+struct TerminalDispatch {
+    exec_refresh_views: BTreeSet<ProcessViewId>,
+    deferred_mismatches: Vec<ProcessViewId>,
 }
 
 impl TerminalBatch {
@@ -2824,7 +5018,12 @@ impl TerminalBatch {
             authority,
             records: Vec::new(),
             complete: false,
+            dispatch: None,
         }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
     }
 
     pub(crate) fn extend(&mut self, records: impl IntoIterator<Item = DiscoveryRecord>) {
@@ -2846,6 +5045,17 @@ impl TerminalBatch {
     #[cfg(test)]
     pub(crate) fn complete(&self) -> bool {
         self.complete
+    }
+
+    #[cfg(test)]
+    /// Timing brackets of the batch records, in order, for handoff
+    /// tests that cannot name the private record vector.
+    #[cfg(test)]
+    pub(crate) fn record_hook_stamps_for_test(&self) -> Vec<u64> {
+        self.records
+            .iter()
+            .map(|queued| queued.record.hook_ts_ns)
+            .collect()
     }
 
     #[cfg(test)]
@@ -3327,7 +5537,7 @@ fn manifest_targets(
 ///
 /// After this pass every manifest key lowers to the intended capture-local pin ID;
 /// `attach.rs` resolves only that ID, with no key or path fallback.
-fn retarget_to_pins(
+pub(crate) fn retarget_to_pins(
     m: &mut Manifest,
     scanned: &[&ScannedModule],
     scan_pins: &PinnedObjects,
@@ -3597,10 +5807,14 @@ pub(crate) fn scope_label(scope: &Scope) -> String {
 }
 
 /// Reads, parses and schema-checks one `--manifest`.
-fn read_manifest_file(path: &Path) -> Result<Manifest> {
+pub(crate) fn read_manifest_file(path: &Path) -> Result<Manifest> {
     let text = read_manifest(path)
         .map_err(|error| anyhow!("reading manifest {}: {error}", path.display()))?;
-    let document: serde_json::Value = serde_json::from_str(&text)
+    parse_manifest_text(&text, path)
+}
+
+pub(crate) fn parse_manifest_text(text: &str, path: &Path) -> Result<Manifest> {
+    let document: serde_json::Value = serde_json::from_str(text)
         .with_context(|| format!("parsing manifest {}", path.display()))?;
     if document.get("schema").and_then(serde_json::Value::as_str) != Some(SCHEMA) {
         bail!(
@@ -3609,7 +5823,7 @@ fn read_manifest_file(path: &Path) -> Result<Manifest> {
             document.get("schema")
         );
     }
-    let manifest: Manifest = serde_json::from_str(&text)
+    let manifest: Manifest = serde_json::from_str(text)
         .with_context(|| format!("parsing manifest {}", path.display()))?;
     Ok(manifest)
 }
@@ -3817,8 +6031,13 @@ fn broad_fixed_pool_module(
         Some(relative) => relative,
         None => return,
     };
-    let rooted = PathBuf::from(format!("/proc/{}/root", view.pid())).join(relative);
-    let (file, key) = match open_view_object(view, &rooted, budget) {
+    let rooted = Path::new("/").join(relative);
+    let (file, key) = match open_view_rooted_object_cached(
+        view,
+        &rooted,
+        &mut crate::process::MountTableCache::default(),
+        budget,
+    ) {
         Ok(opened) => opened,
         Err(_) => return,
     };
@@ -4099,6 +6318,64 @@ pub(crate) fn select_deep_scan_candidates(
         .collect()
 }
 
+/// Pids in `sweep` that are kernel threads with no user address space, to
+/// be excluded before the deep-scan cap is applied: a successfully-read
+/// but empty maps snapshot (never an unavailable one) plus the
+/// `PF_KTHREAD` flag in `{proc_root}/<pid>/stat`. Callers count every
+/// excluded pid on the pass budget's kernel-thread note and select from
+/// the rest, so leftover slots reach user processes instead of threads
+/// that can never call a provider. Fail-closed: an unreadable or
+/// unparsable stat, a missing flag, a non-empty snapshot, or an
+/// unavailable pid all stay eligible. Selection reads a snapshot: a pid
+/// recycled between the sweep and the stat read is handled no worse than
+/// today's deep-scan classification of a changed generation.
+pub(crate) fn kernel_thread_exclusions(
+    sweep: &SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    proc_root: &Path,
+) -> BTreeSet<u32> {
+    let mut excluded = BTreeSet::new();
+    for (pid, entries) in sweep {
+        if !entries.is_empty() || unavailable.contains(pid) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"));
+        let is_kthread = stat.is_ok_and(|text| {
+            process::stat_flags_from_stat_text(&text)
+                .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
+        });
+        if is_kthread {
+            excluded.insert(*pid);
+        }
+    }
+    excluded
+}
+
+/// Deep-scan selection with kernel threads excluded first: threads with
+/// no user address space never consume cap slots. Every excluded pid is
+/// counted on the pass budget's kernel-thread note, and the rest select
+/// by provider rarity. The three selection call sites (capture,
+/// system inspect, cgroup inventory) share this; the exclusion predicate
+/// above stays separately pinned.
+pub(crate) fn select_excluding_kernel_threads(
+    sweep: &SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    proc_root: &Path,
+    cap: usize,
+    budget: &mut CaptureWorkBudget,
+) -> Vec<u32> {
+    let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
+    for _ in &excluded {
+        budget.note_kernel_thread_absence();
+    }
+    let eligible: SweepSnapshots = sweep
+        .iter()
+        .filter(|(pid, _)| !excluded.contains(pid))
+        .cloned()
+        .collect();
+    select_deep_scan_candidates(&eligible, cap)
+}
+
 /// Rotation's fairness-tiered variant of the selection above: identical
 /// grouping, global rarity census, and group order — but within each group
 /// the representative is the lowest never-evicted member (falling back to
@@ -4292,14 +6569,71 @@ impl MapsSweep {
 /// serial loop itself.
 pub(crate) fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
     let shards = sweep_shards::shard_count(pids.len(), sweep_shards::shard_threads());
-    sweep_process_maps_with(
+    let mut sweep = sweep_process_maps_with(
         pids,
         budget,
         shards,
         MapsReadLimits::LIVE,
         &|pid| std::fs::File::open(format!("/proc/{pid}/maps")),
         &crate::attach::monotonic_ns,
-    )
+    );
+    // Keep the sharded common path untouched. An empty leader read may be
+    // a Z boundary too. Every such row starts unknown before the serial,
+    // globally charged classification/proof; stop never leaves empty success.
+    let deadline = process::cold_filesystem_deadline(budget);
+    for (pid, snapshot) in &mut sweep.snapshots {
+        if matches!(snapshot, MapsSnapshot::Read(maps) if !maps.is_empty()) {
+            continue;
+        }
+        let initial = match std::mem::replace(snapshot, MapsSnapshot::Unavailable) {
+            MapsSnapshot::Read(maps) => Ok(maps),
+            MapsSnapshot::Unavailable => Err("initial process maps unavailable".into()),
+        };
+        if let Ok(maps) = complete_maps_snapshot(*pid, initial, budget, deadline) {
+            *snapshot = MapsSnapshot::Read(maps);
+        }
+    }
+    sweep
+}
+
+/// Shared initial/reconcile completion. Generic successful empty snapshots
+/// stay valid for a noncold leader, but a Z leader needs actual survivor maps.
+/// Stopped or unclassifiable rows remain unknown, without uncharged metadata.
+fn complete_maps_snapshot(
+    pid: u32,
+    initial: Result<Vec<MapEntry>, String>,
+    budget: &mut CaptureWorkBudget,
+    deadline: std::time::Instant,
+) -> Result<Vec<MapEntry>, String> {
+    if matches!(&initial, Ok(maps) if !maps.is_empty()) {
+        return initial;
+    }
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("cold maps snapshot stage deadline exhausted".into());
+    }
+    if !process::snapshot_leader_is_zombie(pid, budget, deadline)? {
+        return initial;
+    }
+    // No path below can recover the original empty snapshot on refusal.
+    let maps = read_cold_maps_snapshot(pid, budget, deadline)?;
+    if maps.is_empty() {
+        return Err("cold member maps remain unavailable or empty".into());
+    }
+    Ok(maps)
+}
+
+fn read_cold_maps_snapshot(
+    pid: u32,
+    budget: &mut CaptureWorkBudget,
+    deadline: std::time::Instant,
+) -> Result<Vec<MapEntry>, String> {
+    process::with_cold_snapshot_filesystem(pid, budget, deadline, |filesystem, budget| {
+        let maps = filesystem.open_maps().map_err(|error| error.to_string())?;
+        read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns)
+    })
 }
 
 /// [`sweep_process_maps`] with its shard count, read bounds, opener and
@@ -4347,9 +6681,43 @@ fn discover_plan(
 ) -> Result<Engine> {
     let mut discovered = Engine::empty();
     discovered.broad_admit = broad_admit_from_env();
+    discovered.counter_hint = a.metrics && a.counter_mode.is_none();
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
+    discovered.budget.set_excludes(a.exclude_modules.clone());
+    // P-C phase 2 (§6.2): start the pre-arm witness BEFORE the scope-start
+    // stamp, so its hooks precede every observation. No pre-arm modules
+    // or an unavailable startup leaves no witness: today's output.
+    let mut prearm_witness_live = if a.prearm_modules.is_empty() {
+        None
+    } else {
+        match crate::attach::prearm_witness::start(
+            &a.prearm_modules,
+            scope,
+            matches!(
+                crate::pidns::observer(),
+                crate::pidns::ObserverPidNs::Initial
+            ),
+        ) {
+            Ok(witness) => Some(witness),
+            Err(reason) => {
+                eprintln!("p11scope: pre-arm witness unavailable: {}", reason.class());
+                None
+            }
+        }
+    };
+    // The capture's scope start, before any observation: the outer bound of
+    // every unobserved window. (The `run` path overrides with its pre-spawn
+    // instant once it knows it.)
+    discovered
+        .prearm
+        .set_scope_start_ns(crate::attach::monotonic_ns());
+    // The witness records the stamp it precedes (condition 3).
+    if let Some(witness) = prearm_witness_live.as_mut() {
+        witness.scope_start_ns = discovered.prearm.scope_start_ns();
+    }
+    discovered.prearm_witness_live = prearm_witness_live;
     discovered.max_scan_pids = a
         .max_scan_pids
         .filter(|cap| *cap > 0)
@@ -4366,8 +6734,8 @@ fn discover_plan(
     // the identity, so the sweep (and its budget charge) is skipped there.
     let selected = if pids.len() > max_scan_pids {
         let sweep_start = crate::attach::monotonic_ns();
-        let (sweep, unavailable) =
-            sweep_process_maps(&pids, &mut discovered.budget).into_selection();
+        let (sweep, sweep_unavailable, unavailable) =
+            sweep_process_maps(&pids, &mut discovered.budget).into_selection_with_unavailable();
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,
             "sweep_process_maps",
@@ -4379,7 +6747,13 @@ fn discover_plan(
             discovered.base_counters.object_skips.push(skipped);
         }
         let select_start = crate::attach::monotonic_ns();
-        let selected = select_deep_scan_candidates(&sweep, max_scan_pids);
+        let selected = select_excluding_kernel_threads(
+            &sweep,
+            &sweep_unavailable,
+            Path::new("/proc"),
+            max_scan_pids,
+            &mut discovered.budget,
+        );
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,
             "select_deep_scan_candidates",
@@ -4425,11 +6799,30 @@ fn discover_plan(
             // Allocated but never admitted: a member that ended before
             // discovery reached it fails open below, and its ID returns
             // to the pool instead of burning for the capture lifetime.
-            ProcessView::open(id, *pid).inspect_err(|_| discovered.release_view_id(id))
+            ProcessView::open_with_budget(id, *pid, &mut discovered.budget)
+                .inspect_err(|_| discovered.release_view_id(id))
         };
         let view = match opened {
             Ok(view) => view,
-            Err(error) if named => return Err(anyhow!(error)),
+            Err(error) if named => {
+                // Never-stop: a named pid that exits between scope
+                // resolution and discovery gaps like a cgroup member and
+                // reports an empty PARTIAL plan. A missing view for a live
+                // pid stays a programmer error (fatal).
+                if process::generation_gone(*pid) {
+                    if let Some(skipped) = unreadable_member_skip(
+                        *pid,
+                        true,
+                        &format!("the named process exited before discovery: {error}"),
+                        &mut discovered.base_counters.noise,
+                    ) {
+                        attribution::note(&skipped);
+                        discovered.base_counters.object_skips.push(skipped);
+                    }
+                    continue;
+                }
+                return Err(anyhow!(error));
+            }
             Err(error) => {
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
@@ -4465,10 +6858,13 @@ fn discover_plan(
             broad_admit,
             &mut discovered.stage_timings,
         );
+        // 6.14 Option B: the scan observed this generation alive; learn
+        // its executable path whether or not the scan completed.
+        elf_needed::learn_view_exe(&mut discovered.extensive, &view);
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
             Ok((found, pins)) => {
-                discovered.note_scan_observed(view.id(), &found);
+                discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
                     view.id(),
                     ScanInput {
@@ -4479,10 +6875,9 @@ fn discover_plan(
                 );
                 discovered.views.push(view);
             }
-            // The pid the operator named *is* the capture; any other is one of many
-            // in a cgroup, and may legitimately exit between listing and scanning —
-            // legitimate, but still a process whose providers went unexamined.
-            Err(error) if named => return Err(error),
+            // Never-stop: a named pid that exits between listing and
+            // scanning gaps exactly like a cgroup member and reports an
+            // empty PARTIAL plan — never an abort with no report.
             Err(error) => {
                 // Allocated but never admitted: the failed scan drops
                 // this view, so its ID returns to the pool.
@@ -4539,6 +6934,20 @@ fn discover_plan(
                 path.display()
             )
         })?;
+        // Never-stop: per-object pin failures become gaps, good pins continue.
+        // Structurally invalid and whole-budget refusals still bail above.
+        for skip in &pinning.skipped {
+            eprintln!(
+                "p11scope: discovery skipped {} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason)
+            );
+            attribution::note(skip);
+        }
+        discovered
+            .base_counters
+            .object_skips
+            .extend(pinning.skipped.clone());
         discovered.manifest_inputs.push(ManifestInput {
             path: path.clone(),
             manifest,
@@ -4547,7 +6956,70 @@ fn discover_plan(
         });
     }
 
+    // Pre-arm inputs pin once at startup, after the manifests, through the
+    // shared worker and budget (R2-D1-1/2/3). One bad path fails the whole
+    // startup; nothing pins partially, and no pre-arm input populates
+    // `module_hints` or manufactures manifest claims.
+    if !a.prearm_modules.is_empty() {
+        let named_pid = match scope {
+            Scope::Pid(pid) => Some(*pid),
+            Scope::Cgroup { .. } | Scope::System => None,
+        };
+        let prior_objects: usize = discovered
+            .manifest_inputs
+            .iter()
+            .map(|input| input.pins.pinned().count())
+            .sum();
+        let prior_bytes: u64 = discovered
+            .manifest_inputs
+            .iter()
+            .map(|input| input.pins.pinned_object_bytes())
+            .fold(0u64, |total, bytes| total.saturating_add(bytes));
+        let pinning = pin_prearm_objects_in_views_with_budget(
+            &a.prearm_modules,
+            &discovered.views,
+            named_pid,
+            prior_objects,
+            prior_bytes,
+            &mut discovered.budget,
+        )
+        .map_err(|error| {
+            for problem in error.problems() {
+                eprintln!("p11scope: {problem}");
+            }
+            anyhow!("--prearm-module inputs are not usable trusted inputs; refusing to attach")
+        })?;
+        // Never-stop: per-path failures become gaps naming the bad path;
+        // good pins continue and the capture reads PARTIAL.
+        for skip in &pinning.skipped {
+            eprintln!(
+                "p11scope: discovery skipped {} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason)
+            );
+            attribution::note(skip);
+        }
+        discovered
+            .base_counters
+            .object_skips
+            .extend(pinning.skipped.clone());
+        eprintln!(
+            "p11scope: pre-armed {} provider file(s) before any mapping",
+            pinning.inputs.len()
+        );
+        discovered.prearm_input = Some(PrearmInput {
+            pins: pinning.pins,
+            inputs: pinning.inputs,
+        });
+    }
+
     rebuild_discovered(&mut discovered)?;
+    // The initial build's module set: assembly reads late discovery off it.
+    // Recorded once here (not in the rebuild: stale-view re-runs must not
+    // re-mark the set).
+    discovered
+        .prearm
+        .record_initial_modules(discovered.plan.modules.iter().map(|module| module.object));
     discovered.counters.report_notes();
     // Task 3.2 (S1): one categorical summary per noise class instead of one
     // line per skipped view. Cleared here so live accumulation starts fresh
@@ -4568,23 +7040,61 @@ fn discover_plan(
     Ok(discovered)
 }
 
+/// Resolves the capture's `--prearm-module` inputs against the current pin
+/// set (packet 6.13): like manifest resolution, a retired object simply
+/// has no piece here, never a stale id.
+fn resolve_prearm_pieces(
+    prearm: Option<&PrearmInput>,
+    pinned: &PinnedObjects,
+) -> Vec<plan::PrearmPlanPiece> {
+    prearm
+        .map(|prearm| {
+            prearm
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    pinned.id_for_prearm(input.key, &input.path).map(|object| {
+                        plan::PrearmPlanPiece {
+                            object,
+                            key: input.key,
+                            path: input.path.clone(),
+                            proved: input.proved.clone(),
+                            non_executable: input.non_executable.clone(),
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_current_plan(
     modules: &[ReconciledModule],
     manifests: &[Manifest],
+    prearm: &[plan::PrearmPlanPiece],
     pinned: &PinnedObjects,
     counters: &mut DiscoveryCounters,
+    tombstones: &mut BTreeSet<(String, String)>,
     corroborated: &BTreeSet<PinnedObjectId>,
     identity_mismatches: usize,
     manifest_fallbacks: usize,
     broad_admit: bool,
     admission_scope: plan::AdmissionScope,
+    counter_hint: bool,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan =
-        plan::build_from_sources_scoped(modules, manifests, pinned, broad_admit, admission_scope);
-    record_object_skips(&mut plan, &counters.object_skips);
+    let mut plan = plan::build_from_sources_scoped_with_prearm(
+        modules,
+        manifests,
+        prearm,
+        pinned,
+        broad_admit,
+        admission_scope,
+        counter_hint,
+    );
+    record_object_skips(&mut plan, &counters.object_skips, tombstones);
     for object in corroborated {
         if let Some(summary) = plan
             .modules
@@ -4598,14 +7108,12 @@ fn build_current_plan(
         }
     }
     counters.uncorroborated = uncorroborated_count(&plan, identity_mismatches, manifest_fallbacks);
-    if identity_mismatches + manifest_fallbacks > 0 && plan.slots.is_empty() {
-        bail!(
-            "{} stale --manifest input object(s) had no usable planned replacement, and no discovery source found a function table",
-            identity_mismatches + manifest_fallbacks
-        );
-    }
-    // A named capture that can attach nothing has nothing to observe. A
-    // shared-scope capture still starts: its refusals are published and
+    // Never-stop: an empty plan with stale inputs is a PARTIAL report with
+    // gaps (uncorroborated above, plus object_skips), not an abort. The
+    // capture still runs and reports what the scan proved (possibly nothing).
+    // A named capture that a capacity refusal left with nothing to attach
+    // has nothing to observe (an unpublished closure alone is not one, see
+    // `refusal_error`). A shared-scope capture still starts: its refusals are published and
     // printed, and a provider that loads, or is corroborated, later in the
     // capture can still be admitted into the reserve.
     if plan.admission_scope() == plan::AdmissionScope::Named
@@ -4630,25 +7138,68 @@ fn uncorroborated_count(
     let uncorroborated = plan
         .modules
         .iter()
-        .filter(|m| m.source.contains("manifest") && !m.corroborated)
+        .filter(|m| {
+            (m.source.contains("manifest") || m.source.contains("prearm")) && !m.corroborated
+        })
         .count();
     (uncorroborated + identity_mismatches + manifest_fallbacks) as u64
+}
+
+/// Exact `(subject, reason)` identity of a scan gap. `record_object_skips`
+/// and `merge_current` share this shape so a tombstone one writes the other
+/// reads; a drift between the two would resurrect retired gaps.
+fn scan_gap_key(skip: &Skipped) -> (String, String) {
+    (skip.subject.clone(), skip.reason.clone())
 }
 
 /// Folds the scan's own object-level losses into the plan's skip list, where
 /// `Evidence::verdict` already turns any skip into `PARTIAL`. Deduplicated:
 /// a `--cgroup` scans every process in the tree, and one provider ten of them
 /// map is one loss, not ten lines of the same one.
-fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
+fn record_object_skips(
+    plan: &mut plan::AttachPlan,
+    skips: &[Skipped],
+    tombstones: &mut BTreeSet<(String, String)>,
+) {
     // Judged by capture end, so what an earlier batch already recorded is
     // re-judged too: the plan's skip list is only rebuilt when its sources are.
+    // A gap contradicted once — the capture attached a full same-path table —
+    // stays contradicted: the tombstone outlives the retirement that empties
+    // the terminal plan, so a terminal record cannot resurrect the gap the
+    // persistent counters still carry.
     let modules = std::mem::take(&mut plan.modules);
-    plan.skipped
-        .retain(|skip| !scan_gap_this_capture_attached(&modules, skip));
-    for skip in skips {
-        if scan_gap_this_capture_attached(&modules, skip) || plan.skipped.contains(skip) {
-            continue;
+    plan.skipped.retain(|skip| {
+        let key = scan_gap_key(skip);
+        if scan_gap_this_capture_attached(&modules, skip) {
+            tombstones.insert(key);
+            return false;
         }
+        !tombstones.contains(&key)
+    });
+    // Newly visible loss records in canonical (subject, reason) order —
+    // the merge folds counters into a keyed losses map and projection
+    // emits that map's order, so arrival order here would flip-flop
+    // against projection order every arm and no commit could ever
+    // reproduce its predecessor. Already-recorded entries keep their
+    // positions; a late out-of-order arrival heals with one publish.
+    // Tombstoned and newly contradicted gaps stay out, as above.
+    let mut new: Vec<&Skipped> = skips
+        .iter()
+        .filter(|skip| {
+            let key = scan_gap_key(skip);
+            if tombstones.contains(&key) {
+                return false;
+            }
+            if scan_gap_this_capture_attached(&modules, skip) {
+                tombstones.insert(key);
+                return false;
+            }
+            !plan.skipped.contains(skip)
+        })
+        .collect();
+    new.sort_by(|a, b| (&a.subject, &a.reason).cmp(&(&b.subject, &b.reason)));
+    new.dedup();
+    for skip in new {
         plan.skipped.push(skip.clone());
     }
     plan.modules = modules;
@@ -4676,8 +7227,16 @@ fn scan_gap_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skippe
 /// than aborting. It stays an error only when it leaves nothing to attach: an
 /// empty capture whose emptiness was caused by a refusal is not the "no modules
 /// discovered" case (spec §4.10) and must not read like it.
+///
+/// A proxy closure array waiting for a published table is not a capacity
+/// refusal: it attaches nothing yet whatever the free capacity, and the
+/// providers it forwards to attach as they load. A capture whose only gaps
+/// are such closures starts, PARTIAL, like one with nothing mapped yet.
 fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
-    let refused = plan.modules_skipped.first()?;
+    let refused = plan
+        .modules_skipped
+        .iter()
+        .find(|skipped| !plan::is_closure_awaiting_publication(&skipped.reason))?;
     plan.slots.is_empty().then(|| {
         format!(
             "every module discovery found was refused at the {} attach-slot ceiling, \
@@ -4697,6 +7256,7 @@ fn discovery_evidence(
     plan: &plan::AttachPlan,
     pinned: &PinnedObjects,
     counters: &DiscoveryCounters,
+    prearm: &crate::prearm_module::PrearmState,
 ) -> render::DiscoveryEvidence {
     let summary_of = |id, path: &str| {
         let pin = pinned
@@ -4751,6 +7311,11 @@ fn discovery_evidence(
                 tables: m.tables.clone(),
                 interfaces: m.interfaces,
                 skipped: m.skipped.iter().map(render::capture_skipped_out).collect(),
+                // Discovery emits only the watch (R2-D1-5 stage rule);
+                // attach keys merge at evidence assembly.
+                watch: prearm.get(m.object).map(|watch| watch.render()),
+                attached_at_ns: None,
+                unobserved_windows: None,
             }
         })
         .collect();
@@ -4786,8 +7351,9 @@ fn discovery_evidence(
 }
 
 /// Every §4.12 outcome recorded against this module's object — one per
-/// `--manifest` that named it. Empty only when no manifest did, which the
-/// record states as `single_source` rather than as silence.
+/// `--manifest` that named it, plus one `agreed` when pre-arm and scan meet
+/// with no manifest naming the object. Empty only when neither did, which
+/// the record states as `single_source` rather than as silence.
 fn corroboration_of(counters: &DiscoveryCounters, m: &plan::ModuleSummary) -> Vec<&'static str> {
     let recorded: Vec<&'static str> = counters
         .corroboration
@@ -4798,13 +7364,15 @@ fn corroboration_of(counters: &DiscoveryCounters, m: &plan::ModuleSummary) -> Ve
     if !recorded.is_empty() {
         return recorded;
     }
-    vec![if !m.source.contains("manifest") {
-        "single_source"
-    } else if m.corroborated {
-        "agreed"
-    } else {
-        "uncorroborated"
-    }]
+    vec![
+        if !m.source.contains("manifest") && !m.source.contains("prearm") {
+            "single_source"
+        } else if m.corroborated {
+            "agreed"
+        } else {
+            "uncorroborated"
+        },
+    ]
 }
 
 fn skipped_out(s: &Skipped) -> render::SkippedOut {
@@ -4938,6 +7506,15 @@ pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
 /// left stays queued in ring order for the next frame.
 pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
 
+/// Shared userspace allowance for ordinary discovery records (H5): pending
+/// Engine records plus session-staged records plus the fresh records one
+/// frame pulls — one allowance, so the staging FIFO capacity is its single
+/// source. Terminal-authority batches stay outside this in-Engine bound so
+/// terminal completion can never deadlock behind it; the full cross-owner
+/// credit audit (including pause-held records) needs the coordinator-owned
+/// credit module outside this slice's lease.
+pub(crate) const DISCOVERY_HELD_CAP: usize = crate::attach::DiscoveryStage::CAPACITY;
+
 /// How long one live discovery frame may work before it defers the rest of
 /// its records, deferred loader scans, loader arming and export attach to
 /// the next frame (H-1). A frame used to run all of it with no clock check —
@@ -4960,6 +7537,8 @@ pub(crate) const UNFINISHED_DEFERRAL_LOSS: &str =
     "discovery work deferred by a frame budget was never completed before the capture ended";
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
     "the live discovery drain stopped at its work quantum with records still queued";
+const DISCOVERY_CAPACITY_BLOCKED_REASON: &str =
+    "the live discovery drain stopped at the shared storage allowance with records still unread";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
      tombstoned for retry";
 
@@ -5525,6 +8104,7 @@ fn fallback_proof_in_plan(proof: &BoundFallbackProof, plan: &plan::AttachPlan) -
 }
 
 fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
+    discovered.loader_plan_cache = None;
     let aggregate_start = crate::attach::monotonic_ns();
     let mut counters = discovered.base_counters.clone();
     let mut scan_modules = Vec::new();
@@ -5566,17 +8146,31 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         let mut stale_candidates = Vec::new();
         let manifest_number = u32::try_from(manifest_index)
             .map_err(|_| anyhow!("too many --manifest inputs to identify fallback evidence"))?;
+        let mut manifest_skipped_without_replacement = false;
         for stale in &input.stale {
             let Some(candidate) =
                 scanned_replacement(&manifest, stale, &scan_modules, &pinned, manifest_pins)
             else {
-                counters.report_notes();
-                bail!(
-                    "stale manifest object {} from {} ({}) has no exact, complete scanned replacement table",
-                    stale.object,
-                    input.path.display(),
-                    stale.reason.label(),
+                // Never-stop: a stale object with no scanned replacement
+                // becomes a gap, not an abort. Siblings continue.
+                let skip = Skipped {
+                    subject: stale.path.clone(),
+                    reason: format!(
+                        "manifest object unavailable: stale manifest object {} ({}) has no scanned replacement",
+                        stale.object,
+                        stale.reason.label(),
+                    ),
+                };
+                eprintln!(
+                    "p11scope: discovery skipped {} — {}",
+                    crate::render::escape_controls(&skip.subject),
+                    crate::render::escape_controls(&skip.reason)
                 );
+                attribution::note(&skip);
+                counters.object_skips.push(skip);
+                stale_ids.insert(stale.object);
+                manifest_skipped_without_replacement = true;
+                continue;
             };
             if pending_fallbacks.len() >= crate::manifest_input::MAX_OBJECTS {
                 bail!(
@@ -5626,9 +8220,24 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 .map(|module| OutcomeOwner::Scan(ScanOutcomeLocator::module(module)))
                 .collect();
             if owners.is_empty() {
-                bail!(
-                    "stale manifest module had no exact scanned object instance to bind after reconciliation"
-                );
+                // Never-stop: a stale module with no bindable replacement
+                // becomes a gap (already recorded when the replacement was
+                // missing, or recorded here when reconciliation lost it).
+                if !manifest_skipped_without_replacement {
+                    let skip = Skipped {
+                        subject: input.path.display().to_string(),
+                        reason: "manifest object unavailable: stale manifest module has no bindable scanned replacement"
+                            .into(),
+                    };
+                    eprintln!(
+                        "p11scope: discovery skipped {} — {}",
+                        crate::render::escape_controls(&skip.subject),
+                        crate::render::escape_controls(&skip.reason)
+                    );
+                    attribution::note(&skip);
+                    counters.object_skips.push(skip);
+                }
+                continue;
             }
             pending_outcomes.push(PendingCorroboration {
                 owners,
@@ -5636,8 +8245,24 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             });
             continue;
         }
-        if !stale_ids.is_empty() {
-            filter_manifest_fallbacks(&mut manifest, &stale_ids)?;
+        if !stale_ids.is_empty()
+            && let Err(error) = filter_manifest_fallbacks(&mut manifest, &stale_ids)
+        {
+            // Never-stop: filtering that would invalidate the manifest
+            // (e.g. every object stale without a replacement) skips this
+            // manifest with a gap instead of aborting siblings.
+            let skip = Skipped {
+                subject: input.path.display().to_string(),
+                reason: format!("manifest object unavailable: {error}"),
+            };
+            eprintln!(
+                "p11scope: discovery skipped {} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason)
+            );
+            attribution::note(&skip);
+            counters.object_skips.push(skip);
+            continue;
         }
         let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
         let scan_targets = view
@@ -5740,6 +8365,30 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         }
     }
 
+    // Pre-arm pins join the capture set like manifest pins: one pinned
+    // object however many of pre-arm/manifest/scan name it, sources
+    // gaining the `"prearm"` label on merge.
+    if let Some(prearm) = discovered.prearm_input.as_ref() {
+        let absorbed = pinned.absorb(prearm.pins.clone());
+        attribution::note_all(&absorbed);
+        counters.object_skips.extend(absorbed);
+    }
+
+    // Pre-6.8 overlayfs splits the pre-arm join the same way it splits
+    // the manifest join: the scan files the maps/backing key while the
+    // pre-arm pin files the opened fd's overlay key, so the absorb keeps two
+    // objects for one file and the candidate bails on the same exact
+    // provider twice. Re-file every split alias onto its scan pin — proved
+    // by the pin-time self-mapping proof the pre-arm pin carries — so plan
+    // lowering and every later exact join resolve one provider. Pre-arm
+    // first: a manifest alias may share the fd-keyed entry, and moving the
+    // pre-arm alias first leaves the manifest alias owning alone for its own
+    // re-filing below. Exact captures never move an alias.
+    if let Some(prearm) = discovered.prearm_input.as_ref() {
+        for input in &prearm.inputs {
+            pinned.refile_split_prearm_alias(&input.path);
+        }
+    }
     // Pre-6.8 overlayfs splits the manifest join: the helper recorded the
     // maps/backing key while each manifest pin files the opened fd's overlay
     // key. Re-file every split alias onto its scan pin — proved by the shared
@@ -5776,8 +8425,33 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     attribution::note_all(&differed);
     counters.object_skips.extend(differed);
     let proofs_start = crate::attach::monotonic_ns();
-    let corroborated =
+    let mut corroborated =
         bind_pending_corroboration(pending_outcomes, &modules, &pinned, &mut counters)?;
+    // Pre-arm/scan agreement (R2-D1-1): a pre-armed object the scan also
+    // bound is corroborated — two independent sources describing one
+    // object — with no manifest needed. Recorded only when no manifest
+    // named the object, so outcome labels stay one-per-manifest plus at
+    // most one pre-arm agreement (two operator inputs never manufacture
+    // independent scan corroboration on their own).
+    if let Some(prearm) = discovered.prearm_input.as_ref() {
+        let manifest_objects: BTreeSet<PinnedObjectId> = accepted
+            .iter()
+            .filter_map(|manifest| manifest_module_object(manifest, &pinned))
+            .collect();
+        let scan_objects: BTreeSet<PinnedObjectId> =
+            modules.iter().map(|module| module.object).collect();
+        for input in &prearm.inputs {
+            let Some(id) = pinned.id_for_prearm(input.key, &input.path) else {
+                continue;
+            };
+            if scan_objects.contains(&id) && !manifest_objects.contains(&id) {
+                corroborated.insert(id);
+                counters
+                    .corroboration
+                    .push((BTreeSet::from([id]), "agreed"));
+            }
+        }
+    }
 
     let mut replacements = BTreeSet::new();
     for pending in pending_fallbacks {
@@ -5830,17 +8504,25 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     let plan_start = crate::attach::monotonic_ns();
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let broad_admit = discovered.broad_admit;
+    let counter_hint = discovered.counter_hint;
     let admission_scope = discovered.admission_scope();
+    let prearm_pieces = resolve_prearm_pieces(discovered.prearm_input.as_ref(), &pinned);
     let mut plan = build_current_plan(
         &modules,
         &accepted,
+        &prearm_pieces,
         &pinned,
         &mut counters,
+        &mut discovered
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
         &corroborated,
         identity_mismatches,
         manifest_fallbacks,
         broad_admit,
         admission_scope,
+        counter_hint,
     )
     .inspect_err(|_| counters.report_notes())?;
     discovered
@@ -5860,7 +8542,14 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             reason,
         });
     }
-    record_object_skips(&mut plan, &counters.object_skips);
+    record_object_skips(
+        &mut plan,
+        &counters.object_skips,
+        &mut discovered
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     if let Some(fallback) = counters
         .manifest_fallbacks
         .iter()
@@ -5875,6 +8564,12 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     if pinned.has_overlay_uncertainty() {
         discovered.invalidate_causal_timing();
     }
+    // Freeze each pre-arm watch's declared endpoint set from the
+    // operator-declared keys. Existing watches are never reset.
+    let declared = plan::operator_target_keys(&accepted, &prearm_pieces, &pinned);
+    discovered
+        .prearm
+        .create_watches(&plan.modules, &declared, &pinned);
     discovered.stage_timings.span(
         crate::timing::StageKind::Plan,
         "build_initial_plan",
@@ -5882,7 +8577,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         crate::attach::monotonic_ns(),
     );
     let evidence_start = crate::attach::monotonic_ns();
-    let discovery = discovery_evidence(&plan, &pinned, &counters);
+    let discovery = discovery_evidence(&plan, &pinned, &counters, &discovered.prearm);
     discovered.stage_timings.span(
         crate::timing::StageKind::Projection,
         "build_initial_evidence",
@@ -5897,6 +8592,9 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     discovered.manifest_ordinals = accepted_ordinals;
     discovered.counters = counters;
     discovered.identity_mismatches = identity_mismatches;
+    // Initial discovery bypasses the rebuild: the first tick's full build
+    // re-establishes stability when it commits.
+    discovered.plan_rebuild_stable = false;
     Ok(())
 }
 
@@ -6001,8 +8699,8 @@ fn export_abi(kind: u8) -> Option<HookAbi> {
 /// The table version a record's carried prefix claims, when it claims
 /// one. Export records carry the raw word; selection records carry the
 /// probe's version class instead (their raw word fields stay zero by
-/// transport contract). An unknown class claims nothing: the prefix is
-/// unusable and the table must re-validate from memory alone.
+/// transport contract). An unknown class supplies no version claim; its
+/// observed function words still undergo fresh content validation.
 fn record_prefix_version(record: &DiscoveryRecord) -> Option<(u8, u8)> {
     if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
         return match record.selection_version_class {
@@ -6012,6 +8710,9 @@ fn record_prefix_version(record: &DiscoveryRecord) -> Option<(u8, u8)> {
             DISCOVERY_VERSION_V3_2 => Some((3, 2)),
             _ => None,
         };
+    }
+    if record.pointers_attempted == 0 && record.version_major == 0 && record.version_minor == 0 {
+        return None;
     }
     Some((record.version_major, record.version_minor))
 }
@@ -6035,8 +8736,9 @@ fn name_class(class: u8) -> &'static str {
 /// explicit refusal the caller publishes as live loss. Refusals degrade
 /// confidence — they never claim the table is absent.
 enum HeapLowerOutcome {
-    Admitted(ScannedModule),
+    Admitted(ScannedModule, bool),
     Refused(&'static str),
+    Unowned(ScannedTable, bool),
 }
 
 /// Why one bounded exact-address validation failed. The selection path
@@ -6090,14 +8792,13 @@ fn resolve_heap_table_owner(
     None
 }
 
-/// Decoder layouts for one heap-table exact read, strongest first: the
-/// scanned hook exporters' ABI when they agree, both widths otherwise.
-/// At most two bounded reads; a wrong width fails fast on the version word.
-fn heap_table_layouts(
+/// An independently known exporter ABI can be used when the process executable
+/// cannot be opened. Table metadata and sparse contents never select a width.
+fn known_heap_table_layout(
     hook: &str,
     view: ProcessViewId,
     modules: &[ReconciledModule],
-) -> Vec<LinuxLayout> {
+) -> Option<LinuxLayout> {
     let mut abis = BTreeSet::new();
     for module in modules.iter().map(|module| &module.scanned) {
         if module.view == view
@@ -6108,9 +8809,9 @@ fn heap_table_layouts(
         }
     }
     if let Some(abi) = abis.iter().next().filter(|_| abis.len() == 1) {
-        return vec![target_layout(*abi)];
+        return Some(target_layout(*abi));
     }
-    vec![LinuxLayout::Lp64, LinuxLayout::Ilp32]
+    None
 }
 
 /// Lowers one already-decoded export record through the same table-layout and
@@ -6122,7 +8823,7 @@ fn lower_export_record(
     hooks: &HookRegistry,
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
-) -> Result<Option<ScannedModule>, String> {
+) -> Result<Option<(ScannedModule, bool)>, String> {
     if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
         return Err("selection record reached export lowering".into());
     }
@@ -6142,14 +8843,14 @@ fn lower_publication_record(
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
     gi_hook: Option<(&str, HookAbi)>,
-) -> Result<Option<ScannedModule>, String> {
+) -> Result<Option<(ScannedModule, bool)>, String> {
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
     let Some(expected_abi) = export_abi(record.kind) else {
         return Err("non-export discovery record reached export lowering".into());
     };
-    let (hook_name, abi) = match record.kind {
+    let (_hook_name, abi) = match record.kind {
         DISCOVERY_KIND_INTERFACE_RETURN => {
             gi_hook.ok_or("selection record reached export lowering without its bound hook")?
         }
@@ -6166,163 +8867,22 @@ fn lower_publication_record(
     if abi != expected_abi {
         return Err("export record kind disagrees with its private hook ABI".into());
     }
-    if record.usable_n == 0 {
-        return Ok(None);
-    }
-    if !view.still_the_same() {
-        return Err("process generation changed before export lowering".into());
-    }
-    // The live path's one clock poll per record: nothing between the bounded
-    // snapshot read and this decode polls the batch deadline, and a sticky stop
-    // another consumer of the one budget left must refuse the record here — the
-    // caller publishes either as live loss. Admission below refuses on the
-    // sticky stop too; a decode ceiling stays the count-only outcome it was.
-    if let Some(reason) = budget.stopped_now() {
-        return Err(reason.into());
-    }
-
-    budget.spend(1)?;
-    let Resolved::File {
-        path: MappedPath::Usable(owner_path),
-        device: owner_device,
-        inode: owner_inode,
-        file_offset: table_file_offset,
-        permissions: owner_permissions,
-        ..
-    } = maps.resolve(record.table_ptr)
-    else {
-        return Ok(None);
-    };
-    if owner_inode == 0 || owner_permissions[0] != b'r' {
-        return Ok(None);
-    }
-
-    let Some((prefix_major, prefix_minor)) = record_prefix_version(record) else {
-        return Ok(None);
-    };
-    let word = u64::from(prefix_major) | (u64::from(prefix_minor) << 8);
-    let Some((version, spans, walk)) = spans_for(word) else {
-        return Ok(None);
-    };
-    let usable = usize::from(record.usable_n);
-    if usable > spans.iter().map(|span| span.fields().len()).sum() {
-        return Ok(None);
-    }
-    // Byte-identical repeats skip the table charge but still decode below;
-    // the interface-record charge is per record, not per table, and stays.
-    let identity = TableIdentity {
-        device: owner_device,
-        inode: owner_inode,
-        file_offset: table_file_offset,
-        version_word: word,
-        usable,
-    };
-    if !budget.table_already_admitted(&identity) {
-        if !budget.admit_table(usable) {
-            return Ok(None);
-        }
-        budget.note_table_admitted(identity);
-    }
-    if matches!(
-        record.kind,
-        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
-    ) && !budget.admit_interface()
+    if !matches!(maps.resolve(record.table_ptr), Resolved::File { permissions, inode, path: MappedPath::Usable(_), .. } if inode != 0 && permissions[0] == b'r')
     {
         return Ok(None);
     }
-
-    let mut entries = Vec::new();
-    let mut null_entries = Vec::new();
-    for (field, pointer) in spans
-        .iter()
-        .flat_map(|span| span.fields())
-        .take(usable)
-        .zip(record.pointers)
-    {
-        if pointer == 0 {
-            null_entries.push(field.name);
-            continue;
+    match lower_heap_publication_record(view, maps, hooks, record, &[], budget, gi_hook)? {
+        HeapLowerOutcome::Admitted(mut module, header_available) => {
+            if record.kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+                && record.name_class == DISCOVERY_NAME_EXACT_STANDARD
+                && record.usable_n > 0
+            {
+                module.interfaces[0].table = Some(0);
+            }
+            Ok(Some((module, header_available)))
         }
-        budget.spend(1)?;
-        let Resolved::File {
-            path: MappedPath::Usable(path),
-            file_offset,
-            device,
-            inode,
-            permissions,
-            ..
-        } = maps.resolve(pointer)
-        else {
-            return Ok(None);
-        };
-        if inode == 0 || permissions[2] != b'x' {
-            return Ok(None);
-        }
-        entries.push(ScannedEntry {
-            name: field.name,
-            object: ObjectKey { device, inode },
-            object_path: path.display().to_string(),
-            file_offset,
-        });
+        HeapLowerOutcome::Refused(_) | HeapLowerOutcome::Unowned(..) => Ok(None),
     }
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    let interfaces = match record.kind {
-        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => vec![ScannedInterface {
-            index: usize::from(record.interface_index),
-            name_class: name_class(record.name_class),
-            name_lossy: None,
-            name_private: None,
-            flags: record.interface_flags,
-            table: Some(0),
-        }],
-        DISCOVERY_KIND_INTERFACE_RETURN => vec![ScannedInterface {
-            index: usize::from(record.interface_index),
-            name_class: name_class(record.name_class),
-            name_lossy: None,
-            name_private: None,
-            flags: record.interface_flags,
-            // Unlinked (see the heap arm below): the echoed index is the
-            // request version class, not a list position.
-            table: None,
-        }],
-        _ => Vec::new(),
-    };
-    let module = ScannedModule {
-        mapped_identity: None,
-        double_loaded: false,
-        view: view.id(),
-        mount_namespace: view.mount_namespace(),
-        key: ObjectKey {
-            device: owner_device,
-            inode: owner_inode,
-        },
-        path: owner_path.display().to_string(),
-        decoder_abi: None,
-        exports: vec![hook_name.to_string()],
-        tables: vec![ScannedTable {
-            version,
-            walk,
-            entries,
-            null_entries,
-            unpinned: Vec::new(),
-            address: record.table_ptr,
-            file_offset: Some(table_file_offset),
-            // The provider returned this table through a live export: its
-            // ordinal names carry publication evidence, unlike heuristic decode.
-            live_return: true,
-            // Manifest agreement is derived per rebuild by fallback binding,
-            // never at lowering time.
-            manifest_supported: false,
-        }],
-        interfaces,
-    };
-    if !view.still_the_same() {
-        return Err("process generation changed during export lowering".into());
-    }
-    Ok(Some(module))
 }
 
 /// Lowers a published table the file-backed prefix path could not own:
@@ -6385,50 +8945,34 @@ fn lower_heap_publication_record(
     }
     budget.spend(1)?;
 
-    // Strongest layout first, at most two bounded reads; the wrong width
-    // fails fast on the version word.
-    let mut refusals = Vec::new();
-    let mut validated = None;
-    for layout in heap_table_layouts(hook_name, view.id(), modules) {
-        match Engine::read_exact_table_bracketed(
-            view,
-            record.table_ptr,
-            layout,
-            index_a,
-            budget,
-            false,
-        ) {
-            Ok(valid) => {
-                validated = Some((layout, valid));
-                break;
+    let validated = Engine::read_process_table_layout(view, budget)
+        .or_else(|refusal| {
+            if refusal == ExactReadRefusal::Unreadable {
+                known_heap_table_layout(hook_name, view.id(), modules).ok_or(refusal)
+            } else {
+                Err(refusal)
             }
-            Err(refusal) => refusals.push(refusal),
+        })
+        .and_then(|layout| {
+            Engine::read_acquired_table_bracketed(view, layout, index_a, budget, record)
+                .map(|table| (layout, table))
+        });
+    let (layout, (mut table, bytes, header_available)) = match validated {
+        Ok(validated) => validated,
+        Err(refusal) => {
+            return Ok(HeapLowerOutcome::Refused(match refusal {
+                ExactReadRefusal::Budget => {
+                    "a published table validation stopped at a decode budget ceiling"
+                }
+                ExactReadRefusal::Unstable => {
+                    "a published table moved or the process generation changed during validation"
+                }
+                ExactReadRefusal::Unreadable => {
+                    "a published table address was unreadable when validated"
+                }
+                _ => "a published table's bytes did not decode as a function table",
+            }));
         }
-    }
-    let Some((layout, (_, mut table, bytes))) = validated else {
-        // The most actionable refusal first: a capture stop, then
-        // instability (the world moved mid-read), then undecodability.
-        let refusal = refusals
-            .iter()
-            .find(|refusal| **refusal == ExactReadRefusal::Budget)
-            .or_else(|| {
-                refusals
-                    .iter()
-                    .find(|refusal| **refusal == ExactReadRefusal::Unstable)
-            })
-            .or(refusals.first());
-        return Ok(HeapLowerOutcome::Refused(match refusal {
-            Some(ExactReadRefusal::Budget) => {
-                "a published table validation stopped at a decode budget ceiling"
-            }
-            Some(ExactReadRefusal::Unstable) => {
-                "a published table moved or the process generation changed during validation"
-            }
-            Some(ExactReadRefusal::Unreadable) => {
-                "a published table address was unreadable when validated"
-            }
-            _ => "a published table's bytes did not decode as a function table",
-        }));
     };
 
     // A carried prefix is the probe's observation; the mem read above is
@@ -6436,16 +8980,6 @@ fn lower_heap_publication_record(
     // under us — refuse, never blend.
     let usable = usize::from(record.usable_n);
     if usable > 0 {
-        let Some(prefix_version) = record_prefix_version(record) else {
-            return Ok(HeapLowerOutcome::Refused(
-                "a published selection result carried a table prefix with an unknown version class",
-            ));
-        };
-        if prefix_version != table.version {
-            return Ok(HeapLowerOutcome::Refused(
-                "a published table changed between the probe capture and validation",
-            ));
-        }
         let mut matches = true;
         for (ordinal, expected) in record.pointers.iter().take(usable).enumerate() {
             match read_function_pointer(&bytes, layout, ordinal) {
@@ -6489,19 +9023,12 @@ fn lower_heap_publication_record(
             match resolve_heap_table_owner(hook_name, view.id(), &table.entries, modules) {
                 Some(owner) => owner,
                 None => {
-                    return Ok(HeapLowerOutcome::Refused(
-                        "a published heap table could not be attributed to exactly one provider",
-                    ));
+                    return Ok(HeapLowerOutcome::Unowned(table, header_available));
                 }
             }
         }
     };
 
-    // The provider returned this table through a live export: its ordinal
-    // names carry publication evidence, unlike heuristic decode. Manifest
-    // agreement is derived per rebuild by fallback binding, never here.
-    table.live_return = true;
-    table.manifest_supported = false;
     if matches!(
         record.kind,
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
@@ -6512,23 +9039,49 @@ fn lower_heap_publication_record(
         ));
     }
 
+    let module = publication_module(view, record, hook_name, key, path, table);
+    if !view.still_the_same() {
+        return Err("process generation changed during export lowering".into());
+    }
+    Ok(HeapLowerOutcome::Admitted(module, header_available))
+}
+
+fn publication_module(
+    view: &ProcessView,
+    record: &DiscoveryRecord,
+    hook_name: &str,
+    key: ObjectKey,
+    path: String,
+    mut table: ScannedTable,
+) -> ScannedModule {
+    // The return is an observation fact even when an opaque interface does
+    // not prove a standard ordinal layout. Naming is scored separately.
+    table.live_return = true;
+    table.manifest_supported = false;
     let interfaces = match record.kind {
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
             vec![ScannedInterface {
-                index: usize::from(record.interface_index),
+                index: if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                    0
+                } else {
+                    usize::from(record.interface_index)
+                },
                 name_class: name_class(record.name_class),
                 name_lossy: None,
                 name_private: None,
                 flags: record.interface_flags,
-                // Unlinked by contract (see above): no widening.
-                table: None,
+                // Opaque source context limits naming without conferring
+                // standard linkage or a selection enumeration position.
+                table: (record.name_class != DISCOVERY_NAME_EXACT_STANDARD).then_some(0),
             }]
         }
         _ => Vec::new(),
     };
-    let module = ScannedModule {
+    ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
@@ -6537,11 +9090,7 @@ fn lower_heap_publication_record(
         exports: vec![hook_name.to_string()],
         tables: vec![table],
         interfaces,
-    };
-    if !view.still_the_same() {
-        return Err("process generation changed during export lowering".into());
     }
-    Ok(HeapLowerOutcome::Admitted(module))
 }
 
 /// Whether `module` has no counterpart among already-retained modules:
@@ -6556,6 +9105,15 @@ fn is_newly_observed_module(retained: &[ScannedModule], module: &ScannedModule) 
             && known.mount_namespace == module.mount_namespace
             && known.key == module.key
             && known.path == module.path
+    })
+}
+
+fn is_still_observed_module(found: &[ScannedModule], module: &ScannedModule) -> bool {
+    found.iter().any(|current| {
+        current.view == module.view
+            && current.mount_namespace == module.mount_namespace
+            && current.key == module.key
+            && current.path == module.path
     })
 }
 
@@ -6587,27 +9145,59 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     // evidence of one load, and a newly detected double-load must
     // land on its retained module. Clearing happens only by
     // complete-scan replacement (fresh `found` evidence rebuilds
-    // the view's modules outright), never by union.
+    // the view's modules outright), never by union. The load count
+    // keeps the maximum for the same reason: a partial pass that
+    // sees fewer loads is not fresh evidence of fewer loads.
     existing.double_loaded |= incoming.double_loaded;
+    existing.same_file_loads = existing.same_file_loads.max(incoming.same_file_loads);
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);
         }
     }
     let mut table_indices = Vec::new();
-    for table in incoming.tables.drain(..) {
+    let mut typed_live_tables = BTreeSet::new();
+    for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
+        let typed_live = table.live_return
+            && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
         let index = existing.tables.iter().position(|known| *known == table);
         table_indices.push(match index {
             Some(index) => {
-                // Same table seen twice: publication evidence unions —
-                // whichever instance observed it, the table was observed.
+                if typed_live
+                    || (existing.tables[index].live_return
+                        && !table_has_only_opaque_interfaces(index, &existing.interfaces))
+                {
+                    typed_live_tables.insert(index);
+                    for interface in &mut existing.interfaces {
+                        if interface.table == Some(index)
+                            && interface.name_class != "exact_standard"
+                        {
+                            // Keep opaque metadata without revoking the
+                            // independent typed getter's stronger name proof.
+                            interface.table = None;
+                        }
+                    }
+                }
                 existing.tables[index].live_return |= table.live_return;
                 existing.tables[index].manifest_supported |= table.manifest_supported;
+                // The extension proof unions like the other monotonic
+                // observation flags: an equal table is `PartialEq`-equal
+                // with or without the flag, so a later full-extent decode
+                // whose first failure refutes nothing cannot clear an
+                // earlier proof. Clearing happens only by complete-scan
+                // replacement (the view's modules are rebuilt outright),
+                // never by union. This needs a writable table and lasts
+                // until that rescan.
+                existing.tables[index].extension_impossible |= table.extension_impossible;
                 index
             }
             None => {
                 existing.tables.push(table);
-                existing.tables.len() - 1
+                let index = existing.tables.len() - 1;
+                if typed_live {
+                    typed_live_tables.insert(index);
+                }
+                index
             }
         });
     }
@@ -6615,6 +9205,13 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         interface.table = interface
             .table
             .and_then(|index| table_indices.get(index).copied());
+        if interface.name_class != "exact_standard"
+            && interface
+                .table
+                .is_some_and(|index| typed_live_tables.contains(&index))
+        {
+            interface.table = None;
+        }
         if let Some(known) = existing.interfaces.iter_mut().find(|known| {
             known.index == interface.index
                 && known.name_class == interface.name_class
@@ -6823,6 +9420,42 @@ fn loader_state_address(snapshot: &ElfSnapshot) -> std::result::Result<Option<u6
         .transpose()
 }
 
+/// One dynamic loader file's arming facts: reused from an earlier completed
+/// arm when the opened file still has the same `st_dev` and pin, otherwise
+/// read from the file under the capture budget exactly as before. Returns the
+/// key alongside freshly read facts whose pin held across the read, so the
+/// caller can retain them once its arm commits; a reuse returns `None`.
+fn loader_elf_facts(
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+) -> std::result::Result<(LoaderElfFacts, Option<LoaderFactsKey>), String> {
+    let key = LoaderFactsKey {
+        device: file
+            .metadata()
+            .map_err(|error| format!("metadata failed: {error}"))?
+            .dev(),
+        pin: pin_of(file)?,
+    };
+    // Nothing is read for this hit, but the file may have changed since the
+    // key was taken; only the still-unchanged file may reuse the facts.
+    if let Some(facts) = budget
+        .loader_elf_facts_for(&key)
+        .filter(|_| pin_of(file).is_ok_and(|after| after == key.pin))
+    {
+        return Ok((facts, None));
+    }
+    let snapshot = read_elf_snapshot(file, budget)?;
+    let facts = LoaderElfFacts {
+        abi: snapshot.abi(),
+        hook: snapshot
+            .defined_symbol("_dl_debug_state")
+            .map(|hook| hook.filter(|hook| snapshot.is_executable_offset(hook.file_offset))),
+        state_address: loader_state_address(&snapshot),
+    };
+    let stable = pin_of(file).is_ok_and(|after| after == key.pin);
+    Ok((facts, stable.then_some(key)))
+}
+
 const NO_EXECUTABLE_MAPPING_REASON: &str = "retained executable has no usable executable mapping";
 const NO_LOADER_MAPPING_REASON: &str = "PT_INTERP has no usable executable loader mapping";
 
@@ -6916,6 +9549,24 @@ fn loader_snapshot_for_fd(
     }
 }
 
+/// Whether a pinned loader key agrees with a freshly opened locator key
+/// across the pre-6.8 overlayfs maps-identity split. The pre-exec pin
+/// carries the kernel maps identity on overlayfs while the locator key
+/// comes from the opened fd, so a plain comparison refuses the same
+/// loader on split kernels. Equal keys accept without consulting the
+/// probe; a split accepts only when the kernel renders this exact fd at
+/// the pinned maps key, and anything else — including a probe that
+/// cannot decide — refuses.
+fn loader_pin_matches_locator(
+    pin_key: ObjectKey,
+    locator_key: ObjectKey,
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> bool {
+    opened_file_matches_maps(file, locator_key, pin_key, budget, probe)
+}
+
 fn unique_mapping_for_offset(
     mappings: &[MapEntry],
     offset: u64,
@@ -6983,6 +9634,80 @@ fn candidate_admission(
         missing_contexts: loader_registry.contexts_missing_from(candidate_pins),
         targets_ok,
         newly_rejected_keys: candidate_pins.newly_rejected_keys(committed_pins),
+    }
+}
+
+/// Shared counter bank refusal core: the endpoint-ceiling budget
+/// refusal renders in plain words with its counts; every other
+/// publication keeps the token plus the failing check when the refusal
+/// named one. Unnamed refusals keep their exact historical token text.
+/// Staging and growth share this arm so the two paths cannot diverge.
+fn counter_bank_refusal_core_text(publication: &BankPublication, check: Option<&str>) -> String {
+    if let BankPublication::Refused(BankRefusal::BudgetExhausted {
+        resource,
+        needed,
+        available,
+    }) = publication
+        && *resource == COUNTER_ENDPOINT_CEILING_RESOURCE
+    {
+        let text = format!("{needed} endpoints exceed the {available} counter ceiling");
+        return match check {
+            Some(check) => format!("{text} ({check})"),
+            None => text,
+        };
+    }
+    match check {
+        Some(check) => format!("{publication:?} ({check})"),
+        None => format!("{publication:?}"),
+    }
+}
+
+/// Finite counter staging refusal text: the shared refusal core behind
+/// the staging prefix.
+pub(crate) fn counter_staging_refusal_text(
+    publication: &BankPublication,
+    check: Option<&str>,
+) -> String {
+    format!(
+        "counter bank staging refused: {}",
+        counter_bank_refusal_core_text(publication, check)
+    )
+}
+
+/// Finite counter growth refusal text: the shared refusal core.
+pub(crate) fn counter_growth_refusal_text(
+    publication: &BankPublication,
+    check: Option<&str>,
+) -> String {
+    counter_bank_refusal_core_text(publication, check)
+}
+
+/// Maps a counter staging outcome onto the attach result shape: published
+/// extents complete, refusals fail carrying their token. A plan with no
+/// fresh tail is a no-op.
+fn counter_growth_attach_outcome(
+    session: &mut dyn EngineSession,
+    plan: &mut plan::AttachPlan,
+    objects: &PinnedObjects,
+    reserve: &SemanticResourceReserver,
+) -> Result<TargetAttachResult> {
+    if plan.counter_consumed_end() as usize == plan.slots.len() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    match session.stage_counter_growth(plan, objects, reserve) {
+        BankPublication::Published { extent, .. } => {
+            let stamped = crate::attach::monotonic_ns();
+            Ok((
+                Vec::new(),
+                (extent.first..extent.end)
+                    .map(|index| (index, stamped))
+                    .collect(),
+            ))
+        }
+        publication => Err(anyhow!(
+            "{}",
+            counter_growth_refusal_text(&publication, session.last_counter_stage_check())
+        )),
     }
 }
 
@@ -7327,6 +10052,114 @@ fn process_view_is_current(
         .is_some_and(ProcessView::still_the_same)
 }
 
+/// 6.14 Option A exit-time verdict for one novel unmatched kind-7
+/// exit: `Mapped` (the kernel named a watched-provider slot with no
+/// disqualifying refusal) or one `unknown` reason. Publication
+/// collapses every non-`Mapped` reason into the single `unknown`
+/// count; the reasons exist so each arm stays testable and no
+/// negative ("did not map") can be smuggled through an unnamed
+/// path. There is deliberately no negative variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMappingReason {
+    Mapped,
+    UnknownSharedMm,
+    UnknownHooksRefused,
+    UnknownLateWatch,
+    UnknownLocalFault,
+    UnknownEmpty,
+}
+
+/// 6.14 Option A capture-local state: the mapped/unknown counts plus
+/// the bounded per-PID exec-timing behind the late-watch rule.
+/// Active only while extensive mode is armed; the published key is
+/// `None` otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct ExitMappingState {
+    enabled: bool,
+    mapped: u64,
+    unknown: u64,
+    execs: BTreeMap<u32, u64>,
+    #[cfg(test)]
+    reasons: Vec<ExitMappingReason>,
+}
+
+impl ExitMappingState {
+    fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
+    /// Record one EXEC observed during the capture. Every EXEC
+    /// counts as observed (observation, not authority: no ticket
+    /// gate); a re-exec overwrites, and a full table evicts the
+    /// smallest PID first, mirroring the Option B stash bound.
+    fn note_exec(&mut self, pid: u32, hook_ts_ns: u64) {
+        if !self.enabled {
+            return;
+        }
+        if self.execs.len() >= elf_needed::HINT_MAX_EXE_STASH_ENTRIES
+            && !self.execs.contains_key(&pid)
+        {
+            self.execs.pop_first();
+        }
+        self.execs.insert(pid, hook_ts_ns);
+    }
+
+    /// An admitted PID's exits match its admission, never a gap, so
+    /// its exec timing is dead. Dropping it also bounds the table
+    /// against long-lived processes that never gap.
+    fn drop_exec_for_pid(&mut self, pid: u32) {
+        self.execs.remove(&pid);
+    }
+
+    /// Classify one novel unmatched kind-7 exit (the caller checked
+    /// the kind) into exactly one split entry, in contract priority
+    /// order: refused hooks, shared mm, local fault, late watch,
+    /// then named slots. Unarmed captures record nothing. There is
+    /// no negative outcome: every non-`Mapped` reason feeds the
+    /// single `unknown` count.
+    fn classify(&mut self, record: &DiscoveryRecord, hooks_refused: bool) {
+        debug_assert_eq!(record.kind, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        if !self.enabled {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let status = record.status_flags;
+        let timely_exec = self
+            .execs
+            .get(&pid)
+            .is_some_and(|exec_ts| *exec_ts < record.hook_ts_ns);
+        let reason = if hooks_refused || status & DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED != 0 {
+            ExitMappingReason::UnknownHooksRefused
+        } else if status & DISCOVERY_STATUS_EXIT_MAP_SHARED_MM != 0 {
+            ExitMappingReason::UnknownSharedMm
+        } else if status & DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT != 0 {
+            ExitMappingReason::UnknownLocalFault
+        } else if !timely_exec {
+            ExitMappingReason::UnknownLateWatch
+        // OVERFLOW is deliberately not an arm: named slots still
+        // count as `mapped` when the leader record overflowed (the
+        // set may be partial, but what is named was observed).
+        } else if record.pointers[..RECORD_SLOTS]
+            .iter()
+            .any(|cell| (1..=u64::from(FILE_SLOTS)).contains(cell))
+        {
+            ExitMappingReason::Mapped
+        } else {
+            ExitMappingReason::UnknownEmpty
+        };
+        match reason {
+            ExitMappingReason::Mapped => {
+                self.mapped = self.mapped.saturating_add(1);
+            }
+            _ => {
+                self.unknown = self.unknown.saturating_add(1);
+            }
+        }
+        #[cfg(test)]
+        self.reasons.push(reason);
+    }
+}
+
 fn lifecycle_retirement(
     views: &[ProcessView],
     pid: u32,
@@ -7339,7 +10172,11 @@ fn lifecycle_retirement(
         .max_by_key(|view| view.admitted_ns())?;
     let cause = match kind {
         DISCOVERY_KIND_EXEC => RetirementCause::ExecRefresh,
-        DISCOVERY_KIND_LEADER_EXIT => RetirementCause::ExpectedRemoval,
+        // 6.14 Option A: kind 7 is a leader exit plus the mapping
+        // summary, so it retires exactly like kind 6.
+        DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
+            RetirementCause::ExpectedRemoval
+        }
         _ => return None,
     };
     Some((view.id(), cause))
@@ -7501,8 +10338,10 @@ fn validate_loader_record_context<'a>(
 
 fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> ScannedModule {
     ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key: ObjectKey::of(mapping),
@@ -7517,11 +10356,28 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
 impl Engine {
     fn empty() -> Self {
         Self {
+            return_probe_admission: None,
             plan: plan::build_from_reconciled_modules(&[]),
             pinned: PinnedObjects::empty(),
             discovery: render::DiscoveryEvidence::default(),
             capture_facts: CaptureFacts::default(),
             views: Vec::new(),
+            trace_seeds: BTreeMap::new(),
+            trace_by_view: BTreeMap::new(),
+            trace_owner: None,
+            trace_active: None,
+            trace_frame_deadline_ns: None,
+            trace_terminal: None,
+            trace_phase: TracePhase::Arming,
+            trace_phase_visits: 0,
+            trace_arm_cursor: None,
+            trace_settle_cursor: None,
+            trace_view_cursor: 0,
+            trace_provider_views: BTreeMap::new(),
+            trace_provider_cursor: None,
+            trace_provider_turn: true,
+            trace_needs_health: false,
+            trace_health_seed: None,
             modules: Vec::new(),
             manifests: Vec::new(),
             manifest_ordinals: Vec::new(),
@@ -7529,6 +10385,10 @@ impl Engine {
             identity_mismatches: 0,
             scan_inputs: BTreeMap::new(),
             manifest_inputs: Vec::new(),
+            prearm_input: None,
+            prearm: crate::prearm_module::PrearmState::empty(),
+            prearm_witness: None,
+            prearm_witness_live: None,
             base_counters: DiscoveryCounters::default(),
             budget: CaptureWorkBudget::default(),
             inventory: None,
@@ -7540,7 +10400,40 @@ impl Engine {
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
+            collected_finish_actions: None,
+            collected_finish_assessment_after: None,
+            collected_assessment_lap: AssessmentLap::default(),
+            graph_inputs_epoch: 0,
+            collected_graph_requested: false,
+            collected_graph: None,
+            collected_graph_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
+            counter_pool: SemanticResourcePool::with_limit(COUNTER_POOL_BYTES),
+            #[cfg(test)]
+            counter_cpus_override: None,
+            #[cfg(test)]
+            disable_empty_tick_fast_path_for_test: false,
+            #[cfg(test)]
+            disable_publish_deferral_for_test: false,
+            plan_rebuild_stable: false,
+            graph_backing: None,
+            retired_files: None,
+            collected_graph_refusal: None,
+            collected_graph_reclaim_forgotten: 0,
             pause_owned_batch: false,
+            pressure_service_active: false,
+            in_refresh_tick: false,
+            pressure_selected: None,
+            pressure_protection: PressureProtection::default(),
+            pressure_episode: None,
+            pressure_rotation_pending: false,
+            pressure_service_passes: 0,
+            pressure_attempts: 0,
+            frame_fresh_blocked: false,
+            immediate_exec_recovery_frame: false,
+            pending_global_retirement: None,
+            global_retirement_frame_owed: false,
+            terminal_capacity_backlog: 0,
+            discovery_held_high_water: 0,
             held_records: BTreeSet::new(),
             paused_loader_views: BTreeSet::new(),
             unpaused_loader_views: BTreeSet::new(),
@@ -7563,9 +10456,13 @@ impl Engine {
             counter_snapshot: CounterSnapshot::default(),
             malformed_discovery: 0,
             refresh_requested: BTreeMap::new(),
+            last_refresh_serial: 0,
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
+            loader_benign_hits: 0,
             timings: CausalTimings::default(),
+            physical_gap: crate::attach::PhysicalGapSummary::default(),
+            continuity_deferred: false,
             stage_timings: crate::timing::StageTimings::new(),
             newcomer_first_seen: BTreeMap::new(),
             newcomer_ages: crate::timing::NewcomerStats::new(),
@@ -7574,22 +10471,34 @@ impl Engine {
             // exactly like the un-gated tail it replaces.
             facts_revision: 1,
             published_facts_revision: 0,
+            loader_plan_cache: None,
             tail_publishes: 0,
             tail_skips: 0,
             discovery_truncated: 0,
+            exit_ended_truncations: 0,
+            exit_ended_by_route: [0, 0, 0],
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
             retirement_intents: PendingViewRetirements::new(),
             ready_expected_removals: BTreeSet::new(),
+            ended_pid_retirement: None,
+            ended_loader_origins: VecDeque::new(),
             expected_target_exit_pending: None,
             expected_target_exit: false,
+            expected_target_exit_since: None,
+            expected_target_exit_blocked: None,
+            expected_target_exit_tripped: false,
             pending_leader_exit_views: BTreeSet::new(),
+            pending_leader_exit_order: BTreeMap::new(),
             counted_leader_exit_views: BTreeSet::new(),
+            exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
+            extensive: elf_needed::ExtensiveState::new(),
+            exit_map: ExitMappingState::default(),
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
@@ -7597,13 +10506,36 @@ impl Engine {
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
             pending_loader_scans: BTreeMap::new(),
+            pending_loader_arm_scans: BTreeSet::new(),
             broad_admit: false,
+            counter_hint: false,
             exploratory_dirty: BTreeSet::new(),
             deep_scans: 0,
             loader_arms: 0,
             exploratory_evictions: 0,
+            probationary_completions: 0,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
+            #[cfg(test)]
+            fail_next_loader_memory_scan: false,
+            #[cfg(test)]
+            loader_arm_scan_after_scan: None,
+            #[cfg(test)]
+            loader_force_record_scan_incomplete: false,
+            #[cfg(test)]
+            pin_probe_script: RefCell::new(VecDeque::new()),
+            #[cfg(test)]
+            collected_graphs_created: 0,
+            #[cfg(test)]
+            collected_intake_intents: 0,
+            #[cfg(test)]
+            collected_test_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
+            #[cfg(test)]
+            collected_test_transport_pending: false,
+            #[cfg(test)]
+            names_inspected: Cell::new(0),
+            #[cfg(test)]
+            view_log: Vec::new(),
         }
     }
 
@@ -7648,6 +10580,7 @@ impl Engine {
     pub fn loader_discovery(&self) -> render::LoaderDiscovery {
         let mut aggregate = render::LoaderDiscovery {
             hits: self.counter_snapshot.loader_hits,
+            benign_hits: self.loader_benign_hits,
             state_read_failures: self.counter_snapshot.loader_state_read_failures,
             ..render::LoaderDiscovery::default()
         };
@@ -7729,6 +10662,12 @@ impl Engine {
         self.mark_partial("owned pause", reason);
     }
 
+    fn cancellation_requested(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Whether the running live frame must stop taking on work items (H-1):
     /// its work budget is spent, or the operator asked the capture to stop.
     /// Always false outside a live frame.
@@ -7736,10 +10675,13 @@ impl Engine {
         let Some(deadline) = self.frame_deadline_ns else {
             return false;
         };
-        self.cancel_flag
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-            || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
+        // Collected Finish is already admission-gated. An operator stop must
+        // not strand its owned prefix; its explicit action/time bounds still
+        // apply, while ordinary frames retain the cancellation check.
+        self.cancel_flag.as_ref().is_some_and(|flag| {
+            self.collected_finish_actions.is_none()
+                && flag.load(std::sync::atomic::Ordering::Relaxed)
+        }) || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
     }
 
     /// Books one frame's deferral once (F4). Deferred work is delayed, never
@@ -7752,16 +10694,655 @@ impl Engine {
         }
     }
 
+    pub(crate) fn with_trace_frame<S: TraceIo, T>(
+        &mut self,
+        session: &mut S,
+        run: impl FnOnce(&mut Self, &mut S, &mut TraceWorkTicket) -> Result<T>,
+    ) -> Result<T> {
+        self.note_graph_inputs_mutated();
+        let Some(proof) = session.proof().cloned() else {
+            return run(self, session, &mut TraceWorkTicket::default());
+        };
+        if self
+            .trace_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.same_allocation(&proof))
+        {
+            return run(self, session, &mut TraceWorkTicket::default());
+        }
+        if let Some(active) = &self.trace_active {
+            return run(self, session, &mut active.clone());
+        }
+        self.trace_owner = Some(proof.clone());
+        let prior_deadline = self.trace_frame_deadline_ns;
+        let mut work = TraceWorkTicket::default();
+        if let Some(start) = proof.now()
+            && let Some(frame) = start.checked_add(self.frame_work_budget_ns)
+            && let Some(proof_end) = start.checked_add(5_000_000)
+        {
+            let frame = prior_deadline.map_or(frame, |prior| prior.min(frame));
+            let frame = self
+                .frame_deadline_ns
+                .map_or(frame, |prior| prior.min(frame));
+            self.trace_frame_deadline_ns = Some(frame);
+            work = TraceWorkTicket::new(
+                proof.clone(),
+                start,
+                frame.min(proof_end),
+                false,
+                self.cancel_flag.clone(),
+            );
+        } else {
+            proof.invalidate_cgroup_work();
+        }
+        self.trace_active = Some(work.clone());
+        let result = run(self, session, &mut work);
+        work.close();
+        self.trace_active = None;
+        self.trace_frame_deadline_ns = prior_deadline;
+        result
+    }
+    fn drop_trace_seed(&mut self, id: SeedId) {
+        if let Some(candidate) = self.trace_seeds.remove(&id) {
+            if self.trace_by_view.get(&candidate.body.view_id()) == Some(&id) {
+                self.trace_by_view.remove(&candidate.body.view_id());
+            }
+            // No ledger guard is held while dropping the sole reservation.
+            drop(candidate);
+        }
+    }
+    fn next_trace_seed(&self, cursor: Option<SeedId>) -> Option<SeedId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match cursor {
+            Some(id) => self
+                .trace_seeds
+                .range((Excluded(id), Unbounded))
+                .next()
+                .map(|(id, _)| *id),
+            None => self.trace_seeds.keys().next().copied(),
+        }
+    }
+    fn trace_provider_associated(&self, view: &ProcessView) -> bool {
+        self.trace_provider_views
+            .get(&view.id())
+            .is_some_and(|admission| admission.same_allocation(&view.view_admission()))
+    }
+
+    /// A provider association selects work, never executable proof. The ordinary
+    /// cursor still visits every retained view; the two classes alternate turns.
+    /// Health peeks the same selection without advancing either class.
+    fn next_trace_view(
+        &mut self,
+        proof: &ProofSession,
+        work: &TraceWorkTicket,
+    ) -> std::result::Result<Option<(usize, bool)>, TraceWorkError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if self.views.is_empty() {
+            return Ok(None);
+        }
+        if !matches!(self.scope, Scope::System) || proof.is_cgroup() {
+            return Ok(Some((self.trace_view_cursor % self.views.len(), false)));
+        }
+        if self.trace_provider_turn {
+            let mut cursor = self.trace_provider_cursor;
+            let mut remaining = self.trace_provider_views.len();
+            while remaining != 0 {
+                work.check(proof)?;
+                let next = cursor
+                    .and_then(|id| {
+                        self.trace_provider_views
+                            .range((Excluded(id), Unbounded))
+                            .next()
+                            .map(|(id, _)| *id)
+                    })
+                    .or_else(|| {
+                        self.trace_provider_views
+                            .first_key_value()
+                            .map(|(id, _)| *id)
+                    });
+                let Some(id) = next else { break };
+                if let Some(position) = self.views.iter().position(|view| view.id() == id)
+                    && self.trace_provider_associated(&self.views[position])
+                {
+                    work.check(proof)?;
+                    return Ok(Some((position, true)));
+                }
+                // A stale/reused ID or vanished association is only a discarded
+                // hint. Pruning progresses even if this ticket later expires.
+                self.trace_provider_views.remove(&id);
+                cursor = Some(id);
+                remaining -= 1;
+            }
+        }
+        work.check(proof)?;
+        Ok(Some((self.trace_view_cursor % self.views.len(), false)))
+    }
+
+    fn advance_trace_phase(&mut self) {
+        self.trace_phase = match self.trace_phase {
+            TracePhase::Arming => TracePhase::Health,
+            TracePhase::Health => TracePhase::Settlement,
+            TracePhase::Settlement => TracePhase::Seeding,
+            TracePhase::Seeding => TracePhase::Arming,
+        };
+        self.trace_phase_visits = 0;
+    }
+    pub(crate) fn service_trace_images(
+        &mut self,
+        session: &impl TraceIo,
+        work: &mut TraceWorkTicket,
+        mut accept: impl FnMut(VerifiedTraceSeed),
+    ) -> TraceServiceProgress {
+        self.note_graph_inputs_mutated();
+        let mut progress = TraceServiceProgress::default();
+        let Some(proof) = session.proof() else {
+            progress.deferred = 1;
+            return progress;
+        };
+        let owned = self
+            .trace_active
+            .as_ref()
+            .is_some_and(|active| active.same_allocation(work))
+            || self
+                .trace_terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.same_allocation(work));
+        if !owned {
+            progress.deferred = 1;
+            return progress;
+        }
+        loop {
+            let checked = if proof.is_cgroup() {
+                work.cgroup_check(proof, u64::MAX)
+                    .map(|_| ())
+                    .map_err(Into::into)
+            } else {
+                work.check(proof)
+            };
+            if let Err(error) = checked {
+                if matches!(error, TraceWorkError::Unknown(_)) {
+                    proof.invalidate_cgroup_work();
+                }
+                progress.deferred += 1;
+                break;
+            }
+            match self.trace_phase {
+                TracePhase::Arming => {
+                    if self.trace_phase_visits >= 8 {
+                        self.advance_trace_phase();
+                        continue;
+                    }
+                    let Some(id) = self.next_trace_seed(self.trace_arm_cursor) else {
+                        self.trace_arm_cursor = None;
+                        self.advance_trace_phase();
+                        continue;
+                    };
+                    if work.visit(proof).is_err() {
+                        progress.deferred += 1;
+                        break;
+                    }
+                    progress.visited += 1;
+                    // An attempted confirmation consumes its fair phase turn,
+                    // including when the original-pin read later defers.
+                    self.trace_arm_cursor = Some(id);
+                    self.trace_phase_visits += 1;
+                    let candidate = self.trace_seeds.get_mut(&id).expect("visited candidate");
+                    let result = match &mut candidate.body {
+                        TraceCandidateBody::Cgroup(registration) => self
+                            .views
+                            .get(candidate.position)
+                            .ok_or(TraceWorkError::Unknown(TraceProofUnknown::TargetGone))
+                            .and_then(|view| {
+                                let status = proof.cgroup_status(registration, view, work)?;
+                                self.trace_needs_health |= status.needs_health;
+                                if status.needs_health {
+                                    self.trace_health_seed = Some(id);
+                                }
+                                match status.action {
+                                    CgroupAction::Sample => {
+                                        session.sample_cgroup(registration, view, work)
+                                    }
+                                    CgroupAction::Confirm => {
+                                        session.confirm_cgroup(registration, view, work)
+                                    }
+                                    CgroupAction::Parked => {
+                                        proof.park_cgroup(
+                                            registration,
+                                            TraceProofUnknown::ProofPending,
+                                        );
+                                        Ok(())
+                                    }
+                                    CgroupAction::Idle => Ok(()),
+                                }
+                            }),
+                        TraceCandidateBody::Accepted(interest) => self
+                            .views
+                            .get(candidate.position)
+                            .ok_or(TraceProofUnknown::TargetGone)
+                            .and_then(|view| proof.cgroup_interest_status(interest, view))
+                            .map(|_| ())
+                            .map_err(Into::into),
+                        TraceCandidateBody::PidSystem(seed) => {
+                            let status = self
+                                .views
+                                .get(candidate.position)
+                                .ok_or(TraceProofUnknown::TargetGone)
+                                .and_then(|view| proof.seed_status(seed, view));
+                            match status {
+                                Ok((true, _)) => {
+                                    let view = &self.views[candidate.position];
+                                    session
+                                        .cookie(view.retained_pin(), work)
+                                        .and_then(|cookie| {
+                                            proof.confirm(seed, view, cookie).map_err(Into::into)
+                                        })
+                                }
+                                Ok((false, needs_health)) => {
+                                    self.trace_needs_health |= needs_health;
+                                    Ok(())
+                                }
+                                Err(reason) => Err(reason.into()),
+                            }
+                        }
+                    };
+                    match result {
+                        Err(TraceWorkError::Deferred) => {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        Err(TraceWorkError::Unknown(reason)) => {
+                            let redirect = self.trace_seeds.get(&id).and_then(|candidate| {
+                                if let TraceCandidateBody::Cgroup(registration) = &candidate.body {
+                                    self.views.get(candidate.position).and_then(|view| {
+                                        proof
+                                            .redirect_cgroup(registration, view)
+                                            .map(|interest| (interest, candidate.position))
+                                    })
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some((interest, position)) = redirect {
+                                self.drop_trace_seed(id);
+                                let body = TraceCandidateBody::Accepted(interest);
+                                let target = body.id();
+                                // Drop an old handle before installing the replacement:
+                                // its detach cannot erase a newly installed alias.
+                                self.drop_trace_seed(target);
+                                self.trace_by_view.insert(body.view_id(), target);
+                                self.trace_seeds
+                                    .insert(target, TraceCandidate { body, position });
+                                continue;
+                            }
+                            if let Some(candidate) = self.trace_seeds.get_mut(&id)
+                                && let TraceCandidateBody::Cgroup(registration) =
+                                    &mut candidate.body
+                                && !matches!(
+                                    reason,
+                                    TraceProofUnknown::TargetGone
+                                        | TraceProofUnknown::AfterEvent
+                                        | TraceProofUnknown::NotSeeded
+                                )
+                            {
+                                proof.park_cgroup(registration, reason);
+                            } else {
+                                self.drop_trace_seed(id);
+                            }
+                        }
+                        Ok(()) => {
+                            if let Some(candidate) = self.trace_seeds.get(&id)
+                                && let Some(view) = self.views.get(candidate.position)
+                            {
+                                match &candidate.body {
+                                    TraceCandidateBody::PidSystem(seed) => {
+                                        if let Ok((_, needs)) = proof.seed_status(seed, view) {
+                                            self.trace_needs_health |= needs;
+                                        }
+                                    }
+                                    TraceCandidateBody::Cgroup(registration) => {
+                                        if let Ok(status) =
+                                            proof.cgroup_status(registration, view, work)
+                                        {
+                                            self.trace_needs_health |= status.needs_health;
+                                            if status.needs_health {
+                                                self.trace_health_seed = Some(id);
+                                            }
+                                        }
+                                    }
+                                    TraceCandidateBody::Accepted(_) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                TracePhase::Health => {
+                    let mut baseline_needed = false;
+                    if !proof.is_cgroup()
+                        && !work.terminal()
+                        && !proof.has_baseline()
+                        && !self.views.is_empty()
+                    {
+                        if work.visit(proof).is_err() {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        progress.visited += 1;
+                        let selection = self.next_trace_view(proof, work);
+                        match selection {
+                            Ok(Some((position, _))) => {
+                                baseline_needed = proof.can_seed(&self.views[position]).is_ok();
+                            }
+                            Err(_) => {
+                                progress.deferred += 1;
+                                break;
+                            }
+                            Ok(None) => {}
+                        }
+                    }
+                    if (self.trace_needs_health || baseline_needed) && !work.health_attempted() {
+                        let result = if proof.is_cgroup() {
+                            if work.visit(proof).is_err() {
+                                progress.deferred += 1;
+                                break;
+                            }
+                            progress.visited += 1;
+                            // A saved demand is only a cursor into charged state.
+                            // Revalidate it before any shared health syscall.
+                            let demand = self.trace_health_seed.and_then(|id| {
+                                self.trace_seeds.get(&id).and_then(|candidate| {
+                                    self.views.get(candidate.position).and_then(|view| {
+                                        if let TraceCandidateBody::Cgroup(registration) =
+                                            &candidate.body
+                                        {
+                                            Some((
+                                                id,
+                                                proof.cgroup_status(registration, view, work),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            });
+                            match demand {
+                                Some((id, Ok(status))) if status.needs_health => session
+                                    .refresh_health(
+                                        &mut work.cgroup_reader(status.deadline, Some(id)),
+                                    ),
+                                Some((_, Err(TraceWorkError::Deferred))) => {
+                                    Err(TraceWorkError::Deferred)
+                                }
+                                _ => Ok(()),
+                            }
+                        } else {
+                            session.refresh_health(work)
+                        };
+                        match result {
+                            Err(TraceWorkError::Deferred) => {
+                                progress.deferred += 1;
+                                break;
+                            }
+                            _ => {
+                                self.trace_needs_health = false;
+                                self.trace_health_seed = None;
+                            }
+                        }
+                    }
+                    self.advance_trace_phase();
+                }
+                TracePhase::Settlement => {
+                    if self.trace_phase_visits >= 8 {
+                        self.advance_trace_phase();
+                        continue;
+                    }
+                    let Some(id) = self.next_trace_seed(self.trace_settle_cursor) else {
+                        self.trace_settle_cursor = None;
+                        self.advance_trace_phase();
+                        continue;
+                    };
+                    if work.visit(proof).is_err() {
+                        progress.deferred += 1;
+                        break;
+                    }
+                    progress.visited += 1;
+                    let candidate = &self.trace_seeds[&id];
+                    let result = self
+                        .views
+                        .get(candidate.position)
+                        .ok_or(TraceWorkError::Unknown(TraceProofUnknown::TargetGone))
+                        .and_then(|view| match &candidate.body {
+                            TraceCandidateBody::PidSystem(seed) => {
+                                proof.seed_status(seed, view)?;
+                                proof.ready_to_transfer(seed).map_err(Into::into)
+                            }
+                            TraceCandidateBody::Cgroup(registration) => proof
+                                .cgroup_status(registration, view, work)
+                                .map(|status| status.ready_to_transfer),
+                            TraceCandidateBody::Accepted(_) => Ok(false),
+                        });
+                    match result {
+                        Ok(true) => {
+                            let candidate = self
+                                .trace_seeds
+                                .remove(&id)
+                                .expect("visited retained candidate");
+                            let position = candidate.position;
+                            match candidate.body {
+                                TraceCandidateBody::PidSystem(seed) => {
+                                    if self.trace_by_view.get(&seed.view_id()) == Some(&id) {
+                                        self.trace_by_view.remove(&seed.view_id());
+                                    }
+                                    if let Ok(verified) =
+                                        proof.verified(seed, &self.views[position])
+                                    {
+                                        progress.transferred += 1;
+                                        accept(verified);
+                                    }
+                                }
+                                TraceCandidateBody::Cgroup(registration) => {
+                                    match proof.verify_cgroup(
+                                        registration,
+                                        &self.views[position],
+                                        work,
+                                    ) {
+                                        Ok((verified, interest)) => {
+                                            self.trace_seeds.insert(
+                                                id,
+                                                TraceCandidate {
+                                                    body: TraceCandidateBody::Accepted(interest),
+                                                    position,
+                                                },
+                                            );
+                                            progress.transferred += 1;
+                                            accept(verified);
+                                        }
+                                        Err((mut registration, error)) => {
+                                            if let TraceWorkError::Unknown(reason) = error {
+                                                proof.park_cgroup(&mut registration, reason);
+                                            }
+                                            self.trace_seeds.insert(
+                                                id,
+                                                TraceCandidate {
+                                                    body: TraceCandidateBody::Cgroup(registration),
+                                                    position,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                TraceCandidateBody::Accepted(_) => {
+                                    unreachable!("accepted aliases cannot transfer")
+                                }
+                            }
+                        }
+                        Err(TraceWorkError::Deferred) => {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        Err(TraceWorkError::Unknown(_)) => self.drop_trace_seed(id),
+                        Ok(false) => {}
+                    }
+                    self.trace_settle_cursor = Some(id);
+                    self.trace_phase_visits += 1;
+                }
+                TracePhase::Seeding => {
+                    if work.terminal() || self.views.is_empty() || self.trace_phase_visits >= 8 {
+                        self.advance_trace_phase();
+                        break;
+                    }
+                    if work.visit(proof).is_err() {
+                        progress.deferred += 1;
+                        break;
+                    }
+                    progress.visited += 1;
+                    let (position, provider) = match self.next_trace_view(proof, work) {
+                        Ok(Some(selection)) => selection,
+                        Err(_) => {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        Ok(None) => {
+                            self.advance_trace_phase();
+                            break;
+                        }
+                    };
+                    let view = &self.views[position];
+                    let eligible = if proof.is_cgroup() {
+                        self.trace_by_view
+                            .get(&view.id())
+                            .and_then(|id| self.trace_seeds.get(id))
+                            .is_none_or(|candidate| match &candidate.body {
+                                TraceCandidateBody::Accepted(interest) => proof
+                                    .cgroup_interest_status(interest, view)
+                                    .unwrap_or(false),
+                                _ => false,
+                            })
+                    } else {
+                        !self.trace_by_view.contains_key(&view.id()) && proof.can_seed(view).is_ok()
+                    };
+                    if eligible && !proof.is_cgroup() && !proof.has_baseline() {
+                        // The baseline read retains this eligible view for its
+                        // capacity recheck; no sample attempt has begun yet.
+                        self.trace_phase = TracePhase::Health;
+                        self.trace_phase_visits = 0;
+                        progress.deferred += 1;
+                        break;
+                    }
+                    // Charge the fair slot before a sample can overrun. Partial
+                    // samples roll back; this view is retried on a later pass.
+                    let prior_provider_cursor = self.trace_provider_cursor;
+                    if provider {
+                        self.trace_provider_cursor = Some(view.id());
+                    } else {
+                        self.trace_view_cursor = (position + 1) % self.views.len();
+                    }
+                    self.trace_provider_turn = !provider;
+                    self.trace_phase_visits += 1;
+                    if eligible {
+                        let result = if proof.is_cgroup() {
+                            proof
+                                .register_cgroup(view, work)
+                                .map(TraceCandidateBody::Cgroup)
+                        } else {
+                            session
+                                .sample(view, work)
+                                .map(TraceCandidateBody::PidSystem)
+                        };
+                        match result {
+                            Ok(body) => {
+                                let id = body.id();
+                                self.trace_by_view.insert(view.id(), id);
+                                self.trace_seeds
+                                    .insert(id, TraceCandidate { body, position });
+                                progress.seeded += 1;
+                            }
+                            Err(TraceWorkError::Deferred) => {
+                                if matches!(self.scope, Scope::System)
+                                    && !proof.is_cgroup()
+                                    && work.check(proof).is_ok()
+                                    && work
+                                        .state
+                                        .as_ref()
+                                        .and_then(|state| state.lock().ok())
+                                        .is_some_and(|state| state.reads == 0)
+                                {
+                                    // Retry only read-credit shortfalls with a
+                                    // fresh ordinary ticket. Time/stop/unknown
+                                    // failures keep their fair advancement.
+                                    if provider {
+                                        self.trace_provider_cursor = prior_provider_cursor;
+                                    } else {
+                                        self.trace_view_cursor = position;
+                                    }
+                                    self.trace_provider_turn = provider;
+                                }
+                                if self.trace_phase_visits as usize >= self.views.len()
+                                    || self.trace_phase_visits >= 8
+                                {
+                                    self.advance_trace_phase();
+                                }
+                                progress.deferred += 1;
+                                break;
+                            }
+                            Err(TraceWorkError::Unknown(_)) => {}
+                        }
+                    }
+                    // One complete bounded view pass need not revisit a short list.
+                    if self.trace_phase_visits as usize >= self.views.len() {
+                        self.advance_trace_phase();
+                        break;
+                    }
+                }
+            }
+        }
+        progress
+    }
+    pub(crate) fn begin_trace_terminal_work(
+        &mut self,
+        remaining: std::time::Duration,
+    ) -> TraceWorkTicket {
+        self.note_graph_inputs_mutated();
+        if let Some(ticket) = &self.trace_terminal {
+            return ticket.clone();
+        }
+        let mut ticket = TraceWorkTicket::default();
+        if let Some(proof) = &self.trace_owner
+            && let Some(now) = proof.now()
+            && let Ok(ns) = u64::try_from(remaining.as_nanos())
+            && let Some(stop) = now.checked_add(ns)
+            && let Some(end) = now.checked_add(5_000_000)
+        {
+            ticket = TraceWorkTicket::new(
+                proof.clone(),
+                now,
+                stop.min(end),
+                true,
+                self.cancel_flag.clone(),
+            );
+        }
+        self.trace_terminal = Some(ticket.clone());
+        ticket
+    }
+
     /// Runs one live discovery frame under its work budget (H-1).
     fn with_live_frame<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        // An unreadable clock bounds nothing rather than deferring forever.
-        self.frame_deadline_ns = Some(crate::attach::monotonic_ns().map_or(u64::MAX, |now| {
-            now.saturating_add(self.frame_work_budget_ns)
+        // A nested actual live scope reuses its existing allowance. The trace
+        // wrapper alone never activates ordinary discovery or pause deferral.
+        if self.trace_active.is_some() && self.frame_deadline_ns.is_some() {
+            return work(self);
+        }
+        let prior_deadline = self.frame_deadline_ns;
+        let prior_deferred = self.frame_deferred;
+        // Preserve the ordinary disabled clock-failure policy.
+        self.frame_deadline_ns = Some(self.trace_frame_deadline_ns.unwrap_or_else(|| {
+            crate::attach::monotonic_ns().map_or(u64::MAX, |now| {
+                now.saturating_add(self.frame_work_budget_ns)
+            })
         }));
         self.frame_deferred = false;
         let result = work(self);
-        self.frame_deadline_ns = None;
-        self.frame_deferred = false;
+        self.frame_deadline_ns = prior_deadline;
+        self.frame_deferred = prior_deferred;
         result
     }
 
@@ -7815,6 +11396,32 @@ impl Engine {
         }
     }
 
+    /// Books a terminal-drain record as never pause-held. Terminal batches
+    /// are collected at detach/Finish, never handed to a pause stop, so no
+    /// stale pause proof from an earlier held batch may exonerate them. This
+    /// deliberately does not consult `held_records`: even inside a
+    /// pause-owned batch the terminal records arrived via the installed
+    /// batch, not via the held handoff.
+    fn note_terminal_record_unheld(&mut self, record: &DiscoveryRecord) {
+        if !matches!(
+            record.kind,
+            DISCOVERY_KIND_LOADER
+                | DISCOVERY_KIND_FUNCTION_LIST_RETURN
+                | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+                | DISCOVERY_KIND_INTERFACE_RETURN
+        ) {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let views: Vec<_> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        self.unpaused_loader_views.extend(views);
+    }
+
     pub(crate) fn discovery_deferrals(&self) -> u64 {
         self.frame_deferrals
     }
@@ -7822,11 +11429,17 @@ impl Engine {
     /// Called when the terminal drain is done: deferred records it still
     /// left undispatched are the one deferral that is a loss (F4).
     pub(crate) fn settle_frame_deferrals_at_capture_end(&mut self) {
+        self.note_graph_inputs_mutated();
+        self.pending_loader_arm_scans.clear();
         if self.pending_discovery_records.is_empty() {
             return;
         }
         self.mark_live_loss("live discovery frame", UNFINISHED_DEFERRAL_LOSS);
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
     }
 
     /// The capture's operator-stop flag: a live frame that sees it set
@@ -7855,6 +11468,13 @@ impl Engine {
         self.expected_target_exit
     }
 
+    /// True once the expected-target-exit wait tripped its no-progress
+    /// bound: the target exited but its cleanup never drained. False on
+    /// the ordinary all-clear path and when the wait never armed.
+    pub fn expected_target_exit_tripped(&self) -> bool {
+        self.expected_target_exit_tripped
+    }
+
     /// The one immutable public view of capture facts (plan Task 8 Step 2).
     /// Every field is boundary-safe: no pins, views, files, timing keys, or
     /// loader/pause identity crosses it. Most fields are the projected
@@ -7866,25 +11486,56 @@ impl Engine {
     /// rest of this snapshot stays exactly what the capture accepted (see
     /// `AttachPlan::active_slot_count`).
     pub fn capture_facts(&self) -> render::CaptureFacts {
+        // One accumulator, each source feeding it once (design §9.1).
+        let discovery_truncated = self
+            .discovery_truncated
+            .saturating_add(self.malformed_discovery)
+            .saturating_add(self.loader_registry.discovery_truncated())
+            .saturating_add(self.loader_registry.context_failures());
+        let exit_ended = self.exit_ended_truncations;
+        debug_assert!(
+            exit_ended <= discovery_truncated,
+            "exit-only stays a subset of the truncation total"
+        );
+        debug_assert_eq!(
+            self.exit_ended_by_route.iter().sum::<u64>(),
+            exit_ended,
+            "the per-route exit-only buckets sum to the total"
+        );
+        // 6.14 Option A: stamp the exit-mapping carrier from live
+        // engine state on every read, so the projection is always
+        // current without depending on projection timing.
+        let mut discovery = self.discovery.clone();
+        discovery.gap_exit_mappings = self.gap_exit_mappings();
         render::CaptureFacts {
-            discovery: self.discovery.clone(),
+            discovery,
             table_entries: self.plan.entries_seen,
             slots: self.plan.slots.len(),
             // U-14: mirrors how `slots` reads the plan, but counts only what
             // `plan.is_active` still has attached right now.
             active_slots: self.plan.active_slot_count(),
-            attach_gap_ms: self.timings.max_gap_ms(),
+            attach_gap_ms: if self.physical_gap.open
+                || self.physical_gap.unknown
+                || self.timings.invalidated
+            {
+                None
+            } else {
+                self.timings
+                    .max_gap_ms()
+                    .into_iter()
+                    .chain(self.physical_gap.max_gap_ns.map(|ns| ns / 1_000_000))
+                    .max()
+            },
             loader_discovery: self.loader_discovery(),
             discovery_ring_loss: self.counter_snapshot.ring_loss,
             discovery_state_failures: self.counter_snapshot.export_state_failures,
             discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
             task_uprobe_link_losses: self.task_uprobe_link_losses,
-            // One accumulator, each source feeding it once (design §9.1).
-            discovery_truncated: self
-                .discovery_truncated
-                .saturating_add(self.malformed_discovery)
-                .saturating_add(self.loader_registry.discovery_truncated())
-                .saturating_add(self.loader_registry.context_failures()),
+            discovery_truncated,
+            // The exit-ended subset of the truncation total above: K0
+            // subtracts it from the total.
+            exit_ended_truncations: exit_ended,
+            exit_ended_by_route: self.exit_ended_by_route,
         }
     }
 
@@ -7893,6 +11544,47 @@ impl Engine {
             self.pid_descendant_gaps
         } else {
             0
+        }
+    }
+
+    /// Extensive-mode static-hint split, present only when armed. Like
+    /// the gap counter it never moves calls or attribution; unlike it,
+    /// the split is `None` (key omitted) unless armed.
+    pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
+        self.extensive.enabled().then_some(self.extensive.hints())
+    }
+
+    /// 6.14 Option A exit-time split, present only when armed. Like
+    /// the gap counter it never moves calls or attribution; unlike
+    /// it, the split is `None` (key omitted) unless armed.
+    pub(crate) fn gap_exit_mappings(&self) -> Option<render::GapExitMappings> {
+        self.extensive.enabled().then_some(render::GapExitMappings {
+            mapped: self.exit_map.mapped,
+            unknown: self.exit_map.unknown,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_mapping_reasons_for_test(&self) -> &[ExitMappingReason] {
+        &self.exit_map.reasons
+    }
+
+    /// 6.14 Option B: arm extensive mode from `--track-short-lived`
+    /// before the session starts (run flow only; inventory never calls
+    /// this, so its surface is unchanged). Arming snapshots the pinned
+    /// watched providers; the kernel bit publishes with the session.
+    /// 614b P1: the engine itself refuses to arm on a scope that never
+    /// classifies descendant gaps, so no caller can arm the
+    /// exe-identity read (or retain its stash/caches) for an exact-PID
+    /// capture however it computed its request.
+    pub(crate) fn arm_extensive(&mut self, track_short_lived: bool) {
+        let armed = track_short_lived && self.admits_generations();
+        self.extensive.set_enabled(armed);
+        // 6.14 Option A: the exit-mapping split arms with the same
+        // flag; `gap_exit_mappings` reads `None` unless armed.
+        self.exit_map.set_enabled(armed);
+        if armed {
+            self.extensive.snapshot_watched(&self.pinned);
         }
     }
 
@@ -7963,13 +11655,24 @@ impl Engine {
             else {
                 continue;
             };
+            let pid = view_data.pid;
             if self.admitted_cgroup_views.insert(view, view_data).is_none() {
                 self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
             }
+            // 6.14 Option B: an admitted PID's exits match its
+            // admission, never a gap, so its stash entry is dead.
+            self.extensive.drop_stash_for_pid(pid);
+            // 6.14 Option A: same for the exec timing behind the
+            // late-watch rule.
+            self.exit_map.drop_exec_for_pid(pid);
         }
     }
 
-    fn record_unmatched_cgroup_leader_exit(&mut self, record: &DiscoveryRecord) {
+    fn record_unmatched_cgroup_leader_exit(
+        &mut self,
+        record: &DiscoveryRecord,
+        hooks_refused: bool,
+    ) {
         if !self.admits_generations() {
             return;
         }
@@ -7999,6 +11702,16 @@ impl Engine {
         }
         self.unmatched_leader_exit_events.insert(key);
         self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+        // 6.14 Option B: exactly one static hint per novel unmatched
+        // exit in extensive mode. The gap count above never depends
+        // on the hint outcome.
+        self.extensive.classify_gap(record);
+        // 6.14 Option A: exactly one mapping verdict per novel
+        // unmatched kind-7 exit. Kind 6 never classifies; unarmed
+        // captures record nothing.
+        if record.kind == DISCOVERY_KIND_LEADER_EXIT_MAPPINGS {
+            self.exit_map.classify(record, hooks_refused);
+        }
     }
 
     fn close_cgroup_admission(&mut self, view: ProcessViewId, closed_ns: u64) {
@@ -8063,8 +11776,10 @@ impl Engine {
         records.retain(|queued| {
             let record = &queued.record;
             let pid = (record.pid_tgid >> 32) as u32;
-            let coalesced = record.kind == DISCOVERY_KIND_LEADER_EXIT
-                && admitted.iter().any(|view| {
+            let coalesced = matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) && admitted.iter().any(|view| {
                     self.admitted_cgroup_views
                         .get(view)
                         .is_some_and(|admission| {
@@ -8168,10 +11883,7 @@ impl Engine {
             .keys()
             .map(|stable| render::StandardExport {
                 module: public_modules[stable],
-                status: standard_export_status(
-                    history.standard_exports.get(stable),
-                    history.standard_requirements.get(stable),
-                ),
+                status: standard_export_status(history.standard_exports.get(stable)),
             })
             .collect();
         if standard_exports.len() > MAX_LIVE_SELECTION_SURFACES {
@@ -8268,6 +11980,13 @@ impl Engine {
     }
 
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
+        let id = self.allocate_view_id_inner()?;
+        #[cfg(test)]
+        self.record_view_log(ViewLogKind::Allocated, id, None);
+        Ok(id)
+    }
+
+    fn allocate_view_id_inner(&mut self) -> Result<ProcessViewId> {
         if self.inventory.is_some() {
             self.inventory_state()?;
             let Some(inventory) = self.inventory.as_mut() else {
@@ -8290,9 +12009,61 @@ impl Engine {
         Ok(id)
     }
 
+    /// Allocates a view ID for a newcomer admission, making room for a
+    /// pressure-selected pid when the capture sits at view capacity
+    /// (Lane-A P1). A selected transaction serves only its selected pid:
+    /// when no ID is free it evicts exactly one guarded exploratory view
+    /// and retries once. Ordinary ticks never evict here; without a victim
+    /// the request defers exactly as before (fail-closed).
+    fn allocate_view_id_for_newcomer(&mut self, pid: u32) -> Result<ProcessViewId> {
+        match self.allocate_view_id() {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                if !self
+                    .pressure_selected
+                    .is_some_and(|selected| selected.pid == pid)
+                {
+                    return Err(error);
+                }
+                if !self.evict_one_exploratory_for_selected(pid) {
+                    return Err(error);
+                }
+                self.allocate_view_id()
+            }
+        }
+    }
+
     fn release_view_id(&mut self, id: ProcessViewId) {
+        #[cfg(test)]
+        let release_pid = self
+            .views
+            .iter()
+            .find(|view| view.id() == id)
+            .map(|view| view.pid());
+        #[cfg(test)]
+        self.record_view_log(ViewLogKind::Released, id, release_pid);
+        // A retained collected transaction keeps its original ID: under
+        // collected Finish the bookkeeping below still runs, but the ID
+        // never returns to the free list (no reuse after Q; the Engine ends
+        // with its Session). Ordinary behavior is otherwise unchanged (§1.5).
+        self.trace_provider_views.remove(&id);
+        self.pending_loader_arm_scans.retain(|key| key.view != id);
+        self.exec_rearm_views.remove(&id);
+        self.pending_leader_exit_order.remove(&id);
+        if let Some(seed) = self.trace_by_view.get(&id).copied() {
+            if let Some(proof) = &self.trace_owner
+                && let Some(candidate) = self.trace_seeds.get(&seed)
+                && let TraceCandidateBody::Cgroup(registration) = &candidate.body
+            {
+                proof.cancel_cgroup_view(registration);
+            }
+            self.drop_trace_seed(seed);
+        }
         if let Some(inventory) = &mut self.inventory {
             inventory.release_reservation(id);
+            return;
+        }
+        if self.collected_finish_actions.is_some() {
             return;
         }
         // Skip-if-present: a duplicate retired entry would mint one ID to
@@ -8481,11 +12252,15 @@ impl Engine {
     fn record_selection_loss(&mut self, reason: &str) {
         self.capture_facts.record_selection_loss(reason);
         self.invalidate_silent_selection_coverage();
+        // Selection history feeds the merge: recording dirties the
+        // publication inputs like any other merge-input mutation.
+        self.note_facts_mutated();
     }
 
     fn record_selection_loss_for(&mut self, id: u64, reason: &str) {
         self.capture_facts.record_selection_loss(reason);
         self.invalidate_selection_coverage(id);
+        self.note_facts_mutated();
     }
 
     fn record_lifecycle_tracking_unavailable(&mut self, fact: Option<&str>) {
@@ -8587,6 +12362,20 @@ impl Engine {
         false
     }
 
+    /// An exit-caused loader reject (R-1): the registry's
+    /// `context_failures` grows (one summand of the truncation total)
+    /// and the exit-only count grows in the same step, so exit-only
+    /// stays a subset of the total. The live loss is kept: a reject
+    /// costs its causal timing proof even when an exit explains it.
+    #[track_caller]
+    fn reject_loader_record_exit_ended(&mut self, reason: &str) -> bool {
+        self.loader_registry.reject_hit();
+        self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[1] = self.exit_ended_by_route[1].saturating_add(1);
+        self.mark_live_loss("live loader discovery", reason);
+        false
+    }
+
     fn invalidate_causal_timing(&mut self) {
         self.timings.invalidate();
     }
@@ -8617,9 +12406,46 @@ impl Engine {
         }
     }
 
+    fn sync_physical_gap(&mut self, session: &dyn EngineSession) {
+        self.sync_physical_gap_summary(session.physical_gap_summary());
+    }
+
+    fn sync_physical_gap_summary(&mut self, next: crate::attach::PhysicalGapSummary) {
+        if next == self.physical_gap {
+            return;
+        }
+        self.physical_gap = next;
+        if next.episodes != 0 || next.open || next.unknown {
+            self.mark_partial("physical static probe gap", if next.open || next.unknown {
+                "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete"
+            } else { "static probes detached and final exact pairs reattached; the physical coverage interval remains in history" });
+        }
+    }
+
     fn record_apply_timing(&mut self, outcome: &ApplyOutcome) {
+        // Freeze owner eligibility before any slot completion updates it. A
+        // newly incomplete owner needs every slot's completion (including a
+        // missing timestamp); later physical recovery of an already complete
+        // owner must not extend its initial interval through healthy time.
+        let initial_owners: BTreeSet<_> = outcome
+            .static_completions
+            .iter()
+            .flat_map(|(modules, _)| modules)
+            .filter(|module| {
+                (self.physical_gap.episodes == 0
+                    && !self.physical_gap.open
+                    && !self.physical_gap.unknown)
+                    || self
+                        .timings
+                        .modules
+                        .get(*module)
+                        .is_none_or(|timing| timing.attach_complete_ns.is_none())
+            })
+            .cloned()
+            .collect();
         for (modules, completed) in &outcome.static_completions {
-            self.complete_causal_timing(modules, *completed);
+            let initial: BTreeSet<_> = modules.intersection(&initial_owners).cloned().collect();
+            self.complete_causal_timing(&initial, *completed);
         }
         for module in &outcome.static_failures {
             self.timings.lose(module);
@@ -8647,6 +12473,7 @@ impl Engine {
             recompleted,
             rebuild_failures,
             rebuilt_groups,
+            pending: _,
         } = report;
         if rebuilt_groups == 0 && recompleted.is_empty() && rebuild_failures.is_empty() {
             return;
@@ -8690,13 +12517,10 @@ impl Engine {
     /// (`read_maps_or_refuse`). Every caller turns `Err` into a refused
     /// record or an unarmed view, never into a decision on a shorter map.
     fn read_maps(view: &ProcessView, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>> {
-        let pid = view.pid();
-        view.run_while_same(|| {
-            let maps = std::fs::File::open(format!("/proc/{pid}/maps"))
-                .map_err(|error| error.to_string())?;
+        view.with_filesystem(budget, |filesystem, budget| {
+            let maps = filesystem.open_maps().map_err(|error| error.to_string())?;
             read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns)
         })
-        .map_err(anyhow::Error::msg)?
         .map_err(anyhow::Error::msg)
     }
 
@@ -8704,16 +12528,11 @@ impl Engine {
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> Result<Option<LoaderLocator>> {
-        let pid = view.pid();
         // One mount-table read serves every identity below (H-3).
         let mut mounts = crate::process::MountTableCache::default();
         let before_maps = Self::read_maps(view, budget)?;
-        let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
-        let before_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
-            .map_err(anyhow::Error::msg)?;
-        let executable = view
-            .run_while_same(|| std::fs::File::open(&executable_path))
-            .map_err(anyhow::Error::msg)??;
+        let (executable, before_executable) =
+            open_view_executable_cached(view, &mut mounts, budget).map_err(anyhow::Error::msg)?;
         let before_file = FileSnapshot::read(&executable).map_err(anyhow::Error::msg)?;
         let (interpreter, executable_abi) =
             read_bounded_interpreter(&executable, before_file.size).map_err(anyhow::Error::msg)?;
@@ -8726,15 +12545,11 @@ impl Engine {
                 .map_err(anyhow::Error::msg)?;
 
         let interpreter_file = if let Some(interpreter) = &interpreter {
-            let path = PathBuf::from(format!("/proc/{pid}/root")).join(
-                interpreter
-                    .strip_prefix("/")
-                    .expect("bounded PT_INTERP paths are absolute"),
-            );
-            let (file, key) = open_view_object_cached(view, &path, &mut mounts, budget)
-                .map_err(anyhow::Error::msg)?;
-            let object = read_elf_snapshot(&file, budget).map_err(anyhow::Error::msg)?;
-            if object.abi() != executable_abi {
+            let (file, key) =
+                open_view_rooted_object_cached(view, Path::new(interpreter), &mut mounts, budget)
+                    .map_err(anyhow::Error::msg)?;
+            let (object, _) = loader_elf_facts(&file, budget).map_err(anyhow::Error::msg)?;
+            if object.abi != executable_abi {
                 bail!("retained executable and PT_INTERP have different target ABIs");
             }
             let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
@@ -8744,8 +12559,9 @@ impl Engine {
         };
 
         let after_maps = Self::read_maps(view, budget)?;
-        let after_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
-            .map_err(anyhow::Error::msg)?;
+        let after_executable = open_view_executable_cached(view, &mut mounts, budget)
+            .map_err(anyhow::Error::msg)?
+            .1;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
@@ -8816,6 +12632,9 @@ impl Engine {
     /// quantum stop is an `IncompleteTerminalDrain` with `backlog` set, so no
     /// route can mistake it for an empty ring, and the terminal routes retain
     /// its exact prefix as an incomplete batch until a later drain reads empty.
+    /// Test-only: every production pull goes through `nested_pull_capped`
+    /// or a bounded frame/terminal quantum under the shared allowance.
+    #[cfg(test)]
     fn collect_discovery_records(
         session: &mut dyn EngineSession,
     ) -> Result<(Vec<DiscoveryRecord>, u64)> {
@@ -8837,6 +12656,52 @@ impl Engine {
             }
         }
         Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+    }
+
+    /// Pulls up to `quantum` items for a capacity-bounded collector
+    /// quantum, consuming `budget` only for fresh ring reads. Staged pops
+    /// are credit transfers — the FIFO shrinks as the batch grows — and
+    /// cost nothing, so a staged backlog never under-admits fresh room.
+    /// Stops at the first observed empty read, at the quantum, or at an
+    /// exhausted budget with nothing staged to transfer; all three keep
+    /// their exact prefix. Only an observed empty read proves the queue
+    /// drained: a budget stop is never an empty observation. A real
+    /// dequeue failure still carries its retained prefix with it.
+    fn collect_discovery_records_budgeted(
+        session: &mut dyn EngineSession,
+        budget: &Cell<usize>,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool)> {
+        let mut records = Vec::new();
+        let mut malformed = 0u64;
+        for _ in 0..quantum {
+            if budget.get() == 0 && session.staged_discovery_len() == 0 {
+                return Ok((records, malformed, false));
+            }
+            // A dequeue never grows the FIFO: an unchanged length means
+            // the item came off the ring (a fresh acquisition), a shrunk
+            // one means it transferred out of the FIFO (already counted).
+            let staged_before = session.staged_discovery_len();
+            match session.discovery_dequeue() {
+                Ok(Some(crate::events::DiscoveryItem::Record(record))) => {
+                    if session.staged_discovery_len() == staged_before {
+                        budget.set(budget.get().saturating_sub(1));
+                    }
+                    records.push(record);
+                }
+                Ok(Some(crate::events::DiscoveryItem::Malformed)) => {
+                    if session.staged_discovery_len() == staged_before {
+                        budget.set(budget.get().saturating_sub(1));
+                    }
+                    malformed = malformed.saturating_add(1);
+                }
+                Ok(None) => return Ok((records, malformed, true)),
+                Err(error) => {
+                    return Err(IncompleteTerminalDrain::new(records, malformed, 0, error).into());
+                }
+            }
+        }
+        Ok((records, malformed, false))
     }
 
     /// Every dequeue is capture-wide work, charged where the records enter the
@@ -8924,31 +12789,146 @@ impl Engine {
         })
     }
 
-    /// Enqueues one lifecycle/loader refresh request on the bounded pending
-    /// queue (Task 3.1b). Past the cap the excess request is dropped with
-    /// explicit truncation evidence — the queue never grows unbounded.
-    /// Re-requesting an already-queued pid is free and keeps the earliest
-    /// arrival mark. `now_ns` is the caller's clock poll (scheduler style);
-    /// `None` marks the arrival clock-unknown.
-    fn request_refresh(&mut self, pid: u32, now_ns: Option<u64>) {
-        if self.refresh_requested.contains_key(&pid) {
-            return;
+    /// Ensure retry/setup work is queued without renewing a later consumed
+    /// request or counting an unperformed retry as another dropped record.
+    /// `None` keeps the original arrival clock-unknown.
+    fn request_refresh(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
+        let accepted = self.request_refresh_with(pid, now_ns, false, None);
+        if !accepted {
+            // A retained owner's skipped setup/replacement must remain owed
+            // when the PID queue cannot accept it. The existing bounded
+            // retirement-intent replay waits for capacity before finishing
+            // ExecRefresh. Stronger existing retirement causes still win.
+            for view in self.views.iter().filter(|view| view.pid() == pid) {
+                self.retirement_intents
+                    .entry(view.id())
+                    .and_modify(|cause| *cause = cause.merge(RetirementCause::ExecRefresh))
+                    .or_insert(RetirementCause::ExecRefresh);
+            }
         }
-        if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
-            self.discovery_truncated = self.discovery_truncated.saturating_add(1);
-            // The drop keeps its loss marker and reports the dropped age:
-            // a diff-discovered newcomer carries its first-seen mark, so a
-            // drop then still says how long the newcomer had waited.
-            let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
-            self.newcomer_ages
-                .note_dropped(newcomer_age_ms(seen, now_ns));
-            self.mark_live_loss(
-                "live discovery refresh",
-                "refresh requests exceeded the bounded pending queue; excess requests were dropped",
-            );
-            return;
+        accepted
+    }
+
+    /// Each consumed record renews pending intent while keeping its first
+    /// arrival mark. Refusing that record preserves explicit loss evidence.
+    fn request_refresh_consumed(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
+        self.request_refresh_with(pid, now_ns, true, None)
+    }
+
+    /// The lifecycle matcher already identified this record's retained
+    /// owner. Keep that identity when an original pin now proves exit:
+    /// the late record still belongs to the ended group, not a replacement.
+    fn request_refresh_consumed_for_view(
+        &mut self,
+        pid: u32,
+        now_ns: Option<u64>,
+        owner: ProcessViewId,
+    ) -> bool {
+        self.request_refresh_with(pid, now_ns, true, Some(owner))
+    }
+
+    fn request_refresh_with(
+        &mut self,
+        pid: u32,
+        now_ns: Option<u64>,
+        consumed: bool,
+        owner: Option<ProcessViewId>,
+    ) -> bool {
+        let existing = self.refresh_requested.get(&pid).cloned();
+        if existing.is_some() && !consumed {
+            return true;
         }
-        self.refresh_requested.insert(pid, now_ns);
+        if existing.is_none() && self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+            if consumed {
+                self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                // Diff-first arrivals retain their known dropped age.
+                let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                self.newcomer_ages
+                    .note_dropped(newcomer_age_ms(seen, now_ns));
+                self.mark_live_loss(
+                    "live discovery refresh",
+                    "refresh requests exceeded the bounded pending queue; excess requests were dropped",
+                );
+            } else {
+                self.mark_partial(
+                    "live discovery refresh",
+                    "refresh retry exceeded the bounded pending queue; work remains unfinished",
+                );
+            }
+            return false;
+        }
+        let Some(serial) = self.last_refresh_serial.checked_add(1) else {
+            if consumed {
+                self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                let refresh_seen = existing.as_ref().and_then(|request| request.first_seen_ns);
+                let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                let seen = match (refresh_seen, diff_seen) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                self.newcomer_ages
+                    .note_dropped(newcomer_age_ms(seen, now_ns));
+                self.mark_live_loss(
+                    "live discovery refresh",
+                    "refresh request serials were exhausted; a consumed request was refused",
+                );
+            } else {
+                self.mark_partial(
+                    "live discovery refresh",
+                    "refresh request serials were exhausted; retry work remains unfinished",
+                );
+            }
+            return false;
+        };
+        self.last_refresh_serial = serial;
+        let owner = owner.or_else(|| {
+            self.views
+                .iter()
+                .find(|view| view.pid() == pid && view.still_the_same())
+                .map(ProcessView::id)
+        });
+        self.refresh_requested.insert(
+            pid,
+            RefreshRequest {
+                first_seen_ns: existing
+                    .as_ref()
+                    .map_or(now_ns, |request| request.first_seen_ns),
+                serial,
+                owner,
+                exec_binding: None,
+                exec_hook_ts_ns: None,
+            },
+        );
+        if let Some(owner) = owner
+            && let Some(marker) = self.exec_rearm_views.get_mut(&owner)
+        {
+            *marker = Some(serial);
+        }
+        true
+    }
+
+    fn clear_refresh_for_view(&mut self, view: ProcessViewId, pid: u32) {
+        if self
+            .refresh_requested
+            .get(&pid)
+            .is_some_and(|request| request.owner == Some(view))
+        {
+            self.refresh_requested.remove(&pid);
+        }
+    }
+
+    fn refresh_request_snapshot(&self) -> BTreeMap<u32, u64> {
+        self.refresh_requested
+            .iter()
+            .map(|(pid, request)| (*pid, request.serial))
+            .collect()
+    }
+
+    fn complete_refresh_requests(&mut self, serviced: &BTreeMap<u32, u64>, failed: &BTreeSet<u32>) {
+        self.refresh_requested.retain(|pid, request| {
+            failed.contains(pid) || serviced.get(pid) != Some(&request.serial)
+        });
     }
 
     /// Marks one diff-discovered newcomer's arrival (first diff wins; later
@@ -8970,7 +12950,10 @@ impl Engine {
     /// mark (a loader event can queue a refresh before the diff finds the
     /// pid, or after — either order keeps the earlier observation).
     fn sample_newcomer_admission(&mut self, pid: u32, now_ns: Option<u64>) {
-        let refresh_seen = self.refresh_requested.get(&pid).copied().flatten();
+        let refresh_seen = self
+            .refresh_requested
+            .get(&pid)
+            .and_then(|request| request.first_seen_ns);
         let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
         let seen = match (refresh_seen, diff_seen) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -8988,12 +12971,21 @@ impl Engine {
     /// it. Unconditional by design — a dedup-hit marker (an eviction message
     /// identical to an earlier one) still follows a real mutation.
     fn note_facts_mutated(&mut self) {
+        self.loader_plan_cache = None;
         self.facts_revision = self.facts_revision.saturating_add(1);
     }
 
-    fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
-        if let Some(earliest) = self.pending_loader_scans.get_mut(&key) {
-            *earliest = (*earliest).min(hook_ts_ns);
+    fn defer_loader_memory_scan(
+        &mut self,
+        key: PendingLoaderScanKey,
+        hook_ts_ns: u64,
+        announced: u32,
+    ) {
+        if let Some(pending) = self.pending_loader_scans.get_mut(&key) {
+            // One transaction at a time per key: the loader lock serializes
+            // a process's map changes, so a second deferral only moves the
+            // timestamp. Keep the first announcement.
+            pending.0 = pending.0.min(hook_ts_ns);
             return;
         }
         if self.pending_loader_scans.len() == crate::discovery::loader::MAX_LOADER_CONTEXTS {
@@ -9002,7 +12994,8 @@ impl Engine {
             );
             return;
         }
-        self.pending_loader_scans.insert(key, hook_ts_ns);
+        self.pending_loader_scans
+            .insert(key, (hook_ts_ns, announced));
     }
 
     fn record_pending_loader_scan_loss(&mut self, reason: &str) {
@@ -9010,14 +13003,32 @@ impl Engine {
         self.mark_live_loss("live loader memory discovery", reason);
     }
 
-    /// A deferred scan whose process provably exited before the loader
-    /// transaction's RT_CONSISTENT. It stays a counted truncation, but not a
-    /// causal-timing loss: dlopen relocates and initializes an object only
-    /// after RT_CONSISTENT, so an object announced by RT_ADD in a process
-    /// that ended first never ran, and RT_DELETE introduces nothing (GT-4).
+    /// A deferred scan whose process provably exited before the scan
+    /// resolved. It stays a counted truncation (GT-4: the scan's table
+    /// was never published), but not a causal-timing loss: the exit
+    /// ended the loader observation the scan belonged to, so no later
+    /// timing proof can still need it. Exit is read at settle time —
+    /// the process may well have run (a short `run` child signs and
+    /// exits; only its scan outlived it) — and each such truncation is
+    /// also counted apart as exit-only, so K0's truncation-growth rule
+    /// can ignore growth the exiting process explains without hiding
+    /// real discovery loss.
     fn record_pending_loader_scan_end(&mut self, reason: &str) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[0] = self.exit_ended_by_route[0].saturating_add(1);
         self.mark_partial("live loader memory discovery", reason);
+    }
+
+    /// A zero-state scan whose process provably exited before the scan
+    /// resolved (R-1): counted exit-only like the deferred-scan end
+    /// above, but the live loss is kept — the RT_CONSISTENT code may
+    /// have run, so causal timing stays unproven.
+    fn record_pending_loader_scan_end_with_live_loss(&mut self, reason: &str) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[2] = self.exit_ended_by_route[2].saturating_add(1);
+        self.mark_live_loss("live loader memory discovery", reason);
     }
 
     fn settle_pending_loader_scan(
@@ -9091,7 +13102,39 @@ impl Engine {
         counters.object_skips
     }
 
+    /// Records the capture's object skips into the committed plan, reporting
+    /// whether the plan's skip list changed. Deferred publication shares
+    /// this with the full path: a changed list means the merge would fold
+    /// newly visible loss, so the commit must publish.
+    fn record_publication_skips(&mut self) -> bool {
+        let skips_start = crate::attach::monotonic_ns();
+        let before = self.plan.skipped.clone();
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Projection,
+            "record_publication_skips",
+            skips_start,
+            crate::attach::monotonic_ns(),
+        );
+        self.plan.skipped != before
+    }
+
     fn publish_current_capture_facts(&mut self) -> Result<()> {
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
+        self.record_publication_skips();
+        self.merge_and_project_capture_facts()
+    }
+
+    /// Merges committed state into the capture history and projects it onto
+    /// the plan and discovery evidence. Deferred publication skips this when
+    /// its gate proves the merge a no-op; every other path runs it.
+    fn merge_and_project_capture_facts(&mut self) -> Result<()> {
         let merge_start = crate::attach::monotonic_ns();
         let merged = self.capture_facts.merge_current(
             &self.plan,
@@ -9100,6 +13143,7 @@ impl Engine {
             &self.manifests,
             &self.manifest_ordinals,
             &self.counters,
+            &self.prearm,
         );
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
@@ -9112,28 +13156,20 @@ impl Engine {
             return Ok(());
         }
         self.project_capture_facts();
+        self.published_facts_revision = self.facts_revision;
         Ok(())
     }
 
-    /// One batch tail's publication work, gated (B1). A batch that changed
-    /// nothing and dirtied no publication input republishes byte-identical
-    /// facts: skip the skip-recompute, the evidence rebuild, and the
-    /// consumer resync. The revision gate (not `changed` alone) is what
-    /// makes this sound: scan time, loss markers, and plan-equal pin commits
-    /// all bump the revision without setting `changed`, and any of them
-    /// forces the tail to run.
-    fn publish_batch_tail(&mut self, changed: bool) -> Result<()> {
-        if changed || self.facts_revision != self.published_facts_revision {
-            let skips_start = crate::attach::monotonic_ns();
-            record_object_skips(&mut self.plan, &self.counters.object_skips);
-            self.stage_timings.span(
-                crate::timing::StageKind::Projection,
-                "record_tail_skips",
-                skips_start,
-                crate::attach::monotonic_ns(),
-            );
+    /// Reuse a candidate's completed publication when no later input changed.
+    /// The batch's `changed` flag still tells consumers to resynchronize; it
+    /// does not require publishing the same revision twice. Scan time, loss
+    /// markers and plan-equal pin commits dirty the revision independently.
+    /// Startup staging remains ineligible for public-publication reuse.
+    fn publish_batch_tail(&mut self, _changed: bool) -> Result<()> {
+        if self.facts_revision != self.published_facts_revision
+            || self.capture_facts.staged.is_some()
+        {
             self.publish_current_capture_facts()?;
-            self.published_facts_revision = self.facts_revision;
             self.tail_publishes = self.tail_publishes.saturating_add(1);
         } else {
             self.tail_skips = self.tail_skips.saturating_add(1);
@@ -9142,9 +13178,16 @@ impl Engine {
     }
 
     fn project_capture_facts(&mut self) {
+        self.loader_plan_cache = None;
         let project_start = crate::attach::monotonic_ns();
         self.capture_facts.apply_to_plan(&mut self.plan);
-        self.discovery = self.capture_facts.discovery(&self.plan);
+        // Borrow the budget's exclusion records before the mutable plan borrow
+        // ends: clone the small vecs (excluded files are few).
+        let excluded_records = self.budget.excluded().to_vec();
+        let excludes = self.budget.excludes().to_vec();
+        self.discovery = self
+            .capture_facts
+            .discovery(&self.plan, &excluded_records, &excludes);
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
             "project_facts",
@@ -9207,13 +13250,20 @@ impl Engine {
         // identity left with its process view stops accepting probes, and its
         // already-accepted aggregate cell stays exactly as it was.
         plan.retire_unpinned_targets(&pinned, plan.slots.len());
-        record_object_skips(&mut plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
 
         self.plan = plan;
         self.pinned = pinned;
         self.modules = modules;
         self.counters.corroboration = snapshot.corroboration;
         self.counters.manifest_fallbacks = snapshot.manifest_fallbacks;
+        // A restored snapshot bypasses the rebuild: committed state is no
+        // longer provably what a rebuild produces.
+        self.plan_rebuild_stable = false;
         self.note_facts_mutated();
         self.next_selection_binding_id = snapshot.next_selection_binding_id;
         self.selection_bindings = snapshot.selection_bindings;
@@ -9228,7 +13278,8 @@ impl Engine {
         } else if self.capture_facts.history.modules.is_empty()
             && self.capture_facts.history.decoded.is_empty()
         {
-            self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+            self.discovery =
+                discovery_evidence(&self.plan, &self.pinned, &self.counters, &self.prearm);
         } else {
             self.project_capture_facts();
         }
@@ -9243,6 +13294,7 @@ impl Engine {
             Ok(value) => {
                 self.capture_facts.commit_stage()?;
                 self.project_capture_facts();
+                self.published_facts_revision = self.facts_revision;
                 Ok(value)
             }
             Err(error) => {
@@ -9252,7 +13304,11 @@ impl Engine {
                 self.settle_all_pending_loader_scans(
                     "a deferred loader memory scan was unresolved when capture start was cancelled",
                 );
-                record_object_skips(&mut self.plan, &self.counters.object_skips);
+                record_object_skips(
+                    &mut self.plan,
+                    &self.counters.object_skips,
+                    &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+                );
                 Err(error)
             }
         }
@@ -9264,7 +13320,22 @@ impl Engine {
         raw_modules: Vec<ScannedModule>,
         skipped: Vec<Skipped>,
     ) -> Result<LiveCandidate> {
-        self.live_candidate_with_pending(pinned, raw_modules, skipped, None)
+        self.live_candidate_with_pending(pinned, raw_modules, skipped, None, &BTreeSet::new())
+    }
+
+    /// The inventory rebuild for a tick that declined some loss reports: a
+    /// declined view is retained but known-stale, so its selection claims
+    /// and tables survive the liveness filter below instead of dropping
+    /// (which would retire their sole-owned endpoints without an accepted
+    /// removal decision).
+    fn live_candidate_with_declined(
+        &mut self,
+        pinned: PinnedObjects,
+        raw_modules: Vec<ScannedModule>,
+        skipped: Vec<Skipped>,
+        declined: &BTreeSet<ProcessViewId>,
+    ) -> Result<LiveCandidate> {
+        self.live_candidate_with_pending(pinned, raw_modules, skipped, None, declined)
     }
 
     fn live_candidate_with_pending(
@@ -9273,7 +13344,9 @@ impl Engine {
         mut raw_modules: Vec<ScannedModule>,
         mut skipped: Vec<Skipped>,
         pending_selection: Option<&SelectionTableKey>,
+        declined: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
+        self.loader_plan_cache = None;
         let merge_head_start = crate::attach::monotonic_ns();
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
@@ -9328,9 +13401,31 @@ impl Engine {
         );
         let plan_start = crate::attach::monotonic_ns();
         let broad_admit = self.broad_admit;
-        let mut rebuilt =
-            self.plan
-                .rebuild_from_sources_broad(&modules, &self.manifests, &pinned, broad_admit);
+        let counter_hint = self.counter_hint;
+        // The live twin of the initial-build pre-arm join: a target mapping
+        // its provider after startup files a maps-keyed scan pin beside the
+        // fd-keyed pre-arm pin on pre-6.8 overlayfs. Re-file the split alias
+        // onto its scan pin before resolving pieces, or the rebuilt
+        // candidate bails on the same exact provider twice.
+        if let Some(prearm) = self.prearm_input.as_ref() {
+            for input in &prearm.inputs {
+                pinned.refile_split_prearm_alias(&input.path);
+            }
+        }
+        let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &pinned);
+        let mut rebuilt = self.plan.rebuild_from_sources_broad_with_prearm(
+            &modules,
+            &self.manifests,
+            &prearm_pieces,
+            &pinned,
+            broad_admit,
+            counter_hint,
+        );
+        // Live rebuilds keep pre-armed modules (and only create watches for
+        // newly appeared ones — live interval state is never reset).
+        let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &pinned);
+        self.prearm
+            .create_watches(&rebuilt.modules, &declared, &pinned);
         self.capture_facts.bind_plan_module_ids(
             &mut rebuilt,
             &modules,
@@ -9367,7 +13462,11 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         let mut merge_tail_start = crate::attach::monotonic_ns();
-        record_object_skips(&mut rebuilt, &self.counters.object_skips);
+        record_object_skips(
+            &mut rebuilt,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let module_objects: BTreeSet<_> =
             rebuilt.modules.iter().map(|module| module.object).collect();
         let mut corroboration = self.counters.corroboration.clone();
@@ -9401,6 +13500,8 @@ impl Engine {
         if !invalidated_modules.is_empty() || !invalidated_fallbacks.is_empty() {
             self.capture_facts
                 .invalidate_discovery_proofs(invalidated_modules, invalidated_fallbacks);
+            // Proof invalidation rewrites merge-input history mid-build.
+            self.note_facts_mutated();
             // The projection below records its own span: close the merge
             // tail before it and reopen after, so stages never overlap.
             self.stage_timings.span(
@@ -9433,10 +13534,12 @@ impl Engine {
             let Some(binding) = self.selection_bindings.get(&key.binding_id) else {
                 return false;
             };
-            let live_view = self
-                .views
-                .iter()
-                .any(|view| view.id() == key.view && view.still_the_same());
+            // A declined view is retained but known-stale: its claims
+            // survive like a live view's, or the rebuild below retires
+            // their sole-owned endpoints with no accepted removal.
+            let live_view = self.views.iter().any(|view| {
+                view.id() == key.view && (declined.contains(&key.view) || view.still_the_same())
+            });
             let binding_live = binding.attached
                 && !binding.retired
                 && binding.context.get() == key.context
@@ -9467,15 +13570,14 @@ impl Engine {
         }
         let mut selection_tables = self.selection_tables.clone();
         selection_tables.retain(|key, _| {
-            self.views
-                .iter()
-                .any(|view| view.id() == key.view && view.still_the_same())
-                && modules.iter().any(|module| {
-                    module.scanned.view == key.view
-                        && pinned
-                            .owned_timing_key(module.object)
-                            .is_some_and(|provider| provider == key.provider)
-                })
+            self.views.iter().any(|view| {
+                view.id() == key.view && (declined.contains(&key.view) || view.still_the_same())
+            }) && modules.iter().any(|module| {
+                module.scanned.view == key.view
+                    && pinned
+                        .owned_timing_key(module.object)
+                        .is_some_and(|provider| provider == key.provider)
+            })
         });
         let active_selection_tables = selection_tables_from_claims(&selection_claims);
         for (key, table) in active_selection_tables {
@@ -9532,7 +13634,11 @@ impl Engine {
         if !candidate_identity_is_complete(&candidate_plan, &modules, &pinned) {
             bail!("live candidate retained an active module or slot without exact pinned identity");
         }
-        record_object_skips(&mut candidate_plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut candidate_plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let views = modules.iter().map(|module| module.scanned.view).collect();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
@@ -9553,7 +13659,61 @@ impl Engine {
             selection_admission: None,
             manifest_selection_admissions,
             manifest_inventory_slots,
+            loader_plan_proof: None,
+            exec_preservations: Vec::new(),
+            exec_completions: Vec::new(),
+            built_by_full_rebuild: true,
         })
+    }
+
+    /// Prove only the admitted loader's pin ownership may change. Existing
+    /// proof/table history is permitted; inputs requiring fresh admission or
+    /// retirement stay on the original planner path.
+    fn loader_inputs_are_stationary(
+        &self,
+        view: ProcessViewId,
+        loader_module: &ScannedModule,
+        pinned: &PinnedObjects,
+        loader: PinnedObjectId,
+    ) -> bool {
+        // The merge renders pre-arm watches, but watch transitions
+        // re-render discovery directly without dirtying the facts
+        // revision — so a proved commit could defer and leave the stored
+        // history watch stale. Deny the proof while any watch exists:
+        // pre-arm captures merge per commit, exactly as before deferral.
+        self.capture_facts.staged.is_none()
+            && self.facts_revision == self.published_facts_revision
+            && self.prearm.is_empty()
+            && self.inventory.is_none()
+            && self.manifests.is_empty()
+            && self.manifest_ordinals.is_empty()
+            && self.manifest_inputs.is_empty()
+            && self.counters.manifest_fallbacks.is_empty()
+            && self.selection_claims.is_empty()
+            && self.pending_retirements.is_empty()
+            && self.retirement_intents.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && self.pending_leader_exit_views.is_empty()
+            && self.ready_expected_removals.is_empty()
+            && self.expected_target_exit_pending.is_none()
+            && self.plan.active_slot_count() == self.plan.slots.len()
+            && loader_module.view == view
+            && loader_module.tables.is_empty()
+            && loader_module.interfaces.is_empty()
+            && self.modules.iter().all(|module| {
+                module.object != loader
+                    && !module
+                        .entry_objects
+                        .iter()
+                        .flatten()
+                        .any(|id| *id == loader)
+            })
+            && pinned
+                .view_claims(view)
+                .is_some_and(|claims| claims.pins.contains(&loader))
+            && self
+                .pinned
+                .preserves_provider_inputs_for_loader(pinned, loader)
     }
 
     fn loader_candidate(
@@ -9571,12 +13731,100 @@ impl Engine {
             .is_some_and(|candidate_loader| {
                 loader_pins.exactly_matches(local_loader, &candidate_pins, candidate_loader)
             });
-        let raw_modules = self
-            .modules
-            .iter()
-            .map(|module| module.scanned.clone())
-            .collect();
-        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        // Canonicalize the candidate pins directly instead of a probe
+        // clone. With no folds the canonicalizer is the identity (empty
+        // remaps mutate nothing), so the stationary path below commits
+        // exactly what the probe would have approved; with folds the miss
+        // path re-canonicalizes idempotently, and the lost skips join the
+        // derivation inputs so the same skips record in the same order.
+        let stationary = if skipped.is_empty() && had_exact_loader {
+            let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
+            let clean = folds == 0 && lost.is_empty();
+            skipped.extend(lost);
+            candidate_pins
+                .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
+                .is_some_and(|loader| {
+                    clean
+                        && self.loader_inputs_are_stationary(
+                            view,
+                            loader_module,
+                            &candidate_pins,
+                            loader,
+                        )
+                })
+        } else {
+            false
+        };
+        let proof = stationary.then(|| LoaderPlanProof {
+            revision: self.facts_revision,
+            published_plan: self.plan.clone(),
+            discovery: self.discovery.clone(),
+        });
+        let cached_plan = stationary
+            .then_some(self.loader_plan_cache.as_ref())
+            .flatten()
+            .filter(|cache| {
+                cache.revision == self.published_facts_revision
+                    && cache.broad_admit == self.broad_admit
+                    && cache.counter_hint == self.counter_hint
+            })
+            .map(|cache| cache.plan.clone());
+        let mut candidate = if let Some(plan) = cached_plan {
+            LiveCandidate {
+                pinned: candidate_pins,
+                modules: self.modules.clone(),
+                plan,
+                delta: plan::AttachDelta {
+                    new: Vec::new(),
+                    replace: Vec::new(),
+                    retire: Vec::new(),
+                },
+                views: self
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.view)
+                    .collect(),
+                corroboration: self.counters.corroboration.clone(),
+                manifest_fallbacks: Vec::new(),
+                selection_claims: BTreeMap::new(),
+                selection_tables: self.selection_tables.clone(),
+                selection_admission: None,
+                manifest_selection_admissions: Vec::new(),
+                // No manifest/selection admission can use rollback inventory.
+                manifest_inventory_slots: BTreeMap::new(),
+                // The cache hit implies stationary, and this literal
+                // constructs every proof conjunct: the delta is built
+                // empty, modules/corroboration/tables are clones of `Eq`
+                // types (reflexive), and stationary's empty
+                // manifest-fallback and selection-claim requirements match
+                // the empty constructed maps. Attach the proof (always
+                // `Some` here) without re-walking the structures.
+                loader_plan_proof: proof,
+                exec_preservations: Vec::new(),
+                exec_completions: Vec::new(),
+                built_by_full_rebuild: false,
+            }
+        } else {
+            self.loader_plan_cache = None;
+            let raw_modules = self
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect();
+            let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+            if candidate.delta.new.is_empty()
+                && candidate.delta.replace.is_empty()
+                && candidate.delta.retire.is_empty()
+                && candidate.modules == self.modules
+                && candidate.corroboration == self.counters.corroboration
+                && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
+                && candidate.selection_claims == self.selection_claims
+                && candidate.selection_tables == self.selection_tables
+            {
+                candidate.loader_plan_proof = proof;
+            }
+            candidate
+        };
         candidate.views.insert(view);
         let loader = candidate
             .pinned
@@ -9641,15 +13889,112 @@ impl Engine {
         self.live_candidate(pinned, raw_modules, skipped)
     }
 
+    fn lower_registered_retries(&self, session: &dyn EngineSession, candidate: &mut LiveCandidate) {
+        let held: Vec<_> = candidate
+            .delta
+            .new
+            .extract_if(.., |slot| session.has_slot_link(slot.index))
+            .collect();
+        candidate.delta.replace.extend(held);
+        // A detach preflight can leave the native handles untouched while the
+        // failed candidate deactivates their cookies. The planner never reuses
+        // those cookies: retire their actual handles before attaching retries.
+        for slot in &self.plan.slots {
+            if !self.plan.is_active(slot.index)
+                && session.has_slot_link(slot.index)
+                && !candidate
+                    .delta
+                    .retire
+                    .iter()
+                    .chain(&candidate.delta.replace)
+                    .any(|selected| selected.index == slot.index)
+            {
+                candidate.delta.retire.push(slot.clone());
+            }
+        }
+    }
+
     fn apply_candidate(
+        &mut self,
+        session: &mut dyn EngineSession,
+        candidate: LiveCandidate,
+        additions_allowed: &mut bool,
+        preflighted: bool,
+        extra_views: &[&ProcessView],
+    ) -> Result<ApplyOutcome> {
+        self.apply_candidate_with_ended(
+            session,
+            candidate,
+            additions_allowed,
+            preflighted,
+            extra_views,
+            None,
+        )
+    }
+
+    fn apply_candidate_with_ended(
         &mut self,
         session: &mut dyn EngineSession,
         mut candidate: LiveCandidate,
         additions_allowed: &mut bool,
         preflighted: bool,
         extra_views: &[&ProcessView],
+        ended: Option<&PendingEndedPidRetirement>,
     ) -> Result<ApplyOutcome> {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Apply,
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.delta.retire.len() as u64),
+                    Some(
+                        (candidate.exec_preservations.len() + candidate.exec_completions.len())
+                            as u64,
+                    ),
+                ],
+            )
+        });
         let mut outcome = ApplyOutcome::default();
+        if self.continuity_deferred || self.cancellation_requested() || session.mutation_stopped() {
+            *additions_allowed = false;
+            // Stop-time newcomers (item 6): the terminal drain runs after
+            // the stop gate closed, so every candidate refuses here — but
+            // the tick already admitted and scanned its newcomers above.
+            // A scanned newcomer that mapped a provider and is dropped
+            // unpublished must not vanish silently: its calls were never
+            // observed. A fully scanned provider-free newcomer needs no
+            // attach and leaves no mark (the live-tick `undone` predicate
+            // below, reused over the refused views). Live deferrals retry
+            // on a later tick, so only the stopping capture marks.
+            if session.mutation_stopped()
+                && extra_views.iter().any(|view| {
+                    candidate
+                        .modules
+                        .iter()
+                        .any(|module| module.scanned.view == view.id())
+                })
+            {
+                self.mark_partial(
+                    "live inventory transaction",
+                    "a new process mapped a provider after the capture began stopping; its calls were not observed",
+                );
+            }
+            return Ok(outcome);
+        }
+        // A pending batch owns the whole global candidate boundary, including
+        // replacement-only candidates. Never replay this candidate after close.
+        if self.pending_global_retirement.is_some() {
+            outcome.disposition = ApplyDisposition::Deferred;
+            outcome
+                .unpublished_views
+                .extend(extra_views.iter().map(|view| view.id()));
+            return Ok(outcome);
+        }
+        if !preflighted {
+            self.lower_registered_retries(session, &mut candidate);
+        }
         let targets: Vec<_> = candidate
             .delta
             .new
@@ -9659,11 +14004,31 @@ impl Engine {
             .collect();
         let timing_owners = candidate_timing_owners(&candidate);
         let target_modules = delta_timing_keys(&candidate.delta, &timing_owners);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let preflight_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Preflight,
+                [
+                    Some(targets.len() as u64),
+                    Some(u64::from(preflighted)),
+                    None,
+                    None,
+                ],
+            )
+        });
         let preflight_start = crate::attach::monotonic_ns();
         let targets_ok = preflighted
             || session
                 .preflight_targets(&targets, &candidate.pinned)
                 .is_ok();
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = preflight_span {
+            span.finish(if targets_ok {
+                DiagnosticOutcome::Ok
+            } else {
+                DiagnosticOutcome::Refused
+            });
+        }
         // A preflighted candidate paid nothing here: the span still records
         // (usually zero) so invocations count applications, not syscalls.
         self.stage_timings.span(
@@ -9681,7 +14046,9 @@ impl Engine {
             &self.pinned,
             targets_ok,
         );
-        outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        if !candidate.has_exec_receipts() {
+            outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        }
         let generation_stale = !admission.stale_views.is_empty();
         outcome.stale_views = admission.stale_views;
         outcome.missing_contexts = admission.missing_contexts;
@@ -9716,6 +14083,63 @@ impl Engine {
         // link mutation below there is no rollback and no early return, so
         // identity, planner, and history work all has to be proven here.
         self.preflight_candidate_publication(&candidate)?;
+        let preservation_ok = !self.cancellation_requested()
+            && !session.mutation_stopped()
+            && candidate.exec_preservations.iter().all(|prepared| {
+                self.views
+                    .iter()
+                    .find(|view| view.id() == prepared.view)
+                    .is_some_and(|view| {
+                        self.refresh_requested
+                            .get(&view.pid())
+                            .is_some_and(|request| {
+                                request.owner == Some(prepared.view)
+                                    && request.serial == prepared.serial
+                                    && request.exec_binding.as_ref().is_some_and(|binding| {
+                                        session.validate_preservation(
+                                            &prepared.receipt,
+                                            binding,
+                                            view,
+                                            prepared.serial,
+                                            &candidate.pinned,
+                                        )
+                                    })
+                            })
+                    })
+            })
+            && candidate.exec_completions.iter().all(|prepared| {
+                self.views
+                    .iter()
+                    .find(|view| view.id() == prepared.view)
+                    .is_some_and(|view| {
+                        self.refresh_requested
+                            .get(&view.pid())
+                            .is_some_and(|request| {
+                                request.owner == Some(prepared.view)
+                                    && request.serial == prepared.serial
+                                    && request.exec_binding.as_ref().is_some_and(|binding| {
+                                        session.validate_completed_rearm(
+                                            &prepared.receipt,
+                                            binding,
+                                            view,
+                                            prepared.serial,
+                                            &candidate.pinned,
+                                        )
+                                    })
+                            })
+                    })
+            })
+            && !self.cancellation_requested()
+            && !session.mutation_stopped();
+        if !preservation_ok {
+            self.continuity_deferred = true;
+            *additions_allowed = false;
+            self.mark_partial("live exec continuity", "current Session/request/target/health/frontier refused preservation before mutation; refresh remains pending");
+            return Ok(outcome);
+        }
+        if candidate.has_exec_receipts() {
+            outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        }
 
         let selected: Vec<_> = candidate
             .delta
@@ -9725,13 +14149,117 @@ impl Engine {
             .cloned()
             .collect();
         let detach_slots_start = crate::attach::monotonic_ns();
-        let detach_slots_outcome = session.detach_slots(&selected);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::DetachSlots,
+                [Some(selected.len() as u64), None, None, None],
+            )
+        });
+        let detach_slots_outcome = match ended.filter(|_| {
+            candidate.delta.new.is_empty()
+                && candidate.delta.replace.is_empty()
+                && candidate.views.is_empty()
+        }) {
+            Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
+            // Live/stop and publication checks already passed above. A
+            // removal-only conservative candidate closes additions without
+            // changing eligibility to retire its actually owned global links.
+            // Session still rejects PID, stopped or ineligible ownership.
+            None if ended.is_none() => match session.begin_global_static_retirement(&selected) {
+                Ok(Some(ticket)) => Ok(crate::attach::DetachOutcome {
+                    pending: Some(ticket),
+                    ..Default::default()
+                }),
+                Ok(None) => session.detach_slots(&selected),
+                Err(error) => Err(error),
+            },
+            None => session.detach_slots(&selected),
+        };
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = detach_span {
+            span.finish_result(&detach_slots_outcome);
+        }
+        self.sync_physical_gap(session);
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "detach_slots",
             detach_slots_start,
             crate::attach::monotonic_ns(),
         );
+        if let Ok(report) = &detach_slots_outcome
+            && let Some(ticket) = &report.pending
+        {
+            // Authority comes from the Session's actual extracted original
+            // registrations, never from updated replacement descriptors or
+            // unaccepted candidate additions. Retain pins/modules/history.
+            for index in ticket.retired_slots() {
+                if !self.plan.slots.iter().any(|slot| slot.index == *index) {
+                    self.mark_partial("global native retirement", "a retired original registration has no historical plan slot; its ownership cannot grant replacement authority");
+                }
+                if self.plan.is_active(*index) {
+                    self.plan.deactivate(*index);
+                    self.plan_rebuild_stable = false;
+                    outcome.changed = true;
+                }
+            }
+            // Only historical providers that owned actual retired slots, and
+            // unpublished newcomers, need fresh ordinary discovery. Existing
+            // requests keep their exact owner, serial and first arrival time.
+            let owners: BTreeSet<_> = self
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| ticket.retired_slots().contains(&slot.index))
+                .flat_map(|slot| slot.module_ids.iter().copied())
+                .collect();
+            let objects: BTreeSet<_> = self
+                .plan
+                .modules
+                .iter()
+                .filter(|module| owners.contains(&module.id))
+                .map(|module| module.object)
+                .collect();
+            let views: BTreeSet<_> = self
+                .modules
+                .iter()
+                .filter(|module| objects.contains(&module.object))
+                .map(|module| module.scanned.view)
+                .collect();
+            let pids: BTreeSet<_> = self
+                .views
+                .iter()
+                .filter(|view| views.contains(&view.id()))
+                .map(ProcessView::pid)
+                .chain(extra_views.iter().map(|view| view.pid()))
+                .collect();
+            let arrival = crate::attach::monotonic_ns();
+            for pid in pids {
+                self.request_refresh(pid, arrival);
+            }
+            let unlinked: Vec<_> = candidate
+                .plan
+                .slots
+                .iter()
+                .skip(self.plan.slots.len())
+                .map(|slot| slot.index)
+                .collect();
+            for index in unlinked {
+                candidate.plan.deactivate(index);
+            }
+            candidate
+                .plan
+                .withdraw_unlinked_additions(self.plan.slots.len());
+            if outcome.changed {
+                self.note_facts_mutated();
+            }
+            self.pending_global_retirement = Some(ticket.clone());
+            outcome.disposition = ApplyDisposition::Deferred;
+            outcome
+                .unpublished_views
+                .extend(extra_views.iter().map(|view| view.id()));
+            return Ok(outcome);
+        }
         let detach_failed = match detach_slots_outcome {
             Ok(report) => {
                 self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);
@@ -9766,10 +14294,34 @@ impl Engine {
         } else {
             let candidate_views = candidate.views.clone();
             let mut generation_lost = false;
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            let new_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+                d.begin(
+                    DiagnosticPhase::NewAttach,
+                    [Some(candidate.delta.new.len() as u64), None, None, None],
+                )
+            });
+            let counter_growth = session.capture_policy().counter_mode().is_some();
             let attach_targets_start = crate::attach::monotonic_ns();
+            let counter_reserve = counter_growth.then(|| self.counter_reserver());
             let attach = generation_checked_mutation(
                 || process_views_are_current(&self.views, extra_views, &candidate_views),
-                || session.attach_targets(&candidate.delta.new, &candidate.pinned),
+                || {
+                    if let Some(reserve) = counter_reserve.as_ref() {
+                        counter_growth_attach_outcome(
+                            session,
+                            &mut candidate.plan,
+                            &candidate.pinned,
+                            reserve,
+                        )
+                    } else {
+                        session.attach_targets(
+                            &candidate.delta.new,
+                            &candidate.pinned,
+                            &self.prearm.ended_declared_keys(),
+                        )
+                    }
+                },
             );
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,
@@ -9777,6 +14329,20 @@ impl Engine {
                 attach_targets_start,
                 crate::attach::monotonic_ns(),
             );
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            if let Some(span) = new_span {
+                span.finish(match &attach {
+                    GenerationMutation::PrecheckFailed => DiagnosticOutcome::SerialChanged,
+                    GenerationMutation::PostcheckFailed(_) => DiagnosticOutcome::SerialChanged,
+                    GenerationMutation::Committed(result) => {
+                        if result.is_ok() {
+                            DiagnosticOutcome::Ok
+                        } else {
+                            DiagnosticOutcome::Error
+                        }
+                    }
+                });
+            }
             let (attach, attach_stale) = match attach {
                 GenerationMutation::PrecheckFailed => (None, true),
                 GenerationMutation::Committed(result) => (Some(result), false),
@@ -9784,7 +14350,33 @@ impl Engine {
             };
             generation_lost |= attach_stale;
             new_targets_attached = attach.is_some();
-            if let Some(attach) = attach {
+            if counter_growth {
+                // Counter growth stages the candidate plan append-only.
+                // Refusals deactivate the fresh tail for withdrawal and
+                // report PARTIAL with the refusal token; the published
+                // prefix and its plan extent stay intact.
+                match attach {
+                    None => {
+                        new_targets_attached = false;
+                    }
+                    Some(Ok((_, completed))) => {
+                        outcome.record_completions(&candidate.delta.new, &timing_owners, completed);
+                    }
+                    Some(Err(error)) => {
+                        for slot in &candidate.delta.new {
+                            outcome
+                                .static_failures
+                                .extend(slot_timing_keys(slot, &timing_owners));
+                            candidate.plan.deactivate(slot.index);
+                        }
+                        self.mark_partial(
+                            "live counter growth",
+                            &format!("counter bank growth refused: {error:#}"),
+                        );
+                        new_targets_attached = false;
+                    }
+                }
+            } else if let Some(attach) = attach {
                 match attach {
                     Ok((failed, completed)) => {
                         outcome.record_completions(&candidate.delta.new, &timing_owners, completed);
@@ -9796,7 +14388,9 @@ impl Engine {
                             .cloned()
                             .collect();
                         let detach_failed_slots_start = crate::attach::monotonic_ns();
-                        let detach_failed_slots_outcome = session.detach_slots(&failed_slots);
+                        let detach_failed_slots_outcome =
+                            session.detach_failed_slots(&failed_slots);
+                        self.sync_physical_gap(session);
                         self.stage_timings.span(
                             crate::timing::StageKind::Attach,
                             "detach_failed_slots",
@@ -9839,8 +14433,21 @@ impl Engine {
                     }
                 }
             }
-            if *additions_allowed && !generation_lost {
+            // Counter growth is append-only: replacements never run here
+            // (the bank guard would refuse the empty attach). Non-empty
+            // counter replacements keep flowing below and refuse honestly.
+            if *additions_allowed
+                && !generation_lost
+                && (!counter_growth || !candidate.delta.replace.is_empty())
+            {
                 let detach_failures = session.detach_failures().len();
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                let replace_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+                    d.begin(
+                        DiagnosticPhase::ReplaceAttach,
+                        [Some(candidate.delta.replace.len() as u64), None, None, None],
+                    )
+                });
                 let replace_targets_start = crate::attach::monotonic_ns();
                 let replacement = generation_checked_mutation(
                     || process_views_are_current(&self.views, extra_views, &candidate_views),
@@ -9858,6 +14465,20 @@ impl Engine {
                     replace_targets_start,
                     crate::attach::monotonic_ns(),
                 );
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                if let Some(span) = replace_span {
+                    span.finish(match &replacement {
+                        GenerationMutation::PrecheckFailed => DiagnosticOutcome::SerialChanged,
+                        GenerationMutation::PostcheckFailed(_) => DiagnosticOutcome::SerialChanged,
+                        GenerationMutation::Committed(result) => {
+                            if result.is_ok() {
+                                DiagnosticOutcome::Ok
+                            } else {
+                                DiagnosticOutcome::Error
+                            }
+                        }
+                    });
+                }
                 let (replacement, replacement_stale) = match replacement {
                     GenerationMutation::PrecheckFailed => (None, true),
                     GenerationMutation::Committed(result) => (Some(result), false),
@@ -9986,6 +14607,7 @@ impl Engine {
                 .collect();
             self.unpaused_loader_views.extend(views);
         }
+        self.sync_physical_gap(session);
         self.finalize_candidate(
             session,
             candidate,
@@ -9995,6 +14617,37 @@ impl Engine {
             additions_allowed,
             &mut outcome,
         );
+        self.sync_physical_gap(session);
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::Apply,
+                if outcome.accepted() {
+                    DiagnosticOutcome::Accepted
+                } else {
+                    DiagnosticOutcome::Rejected
+                },
+                [
+                    Some(
+                        self.plan
+                            .slots
+                            .iter()
+                            .filter(|s| self.plan.is_active(s.index))
+                            .count() as u64,
+                    ),
+                    Some(self.plan.slots.len() as u64),
+                    Some(outcome.static_failures.len() as u64),
+                    Some(u64::from(outcome.detach_failed)),
+                ],
+            );
+        });
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = diagnostic_span {
+            span.finish(if outcome.accepted() {
+                DiagnosticOutcome::Accepted
+            } else {
+                DiagnosticOutcome::Rejected
+            });
+        }
         Ok(outcome)
     }
 
@@ -10044,6 +14697,391 @@ impl Engine {
         }
     }
 
+    /// The view's accepted static targets that survived the rescan unchanged:
+    /// active, attributable to the view's reconciled modules, and absent
+    /// from every delta list. Anything the ordinary delta already churns is
+    /// excluded, so forcing never double-covers a target.
+    fn unchanged_exec_targets(view: ProcessViewId, candidate: &LiveCandidate) -> Vec<plan::Slot> {
+        let owned: BTreeSet<PinnedObjectId> = candidate
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == view)
+            .map(|module| module.object)
+            .collect();
+        let covered: BTreeSet<u32> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .chain(&candidate.delta.retire)
+            .map(|slot| slot.index)
+            .collect();
+        candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                candidate.plan.is_active(slot.index)
+                    && !covered.contains(&slot.index)
+                    && slot.module_ids.iter().any(|id| {
+                        candidate
+                            .plan
+                            .modules
+                            .iter()
+                            .any(|module| module.id == *id && owned.contains(&module.object))
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Mints one exec rearm for an exec-refreshed view: the refresh request
+    /// still names this exact matched owner at the tick's checked serial,
+    /// original custody is live, and the rescan re-accepted the same static
+    /// targets. System/Cgroup file links survive caller exec, so their token
+    /// carries no forced slots. Anything else mints nothing: a renewed serial
+    /// or a lost generation stays owned by a later attempt, and changed PID
+    /// targets stay owned by the ordinary delta.
+    fn prepare_exec_rearm(
+        &self,
+        session: &mut dyn EngineSession,
+        view: ProcessViewId,
+        serial: u64,
+        candidate: &LiveCandidate,
+    ) -> Option<PreparedExecRearm> {
+        let Some(retained) = self.views.iter().find(|old| old.id() == view) else {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoOwner,
+                    [None; 4],
+                );
+            });
+            return None;
+        };
+        if !retained.still_the_same() {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoOwner,
+                    [None; 4],
+                );
+            });
+            return None;
+        }
+        let Some(request) = self.refresh_requested.get(&retained.pid()) else {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoOwner,
+                    [None; 4],
+                );
+            });
+            return None;
+        };
+        if request.owner != Some(view) || request.serial != serial {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::SerialChanged,
+                    [None; 4],
+                );
+            });
+            return None;
+        }
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            let renewed = diag.serial(Some(serial));
+            diag.note(
+                DiagnosticPhase::Request,
+                if renewed {
+                    DiagnosticOutcome::Renewed
+                } else {
+                    DiagnosticOutcome::Queued
+                },
+                [
+                    Some(self.refresh_requested.len() as u64),
+                    Some(self.exec_rearm_views.len() as u64),
+                    None,
+                    None,
+                ],
+            );
+        });
+        let slots = if matches!(self.scope, Scope::Pid(_)) {
+            let slots = Self::unchanged_exec_targets(view, candidate);
+            if slots.is_empty() {
+                crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                    diag.note(
+                        DiagnosticPhase::Rearm,
+                        DiagnosticOutcome::NoTargets,
+                        [Some(0), None, None, None],
+                    );
+                });
+                return None;
+            }
+            slots
+        } else {
+            Vec::new()
+        };
+        let ordinary: Vec<_> = candidate
+            .delta
+            .retire
+            .iter()
+            .chain(&candidate.delta.replace)
+            .cloned()
+            .collect();
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            if request.exec_binding.is_none() {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoBinding,
+                    [Some(slots.len() as u64), None, None, None],
+                );
+            }
+        });
+        let preservation = request.exec_binding.as_ref().and_then(|binding| {
+            session.prepare_preservation(
+                binding,
+                retained,
+                serial,
+                &slots,
+                &ordinary,
+                &candidate.pinned,
+            )
+        });
+        let completed = if preservation.is_none() {
+            request.exec_binding.as_ref().and_then(|binding| {
+                session.prepare_completed_rearm(
+                    binding,
+                    retained,
+                    serial,
+                    &slots,
+                    &ordinary,
+                    &candidate.pinned,
+                )
+            })
+        } else {
+            None
+        };
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::Rearm,
+                if preservation.is_some() {
+                    DiagnosticOutcome::Preserved
+                } else if completed.is_some() {
+                    DiagnosticOutcome::Accepted
+                } else {
+                    DiagnosticOutcome::Forced
+                },
+                [
+                    Some(slots.len() as u64),
+                    Some(ordinary.len() as u64),
+                    Some(u64::from(request.exec_binding.is_some())),
+                    None,
+                ],
+            );
+        });
+        Some(PreparedExecRearm {
+            view,
+            serial,
+            slots,
+            preservation,
+            completed,
+        })
+    }
+
+    /// Lowers one minted rearm into the existing replacement transaction: the
+    /// unchanged accepted PID targets detach and reattach at their same
+    /// object/offset/slot through `detach_slots`/`replace_targets`. The
+    /// request binding is rechecked first: a renewal since minting owns the
+    /// retry, and this attempt retires without touching the delta. A global
+    /// token leaves the ordinary delta intact and only settles after apply.
+    fn consume_exec_rearm(
+        &self,
+        candidate: &mut LiveCandidate,
+        prepared: PreparedExecRearm,
+    ) -> bool {
+        let current = self
+            .views
+            .iter()
+            .find(|view| view.id() == prepared.view)
+            .and_then(|view| self.refresh_requested.get(&view.pid()));
+        let renewed = current.is_none_or(|request| {
+            request.owner != Some(prepared.view) || request.serial != prepared.serial
+        });
+        if renewed {
+            return false;
+        }
+        if let Some(receipt) = prepared.preservation {
+            candidate.exec_preservations.push(PreparedPreservation {
+                view: prepared.view,
+                serial: prepared.serial,
+                receipt,
+            });
+        } else if let Some(receipt) = prepared.completed {
+            candidate.exec_completions.push(PreparedCompletedRearm {
+                view: prepared.view,
+                serial: prepared.serial,
+                receipt,
+            });
+        } else {
+            candidate.delta.replace.extend(prepared.slots);
+        }
+        true
+    }
+
+    /// Forces PID exec-refreshed views whose rescan re-accepted the same static
+    /// targets through the existing detach/replace transaction. Global scope
+    /// markers settle with their context refresh without forced slots. Only
+    /// views carrying a matched-EXEC marker, a matched owner at the tick's checked
+    /// serial, and live original custody mint a rearm, and only their own
+    /// unchanged active targets are lowered — unrelated views' links are
+    /// never touched. Lowering reports the consumed views but clears nothing:
+    /// the caller clears them only after the apply mutates (a completed
+    /// rearm, or an ordinary delta that already churned every attributable
+    /// target). A tick that aborts after lowering — stale views, a refused
+    /// preflight, a refused apply — keeps every marker, so the retry the
+    /// retained request owns re-forces the same unchanged links instead of
+    /// completing with them silently dead.
+    fn lower_exec_rearms(
+        &mut self,
+        session: &mut dyn EngineSession,
+        candidate: &mut LiveCandidate,
+        refreshed: &BTreeSet<ProcessViewId>,
+        serviced: &BTreeMap<u32, u64>,
+    ) -> Vec<(ProcessViewId, u64)> {
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::Candidate,
+                DiagnosticOutcome::Ok,
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.delta.retire.len() as u64),
+                    Some(candidate.exec_preservations.len() as u64),
+                ],
+            );
+            let old: Vec<_> = self
+                .plan
+                .slots
+                .iter()
+                .take(136)
+                .filter(|slot| self.plan.is_active(slot.index))
+                .collect();
+            let current: Vec<_> = candidate
+                .plan
+                .slots
+                .iter()
+                .take(136)
+                .filter(|slot| candidate.plan.is_active(slot.index))
+                .collect();
+            let mut same_id = 0u64;
+            let mut same_file = 0u64;
+            let mut unknown = 0u64;
+            for before in &old {
+                same_id += u64::from(current.iter().any(|after| {
+                    before.object == after.object && before.file_offset == after.file_offset
+                }));
+                if let Some(identity) = self.plan.target_object_of(before) {
+                    same_file += u64::from(current.iter().any(|after| {
+                        before.file_offset == after.file_offset
+                            && candidate.plan.target_object_of(after).as_ref() == Some(&identity)
+                    }));
+                } else {
+                    unknown += 1;
+                }
+            }
+            diag.note(
+                DiagnosticPhase::Identity,
+                if self.plan.slots.len() > 136 || candidate.plan.slots.len() > 136 {
+                    DiagnosticOutcome::Incomplete
+                } else {
+                    DiagnosticOutcome::Ok
+                },
+                [
+                    Some(same_id),
+                    Some(same_file),
+                    Some(unknown),
+                    Some(old.len() as u64),
+                ],
+            );
+        });
+        let marked: Vec<ProcessViewId> = refreshed
+            .iter()
+            .copied()
+            .filter(|view| self.exec_rearm_views.contains_key(view))
+            .collect();
+        let mut lowered = Vec::new();
+        for view in marked {
+            let serial = self
+                .views
+                .iter()
+                .find(|old| old.id() == view)
+                .map(ProcessView::pid)
+                .and_then(|pid| serviced.get(&pid).copied());
+            let Some(serial) = serial else {
+                continue;
+            };
+            if let Some(prepared) = self.prepare_exec_rearm(session, view, serial, candidate)
+                && self.consume_exec_rearm(candidate, prepared)
+            {
+                lowered.push((view, serial));
+                continue;
+            }
+            let current = self
+                .views
+                .iter()
+                .find(|old| old.id() == view)
+                .and_then(|old| self.refresh_requested.get(&old.pid()));
+            if current
+                .is_some_and(|request| request.owner == Some(view) && request.serial == serial)
+                && self.exec_rearm_views.get(&view) == Some(&Some(serial))
+                && Self::exec_rearm_moot(view, candidate)
+            {
+                crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                    diag.note(
+                        DiagnosticPhase::Rearm,
+                        DiagnosticOutcome::Moot,
+                        [Some(0), None, None, None],
+                    );
+                });
+                lowered.push((view, serial));
+            }
+        }
+        lowered
+    }
+
+    fn settle_exec_rearms(&mut self, serviced: impl IntoIterator<Item = (ProcessViewId, u64)>) {
+        for (view, serial) in serviced {
+            if self.exec_rearm_views.get(&view) == Some(&Some(serial)) {
+                self.exec_rearm_views.remove(&view);
+            }
+        }
+    }
+
+    /// Completed-pair acknowledgement is positive publication authority.
+    /// Existing destructive/conservative recovery retains its settlement rule.
+    fn settle_applied_exec_rearms(
+        &mut self,
+        serviced: impl IntoIterator<Item = (ProcessViewId, u64)>,
+        completed: &BTreeSet<(ProcessViewId, u64)>,
+        outcome: &ApplyOutcome,
+    ) {
+        if !outcome.retains_intent() {
+            self.settle_exec_rearms(
+                serviced
+                    .into_iter()
+                    .filter(|key| outcome.accepted() || !completed.contains(key)),
+            );
+        }
+    }
+
+    /// Whether an exec marker's work is already done: none of the view's
+    /// attributable targets is both active and absent from the delta, so the
+    /// ordinary transaction retired, replaced, or never owned every one.
+    fn exec_rearm_moot(view: ProcessViewId, candidate: &LiveCandidate) -> bool {
+        Self::unchanged_exec_targets(view, candidate).is_empty()
+    }
+
     /// Everything a candidate can fail at, proven before its first link
     /// mutation. Post-mutation cleanup only ever drops sources, so a candidate
     /// that passes here still publishes after a conservative retirement.
@@ -10062,6 +15100,64 @@ impl Engine {
             &self.manifests,
             &self.manifest_ordinals,
         )
+    }
+
+    /// Whether candidate pins reproduce committed pins for the stability
+    /// comparison: same inventory, identities, sources, overlay flag and
+    /// rejection sets. The rebuild filters and walks by exactly these.
+    fn pins_match_for_stability(candidate: &PinnedObjects, committed: &PinnedObjects) -> bool {
+        candidate.pinned().count() == committed.pinned().count()
+            && candidate.has_overlay_uncertainty() == committed.has_overlay_uncertainty()
+            && candidate.newly_rejected_keys(committed).is_empty()
+            && committed.newly_rejected_keys(candidate).is_empty()
+            && candidate.pinned().all(|pin| {
+                candidate.exactly_matches(pin.id, committed, pin.id)
+                    && candidate.sources(pin.id) == committed.sources(pin.id)
+            })
+    }
+
+    /// Deferral pin identity: every committed pin must be present and
+    /// identical (identity plus sources) in the candidate. Candidate
+    /// extras are ignored: the loader derivation retains pins the
+    /// committed store never holds (its loader pin), and extras are
+    /// merge-invisible — the merge folds only plan-referenced pins,
+    /// every one of which the last merge read from the committed
+    /// store, and the plan itself is compared identical separately.
+    /// Store-level flags stay whole-store: an extra that flips
+    /// overlay uncertainty or rejects a key still publishes.
+    fn pins_match_for_deferral(candidate: &PinnedObjects, committed: &PinnedObjects) -> bool {
+        candidate.has_overlay_uncertainty() == committed.has_overlay_uncertainty()
+            && candidate.newly_rejected_keys(committed).is_empty()
+            && committed.newly_rejected_keys(candidate).is_empty()
+            && committed.pinned().all(|pin| {
+                candidate.exactly_matches(pin.id, committed, pin.id)
+                    && candidate.sources(pin.id) == committed.sources(pin.id)
+            })
+    }
+
+    /// Deferral module-table flag identity: `ScannedTable::eq` deliberately
+    /// ignores `live_return`/`manifest_supported` (admission-union
+    /// semantics), but the merge reads them, so leg 2 compares them
+    /// separately. Stability needs no such conjunct: flags only grow by
+    /// union over the same raw modules, which is already a rebuild
+    /// fixpoint, and stability gates the rebuild, never the merge.
+    fn table_flags_match_for_deferral(
+        candidate: &[ReconciledModule],
+        committed: &[ReconciledModule],
+    ) -> bool {
+        candidate.len() == committed.len()
+            && candidate.iter().zip(committed.iter()).all(|(left, right)| {
+                left.scanned.tables.len() == right.scanned.tables.len()
+                    && left
+                        .scanned
+                        .tables
+                        .iter()
+                        .zip(right.scanned.tables.iter())
+                        .all(|(left, right)| {
+                            left.live_return == right.live_return
+                                && left.manifest_supported == right.manifest_supported
+                        })
+            })
     }
 
     /// The one complete finalization for a candidate whose links were already
@@ -10095,6 +15191,18 @@ impl Engine {
         additions_allowed: &mut bool,
         outcome: &mut ApplyOutcome,
     ) {
+        let loader_plan = candidate
+            .loader_plan_proof
+            .take()
+            .map(|proof| (proof, candidate.plan.clone()));
+        // Publication-deferral leg 1: nothing dirtied the merge inputs
+        // between the last merge and this commit. Every merge-input
+        // mutation (scans, loss markers, evictions, selection recording,
+        // counter pushes, snapshot restores) bumps the revision, so
+        // equality with the last published revision proves the inputs
+        // below are still what that merge folded. Snapshotted at entry:
+        // this commit's own dirty must not satisfy its own gate.
+        let revision_before_commit = self.facts_revision;
         let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
@@ -10120,16 +15228,30 @@ impl Engine {
             );
         } else if !outcome.unpublished_views.is_empty() {
             let unpublished = outcome.unpublished_views.clone();
+            // A checked-clean newcomer (fully scanned, no reconciled
+            // modules) carries no pins, modules or links, so leaving it
+            // unpublished undoes no attach or publish work; only views with
+            // reconciled modules still have work outstanding. Their own scan
+            // skips, if any, already cover unverified content. Read before
+            // retire drops the unpublished views' modules below.
+            let undone = unpublished.iter().any(|view| {
+                candidate
+                    .modules
+                    .iter()
+                    .any(|module| module.scanned.view == *view)
+            });
             self.retire_stale_candidate_sources(
                 session,
                 &mut candidate,
                 &unpublished,
                 &mut *outcome,
             );
-            self.mark_partial(
-                "live inventory transaction",
-                "additions were blocked; newly observed process generations were left unpublished for a later tick",
-            );
+            if undone {
+                self.mark_partial(
+                    "live inventory transaction",
+                    "additions were blocked; newly observed process generations were left unpublished for a later tick",
+                );
+            }
         }
         if !new_targets_attached {
             let owners = candidate_timing_owners(&candidate);
@@ -10227,7 +15349,8 @@ impl Engine {
                     .cloned()
                     .collect();
                 let detach_selection_start = crate::attach::monotonic_ns();
-                let detach_selection_outcome = session.detach_slots(&detach);
+                let detach_selection_outcome = session.detach_failed_slots(&detach);
+                self.sync_physical_gap(session);
                 self.stage_timings.span(
                     crate::timing::StageKind::Attach,
                     "detach_selection",
@@ -10362,7 +15485,8 @@ impl Engine {
                 .cloned()
                 .collect();
             let detach_rollback_start = crate::attach::monotonic_ns();
-            let detach_rollback_outcome = session.detach_slots(&rollback);
+            let detach_rollback_outcome = session.detach_failed_slots(&rollback);
+            self.sync_physical_gap(session);
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,
                 "detach_rollback",
@@ -10395,13 +15519,78 @@ impl Engine {
         // so no count can be in them. Kept, they burned the capture-lifetime
         // budget: every conservative replay after an ordinary process exit
         // allocated one more cell per listed-but-inactive endpoint.
+        let slots_before_withdraw = candidate.plan.slots.len();
         if !new_targets_attached {
             candidate
                 .plan
                 .withdraw_unlinked_additions(self.plan.slots.len());
         }
-        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
-        outcome.changed |= candidate.plan != self.plan;
+        let withdrew = candidate.plan.slots.len() != slots_before_withdraw;
+        record_object_skips(
+            &mut candidate.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
+        let plan_reproduced = candidate.plan == self.plan;
+        outcome.changed |= !plan_reproduced;
+        // Publication-deferral leg 2: this commit reproduces every merge
+        // input it installs, compared after all finalize mutations
+        // (retirement, selection, manifest rollback, withdrawal and the
+        // counter fold above) so none of them can escape the gate. The
+        // plan comparison is full equality, synced fields included.
+        // The deep comparisons are shared with the stability check
+        // below; each side's provenance short-circuits first so plain
+        // inventory candidates skip them entirely.
+        let stabilizes_provenance = candidate.built_by_full_rebuild
+            && !withdrew
+            && candidate.plan.matches_for_stability(&self.plan);
+        let commit_provenance = loader_plan.is_some();
+        let (
+            modules_reproduced,
+            corroboration_reproduced,
+            fallbacks_reproduced,
+            claims_reproduced,
+            tables_reproduced,
+        ) = if stabilizes_provenance || commit_provenance {
+            (
+                candidate.modules == self.modules,
+                candidate.corroboration == self.counters.corroboration,
+                candidate.manifest_fallbacks == self.counters.manifest_fallbacks,
+                candidate.selection_claims == self.selection_claims,
+                candidate.selection_tables == self.selection_tables,
+            )
+        } else {
+            (false, false, false, false, false)
+        };
+        // The pin walks differ: stability needs the whole store to
+        // match, deferral only the committed pins (the derivation
+        // retains merge-invisible extras). Each runs under its own
+        // provenance so neither side pays for the other.
+        let pins_reproduced =
+            commit_provenance && Self::pins_match_for_deferral(&candidate.pinned, &self.pinned);
+        let table_flags_reproduced = commit_provenance
+            && Self::table_flags_match_for_deferral(&candidate.modules, &self.modules);
+        let commit_reproduced = commit_provenance
+            && plan_reproduced
+            && modules_reproduced
+            && corroboration_reproduced
+            && fallbacks_reproduced
+            && claims_reproduced
+            && tables_reproduced
+            && pins_reproduced
+            && table_flags_reproduced;
+        // Committing a full rebuild with no post-build withdrawal installs
+        // rebuild output only when the candidate actually converged: the
+        // rebuild reads committed-plan reuse state, so a commit can move it
+        // (surfaces, ordinals) and the next rebuild may differ. Verify by
+        // comparison instead of assuming a fixpoint.
+        let stabilizes = stabilizes_provenance
+            && modules_reproduced
+            && corroboration_reproduced
+            && fallbacks_reproduced
+            && claims_reproduced
+            && tables_reproduced
+            && Self::pins_match_for_stability(&candidate.pinned, &self.pinned);
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
@@ -10423,20 +15612,83 @@ impl Engine {
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
         self.selection_claims = candidate.selection_claims;
         self.selection_tables = candidate.selection_tables;
-        outcome.disposition = if retired {
-            ApplyDisposition::ConservativeRetirement
+        self.plan_rebuild_stable = stabilizes;
+        // Publication deferral: a proved loader transaction whose commit
+        // reproduces every merge input it installs (leg 2 above), with
+        // nothing else dirtied since the last merge (leg 1: the revision
+        // is still what that merge published), leaves the post-commit
+        // merge inputs identical to the last merge's. The merge folds are
+        // idempotent on identical inputs, so the merge and projection are
+        // redundant with the batch tail's. With nothing retired or
+        // unpublished, its links attached, merge inputs resolvable and no
+        // newly recorded loss, invalidate the planning proof and mark the
+        // revision published exactly as a no-op merge would. Anything else
+        // publishes per commit, and skip recording runs on both paths.
+        let skips_changed = self.record_publication_skips();
+        #[cfg(not(test))]
+        let deferral_disabled = false;
+        #[cfg(test)]
+        let deferral_disabled = self.publish_deferral_disabled();
+        let defer_publication = commit_reproduced
+            && revision_before_commit == self.published_facts_revision
+            && self.capture_facts.staged.is_none()
+            && outcome.stale_views.is_empty()
+            && outcome.unpublished_views.is_empty()
+            && new_targets_attached
+            && !skips_changed
+            && self
+                .capture_facts
+                .resolve_merge_inputs(
+                    &self.plan,
+                    &self.pinned,
+                    &self.modules,
+                    &self.manifests,
+                    &self.manifest_ordinals,
+                )
+                .is_ok()
+            && !deferral_disabled;
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
+        let publication = if defer_publication {
+            // Tripwire: the only revision bump between the leg-1 snapshot
+            // and this gate is the commit's own install, so a future bump
+            // inserted in between fails loudly instead of deferring over
+            // dirtied inputs.
+            debug_assert_eq!(self.facts_revision, revision_before_commit + 1);
+            self.published_facts_revision = self.facts_revision;
+            Ok(())
         } else {
-            ApplyDisposition::Accepted
+            self.merge_and_project_capture_facts()
         };
-        if self.publish_current_capture_facts().is_err() {
+        outcome.disposition = candidate_publication_disposition(retired, &publication);
+        if publication.is_err() {
             // The preflight proved this for the whole candidate, so only the
             // cleaned subset can still refuse. Keep the committed state and
             // drop to conservative authority rather than unwinding.
-            outcome.disposition = ApplyDisposition::ConservativeRetirement;
             self.mark_partial(
                 "live discovery evidence",
                 "the retired candidate's provider history could not be published",
             );
+        }
+        if let Some((proof, plan)) = loader_plan
+            && outcome.disposition == ApplyDisposition::Accepted
+            && new_targets_attached
+            && extra_views.is_empty()
+            && self.capture_facts.staged.is_none()
+            && self.facts_revision == self.published_facts_revision
+            && self.facts_revision == proof.revision.saturating_add(1)
+            && self.plan == proof.published_plan
+            && self.discovery == proof.discovery
+        {
+            // Publication invalidates first. Only this proved unchanged
+            // accepted transaction can carry the exact raw plan forward.
+            self.loader_plan_cache = Some(LoaderPlanCache {
+                revision: self.published_facts_revision,
+                broad_admit: self.broad_admit,
+                counter_hint: self.counter_hint,
+                plan,
+            });
         }
         outcome.selection_authorized &= outcome.disposition == ApplyDisposition::Accepted;
     }
@@ -10530,6 +15782,7 @@ impl Engine {
         if !orphaned_selection.is_empty() {
             let detach_orphaned_start = crate::attach::monotonic_ns();
             let detach_orphaned_outcome = session.detach_slots(&orphaned_selection);
+            self.sync_physical_gap(session);
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,
                 "detach_orphaned_selection",
@@ -10557,6 +15810,7 @@ impl Engine {
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
         let detach_retired_start = crate::attach::monotonic_ns();
         let detach_retired_outcome = session.detach_slots(&retired);
+        self.sync_physical_gap(session);
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "detach_retired",
@@ -10582,6 +15836,10 @@ impl Engine {
         if !self.plan.latch_ambiguity_from(candidate) {
             return false;
         }
+        self.note_facts_mutated();
+        // The latch mutates plan state outside commits; the committed plan
+        // is no longer rebuild output, so stability must not survive it.
+        self.plan_rebuild_stable = false;
         self.discovery.module_ambiguous = self.plan.module_ambiguous as u64;
         true
     }
@@ -10590,6 +15848,19 @@ impl Engine {
         let next = session.counter_snapshot().inspect_err(|_| {
             self.owned_initial_exec = None;
         })?;
+        // Under collected Finish the five sticky scalars invalidate once:
+        // later credits run a sticky branch only when one of its scalars
+        // grew (§1.3).
+        let sticky_before = self.collected_finish_actions.is_some().then_some((
+            self.counter_snapshot.ring_loss,
+            self.counter_snapshot.export_state_failures,
+            self.counter_snapshot.export_bounded_read_failures,
+            self.counter_snapshot.abi_refusals,
+            self.counter_snapshot.loader_state_read_failures,
+        ));
+        let grown = |before: u64, now: u64| sticky_before.is_none_or(|_| now > before);
+        let (ring_was, export_was, bounded_was, abi_was, loader_was) =
+            sticky_before.unwrap_or((0, 0, 0, 0, 0));
         if !self.counter_snapshot.replace_with(next) {
             self.owned_initial_exec = None;
             self.invalidate_silent_selection_coverage();
@@ -10600,7 +15871,7 @@ impl Engine {
             );
             return Ok(());
         }
-        if self.counter_snapshot.ring_loss > 0 {
+        if self.counter_snapshot.ring_loss > 0 && grown(ring_was, self.counter_snapshot.ring_loss) {
             self.owned_initial_exec = None;
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
@@ -10609,9 +15880,15 @@ impl Engine {
                 "the kernel could not reserve one or more private discovery records",
             );
         }
-        if self.counter_snapshot.export_state_failures > 0
+        if (self.counter_snapshot.export_state_failures > 0
             || self.counter_snapshot.export_bounded_read_failures > 0
-            || self.counter_snapshot.abi_refusals > 0
+            || self.counter_snapshot.abi_refusals > 0)
+            && (grown(export_was, self.counter_snapshot.export_state_failures)
+                || grown(
+                    bounded_was,
+                    self.counter_snapshot.export_bounded_read_failures,
+                )
+                || grown(abi_was, self.counter_snapshot.abi_refusals))
         {
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
@@ -10620,7 +15897,9 @@ impl Engine {
                 "the kernel reported export state, bounded-read, or target ABI failures",
             );
         }
-        if self.counter_snapshot.loader_state_read_failures > 0 {
+        if self.counter_snapshot.loader_state_read_failures > 0
+            && grown(loader_was, self.counter_snapshot.loader_state_read_failures)
+        {
             self.invalidate_causal_timing();
             self.mark_partial(
                 "live loader discovery",
@@ -10628,6 +15907,115 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_unowned_publication(
+        &mut self,
+        table: ScannedTable,
+        header_available: bool,
+        position: usize,
+        record: &DiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        subject: &str,
+    ) -> Result<DiscoveryRecordOutcome> {
+        self.note_publication_availability(subject, record, table.version, header_available);
+        self.note_unowned_publication(subject, &table);
+        let mut targets = BTreeMap::<ObjectKey, String>::new();
+        for entry in &table.entries {
+            targets
+                .entry(entry.object)
+                .or_insert_with(|| entry.object_path.clone());
+        }
+        let mut changed = false;
+        let mut complete = true;
+        for (key, path) in targets {
+            let mut observed = table.clone();
+            observed.entries.retain(|entry| entry.object == key);
+            observed.unpinned.extend(table.entries.iter().filter(|entry| entry.object != key).map(|entry| Skipped {
+                subject: entry.name.to_string(),
+                reason: "target belongs to another observed code object; provider ownership is uncertain".to_string(),
+            }));
+            observed.file_offset = None;
+            observed.live_return = false;
+            observed.manifest_supported = false;
+            observed.walk = "known_prefix";
+            let view = &self.views[position];
+            let module = ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                view: view.id(),
+                mount_namespace: view.mount_namespace(),
+                key,
+                path,
+                decoder_abi: None,
+                exports: Vec::new(),
+                tables: vec![observed],
+                interfaces: Vec::new(),
+            };
+            let outcome = self.apply_lowered_module(
+                module,
+                position,
+                record.hook_ts_ns,
+                session,
+                additions_allowed,
+                pending_views,
+            )?;
+            changed |= outcome.changed();
+            complete &= outcome.required_complete();
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, complete))
+    }
+
+    fn note_unowned_publication(&mut self, subject: &str, table: &ScannedTable) {
+        self.mark_partial(subject, &format!(
+            "acquired table observation retained with uncertain provider ownership: version {}.{}, {} observed positions, {} NULL, {} usable targets, {} unusable targets",
+            table.version.0, table.version.1, table.decoded_slot_count(), table.null_entries.len(), table.entries.len(), table.unpinned.len(),
+        ));
+    }
+
+    fn note_publication_availability(
+        &mut self,
+        subject: &str,
+        record: &DiscoveryRecord,
+        observed_version: (u8, u8),
+        header_available: bool,
+    ) {
+        let failed = record.status_flags & p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE != 0;
+        let uncertain = failed
+            && (record_prefix_version(record) == Some((0, 0))
+                || (record.kind == DISCOVERY_KIND_INTERFACE_RETURN
+                    && record.selection_version_class == DISCOVERY_VERSION_UNREADABLE));
+        if failed {
+            self.mark_partial(subject, &format!(
+            "table acquisition reported a read failure after {} completed positions; uncaptured words were unavailable, not observed NULL",
+            record.completed_prefix,
+        ));
+        }
+        if uncertain {
+            self.mark_partial(subject,
+                "captured table version metadata was unavailable or uncertain; 0.0 is only a placeholder when no fresh metadata can be read");
+        }
+        if !header_available {
+            self.mark_partial(subject, if record_prefix_version(record).is_none() || uncertain {
+                "table header metadata was unreadable during validation; displayed 0.0 is an unavailable-metadata placeholder"
+            } else {
+                "table header metadata was unreadable during validation; the displayed version retains the captured metadata"
+            });
+        }
+        if !uncertain
+            && let Some(captured) = record_prefix_version(record)
+            && captured != observed_version
+        {
+            self.mark_partial(subject, &format!(
+                "published table version metadata changed from {}.{} to {}.{}; all carried function words were revalidated unchanged",
+                captured.0, captured.1, observed_version.0, observed_version.1,
+            ));
+        }
     }
 
     fn process_export_record(
@@ -10646,7 +16034,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
                 "live export discovery",
                 "an export record had no retained process generation",
@@ -10655,7 +16043,7 @@ impl Engine {
                 RecordRejection::ExportNoRetainedView,
             ));
         };
-        let lowered = {
+        let (lowered, header_available) = {
             let view = &self.views[position];
             let maps = Self::read_maps(view, &mut self.budget)?;
             let index =
@@ -10677,7 +16065,21 @@ impl Engine {
                     None,
                 ) {
                     Err(error) => return Err(anyhow!(error)),
-                    Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Admitted(module, header_available)) => {
+                        (module, header_available)
+                    }
+                    Ok(HeapLowerOutcome::Unowned(table, header_available)) => {
+                        return self.apply_unowned_publication(
+                            table,
+                            header_available,
+                            position,
+                            record,
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            "live export discovery",
+                        );
+                    }
                     Ok(HeapLowerOutcome::Refused(reason)) => {
                         self.mark_live_loss("live export discovery", reason);
                         return Ok(DiscoveryRecordOutcome::Rejected(
@@ -10687,6 +16089,12 @@ impl Engine {
                 },
             }
         };
+        self.note_publication_availability(
+            "live export discovery",
+            record,
+            lowered.tables[0].version,
+            header_available,
+        );
         self.apply_lowered_module(
             lowered,
             position,
@@ -10710,6 +16118,13 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
+        if self.collected_finish_actions.is_some() {
+            self.mark_partial(
+                "live export discovery",
+                "a publication lowered after the terminal stop was not admitted; its objects were not pinned",
+            );
+            return Ok(DiscoveryRecordOutcome::applied(false, false));
+        }
         #[cfg(test)]
         crate::first_use_probe::publication_validated(&self.views[position], &lowered, hook_ts_ns);
         let (pins, pin_skips) = {
@@ -10734,7 +16149,11 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         let observed_module = lowered.clone();
-        self.note_scan_observed(lowered.view, std::slice::from_ref(&lowered));
+        self.note_scan_observed(
+            lowered.view,
+            self.views[position].view_admission(),
+            std::slice::from_ref(&lowered),
+        );
         merge_scanned_module(&mut raw_modules, lowered);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
@@ -10764,21 +16183,29 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
-        let (binding_view, hook_name) = self
+        let (binding_view, hook_name, binding_owner) = self
             .selection_bindings
             .get(&record.binding_id)
             .and_then(|binding| {
                 self.hooks
                     .by_id(binding.hook_id)
                     .filter(|(_, abi)| *abi == HookAbi::Interface)
-                    .map(|(name, _)| (binding.view, name.to_string()))
+                    .map(|(name, _)| {
+                        (
+                            binding.view,
+                            name.to_string(),
+                            self.pinned
+                                .summary(binding.object)
+                                .map(|owner| (owner.key, owner.path.to_string())),
+                        )
+                    })
             })
             .ok_or_else(|| anyhow!("selection lowering lost its attributed binding"))?;
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| {
             view.id() == binding_view && view.pid() == pid && view.still_the_same()
         }) else {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
                 "live interface selection",
                 "a selection result had no retained process generation when its table was validated",
@@ -10787,7 +16214,7 @@ impl Engine {
                 RecordRejection::SelectionUnattributed,
             ));
         };
-        let lowered = {
+        let (lowered, header_available) = {
             let view = &self.views[position];
             let maps = Self::read_maps(view, &mut self.budget)?;
             let index =
@@ -10813,7 +16240,31 @@ impl Engine {
                     gi_hook,
                 ) {
                     Err(error) => return Err(anyhow!(error)),
-                    Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Admitted(module, header_available)) => {
+                        (module, header_available)
+                    }
+                    Ok(HeapLowerOutcome::Unowned(table, header_available)) => {
+                        if let Some((key, path)) = binding_owner
+                            .clone()
+                            .filter(|_| self.pinned.check_unchanged().unwrap_or(false))
+                        {
+                            (
+                                publication_module(view, record, &hook_name, key, path, table),
+                                header_available,
+                            )
+                        } else {
+                            return self.apply_unowned_publication(
+                                table,
+                                header_available,
+                                position,
+                                record,
+                                session,
+                                additions_allowed,
+                                pending_views,
+                                "live interface selection",
+                            );
+                        }
+                    }
                     Ok(HeapLowerOutcome::Refused(reason)) => {
                         self.mark_live_loss("live interface selection", reason);
                         return Ok(DiscoveryRecordOutcome::applied(false, true));
@@ -10821,6 +16272,12 @@ impl Engine {
                 },
             }
         };
+        self.note_publication_availability(
+            "live interface selection",
+            record,
+            lowered.tables[0].version,
+            header_available,
+        );
         self.apply_lowered_module(
             lowered,
             position,
@@ -10851,21 +16308,249 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn service_loader_arm_scans(
+        &mut self,
+        due: BTreeSet<PendingLoaderScanKey>,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        records_pending: bool,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let mut changed = false;
+        let mut complete = true;
+        for key in due {
+            if !self.pending_loader_arm_scans.contains(&key) {
+                continue;
+            }
+            if !*additions_allowed
+                || self.cancellation_requested()
+                || session.mutation_stopped()
+                || self.frame_work_exhausted()
+                || self.budget.stopped_now().is_some()
+                || records_pending
+                || self.discovery_backlog_pending(session.staged_discovery_len())
+                || self.pressure_service_active
+                || self.pressure_rotation_pending
+                || self.pressure_episode.is_some()
+                || self.pressure_protection.block_all
+                || !self.pressure_protection.pids.is_empty()
+                || self.terminal_journal.is_some()
+                || self.terminal_batch.is_some()
+                || !pending_views.is_empty()
+                || !self.pending_retirements.is_empty()
+            {
+                complete = false;
+                break;
+            }
+            let position = self.views.iter().position(|view| view.id() == key.view);
+            let Some(position) = position.filter(|position| {
+                self.views[*position].still_the_same()
+                    && !self
+                        .refresh_requested
+                        .contains_key(&self.views[*position].pid())
+            }) else {
+                self.pending_loader_arm_scans.remove(&key);
+                continue;
+            };
+            let authority = self.loader_arm_scan_authority(position, key);
+            // No memory scan started: keep the exact key when preparation
+            // alone spent this opportunity, without renewing its budget.
+            if self.frame_work_exhausted()
+                || self.budget.stopped_now().is_some()
+                || self.cancellation_requested()
+                || session.mutation_stopped()
+            {
+                complete = false;
+                break;
+            }
+            let Ok(Some(authority)) = authority else {
+                self.pending_loader_arm_scans.remove(&key);
+                continue;
+            };
+            self.pending_loader_arm_scans.remove(&key);
+            self.unpaused_loader_views.insert(key.view);
+            let outcome = self.process_validated_loader_scan(
+                position,
+                key.context,
+                None,
+                Some(authority),
+                None,
+                &[],
+                LoaderScanMode::Memory,
+                session,
+                additions_allowed,
+                pending_views,
+                None,
+            )?;
+            changed |= outcome.changed();
+            complete &= outcome.required_complete();
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, complete))
+    }
+
+    /// A catch-up is a scheduling hint, so re-prove the actual armed loader
+    /// against the current original process, held file and exact mapping.
+    fn loader_arm_scan_authority(
+        &mut self,
+        position: usize,
+        key: PendingLoaderScanKey,
+    ) -> Result<Option<LoaderAuthority>> {
+        let Some(context) = self.loader_registry.context(key.context) else {
+            return Ok(None);
+        };
+        if context.spec.view != key.view
+            || self.views[position].id() != key.view
+            || !context.was_attached
+            || self.loader_registry.is_tombstoned(key.context)
+            || !self.views[position].still_the_same()
+            || !self.pinned.check_unchanged().unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let spec = context.spec.clone();
+        let Some(mapping) = spec.mapping.as_ref() else {
+            return Ok(None);
+        };
+        let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
+            return Ok(None);
+        };
+        let pin_key = self.pinned.summary(spec.loader).map(|loader| loader.key);
+        let loader_file = self.pinned.file_for(spec.loader);
+        let keys_agree = match (pin_key, loader_file) {
+            (Some(pin_key), Some(file)) => {
+                pin_key == ObjectKey::of(mapping)
+                    && loader_pin_matches_locator(
+                        pin_key,
+                        locator.authority.loader_key,
+                        file,
+                        &mut self.budget,
+                        &KernelSelfMappingProbe,
+                    )
+            }
+            _ => false,
+        };
+        let valid = keys_agree
+            && loader_file.is_some_and(|file| {
+                FileSnapshot::read(file).ok().as_ref() == Some(&locator.authority.interpreter_file)
+            })
+            && unique_mapping_for_offset(&locator.authority.loader_maps, spec.hook.file_offset)
+                .is_ok_and(|current| current == *mapping);
+        Ok(valid.then_some(locator.authority))
+    }
+
+    /// Classify one accepted loader record's scan for benign-hit
+    /// accounting: bump `loader_benign_hits` by exactly one when the scan
+    /// proves the hit harmless, else leave the hit unresolved (a gap).
+    ///
+    /// A hit is harmless when its scan is complete and the mapping diff
+    /// shows no provider relevance: no new module (a late provider load
+    /// is a true window), and no unexplained close. Every close fires an
+    /// RT_DELETE record, so a completion that resolves a delete with
+    /// nothing vanished is a transient open-close cycle whose calls are
+    /// unknown. Pause proof exonerates regardless of the diff: the child
+    /// was stopped while the load happened, so no first call could have
+    /// run unobserved. Anything unproven — an incomplete scan, an
+    /// unreadable announcement, a new or unclassifiable module, a
+    /// same-file double-load transition — stays unresolved.
+    ///
+    /// Completeness is the scan's own verdict: it already fails closed on
+    /// truncating skips, budget stops, new refusals and unavailability.
+    /// Benign noise skips (examined objects with no wanted table) must not
+    /// disqualify: every ordinary scan records them.
+    fn classify_loader_record_scan(
+        &mut self,
+        view_id: ProcessViewId,
+        class: LoaderHitClass,
+        retained_before: &[ScannedModule],
+        found: &[ScannedModule],
+        found_complete: bool,
+    ) {
+        const RT_ADD: u32 = 1;
+        const RT_DELETE: u32 = 2;
+        if !found_complete {
+            return;
+        }
+        let protected = self.paused_loader_views.contains(&view_id)
+            && !self.unpaused_loader_views.contains(&view_id);
+        if protected {
+            self.loader_benign_hits = self.loader_benign_hits.saturating_add(1);
+            return;
+        }
+        // A same-file second load (notably a `dlmopen` private-namespace
+        // double-load) shares its (view, mount namespace, key, path) with
+        // the retained first load, so the mapping diff alone sees no change.
+        // The second instance owns a distinct session namespace whose first
+        // calls before attach went unobserved, so any double-load
+        // transition in either direction is a true window, never benign.
+        // The count comparison catches what the boolean cannot: a third
+        // (or later) same-file load keeps `double_loaded` true on both
+        // sides while moving the load count.
+        let double_load_transition = found.iter().any(|module| {
+            retained_before
+                .iter()
+                .find(|known| {
+                    known.view == module.view
+                        && known.mount_namespace == module.mount_namespace
+                        && known.key == module.key
+                        && known.path == module.path
+                })
+                .is_some_and(|known| {
+                    known.double_loaded != module.double_loaded
+                        || known.same_file_loads != module.same_file_loads
+                })
+        });
+        if double_load_transition {
+            return;
+        }
+        let new_provider = found
+            .iter()
+            .any(|module| is_newly_observed_module(retained_before, module));
+        if new_provider {
+            return;
+        }
+        let vanished = retained_before
+            .iter()
+            .any(|module| !is_still_observed_module(found, module));
+        let benign = match class {
+            // An open/close notification whose scan shows no change yet:
+            // the transaction's completion carries the verdict.
+            LoaderHitClass::Announced(RT_ADD) | LoaderHitClass::Announced(RT_DELETE) => !vanished,
+            LoaderHitClass::Announced(_) => false,
+            LoaderHitClass::Consistent { resolving } => match resolving {
+                // A close that removed retained code completed.
+                Some(RT_DELETE) => vanished,
+                // An open that changed nothing: a failed or refcount open,
+                // which fires no RT_ADD of its own.
+                Some(RT_ADD) | None => !vanished,
+                Some(_) => false,
+            },
+        };
+        if benign {
+            self.loader_benign_hits = self.loader_benign_hits.saturating_add(1);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn process_validated_loader_scan(
         &mut self,
         position: usize,
         context_id: LoaderContextId,
-        hook_ts_ns: u64,
+        hook_ts_ns: Option<u64>,
+        catchup_authority: Option<LoaderAuthority>,
         terminal_owner: Option<LoaderContextId>,
         terminal_exports: &[DynamicExportIdentity],
         mode: LoaderScanMode,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        classify: Option<LoaderHitClass>,
     ) -> Result<DiscoveryRecordOutcome> {
         #[cfg(test)]
         if mode == LoaderScanMode::Memory {
             self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
+            if std::mem::take(&mut self.fail_next_loader_memory_scan) {
+                return Err(anyhow!("test-forced loader memory scan failure"));
+            }
         }
         let broad_admit = self.broad_admit;
         let (scan_result, scan_counters) = match mode {
@@ -10886,8 +16571,54 @@ impl Engine {
                 &mut self.stage_timings,
             ),
         };
-        let mut skipped = self.absorb_scan_counters(scan_counters);
+        // 6.14 Option B: learn the scanned generation's executable path.
+        elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
         self.deep_scans = self.deep_scans.saturating_add(1);
+        #[cfg(test)]
+        if catchup_authority.is_some()
+            && let Some(after_scan) = self.loader_arm_scan_after_scan.take()
+        {
+            after_scan(self);
+        }
+        #[cfg(test)]
+        let record_path_scan = catchup_authority.is_none();
+        if let Some(expected) = catchup_authority {
+            if self.original_exited(self.views[position].id()) {
+                return Ok(DiscoveryRecordOutcome::applied(false, true));
+            }
+            if scan_result.is_err()
+                || scan_result.as_ref().is_ok_and(|(_, _, complete)| !complete)
+                || self.budget.stopped_now().is_some()
+                || self.frame_work_exhausted()
+                || self.cancellation_requested()
+                || session.mutation_stopped()
+            {
+                self.mark_partial(
+                    "post-arm provider discovery",
+                    "the one-shot loader-arm catch-up scan did not complete",
+                );
+                return Ok(DiscoveryRecordOutcome::applied(false, false));
+            }
+            let key = PendingLoaderScanKey {
+                view: self.views[position].id(),
+                context: context_id,
+            };
+            let current = self.loader_arm_scan_authority(position, key);
+            if self.original_exited(self.views[position].id()) {
+                return Ok(DiscoveryRecordOutcome::applied(false, true));
+            }
+            if self.budget.stopped_now().is_some() || self.frame_work_exhausted() {
+                self.mark_partial(
+                    "post-arm provider discovery",
+                    "the one-shot loader-arm catch-up scan did not complete",
+                );
+                return Ok(DiscoveryRecordOutcome::applied(false, false));
+            }
+            if !current.is_ok_and(|current| current.as_ref() == Some(&expected)) {
+                return Ok(DiscoveryRecordOutcome::applied(false, true));
+            }
+        }
+        let mut skipped = self.absorb_scan_counters(scan_counters);
         let (mut found, fresh_pins, found_complete) = match scan_result {
             Ok(value) => value,
             Err(error) => {
@@ -10897,7 +16628,21 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.note_scan_observed(self.views[position].id(), &found);
+        // Test-only: a one-shot incomplete verdict on the record path
+        // (the catch-up path already fails closed above), so the
+        // dispatch twin pins the live `found_complete` plumbing.
+        #[cfg(test)]
+        let found_complete =
+            if record_path_scan && std::mem::take(&mut self.loader_force_record_scan_incomplete) {
+                false
+            } else {
+                found_complete
+            };
+        self.note_scan_observed(
+            self.views[position].id(),
+            self.views[position].view_admission(),
+            &found,
+        );
         if mode == LoaderScanMode::MetadataOnly {
             for module in &mut found {
                 let Some(current) = self.modules.iter().find(|current| {
@@ -10913,7 +16658,56 @@ impl Engine {
                 module.interfaces = current.scanned.interfaces.clone();
             }
         }
-        let export_modules = found.clone();
+        // Benign-hit accounting (W4-1): a record-driven scan classifies
+        // exactly its own hit, before this view's retained modules are
+        // replaced below. Pin and plan skips land later and gap
+        // independently; the scan's own completeness verdict already
+        // fails closed on truncating skips.
+        if let Some(class) = classify {
+            let view_id = self.views[position].id();
+            let retained_before: Vec<ScannedModule> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            self.classify_loader_record_scan(
+                view_id,
+                class,
+                &retained_before,
+                &found,
+                found_complete,
+            );
+        }
+        // A catch-up has no loader occurrence to seed an already published
+        // provider again. Keep the full candidate scan, but request export
+        // work only for provider facts this scan actually added or changed.
+        let export_modules: Vec<_> = found
+            .iter()
+            .filter(|module| {
+                hook_ts_ns.is_some()
+                    || !self
+                        .modules
+                        .iter()
+                        .any(|current| current.scanned == **module)
+            })
+            .cloned()
+            .collect();
+        let late_modules: Vec<_> = if hook_ts_ns.is_none() {
+            let retained: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == self.views[position].id())
+                .map(|module| module.scanned.clone())
+                .collect();
+            export_modules
+                .iter()
+                .filter(|module| is_newly_observed_module(&retained, module))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let loader = self
             .loader_registry
             .context(context_id)
@@ -10990,7 +16784,10 @@ impl Engine {
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
-        self.observe_causal_timing(&observed, hook_ts_ns);
+        if let Some(hook_ts_ns) = hook_ts_ns {
+            self.observe_causal_timing(&observed, hook_ts_ns);
+        }
+        let late_observed = candidate_timing_keys(&candidate, &late_modules);
         let collected = self.collect_dynamic_export_work(
             context_id,
             &export_modules,
@@ -11046,6 +16843,16 @@ impl Engine {
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         let mut required_complete = required_seed_complete && outcome.required_complete();
+        if outcome.accepted() && !late_observed.is_empty() {
+            for module in late_observed {
+                self.timings.lose(&module);
+            }
+            self.mark_live_loss(
+                "post-arm provider discovery",
+                "a provider was first observed after loader rearm; calls across the unarmed window and before attachment are unknown",
+            );
+            required_complete = false;
+        }
         if terminal_owner.is_none() && outcome.accepted() {
             let (retire, dynamic_complete, _) = self.attach_export_work(
                 self.views[position].id(),
@@ -11087,13 +16894,19 @@ impl Engine {
         let mut changed = false;
         let mut required_complete = true;
         for key in due {
+            // An earlier fallback can hand off native ownership. The remaining
+            // keys keep their original timestamps for the fresh scoped frame.
+            if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
+                required_complete = false;
+                break;
+            }
             // H-1: a spent live frame leaves the rest pending; the next
             // frame's fallback pass serves them.
             if self.pending_loader_scans.contains_key(&key) && self.frame_work_exhausted() {
                 self.note_frame_deferral();
                 break;
             }
-            let Some(hook_ts_ns) = self.pending_loader_scans.remove(&key) else {
+            let Some((hook_ts_ns, _announced)) = self.pending_loader_scans.remove(&key) else {
                 continue;
             };
             if let Some(reason) = self.budget.stopped_now() {
@@ -11119,26 +16932,32 @@ impl Engine {
             if !self.pause_owned_batch {
                 self.unpaused_loader_views.insert(key.view);
             }
+            // An early fallback scan is interim: the record's own scan at
+            // its announcement, and the transaction's completion scan,
+            // carry the benign-hit verdicts.
             match self.process_validated_loader_scan(
                 position,
                 key.context,
-                hook_ts_ns,
+                Some(hook_ts_ns),
+                None,
                 None,
                 &[],
                 LoaderScanMode::Memory,
                 session,
                 additions_allowed,
                 pending_views,
+                None,
             ) {
                 Ok(outcome) => {
                     changed |= outcome.changed();
                     required_complete &= outcome.required_complete();
                 }
                 Err(error) => {
-                    // A target that provably exited before its fallback ran
-                    // ended its loader transaction unfinished: a counted
-                    // truncation, never a reason to abandon the capture, and
-                    // no lost causal timing (`record_pending_loader_scan_end`).
+                    // A fallback that failed after its process provably
+                    // exited: the exit ended the loader observation the scan
+                    // belonged to, so the unresolved scan is a counted
+                    // truncation, never a reason to abandon the capture
+                    // (`record_pending_loader_scan_end`).
                     if self.original_exited(key.view) {
                         self.record_pending_loader_scan_end(
                             "a deferred loader memory scan was unresolved at expected process exit",
@@ -11190,8 +17009,17 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
-            self.reject_loader_record("a loader hit had no retained process generation");
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
+            // A late record bound to a recorded proven-ended original by
+            // pid and hook time counts exit-only; anything else stays a
+            // real loss. Never pid alone (reuse).
+            if self.late_loader_record_ended(pid, record.hook_ts_ns) {
+                self.reject_loader_record_exit_ended(
+                    "a loader hit had no retained process generation",
+                );
+            } else {
+                self.reject_loader_record("a loader hit had no retained process generation");
+            }
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderNoRetainedView,
             ));
@@ -11225,6 +17053,13 @@ impl Engine {
             if self.exec_replaced_the_armed_image(&context.spec, view_id, pid, &maps, pending_views)
             {
                 self.invalidate_causal_timing();
+            } else if self.original_exited(view_id) {
+                // The hook's process provably ended: the unmapped address
+                // is exit fallout, counted exit-only with the live loss
+                // kept.
+                self.reject_loader_record_exit_ended(
+                    "a loader hook address no longer resolved to a mapping",
+                );
             } else {
                 self.reject_loader_record("a loader hook address no longer resolved to a mapping");
             }
@@ -11295,22 +17130,29 @@ impl Engine {
             view: view_id,
             context: context_id,
         };
+        // Actual validated loader work owns the scan now, including the
+        // RT_ADD path's existing deferred memory scan. No duplicate catch-up.
+        self.pending_loader_arm_scans.remove(&key);
         if matches!(record.announced_count, 1 | 2) {
-            self.defer_loader_memory_scan(key, record.hook_ts_ns);
+            self.defer_loader_memory_scan(key, record.hook_ts_ns, record.announced_count);
             let result = self.process_validated_loader_scan(
                 position,
                 context_id,
-                record.hook_ts_ns,
+                Some(record.hook_ts_ns),
+                None,
                 terminal_owner,
                 &terminal_exports,
                 LoaderScanMode::MetadataOnly,
                 session,
                 additions_allowed,
                 pending_views,
+                Some(LoaderHitClass::Announced(record.announced_count)),
             );
             if result.is_err() {
-                // An RT_ADD/RT_DELETE hit of a process that already ended:
-                // its transaction never reached RT_CONSISTENT.
+                // A scan that failed while its process provably ended: the
+                // exit ended the loader observation the scan belonged to, so
+                // the unresolved scan counts exit-only (the process may well
+                // have run; only its scan outlived it).
                 let ended = self.original_exited(view_id);
                 self.settle_pending_loader_scan(
                     key,
@@ -11328,22 +17170,37 @@ impl Engine {
             }
             result
         } else {
-            let resolving_pending = self.pending_loader_scans.remove(&key).is_some();
+            let resolving = self.pending_loader_scans.remove(&key);
+            let resolving_pending = resolving.is_some();
+            let resolving_kind = resolving.map(|(_, announced)| announced);
             let result = self.process_validated_loader_scan(
                 position,
                 context_id,
-                record.hook_ts_ns,
+                Some(record.hook_ts_ns),
+                None,
                 terminal_owner,
                 &terminal_exports,
                 LoaderScanMode::Memory,
                 session,
                 additions_allowed,
                 pending_views,
+                Some(LoaderHitClass::Consistent {
+                    resolving: resolving_kind,
+                }),
             );
             if resolving_pending && result.is_err() {
-                self.record_pending_loader_scan_loss(
-                    "a zero-state opportunity did not complete its deferred loader memory scan",
-                );
+                // A zero-state scan that failed after its process provably
+                // ended counts exit-only, but the RT_CONSISTENT code may
+                // have run, so the live loss is kept.
+                if self.original_exited(view_id) {
+                    self.record_pending_loader_scan_end_with_live_loss(
+                        "a zero-state opportunity did not complete its deferred loader memory scan",
+                    );
+                } else {
+                    self.record_pending_loader_scan_loss(
+                        "a zero-state opportunity did not complete its deferred loader memory scan",
+                    );
+                }
             } else if resolving_pending && let Some(reason) = self.budget.stopped_now() {
                 self.record_pending_loader_scan_loss(&format!(
                     "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
@@ -11394,6 +17251,9 @@ impl Engine {
                 record(entry.name, Some((provider.clone(), entry.file_offset)));
             }
         }
+        // Recording mutates merge-input history unconditionally (a
+        // re-recorded occurrence still re-inserts), so it dirties.
+        self.note_facts_mutated();
         if invalidates {
             self.invalidate_selection_provider_coverage(module);
         }
@@ -11405,6 +17265,7 @@ impl Engine {
             history.selection_truncated = true;
             insert_selection_loss(history, reason);
         }
+        self.note_facts_mutated();
         self.invalidate_selection_table_coverage(key);
     }
 
@@ -11425,11 +17286,13 @@ impl Engine {
         let targets: Vec<_> = table
             .entries
             .iter()
-            .map(|entry| plan::SelectionTableTarget {
-                object: binding.object,
-                object_path: entry.object_path.clone(),
-                file_offset: entry.file_offset,
-                name: entry.name,
+            .map(|entry| {
+                plan::SelectionTableTarget::provider_local(
+                    binding.object,
+                    entry.object_path.clone(),
+                    entry.file_offset,
+                    entry.name,
+                )
             })
             .collect();
         let previous_claims = self
@@ -11452,6 +17315,7 @@ impl Engine {
                         "conflicting selection tables shared one returned version and flags",
                     );
                 }
+                self.note_facts_mutated();
                 self.invalidate_selection_coverage(binding.id);
                 return None;
             }
@@ -11499,11 +17363,13 @@ impl Engine {
                 targets: table
                     .entries
                     .iter()
-                    .map(|entry| plan::SelectionTableTarget {
-                        object: binding.object,
-                        object_path: entry.object_path.clone(),
-                        file_offset: entry.file_offset,
-                        name: entry.name,
+                    .map(|entry| {
+                        plan::SelectionTableTarget::provider_local(
+                            binding.object,
+                            entry.object_path.clone(),
+                            entry.file_offset,
+                            entry.name,
+                        )
                     })
                     .collect(),
             },
@@ -11528,6 +17394,7 @@ impl Engine {
             raw_modules,
             Vec::new(),
             Some(&selection_admission.key),
+            &BTreeSet::new(),
         );
         self.selection_claims = old_claims;
         self.selection_tables = old_tables;
@@ -11962,6 +17829,9 @@ impl Engine {
         let selection_became_truncated = self
             .capture_facts
             .record_selection(tuple, matches_truncated);
+        // Recording always mutates history (a re-recorded tuple still
+        // bumps its count), so selection evidence dirties the inputs.
+        self.note_facts_mutated();
         if selection_became_truncated {
             self.invalidate_silent_selection_coverage();
         }
@@ -12005,19 +17875,168 @@ impl Engine {
             .map_err(|_| ())
     }
 
-    /// Bounded exact-address table validation, shared by the selection path
-    /// and heap-wrapper export lowering: maps-A membership, one bounded mem
-    /// read (version word first, then the exact table extent), same-decoder
-    /// decode against index A, then the maps-B stability bracket plus the
-    /// generation check. Returns the containing mapping, the decoded table,
-    /// and the raw table bytes (publication cross-checks need them).
-    ///
-    /// `allow_span` (broad fixed-family only) permits the table extent to
-    /// cover a run of contiguous readable mappings instead of one: a fixed
-    /// pool legitimately crosses the file-tail/anonymous-BSS split. The run
-    /// is contiguity-checked mapping by mapping, fully decoded (104
-    /// executable entries stay the content anchor), and every touched
-    /// mapping is stability-bracketed — same contract, wider extent.
+    /// Read the process ELF class under file and generation brackets before
+    /// interpreting acquired words. Sparse or empty tables cannot prove ABI.
+    fn read_process_table_layout(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::result::Result<LinuxLayout, ExactReadRefusal> {
+        if budget.stopped_now().is_some() || !budget.charge(1) {
+            return Err(ExactReadRefusal::Budget);
+        }
+        let open = |budget: &mut CaptureWorkBudget| {
+            view.with_filesystem(budget, |filesystem, _| Ok(filesystem.open_executable()))
+        };
+        let file = open(budget)
+            .map_err(|_| ExactReadRefusal::Unstable)?
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
+        let before = FileSnapshot::read(&file).map_err(|_| ExactReadRefusal::Unreadable)?;
+        let mut header = [0u8; 20];
+        if budget.allowed_io(0, header.len()) < header.len() {
+            return Err(ExactReadRefusal::Budget);
+        }
+        let read = file
+            .read_at(&mut header, 0)
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
+        budget.record_io(read);
+        let current = open(budget)
+            .map_err(|_| ExactReadRefusal::Unstable)?
+            .map_err(|_| ExactReadRefusal::Unstable)?;
+        if FileSnapshot::read(&file).ok() != Some(before)
+            || FileSnapshot::read(&current).ok() != Some(before)
+            || !view.still_the_same()
+        {
+            return Err(ExactReadRefusal::Unstable);
+        }
+        if read != header.len() || &header[..4] != b"\x7fELF" || header[5] != 1 || header[6] != 1 {
+            return Err(ExactReadRefusal::Unreadable);
+        }
+        match (header[4], little_u16(&header[18..20])) {
+            (1, 3) => Ok(LinuxLayout::Ilp32),
+            (2, 62) => Ok(LinuxLayout::Lp64),
+            _ => Err(ExactReadRefusal::Unreadable),
+        }
+    }
+
+    /// Bounded acquired-word validation. Only readable words enter the
+    /// decoded prefix, and every read mapping and valid target is bracketed.
+    fn read_acquired_table_bracketed(
+        view: &ProcessView,
+        layout: LinuxLayout,
+        index_a: &MapIndex,
+        budget: &mut CaptureWorkBudget,
+        record: &DiscoveryRecord,
+    ) -> std::result::Result<(ScannedTable, Vec<u8>, bool), ExactReadRefusal> {
+        let address = record.table_ptr;
+        let mem = view
+            .with_filesystem(budget, |filesystem, _| Ok(filesystem.open_memory()))
+            .map_err(|_| ExactReadRefusal::Unstable)?
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
+        let width = layout.word_bytes();
+        let mut span = BTreeMap::<u64, MapEntry>::new();
+        if let Some(mapping) = index_a.containing(address) {
+            span.insert(mapping.start, mapping.clone());
+        }
+        let mut operation_bytes = 0u64;
+        let mut read_word =
+            |at: u64, len: usize| -> std::result::Result<Option<[u8; 8]>, ExactReadRefusal> {
+                if budget.check_deadline_now().is_some() {
+                    return Err(ExactReadRefusal::Budget);
+                }
+                let Some(end) = at.checked_add(len as u64) else {
+                    return Ok(None);
+                };
+                let mut cursor = at;
+                while cursor < end {
+                    let Some(mapping) = index_a.containing(cursor) else {
+                        return Ok(None);
+                    };
+                    if mapping.permissions[0] != b'r' {
+                        return Ok(None);
+                    }
+                    span.insert(mapping.start, mapping.clone());
+                    cursor = end.min(mapping.end);
+                }
+                if budget.allowed_io(operation_bytes, len) < len {
+                    return Err(ExactReadRefusal::Budget);
+                }
+                let mut bytes = [0u8; 8];
+                match mem.read_at(&mut bytes[..len], at) {
+                    Ok(read) => {
+                        budget.record_io(read);
+                        operation_bytes = operation_bytes.saturating_add(read as u64);
+                        Ok((read == len).then_some(bytes))
+                    }
+                    Err(_) => Ok(None),
+                }
+            };
+        // Only CK_VERSION's two bytes are metadata. Padding is never an
+        // acceptance condition or an excuse to read more function positions.
+        let header = read_word(address, 2)?;
+        let version = header
+            .map(|bytes| (bytes[0], bytes[1]))
+            .or_else(|| record_prefix_version(record))
+            .unwrap_or((0, 0));
+        let hinted =
+            p11scope_ebpf_common::discovery_table_slots(record.kind, version.0, version.1) as usize;
+        let limit = if record.kind == DISCOVERY_KIND_FUNCTION_LIST_RETURN {
+            68
+        } else {
+            hinted.max(usize::from(record.completed_prefix)).min(104)
+        };
+        let mut words = Vec::with_capacity(limit);
+        for ordinal in 0..limit {
+            let at = address
+                .checked_add(((ordinal + 1) * width) as u64)
+                .ok_or(ExactReadRefusal::Undecodable)?;
+            let Some(bytes) = read_word(at, width)? else {
+                break;
+            };
+            words.push(u64::from_le_bytes(bytes));
+        }
+        // The normalized header is metadata storage, not fabricated pointer
+        // input: every appended function word was actually read above.
+        let mut bytes = vec![0u8; width];
+        bytes[0] = version.0;
+        bytes[1] = version.1;
+        for word in &words {
+            bytes.extend_from_slice(&word.to_le_bytes()[..width]);
+        }
+        let table = decode_observed_words(
+            version,
+            &words,
+            limit,
+            address,
+            index_a,
+            budget,
+            Some(view.id()),
+        )
+        .map_err(|_| ExactReadRefusal::Budget)?
+        .ok_or(ExactReadRefusal::Undecodable)?;
+        for target in
+            decoded_table_addresses(&bytes, layout, &table).ok_or(ExactReadRefusal::Undecodable)?
+        {
+            let mapping = index_a
+                .containing(target)
+                .ok_or(ExactReadRefusal::Unstable)?;
+            span.insert(mapping.start, mapping.clone());
+        }
+        let maps_b = Self::read_maps(view, budget).map_err(|_| ExactReadRefusal::Unstable)?;
+        let index_b =
+            index_maps_or_refuse(&maps_b, budget).map_err(|_| ExactReadRefusal::Unstable)?;
+        if !view.still_the_same()
+            || !span
+                .values()
+                .all(|mapping| index_b.containing(mapping.start) == Some(mapping))
+        {
+            return Err(ExactReadRefusal::Unstable);
+        }
+        Ok((table, bytes, header.is_some()))
+    }
+
+    /// Raw exact-address validation brackets the complete decoded extent and
+    /// targets with maps A/B and the process generation. `allow_span` permits
+    /// a contiguous readable run across a file-tail/anonymous-BSS split.
     fn read_exact_table_bracketed(
         view: &ProcessView,
         address: u64,
@@ -12034,7 +18053,7 @@ impl Engine {
             return Err(ExactReadRefusal::Unreadable);
         }
         let mem = view
-            .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
+            .with_filesystem(budget, |filesystem, _| Ok(filesystem.open_memory()))
             .map_err(|_| ExactReadRefusal::Unreadable)?
             .map_err(|_| ExactReadRefusal::Unreadable)?;
         let width = layout.word_bytes();
@@ -12068,32 +18087,42 @@ impl Engine {
             };
         read_exact(&mut bytes, address)?;
         let table_bytes = exact_table_bytes(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
-        let table_end = address
-            .checked_add(table_bytes as u64)
-            .ok_or(ExactReadRefusal::Undecodable)?;
-        // Mappings the table extent touches: one, or a contiguous readable
-        // run when the caller allows a span. Every touched mapping joins
-        // the maps-B stability check below.
-        let mut span = vec![mapping_a.clone()];
-        if table_end > mapping_a.end {
-            if !allow_span {
-                return Err(ExactReadRefusal::Undecodable);
-            }
-            let mut cursor = mapping_a.end;
-            while cursor < table_end {
-                let Some(next) = index_a.containing(cursor).cloned() else {
-                    return Err(ExactReadRefusal::Undecodable);
-                };
-                if next.start != cursor || next.permissions[0] != b'r' {
-                    return Err(ExactReadRefusal::Undecodable);
+        // Prefer the complete declared extent when maps A proves it
+        // readable under this reader's span policy. Otherwise a plausible
+        // 3.x table may expose its complete legacy prefix alone. This is
+        // an acquisition choice, never recovery from a failed read or a
+        // budget/stability refusal. Every mapping actually read remains
+        // in the maps-B bracket, including a fully read unusable tail.
+        let readable_span = |len: usize| -> Option<Vec<MapEntry>> {
+            let table_end = address.checked_add(len as u64)?;
+            let mut span = vec![mapping_a.clone()];
+            if table_end > mapping_a.end {
+                if !allow_span {
+                    return None;
                 }
-                cursor = next.end;
-                span.push(next);
-                if span.len() > index_a.entries().len() {
-                    return Err(ExactReadRefusal::Undecodable);
+                let mut cursor = mapping_a.end;
+                while cursor < table_end {
+                    let next = index_a.containing(cursor)?.clone();
+                    if next.start != cursor || next.permissions[0] != b'r' {
+                        return None;
+                    }
+                    cursor = next.end;
+                    span.push(next);
+                    if span.len() > index_a.entries().len() {
+                        return None;
+                    }
                 }
             }
-        }
+            Some(span)
+        };
+        let (table_bytes, span) = if let Some(span) = readable_span(table_bytes) {
+            (table_bytes, span)
+        } else {
+            let prefix_bytes =
+                exact_legacy_prefix_bytes(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
+            let span = readable_span(prefix_bytes).ok_or(ExactReadRefusal::Undecodable)?;
+            (prefix_bytes, span)
+        };
         bytes.resize(table_bytes, 0);
         if table_bytes > width {
             read_exact(
@@ -12103,8 +18132,17 @@ impl Engine {
                     .ok_or(ExactReadRefusal::Unstable)?,
             )?;
         }
-        let raw_addresses =
-            exact_table_addresses(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
+        // Decode before bracketing: the decoded slot count — not the
+        // declared version — bounds the stability bracket, so a
+        // mislabelled table's tail words never join it.
+        let table =
+            match decode_exact_table(&bytes, address, layout, index_a, budget, Some(view.id())) {
+                Err(()) => return Err(ExactReadRefusal::Budget),
+                Ok(None) => return Err(ExactReadRefusal::Undecodable),
+                Ok(Some(table)) => table,
+            };
+        let raw_addresses = exact_table_addresses_n(&bytes, layout, table.decoded_slot_count())
+            .ok_or(ExactReadRefusal::Undecodable)?;
         let mut addresses = Vec::with_capacity(raw_addresses.len() + 1);
         addresses.push(address);
         addresses.extend(raw_addresses);
@@ -12117,12 +18155,6 @@ impl Engine {
                     .ok_or(ExactReadRefusal::Undecodable)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let table =
-            match decode_exact_table(&bytes, address, layout, index_a, budget, Some(view.id())) {
-                Err(()) => return Err(ExactReadRefusal::Budget),
-                Ok(None) => return Err(ExactReadRefusal::Undecodable),
-                Ok(Some(table)) => table,
-            };
         let maps_b = Self::read_maps(view, budget).map_err(|_| ExactReadRefusal::Unstable)?;
         let index_b =
             index_maps_or_refuse(&maps_b, budget).map_err(|_| ExactReadRefusal::Unstable)?;
@@ -12160,7 +18192,7 @@ impl Engine {
                 .exports
                 .iter()
                 .filter(|name| {
-                    session.capture_policy() != CapturePolicy::AggregateOnly
+                    !session.capture_policy().is_aggregate()
                         || self.hooks.abi(name) != Some(HookAbi::Interface)
                 })
                 .collect();
@@ -12641,7 +18673,10 @@ impl Engine {
             return Ok(false);
         }
         let pid = self.views[position].pid();
-        if Self::loader_exe_is_gone(pid) {
+        if Self::loader_exe_is_gone(pid)
+            && !(process::process_is_zombie(pid)
+                && self.views[position].original_exited() == Ok(false))
+        {
             return Err(LoaderArmFailure::NotArmable);
         }
         let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
@@ -12679,7 +18714,7 @@ impl Engine {
             );
             return Ok(false);
         };
-        let loader_snapshot = read_elf_snapshot(
+        let (loader_facts, fresh_loader_facts) = loader_elf_facts(
             loader_pins
                 .file_for(local_loader_id)
                 .expect("the just-pinned loader has its retained file"),
@@ -12693,7 +18728,7 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         if pinned_loader_file != locator.authority.interpreter_file
-            || loader_snapshot.abi() != locator.authority.executable_abi
+            || loader_facts.abi != locator.authority.executable_abi
         {
             self.mark_partial(
                 "live loader arming",
@@ -12701,11 +18736,7 @@ impl Engine {
             );
             return Ok(false);
         }
-        let Some(hook) = loader_snapshot
-            .defined_symbol("_dl_debug_state")
-            .map_err(anyhow::Error::msg)?
-            .filter(|hook| loader_snapshot.is_executable_offset(hook.file_offset))
-        else {
+        let Some(hook) = loader_facts.hook.clone().map_err(anyhow::Error::msg)? else {
             self.mark_partial(
                 "live loader arming",
                 "the exact loader had no executable _dl_debug_state definition",
@@ -12720,7 +18751,10 @@ impl Engine {
                     return Ok(false);
                 }
             };
-        let state_address = loader_state_address(&loader_snapshot).map_err(anyhow::Error::msg)?;
+        let state_address = loader_facts
+            .state_address
+            .clone()
+            .map_err(anyhow::Error::msg)?;
 
         let (candidate, loader) = self
             .loader_candidate(
@@ -12819,6 +18853,31 @@ impl Engine {
                 self.loader_registry
                     .mark_attached(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
+                // This arm read the loader and both revalidation brackets
+                // held: later arms of the unchanged file reuse its facts.
+                if let Some(key) = fresh_loader_facts {
+                    self.budget.note_loader_elf_facts(key, loader_facts);
+                }
+                if matches!(self.scope, Scope::Pid(_))
+                    && self.frame_deadline_ns.is_some()
+                    && !self.pause_owned_batch
+                    && self.capture_facts.staged.is_none()
+                {
+                    let key = PendingLoaderScanKey {
+                        view: view_id,
+                        context,
+                    };
+                    if self.pending_loader_arm_scans.len()
+                        < crate::discovery::loader::MAX_LOADER_CONTEXTS
+                    {
+                        self.pending_loader_arm_scans.insert(key);
+                    } else {
+                        self.mark_partial(
+                            "post-arm provider discovery",
+                            "the bounded loader-arm catch-up ledger was full",
+                        );
+                    }
+                }
                 false
             }
             GenerationMutation::PostcheckFailed(Ok(_)) => {
@@ -12905,6 +18964,8 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<OwnedLoaderPrearmOutcome> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let Some(prepared_executable) = child.prepared_executable() else {
             self.mark_partial(
                 "owned initial-set discovery",
@@ -12932,8 +18993,10 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         let loader_module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view_id,
             mount_namespace: self.views[position].mount_namespace(),
             key: loader_identity,
@@ -13133,6 +19196,8 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         initiating_error: String,
     ) -> Result<OwnedLoaderPrearmOutcome> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let mut errors = vec![initiating_error];
         let detach_dynamic_start = crate::attach::monotonic_ns();
         let (terminal_exports, detach_failed) = session.detach_dynamic_context(context);
@@ -13147,12 +19212,16 @@ impl Engine {
         }
         let mut complete = true;
         let mut unvalidated_records = 0;
+        // The post-detach pull shares the allowance with everything staged
+        // and held: at zero room it reports capacity-blocked (an incomplete
+        // drain the journal continuation retries) instead of over-admitting.
+        let prearm_budget = Cell::new(self.shared_allowance_remaining(session, 0));
         let drained = begin_owned_prearm_retirement_with(
             &mut self.loader_registry,
             context,
             registry_attached,
             &mut errors,
-            || match Self::collect_discovery_records(session) {
+            || match Self::nested_pull_capped(session, &prearm_budget) {
                 // The prefix is already off the ring: retain it incomplete for
                 // the shared continuation instead of losing it with the drain.
                 Err(error) => {
@@ -13337,16 +19406,23 @@ impl Engine {
     /// and the empty-scan rule; a journal still pending keeps the record, and
     /// the timing proof this loss already invalidated is not given back.
     pub(crate) fn settle_terminal_drain(&mut self) {
+        self.note_graph_inputs_mutated();
+        self.pending_loader_arm_scans.clear();
         self.settle_all_pending_loader_scans(
             "a deferred loader memory scan was unresolved at capture cancellation or shutdown",
         );
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let pending_views = self.pending_leader_exit_views.clone();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
             &mut self.counted_leader_exit_views,
             &mut self.task_uprobe_link_losses,
         );
+        self.pending_leader_exit_order.clear();
         for view in pending_views {
             self.close_owned_selection_for_view(view);
         }
@@ -13426,14 +19502,21 @@ impl Engine {
                 self.retain_terminal_batch(records, true, malformed)?;
                 Ok(Ok(()))
             }
+            // H5 pressure: the collector diverted fresh records behind the
+            // parked prefix; the nested operation stays incomplete for this
+            // episode. Never loss, never complete.
+            Err(error) if error.is::<PressureOrderingBlocked>() => Ok(Err(error)),
             Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
                 Ok(incomplete) => {
                     self.account_unvalidated_discovery(incomplete.unvalidated_records);
-                    self.retain_terminal_batch(
-                        incomplete.records.clone(),
-                        false,
-                        incomplete.malformed,
-                    )?;
+                    // Move-only: the batch takes the prefix, and the signal
+                    // back up keeps the retained count for its diagnostic
+                    // without a second owned copy.
+                    let mut incomplete = incomplete;
+                    let prefix = std::mem::take(&mut incomplete.records);
+                    incomplete.moved_to_batch = prefix.len();
+                    let malformed = incomplete.malformed;
+                    self.retain_terminal_batch(prefix, false, malformed)?;
                     Ok(Err(incomplete.into()))
                 }
                 Err(error) => Ok(Err(error)),
@@ -13446,6 +19529,8 @@ impl Engine {
         additions_allowed: &mut bool,
         closure: &mut PauseClosure,
     ) {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let Some(journal) = self.terminal_journal.as_mut() else {
             return;
         };
@@ -13473,6 +19558,23 @@ impl Engine {
             "live discovery counters",
             "the terminal batch exhausted its one predispatch retry and was cleaned without replay",
         );
+    }
+
+    /// Whether `install_terminal_batch` would accept this batch: the
+    /// journal exists and names its owner, dispatch has not started, and the
+    /// engine holds no competing batch. Move-only callers precheck before
+    /// moving ownership, so a refusal never needs the batch back.
+    pub(crate) fn terminal_batch_installable(&self, batch: &TerminalBatch) -> Result<()> {
+        let Some(journal) = self.terminal_journal else {
+            bail!("terminal loader drain journal is missing");
+        };
+        if journal.owner != batch.authority.owner
+            || journal.dispatch_started
+            || self.terminal_batch.is_some()
+        {
+            bail!("terminal loader drain batch cannot be restored");
+        }
+        Ok(())
     }
 
     pub(crate) fn install_terminal_batch(
@@ -13587,11 +19689,13 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         closure: &mut PauseClosure,
     ) -> Result<Option<bool>> {
-        let Some(batch) = self.terminal_batch.take() else {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
+        let Some(mut batch) = self.terminal_batch.take() else {
             let Some(journal) = self.terminal_journal else {
                 return Ok(Some(false));
             };
-            if !journal.dispatch_started {
+            if !journal.dispatch_started || !self.take_collected_finish_action() {
                 return Ok(Some(false));
             }
             if self.loader_registry.remove(journal.owner).is_err() {
@@ -13609,43 +19713,43 @@ impl Engine {
             self.terminal_batch = Some(batch);
             return Ok(None);
         }
-        let journal = self
-            .terminal_journal
-            .as_ref()
-            .ok_or_else(|| anyhow!("terminal loader drain journal is missing"))?;
-        if journal.owner != batch.authority.owner || journal.dispatch_started {
-            bail!("terminal loader drain batch was already dispatched");
+        let Some(journal) = self.terminal_journal else {
+            self.terminal_batch = Some(batch);
+            bail!("terminal loader drain journal is missing");
+        };
+        if journal.owner != batch.authority.owner
+            || journal.dispatch_started != batch.dispatch.is_some()
+        {
+            self.terminal_batch = Some(batch);
+            bail!("terminal loader drain batch does not match its dispatch journal");
         }
         let owner = journal.owner;
-        let mut records =
-            match begin_discovery_batch(batch.records, self.update_counter_snapshot(session)) {
-                Ok(records) => records,
-                Err((_, records)) => {
-                    self.terminal_batch = Some(TerminalBatch {
-                        authority: batch.authority,
-                        records,
-                        complete: true,
-                    });
-                    self.retry_terminal_predispatch_failure(additions_allowed, closure);
-                    return Ok(Some(false));
-                }
-            };
+        // Keep the original vector and its dispatch accumulators on counter
+        // refusal. Once dispatch has started it is never a predispatch retry.
+        if self.update_counter_snapshot(session).is_err() {
+            self.terminal_batch = Some(batch);
+            self.retry_terminal_predispatch_failure(additions_allowed, closure);
+            return Ok(Some(false));
+        }
+        let mut dispatch = batch.dispatch.take().unwrap_or_default();
         self.terminal_journal
             .as_mut()
             .expect("journal checked above")
             .dispatch_started = true;
         let mut changed = false;
-        let mut exec_refresh_views = BTreeSet::new();
-        let mut deferred_mismatches = Vec::new();
-        for queued in records.drain(..) {
+        while !batch.records.is_empty() && self.take_collected_finish_action() {
+            // The physical prefix leaves its only dispatchable owner before
+            // the handler runs. A retry retains exactly the untouched suffix.
+            let queued = batch.records.remove(0);
             let origin = (queued.record.pid_tgid >> 32) as u32;
+            self.note_terminal_record_unheld(&queued.record);
             match self.dispatch_discovery_record(
                 queued,
                 session,
                 additions_allowed,
                 pending_views,
-                &mut exec_refresh_views,
-                &mut deferred_mismatches,
+                &mut dispatch.exec_refresh_views,
+                &mut dispatch.deferred_mismatches,
             ) {
                 Ok(outcome) => {
                     changed |= outcome.changed();
@@ -13666,8 +19770,26 @@ impl Engine {
                 }
             }
         }
-        self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
+        // Mismatch classification waits for ALL original records, including
+        // a later EXEC. Each subsequent classification is itself one action.
+        while batch.records.is_empty()
+            && !dispatch.deferred_mismatches.is_empty()
+            && self.take_collected_finish_action()
+        {
+            let view = dispatch.deferred_mismatches.remove(0);
+            self.settle_deferred_loader_mismatch(view, &dispatch.exec_refresh_views);
+        }
+        if !batch.records.is_empty()
+            || !dispatch.deferred_mismatches.is_empty()
+            || !self.take_collected_finish_action()
+        {
+            batch.dispatch = Some(dispatch);
+            self.terminal_batch = Some(batch);
+            return Ok(Some(changed));
+        }
         if self.loader_registry.remove(owner).is_err() {
+            // No replayable record or deferred mismatch remains. Keep the
+            // original cleanup-only journal, as in ordinary dispatch.
             *additions_allowed = false;
             self.mark_partial(
                 "live loader retirement",
@@ -13681,9 +19803,9 @@ impl Engine {
 
     /// The one authority-specific continuation. It advances an incomplete
     /// terminal batch by exactly one collection attempt, then hands the journal
-    /// to `dispatch_terminal_batch`, which either dispatches a complete
-    /// undispatched batch or, once dispatch has started, repeats nothing but
-    /// the registry removal. Generic records never reach it.
+    /// to `dispatch_terminal_batch`. Bounded dispatch retains its exact suffix
+    /// and cross-record state; cleanup-only retries repeat no originals.
+    /// Generic records never reach it.
     fn continue_terminal_batch(
         &mut self,
         session: &mut dyn EngineSession,
@@ -13710,9 +19832,9 @@ impl Engine {
         self.dispatch_terminal_batch(session, additions_allowed, pending_views, closure)
     }
 
-    // One retirement pass owns the whole decision: the view, the terminal
-    // handoffs it may still hand a selection to, and every accumulator the
-    // caller needs back. Splitting it would hand out the same state twice.
+    // The persistent view intent and original terminal journal retain the
+    // decision across bounded Finish calls. Ordinary retirement still visits
+    // the complete context set; Finish touches at most one context here.
     #[allow(clippy::too_many_arguments)]
     fn retire_loader_contexts(
         &mut self,
@@ -13724,6 +19846,8 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
     ) -> Result<(bool, bool)> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         if self
             .owned_initial_exec
             .is_some_and(|initial| initial.view == view)
@@ -13748,13 +19872,29 @@ impl Engine {
                     self.mark_live_loss(TERMINAL_DRAIN_SUBJECT, TERMINAL_DRAIN_RETRY_REASON);
                     return Ok((changed, false));
                 }
+                // H5 pressure: the journal survives the episode untouched;
+                // its continuation retries after the parked prefix dispatch.
+                Err(error) if error.is::<PressureOrderingBlocked>() => {
+                    closure.fail();
+                    return Ok((changed, false));
+                }
                 Err(error) => return Err(error),
             }
             if self.terminal_journal.is_some() {
                 return Ok((changed, false));
             }
         }
-        for context_id in self.loader_registry.ids_for_view(view) {
+        let collected_finish = self.collected_finish_actions.is_some();
+        for context_id in self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .take(if collected_finish { 1 } else { usize::MAX })
+        {
+            self.pending_loader_arm_scans.remove(&PendingLoaderScanKey {
+                view,
+                context: context_id,
+            });
             let Some(context) = self.loader_registry.context(context_id).cloned() else {
                 continue;
             };
@@ -13787,15 +19927,38 @@ impl Engine {
                         "a one-shot dynamic detach failed; replacement was blocked for this cycle",
                     );
                 }
+                // This action performed the original native context detach.
+                // Collection and dispatch resume as separate opportunities;
+                // a work yield is never an observed empty drain or a loss.
                 let terminal_drain =
-                    self.begin_terminal_drain(context_id, terminal_exports, || collect(session));
+                    self.begin_terminal_drain(context_id, terminal_exports, || {
+                        if collected_finish {
+                            Err(IncompleteTerminalDrain::backlog(Vec::new(), 0).into())
+                        } else {
+                            collect(session)
+                        }
+                    });
                 if terminal_drain.is_ok()
                     && let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
-                    && let Err(error) =
-                        self.handoff_precharged_terminal_records(context_id, records.clone())
+                    && !records.is_empty()
                 {
-                    self.reject_terminal_selection_handoffs(records, closure);
-                    return Err(error);
+                    // Move-only: the handoff moves the records, so ownership
+                    // is checked before the move; only a failed check keeps
+                    // the originals for rejection.
+                    let owner_ok = self
+                        .terminal_batch
+                        .as_ref()
+                        .is_some_and(|batch| batch.authority.owner == context_id);
+                    if !owner_ok {
+                        let error = if self.terminal_batch.is_none() {
+                            anyhow!("terminal loader drain batch is missing")
+                        } else {
+                            anyhow!("terminal selection handoff named the wrong loader owner")
+                        };
+                        self.reject_terminal_selection_handoffs(records, closure);
+                        return Err(error);
+                    }
+                    self.handoff_precharged_terminal_records(context_id, records)?;
                 }
                 match terminal_drain {
                     Ok(Ok((owned, malformed))) => {
@@ -13818,8 +19981,16 @@ impl Engine {
                         deferred.terminal_batch = Some(self.take_terminal_batch_for_deferred()?);
                         return Err(deferred.into());
                     }
+                    // H5 pressure: the tombstoned context keeps its pending
+                    // journal; no loss is marked for an episode block.
+                    Ok(Err(error)) if error.is::<PressureOrderingBlocked>() => {
+                        closure.fail();
+                        return Ok((changed, false));
+                    }
                     Ok(Err(error)) => {
+                        let mut work_backlog = false;
                         if let Ok(incomplete) = error.downcast::<IncompleteTerminalDrain>() {
+                            work_backlog = incomplete.backlog;
                             self.account_unvalidated_discovery(incomplete.unvalidated_records);
                             self.retain_terminal_batch(
                                 incomplete.records,
@@ -13828,7 +19999,12 @@ impl Engine {
                             )?;
                         }
                         closure.fail();
-                        self.mark_live_loss(TERMINAL_DRAIN_SUBJECT, TERMINAL_DRAIN_RETRY_REASON);
+                        if !work_backlog {
+                            self.mark_live_loss(
+                                TERMINAL_DRAIN_SUBJECT,
+                                TERMINAL_DRAIN_RETRY_REASON,
+                            );
+                        }
                         return Ok((changed, false));
                     }
                     Err(_) => {
@@ -13877,7 +20053,10 @@ impl Engine {
                 return Ok((changed, false));
             }
         }
-        Ok((changed, true))
+        Ok((
+            changed,
+            !collected_finish || self.loader_registry.ids_for_view(view).is_empty(),
+        ))
     }
 
     /// Whether an inventory preflight's stale views include a generation
@@ -13903,6 +20082,7 @@ impl Engine {
             .any(|view| !self.original_exited(*view))
     }
 
+    #[track_caller]
     fn queue_stale_views(
         &mut self,
         stale: &BTreeSet<ProcessViewId>,
@@ -13942,28 +20122,70 @@ impl Engine {
     /// pin that proves the original exited names the ordinary leader-exit
     /// transition, so the capture ends instead of failing — the `LEADER_EXIT`
     /// record is still in the ring when the pidfd is already readable, and a
-    /// short-lived target loses that race almost every time. Loss stays loss
-    /// whenever exit cannot be proven, and an already-recorded loss stays
-    /// sticky: only the incoming cause is reclassified.
+    /// short-lived target loses that race almost every time. A loss report
+    /// the pin contradicts (it re-reads Current) or cannot judge (its
+    /// observation failed, or no view is retained) is declined with a
+    /// partial mark — never recorded, never sticky — and the next pass
+    /// re-checks: a real exit is persistent, so deferral cannot hide one,
+    /// while recording loss without positive evidence of change aborted
+    /// live captures (E17 midfinal: an unprovable pin for a live caller
+    /// skipped every terminal COUNT/EVIDENCE record). The exit verdict is
+    /// observed once per call: a positive proof is reused below, so a later
+    /// observation failure cannot overwrite it with fatal loss. An
+    /// already-recorded loss stays sticky: only the incoming cause is
+    /// reclassified.
+    #[track_caller]
     fn queue_retirement(
         &mut self,
         view: ProcessViewId,
-        cause: RetirementCause,
+        mut cause: RetirementCause,
         pending_views: &mut PendingViewRetirements,
     ) {
+        // One exit observation per call: a positive proof below must
+        // survive a later observation failure instead of becoming fatal
+        // loss, so the merge reuses this verdict and never re-reads.
+        let proven_exited = cause == RetirementCause::GenerationLost && self.original_exited(view);
+        // A declined report has no side effects at all: re-verify before
+        // clearing exec state, merging causes, or settling loader scans.
+        if cause == RetirementCause::GenerationLost && !proven_exited {
+            match self.retained_generation_state(view) {
+                Some(Ok(OriginalGenerationState::Current)) | Some(Err(_)) | None => {
+                    self.mark_partial(
+                        "live discovery generation",
+                        "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+                    );
+                    return;
+                }
+                // The exit/reuse won the race after the stale report (or
+                // after the first exit check): retire as an expected end,
+                // mapped directly without a third pin read.
+                Some(Ok(OriginalGenerationState::Exited | OriginalGenerationState::Reused)) => {
+                    cause = RetirementCause::ExpectedRemoval;
+                }
+            }
+        }
         if self
             .owned_initial_exec
             .is_some_and(|initial| initial.view == view)
         {
             self.owned_initial_exec = None;
         }
+        let incoming = cause;
         let previous = self.retirement_intents.get(&view).copied();
-        let cause = if cause == RetirementCause::GenerationLost && self.original_exited(view) {
+        let cause = if cause == RetirementCause::GenerationLost && proven_exited {
             RetirementCause::ExpectedRemoval
         } else {
             cause
         };
         let cause = previous.map_or(cause, |current| current.merge(cause));
+        if cause != RetirementCause::ExpectedRemoval
+            && self
+                .ended_pid_retirement
+                .as_ref()
+                .is_some_and(|ended| ended.owner.id() == view)
+        {
+            self.ended_pid_retirement = None;
+        }
         let pending_reason = match cause {
             RetirementCause::ExpectedRemoval => {
                 "a deferred loader memory scan was unresolved at expected process exit"
@@ -13994,7 +20216,7 @@ impl Engine {
         {
             match cause {
                 RetirementCause::ExpectedRemoval => {
-                    self.refresh_requested.remove(&pid);
+                    self.clear_refresh_for_view(view, pid);
                     // The view is leaving, so its pending poll dies with it:
                     // no rescan will settle it, and the removal evidence is
                     // its publication (F1).
@@ -14008,10 +20230,34 @@ impl Engine {
         if cause == RetirementCause::GenerationLost
             && previous != Some(RetirementCause::GenerationLost)
         {
-            self.mark_live_loss(
-                "live discovery generation",
-                "a retained process generation changed and was scheduled for conservative cleanup",
-            );
+            let reason =
+                "a retained process generation changed and was scheduled for conservative cleanup";
+            if matches!(self.scope, Scope::Pid(_)) {
+                // The first named-generation loss terminates this capture:
+                // one bounded witness, without per-record/per-PID history in
+                // multi-process captures. This is a later observation, not a
+                // replacement for the check that originally refused authority.
+                let retained = self.views.iter().find(|candidate| candidate.id() == view);
+                let pid = retained.map_or(0, ProcessView::pid);
+                let original = match retained.map(ProcessView::original_generation_state) {
+                    Some(Ok(OriginalGenerationState::Current)) => "Current",
+                    Some(Ok(OriginalGenerationState::Exited)) => "Exited",
+                    Some(Ok(OriginalGenerationState::Reused)) => "Reused",
+                    Some(Err(_)) => "Unproven",
+                    None => "Missing",
+                };
+                self.mark_live_loss(
+                    "live discovery generation",
+                    &format!(
+                        "{reason}; view={} pid={pid} enqueue_line={} incoming={incoming:?} previous={previous:?} original={original} cancel_at_enqueue={}",
+                        view.0,
+                        std::panic::Location::caller().line(),
+                        self.cancellation_requested(),
+                    ),
+                );
+            } else {
+                self.mark_live_loss("live discovery generation", reason);
+            }
         }
     }
 
@@ -14028,24 +20274,122 @@ impl Engine {
             .any(|view| view.original_exited() == Ok(true))
     }
 
+    /// Retains one ended loader origin (R-1): called with a view being
+    /// removed as ExpectedRemoval. Only in `Scope::Pid`, and only when
+    /// the pin still proves exit; anything else stays unrecorded
+    /// (fail-closed). Bounded FIFO: an evicted origin's late records
+    /// stay real losses.
+    fn note_ended_loader_origin(&mut self, view: &ProcessView) {
+        if !matches!(self.scope, Scope::Pid(_)) {
+            return;
+        }
+        if view.original_exited() != Ok(true) {
+            return;
+        }
+        if self.ended_loader_origins.len() >= MAX_ENDED_LOADER_ORIGINS {
+            self.ended_loader_origins.pop_front();
+        }
+        self.ended_loader_origins.push_back(EndedLoaderOrigin {
+            pid: view.pid(),
+            admitted_ns: view.admitted_ns(),
+            pin: view.retained_pin_arc().clone(),
+        });
+    }
+
+    /// Whether a loader record with no retained view belongs to a
+    /// recorded, proven-ended original (R-1): some retained origin
+    /// matches by pid **and** `hook_ts_ns >= admitted_ns`, with its
+    /// pin still proving exit. Never pid alone (reuse): a hook from
+    /// before admission, or from a live generation, matches nothing.
+    /// Uses the live pin only (no test script): twins use genuinely
+    /// dead or live children.
+    fn late_loader_record_ended(&self, pid: u32, hook_ts_ns: u64) -> bool {
+        self.ended_loader_origins.iter().any(|origin| {
+            origin.pid == pid
+                && hook_ts_ns >= origin.admitted_ns
+                && origin.pin.original_exited() == Ok(true)
+        })
+    }
+
     /// Whether this view's retained original pin *proves* its process exited.
     /// A poll failure or a dropped view is not exit evidence and stays false,
     /// so an unprovable loss is never downgraded.
     fn original_exited(&self, view: ProcessViewId) -> bool {
+        #[cfg(test)]
+        if let Some(answer) = self.pop_pin_probe_exited() {
+            return answer == Ok(true);
+        }
         self.views
             .iter()
             .find(|candidate| candidate.id() == view)
             .is_some_and(|retained| retained.original_exited() == Ok(true))
     }
 
+    /// The retained pin's generation verdict for `view`: `None` when no
+    /// view is retained. The one place `queue_retirement` re-verifies a
+    /// loss report, so tests script the race there instead of in the pin.
+    fn retained_generation_state(
+        &self,
+        view: ProcessViewId,
+    ) -> Option<Result<OriginalGenerationState, String>> {
+        #[cfg(test)]
+        if let Some(answer) = self.pop_pin_probe_state() {
+            return answer;
+        }
+        self.views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map(|retained| retained.original_generation_state())
+    }
+
+    /// Pops the next scripted exit answer, if the test armed one. A queued
+    /// answer of the other kind is a script/code desync and panics loudly.
+    #[cfg(test)]
+    fn pop_pin_probe_exited(&self) -> Option<Result<bool, String>> {
+        let mut script = self.pin_probe_script.borrow_mut();
+        match script.front() {
+            None => None,
+            Some(PinProbeAnswer::Exited(_)) => {
+                let Some(PinProbeAnswer::Exited(answer)) = script.pop_front() else {
+                    unreachable!("the front was just matched as Exited");
+                };
+                Some(answer)
+            }
+            Some(PinProbeAnswer::State(_)) => {
+                panic!("pin probe script desync: an exit probe met a queued state answer");
+            }
+        }
+    }
+
+    /// Pops the next scripted generation-state answer, if the test armed
+    /// one. A queued answer of the other kind is a script/code desync and
+    /// panics loudly.
+    #[cfg(test)]
+    fn pop_pin_probe_state(&self) -> Option<Option<Result<OriginalGenerationState, String>>> {
+        let mut script = self.pin_probe_script.borrow_mut();
+        match script.front() {
+            None => None,
+            Some(PinProbeAnswer::State(_)) => {
+                let Some(PinProbeAnswer::State(answer)) = script.pop_front() else {
+                    unreachable!("the front was just matched as State");
+                };
+                Some(answer)
+            }
+            Some(PinProbeAnswer::Exited(_)) => {
+                panic!("pin probe script desync: a state probe met a queued exit answer");
+            }
+        }
+    }
+
+    #[track_caller]
     fn queue_apply_outcome(
         &mut self,
         outcome: &ApplyOutcome,
         pending_views: &mut PendingViewRetirements,
     ) {
         // Both an accepted candidate and a conservative cleanup consumed the
-        // retry intent they were built from; only a refusal retains it.
-        if outcome.refused() {
+        // retry intent they were built from. Refusal and worker deferral retain it.
+        if outcome.retains_intent() {
             self.pending_rejected_keys
                 .extend(outcome.newly_rejected_keys.iter().copied());
         } else {
@@ -14067,7 +20411,43 @@ impl Engine {
     /// capture policy. One place decides that, so the two scopes cannot drift.
     fn arm_expected_target_exit(&mut self, view: ProcessViewId) {
         if matches!(self.scope, Scope::Pid(_)) {
+            let blocked = self.snapshot_expected_target_exit_blocked(view);
             self.expected_target_exit_pending = Some(view);
+            self.expected_target_exit_since = Some(std::time::Instant::now());
+            self.expected_target_exit_blocked = Some(blocked);
+        }
+    }
+
+    /// Snapshots the blocking set behind the expected-target-exit wait:
+    /// the same conjuncts `finalize_expected_target_exit` needs empty
+    /// for its all-clear.
+    fn snapshot_expected_target_exit_blocked(
+        &self,
+        view: ProcessViewId,
+    ) -> ExpectedTargetExitBlocked {
+        ExpectedTargetExitBlocked {
+            views: self.views.len(),
+            intents: self.retirement_intents.len(),
+            retirements: self.pending_retirements.len(),
+            ended: self.ended_pid_retirement.is_some(),
+            rejected: self.pending_rejected_keys.len(),
+            loader_ids: self.loader_registry.ids_for_view(view).len(),
+            journal: self.terminal_journal.is_some(),
+            batch: self.terminal_batch.is_some(),
+            records: self.pending_discovery_records.len(),
+        }
+    }
+
+    /// The owner deliberately reaped the named PID-scope target during
+    /// settlement (SIGKILL after signal-forwarding grace): its absence
+    /// from later terminal passes is expected, not a lost generation.
+    /// Observation-driven arming cannot cover this ordering — the exit
+    /// record is still fresh when the terminal pass runs — so settlement
+    /// marks it directly. PID scope only; other scopes never name one
+    /// generation.
+    pub(crate) fn note_owned_target_reaped(&mut self) {
+        if matches!(self.scope, Scope::Pid(_)) {
+            self.expected_target_exit = true;
         }
     }
 
@@ -14075,17 +20455,68 @@ impl Engine {
         let Some(view) = self.expected_target_exit_pending else {
             return;
         };
-        if self.views.is_empty()
-            && self.retirement_intents.is_empty()
-            && self.pending_retirements.is_empty()
-            && self.pending_rejected_keys.is_empty()
-            && self.loader_registry.ids_for_view(view).is_empty()
-            && self.terminal_journal.is_none()
-            && self.terminal_batch.is_none()
-            && self.pending_discovery_records.is_empty()
-        {
+        let blocked = self.snapshot_expected_target_exit_blocked(view);
+        if blocked == ExpectedTargetExitBlocked::CLEAR {
             self.expected_target_exit_pending = None;
+            self.expected_target_exit_blocked = None;
             self.expected_target_exit = true;
+            return;
+        }
+        if self.expected_target_exit {
+            // Already latched — owned `run` settlement, or an all-clear
+            // behind a re-armed pending: no wait is outstanding, so there
+            // is nothing to bound and no PARTIAL mark to add. `run`
+            // behaviour is unchanged.
+            return;
+        }
+        // Drain progress restarts the no-progress clock: a retirement
+        // settled, a loader id cleared, or a parked record finalized (see
+        // `ExpectedTargetExitBlocked`). Progress drops below the low-water
+        // marks and sets them to the current snapshot; a stall leaves the
+        // marks alone, so an out-and-back cycle cannot keep resetting the
+        // clock. Only a stall with no progress trips the bound below.
+        let now = std::time::Instant::now();
+        match self.expected_target_exit_blocked {
+            Some(previous) if blocked.drained_since(&previous) => {
+                self.expected_target_exit_since = Some(now);
+                self.expected_target_exit_blocked = Some(blocked);
+            }
+            None => {
+                self.expected_target_exit_blocked = Some(blocked);
+            }
+            Some(_) => {}
+        }
+        // The trip is suppressed after an operator stop and during the
+        // collected finish: once the operator asked the capture to stop, or
+        // the collected finish has started, no trip mark is added. A stop
+        // at `--duration` expiry sets no cancel flag, so it can still
+        // trip: the target really exited and the stall is real. The
+        // all-clear latch above still runs everywhere.
+        if self.cancellation_requested() || self.collected_finish_actions.is_some() {
+            return;
+        }
+        // A retirement cleanup that stays queued must not hold a
+        // `profile --pid` capture open past its target's exit forever:
+        // when the armed wait makes no drain progress for the whole
+        // no-progress bound, end the wait with a named PARTIAL reason and
+        // keep the calls collected so far. The arm proves the target
+        // exited, so the bound can only trip after the exit — never while
+        // the target is alive.
+        let since = *self.expected_target_exit_since.get_or_insert(now);
+        let stalled = since.elapsed();
+        if stalled >= EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT {
+            self.mark_partial(
+                "live discovery transaction",
+                &format!(
+                    "the named target exited but its cleanup was still pending after {}s; \
+                     the capture ends with the calls collected so far",
+                    stalled.as_secs()
+                ),
+            );
+            self.expected_target_exit_pending = None;
+            self.expected_target_exit_blocked = None;
+            self.expected_target_exit = true;
+            self.expected_target_exit_tripped = true;
         }
     }
 
@@ -14097,7 +20528,7 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) -> bool {
         self.queue_apply_outcome(outcome, pending_views);
-        if !outcome.refused() {
+        if !outcome.retains_intent() {
             self.pending_retirements
                 .retain(|view| !retirements.contains(view));
             self.pending_rejected_keys
@@ -14136,10 +20567,20 @@ impl Engine {
             }
         };
         let mut no_additions = false;
-        let outcome = match self.apply_candidate(session, candidate, &mut no_additions, false, &[])
-        {
+        let ended = self.ended_pid_retirement.take();
+        let outcome = match self.apply_candidate_with_ended(
+            session,
+            candidate,
+            &mut no_additions,
+            false,
+            &[],
+            ended
+                .as_ref()
+                .filter(|ended| retirements.contains(&ended.owner.id())),
+        ) {
             Ok(outcome) => outcome,
             Err(_) => {
+                self.ended_pid_retirement = ended;
                 *additions_allowed = false;
                 self.mark_partial(
                     "live discovery transaction",
@@ -14154,9 +20595,406 @@ impl Engine {
         if !outcome.accepted() || outcome.detach_failed {
             *additions_allowed = false;
         }
+        if outcome.retains_intent() {
+            self.ended_pid_retirement = ended;
+        }
         self.record_apply_timing(&outcome);
         self.queue_conservative_outcome(&outcome, &retirements, &keys, pending_views);
         outcome
+    }
+
+    /// No candidate or native application is necessary if this exact retired
+    /// owner is already absent from every graph input. Other IDs and rejected
+    /// keys remain owned. In particular an ended-pid native proof is not
+    /// discarded as if it had been applied.
+    fn settle_unreferenced_collected_retirement(&mut self) -> bool {
+        let Some(view) = self.pending_retirements.first().copied() else {
+            return false;
+        };
+        if self.names_view_bounded(view) {
+            return false;
+        }
+        self.pending_retirements.remove(&view);
+        self.finalize_expected_target_exit();
+        true
+    }
+
+    /// Stateless bounded names check (§1.5): keyed O(log n) lookups first,
+    /// then the unkeyed sets only when their combined length fits one
+    /// stride — past that the view counts as named without scanning, so at
+    /// system scale the graph handles every view at one credit per intent
+    /// plus one graph. These are original inputs to the bounded graph; a
+    /// numeric pending set cannot replace their ProcessView custody.
+    /// (`selection_tables` joins the stride gate: no O(log n) range lower
+    /// bound is constructible without touching identity.rs. The check stays
+    /// one-stride bounded and conservative. See the T4 report.)
+    fn names_view_bounded(&self, view: ProcessViewId) -> bool {
+        #[cfg(test)]
+        self.names_inspected.set(0);
+        if self.pinned.view_claims(view).is_some()
+            || self.scan_inputs.contains_key(&view)
+            || self
+                .ended_pid_retirement
+                .as_ref()
+                .is_some_and(|ended| ended.owner.id() == view)
+        {
+            return true;
+        }
+        if self.modules.len()
+            + self.selection_claims.len()
+            + self.selection_bindings.len()
+            + self.selection_tables.len()
+            > GRAPH_STRIDE
+        {
+            return true;
+        }
+        let mut inspected = 0usize;
+        let found = self.modules.iter().any(|module| {
+            inspected += 1;
+            module.scanned.view == view
+        }) || self.selection_claims.keys().any(|key| {
+            inspected += 1;
+            key.view == view
+        }) || self.selection_bindings.values().any(|binding| {
+            inspected += 1;
+            binding.view == view && !binding.retired
+        }) || self.selection_tables.keys().any(|key| {
+            inspected += 1;
+            key.view == view
+        });
+        #[cfg(test)]
+        self.names_inspected.set(inspected);
+        #[cfg(not(test))]
+        let _ = inspected;
+        found
+    }
+
+    /// Whether dispatching a matched EXEC for `view` would consume the owned
+    /// initial prearm as an acknowledgment instead of queueing a refresh.
+    /// Read-only preview of `acknowledge_owned_initial_exec` for the pressure
+    /// lookahead: the same checks without consuming the one-shot prearm.
+    fn owned_initial_exec_would_acknowledge(&self, view: ProcessViewId) -> bool {
+        let Some(initial) = self
+            .owned_initial_exec
+            .filter(|initial| initial.view == view)
+        else {
+            return false;
+        };
+        initial.revalidated
+            && self.counter_snapshot.ring_loss == 0
+            && self.malformed_discovery == 0
+            && self.discovery_truncated == 0
+            && self
+                .views
+                .iter()
+                .any(|retained| retained.id() == view && retained.still_the_same())
+            && self
+                .loader_registry
+                .context(initial.context)
+                .is_some_and(|context| {
+                    context.spec.view == view
+                        && context.spec.mapping.is_none()
+                        && context.was_attached
+                        && !self.loader_registry.is_tombstoned(initial.context)
+                })
+            && self.pinned.check_unchanged().unwrap_or(false)
+    }
+
+    /// Whether dispatching this queued record would consume a refresh-request
+    /// map entry for a pid that has none. Renewing an already-pending pid is
+    /// free. Every arm mirrors the exact dispatch condition that calls
+    /// `request_refresh_consumed`, without charging loader acceptance,
+    /// emitting rejection evidence or reading provider memory. The selection
+    /// arm is conservative: it predicts that lowering will need the entry
+    /// whenever the record is lowerable and its generation is gone, even
+    /// though attribution itself may still reject the record first.
+    fn record_needs_new_request(&self, queued: &QueuedDiscoveryRecord) -> bool {
+        if self.refresh_requested.len() < MAX_PENDING_REFRESH {
+            return false;
+        }
+        let record = &queued.record;
+        let pid = (record.pid_tgid >> 32) as u32;
+        if self.refresh_requested.contains_key(&pid) {
+            return false;
+        }
+        match record.kind {
+            DISCOVERY_KIND_EXEC => {
+                if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
+                    cause == RetirementCause::ExecRefresh
+                        && !self.owned_initial_exec_would_acknowledge(view)
+                } else {
+                    unmatched_exec_requests_refresh(&self.views, pid)
+                }
+            }
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
+                !self.views.iter().any(|view| view.pid() == pid)
+            }
+            DISCOVERY_KIND_LOADER => {
+                self.loader_records_accepted < self.counter_snapshot.loader_hits
+                    && !self.views.iter().any(|view| view.pid() == pid)
+            }
+            DISCOVERY_KIND_INTERFACE_RETURN => {
+                queued.terminal_owner.is_none()
+                    && record.return_rv == 0
+                    && record.table_ptr != 0
+                    && self
+                        .selection_bindings
+                        .get(&record.binding_id)
+                        .is_some_and(|binding| {
+                            !self.views.iter().any(|view| {
+                                view.id() == binding.view
+                                    && view.pid() == pid
+                                    && view.still_the_same()
+                            })
+                        })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this record is a pressure head: the request map is full, the
+    /// record would need a new entry, and this pass is allowed to service
+    /// pressure. Pause-owned batches keep their bounded timing, and a tick's
+    /// own leftover passes dispatch normally, so a service pass can never
+    /// nest inside the tick it is servicing.
+    fn pressure_head_pending(&self, queued: &QueuedDiscoveryRecord) -> bool {
+        if self.pause_owned_batch || self.in_refresh_tick {
+            return false;
+        }
+        self.record_needs_new_request(queued)
+    }
+
+    /// What a pressure service pass must leave untouched, built from every
+    /// already-owned undispatched record: the parked prefix, the pending
+    /// queue, the fresh records diverted behind the prefix this episode,
+    /// the terminal batch and journal authority, and pause-held records.
+    /// Each record protects its pid plus the owner views of the loader
+    /// context, terminal owner and selection binding it names. Ownership
+    /// that cannot be narrowed — an unresolvable loader context, terminal
+    /// owner, journal authority or selection binding — blocks every
+    /// retained context instead of guessing an owner from PID alone.
+    fn pressure_protection_for(
+        &self,
+        parked: &[QueuedDiscoveryRecord],
+        diverted: &[QueuedDiscoveryRecord],
+    ) -> PressureProtection {
+        let mut protection = PressureProtection::default();
+        for queued in parked
+            .iter()
+            .chain(self.pending_discovery_records.iter())
+            .chain(diverted.iter())
+        {
+            self.protect_queued_record(queued, &mut protection);
+        }
+        if let Some(batch) = self.terminal_batch.as_ref() {
+            for queued in batch.records.iter() {
+                self.protect_queued_record(queued, &mut protection);
+            }
+            if !self.protect_loader_owner(batch.authority.owner, &mut protection.pids) {
+                protection.block_all = true;
+            }
+        }
+        if let Some(journal) = self.terminal_journal
+            && !self.protect_loader_owner(journal.owner, &mut protection.pids)
+        {
+            protection.block_all = true;
+        }
+        for (pid_tgid, _, _) in self.held_records.iter() {
+            protection.pids.insert((pid_tgid >> 32) as u32);
+        }
+        protection
+    }
+
+    /// Folds one owned record's requirements into the protection: its pid,
+    /// plus the owner view of any loader context, terminal owner or
+    /// selection binding it names. Unresolvable ownership sets `block_all`.
+    fn protect_queued_record(
+        &self,
+        queued: &QueuedDiscoveryRecord,
+        protection: &mut PressureProtection,
+    ) {
+        let record = &queued.record;
+        protection.pids.insert((record.pid_tgid >> 32) as u32);
+        if record.kind == DISCOVERY_KIND_LOADER
+            && !self.protect_loader_owner(
+                LoaderContextId::from_case_id(record.case_id),
+                &mut protection.pids,
+            )
+        {
+            protection.block_all = true;
+        }
+        if let Some(owner) = queued.terminal_owner
+            && !self.protect_loader_owner(owner, &mut protection.pids)
+        {
+            protection.block_all = true;
+        }
+        if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+            let narrowed = self
+                .selection_bindings
+                .get(&record.binding_id)
+                .and_then(|binding| self.views.iter().find(|view| view.id() == binding.view))
+                .is_some_and(|view| {
+                    protection.pids.insert(view.pid());
+                    true
+                });
+            if !narrowed {
+                protection.block_all = true;
+            }
+        }
+    }
+
+    /// Protects the retained view owning a loader context. Reports whether
+    /// the ownership narrowed to a retained view at all.
+    fn protect_loader_owner(&self, context: LoaderContextId, pids: &mut BTreeSet<u32>) -> bool {
+        self.loader_registry
+            .context(context)
+            .and_then(|context| {
+                self.views
+                    .iter()
+                    .find(|view| view.id() == context.spec.view)
+            })
+            .is_some_and(|view| {
+                pids.insert(view.pid());
+                true
+            })
+    }
+
+    /// Begins (or continues) the held head's service episode. A newly seen
+    /// head snapshots at most 256 `(pid, serial, owner)` request candidates
+    /// in pid order; the same head keeps its snapshot and ruled-out set so
+    /// one bounded rotation spans its service opportunities.
+    fn pressure_episode_begin(&mut self, head: &QueuedDiscoveryRecord) {
+        let record = &head.record;
+        let key = PressureHeadKey {
+            pid_tgid: record.pid_tgid,
+            kind: record.kind,
+            case_id: record.case_id,
+            hook_ts_ns: record.hook_ts_ns,
+        };
+        if self
+            .pressure_episode
+            .as_ref()
+            .is_some_and(|episode| episode.head == key)
+        {
+            return;
+        }
+        self.pressure_episode = Some(PressureEpisode {
+            head: key,
+            snapshot: self
+                .refresh_requested
+                .iter()
+                .map(|(pid, request)| (*pid, (request.serial, request.owner)))
+                .collect(),
+            ruled_out: BTreeSet::new(),
+        });
+    }
+
+    /// Discards the held head's episode when the head settles (dispatch or
+    /// refusal): its rotation, protection and re-park state end with it.
+    fn pressure_episode_clear(&mut self) {
+        self.pressure_episode = None;
+        self.pressure_protection = PressureProtection::default();
+        self.pressure_rotation_pending = false;
+    }
+
+    /// The next request this episode may attempt: the lowest snapshot pid
+    /// not yet ruled out whose live request still carries the snapshot
+    /// serial and passes the safe-service subset. Absent or renewed
+    /// candidates are skipped without an attempt and never selected.
+    fn pressure_select_next(&self, protection: &PressureProtection) -> Option<PressureSelection> {
+        let episode = self.pressure_episode.as_ref()?;
+        episode
+            .snapshot
+            .iter()
+            .filter(|(pid, _)| !episode.ruled_out.contains(pid))
+            .filter(|(pid, (serial, _))| {
+                self.refresh_requested
+                    .get(pid)
+                    .is_some_and(|live| live.serial == *serial)
+            })
+            .filter(|(pid, _)| {
+                self.refresh_requested
+                    .get(pid)
+                    .is_some_and(|live| self.pressure_request_eligible(**pid, live, protection))
+            })
+            .map(|(pid, (serial, _))| PressureSelection {
+                pid: *pid,
+                serial: *serial,
+            })
+            .next()
+    }
+
+    /// Whether a queued request is safe to service while the head is held:
+    /// its pid and its owner's view are outside the protected set, and it
+    /// falls in the conservative service subset — provably stale with no
+    /// live context obligation, or a retained owner whose old contexts are
+    /// already fully retired so setup finishes without dispatching later
+    /// records. A live old context, selection handoff or incomplete
+    /// terminal journal blocks the request for this pressure episode. Under
+    /// block-all protection only provably context-free stale requests —
+    /// no views at all — stay eligible.
+    fn pressure_request_eligible(
+        &self,
+        pid: u32,
+        request: &RefreshRequest,
+        protection: &PressureProtection,
+    ) -> bool {
+        if protection.pids.contains(&pid) {
+            return false;
+        }
+        if let Some(view) = request
+            .owner
+            .and_then(|owner| self.views.iter().find(|view| view.id() == owner))
+            && protection.pids.contains(&view.pid())
+        {
+            return false;
+        }
+        if protection.block_all {
+            return !self.views.iter().any(|view| view.pid() == pid)
+                && request
+                    .owner
+                    .is_none_or(|owner| !self.views.iter().any(|view| view.id() == owner));
+        }
+        let mut views: Vec<ProcessViewId> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        if let Some(owner) = request.owner
+            && !views.contains(&owner)
+            && self.views.iter().any(|view| view.id() == owner)
+        {
+            views.push(owner);
+        }
+        for view in views {
+            if !self.loader_registry.ids_for_view(view).is_empty() {
+                return false;
+            }
+            if self
+                .selection_bindings
+                .values()
+                .any(|binding| binding.view == view)
+            {
+                return false;
+            }
+            if self.terminal_journal.is_some_and(|journal| {
+                self.loader_registry
+                    .context(journal.owner)
+                    .is_some_and(|context| context.spec.view == view)
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a pressure service pass must leave this pid's views alone:
+    /// while the pass runs, and while its head episode still holds the
+    /// parked prefix for another rotation opportunity.
+    fn pressure_view_shielded(&self, pid: u32) -> bool {
+        (self.pressure_service_active || self.pressure_rotation_pending)
+            && (self.pressure_protection.block_all || self.pressure_protection.pids.contains(&pid))
     }
 
     fn acknowledge_owned_initial_exec(&mut self, view: ProcessViewId) -> bool {
@@ -14189,38 +21027,59 @@ impl Engine {
             && self.pinned.check_unchanged().unwrap_or(false)
     }
 
+    /// The lifecycle generation a record resolves against, after the scope
+    /// admission check. Only cgroup scope filters through the admission
+    /// ledger: system scope admits every pid without a membership check
+    /// (the whole machine is in scope), while the ledger still counts
+    /// unmatched exits as descendant gaps below. Shared by dispatch and by
+    /// the pressure lookahead so both resolve the same owner.
+    fn admitted_lifecycle_match(
+        &self,
+        record: &DiscoveryRecord,
+    ) -> Option<(ProcessViewId, RetirementCause)> {
+        let pid = (record.pid_tgid >> 32) as u32;
+        lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind).filter(
+            |(view, _)| {
+                !matches!(self.scope, Scope::Cgroup { .. })
+                    || self
+                        .admitted_cgroup_views
+                        .get(view)
+                        .is_some_and(|admission| {
+                            if matches!(
+                                record.kind,
+                                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                            ) {
+                                admission.covers(record.hook_ts_ns, pid)
+                            } else {
+                                admission.pid == pid
+                                    && self
+                                        .views
+                                        .iter()
+                                        .find(|candidate| candidate.id() == *view)
+                                        .is_some_and(ProcessView::still_the_same)
+                            }
+                        })
+            },
+        )
+    }
+
     fn dispatch_lifecycle_record(
         &mut self,
+        session: &mut dyn EngineSession,
         record: &DiscoveryRecord,
         pending_views: &mut PendingViewRetirements,
     ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
-        // Only cgroup scope filters lifecycle records through the admission
-        // ledger: system scope admits every pid without a membership check
-        // (the whole machine is in scope), while the ledger still counts
-        // unmatched exits as descendant gaps below.
-        if let Some((view, cause)) =
-            lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind).filter(
-                |(view, _)| {
-                    !matches!(self.scope, Scope::Cgroup { .. })
-                        || self
-                            .admitted_cgroup_views
-                            .get(view)
-                            .is_some_and(|admission| {
-                                if record.kind == DISCOVERY_KIND_LEADER_EXIT {
-                                    admission.covers(record.hook_ts_ns, pid)
-                                } else {
-                                    admission.pid == pid
-                                        && self
-                                            .views
-                                            .iter()
-                                            .find(|candidate| candidate.id() == *view)
-                                            .is_some_and(ProcessView::still_the_same)
-                                }
-                            })
-                },
-            )
-        {
+        // 6.14 Option B: seed the exe-identity stash from every EXEC,
+        // matched or not; a gap exit may consume it later. Disabled
+        // captures ignore the record's exe words entirely.
+        if record.kind == DISCOVERY_KIND_EXEC {
+            self.extensive.note_exec_record(record);
+            // 6.14 Option A: seed the exec timing behind the
+            // late-watch rule from the same EXEC.
+            self.exit_map.note_exec(pid, record.hook_ts_ns);
+        }
+        if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
             if record.kind == DISCOVERY_KIND_EXEC && self.acknowledge_owned_initial_exec(view) {
                 // The validated prearm now also serves ordinary live loader
                 // discovery. Keep the existing per-load-kind classification;
@@ -14231,29 +21090,100 @@ impl Engine {
                 // a mismatched loader record elsewhere in this batch.
                 return None;
             }
-            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            if record.kind == DISCOVERY_KIND_EXEC
+                && cause == RetirementCause::ExecRefresh
+                && let Some(diag) = session.reexec_diagnostic()
+            {
+                diag.matched_exec();
+                diag.note(DiagnosticPhase::Exec, DiagnosticOutcome::Begin, [None; 4]);
+            }
+            if matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) {
                 self.close_cgroup_admission(view, record.hook_ts_ns);
                 if !self.admitted_cgroup_views.contains_key(&view) {
-                    self.record_unmatched_cgroup_leader_exit(record);
+                    self.record_unmatched_cgroup_leader_exit(
+                        record,
+                        session.instance_hooks_refused(),
+                    );
                 }
             }
+            let mut refreshed_serial = None;
             if cause == RetirementCause::ExpectedRemoval {
-                self.queue_leader_exit_assessment(view);
+                self.queue_leader_exit_assessment(view, Some(record.hook_ts_ns));
             } else {
                 if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
                     admission.closed_ns = None;
                 }
+                let accepted = self.request_refresh_consumed_for_view(
+                    pid,
+                    crate::attach::monotonic_ns(),
+                    view,
+                );
+                if record.kind == DISCOVERY_KIND_EXEC {
+                    if accepted {
+                        let request = self
+                            .refresh_requested
+                            .get_mut(&pid)
+                            .expect("accepted refresh request");
+                        refreshed_serial = Some(request.serial);
+                        request.exec_binding = self
+                            .views
+                            .iter()
+                            .find(|retained| retained.id() == view)
+                            .and_then(|retained| {
+                                session.bind_exec(retained, request.serial, record)
+                            });
+                        request.exec_hook_ts_ns = request
+                            .exec_binding
+                            .as_ref()
+                            .map(|_| record.hook_ts_ns)
+                            .filter(|timestamp| *timestamp != 0);
+                    } else if let Some(request) = self.refresh_requested.get_mut(&pid) {
+                        request.exec_binding = None;
+                        request.exec_hook_ts_ns = None;
+                    }
+                }
                 self.queue_retirement(view, cause, pending_views);
+            }
+            if record.kind == DISCOVERY_KIND_EXEC && cause == RetirementCause::ExecRefresh {
+                // A matched EXEC may have killed this view's PID-bound static
+                // links. The refresh rearms them even when the rescan
+                // re-accepts the same targets; removal prunes the marker.
+                self.exec_rearm_views.insert(view, refreshed_serial);
+                crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                    diag.serial(refreshed_serial);
+                    let request = self.refresh_requested.get(&pid);
+                    diag.note(
+                        DiagnosticPhase::Request,
+                        if refreshed_serial.is_some() {
+                            DiagnosticOutcome::Queued
+                        } else {
+                            DiagnosticOutcome::Refused
+                        },
+                        [
+                            Some(self.refresh_requested.len() as u64),
+                            Some(u64::from(request.is_some_and(|r| r.owner == Some(view)))),
+                            Some(u64::from(request.is_some_and(|r| r.exec_binding.is_some()))),
+                            None,
+                        ],
+                    );
+                });
             }
             (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             None
         } else {
-            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
-                self.record_unmatched_cgroup_leader_exit(record);
+            if matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) {
+                self.record_unmatched_cgroup_leader_exit(record, session.instance_hooks_refused());
             }
             None
         }
@@ -14265,11 +21195,19 @@ impl Engine {
         exec_refresh_views: &BTreeSet<ProcessViewId>,
     ) {
         for view in deferred_mismatches {
-            if !exec_refresh_views.contains(&view) {
-                self.reject_loader_record(
-                    "a loader hit failed generation, mapping, identity, or hook-IP validation",
-                );
-            }
+            self.settle_deferred_loader_mismatch(view, exec_refresh_views);
+        }
+    }
+
+    fn settle_deferred_loader_mismatch(
+        &mut self,
+        view: ProcessViewId,
+        exec_refresh_views: &BTreeSet<ProcessViewId>,
+    ) {
+        if !exec_refresh_views.contains(&view) {
+            self.reject_loader_record(
+                "a loader hit failed generation, mapping, identity, or hook-IP validation",
+            );
         }
     }
 
@@ -14302,11 +21240,95 @@ impl Engine {
                 view,
                 original_exited,
             );
+            if !self.pending_leader_exit_views.contains(&view) {
+                self.pending_leader_exit_order.remove(&view);
+            }
         }
     }
 
-    fn queue_leader_exit_assessment(&mut self, view: ProcessViewId) {
-        self.pending_leader_exit_views.insert(view);
+    fn queue_leader_exit_assessment(&mut self, view: ProcessViewId, hook_ts_ns: Option<u64>) {
+        let known = hook_ts_ns.filter(|timestamp| *timestamp != 0);
+        let newly_pending = self.pending_leader_exit_views.insert(view);
+        if newly_pending {
+            // A new assessment dirties the current lap and restarts the
+            // clean-pass count (R-26 N1).
+            self.collected_assessment_lap.dirty = true;
+            self.collected_assessment_lap.clean = 0;
+        }
+        let order = self
+            .pending_leader_exit_order
+            .entry(view)
+            .or_insert(if newly_pending { known } else { None });
+        *order = match (*order, known) {
+            (Some(previous), Some(next)) => Some(previous.max(next)),
+            _ => None,
+        };
+    }
+
+    /// Consume only the next-frame scheduling hint, never admission authority.
+    pub(crate) fn take_immediate_exec_recovery_frame(&mut self) -> bool {
+        std::mem::take(&mut self.immediate_exec_recovery_frame)
+    }
+
+    /// Poll only the current Session allocation's ticket. Ordinary live work
+    /// stays blocked on both pending and refused ownership. Carry the actual
+    /// verdict so collected Finish can end incompletely on refusal while
+    /// retaining the quarantine. Only settlement owes an ordinary scoped frame.
+    fn poll_global_retirement_barrier(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Option<(RetirementPoll, BacklogOutcome)> {
+        let ticket = self.pending_global_retirement.as_ref()?;
+        let poll = session.poll_global_retirement(ticket);
+        let settled = match poll {
+            RetirementPoll::Pending => false,
+            RetirementPoll::Refused => {
+                if !self.counters.object_skips.iter().any(|skip| skip.subject == "global native retirement" && skip.reason == "original static ownership remains uncertain; replacement admission is blocked") {
+                    self.mark_partial(
+                    "global native retirement",
+                    "original static ownership remains uncertain; replacement admission is blocked",
+                    );
+                }
+                false
+            }
+            RetirementPoll::Settled => {
+                self.pending_global_retirement = None;
+                if !self.cancellation_requested() && !session.mutation_stopped() {
+                    self.immediate_exec_recovery_frame = true;
+                    self.global_retirement_frame_owed = true;
+                }
+                true
+            }
+        };
+        Some((
+            poll,
+            BacklogOutcome {
+                changed: false,
+                progressed: settled,
+                pending: self.discovery_backlog_pending(session.staged_discovery_len()),
+            },
+        ))
+    }
+
+    /// Keep recovery work owed by a later matched EXEC. This only retains an
+    /// existing request; it grants no continuity or attachment authority. The
+    /// ordinary next tick still scans, admits and validates every mutation.
+    fn pid_exec_after_leader_exit(
+        &self,
+        view: ProcessViewId,
+        pid: u32,
+        exit_hook_ts_ns: Option<u64>,
+    ) -> bool {
+        matches!(self.scope, Scope::Pid(named) if named == pid)
+            && self.refresh_requested.get(&pid).is_some_and(|request| {
+                request.owner == Some(view)
+                    && self.exec_rearm_views.get(&view) == Some(&Some(request.serial))
+                    && request.exec_binding.is_some()
+                    && request
+                        .exec_hook_ts_ns
+                        .zip(exit_hook_ts_ns)
+                        .is_some_and(|(exec, exit)| exit != 0 && exit < exec)
+            })
     }
 
     fn settle_leader_exit_assessments(
@@ -14317,46 +21339,68 @@ impl Engine {
         closure: &mut PauseClosure,
     ) {
         for view in assessments {
-            let result = self
-                .views
-                .iter()
-                .find(|candidate| candidate.id() == *view)
-                .map_or_else(
-                    || Err("retained process view is no longer available".to_string()),
-                    ProcessView::original_exited,
-                );
-            match settle_leader_exit_view(
-                &mut self.pending_leader_exit_views,
-                &mut self.counted_leader_exit_views,
-                &mut self.task_uprobe_link_losses,
-                *view,
-                result,
-            ) {
-                LeaderExitAssessment::AlreadySettled => {}
-                LeaderExitAssessment::Pending => {
-                    *additions_allowed = false;
-                    closure.fail();
-                }
-                LeaderExitAssessment::WholeGroupExit => {
-                    self.queue_retirement(*view, RetirementCause::ExpectedRemoval, pending_views);
-                }
-                LeaderExitAssessment::LinkLoss => {
-                    *additions_allowed = false;
-                    closure.fail();
-                    self.invalidate_causal_timing();
-                    self.close_owned_selection_for_view(*view);
-                    if let Some(pid) = self
-                        .views
-                        .iter()
-                        .find(|candidate| candidate.id() == *view)
-                        .map(ProcessView::pid)
-                    {
-                        self.refresh_requested.remove(&pid);
-                        // No rescan will settle this view's pending poll, and
-                        // the link loss is counted separately — forget the
-                        // poll rather than publishing it twice (F1).
-                        self.polled_pids.remove(&pid);
+            self.settle_leader_exit_assessment(*view, pending_views, additions_allowed, closure);
+        }
+    }
+
+    fn settle_leader_exit_assessment(
+        &mut self,
+        view: ProcessViewId,
+        pending_views: &mut PendingViewRetirements,
+        additions_allowed: &mut bool,
+        closure: &mut PauseClosure,
+    ) {
+        let exit_hook_ts_ns = self.pending_leader_exit_order.get(&view).copied().flatten();
+        let result = self
+            .views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map_or_else(
+                || Err("retained process view is no longer available".to_string()),
+                ProcessView::original_exited,
+            );
+        let assessment = settle_leader_exit_view(
+            &mut self.pending_leader_exit_views,
+            &mut self.counted_leader_exit_views,
+            &mut self.task_uprobe_link_losses,
+            view,
+            result,
+        );
+        if !self.pending_leader_exit_views.contains(&view) {
+            self.pending_leader_exit_order.remove(&view);
+        }
+        match assessment {
+            LeaderExitAssessment::AlreadySettled => {}
+            LeaderExitAssessment::Pending => {
+                *additions_allowed = false;
+                closure.fail();
+            }
+            LeaderExitAssessment::WholeGroupExit => {
+                self.queue_retirement(view, RetirementCause::ExpectedRemoval, pending_views);
+            }
+            LeaderExitAssessment::LinkLoss => {
+                *additions_allowed = false;
+                closure.fail();
+                self.invalidate_causal_timing();
+                self.close_owned_selection_for_view(view);
+                if let Some(pid) = self
+                    .views
+                    .iter()
+                    .find(|candidate| candidate.id() == view)
+                    .map(ProcessView::pid)
+                {
+                    if self.pid_exec_after_leader_exit(view, pid, exit_hook_ts_ns) {
+                        // Keep this batch closed: protected old-context
+                        // records still use its admission flag. Only the
+                        // next ordinary frame may service the exact EXEC.
+                        self.immediate_exec_recovery_frame = true;
+                    } else {
+                        self.clear_refresh_for_view(view, pid);
                     }
+                    // No rescan will settle this view's pending poll, and
+                    // the link loss is counted separately — forget the
+                    // poll rather than publishing it twice (F1).
+                    self.polled_pids.remove(&pid);
                 }
             }
         }
@@ -14450,8 +21494,11 @@ impl Engine {
                 pending_views,
                 deferred_mismatches,
             ),
-            DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
-                if let Some(view) = self.dispatch_lifecycle_record(&record, pending_views) {
+            DISCOVERY_KIND_EXEC
+            | DISCOVERY_KIND_LEADER_EXIT
+            | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
+                if let Some(view) = self.dispatch_lifecycle_record(session, &record, pending_views)
+                {
                     exec_refresh_views.insert(view);
                 }
                 Ok(DiscoveryRecordOutcome::applied(false, true))
@@ -14468,6 +21515,197 @@ impl Engine {
         }
     }
 
+    /// Dispatches one queued record with the batch's exact outcome
+    /// accounting. Shared by the ordinary loop and by the pressure path's
+    /// explicit head refusal, so a refused head keeps the honest accounting
+    /// ordinary dispatch would have recorded for it.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_one_queued_record(
+        &mut self,
+        queued: QueuedDiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        exec_refresh_views: &mut BTreeSet<ProcessViewId>,
+        deferred_mismatches: &mut Vec<ProcessViewId>,
+        terminal_selection_handoffs: &mut TerminalSelectionHandoffs,
+        closure: &mut PauseClosure,
+        changed: &mut bool,
+    ) {
+        self.note_record_protection(&queued.record);
+        let record = queued.record;
+        let origin = (queued.record.pid_tgid >> 32) as u32;
+        match self.dispatch_discovery_record(
+            queued,
+            session,
+            additions_allowed,
+            pending_views,
+            exec_refresh_views,
+            deferred_mismatches,
+        ) {
+            Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff { view, owner }) => {
+                terminal_selection_handoffs
+                    .entry(owner.get())
+                    .or_default()
+                    .push(record);
+                self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
+            }
+            Ok(outcome) => {
+                *changed |= outcome.changed();
+                if !outcome.required_complete() {
+                    closure.fail();
+                }
+            }
+            Err(_) => {
+                closure.fail();
+                if self.record_generation_ended(origin) {
+                    if record_could_publish_callable_code(&record) {
+                        self.invalidate_causal_timing();
+                    }
+                } else {
+                    self.mark_live_loss(
+                        "live discovery record",
+                        "a structurally valid private record failed exact live resolution",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs one selected-request service transaction with the parked
+    /// prefix withheld, to free a request-map slot for a pressure head. The
+    /// transaction serves only `selection`: every other request is retained
+    /// with its serial and age on every exit path. Protected views are
+    /// neither refreshed nor retired. The tick's collector diverts any fresh
+    /// session records into `diverted` (oldest first) instead of dispatching
+    /// them ahead of the parked prefix, and reports the nested operation
+    /// blocked for this episode. Diverted records are charged and counted
+    /// exactly once, at their first Engine accounting boundary. H1 fairness
+    /// cursors are checkpointed around the transaction and restored on every
+    /// exit path, fatal or not: the selected attempt is recorded in the
+    /// pressure episode's own counters, never in H1 shares.
+    #[allow(clippy::too_many_arguments)]
+    fn pressure_service_pass(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
+        protection: &PressureProtection,
+        selection: PressureSelection,
+        parked_len: usize,
+        diverted: &mut Vec<QueuedDiscoveryRecord>,
+    ) -> Result<PressureServiceOutcome> {
+        let held = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(parked_len)
+            .saturating_add(diverted.len());
+        let allowance = DISCOVERY_HELD_CAP
+            .saturating_sub(held)
+            .saturating_sub(LIVE_DISCOVERY_DRAIN_QUANTUM);
+        let diverted_base = diverted.len();
+        let mut diverted_malformed = 0u64;
+        let fairness = self.scheduler.fairness_checkpoint();
+        let scans_before = self.deep_scans;
+        let arms_before = self.loader_arms;
+        self.pressure_service_active = true;
+        self.pressure_protection.clone_from(protection);
+        self.pressure_selected = Some(selection);
+        self.pressure_service_passes = self.pressure_service_passes.saturating_add(1);
+        let collect_inner = &mut *collect;
+        let mut service_collect =
+            |session: &mut dyn EngineSession| -> Result<(Vec<DiscoveryRecord>, u64)> {
+                let diverted_now =
+                    diverted.len().saturating_sub(diverted_base) as u64 + diverted_malformed;
+                // Once this episode has diverted anything, later nested collects
+                // block without pulling: the pending journal must see its whole
+                // drain, and its completion waits for the post-service
+                // continuation that observes the ring directly. At capacity the
+                // pass likewise blocks without pulling: claiming empty would be
+                // fabricated, and pulling past the shared allowance would
+                // over-admit. Every nested operation retries after the parked
+                // prefix is dispatched.
+                if diverted_now > 0 || diverted_now >= allowance as u64 {
+                    return Err(PressureOrderingBlocked.into());
+                }
+                match collect_inner(session) {
+                    Ok((records, malformed)) if records.is_empty() && malformed == 0 => {
+                        Ok((records, malformed))
+                    }
+                    Ok((records, malformed)) => {
+                        diverted.extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
+                            record,
+                            terminal_owner: None,
+                            terminal_exports: Vec::new(),
+                        }));
+                        diverted_malformed = diverted_malformed.saturating_add(malformed);
+                        Err(PressureOrderingBlocked.into())
+                    }
+                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                        Ok(incomplete) if incomplete.backlog || incomplete.capacity_blocked => {
+                            // A genuine quantum or storage stop: the pulled
+                            // prefix is consumed, so it joins the diverted
+                            // stash and the nested operation stays incomplete
+                            // for this episode.
+                            diverted.extend(incomplete.records.into_iter().map(|record| {
+                                QueuedDiscoveryRecord {
+                                    record,
+                                    terminal_owner: None,
+                                    terminal_exports: Vec::new(),
+                                }
+                            }));
+                            diverted_malformed =
+                                diverted_malformed.saturating_add(incomplete.malformed);
+                            Err(PressureOrderingBlocked.into())
+                        }
+                        Ok(incomplete) => Err(incomplete.into()),
+                        Err(error) => Err(error),
+                    },
+                }
+            };
+        let mut empty_records = Vec::new();
+        let mut tick_now = crate::attach::monotonic_ns;
+        let outcome = self.refresh_inventory(
+            session,
+            additions_allowed,
+            &mut empty_records,
+            pending_views,
+            &mut service_collect,
+            closure,
+            &mut tick_now,
+        );
+        self.pressure_service_active = false;
+        self.pressure_selected = None;
+        self.scheduler.restore_fairness(fairness);
+        // Every nested pull during the pass belonged to a terminal drain, so
+        // the diverted slice keeps its terminal validation: records matching
+        // the pending authority dispatch as terminal hits after the parked
+        // prefix instead of rejecting as ordinary records.
+        if let Some(batch) = self.terminal_batch.as_ref() {
+            batch.authority.tag_matching(&mut diverted[diverted_base..]);
+        }
+        let fresh = diverted.len().saturating_sub(diverted_base);
+        self.charge_discovery_drain(fresh, diverted_malformed);
+        self.record_malformed_discovery(diverted_malformed);
+        if diverted_malformed != 0 {
+            closure.fail();
+        }
+        let changed = outcome?;
+        // A real attempt ran a scan, an arm or an admission, or it settled
+        // the selected request (completed, or completed-then-renewed with a
+        // newer serial). A quantum deferral settles nothing and scans
+        // nothing; the episode rules the entry out without an attempt.
+        let completed = self
+            .refresh_requested
+            .get(&selection.pid)
+            .is_none_or(|live| live.serial != selection.serial);
+        let attempted =
+            completed || self.deep_scans != scans_before || self.loader_arms != arms_before;
+        Ok(PressureServiceOutcome { changed, attempted })
+    }
+
     fn process_discovery_records(
         &mut self,
         session: &mut dyn EngineSession,
@@ -14477,11 +21715,38 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
     ) -> Result<bool> {
+        self.note_discovery_held_high_water(records.len());
+        if self.pending_global_retirement.is_some() {
+            // Re-park before H5 selects or rules out any pressure request.
+            self.pending_discovery_records.append(records);
+            closure.fail();
+            return Ok(false);
+        }
+        // A re-parked rotation never leaks across record passes: this pass
+        // sets it again only if it re-parks a head itself.
+        self.pressure_rotation_pending = false;
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
         let mut terminal_selection_handoffs = TerminalSelectionHandoffs::new();
-        for (view, cause) in self.retirement_intents.clone() {
+        // Set once a service pass concludes without freeing a request slot:
+        // later heads in this pass dispatch normally instead of repeating a
+        // service attempt the same state just proved fruitless.
+        let mut pressure_quiet = false;
+        // Fresh session records diverted by service passes, oldest first.
+        // They rejoin the pending queue behind every parked record.
+        let mut diverted_fresh: Vec<QueuedDiscoveryRecord> = Vec::new();
+        let intents = if self.collected_finish_actions.is_some() {
+            // The persistent map remains the owner of the other intents.
+            self.retirement_intents
+                .first_key_value()
+                .map(|(view, cause)| (*view, *cause))
+                .into_iter()
+                .collect()
+        } else {
+            self.retirement_intents.clone()
+        };
+        for (view, cause) in intents {
             pending_views
                 .entry(view)
                 .and_modify(|current| *current = current.merge(cause))
@@ -14492,6 +21757,17 @@ impl Engine {
             let mut deferred_mismatches = Vec::new();
             let mut batch = std::mem::take(records).into_iter();
             while let Some(queued) = batch.next() {
+                if !self.take_collected_finish_action() {
+                    self.pending_discovery_records
+                        .extend(std::iter::once(queued).chain(batch));
+                    break;
+                }
+                if self.pending_global_retirement.is_some() {
+                    self.pending_discovery_records
+                        .extend(std::iter::once(queued).chain(batch));
+                    closure.fail();
+                    break;
+                }
                 // H-1: a spent live frame dispatches nothing more. The rest
                 // waits, in ring order, at the head of the next batch. Only
                 // where that cannot change a verdict: no loader mismatch
@@ -14510,54 +21786,212 @@ impl Engine {
                         .extend(std::iter::once(queued).chain(batch));
                     break;
                 }
-                self.note_record_protection(&queued.record);
-                let record = queued.record;
-                let origin = (queued.record.pid_tgid >> 32) as u32;
-                match self.dispatch_discovery_record(
+                // H5 pressure: at a full request map, a head that would need
+                // a new entry parks with its whole suffix in original order
+                // while its episode runs one selected-request service
+                // transaction per opportunity. The transaction shields every
+                // view the owned records name and serves only its selected
+                // request; if it frees a slot the parked prefix resumes in
+                // order, otherwise the episode rotates to its next eligible
+                // snapshot entry on a later opportunity. When one bounded
+                // rotation rules every entry out, the head is refused exactly
+                // once through ordinary dispatch and the suffix advances.
+                // Never a frame deferral: deferral would suppress the
+                // inventory work that frees capacity.
+                if !pressure_quiet && self.pressure_head_pending(&queued) {
+                    if self.collected_finish_actions.is_some() {
+                        // The terminal stop takes the "rotation ruled every
+                        // entry out" route: no service pass, scan, admit,
+                        // evict or refresh runs here. The head is refused
+                        // exactly once through ordinary dispatch with
+                        // additions closed, and the suffix keeps ring order.
+                        pressure_quiet = true;
+                        *additions_allowed = false;
+                        self.dispatch_one_queued_record(
+                            queued,
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            &mut exec_refresh_views,
+                            &mut deferred_mismatches,
+                            &mut terminal_selection_handoffs,
+                            closure,
+                            &mut changed,
+                        );
+                        self.pressure_episode_clear();
+                        continue;
+                    }
+                    if self.frame_work_exhausted() {
+                        self.note_frame_deferral();
+                        self.pending_discovery_records
+                            .extend(std::iter::once(queued).chain(batch));
+                        break;
+                    }
+                    let parked: Vec<QueuedDiscoveryRecord> =
+                        std::iter::once(queued).chain(batch).collect();
+                    self.pressure_episode_begin(&parked[0]);
+                    let protection = self.pressure_protection_for(&parked, &diverted_fresh);
+                    // A failed clock is a deferral condition, never a
+                    // refusal: the episode waits untouched for the next
+                    // opportunity instead of manufacturing queue overflow.
+                    let clock_ok = crate::attach::monotonic_ns().is_some();
+                    if clock_ok && let Some(selection) = self.pressure_select_next(&protection) {
+                        match self.pressure_service_pass(
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            collect,
+                            closure,
+                            &protection,
+                            selection,
+                            parked.len(),
+                            &mut diverted_fresh,
+                        ) {
+                            Ok(outcome) => {
+                                changed |= outcome.changed;
+                                if self.pending_global_retirement.is_none()
+                                    && let Some(episode) = self.pressure_episode.as_mut()
+                                {
+                                    episode.ruled_out.insert(selection.pid);
+                                }
+                                if outcome.attempted {
+                                    self.pressure_attempts =
+                                        self.pressure_attempts.saturating_add(1);
+                                }
+                            }
+                            Err(error) => {
+                                // A fatal service failure keeps every
+                                // undispatched record queued in ring order.
+                                // The fatal entry is ruled out so a later
+                                // retry never reselects it; the episode
+                                // otherwise survives for that retry.
+                                if let Some(episode) = self.pressure_episode.as_mut() {
+                                    episode.ruled_out.insert(selection.pid);
+                                }
+                                self.pending_discovery_records.extend(parked);
+                                self.pending_discovery_records.append(&mut diverted_fresh);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    self.note_discovery_held_high_water(
+                        parked.len().saturating_add(diverted_fresh.len()),
+                    );
+                    if self.pending_global_retirement.is_some() {
+                        self.pending_discovery_records.extend(parked);
+                        self.pressure_rotation_pending = true;
+                        closure.fail();
+                        break;
+                    }
+                    // A service pass may have spent the frame: defer the
+                    // parked prefix untouched rather than refusing work the
+                    // next frame can still service.
+                    if self.frame_work_exhausted() {
+                        self.note_frame_deferral();
+                        self.pending_discovery_records.extend(parked);
+                        break;
+                    }
+                    if self.refresh_requested.len() < MAX_PENDING_REFRESH {
+                        batch = parked.into_iter();
+                        self.pressure_episode_clear();
+                        continue;
+                    }
+                    // Rotation continues while the snapshot holds another
+                    // selectable entry: the parked prefix waits in ring order
+                    // for the next opportunity, with no ordinary tick behind
+                    // it and retirement still shielded. A failed clock
+                    // always re-parks, even with nothing selectable.
+                    let protection = self.pressure_protection_for(&parked, &diverted_fresh);
+                    if !clock_ok || self.pressure_select_next(&protection).is_some() {
+                        self.pending_discovery_records.extend(parked);
+                        self.pressure_rotation_pending = true;
+                        break;
+                    }
+                    // One bounded rotation ruled every entry out: refuse the
+                    // head exactly once. Later heads in this pass dispatch
+                    // normally instead of repeating service the same state
+                    // just proved fruitless.
+                    pressure_quiet = true;
+                    let mut parked = parked.into_iter();
+                    let head = parked
+                        .next()
+                        .expect("a parked prefix always holds its head");
+                    batch = parked;
+                    self.dispatch_one_queued_record(
+                        head,
+                        session,
+                        additions_allowed,
+                        pending_views,
+                        &mut exec_refresh_views,
+                        &mut deferred_mismatches,
+                        &mut terminal_selection_handoffs,
+                        closure,
+                        &mut changed,
+                    );
+                    self.pressure_episode_clear();
+                    continue;
+                }
+                self.dispatch_one_queued_record(
                     queued,
                     session,
                     additions_allowed,
                     pending_views,
                     &mut exec_refresh_views,
                     &mut deferred_mismatches,
-                ) {
-                    Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff { view, owner }) => {
-                        terminal_selection_handoffs
-                            .entry(owner.get())
-                            .or_default()
-                            .push(record);
-                        self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
-                    }
-                    Ok(outcome) => {
-                        changed |= outcome.changed();
-                        if !outcome.required_complete() {
-                            closure.fail();
-                        }
-                    }
-                    Err(_) => {
-                        closure.fail();
-                        if self.record_generation_ended(origin) {
-                            if record_could_publish_callable_code(&record) {
-                                self.invalidate_causal_timing();
-                            }
-                        } else {
-                            self.mark_live_loss(
-                                "live discovery record",
-                                "a structurally valid private record failed exact live resolution",
-                            );
-                        }
-                    }
-                }
+                    &mut terminal_selection_handoffs,
+                    closure,
+                    &mut changed,
+                );
             }
+            // Diverted fresh records join the pending queue behind anything
+            // the frame deferred: they are newer than every parked record.
+            self.pending_discovery_records.append(&mut diverted_fresh);
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
+            if self.pending_global_retirement.is_some() {
+                closure.fail();
+                break;
+            }
+            // A terminal opportunity never turns a single dispatched original
+            // into an unbounded retirement pass. Its persistent intents remain
+            // beside the same Engine for a later opportunity.
+            if self.collected_finish_actions == Some(0) {
+                for (view, cause) in std::mem::take(pending_views) {
+                    self.retirement_intents
+                        .entry(view)
+                        .and_modify(|old| *old = old.merge(cause))
+                        .or_insert(cause);
+                }
+                break;
+            }
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
+                if self.collected_finish_actions.is_some() {
+                    // Rejections or a named first retirement ask the barrier
+                    // for one bounded graph; anything else settles here (§1.4).
+                    if self.take_collected_finish_action() {
+                        if !self.pending_rejected_keys.is_empty()
+                            || self
+                                .pending_retirements
+                                .first()
+                                .is_some_and(|view| self.names_view_bounded(*view))
+                        {
+                            // Reported as progressed (item 15).
+                            self.collected_graph_requested = true;
+                        } else {
+                            changed |= self.settle_unreferenced_collected_retirement();
+                        }
+                    }
+                    break;
+                }
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
                     || conservative_replay_attempted
                 {
                     break;
                 }
                 conservative_replay_attempted = true;
+                if !self.take_collected_finish_action() {
+                    break;
+                }
                 let outcome =
                     self.replay_pending_conservative(session, additions_allowed, pending_views);
                 closure.observe_apply(&outcome);
@@ -14567,16 +22001,35 @@ impl Engine {
                 // generations (U-07).
                 closure.fail();
                 changed |= outcome.changed;
-                if outcome.refused() && pending_views.is_empty() {
+                if outcome.retains_intent() && pending_views.is_empty() {
                     break;
                 }
             }
             for (view, mut cause) in std::mem::take(pending_views) {
+                if !self.take_collected_finish_action() {
+                    self.retirement_intents
+                        .entry(view)
+                        .and_modify(|old| *old = old.merge(cause))
+                        .or_insert(cause);
+                    continue;
+                }
                 if let Some(next) = pending_views.remove(&view) {
                     cause = cause.merge(next);
                 }
                 if let Some(persistent) = self.retirement_intents.get(&view).copied() {
                     cause = cause.merge(persistent);
+                }
+                if self.collected_finish_actions.is_some() && self.names_view_bounded(view) {
+                    // Until the actual conservative graph/native continuation
+                    // can dispose these inputs, refuse BEFORE context mutation,
+                    // ProcessView removal, scan-input pruning or ID release.
+                    // The request asks the barrier for one bounded graph (§1.4).
+                    self.collected_graph_requested = true;
+                    self.retirement_intents
+                        .entry(view)
+                        .and_modify(|old| *old = old.merge(cause))
+                        .or_insert(cause);
+                    continue;
                 }
                 let Some(retained) = self.views.iter().find(|candidate| candidate.id() == view)
                 else {
@@ -14599,6 +22052,24 @@ impl Engine {
                     }
                     continue;
                 };
+                let retained_pid = retained.pid();
+                // H5 pressure: a service pass never refreshes or retires a
+                // view whose old contexts an undispatched parked record may
+                // still need. The persistent intent survives this deferral
+                // and retries after the parked prefix is dispatched.
+                if self.pressure_view_shielded(retained_pid) {
+                    continue;
+                }
+                // H5 pressure: a selected transaction retires only the
+                // selected pid's views. Unrelated persistent intents are
+                // not whole-scope work for this pass; they retry after
+                // the parked prefix is dispatched.
+                if self
+                    .pressure_selected
+                    .is_some_and(|selected| retained_pid != selected.pid)
+                {
+                    continue;
+                }
                 // A frame-budget deferral must not let EXEC refresh retire
                 // a context still needed by this view's collected records.
                 // The persistent intent is retried after their dispatch.
@@ -14658,12 +22129,45 @@ impl Engine {
                 if !complete {
                     continue;
                 }
+                // Retirement can finish after a consumed EXEC failed to queue
+                // its rescan. Keep that intent until a retry fits; no new
+                // producer record was lost by this retry. Leave inventory
+                // running so it can free capacity instead of deferring the
+                // whole frame behind the full queue.
+                if cause == RetirementCause::ExecRefresh
+                    && !self.refresh_requested.contains_key(&retained_pid)
+                {
+                    if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                        continue;
+                    }
+                    if !self.request_refresh(retained_pid, crate::attach::monotonic_ns()) {
+                        continue;
+                    }
+                }
                 // The conservative replay this queues drops every pin the view
                 // owns. That is right for a generation that is gone, and wrong
                 // for an `ExecRefresh`, which keeps its view and rescans the
                 // same live generation: dropping its pins re-pins the same
                 // provider under a fresh ID, so a second full slot set is
                 // allocated for targets that already have one.
+                let ended = if cause == RetirementCause::ExpectedRemoval
+                    && matches!(self.scope, Scope::Pid(pid) if pid == retained_pid)
+                    && self.ended_pid_retirement.is_none()
+                {
+                    let slots: Vec<_> = self
+                        .plan
+                        .slots
+                        .iter()
+                        .filter(|slot| session.has_slot_link(slot.index))
+                        .cloned()
+                        .collect();
+                    self.views
+                        .iter()
+                        .find(|owner| owner.id() == view)
+                        .and_then(|owner| session.prepare_ended_pid_retirement(owner, &slots))
+                } else {
+                    None
+                };
                 if cause != RetirementCause::ExecRefresh {
                     self.pending_retirements.insert(view);
                 }
@@ -14672,9 +22176,13 @@ impl Engine {
                 if cause == RetirementCause::ExpectedRemoval {
                     self.close_cgroup_admission_at_removal(view);
                     self.settle_leader_exits_at_removal([view]);
-                    let retained = self.views.len();
-                    self.views.retain(|candidate| candidate.id() != view);
-                    if self.views.len() != retained {
+                    if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
+                        let owner = self.views.remove(index);
+                        self.note_ended_loader_origin(&owner);
+                        if let Some(proof) = ended {
+                            self.ended_pid_retirement =
+                                Some(PendingEndedPidRetirement { owner, proof });
+                        }
                         self.release_view_id(view);
                     }
                     self.scan_inputs.remove(&view);
@@ -14690,7 +22198,20 @@ impl Engine {
         self.reject_terminal_selection_handoffs(refused_handoffs, closure);
         self.finalize_expected_target_exit();
         if named_generation_lost {
-            bail!("the named process generation changed during live discovery");
+            let witness = self
+                .counters
+                .object_skips
+                .iter()
+                .find(|skip| {
+                    skip.subject == "live discovery generation"
+                        && skip.reason.starts_with("a retained process generation changed and was scheduled for conservative cleanup;")
+                })
+                .map_or("enqueue witness unavailable", |skip| skip.reason.as_str());
+            bail!(
+                "the named process generation changed during live discovery; {witness}; cancel_now={} mutation_stopped={}",
+                self.cancellation_requested(),
+                session.mutation_stopped(),
+            );
         }
         Ok(changed)
     }
@@ -14705,7 +22226,13 @@ impl Engine {
         let mut failed_pids = BTreeSet::new();
         let mut deferred_pids = BTreeSet::new();
         let mut skipped = Vec::new();
-        let ordered: Vec<ProcessViewId> = views.iter().copied().collect();
+        let ids: Vec<u32> = views.iter().map(|view| view.0).collect();
+        let ordered: Vec<ProcessViewId> = self
+            .scheduler
+            .retained_view_order(&ids)
+            .into_iter()
+            .map(ProcessViewId)
+            .collect();
         for (index, view_id) in ordered.iter().enumerate() {
             // The tick's deep-scan quantum stops the phase before another
             // scan: the current and remaining views defer to the next tick
@@ -14741,6 +22268,7 @@ impl Engine {
                 skipped.push(skip);
                 continue;
             };
+            self.scheduler.note_retained_view_attempt(view_id.0);
             let broad_admit = self.broad_admit;
             let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
@@ -14750,6 +22278,8 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
             );
+            // 6.14 Option B: learn the refreshed generation's executable.
+            elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
             self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
@@ -14763,7 +22293,11 @@ impl Engine {
                 // re-reads the outcome — a refreshed view with modules is
                 // owned, an empty never-dirty one stays exploratory.
                 Ok((modules, pins, _complete)) => {
-                    self.note_scan_observed(*view_id, &modules);
+                    self.note_scan_observed(
+                        *view_id,
+                        self.views[position].view_admission(),
+                        &modules,
+                    );
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -14783,13 +22317,168 @@ impl Engine {
         (scans, failed_pids, deferred_pids, skipped)
     }
 
+    /// Whether the unchanged-tick candidate fast path is disabled. Tests
+    /// only: production always takes the fast path on empty inputs. The
+    /// per-engine flag drives the equivalence twin; the process-wide
+    /// environment variable reruns whole suites against the full path.
+    #[cfg(test)]
+    fn empty_tick_fast_path_disabled(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED
+            .get_or_init(|| std::env::var_os("P11SCOPE_DISABLE_EMPTY_TICK_FAST_PATH").is_some())
+            || self.disable_empty_tick_fast_path_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_disable_empty_tick_fast_path_for_test(&mut self, disabled: bool) {
+        self.disable_empty_tick_fast_path_for_test = disabled;
+    }
+
+    /// Whether per-commit publication deferral is disabled. Tests only:
+    /// production always defers proved-unchanged loader transactions. The
+    /// per-engine flag drives the equivalence twin; the process-wide
+    /// environment variable reruns whole suites against full publication.
+    #[cfg(test)]
+    fn publish_deferral_disabled(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED.get_or_init(|| std::env::var_os("P11SCOPE_DISABLE_PUBLISH_DEFERRAL").is_some())
+            || self.disable_publish_deferral_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_disable_publish_deferral_for_test(&mut self, disabled: bool) {
+        self.disable_publish_deferral_for_test = disabled;
+    }
+
+    /// Builds the candidate for a tick that changed nothing: no removals,
+    /// rescans, admissions or declined views. The caller holds only while
+    /// committed state is rebuild-stable — the last commit installed a built
+    /// candidate, so rebinding the retained modules reproduces it — and the
+    /// candidate carries that committed plan, modules, pins and evidence
+    /// with an empty delta. The merge's real side effects run exactly as the
+    /// full path runs them: skip recording, overlay invalidation, stable
+    /// module-id allocation, pre-arm watches, manifest lowering and skip
+    /// publication into the plan. Selection, corroboration and fallback
+    /// evidence is already committed, so there is nothing to re-derive. The
+    /// loader plan cache is cleared exactly as the full path clears it;
+    /// the commit reseeds it when a proved transaction warrants it.
+    fn inventory_candidate_unchanged(
+        &mut self,
+        candidate_pins: PinnedObjects,
+        skipped: Vec<Skipped>,
+    ) -> Result<LiveCandidate> {
+        self.pending_rejected_keys
+            .extend(candidate_pins.newly_rejected_keys(&self.pinned));
+        if self.pinned.has_overlay_uncertainty() || candidate_pins.has_overlay_uncertainty() {
+            self.invalidate_causal_timing();
+        }
+        self.loader_plan_cache = None;
+        attribution::note_all(&skipped);
+        for skip in skipped {
+            if !self.counters.object_skips.contains(&skip) {
+                self.counters.object_skips.push(skip);
+                self.note_facts_mutated();
+            }
+        }
+        let mut plan_ids = self.plan.clone();
+        self.capture_facts.bind_plan_module_ids(
+            &mut plan_ids,
+            &self.modules,
+            &self.manifests,
+            &candidate_pins,
+        )?;
+        let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &candidate_pins);
+        let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &candidate_pins);
+        self.prearm
+            .create_watches(&self.plan.modules, &declared, &candidate_pins);
+        let mut lowered = self.plan.clone();
+        let (manifest_selection_admissions, selection_refusals) = lower_manifest_selection_tables(
+            &mut lowered,
+            &self.plan,
+            &self.manifests,
+            &self.manifest_ordinals,
+            &candidate_pins,
+        );
+        for reason in selection_refusals {
+            self.mark_partial("offline interface selection", &reason);
+        }
+        let mut plan = self.plan.clone();
+        record_object_skips(
+            &mut plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
+        let manifest_inventory_slots = plan
+            .slots
+            .iter()
+            .map(|slot| {
+                (
+                    plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    },
+                    slot.clone(),
+                )
+            })
+            .collect();
+        let views = self
+            .modules
+            .iter()
+            .map(|module| module.scanned.view)
+            .collect();
+        Ok(LiveCandidate {
+            pinned: candidate_pins,
+            modules: self.modules.clone(),
+            plan,
+            delta: plan::AttachDelta {
+                new: Vec::new(),
+                replace: Vec::new(),
+                retire: Vec::new(),
+            },
+            views,
+            corroboration: self.counters.corroboration.clone(),
+            manifest_fallbacks: self.counters.manifest_fallbacks.clone(),
+            selection_claims: self.selection_claims.clone(),
+            selection_tables: self.selection_tables.clone(),
+            selection_admission: None,
+            manifest_selection_admissions,
+            manifest_inventory_slots,
+            loader_plan_proof: None,
+            exec_preservations: Vec::new(),
+            exec_completions: Vec::new(),
+            // The gate holds only while committed state is rebuild output,
+            // so committing this candidate preserves stability.
+            built_by_full_rebuild: true,
+        })
+    }
+
     fn inventory_candidate(
         &mut self,
         removed: &BTreeSet<ProcessViewId>,
         refreshed: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
         mut skipped: Vec<Skipped>,
+        declined: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
+        #[cfg(not(test))]
+        let fast_path_disabled = false;
+        #[cfg(test)]
+        let fast_path_disabled = self.empty_tick_fast_path_disabled();
+        if removed.is_empty()
+            && refreshed.is_empty()
+            && new_views.is_empty()
+            && declined.is_empty()
+            && self.plan_rebuild_stable
+            && !fast_path_disabled
+        {
+            let mut candidate_pins = self.pinned.clone();
+            let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
+            if folds == 0 && lost.is_empty() {
+                return self.inventory_candidate_unchanged(candidate_pins, skipped);
+            }
+            // A fold would change the pins: fall through to the full path,
+            // which canonicalizes identically.
+        }
         let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
         let mut candidate_pins = self.pinned.clone();
@@ -14823,7 +22512,8 @@ impl Engine {
             assemble_start,
             crate::attach::monotonic_ns(),
         );
-        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        let mut candidate =
+            self.live_candidate_with_declined(candidate_pins, raw_modules, skipped, declined)?;
         candidate
             .views
             .extend(new_views.iter().map(|(view, _, _)| view.id()));
@@ -14836,6 +22526,7 @@ impl Engine {
         candidate: &LiveCandidate,
         removed: &BTreeSet<ProcessViewId>,
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
+        declined: &BTreeSet<ProcessViewId>,
     ) -> CandidateAdmission {
         let targets: Vec<_> = candidate
             .delta
@@ -14844,11 +22535,17 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
+        // Declined views are retained but known-stale: the preflight must
+        // not judge them as newly stale generations, or every deferral
+        // tick would trip the stale preflight below for certain. The
+        // candidate still carries their pins; only the currency check
+        // skips them.
         let mut required_views = candidate.views.clone();
+        required_views.retain(|view| !declined.contains(view));
         required_views.extend(
             self.views
                 .iter()
-                .filter(|view| !removed.contains(&view.id()))
+                .filter(|view| !removed.contains(&view.id()) && !declined.contains(&view.id()))
                 .map(ProcessView::id),
         );
         required_views.extend(new_views.iter().map(|(view, _, _)| view.id()));
@@ -14866,15 +22563,128 @@ impl Engine {
         )
     }
 
+    /// Withholds fresh attach work a declined view solely owns. A declined
+    /// view is retained but unproven: its pins and modules ride the final
+    /// candidate unchanged, and the currency exemption lets that unchanged
+    /// coverage commit — but a previously failed endpoint retrying as
+    /// `delta.new` (or `delta.replace`) must wait for a proven generation
+    /// instead of attaching behind the exemption. Ownership keys on
+    /// contribution to the EXACT endpoint: the planner merges one provider
+    /// object into one module, so an object-level check would let a healthy
+    /// view scanning the same provider authorize an endpoint its tables
+    /// never contained. Withheld targets leave the delta and stay
+    /// deactivated (their keys leave the index), so the next proven tick
+    /// retries them through the ordinary path; newly allocated cells are
+    /// excised rather than kept, so repeated deferral ticks do not
+    /// consume lifetime slot capacity. A target with any live provider —
+    /// a non-declined reconciled view contributing the exact endpoint, or
+    /// no scanned provider at all (manifest-only) — is untouched.
+    fn withhold_declined_retry_targets(
+        &mut self,
+        candidate: &mut LiveCandidate,
+        declined: &BTreeSet<ProcessViewId>,
+    ) {
+        if declined.is_empty() {
+            return;
+        }
+        let mut exact_providers: BTreeMap<(PinnedObjectId, u64), BTreeSet<ProcessViewId>> =
+            BTreeMap::new();
+        for module in &candidate.modules {
+            for (table, objects) in module.scanned.tables.iter().zip(&module.entry_objects) {
+                for (entry, object) in table.entries.iter().zip(objects) {
+                    exact_providers
+                        .entry((*object, entry.file_offset))
+                        .or_default()
+                        .insert(module.scanned.view);
+                }
+            }
+        }
+        let solely_declined = |slot: &plan::Slot| {
+            exact_providers
+                .get(&(slot.object, slot.file_offset))
+                .is_some_and(|providers| {
+                    !providers.is_empty() && providers.iter().all(|view| declined.contains(view))
+                })
+        };
+        let withheld: BTreeSet<u32> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .filter(|slot| solely_declined(slot))
+            .map(|slot| slot.index)
+            .collect();
+        if withheld.is_empty() {
+            return;
+        }
+        // Withholding deactivates and excises cells a rebuild would derive,
+        // so committing this candidate no longer installs rebuild output.
+        self.plan_rebuild_stable = false;
+        candidate
+            .delta
+            .new
+            .retain(|slot| !withheld.contains(&slot.index));
+        candidate
+            .delta
+            .replace
+            .retain(|slot| !withheld.contains(&slot.index));
+        for index in &withheld {
+            candidate.plan.deactivate(*index);
+        }
+        // A withheld `delta.new` cell was allocated by this candidate and
+        // never linked: excise it so repeated deferral ticks do not burn
+        // the capture-lifetime slot budget. Pre-existing (`replace`)
+        // cells stay deactivated in place; every withheld endpoint retries
+        // through the ordinary path on the next proven tick.
+        let old_to_new = candidate
+            .plan
+            .excise_unlinked_tail_cells(self.plan.slots.len(), &withheld);
+        for slot in candidate
+            .delta
+            .new
+            .iter_mut()
+            .chain(&mut candidate.delta.replace)
+            .chain(&mut candidate.delta.retire)
+        {
+            let new = old_to_new
+                .get(slot.index as usize)
+                .copied()
+                .unwrap_or(u32::MAX);
+            debug_assert!(
+                new != u32::MAX,
+                "a surviving delta slot is never an excised cell"
+            );
+            if new != u32::MAX {
+                slot.index = new;
+            }
+        }
+        self.mark_partial(
+            "live discovery attach",
+            "a declined view's fresh attach targets were withheld for a proven generation",
+        );
+    }
+
     /// Marks the view dirty when a scan (or a live record application)
     /// observed modules for it. Every scan-result observation site calls
     /// this — initial discovery, refresh rescans, new-view admissions,
     /// loader rescans, live lowering — so the dirty set is complete by
     /// construction within this file, and eviction never needs `scan.rs`
     /// internals to prove an ID evidence-free.
-    fn note_scan_observed(&mut self, view: ProcessViewId, modules: &[ScannedModule]) {
+    fn note_scan_observed(
+        &mut self,
+        view: ProcessViewId,
+        admission: ViewAdmission,
+        modules: &[ScannedModule],
+    ) {
         if !modules.is_empty() {
             self.exploratory_dirty.insert(view);
+        }
+        if modules.iter().any(|module| module.view == view) {
+            // Current, unmerged discovery association for this allocation.
+            // The token holds no descriptor and confers no executable proof.
+            self.trace_provider_views.insert(view, admission);
+        } else {
+            self.trace_provider_views.remove(&view);
         }
     }
 
@@ -14986,8 +22796,29 @@ impl Engine {
     /// requested pids are skipped, so event-driven work is never
     /// double-queued. Polling can only add coverage (its targets hold
     /// nothing), never flap owned modules — owned views rely on
-    /// event-driven refresh instead. `pids` must be sorted ascending.
+    /// event-driven refresh instead. While the enumeration holds unserved
+    /// event-driven newcomers (pending refresh, no view yet) polls wait
+    /// entirely (Lane-A): queued polls would only consume the capacity
+    /// pressure is trying to free — map entries, scan quantum, and
+    /// evictable victims. `pids` must be sorted ascending.
     fn queue_polling_rescans(&mut self, pids: &[u32]) {
+        // H5 pressure: a service pass services already-accepted requests; it
+        // never queues optional polls, which would only consume the capacity
+        // it is trying to free (and set a frame deferral at a full map).
+        if self.pressure_service_active {
+            return;
+        }
+        // Lane-A: the same rationale for pressured ticks. Silent like the
+        // pass check: rationing while newcomers are unserved, not overflow.
+        // Unenumerated queue entries (stale or foreign EXECs) never block
+        // polls; only members of this enumeration do.
+        let known: BTreeSet<u32> = self.views.iter().map(ProcessView::pid).collect();
+        if pids
+            .iter()
+            .any(|pid| self.refresh_requested.contains_key(pid) && !known.contains(pid))
+        {
+            return;
+        }
         let mut polling = 0;
         let mut last_queued = None;
         for pid in self.scheduler.poll_order(pids) {
@@ -15004,8 +22835,14 @@ impl Engine {
             if !retained_exploratory {
                 continue;
             }
-            self.request_refresh(pid, crate::attach::monotonic_ns());
-            if self.refresh_requested.contains_key(&pid) {
+            // Optional polls wait for queue capacity; no producer record was
+            // dropped. Keep the cursor after the last admitted poll so this
+            // candidate gets its turn when capacity becomes available.
+            if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                self.note_frame_deferral();
+                break;
+            }
+            if self.request_refresh(pid, crate::attach::monotonic_ns()) {
                 polling += 1;
                 last_queued = Some(pid);
                 self.polled_pids.insert(pid);
@@ -15086,6 +22923,28 @@ impl Engine {
         if victims.is_empty() {
             return;
         }
+        // Rotation evicts views outside the candidate's `removed` set
+        // (they already left `self.views` during selection), so the
+        // unchanged-tick gate cannot see the displacement: committed pins
+        // no longer match what a rebuild would derive. Force the full path.
+        self.plan_rebuild_stable = false;
+        #[cfg(test)]
+        {
+            let logged: Vec<(ProcessViewId, Option<u32>)> = victims
+                .iter()
+                .map(|id| {
+                    let pid = self
+                        .views
+                        .iter()
+                        .find(|view| view.id() == *id)
+                        .map(|view| view.pid());
+                    (*id, pid)
+                })
+                .collect();
+            for (id, pid) in logged {
+                self.record_view_log(ViewLogKind::Evicted, id, pid);
+            }
+        }
         for id in &victims {
             if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
                 self.scheduler.note_evicted(view.pid());
@@ -15117,6 +22976,40 @@ impl Engine {
         );
     }
 
+    /// The lowest-pid exploratory view available to a newcomer admission
+    /// for `selected` (Lane-A): evictable by the classifier — no evidence,
+    /// no contexts, no claims, no queued work and in particular no pending
+    /// refresh — outside the parked-prefix shield, and neither the
+    /// newcomer's pid nor its request owner's view. Under block-all
+    /// protection the shield covers every pid, so no victim exists. The
+    /// selected transaction evicts it (P1); the probationary probe runs
+    /// only where it finds none (P3, the last resort).
+    fn find_evictable_victim_for_selected(&self, selected: u32) -> Option<ProcessViewId> {
+        let owner = self
+            .refresh_requested
+            .get(&selected)
+            .and_then(|request| request.owner);
+        self.exploratory_evictable_views().into_iter().find(|id| {
+            let Some(view) = self.views.iter().find(|view| view.id() == *id) else {
+                return false;
+            };
+            if view.pid() == selected || Some(*id) == owner {
+                return false;
+            }
+            !self.pressure_view_shielded(view.pid())
+        })
+    }
+
+    /// Evicts the lowest-pid exploratory view available to a selected
+    /// transaction (Lane-A P1) and reports whether a slot freed.
+    fn evict_one_exploratory_for_selected(&mut self, selected: u32) -> bool {
+        let Some(victim) = self.find_evictable_victim_for_selected(selected) else {
+            return false;
+        };
+        self.evict_exploratory_views(&BTreeSet::from([victim]));
+        true
+    }
+
     /// Over-cap candidate selection without a full maps sweep (Task 3.1b).
     /// Ordinary passes serve event-driven refresh requests plus a
     /// fairness-rotation window over unscanned pids — no maps reads, so no
@@ -15128,7 +23021,10 @@ impl Engine {
     /// ordinary rotation only fills free view slots and never displaces,
     /// while reconcile passes rotate exploratory (never-owned, currently
     /// empty) views to reach unscanned processes within a finite bound.
-    fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
+    /// Desired pids plus whether this pass evicted: the newcomer ordering
+    /// below admits pending waiters first after an eviction, so freed slots
+    /// reach event-driven work instead of refilling in rotation order.
+    fn select_over_cap_desired(&mut self, pids: &[u32]) -> (BTreeSet<u32>, bool) {
         let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
         let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
         let pending: BTreeSet<u32> = enumerated
@@ -15171,7 +23067,7 @@ impl Engine {
                         ),
                     );
                 }
-                desired
+                (desired, false)
             }
             InventoryCadence::Reconcile => {
                 // Exploratory rotation: the slice selects into the free
@@ -15183,7 +23079,31 @@ impl Engine {
                 let evictable = self.exploratory_evictable_views();
                 let evict_budget = evictable.len().min(self.scheduler.max_evictions_per_pass());
                 let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
-                let need = selected.len().saturating_sub(free_slots);
+                // Waiter-driven eviction: viewless enumerated waiters
+                // (event-driven refresh requests with no view yet) count
+                // as eviction demand even when the slice did not select
+                // them, so a waiter outside the current slice still gains
+                // room within a sweep instead of waiting for the cursor to
+                // wrap all the way around. Demand is one slot per waiter
+                // (never double-counting slice-selected waiters), bounded
+                // by the eviction budget; cooling waiters sit out (their
+                // bounded delay beats evict-rerequest churn), and no
+                // waiter's own view is ever a victim (the classifier
+                // shields requested pids).
+                let selected_set: BTreeSet<u32> = selected.iter().copied().collect();
+                let waiter_demand = pending
+                    .iter()
+                    .filter(|pid| {
+                        !known.contains(*pid)
+                            && !selected_set.contains(*pid)
+                            && !self.scheduler.cooling_down(**pid)
+                    })
+                    .count();
+                let need = selected
+                    .len()
+                    .saturating_add(waiter_demand)
+                    .saturating_sub(free_slots)
+                    .min(evict_budget);
                 let victims: BTreeSet<ProcessViewId> = evictable.into_iter().take(need).collect();
                 // Evicted pids leave the desired set with their views: they
                 // were desired as retained views, and re-selecting them as
@@ -15224,7 +23144,7 @@ impl Engine {
                         ),
                     );
                 }
-                desired
+                (desired, !victims.is_empty())
             }
         }
     }
@@ -15255,6 +23175,7 @@ impl Engine {
         let mut revalidated = 0u64;
         let mut quantum_stopped = false;
         let mut clock_failed = start.is_none();
+        let cold_deadline = std::time::Instant::now() + std::time::Duration::from_nanos(quantum_ns);
         for pid in order.into_iter().take(slice_pids) {
             let elapsed = match (start, crate::attach::monotonic_ns()) {
                 (Some(start), Some(now)) => now.saturating_sub(start),
@@ -15287,7 +23208,10 @@ impl Engine {
                         &mut bufs,
                     )
                 });
-            slice.record(pid, result);
+            slice.record(
+                pid,
+                complete_maps_snapshot(pid, result, &mut self.budget, cold_deadline),
+            );
             self.scheduler.advance_cursor(pid);
         }
         let attempted = slice.attempted();
@@ -15328,13 +23252,70 @@ impl Engine {
         select_rotation_candidates(&pool, free_slots, &stale)
     }
 
+    /// Sentinel view ID for probationary scans (Lane-A P3): never
+    /// allocated (the ID space ends at `max_scan_pids`), so a probationary
+    /// view consumes no capture slot and registers nowhere. Only its
+    /// scan-result emptiness is ever read; modules, pins and the ID itself
+    /// are discarded.
+    const PROBATIONARY_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX);
+
+    /// Probationary provider probe for a pending newcomer with no view slot
+    /// and no evictable view anywhere (Lane-A P3, the last resort). Opens
+    /// the pid under the sentinel ID — a generation pin that consumes no
+    /// capture slot — runs the standard newcomer scan through it, and
+    /// reports whether a complete scan proved provider-freedom. The caller
+    /// viewless-completes a proven-free request; a provider found, a
+    /// refused/partial/truncated scan, an unreadable maps snapshot, an
+    /// exited generation, or an exhausted budget all report unproven and
+    /// the request defers exactly as before. Budgeted and charged as a deep
+    /// scan; later EXECs renew the request's serial, so a torn read can
+    /// never complete another generation's work. Returns the verdict plus
+    /// the scan's skips.
+    fn probe_newcomer_provider_free(&mut self, pid: u32) -> (bool, Vec<Skipped>) {
+        let view = match ProcessView::open_with_budget(
+            Self::PROBATIONARY_VIEW_ID,
+            pid,
+            &mut self.budget,
+        ) {
+            Ok(view) => view,
+            Err(_) => return (false, Vec::new()),
+        };
+        if !view.still_the_same() {
+            return (false, Vec::new());
+        }
+        let broad_admit = self.broad_admit;
+        let (scan_result, counters) = Self::scan_retained_view(
+            &view,
+            &self.module_hints,
+            &self.hooks,
+            &mut self.budget,
+            broad_admit,
+            &mut self.stage_timings,
+        );
+        // 6.14 Option B: learn the probationary generation's executable.
+        elf_needed::learn_view_exe(&mut self.extensive, &view);
+        self.deep_scans = self.deep_scans.saturating_add(1);
+        let skipped = self.absorb_scan_counters(counters);
+        match scan_result {
+            // The completeness flag is load-bearing: a refused, partial or
+            // truncated scan yields empty modules without proving anything.
+            Ok((modules, _pins, complete)) => (complete && modules.is_empty(), skipped),
+            Err(_) => (false, skipped),
+        }
+    }
+
     /// Admits one tick's newcomer window: opens, scans, and stages each
     /// admitted pid as an inventory new view. The tick quantum stops
     /// admissions before another scan — the current pid and the rest defer
-    /// with their requests retained, never dropped. Returns the staged new
-    /// views, the pids to keep queued (failures and deferrals alike), and
-    /// the tick's skips. Extracted verbatim from the inventory tick so an
-    /// injected clock can expire mid-path; production behavior is unchanged.
+    /// with their requests retained, never dropped. At view capacity a
+    /// pressure-selected pid evicts one guarded exploratory view and
+    /// retries (Lane-A P1); as the last resort, a still-unhoused pending
+    /// newcomer with no evictable view anywhere completes without a view
+    /// when a complete probationary scan proves provider-freedom (Lane-A
+    /// P3). Returns the staged new views, the pids to keep queued
+    /// (failures and deferrals alike), and the tick's skips. Extracted
+    /// verbatim from the inventory tick so an injected clock can expire
+    /// mid-path; production behavior is unchanged.
     fn admit_inventory_new_views(
         &mut self,
         admitted: Vec<u32>,
@@ -15358,9 +23339,29 @@ impl Engine {
                 });
                 break;
             }
-            let id = match self.allocate_view_id() {
+            let id = match self.allocate_view_id_for_newcomer(pid) {
                 Ok(id) => id,
                 Err(_) => {
+                    // Lane-A P3: no slot even after the selected
+                    // transaction's single eviction (or outside one). The
+                    // probe is the last resort: it runs only for a pending
+                    // newcomer with no evictable view anywhere — where
+                    // ordinary relief cannot free a slot — and completes
+                    // only provider-freedom a complete scan proved.
+                    // Rotation candidates and unproven pids defer as before.
+                    if self.refresh_requested.contains_key(&pid)
+                        && self.find_evictable_victim_for_selected(pid).is_none()
+                    {
+                        let (provider_free, probe_skips) = self.probe_newcomer_provider_free(pid);
+                        skipped.extend(probe_skips);
+                        self.scheduler.note_new_view_attempt(pid);
+                        if provider_free {
+                            self.newcomer_first_seen.remove(&pid);
+                            self.probationary_completions =
+                                self.probationary_completions.saturating_add(1);
+                            continue;
+                        }
+                    }
                     skipped.push(Skipped {
                         subject: "process view".into(),
                         reason: format!(
@@ -15377,7 +23378,7 @@ impl Engine {
             };
             self.scheduler.note_new_view_attempt(pid);
             let open_start = crate::attach::monotonic_ns();
-            let opened = ProcessView::open(id, pid);
+            let opened = ProcessView::open_with_budget(id, pid, &mut self.budget);
             self.stage_timings.span(
                 crate::timing::StageKind::Scan,
                 "open_view",
@@ -15409,6 +23410,8 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
             );
+            // 6.14 Option B: learn the newcomer's executable path.
+            elf_needed::learn_view_exe(&mut self.extensive, &view);
             self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
@@ -15416,7 +23419,7 @@ impl Engine {
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, pins, _complete)) => {
-                    self.note_scan_observed(view.id(), &modules);
+                    self.note_scan_observed(view.id(), view.view_admission(), &modules);
                     self.scheduler.note_admitted(pid);
                     new_views.push((view, modules, pins));
                 }
@@ -15454,7 +23457,20 @@ impl Engine {
         closure: &mut PauseClosure,
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Refresh,
+                [
+                    Some(self.refresh_requested.len() as u64),
+                    Some(self.exec_rearm_views.len() as u64),
+                    None,
+                    None,
+                ],
+            )
+        });
         let mut new_views = Vec::new();
+        self.in_refresh_tick = true;
         let result = self.refresh_inventory_inner(
             session,
             additions_allowed,
@@ -15465,7 +23481,12 @@ impl Engine {
             &mut new_views,
             tick_now,
         );
+        self.in_refresh_tick = false;
         self.release_unadmitted_views(new_views);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = diagnostic_span {
+            span.finish_result(&result);
+        }
         result
     }
 
@@ -15501,6 +23522,10 @@ impl Engine {
         new_views: &mut Vec<InventoryNewView>,
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
+        if self.poll_global_retirement_barrier(session).is_some() {
+            closure.fail();
+            return Ok(false);
+        }
         if matches!(self.scope, Scope::Pid(_)) {
             let mut stale: BTreeSet<_> = self
                 .views
@@ -15536,20 +23561,56 @@ impl Engine {
                     closure,
                 )?;
             }
-            if self.expected_target_exit && self.views.is_empty() {
+            // A settled expected removal whose follow-up bookkeeping
+            // (ended-pid proof, loader ids, parked records) is still
+            // draining: the arm proves the named exit, so the empty view
+            // set is the expected end, not a vanished generation. Record
+            // processing already ran this batch and runs every batch, so
+            // drainage — and the latch — proceed; refresh itself has no
+            // views to refresh. Without this, the first pass after the
+            // settling batch bails "no longer retained", and a
+            // short-lived `run` child exits 1 after writing its report.
+            if self.views.is_empty()
+                && (self.expected_target_exit || self.expected_target_exit_pending.is_some())
+            {
                 return Ok(false);
             }
             if !stale.is_empty() {
                 self.queue_stale_views(&stale, pending_views);
-                let _ = self.process_discovery_records(
-                    session,
-                    records,
-                    pending_views,
-                    additions_allowed,
-                    collect,
-                    closure,
-                )?;
-                bail!("the named process generation changed during capture");
+                // Queueing declines contradicted/unprovable reports
+                // (deferred with a partial mark, never lost); only an
+                // actually recorded loss fails the named capture. An exit
+                // that won the race after the initial check above queues
+                // an accepted expected removal here, and an empty-ring
+                // batch never reaches the record tail below — so settle
+                // whatever queueing accepted before returning, or a
+                // terminal drain finishes with the retirement queued.
+                let loss_recorded = stale.iter().any(|view| {
+                    self.retirement_intents.get(view) == Some(&RetirementCause::GenerationLost)
+                });
+                if !pending_views.is_empty() {
+                    let _ = self.process_discovery_records(
+                        session,
+                        records,
+                        pending_views,
+                        additions_allowed,
+                        collect,
+                        closure,
+                    )?;
+                }
+                if loss_recorded {
+                    bail!("the named process generation changed during capture");
+                }
+                if self.views.is_empty() {
+                    // Settling an accepted removal retired the last view:
+                    // when the exit finalized this is the ordinary end of
+                    // the capture, otherwise the next pass re-checks (a
+                    // parked record may still finalize it). Either way this
+                    // pass made its progress; the "no longer retained" bail
+                    // below stays reserved for views that vanished without
+                    // any retirement settling here.
+                    return Ok(false);
+                }
             }
             if self.views.is_empty() {
                 bail!("the named process generation is no longer retained");
@@ -15580,23 +23641,37 @@ impl Engine {
         // `desired` only narrows which new pids get deep-scanned. A zero cap
         // short-circuits to empty: selection could only ever take nothing,
         // so the sweep reads are skipped outright.
-        let desired: BTreeSet<_> = if max_scan_pids == 0 {
-            BTreeSet::new()
-        } else if pids.len() > max_scan_pids {
-            self.select_over_cap_desired(&pids)
-        } else {
-            // Under-cap polling round, every fourth under-cap tick: retained
-            // exploratory views carry no loader context, so without this a
-            // process that gains a provider while the capture sits under the
-            // cap would never re-scan. Queued here so the requests flow into
-            // `refreshed` below and are served same-tick. The zero cap
-            // short-circuits above and never polls. `scope_pids` guarantees
-            // pid order for the poll cursor.
-            if self.scheduler.begin_under_cap_tick() {
-                self.queue_polling_rescans(&pids);
-            }
-            pids.into_iter().collect()
-        };
+        let (desired, reconcile_evicted): (BTreeSet<_>, bool) =
+            if let Some(selected) = self.pressure_selected {
+                // Selected transaction: serve only the selected pid. No polling
+                // round, no over-cap reconcile turn, no sweep: the pass neither
+                // reads maps beyond this enumeration nor advances any scheduler
+                // cursor of its own (H1 accounting is checkpointed around it).
+                // At view capacity the selected pid still makes its own room —
+                // one guarded exploratory eviction, else a probationary probe —
+                // both scoped to the selection inside newcomer admission.
+                if pids.contains(&selected.pid) {
+                    (BTreeSet::from([selected.pid]), false)
+                } else {
+                    (BTreeSet::new(), false)
+                }
+            } else if max_scan_pids == 0 {
+                (BTreeSet::new(), false)
+            } else if pids.len() > max_scan_pids {
+                self.select_over_cap_desired(&pids)
+            } else {
+                // Under-cap polling round, every fourth under-cap tick: retained
+                // exploratory views carry no loader context, so without this a
+                // process that gains a provider while the capture sits under the
+                // cap would never re-scan. Queued here so the requests flow into
+                // `refreshed` below and are served same-tick. The zero cap
+                // short-circuits above and never polls. `scope_pids` guarantees
+                // pid order for the poll cursor.
+                if self.scheduler.begin_under_cap_tick() {
+                    self.queue_polling_rescans(&pids);
+                }
+                (pids.into_iter().collect(), false)
+            };
         // Only new candidates count: known views are retained, not selected.
         // The zero-cap short-circuit keeps its exact historical skip; the
         // scheduler publishes the ordinary/reconcile gaps itself.
@@ -15611,10 +23686,37 @@ impl Engine {
         // view whose pid is absent has departed. Over the cap or with skips,
         // neither scope claims authority.
         let membership_authoritative = membership_complete && self.admits_generations();
+        let serviced_requests = self.refresh_request_snapshot();
+        // H5 pressure: a service pass retains every request except its
+        // selected one with serials and ages on every exit path, including
+        // the empty-tick early return below. Only the selected request may
+        // complete; unrelated requests are never cleared.
+        let mut failed_refresh_pids: BTreeSet<u32> = BTreeSet::new();
+        if self.pressure_service_active {
+            let selected = self.pressure_selected.map(|selection| selection.pid);
+            failed_refresh_pids.extend(
+                self.refresh_requested
+                    .keys()
+                    .filter(|pid| Some(**pid) != selected)
+                    .copied(),
+            );
+        }
         let retirement_causes: BTreeMap<_, _> = self
             .views
             .iter()
             .filter_map(|view| {
+                // H5 pressure: a view the owned records name gets no cause
+                // in a service pass — neither refreshed nor retired — and a
+                // selected transaction scopes causes to the selected pid.
+                if self.pressure_view_shielded(view.pid()) {
+                    return None;
+                }
+                if self
+                    .pressure_selected
+                    .is_some_and(|selected| view.pid() != selected.pid)
+                {
+                    return None;
+                }
                 inventory_retirement_cause(
                     view.still_the_same(),
                     membership_authoritative,
@@ -15637,6 +23739,11 @@ impl Engine {
             })
             .collect();
         let mut removed: BTreeSet<_> = stale.union(&departed).copied().collect();
+        // Stale views whose loss report `queue_retirement` declines below:
+        // no accepted decision exists for them, so they stay fully
+        // retained and the final preflight does not judge them as newly
+        // stale. Empty until the queue call decides.
+        let mut declined: BTreeSet<ProcessViewId> = BTreeSet::new();
         let refreshed: BTreeSet<_> = retirement_causes
             .iter()
             .filter_map(|(view, (cause, _))| {
@@ -15657,11 +23764,27 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
-            self.refresh_requested.clear();
+            self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::SettleRequest,
+                    DiagnosticOutcome::Ok,
+                    [
+                        Some(serviced_requests.len() as u64),
+                        Some(failed_refresh_pids.len() as u64),
+                        Some(self.refresh_requested.len() as u64),
+                        Some(self.exec_rearm_views.len() as u64),
+                    ],
+                );
+            });
             // No tick queued anything (a queued poll would have made a
             // retirement cause), so any pending poll is stale: forget it
             // with the requests rather than leaking it into a later tick.
-            self.polled_pids.clear();
+            // A selected transaction never touches ordinary polls: it
+            // queued none and settles none.
+            if self.pressure_selected.is_none() {
+                self.polled_pids.clear();
+            }
             for skip in skipped {
                 self.mark_partial(&skip.subject, &skip.reason);
             }
@@ -15672,23 +23795,25 @@ impl Engine {
         // new-view admissions share one wall-time quantum and one admission
         // count bound. Direct scan calls outside this tick stay unbounded.
         self.scheduler.begin_deep_scan_tick(tick_now());
-        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) = self
-            .scan_inventory_views(
-                &refreshed,
-                "a requested inventory refresh failed",
-                &mut *tick_now,
-            );
-        let mut failed_refresh_pids = failed_scan_pids.clone();
-        failed_refresh_pids.extend(deferred_scan_pids);
-        skipped.extend(refresh_skips);
-        self.settle_polling_rescans(&refreshed_scans, &failed_scan_pids, &removed);
-
         // Per-tick admission bound: rotate past the last attempted newcomer
         // before selecting this tick's window. Failed opens/scans must not
         // consume the same first window forever and starve later processes.
         // Deferred requests and their explicit evidence are retained.
         let max_new_views = self.scheduler.max_new_views_per_tick();
-        let mut new_pids = self.scheduler.new_view_order(&new_pids).into_iter();
+        let mut new_pids = if self.views.len() >= self.max_scan_pids || reconcile_evicted {
+            // Lane-A P2a: view slots are scarce, so event-driven newcomers
+            // sort ahead of rotation candidates for whatever frees up. A
+            // reconcile pass that just evicted dropped the count below the
+            // cap, but the freed slots still belong to event-driven work
+            // first. With free slots the plain pid order stands (fairness
+            // pins).
+            let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
+            self.scheduler
+                .new_view_order_pending_first(&new_pids, &pending)
+                .into_iter()
+        } else {
+            self.scheduler.new_view_order(&new_pids).into_iter()
+        };
         let admitted: Vec<u32> = new_pids.by_ref().take(max_new_views).collect();
         let deferred: Vec<u32> = new_pids.collect();
         // Arrival marks in processing order (first diff wins; the admitted
@@ -15697,8 +23822,8 @@ impl Engine {
         for pid in admitted.iter().chain(deferred.iter()) {
             self.mark_newcomer_arrival(*pid, arrival_now);
         }
+        failed_refresh_pids.extend(deferred.iter().copied());
         if !deferred.is_empty() {
-            failed_refresh_pids.extend(deferred.iter().copied());
             let pending = admitted.len() + deferred.len();
             let noun = if pending == 1 { "process" } else { "processes" };
             skipped.push(Skipped {
@@ -15709,8 +23834,50 @@ impl Engine {
                 ),
             });
         }
-        let (admitted_views, failed_admission_pids, admission_skips) =
-            self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+        let newcomers_first = self
+            .scheduler
+            .newcomers_first(!refreshed.is_empty(), !admitted.is_empty());
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let initial_scan_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Scan,
+                [Some(refreshed.len() as u64), None, None, None],
+            )
+        });
+        let (refresh_outcome, admission_outcome) = if newcomers_first {
+            let admission = self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+            let refresh = self.scan_inventory_views(
+                &refreshed,
+                "a requested inventory refresh failed",
+                &mut *tick_now,
+            );
+            (refresh, admission)
+        } else {
+            let refresh = self.scan_inventory_views(
+                &refreshed,
+                "a requested inventory refresh failed",
+                &mut *tick_now,
+            );
+            let admission = self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+            (refresh, admission)
+        };
+        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) =
+            refresh_outcome;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = initial_scan_span {
+            span.finish(
+                if failed_scan_pids.is_empty() && deferred_scan_pids.is_empty() {
+                    DiagnosticOutcome::Ok
+                } else {
+                    DiagnosticOutcome::Incomplete
+                },
+            );
+        }
+        failed_refresh_pids.extend(failed_scan_pids.iter().copied());
+        failed_refresh_pids.extend(deferred_scan_pids);
+        skipped.extend(refresh_skips);
+        self.settle_polling_rescans(&refreshed_scans, &failed_scan_pids, &removed);
+        let (admitted_views, failed_admission_pids, admission_skips) = admission_outcome;
         new_views.extend(admitted_views);
         failed_refresh_pids.extend(failed_admission_pids);
         skipped.extend(admission_skips);
@@ -15723,22 +23890,62 @@ impl Engine {
                 });
             }
         }
-        let new_view_pids: BTreeSet<_> = new_views.iter().map(|(view, _, _)| view.pid()).collect();
+        let mut new_view_pids: BTreeSet<_> =
+            new_views.iter().map(|(view, _, _)| view.pid()).collect();
         let mut deferred_new_view_records = Vec::new();
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
-        let candidate =
-            self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped.clone())?;
+        let candidate = inventory_candidate_observed(
+            session,
+            InventoryDiagnosticPass::First,
+            || {
+                [
+                    Some(removed.len() as u64),
+                    Some(refreshed_scans.len() as u64),
+                    Some(new_views.len() as u64),
+                    None,
+                ]
+            },
+            || {
+                self.inventory_candidate(
+                    &removed,
+                    &refreshed_scans,
+                    new_views,
+                    skipped.clone(),
+                    &declined,
+                )
+            },
+        )?;
         let admission_start = crate::attach::monotonic_ns();
-        let admission =
-            self.inventory_candidate_admission(session, &candidate, &removed, new_views);
+        let admission = inventory_admission_observed(
+            session,
+            InventoryDiagnosticPass::First,
+            || {
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.views.len() as u64),
+                    None,
+                ]
+            },
+            || {
+                self.inventory_candidate_admission(
+                    session, &candidate, &removed, new_views, &declined,
+                )
+            },
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "candidate_admission",
             admission_start,
             crate::attach::monotonic_ns(),
         );
-        let mut changed = self.latch_candidate_ambiguity(&candidate.plan);
+        let mut changed =
+            if matches!(self.scope, Scope::Pid(_)) && !self.exec_rearm_views.is_empty() {
+                false // The final candidate latches only after its preservation check.
+            } else {
+                self.latch_candidate_ambiguity(&candidate.plan)
+            };
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         if !admission.stale_views.is_empty() {
@@ -15813,14 +24020,76 @@ impl Engine {
         let mut failed_retirements = BTreeSet::new();
         let mut context_retirements = BTreeSet::new();
         let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
-        let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
+        let mut retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
         self.queue_inventory_retirements(&retirement_views, &stale, &departed, pending_views);
+        // Accepted decisions govern the removal sets: a stale view with no
+        // recorded intent was declined (a contradicted or unprovable
+        // report), so it stays fully retained — view, contexts, claims,
+        // slots — and the next pass re-checks. A sticky earlier intent
+        // still stands. Departed and refreshed views are never declined.
+        declined = stale
+            .iter()
+            .filter(|view| !self.retirement_intents.contains_key(*view))
+            .copied()
+            .collect();
+        if !declined.is_empty() {
+            removed.retain(|view| !declined.contains(view));
+            retirement_views.retain(|view| !declined.contains(view));
+            // The declined pids were excluded from `known_pids` above, so a
+            // newcomer may already wait for one: cull it (its ID returns to
+            // the pool) instead of shadowing the retained view with a
+            // duplicate. The serviced request still completes below.
+            let declined_pids: BTreeSet<u32> = declined
+                .iter()
+                .filter_map(|view| {
+                    self.views
+                        .iter()
+                        .find(|candidate| candidate.id() == *view)
+                        .map(ProcessView::pid)
+                })
+                .collect();
+            let mut culled = Vec::new();
+            new_views.retain(|(view, _, _)| {
+                let shadowed = declined_pids.contains(&view.pid());
+                if shadowed {
+                    culled.push(view.id());
+                }
+                !shadowed
+            });
+            for id in culled {
+                self.release_view_id(id);
+            }
+            // The culled newcomers never existed: forget their pids, or
+            // the tick below would defer their records and fail their
+            // serviced requests as if real admissions had stalled.
+            new_view_pids.retain(|pid| !declined_pids.contains(pid));
+        }
         for view in &retirement_views {
+            // H5 pressure: a view the parked records name is never retired
+            // by the direct path either; its request is retained for retry
+            // after the parked prefix is dispatched.
+            if let Some(pid) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == *view)
+                .map(ProcessView::pid)
+                .filter(|pid| self.pressure_view_shielded(*pid))
+            {
+                failed_retirements.insert(*view);
+                failed_refresh_pids.insert(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
+                continue;
+            }
             if !self.loader_registry.ids_for_view(*view).is_empty() {
                 mutation_started = true;
                 context_retirements.insert(*view);
             }
-            let (retirement_changed, complete) = self.retire_loader_contexts(
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            let retirement_span = session
+                .reexec_diagnostic()
+                .filter(|d| d.active())
+                .map(|d| d.begin(DiagnosticPhase::ContextRetire, [Some(1), None, None, None]));
+            let retirement_result = self.retire_loader_contexts(
                 *view,
                 &mut no_terminal_selection_handoffs,
                 session,
@@ -15828,7 +24097,12 @@ impl Engine {
                 pending_views,
                 collect,
                 closure,
-            )?;
+            );
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            if let Some(span) = retirement_span {
+                span.finish_result(&retirement_result);
+            }
+            let (retirement_changed, complete) = retirement_result?;
             changed |= retirement_changed;
             mutation_started |= retirement_changed;
             if !complete {
@@ -15876,12 +24150,29 @@ impl Engine {
             );
             return Ok(changed);
         }
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let rescan_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Scan,
+                [Some(refreshed_ok.len() as u64), None, None, None],
+            )
+        });
         let (rescanned, failed_rescan_pids, deferred_rescan_pids, rescan_skips) = self
             .scan_inventory_views(
                 &refreshed_ok,
                 "a post-retirement inventory refresh failed",
                 &mut *tick_now,
             );
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = rescan_span {
+            span.finish(
+                if failed_rescan_pids.is_empty() && deferred_rescan_pids.is_empty() {
+                    DiagnosticOutcome::Ok
+                } else {
+                    DiagnosticOutcome::Incomplete
+                },
+            );
+        }
         failed_refresh_pids.extend(failed_rescan_pids);
         failed_refresh_pids.extend(deferred_rescan_pids);
         skipped.extend(rescan_skips);
@@ -15889,17 +24180,74 @@ impl Engine {
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
-        let candidate = self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
+        let mut candidate = inventory_candidate_observed(
+            session,
+            InventoryDiagnosticPass::Final,
+            || {
+                [
+                    Some(removed.len() as u64),
+                    Some(refreshed_scans.len() as u64),
+                    Some(new_views.len() as u64),
+                    None,
+                ]
+            },
+            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped, &declined),
+        )?;
+        // Declined views stay in the candidate's pins and modules (the
+        // apply carries them over unchanged) but leave its currency set:
+        // the apply reads `candidate.views` raw for its admission,
+        // attach, and finalize staleness checks, and a known-stale
+        // deferral must not trip any of them.
+        candidate.views.retain(|view| !declined.contains(view));
+        // Exec-refreshed views whose rescan re-accepted the same static
+        // PID targets force them through detach/replace: PID-bound links may
+        // be dead while still recorded as attached. Global file links remain
+        // governed by the ordinary delta. Lowered before admission so
+        // the forced targets are preflighted like any other replacement.
+        self.lower_registered_retries(session, &mut candidate);
+        let lowered_exec_rearms =
+            self.lower_exec_rearms(session, &mut candidate, &refreshed_ok, &serviced_requests);
+        // Declined views keep their retained coverage but mint no fresh
+        // links: withhold their sole-owned retries before admission, so the
+        // currency exemption below cannot attach them unproven.
+        self.withhold_declined_retry_targets(&mut candidate, &declined);
         let admission_start = crate::attach::monotonic_ns();
-        let admission =
-            self.inventory_candidate_admission(session, &candidate, &removed, new_views);
+        let admission = inventory_admission_observed(
+            session,
+            InventoryDiagnosticPass::Final,
+            || {
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.views.len() as u64),
+                    None,
+                ]
+            },
+            || {
+                self.inventory_candidate_admission(
+                    session, &candidate, &removed, new_views, &declined,
+                )
+            },
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "candidate_admission",
             admission_start,
             crate::attach::monotonic_ns(),
         );
-        changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        if candidate.has_exec_receipts()
+            && (!admission.targets_ok
+                || !admission.stale_views.is_empty()
+                || !admission.missing_contexts.is_empty())
+        {
+            self.continuity_deferred = true;
+            *additions_allowed = false;
+            self.mark_partial("live exec continuity", "preservation candidate lost its preflight or original custody; refresh remains pending before static mutation");
+            return Ok(changed);
+        }
+        if !candidate.has_exec_receipts() {
+            changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        }
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         let conservative_only = admission.requires_conservative_apply(mutation_started);
@@ -15976,9 +24324,55 @@ impl Engine {
         }
 
         let extra_views: Vec<_> = new_views.iter().map(|(view, _, _)| view).collect();
+        let completed_rearms = candidate
+            .exec_completions
+            .iter()
+            .map(|prepared| (prepared.view, prepared.serial))
+            .collect();
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
+        if outcome.disposition == ApplyDisposition::Deferred {
+            // Retain exact original request serials, ages, newcomers and exec
+            // markers. The fresh frame will reopen and rescan these views.
+            self.queue_apply_outcome(&outcome, pending_views);
+            closure.fail();
+            self.pending_discovery_records.append(records);
+            return Ok(changed || outcome.changed);
+        }
+        if !outcome.retains_intent() {
+            // The apply completed: forced PID slots detached/replaced, or were
+            // deactivated for a `delta.new` retry, and global markers settled
+            // with the context/ordinary-delta refresh, so their markers are
+            // consumed. A refusal mutated nothing — like the stale-view and
+            // preflight exits above — and keeps every marker for the retry
+            // the retained request owns.
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::SettleMarker,
+                    DiagnosticOutcome::Begin,
+                    [
+                        Some(lowered_exec_rearms.len() as u64),
+                        Some(self.exec_rearm_views.len() as u64),
+                        None,
+                        None,
+                    ],
+                );
+            });
+            self.settle_applied_exec_rearms(lowered_exec_rearms, &completed_rearms, &outcome);
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::SettleMarker,
+                    DiagnosticOutcome::Ok,
+                    [
+                        Some(self.exec_rearm_views.len() as u64),
+                        Some(self.refresh_requested.len() as u64),
+                        None,
+                        None,
+                    ],
+                );
+            });
+        }
         // Only a published newcomer is retained and armed. An unpublished one
         // committed nothing, so it stays in `new_views` for release and is
         // requested again, like a newcomer lost to a stale preflight (U-07).
@@ -16032,6 +24426,28 @@ impl Engine {
         if !outcome.accepted() {
             return Ok(changed);
         }
+        if matches!(self.scope, Scope::Pid(_)) && self.physical_gap.open {
+            let failed_views: BTreeSet<_> = self
+                .modules
+                .iter()
+                .filter_map(|module| {
+                    self.pinned
+                        .owned_timing_key(module.object)
+                        .filter(|key| outcome.static_failures.contains(key))
+                        .map(|_| module.scanned.view)
+                })
+                .collect();
+            let retry_pids: Vec<_> = self
+                .views
+                .iter()
+                .filter(|view| failed_views.contains(&view.id()) && view.still_the_same())
+                .map(ProcessView::pid)
+                .collect();
+            for pid in retry_pids {
+                failed_refresh_pids.insert(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
+            }
+        }
         if conservative_only || !*additions_allowed {
             failed_refresh_pids.extend(retirement_views.iter().filter_map(|view| {
                 self.views
@@ -16041,8 +24457,6 @@ impl Engine {
             }));
             failed_refresh_pids.extend(new_view_pids);
         }
-        self.refresh_requested
-            .retain(|pid, _| failed_refresh_pids.contains(pid));
         self.close_cgroup_admissions_at_removal(&removed);
         self.settle_leader_exits_at_removal(removed.iter().copied());
         let released: Vec<_> = self
@@ -16058,6 +24472,18 @@ impl Engine {
         for view in removed.iter().chain(&refreshed_ok) {
             self.scan_inputs.remove(view);
         }
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let setup_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Setup,
+                [
+                    Some(refreshed_ok.len() as u64),
+                    Some(new_view_ids.len() as u64),
+                    None,
+                    None,
+                ],
+            )
+        });
         let arm_result = if *additions_allowed {
             let arm: Vec<_> = self
                 .views
@@ -16074,6 +24500,7 @@ impl Engine {
                 if self.frame_work_exhausted() {
                     self.note_frame_deferral();
                     let pid = self.views[position].pid();
+                    failed_refresh_pids.insert(pid);
                     self.request_refresh(pid, crate::attach::monotonic_ns());
                     return Ok(false);
                 }
@@ -16111,13 +24538,11 @@ impl Engine {
         };
         // A closed tick skips arming: the whole phase when the closure came
         // after the apply, and every view after the one that raised it inside
-        // the phase. A newly admitted newcomer has no refresh request that
-        // the retain above could keep, and a refreshed view's request was
-        // dropped there whenever the tick was still open. Without one, its
-        // loader would never be armed and its dynamic exports never attached
-        // (U-07). Once it owns modules polling never rescans it either.
-        // Request each owned view the closed tick left unarmed; the next open
-        // tick rescans and arms it.
+        // the phase. Keep a serviced request until that setup finishes, and
+        // request any newly admitted owner the closed tick left unarmed.
+        // Without that intent its loader would never be armed and its
+        // dynamic exports never attached (U-07): once it owns modules polling
+        // never rescans it. The next open tick rescans and arms it.
         if !*additions_allowed {
             let unarmed: Vec<_> = self
                 .views
@@ -16131,6 +24556,7 @@ impl Engine {
                 .map(ProcessView::pid)
                 .collect();
             for pid in unarmed {
+                failed_refresh_pids.insert(pid);
                 self.request_refresh(pid, crate::attach::monotonic_ns());
             }
             // The unarmed filter above cannot see an armed view whose export
@@ -16141,6 +24567,11 @@ impl Engine {
         if *additions_allowed && self.frame_deferred {
             self.request_skipped_export_views(&export_incomplete);
         }
+        failed_refresh_pids.extend(
+            self.views
+                .iter()
+                .filter_map(|view| export_incomplete.contains(&view.id()).then_some(view.pid())),
+        );
         let cleanup = self.process_discovery_records(
             session,
             records,
@@ -16153,6 +24584,23 @@ impl Engine {
             return Err(error);
         }
         changed |= cleanup?;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = setup_span {
+            span.finish(DiagnosticOutcome::Ok);
+        }
+        self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::SettleRequest,
+                DiagnosticOutcome::Ok,
+                [
+                    Some(serviced_requests.len() as u64),
+                    Some(failed_refresh_pids.len() as u64),
+                    Some(self.refresh_requested.len() as u64),
+                    Some(self.exec_rearm_views.len() as u64),
+                ],
+            );
+        });
         Ok(changed)
     }
 
@@ -16161,6 +24609,7 @@ impl Engine {
     /// semantic consumers immediately when this reports a plan change, before
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         self.drain_discovery_from(session)
     }
 
@@ -16172,8 +24621,11 @@ impl Engine {
     /// by the run loop's periodic forced full frame.
     fn discovery_shallow_idle(&self) -> bool {
         !matches!(self.scope, Scope::Pid(_))
+            && self.pending_global_retirement.is_none()
+            && !self.global_retirement_frame_owed
             && self.pending_discovery_records.is_empty()
             && self.pending_loader_scans.is_empty()
+            && self.retirement_intents.is_empty()
             && self.pending_retirements.is_empty()
             && self.pending_rejected_keys.is_empty()
             && self.ready_expected_removals.is_empty()
@@ -16193,6 +24645,7 @@ impl Engine {
         session: &mut Session,
         force_full: bool,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         self.drain_discovery_shallow_from(session, force_full)
     }
 
@@ -16201,7 +24654,8 @@ impl Engine {
         session: &mut dyn EngineSession,
         force_full: bool,
     ) -> Result<bool> {
-        let (records, malformed) = self.collect_frame_discovery(session)?;
+        self.note_graph_inputs_mutated();
+        let (records, malformed, _fresh_blocked) = self.collect_frame_discovery(session)?;
         if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
             return self.with_live_frame(|engine| {
                 engine.apply_discovery_batch(session, records, malformed)
@@ -16214,6 +24668,7 @@ impl Engine {
     /// quantum is applied before collecting the next one, so each exact prefix
     /// remains accounted for and producer counters are refreshed per batch.
     pub fn drain_discovery_terminal(&mut self, session: &mut Session) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         self.drain_discovery_terminal_from(session)
     }
 
@@ -16227,24 +24682,26 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
-        let mut collect = Self::collect_discovery_records;
-        let (records, malformed, failure) = match Self::collect_discovery_records(session) {
-            Ok((records, malformed)) => (records, malformed, None),
-            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                Ok(incomplete) if incomplete.backlog => {
-                    (incomplete.records, incomplete.malformed, None)
-                }
-                Ok(incomplete) => {
-                    self.account_unvalidated_discovery(incomplete.unvalidated_records);
-                    (
-                        incomplete.records,
-                        incomplete.malformed,
-                        Some(anyhow::Error::msg(incomplete.cause)),
-                    )
-                }
-                Err(error) => return Err(error),
-            },
+        self.note_graph_inputs_mutated();
+        let nested_budget = Cell::new(self.shared_allowance_remaining(session, 0));
+        let (records, malformed, failure) = match Self::collect_discovery_records_budgeted(
+            session,
+            &nested_budget,
+            LIVE_DISCOVERY_DRAIN_QUANTUM,
+        ) {
+            Ok((records, malformed, _)) => (records, malformed, None),
+            Err(error) => {
+                let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                self.account_unvalidated_discovery(incomplete.unvalidated_records);
+                (
+                    incomplete.records,
+                    incomplete.malformed,
+                    Some(anyhow::Error::msg(incomplete.cause)),
+                )
+            }
         };
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
         let outcome = self.apply_discovery_batch_with(
             session,
             records,
@@ -16270,7 +24727,44 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
-        let mut collect = Self::collect_discovery_records;
+        self.apply_quiesced_discovery_observed(
+            session,
+            records,
+            malformed,
+            &mut |_: &DiscoveryRecord| {},
+            &mut |_: u64| {},
+        )
+    }
+
+    /// The quiesced apply with K0 tail observation: the follow-up
+    /// nested pulls ride to the observer (the staged prefix is the
+    /// caller's — it already holds those records).
+    pub(crate) fn apply_quiesced_discovery_observed<F, G>(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        mut observe_record: F,
+        mut observe_malformed: G,
+    ) -> Result<bool>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
+        self.note_graph_inputs_mutated();
+        let nested_budget =
+            Cell::new(self.shared_allowance_remaining(
+                session,
+                records.len().saturating_add(malformed as usize),
+            ));
+        let mut collect = |session: &mut dyn EngineSession| {
+            Self::nested_pull_capped_observed(
+                session,
+                &nested_budget,
+                &mut observe_record,
+                &mut observe_malformed,
+            )
+        };
         Ok(self
             .apply_discovery_batch_with(
                 session,
@@ -16290,31 +24784,106 @@ impl Engine {
     /// the post-Q invariant violation.
     pub(crate) fn drain_discovery_terminal_to_position(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
     ) -> Result<bool> {
+        self.drain_discovery_terminal_to_position_observed(
+            session,
+            stop,
+            post_q_record,
+            &mut |_: &DiscoveryRecord| {},
+            &mut |_: u64| {},
+        )
+    }
+
+    /// The Q-bounded terminal drain with K0 tail observation: the outer
+    /// Q-bounded records ride to the observer, as do the follow-up
+    /// nested pulls. The outer malformed count rides too — the
+    /// Q-bounded poll bypasses the PID tap, so the tail is its only
+    /// witness — as does nested malformed.
+    pub(crate) fn drain_discovery_terminal_to_position_observed<F, G>(
+        &mut self,
+        session: &mut dyn EngineSession,
+        stop: usize,
+        post_q_record: &mut bool,
+        mut observe_record: F,
+        mut observe_malformed: G,
+    ) -> Result<bool>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
+        self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
-        let result = self.drain_discovery_terminal_to_position_inner(session, stop, post_q_record);
+        let result = self.drain_discovery_terminal_to_position_inner(
+            session,
+            stop,
+            post_q_record,
+            &mut observe_record,
+            &mut observe_malformed,
+        );
         self.span_terminal_overhead("terminal_q_overhead", wall_start, &totals_before);
         result
     }
 
-    fn drain_discovery_terminal_to_position_inner(
+    fn drain_discovery_terminal_to_position_inner<F, G>(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
-    ) -> Result<bool> {
+        observe_record: &mut F,
+        observe_malformed: &mut G,
+    ) -> Result<bool>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
         let mut changed = false;
-        let mut collect = Self::collect_discovery_records;
         loop {
+            // Bounded by the shared allowance: each quantum pulls staged
+            // transfers (free) plus fresh room, one work quantum at most.
+            // Pulling nothing with the Q unreached is the stuck state —
+            // nothing staged to transfer, no room to read — recorded with
+            // explicit unfinished evidence instead of spinning past it.
+            let remaining = self.shared_allowance_remaining(session, 0);
+            let staged_before = session.staged_discovery_len();
+            let quantum = staged_before
+                .saturating_add(remaining)
+                .min(LIVE_DISCOVERY_DRAIN_QUANTUM);
             let (records, malformed, post_q, backlog) =
-                session.collect_discovery_to_position(stop, LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+                session.collect_discovery_to_position(stop, quantum)?;
             *post_q_record |= post_q;
+            for record in &records {
+                observe_record(record);
+            }
+            if malformed > 0 {
+                observe_malformed(malformed);
+            }
+            if backlog && records.is_empty() && malformed == 0 {
+                debug_assert_eq!(quantum, 0, "only a zero quantum pulls nothing with backlog");
+                self.note_terminal_capacity_backlog();
+                return Ok(changed);
+            }
+            // Staged pops are credit transfers, not fresh acquisitions:
+            // only ring reads consume the nested pulls' share.
+            let transfers = staged_before.saturating_sub(session.staged_discovery_len());
+            let fresh = records
+                .len()
+                .saturating_add(malformed as usize)
+                .saturating_sub(transfers);
+            let nested_budget = Cell::new(remaining.saturating_sub(fresh));
+            let mut collect = |session: &mut dyn EngineSession| {
+                Self::nested_pull_capped_observed(
+                    session,
+                    &nested_budget,
+                    observe_record,
+                    observe_malformed,
+                )
+            };
             let outcome = self.apply_discovery_batch_with(
-                session,
+                &mut *session,
                 records,
                 malformed,
                 false,
@@ -16334,6 +24903,7 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
         let result = self.drain_discovery_terminal_from_inner(session);
@@ -16346,27 +24916,39 @@ impl Engine {
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
         let mut changed = false;
-        let mut collect = Self::collect_discovery_records;
         loop {
+            // Bounded by the shared allowance: staged transfers are free
+            // and fresh reads share one budget per quantum. Pulling
+            // nothing without observing empty is the stuck state —
+            // nothing staged to transfer, no room to read — recorded with
+            // explicit unfinished evidence instead of spinning past it.
+            let remaining = self.shared_allowance_remaining(session, 0);
+            let nested_budget = Cell::new(remaining);
             let (records, malformed, complete, failure) =
-                match Self::collect_discovery_records(session) {
-                    Ok((records, malformed)) => (records, malformed, true, None),
-                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                        Ok(incomplete) if incomplete.backlog => {
-                            (incomplete.records, incomplete.malformed, false, None)
-                        }
-                        Ok(incomplete) => {
-                            self.account_unvalidated_discovery(incomplete.unvalidated_records);
-                            (
-                                incomplete.records,
-                                incomplete.malformed,
-                                true,
-                                Some(anyhow::Error::msg(incomplete.cause)),
-                            )
-                        }
-                        Err(error) => return Err(error),
-                    },
+                match Self::collect_discovery_records_budgeted(
+                    session,
+                    &nested_budget,
+                    LIVE_DISCOVERY_DRAIN_QUANTUM,
+                ) {
+                    Ok((records, malformed, true)) => (records, malformed, true, None),
+                    Ok((records, malformed, false)) => (records, malformed, false, None),
+                    Err(error) => {
+                        let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                        self.account_unvalidated_discovery(incomplete.unvalidated_records);
+                        (
+                            incomplete.records,
+                            incomplete.malformed,
+                            true,
+                            Some(anyhow::Error::msg(incomplete.cause)),
+                        )
+                    }
                 };
+            if !complete && records.is_empty() && malformed == 0 {
+                self.note_terminal_capacity_backlog();
+                return Ok(changed);
+            }
+            let mut collect =
+                |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
             let outcome = self.apply_discovery_batch_with(
                 session,
                 records,
@@ -16422,49 +25004,4106 @@ impl Engine {
     /// duration/signal checks precede. Overflow in between is the producer's
     /// `ring_loss`, read with every batch.
     pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
-        let (records, malformed) = self.collect_frame_discovery(session)?;
+        self.note_graph_inputs_mutated();
+        let (records, malformed, _fresh_blocked) = self.collect_frame_discovery(session)?;
         self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))
     }
 
-    /// One live frame's records: up to `LIVE_DISCOVERY_FRAME_QUANTA` collector
-    /// quanta, stopping at the first that empties the queue. A quantum stop
-    /// is backlog, never failure; a real dequeue failure aborts the route as
-    /// before.
+    /// One live frame's records: fresh pulls up to the shared allowance
+    /// minus staged, Engine-held and already-pulled items, in collector
+    /// quanta of at most `LIVE_DISCOVERY_DRAIN_QUANTUM`, stopping at the
+    /// first that empties the queue or at the allowance. Pulled malformed
+    /// items hold credits like records until the batch accounts them. A
+    /// quantum stop is backlog, never failure; excess records stay unread
+    /// in ring order for the next frame, and any overflow they cause is the
+    /// producer's `ring_loss`. A real dequeue failure applies the pulled
+    /// prefix, records a transport gap, and continues to the next tick
+    /// (never-stop). `fresh_blocked` reports stopping for capacity without
+    /// observing an empty queue — capacity-blocked, never empty — and is
+    /// also latched sticky so the scheduler services backlog instead of a
+    /// full sleep.
     fn collect_frame_discovery(
         &mut self,
         session: &mut dyn EngineSession,
-    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool)> {
+        let budget = Cell::new(self.shared_allowance_remaining(session, 0));
         let mut records = Vec::new();
         let mut malformed = 0u64;
+        let mut observed_empty = false;
         for _ in 0..LIVE_DISCOVERY_FRAME_QUANTA {
-            match Self::collect_discovery_records(session) {
-                Ok((drained, drained_malformed)) => {
+            match Self::collect_discovery_records_budgeted(
+                session,
+                &budget,
+                LIVE_DISCOVERY_DRAIN_QUANTUM,
+            ) {
+                Ok((drained, drained_malformed, empty)) => {
+                    if empty {
+                        observed_empty = true;
+                        records.extend(drained);
+                        malformed = malformed.saturating_add(drained_malformed);
+                        break;
+                    }
+                    if drained.is_empty() && drained_malformed == 0 {
+                        // No credit and nothing staged to transfer: the
+                        // queue stays unobserved past the allowance.
+                        break;
+                    }
                     records.extend(drained);
                     malformed = malformed.saturating_add(drained_malformed);
-                    break;
                 }
-                Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                    Ok(incomplete) if incomplete.backlog => {
-                        records.extend(incomplete.records);
-                        malformed = malformed.saturating_add(incomplete.malformed);
-                    }
-                    Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
-                    Err(error) => return Err(error),
-                },
+                // Never-stop: a transport failure applies the pulled
+                // prefix, records a transport gap, and continues to the
+                // next tick — never an abort that drops the prefix.
+                Err(error) => {
+                    let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                    records.extend(incomplete.records);
+                    malformed = malformed.saturating_add(incomplete.malformed);
+                    self.mark_partial(
+                        "live discovery transport",
+                        &format!(
+                            "discovery transport unavailable: dequeue failed after {} records ({} malformed); prefix applied",
+                            records.len(),
+                            malformed
+                        ),
+                    );
+                    self.frame_fresh_blocked = false;
+                    return Ok((records, malformed, false));
+                }
             }
         }
-        Ok((records, malformed))
+        let fresh_blocked = !observed_empty;
+        self.frame_fresh_blocked = fresh_blocked;
+        Ok((records, malformed, fresh_blocked))
     }
 
-    /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
-    /// route instead of retaining and replaying anything, so a collection
-    /// failure here must not carry the terminal routes' "N terminal
-    /// record(s) retained for retry" claim — nothing is retained.
-    fn generic_drain_error(error: anyhow::Error) -> anyhow::Error {
-        match error.downcast::<IncompleteTerminalDrain>() {
-            Ok(incomplete) => anyhow::Error::msg(incomplete.cause),
-            Err(error) => error,
+    /// Ordinary discovery records this Engine currently holds in userspace:
+    /// pending records plus the terminal batch. Measured at tick boundaries
+    /// (no batch locals outstanding) it is exact; the run loop uses it to
+    /// size staging quanta and readiness against the shared allowance.
+    pub(crate) fn discovery_held_len(&self) -> usize {
+        self.pending_discovery_records
+            .len()
+            .saturating_add(self.terminal_batch.as_ref().map_or(0, TerminalBatch::len))
+    }
+
+    /// Userspace-owned discovery items outside the caller's batch locals:
+    /// the session FIFO plus Engine pending and terminal holdings. Every
+    /// fresh acquisition stops before exceeding the shared allowance minus
+    /// this. Staged malformed items hold credits like staged records until
+    /// a dequeue transfers them to their accounting boundary.
+    fn shared_discovery_held(&self, session: &dyn EngineSession) -> usize {
+        session
+            .staged_discovery_len()
+            .saturating_add(self.discovery_held_len())
+    }
+
+    /// Shared-allowance room for fresh acquisition beside `local` already
+    /// pulled batch-local items: the allowance minus staged, Engine-held
+    /// and local items. Malformed items pulled into the local batch count
+    /// like records until they are accounted.
+    fn shared_allowance_remaining(&self, session: &dyn EngineSession, local: usize) -> usize {
+        DISCOVERY_HELD_CAP
+            .saturating_sub(self.shared_discovery_held(session))
+            .saturating_sub(local)
+    }
+
+    /// One nested pull through the shared allowance: at most one work
+    /// quantum and never past `budget`, which the caller seeds from
+    /// `shared_allowance_remaining` and every nested pull consumes from.
+    /// An empty observation is genuine (the pull reached the queue end);
+    /// a quantum stop with allowance left is backlog; an allowance stop
+    /// is capacity-blocked. All three keep their exact prefix; none is
+    /// ever complete evidence.
+    fn nested_pull_capped(
+        session: &mut dyn EngineSession,
+        budget: &Cell<usize>,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
+        match Self::collect_discovery_records_budgeted(
+            session,
+            budget,
+            LIVE_DISCOVERY_DRAIN_QUANTUM,
+        ) {
+            Ok((records, malformed, true)) => Ok((records, malformed)),
+            Ok((records, malformed, false)) => {
+                // A full quantum with more pullable (budget or staged
+                // transfers left) is backlog; anything else stopped at
+                // the allowance with the queue not observed empty.
+                let pulled_full_quantum = records.len().saturating_add(malformed as usize)
+                    >= LIVE_DISCOVERY_DRAIN_QUANTUM;
+                if pulled_full_quantum && (budget.get() > 0 || session.staged_discovery_len() > 0) {
+                    Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+                } else {
+                    Err(IncompleteTerminalDrain::capacity_blocked(records, malformed, 0).into())
+                }
+            }
+            Err(error) => Err(error),
         }
+    }
+
+    /// One nested pull with K0 tail observation: the pulled records and
+    /// malformed count ride to the observer before the caller sees them.
+    /// Err prefixes (backlog/capacity/failure) are observed too — they
+    /// are already off the ring — then re-wrapped unchanged.
+    fn nested_pull_capped_observed<F, G>(
+        session: &mut dyn EngineSession,
+        budget: &Cell<usize>,
+        observe_record: &mut F,
+        observe_malformed: &mut G,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
+        match Self::nested_pull_capped(session, budget) {
+            Ok((records, malformed)) => {
+                for record in &records {
+                    observe_record(record);
+                }
+                if malformed > 0 {
+                    observe_malformed(malformed);
+                }
+                Ok((records, malformed))
+            }
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) => {
+                    for record in &incomplete.records {
+                        observe_record(record);
+                    }
+                    if incomplete.malformed > 0 {
+                        observe_malformed(incomplete.malformed);
+                    }
+                    Err(anyhow::Error::new(incomplete))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    /// Whether retained discovery work waits between frames: pending or
+    /// staged records, a re-parked pressure rotation, or a frame collect
+    /// that stopped at the shared allowance. Schedules backlog service
+    /// instead of a full sleep.
+    pub(crate) fn discovery_backlog_pending(&self, staged_len: usize) -> bool {
+        self.pending_global_retirement.is_some()
+            || self.global_retirement_frame_owed
+            || self.frame_fresh_blocked
+            || self.pressure_rotation_pending
+            || !self.pending_discovery_records.is_empty()
+            || staged_len > 0
+    }
+
+    /// First terminal-graph refusal reason, if any (§1.9).
+    #[allow(dead_code)] // Consumed by T4b (the `failed` flag reads it).
+    pub(crate) fn collected_graph_refused(&self) -> Option<&'static str> {
+        self.collected_graph_refusal
+    }
+
+    /// Reservation handle on the Engine's dedicated collected-graph pool.
+    /// The coordinator pays the graph box, the graph phases and the native
+    /// preflight from this reserver; no graph lease comes from the registry.
+    pub(crate) fn collected_graph_reserver(&self) -> SemanticResourceReserver {
+        self.collected_graph_pool.reserver()
+    }
+
+    /// Reservation handle on the Engine's dedicated counter pool. Each
+    /// counter capture mints its preparation, stage and read reservers
+    /// here; no counter lease comes from another pool.
+    pub(crate) fn counter_reserver(&self) -> SemanticResourceReserver {
+        self.counter_pool.reserver()
+    }
+
+    /// Closes up to `max` retired graph files (§1.8); `true` when the
+    /// chain is empty. The retired-file debt lives beyond the graph on
+    /// the Engine chain so no synchronous close joins a graph credit.
+    pub(crate) fn close_retired_files(&mut self, max: usize) -> bool {
+        match self.retired_files.as_mut() {
+            Some(handoff) => handoff.close_some(max),
+            None => true,
+        }
+    }
+
+    /// Test read of the graph-input generation counter (§1.3).
+    #[cfg(test)]
+    pub(crate) fn graph_inputs_epoch_for_test(&self) -> u64 {
+        self.graph_inputs_epoch
+    }
+
+    /// Test seam: binds every plan module's object timing key to its plan
+    /// module ID, as admission would have established. Hand-built fixture
+    /// populations skip admission, but the plan cursor resolves a stable
+    /// ID for every surviving group and refuses `Identity` without one.
+    #[cfg(test)]
+    pub(crate) fn bind_plan_module_ids_for_test(&mut self) {
+        for module in &self.plan.modules {
+            let key = self
+                .pinned
+                .owned_timing_key(module.object)
+                .expect("plan modules have exact opened identity");
+            self.capture_facts.module_ids.insert(key.clone(), module.id);
+            self.capture_facts.module_keys.insert(module.id, key);
+            let next = module.id.0.saturating_add(1);
+            self.capture_facts.next_module_id = self.capture_facts.next_module_id.max(next);
+        }
+    }
+
+    /// Unkeyed names examined by the latest `names_view_bounded` call (names test).
+    #[cfg(test)]
+    pub(crate) fn names_inspected_for_test(&self) -> usize {
+        self.names_inspected.get()
+    }
+
+    /// Marks the publication inputs dirty (§1.3): every `&mut self` entry
+    /// point that can write the views, modules, plan, pins, scan inputs,
+    /// ended-PID retirement, selection keys or capture facts calls this
+    /// first. Counters, coverage, timings and terminal batches never bump.
+    fn note_graph_inputs_mutated(&mut self) {
+        self.graph_inputs_epoch = self.graph_inputs_epoch.wrapping_add(1);
+    }
+
+    /// No leader-exit assessment still pending: resolved, or written off
+    /// after two clean passes (R-26 N1). Laps are finite: records end at Q.
+    fn collected_assessments_passed(&self) -> bool {
+        self.pending_leader_exit_views.is_empty()
+    }
+
+    /// Whether Q-bounded transport must wait: only Engine-held records, an
+    /// open terminal journal/batch, or a live graph block it. Assessments
+    /// and retirement debt never do (system scale, §1.1).
+    pub(crate) fn collected_finish_transport_blocked(&self) -> bool {
+        self.discovery_backlog_pending(0)
+            || self.terminal_batch.is_some()
+            || self.terminal_journal.is_some()
+            || self.collected_graph.is_some()
+    }
+
+    /// Test seam behind the coordinator's `seed_collected_finish_work_for_test`
+    /// (R-26 N2): one retirement intent plus one pending leader-exit
+    /// assessment.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn seed_collected_finish_work_for_test(&mut self, view: ProcessViewId) {
+        assert!(
+            self.retirement_intents
+                .insert(view, RetirementCause::ExpectedRemoval)
+                .is_none(),
+            "seed view starts idle"
+        );
+        self.queue_leader_exit_assessment(view, None);
+    }
+
+    /// Finish must also retain deferred lifecycle work. A vacant transport
+    /// cursor alone cannot discharge an original already held by the Engine.
+    pub(crate) fn collected_finish_backlog_pending(&self, staged_len: usize) -> bool {
+        self.discovery_backlog_pending(staged_len)
+            || !self.retirement_intents.is_empty()
+            || !self.pending_retirements.is_empty()
+            || !self.pending_rejected_keys.is_empty()
+            || !self.pending_leader_exit_views.is_empty()
+            || self.terminal_batch.is_some()
+            || self.terminal_journal.is_some()
+            || self.collected_graph.is_some()
+            || self.collected_graph_requested
+    }
+
+    fn take_collected_finish_action(&mut self) -> bool {
+        let Some(left) = self.collected_finish_actions.as_mut() else {
+            return true;
+        };
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+
+    /// Test native substitution only. The production entry below receives a
+    /// collector tied to the SAME retained Session/Q by the coordinator.
+    #[cfg(test)]
+    pub(crate) fn service_collected_finish_records(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        work: usize,
+    ) -> Result<BacklogOutcome> {
+        let mut collect = |session: &mut dyn EngineSession| {
+            let (records, malformed, complete) =
+                Self::collect_discovery_records_budgeted(session, &Cell::new(1), 1)?;
+            if complete {
+                Ok((records, malformed))
+            } else {
+                Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+            }
+        };
+        let reserve = self.collected_test_pool.reserver();
+        let transport_at_q = !self.collected_test_transport_pending;
+        self.service_collected_finish_records_with(
+            session,
+            None,
+            &reserve,
+            records,
+            malformed,
+            work,
+            transport_at_q,
+            &mut collect,
+        )
+    }
+
+    /// One graph credit (§1.6, §1.9): takes the boxed graph, steps exactly
+    /// one phase, and restores it on every path. A refused graph stays boxed
+    /// at its phase; later credits report no work while the debt keeps
+    /// Finish pending. Never fails: no `?` between take and restore.
+    fn step_collected_graph(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> GraphService {
+        let mut graph = self
+            .collected_graph
+            .take()
+            .expect("a collected graph is stepped only while boxed");
+        // A refused graph stays boxed at its phase; later credits report
+        // no work while the debt keeps Finish pending. Closed is a
+        // progress verdict: the graph continues through Install.
+        if matches!(
+            graph.verdict,
+            Some(Verdict::RefusedUntouched | Verdict::RefusedRetained)
+        ) {
+            self.collected_graph = Some(graph);
+            return GraphService::default();
+        }
+        let service = self.step_graph_inner(session, q, reserve, collect, &mut graph);
+        if graph.reclaim_forgotten {
+            // Reclaim refusal (§1.9): the handoff already moved to the
+            // Engine chain; the unprovable graph stays process-lifetime
+            // (never dropped) while Finish continues with its install.
+            let installed = graph.installed;
+            std::mem::forget(graph);
+            return GraphService {
+                changed: installed,
+                progressed: true,
+                named_generation_lost: false,
+            };
+        }
+        if matches!(graph.phase, GraphPhase::Done) {
+            // Done (item 13): chain the handoff without allocating, drop the
+            // graph, and report `changed` only after Install.
+            let installed = graph.installed;
+            if let Some(mut handoff) = graph.handoff.take() {
+                handoff.prev = self.retired_files.take();
+                self.retired_files = Some(handoff);
+            }
+            GraphService {
+                changed: installed,
+                progressed: true,
+                named_generation_lost: false,
+            }
+        } else {
+            self.collected_graph = Some(graph);
+            service
+        }
+    }
+
+    /// One graph credit that did work but changed no publication input.
+    fn graph_idle(progressed: bool) -> GraphService {
+        GraphService {
+            changed: false,
+            progressed,
+            named_generation_lost: false,
+        }
+    }
+
+    /// Cancels the phase's active cursor after a pre-mutation refusal
+    /// (§1.9): the rebind and plan cursors mark cancelled; every other
+    /// phase holds no cancellable cursor (pins copies are inert until
+    /// polled, engine-side walks hold no cursor).
+    fn cancel_graph_cursor(graph: &mut CollectedGraph) {
+        match graph.phase {
+            GraphPhase::Rebind => graph.rebind.cancel(),
+            GraphPhase::Plan => graph.plan.cancel(),
+            _ => {}
+        }
+    }
+
+    /// Records a pre-native refusal (§1.9 row 1): cancels the active
+    /// cursor, keeps every original owner and lease, names the reason
+    /// once. No disclosure: the coordinator's `failed` flag takes the
+    /// finite I2 exit with this reason.
+    fn refuse_graph_before_native(&mut self, graph: &mut CollectedGraph) {
+        Self::cancel_graph_cursor(graph);
+        graph.verdict = Some(Verdict::RefusedUntouched);
+        self.collected_graph_refusal
+            .get_or_insert("terminal graph refused before native mutation");
+    }
+
+    /// Whether a scanned row survives into the raw copy: its view is not
+    /// retired and its key is not rejected by the graph selection.
+    fn graph_module_retained(graph: &CollectedGraph, source: &ScannedModule) -> bool {
+        graph.selection.as_ref().is_some_and(|selection| {
+            !selection.retired().contains(&source.view)
+                && !selection.rejected().contains(&source.key)
+        })
+    }
+
+    /// One phase step: T4's Intake, T4a's Freeze..Plan, T4b's
+    /// Handoff..Done with native success mapping. Facts content and
+    /// Install steps 6-8 are T5's stubs.
+    fn step_graph_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        collect: &mut DiscoveryCollector<'_>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        // Epoch rule (finding 2): from Freeze through NativePoll, every
+        // credit first compares the graph-input epoch. A mismatch before
+        // native mutation refuses untouched; after mutation the native
+        // debt is retained. Install revalidates with its own scalars.
+        if matches!(
+            graph.phase,
+            GraphPhase::Freeze
+                | GraphPhase::Selection
+                | GraphPhase::Pins
+                | GraphPhase::RawCopy
+                | GraphPhase::Rebind
+                | GraphPhase::Plan
+                | GraphPhase::Facts
+                | GraphPhase::Handoff
+                | GraphPhase::RemovedCopy
+                | GraphPhase::NativePrepare
+                | GraphPhase::NativeBegin
+                | GraphPhase::NativePoll
+        ) && self.graph_inputs_epoch != graph.epoch
+        {
+            if graph.mutated {
+                graph.verdict = Some(Verdict::RefusedRetained);
+                self.collected_graph_refusal
+                    .get_or_insert("native ownership uncertain");
+            } else {
+                self.refuse_graph_before_native(graph);
+            }
+            return Self::graph_idle(true);
+        }
+        match graph.phase {
+            GraphPhase::Intake => self.step_graph_intake(graph),
+            GraphPhase::Freeze => {
+                graph.epoch = self.graph_inputs_epoch;
+                graph.pins_revision = self.pinned.revision();
+                graph.plan_slots = self.plan.slots.len();
+                graph.phase = GraphPhase::Selection;
+                Self::graph_idle(true)
+            }
+            GraphPhase::Selection => self.step_graph_selection(graph, reserve),
+            GraphPhase::Pins => self.step_graph_pins(graph, reserve),
+            GraphPhase::RawCopy => self.step_graph_raw_copy(graph, reserve),
+            GraphPhase::Rebind => self.step_graph_rebind(graph, reserve),
+            GraphPhase::Plan => self.step_graph_plan(graph, reserve),
+            GraphPhase::Facts => self.step_graph_facts(graph, reserve),
+            GraphPhase::Handoff => self.step_graph_handoff(graph, reserve),
+            GraphPhase::RemovedCopy => self.step_graph_removed_copy(session, graph, reserve),
+            GraphPhase::NativePrepare => self.step_graph_native_prepare(session, q, reserve, graph),
+            GraphPhase::NativeBegin => self.step_graph_native_begin(session, q, graph),
+            GraphPhase::NativePoll => self.step_graph_native_poll(session, q, graph),
+            GraphPhase::Install => self.step_graph_install(graph),
+            GraphPhase::Consume => self.step_graph_consume(session, collect, graph),
+            GraphPhase::Reclaim => self.step_graph_reclaim(graph, reserve),
+            GraphPhase::Done => GraphService::default(),
+        }
+    }
+
+    /// Intake (§1.4): one intent per credit over `retirement_intents`.
+    /// The cursor never wraps: an exhausted range finalizes to Freeze.
+    fn step_graph_intake(&mut self, graph: &mut CollectedGraph) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = match graph.intake_after {
+            None => self.retirement_intents.keys().next().copied(),
+            Some(after) => self
+                .retirement_intents
+                .range((Excluded(after), Unbounded))
+                .next()
+                .map(|(view, _)| *view),
+        };
+        let idle = GraphService {
+            changed: false,
+            progressed: true,
+            named_generation_lost: false,
+        };
+        let Some(view) = next else {
+            // After the last key: disclose the unproven count once (R-24),
+            // then Freeze.
+            if graph.unproven > 0 {
+                self.mark_partial(
+                    "live discovery lifecycle",
+                    &format!(
+                        "{} retirements not proven at the terminal stop were not performed; their originals stay attached until Session cleanup",
+                        graph.unproven
+                    ),
+                );
+            }
+            graph.phase = GraphPhase::Freeze;
+            return idle;
+        };
+        graph.intake_after = Some(view);
+        #[cfg(test)]
+        {
+            self.collected_intake_intents = self.collected_intake_intents.saturating_add(1);
+        }
+        let Some(cause) = self.retirement_intents.get(&view).copied() else {
+            // Unreachable: the barrier fences dispatch while a graph exists,
+            // so intents only leave through Intake and Consume.
+            return idle;
+        };
+        if self.views.iter().all(|owner| owner.id() != view) {
+            // No ProcessView: drop the intent now; no ID release at Q.
+            self.retirement_intents.remove(&view);
+            self.ready_expected_removals.remove(&view);
+            return idle;
+        }
+        if cause == RetirementCause::ExecRefresh {
+            // OD-3: an exec refresh observed before the terminal stop is not
+            // rescanned. The view stays.
+            self.retirement_intents.remove(&view);
+            self.mark_partial(
+                "live discovery lifecycle",
+                "an exec refresh observed before the terminal stop was not rescanned",
+            );
+            return idle;
+        }
+        let retained = self
+            .views
+            .iter()
+            .find(|owner| owner.id() == view)
+            .expect("view presence checked above");
+        let ready = if self.ready_expected_removals.contains(&view)
+            && cause == RetirementCause::ExpectedRemoval
+        {
+            Ok(true)
+        } else {
+            retirement_ready(cause, retained)
+        };
+        self.settle_intake_ready(graph, view, ready);
+        idle
+    }
+
+    /// Applies one Intake readiness verdict (§1.4): ready joins
+    /// `pending_retirements` with its intent kept for Consume; unready or
+    /// failed proofs are disposed once with an OD-7 disclosure. Factored so
+    /// the `Err` arm (a live pin failure no test can stage) stays covered.
+    fn settle_intake_ready(
+        &mut self,
+        graph: &mut CollectedGraph,
+        view: ProcessViewId,
+        ready: Result<bool, String>,
+    ) {
+        match ready {
+            Ok(true) => {
+                self.pending_retirements.insert(view);
+            }
+            Ok(false) => {
+                self.retirement_intents.remove(&view);
+                graph.unproven = graph.unproven.saturating_add(1);
+            }
+            Err(error) => {
+                self.retirement_intents.remove(&view);
+                graph.unproven = graph.unproven.saturating_add(1);
+                self.mark_live_loss(
+                    "live discovery lifecycle",
+                    &format!(
+                        "the original process pin could not prove expected exit; retirement remains queued: {error}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Selection (§1.6): count through the after-cursors, reserve,
+    /// then insert — one key per credit, retirements first, then rejected
+    /// keys. An empty selection finishes at Done with no copy and no
+    /// publish; otherwise the sets seal into a `ConservativePinSelection`
+    /// (the Engine sets stay the owners). A refused reservation inserts
+    /// nothing; a seal refusal keeps the takes for Reclaim.
+    fn step_graph_selection(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if graph.sel_storage.is_none() {
+            // Count pass: walk both sets without inserting.
+            if let Some(next) = match graph.sel_after_view {
+                None => self.pending_retirements.first().copied(),
+                Some(after) => self
+                    .pending_retirements
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied(),
+            } {
+                graph.sel_after_view = Some(next);
+                graph.sel_count.0 = graph.sel_count.0.saturating_add(1);
+                return Self::graph_idle(true);
+            }
+            if let Some(next) = match graph.sel_after_key {
+                None => self.pending_rejected_keys.first().copied(),
+                Some(after) => self
+                    .pending_rejected_keys
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied(),
+            } {
+                graph.sel_after_key = Some(next);
+                graph.sel_count.1 = graph.sel_count.1.saturating_add(1);
+                return Self::graph_idle(true);
+            }
+            if graph.sel_count == (0, 0) {
+                graph.phase = GraphPhase::Done;
+                return Self::graph_idle(true);
+            }
+            let storage =
+                ConservativePinSelection::storage_bound(graph.sel_count.0, graph.sel_count.1)
+                    .and_then(|bytes| reserve.reserve(bytes).ok());
+            let Some(storage) = storage else {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            };
+            graph.sel_storage = Some(storage);
+            graph.sel_after_view = None;
+            graph.sel_after_key = None;
+            return Self::graph_idle(true);
+        }
+        // Insert pass: the reservation precedes every insert.
+        if let Some(next) = match graph.sel_after_view {
+            None => self.pending_retirements.first().copied(),
+            Some(after) => self
+                .pending_retirements
+                .range((Excluded(after), Unbounded))
+                .next()
+                .copied(),
+        } {
+            graph.sel_after_view = Some(next);
+            graph.sel_retired.insert(next);
+            return Self::graph_idle(true);
+        }
+        if let Some(next) = match graph.sel_after_key {
+            None => self.pending_rejected_keys.first().copied(),
+            Some(after) => self
+                .pending_rejected_keys
+                .range((Excluded(after), Unbounded))
+                .next()
+                .copied(),
+        } {
+            graph.sel_after_key = Some(next);
+            graph.sel_rejected.insert(next);
+            return Self::graph_idle(true);
+        }
+        let storage = graph.sel_storage.take().expect("reserved above");
+        let retired = std::mem::take(&mut graph.sel_retired);
+        let rejected = std::mem::take(&mut graph.sel_rejected);
+        match ConservativePinSelection::from_reserved_originals(retired, rejected, storage, reserve)
+        {
+            Ok(selection) => {
+                graph.selection = Some(selection);
+                graph.phase = GraphPhase::Pins;
+            }
+            Err(refusal) => {
+                let (retired, rejected, storage) = refusal.into_originals();
+                graph.sel_retired = retired;
+                graph.sel_rejected = rejected;
+                graph.sel_storage = Some(storage);
+                self.refuse_graph_before_native(graph);
+            }
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Pins (§1.6): one strided conservative copy credit. Ready advances
+    /// to RawCopy; any refusal keeps the originals.
+    fn step_graph_pins(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let Some(selection) = graph.selection.as_ref() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        match self
+            .pinned
+            .poll_conservative_copy(&mut graph.pins, selection, reserve, GRAPH_STRIDE)
+        {
+            Ok(GraphStep::Ready) => {
+                graph.phase = GraphPhase::RawCopy;
+                Self::graph_idle(true)
+            }
+            Ok(GraphStep::Advanced) => Self::graph_idle(true),
+            Ok(GraphStep::Yielded) => Self::graph_idle(false),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// RawCopy (§1.6): surviving scanned rows (view not retired, key not
+    /// rejected) are measured with `ScannedInputMeasure`, reserved, then
+    /// cloned exact by `ScannedModuleCopy` into an exactly preallocated
+    /// `raw_rows`, and sealed into `RetainedScannedInputs`. Each module
+    /// visit costs one leaf; measure and copy steps cost one leaf each,
+    /// up to `GRAPH_STRIDE` per credit.
+    fn step_graph_raw_copy(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.selection.is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if graph.raw_measure.is_none() {
+            match ScannedInputMeasure::new(self.modules.len()) {
+                Ok(measure) => {
+                    graph.raw_measure = Some(measure);
+                    graph.raw_index = 0;
+                    graph.raw_included = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                    return Self::graph_idle(true);
+                }
+            }
+        }
+        if graph.raw_storage.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.modules.get(graph.raw_index) else {
+                    break;
+                };
+                if Self::graph_module_retained(graph, &source.scanned) {
+                    let done = match graph
+                        .raw_measure
+                        .as_mut()
+                        .expect("the measure is seeded above")
+                        .step(&source.scanned)
+                    {
+                        Ok(done) => done,
+                        Err(_) => {
+                            self.refuse_graph_before_native(graph);
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    if done {
+                        graph.raw_included += 1;
+                        graph.raw_index += 1;
+                    }
+                } else {
+                    graph.raw_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.raw_index < self.modules.len() {
+                return Self::graph_idle(true);
+            }
+            let bytes = graph
+                .raw_measure
+                .as_ref()
+                .expect("the measure is seeded above")
+                .bytes();
+            match reserve.reserve(bytes) {
+                Ok(storage) => {
+                    graph.raw_storage = Some(storage);
+                    graph.raw_rows = Vec::with_capacity(graph.raw_included);
+                    graph.raw_copy = Some(ScannedModuleCopy::new());
+                    graph.raw_index = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.raw.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.modules.get(graph.raw_index) else {
+                    break;
+                };
+                if Self::graph_module_retained(graph, &source.scanned) {
+                    let cursor = graph.raw_copy.as_mut().expect("the copy opens at seal");
+                    if cursor.step(&source.scanned, &mut graph.raw_rows) {
+                        graph.raw_index += 1;
+                    }
+                } else {
+                    graph.raw_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.raw_index < self.modules.len() {
+                return Self::graph_idle(true);
+            }
+            let rows = std::mem::take(&mut graph.raw_rows);
+            let storage = graph
+                .raw_storage
+                .take()
+                .expect("the storage is reserved above");
+            debug_assert_eq!(
+                rows.capacity(),
+                rows.len(),
+                "raw rows are preallocated exact"
+            );
+            match RetainedScannedInputs::from_reserved_originals(rows, storage) {
+                Ok(raw) => {
+                    graph.raw = Some(raw);
+                    graph.phase = GraphPhase::Rebind;
+                }
+                Err(refusal) => {
+                    let (rows, storage) = refusal.into_originals();
+                    graph.raw_rows = rows;
+                    graph.raw_storage = Some(storage);
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        graph.phase = GraphPhase::Rebind;
+        Self::graph_idle(true)
+    }
+
+    /// Rebind (§1.6): one strided scanned-rebind credit over the sealed
+    /// raw inputs. Ready advances to Plan; any refusal keeps the
+    /// originals and cancels the rebind cursor.
+    fn step_graph_rebind(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        match graph.pins.poll_scanned_rebind(
+            &mut graph.raw,
+            &mut graph.rebind,
+            reserve,
+            GRAPH_STRIDE,
+        ) {
+            Ok(GraphStep::Ready) => {
+                graph.phase = GraphPhase::Plan;
+                Self::graph_idle(true)
+            }
+            Ok(GraphStep::Advanced) => Self::graph_idle(true),
+            Ok(GraphStep::Yielded) => Self::graph_idle(false),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Plan (§1.6): one strided conservative plan rebuild over the
+    /// rebound modules and the loaned pins output. Ready advances to
+    /// Facts; any refusal (or a missing loaned input) keeps the
+    /// originals and cancels the plan cursor.
+    fn step_graph_plan(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let (Some(modules), Some(pins)) = (graph.rebind.modules(), graph.pins.loaned_output())
+        else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        let facts = &self.capture_facts;
+        let mut stable_id = |object: PinnedObjectId| facts.module_id_for_object(pins, object).ok();
+        let sources =
+            plan::ConservativePlanSources::new(modules, &self.manifests, pins, self.broad_admit);
+        match self.plan.poll_conservative_rebuild(
+            sources,
+            &mut stable_id,
+            &mut graph.plan,
+            reserve,
+            GRAPH_STRIDE,
+        ) {
+            Ok(GraphStep::Ready) => {
+                graph.phase = GraphPhase::Facts;
+                Self::graph_idle(true)
+            }
+            Ok(GraphStep::Advanced) => Self::graph_idle(true),
+            Ok(GraphStep::Yielded) => Self::graph_idle(false),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Records a pre-mutation native refusal (§1.9): the input is back
+    /// with the graph, the reason is named once, the disclosure ships once.
+    fn refuse_graph_native_untouched(&mut self, graph: &mut CollectedGraph) {
+        graph.verdict = Some(Verdict::RefusedUntouched);
+        self.collected_graph_refusal
+            .get_or_insert("terminal graph refused before native mutation");
+        self.mark_partial(
+            "collected native retirement",
+            "the original removal was refused before native mutation; originals remain owned",
+        );
+    }
+
+    /// Records a post-mutation native refusal (§1.9): the first error
+    /// text is kept, the G4 disclosure ships, replacement stays blocked.
+    fn refuse_graph_native_retained(&mut self, graph: &mut CollectedGraph, error: String) {
+        if graph.first_error.is_none() {
+            graph.first_error = Some(error);
+        }
+        graph.verdict = Some(Verdict::RefusedRetained);
+        self.collected_graph_refusal
+            .get_or_insert("native ownership uncertain");
+        self.mark_partial(
+            "global native retirement",
+            "original static ownership remains uncertain; replacement admission is blocked",
+        );
+    }
+
+    /// Defensive post-Closed refusal (§1.9 row 7 shape): no Install, no
+    /// restart, no refund, no extra disclosure. Unreachable by phase
+    /// order: every sink is Ready and every buffer is reserved.
+    fn refuse_graph_after_closed(&mut self, graph: &mut CollectedGraph) {
+        graph.verdict = Some(Verdict::RefusedRetained);
+        self.collected_graph_refusal
+            .get_or_insert("native ownership uncertain");
+    }
+
+    /// Facts (§1.8): one `live_candidate_with_pending` row per step.
+    /// Each row writes only graph buffers, preallocated from a measured
+    /// bound, up to one stride of entries per credit.
+    fn step_graph_facts(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        match graph.facts.step {
+            FactsStep::Overlay => {
+                // Overlay merges cannot be detected here: the scan-only
+                // alias map is private to identity.rs. Live pins are
+                // canonical at Freeze on the manifest-free path (every
+                // install canonicalizes), and the uncertainty flag rides
+                // the copy; a T2b followup must surface a merge detector
+                // before manifest captures can rely on this row.
+                graph.facts.advance(FactsStep::BindingSkips);
+                Self::graph_idle(true)
+            }
+            FactsStep::BindingSkips => {
+                // No bind failures exist below: the rebind cursor binds
+                // losslessly (T2b H2a), and ambiguity records are always
+                // pre-published before a key reaches the pending set, so
+                // the replay's republish is a dedup hit the graph matches
+                // by holding no copy. G11 proves both sides empty.
+                graph.facts.advance(FactsStep::SelectionLowering);
+                Self::graph_idle(true)
+            }
+            FactsStep::SelectionLowering => self.step_facts_lowering(graph, reserve),
+            FactsStep::ObjectSkips => self.step_facts_object_skips(graph, reserve),
+            FactsStep::Corroboration => self.step_facts_corroboration(graph, reserve),
+            FactsStep::Fallbacks => self.step_facts_fallbacks(graph, reserve),
+            FactsStep::Claims => self.step_facts_claims(graph, reserve),
+            FactsStep::Tables => self.step_facts_tables(graph, reserve),
+            FactsStep::Done => {
+                graph.phase = GraphPhase::Handoff;
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Reserve `bytes` for a Facts buffer, refusing untouched on a short
+    /// pool or an overflowed measure. Facts runs before native mutation.
+    fn facts_reserve(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+        bytes: Option<usize>,
+    ) -> Option<ResourceLease> {
+        let bytes = bytes?;
+        match reserve.reserve(bytes) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                None
+            }
+        }
+    }
+
+    /// SelectionLowering (§1.8): manifest selection tables over a
+    /// graph-owned scratch clone of the cursor plan. Admissions are
+    /// discarded — the cursor plan already carries the admitted state,
+    /// so none are installed at Q — and refusals become skips with the
+    /// legacy subject. Outcomes match the twin exactly: they depend
+    /// only on policy, present modules, object match and key sets, all
+    /// equal across twins; the scratch mutations are dropped. One table
+    /// per credit: `add_selection_table` scans the slot keys.
+    fn step_facts_lowering(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if !graph.facts.measured {
+            let mut tables = 0usize;
+            let mut overflow = false;
+            for manifest in &self.manifests {
+                match tables.checked_add(manifest.selection_evidence.tables.len()) {
+                    Some(total) => tables = total,
+                    None => overflow = true,
+                }
+            }
+            let per = std::mem::size_of::<Skipped>()
+                .checked_add(FACTS_REFUSAL_REASON_BOUND)
+                .and_then(|per| per.checked_add(OWNED_ALLOCATION_PADDING));
+            let bound = per
+                .and_then(|per| tables.checked_mul(per))
+                .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING));
+            if overflow || bound.is_none() {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            let Some(lease) = self.facts_reserve(graph, reserve, bound) else {
+                return Self::graph_idle(true);
+            };
+            // Live: refusal skips move into the counters at Install.
+            graph.facts.live_storage.push(lease);
+            graph.facts.skips.reserve(tables);
+            graph.facts.measured = true;
+        }
+        if self.manifests.is_empty() {
+            graph.facts.advance(FactsStep::ObjectSkips);
+            return Self::graph_idle(true);
+        }
+        if graph.facts.scratch.is_none() {
+            let ready = graph.plan.plan().is_some() && graph.plan.required_bytes().is_some();
+            if !ready {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            let required = graph.plan.required_bytes();
+            let Some(lease) = self.facts_reserve(graph, reserve, required) else {
+                return Self::graph_idle(true);
+            };
+            let clone = graph.plan.plan().cloned();
+            let Some(clone) = clone else {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            };
+            graph.facts.scratch_storage = Some(lease);
+            graph.facts.scratch = Some(clone);
+        }
+        if graph.pins.loaned_output().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        // One table per credit; manifests without a provider or module
+        // are skipped exactly like `lower_manifest_selection_tables`.
+        loop {
+            let at = (graph.facts.scratch_manifest, graph.facts.scratch_table);
+            if at.0 >= self.manifests.len() {
+                graph.facts.advance(FactsStep::ObjectSkips);
+                return Self::graph_idle(true);
+            }
+            let manifest = &self.manifests[at.0];
+            let g = &mut *graph;
+            let (pins, facts) = (&g.pins, &mut g.facts);
+            let loaned = pins.loaned_output().expect("loaned pins checked above");
+            let scratch = facts.scratch.as_mut().expect("scratch cloned above");
+            let Some(provider) = manifest_module_object(manifest, loaned) else {
+                facts.scratch_manifest += 1;
+                facts.scratch_table = 0;
+                continue;
+            };
+            let Some(module) = scratch
+                .modules
+                .iter()
+                .find(|module| module.object == provider)
+                .map(|module| module.id)
+            else {
+                facts.scratch_manifest += 1;
+                facts.scratch_table = 0;
+                continue;
+            };
+            let mut targets = manifest_selection_targets(manifest, loaned).skip(at.1);
+            let Some((_, targets)) = targets.next() else {
+                facts.scratch_manifest += 1;
+                facts.scratch_table = 0;
+                continue;
+            };
+            facts.scratch_table += 1;
+            if let Err(reason) = scratch.add_selection_table(&self.plan, module, targets) {
+                facts.skips.push_back(Skipped {
+                    subject: "offline interface selection".into(),
+                    reason,
+                });
+            }
+            return Self::graph_idle(true);
+        }
+    }
+
+    /// ObjectSkips (§1.8): the `record_object_skips` append delta over
+    /// the cursor plan, in twin order. The retain half is vacuous at Q:
+    /// the cursor plan carries only fresh-broad skips (manifest orphans,
+    /// never scan gaps), and removal cannot newly attach a gap. The delta
+    /// also seeds the counters and plan dedup sets Install steps 7-8 use.
+    fn step_facts_object_skips(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.plan.plan().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            // Strided measure over old counters, cursor skips and graph
+            // skips. The plan delta takes old plus graph skips live; the
+            // cursor skips only seed the private dedup sets.
+            let old_len = self.counters.object_skips.len();
+            let cursor_len = graph
+                .plan
+                .plan()
+                .map(|plan| plan.skipped.len())
+                .unwrap_or(0);
+            let skips_len = graph.facts.skips.len();
+            let total = old_len.saturating_add(cursor_len).saturating_add(skips_len);
+            let from = graph.facts.index;
+            let until = total.min(from.saturating_add(GRAPH_STRIDE));
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for position in from..until {
+                let skip = if position < old_len {
+                    &self.counters.object_skips[position]
+                } else if position - old_len < cursor_len {
+                    &graph.plan.plan().expect("cursor checked above").skipped[position - old_len]
+                } else {
+                    &graph.facts.skips[position - old_len - cursor_len]
+                };
+                match facts_skip_bound(skip.subject.len(), skip.reason.len())
+                    .and_then(|bound| bytes.checked_add(bound))
+                {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.index = until;
+            graph.facts.measure_bytes = bytes;
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if until < total {
+                return Self::graph_idle(true);
+            }
+            let private = old_len
+                .checked_add(cursor_len)
+                .and_then(|n| n.checked_add(skips_len))
+                .and_then(|n| n.checked_mul(FACTS_TREE_ENTRY_OVERHEAD * 2 + 1));
+            // Live: the plan-delta skip entries plus their deque buffer;
+            // the deque may allocate up to twice the reserved capacity.
+            let live = old_len
+                .checked_add(skips_len)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<Skipped>() * 2))
+                .and_then(|buffer| bytes.checked_add(buffer));
+            let Some(live_lease) = self.facts_reserve(graph, reserve, live) else {
+                return Self::graph_idle(true);
+            };
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
+            graph
+                .facts
+                .plan_skipped
+                .reserve(old_len.saturating_add(graph.facts.skips.len()));
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            let cursor_len = graph
+                .plan
+                .plan()
+                .map(|plan| plan.skipped.len())
+                .unwrap_or(0);
+            let from = graph.facts.index;
+            let until = cursor_len.min(from.saturating_add(GRAPH_STRIDE));
+            for position in from..until {
+                let skip =
+                    graph.plan.plan().expect("cursor checked above").skipped[position].clone();
+                graph
+                    .facts
+                    .plan_dedup
+                    .insert((skip.subject.clone(), skip.reason.clone()));
+            }
+            graph.facts.index = until;
+            if until >= cursor_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            let old_len = self.counters.object_skips.len();
+            let from = graph.facts.index;
+            let until = old_len.min(from.saturating_add(GRAPH_STRIDE));
+            for position in from..until {
+                let skip = self.counters.object_skips[position].clone();
+                let pair = (skip.subject.clone(), skip.reason.clone());
+                graph.facts.dedup.insert(pair.clone());
+                if graph.facts.plan_dedup.insert(pair) {
+                    graph.facts.plan_skipped.push_back(skip);
+                }
+            }
+            graph.facts.index = until;
+            if until >= old_len {
+                graph.facts.substep = 3;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        let skips_len = graph.facts.skips.len();
+        let from = graph.facts.index;
+        let until = skips_len.min(from.saturating_add(GRAPH_STRIDE));
+        for position in from..until {
+            let skip = graph.facts.skips[position].clone();
+            let pair = (skip.subject.clone(), skip.reason.clone());
+            if graph.facts.plan_dedup.insert(pair) {
+                graph.facts.plan_skipped.push_back(skip);
+            }
+        }
+        graph.facts.index = until;
+        if until >= skips_len {
+            graph.facts.advance(FactsStep::Corroboration);
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Corroboration (§1.8): retain the entries whose objects all survive
+    /// in the cursor plan modules with loaned summaries; the rest name
+    /// invalidated old-plan modules. Mirrors the retain row exactly.
+    fn step_facts_corroboration(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.pins.loaned_output().is_none() || graph.plan.plan().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let old_len = self.counters.corroboration.len();
+            let from = graph.facts.index;
+            let until = old_len.min(from.saturating_add(GRAPH_STRIDE));
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for entry in &self.counters.corroboration[from..until] {
+                match facts_corroboration_entry_bound(entry.0.len())
+                    .and_then(|per| bytes.checked_add(per))
+                {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.index = until;
+            graph.facts.measure_bytes = bytes;
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if until < old_len {
+                return Self::graph_idle(true);
+            }
+            let private = self
+                .plan
+                .modules
+                .len()
+                .checked_add(
+                    graph
+                        .plan
+                        .plan()
+                        .map(|plan| plan.modules.len())
+                        .unwrap_or(0),
+                )
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<PinnedObjectId>()
+                            .checked_add(std::mem::size_of::<(usize, u8)>())?
+                            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
+                    )
+                });
+            // Live: the retained corroboration entries; private: the
+            // old-plan object index. Same total as one reservation.
+            let Some(live_lease) = self.facts_reserve(graph, reserve, Some(bytes)) else {
+                return Self::graph_idle(true);
+            };
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
+            graph.facts.corroboration.reserve(old_len);
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Old-plan object index for invalidation lookups.
+            let modules_len = self.plan.modules.len();
+            let from = graph.facts.index;
+            let until = modules_len.min(from.saturating_add(GRAPH_STRIDE));
+            for (position, module) in self.plan.modules[from..until].iter().enumerate() {
+                graph
+                    .facts
+                    .module_by_object
+                    .entry(module.object)
+                    .and_modify(|slot| slot.1 = slot.1.saturating_add(1).min(2))
+                    .or_insert((from + position, 1));
+            }
+            graph.facts.index = until;
+            if until >= modules_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            // Cursor-plan module objects, sliced directly: the twin's
+            // rebuilt set with no whole-plan Vec per credit.
+            let modules_len = graph
+                .plan
+                .plan()
+                .map(|plan| plan.modules.len())
+                .unwrap_or(0);
+            let from = graph.facts.index;
+            let until = modules_len.min(from.saturating_add(GRAPH_STRIDE));
+            let cursor = graph.plan.plan().expect("cursor checked above");
+            for module in &cursor.modules[from..until] {
+                graph.facts.module_objects.insert(module.object);
+            }
+            graph.facts.index = until;
+            if until >= modules_len {
+                graph.facts.substep = 3;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        let old_len = self.counters.corroboration.len();
+        let from = graph.facts.index;
+        let mut units = 0usize;
+        let mut position = from;
+        while position < old_len && units < GRAPH_STRIDE {
+            let (objects, _) = &self.counters.corroboration[position];
+            units = units.saturating_add(1).saturating_add(objects.len());
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
+            let keep = !objects.is_empty()
+                && objects.iter().all(|object| {
+                    graph.facts.module_objects.contains(object) && loaned.summary(*object).is_some()
+                });
+            if keep {
+                let entry = self.counters.corroboration[position].clone();
+                graph.facts.corroboration.push(entry);
+            } else {
+                let mut invalidated = Vec::new();
+                for object in objects {
+                    if let Some((index, _)) = graph.facts.module_by_object.get(object) {
+                        invalidated.push(self.plan.modules[*index].id);
+                    }
+                }
+                for module in invalidated {
+                    graph.facts.invalidated_modules.insert(module);
+                }
+            }
+            position += 1;
+        }
+        graph.facts.index = position;
+        if position >= old_len {
+            graph.facts.advance(FactsStep::Fallbacks);
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Fallback proof check over indexed plan state, replicating
+    /// `fallback_proof_in_plan` without its linear scans: module
+    /// uniqueness from the object index, required targets from the slot
+    /// index, table counts by nested scan (no allocation per entry).
+    /// Module tables come from the old plan: surviving modules keep the
+    /// same derived tables across the removal-only rebuild (G11 guards
+    /// the equivalence against the twin's rebuilt read).
+    fn facts_proof_in_plan(
+        proof: &BoundFallbackProof,
+        old_modules: &[plan::ModuleSummary],
+        cursor: &plan::AttachPlan,
+        module_by_object: &BTreeMap<PinnedObjectId, (usize, u8)>,
+        slot_index: &BTreeMap<plan::AttachKey, usize>,
+    ) -> bool {
+        for (left, table) in proof.tables.iter().enumerate() {
+            if proof.tables[..left]
+                .iter()
+                .any(|known| known.address == table.address)
+            {
+                return false;
+            }
+        }
+        let Some((index, count)) = module_by_object.get(&proof.module) else {
+            return false;
+        };
+        if *count != 1 {
+            return false;
+        }
+        let Some(module) = old_modules.get(*index) else {
+            return false;
+        };
+        if module.object != proof.module {
+            return false;
+        }
+        for table in &proof.tables {
+            let required = proof
+                .tables
+                .iter()
+                .filter(|known| known.version == table.version && known.entries == table.entries)
+                .count();
+            let available = module
+                .tables
+                .iter()
+                .filter(|known| known.source == "scan")
+                .filter(|known| known.version == table.version && known.entries == table.entries)
+                .count();
+            if available < required {
+                return false;
+            }
+        }
+        proof.required_targets.keys().all(|required| {
+            let key = plan::AttachKey {
+                object: required.object,
+                file_offset: required.file_offset,
+            };
+            slot_index
+                .get(&key)
+                .and_then(|position| cursor.slots.get(*position))
+                .is_some_and(|slot| {
+                    slot.names.iter().any(|name| name == &required.name)
+                        && slot.module_ids.contains(&module.id)
+                })
+        })
+    }
+
+    /// Fallbacks (§1.8): retain the fallbacks whose replacement keeps a
+    /// loaned summary with its proof in the cursor plan; the rest name
+    /// invalidated manifest objects. Unit-counted: one entry minimum per
+    /// credit so a large proof still makes progress.
+    fn step_facts_fallbacks(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.pins.loaned_output().is_none() || graph.plan.plan().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let old_len = self.counters.manifest_fallbacks.len();
+            let from = graph.facts.index;
+            let until = old_len.min(from.saturating_add(GRAPH_STRIDE));
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for fallback in &self.counters.manifest_fallbacks[from..until] {
+                match facts_fallback_entry_bound(
+                    fallback.proof.tables.len(),
+                    fallback.proof.required_targets.len(),
+                )
+                .and_then(|per| bytes.checked_add(per))
+                {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.index = until;
+            graph.facts.measure_bytes = bytes;
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if until < old_len {
+                return Self::graph_idle(true);
+            }
+            let per = std::mem::size_of::<plan::AttachKey>()
+                .checked_add(std::mem::size_of::<usize>())
+                .and_then(|per| per.checked_add(FACTS_TREE_ENTRY_OVERHEAD));
+            let private = per.and_then(|per| {
+                graph
+                    .plan
+                    .plan()
+                    .map(|plan| plan.slots.len())
+                    .unwrap_or(0)
+                    .checked_mul(per)
+            });
+            // Live: the retained fallback entries; private: the
+            // cursor-plan slot index. Same total as one reservation.
+            let Some(live_lease) = self.facts_reserve(graph, reserve, Some(bytes)) else {
+                return Self::graph_idle(true);
+            };
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
+            graph.facts.fallbacks.reserve(old_len);
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Cursor-plan slot index for proof target lookups, sliced
+            // directly off the cursor plan: no whole-plan Vec per credit.
+            let slots_len = graph.plan.plan().map(|plan| plan.slots.len()).unwrap_or(0);
+            let from = graph.facts.index;
+            let until = slots_len.min(from.saturating_add(GRAPH_STRIDE));
+            let cursor = graph.plan.plan().expect("cursor checked above");
+            for (offset, slot) in cursor.slots[from..until].iter().enumerate() {
+                graph.facts.slot_index.insert(
+                    plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    },
+                    from + offset,
+                );
+            }
+            graph.facts.index = until;
+            if until >= slots_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        let old_len = self.counters.manifest_fallbacks.len();
+        let from = graph.facts.index;
+        let mut units = 0usize;
+        let mut position = from;
+        while position < old_len && (units < GRAPH_STRIDE || position == from) {
+            let fallback = &self.counters.manifest_fallbacks[position];
+            units = units
+                .saturating_add(1)
+                .saturating_add(fallback.proof.tables.len())
+                .saturating_add(fallback.proof.required_targets.len().saturating_mul(2));
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
+            let cursor = graph.plan.plan().expect("cursor checked above");
+            let keep = loaned.summary(fallback.replacement).is_some()
+                && Self::facts_proof_in_plan(
+                    &fallback.proof,
+                    &self.plan.modules,
+                    cursor,
+                    &graph.facts.module_by_object,
+                    &graph.facts.slot_index,
+                );
+            if keep {
+                let entry = self.counters.manifest_fallbacks[position].clone();
+                graph.facts.fallbacks.push(entry);
+            } else {
+                graph
+                    .facts
+                    .invalidated_fallbacks
+                    .insert((fallback.manifest, fallback.object));
+            }
+            position += 1;
+        }
+        graph.facts.index = position;
+        if position >= old_len {
+            graph.facts.advance(FactsStep::Claims);
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Claims (§1.8): retain the claims over live views with live
+    /// bindings, replicating the retain predicate condition by
+    /// condition (`declined` is empty and `pending_selection` is `None`
+    /// on the conservative path), then prune table conflicts exactly
+    /// like the twin. Prune conflicts have no graph refuse row (their
+    /// refuse touches history and coverage, outside Install 6-8); the
+    /// fixture raises none and G11 guards the history equality.
+    fn step_facts_claims(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if graph.pins.loaned_output().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let after = graph.facts.claims_cursor.clone();
+            let range: Vec<(SelectionClaimKey, usize)> = match after {
+                None => self
+                    .selection_claims
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.object_path.len()))
+                    .collect(),
+                Some(after) => self
+                    .selection_claims
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.object_path.len()))
+                    .collect(),
+            };
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for (_, path_len) in &range {
+                match facts_claim_entry_bound(*path_len).and_then(|per| bytes.checked_add(per)) {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.measure_bytes = bytes;
+            if let Some((last, _)) = range.last() {
+                graph.facts.claims_cursor = Some(last.clone());
+            }
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            let private = self
+                .views
+                .len()
+                .checked_add(self.plan.slots.len())
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<plan::AttachKey>()
+                            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
+                    )
+                });
+            // Live: the retained claims; private: the live-view and
+            // active-key sets. Same total as one reservation.
+            let Some(live_lease) = self.facts_reserve(graph, reserve, Some(bytes)) else {
+                return Self::graph_idle(true);
+            };
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            graph.facts.claims_cursor = None;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Live views, read once instead of per claim per view.
+            let views_len = self.views.len();
+            let from = graph.facts.index;
+            let until = views_len.min(from.saturating_add(GRAPH_STRIDE));
+            for view in &self.views[from..until] {
+                if view.still_the_same() {
+                    graph.facts.live_views.insert(view.id());
+                }
+            }
+            graph.facts.index = until;
+            if until >= views_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            // Active old-plan slot keys: the twin reads the old plan.
+            let slots_len = self.plan.slots.len();
+            let from = graph.facts.index;
+            let until = slots_len.min(from.saturating_add(GRAPH_STRIDE));
+            for slot in &self.plan.slots[from..until] {
+                if self.plan.is_active(slot.index) {
+                    graph.facts.active_keys.insert(plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    });
+                }
+            }
+            graph.facts.index = until;
+            if until >= slots_len {
+                graph.facts.substep = 3;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 3 {
+            let after = graph.facts.claims_cursor.clone();
+            let range: Vec<(SelectionClaimKey, SelectionClaim)> = match after {
+                None => self
+                    .selection_claims
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.clone()))
+                    .collect(),
+                Some(after) => self
+                    .selection_claims
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.clone()))
+                    .collect(),
+            };
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
+            for (key, claim) in &range {
+                let Some(binding) = self.selection_bindings.get(&key.binding_id) else {
+                    continue;
+                };
+                let live_view = graph.facts.live_views.contains(&key.view);
+                let binding_live = binding.attached
+                    && !binding.retired
+                    && binding.context.get() == key.context
+                    && binding.view == key.view
+                    && binding.object == key.hook_owner
+                    && self
+                        .loader_registry
+                        .context(binding.context)
+                        .is_some_and(|context| {
+                            context.spec.view == key.view
+                                && !self.loader_registry.is_tombstoned(binding.context)
+                        })
+                    && loaned
+                        .owned_timing_key(binding.object)
+                        .is_some_and(|provider| provider == key.provider)
+                    && loaned.summary(claim.target.object).is_some()
+                    && claim.target.object == key.selected_object
+                    && claim.target.file_offset == key.file_offset;
+                if live_view && binding_live && graph.facts.active_keys.contains(&claim.target) {
+                    graph.facts.claims.insert(key.clone(), claim.clone());
+                }
+            }
+            if let Some((last, _)) = range.last() {
+                graph.facts.claims_cursor = Some(last.clone());
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            graph.facts.substep = 4;
+            return Self::graph_idle(true);
+        }
+        // Whole prune, like the twin: conflicts are absent below.
+        let _conflicts = prune_selection_table_conflicts(&mut graph.facts.claims);
+        graph.facts.advance(FactsStep::Tables);
+        Self::graph_idle(true)
+    }
+
+    /// Clone the cursor plan into the lowering scratch if absent,
+    /// reserving the cursor's measured derivation bound for it.
+    fn facts_ensure_scratch(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> bool {
+        if graph.facts.scratch.is_some() {
+            return true;
+        }
+        if graph.plan.plan().is_none() || graph.plan.required_bytes().is_none() {
+            self.refuse_graph_before_native(graph);
+            return false;
+        }
+        let required = graph.plan.required_bytes();
+        let Some(lease) = self.facts_reserve(graph, reserve, required) else {
+            return false;
+        };
+        let clone = graph.plan.plan().cloned();
+        let Some(clone) = clone else {
+            self.refuse_graph_before_native(graph);
+            return false;
+        };
+        graph.facts.scratch_storage = Some(lease);
+        graph.facts.scratch = Some(clone);
+        true
+    }
+
+    /// Tables (§1.8): retain the tables whose view lives with a provider
+    /// module in the rebound set, then admit the active claim tables
+    /// over the lowering scratch. Latch mismatches, missing modules and
+    /// admission failures drop their claims; admission failures also
+    /// queue skips with the legacy subject. The refuse half of those
+    /// paths touches history and coverage, outside Install 6-8; the
+    /// fixture raises none and G11 guards the history equality. One
+    /// active table per credit: admission scans the slot keys.
+    fn step_facts_tables(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if graph.pins.loaned_output().is_none() || graph.rebind.modules().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let after = graph.facts.tables_cursor.clone();
+            let range: Vec<(SelectionTableKey, usize)> = match after {
+                None => self
+                    .selection_tables
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| {
+                        let strings: usize = fact
+                            .targets
+                            .iter()
+                            .map(|target| target.object_path.len())
+                            .sum();
+                        (key.clone(), strings)
+                    })
+                    .collect(),
+                Some(after) => self
+                    .selection_tables
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| {
+                        let strings: usize = fact
+                            .targets
+                            .iter()
+                            .map(|target| target.object_path.len())
+                            .sum();
+                        (key.clone(), strings)
+                    })
+                    .collect(),
+            };
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for (_, strings) in &range {
+                match facts_table_entry_bound(*strings).and_then(|per| bytes.checked_add(per)) {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.measure_bytes = bytes;
+            if let Some((last, _)) = range.last() {
+                graph.facts.tables_cursor = Some(last.clone());
+            }
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            let provider = graph
+                .rebind
+                .modules()
+                .map(|modules| modules.len())
+                .unwrap_or(0)
+                .checked_add(graph.facts.claims.len())
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<(ProcessViewId, PinnedTimingKey)>()
+                            .checked_add(std::mem::size_of::<PinnedObjectId>())?
+                            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?
+                            .checked_add(FACTS_TIMING_KEY_STRINGS)?,
+                    )
+                });
+            // Live: the retained tables plus the admission-skip deque
+            // buffer (skips move into the counters at Install; their
+            // unbounded reason strings ride pool slack, as before).
+            // Private: the provider index plus the dropped-claim buffer.
+            // Both buffers may allocate up to twice the reservation.
+            let live = graph
+                .facts
+                .claims
+                .len()
+                .checked_mul(std::mem::size_of::<Skipped>() * 2)
+                .and_then(|buffer| bytes.checked_add(buffer));
+            let private = graph
+                .facts
+                .claims
+                .len()
+                .checked_mul(std::mem::size_of::<SelectionClaimKey>() * 2)
+                .and_then(|buffer| provider.and_then(|index| index.checked_add(buffer)));
+            let Some(live_lease) = self.facts_reserve(graph, reserve, live) else {
+                return Self::graph_idle(true);
+            };
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
+            graph.facts.table_skips.reserve(graph.facts.claims.len());
+            graph.facts.drop_claims.reserve(graph.facts.claims.len());
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            graph.facts.tables_cursor = None;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Rebound provider objects by (view, timing key). Providers
+            // are unique per object, so first-match order is irrelevant.
+            let modules = graph.rebind.modules().expect("rebind checked above");
+            let from = graph.facts.index;
+            let until = modules.len().min(from.saturating_add(GRAPH_STRIDE));
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
+            for module in &modules[from..until] {
+                if let Some(provider) = loaned.owned_timing_key(module.object) {
+                    graph
+                        .facts
+                        .module_provider_objects
+                        .entry((module.scanned.view, provider))
+                        .or_insert(module.object);
+                }
+            }
+            graph.facts.index = until;
+            if until >= modules.len() {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            let after = graph.facts.tables_cursor.clone();
+            let range: Vec<(SelectionTableKey, SelectionTableFact)> = match after {
+                None => self
+                    .selection_tables
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| (key.clone(), fact.clone()))
+                    .collect(),
+                Some(after) => self
+                    .selection_tables
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| (key.clone(), fact.clone()))
+                    .collect(),
+            };
+            for (key, fact) in &range {
+                let live = graph.facts.live_views.contains(&key.view)
+                    && graph
+                        .facts
+                        .module_provider_objects
+                        .contains_key(&(key.view, key.provider.clone()));
+                if live {
+                    graph.facts.tables.insert(key.clone(), fact.clone());
+                }
+            }
+            if let Some((last, _)) = range.last() {
+                graph.facts.tables_cursor = Some(last.clone());
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            graph.facts.substep = 3;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 3 {
+            // Whole actives build, like the twin; the loop strides below.
+            let active = selection_tables_from_claims(&graph.facts.claims);
+            graph.facts.active_tables = active;
+            graph.facts.substep = 4;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 4 {
+            let Some((key, table)) = graph.facts.active_tables.pop_first() else {
+                graph.facts.substep = 5;
+                graph.facts.index = 0;
+                return Self::graph_idle(true);
+            };
+            if graph.facts.tables.get(&key).is_some_and(|known| {
+                known.object != table.object
+                    || known.file_offset != table.file_offset
+                    || !same_selection_target_set(&known.targets, &table.targets)
+            }) {
+                graph.facts.drop_tables.insert(key);
+                return Self::graph_idle(true);
+            }
+            graph
+                .facts
+                .tables
+                .entry(key.clone())
+                .or_insert_with(|| table.clone());
+            let object = graph
+                .facts
+                .module_provider_objects
+                .get(&(key.view, key.provider.clone()))
+                .copied();
+            let module = object.and_then(|object| {
+                graph
+                    .facts
+                    .module_by_object
+                    .get(&object)
+                    .and_then(|(index, count)| (*count == 1).then_some(*index))
+            });
+            let Some(module) = module else {
+                graph.facts.drop_tables.insert(key);
+                return Self::graph_idle(true);
+            };
+            if !self.facts_ensure_scratch(graph, reserve) {
+                // The popped table is requeued so the refusal path and a
+                // later retry keep it. Refusal already recorded above.
+                graph.facts.active_tables.insert(key, table);
+                return Self::graph_idle(true);
+            }
+            let module_id = self.plan.modules[module].id;
+            let g = &mut *graph;
+            let facts = &mut g.facts;
+            let scratch = facts.scratch.as_mut().expect("scratch ensured above");
+            if let Err(reason) =
+                scratch.add_selection_table(&self.plan, module_id, table.targets.clone())
+            {
+                facts.table_skips.push_back(Skipped {
+                    subject: "live interface selection".into(),
+                    reason,
+                });
+                facts.drop_tables.insert(key);
+            }
+            Self::graph_idle(true)
+        } else if graph.facts.substep == 5 {
+            // Collect the claims whose table key was dropped.
+            let after = graph.facts.drop_cursor.clone();
+            let range: Vec<SelectionClaimKey> = match after {
+                None => graph
+                    .facts
+                    .claims
+                    .keys()
+                    .take(GRAPH_STRIDE)
+                    .cloned()
+                    .collect(),
+                Some(after) => graph
+                    .facts
+                    .claims
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, _)| key.clone())
+                    .collect(),
+            };
+            for key in &range {
+                if graph.facts.drop_tables.contains(&selection_table_key(key)) {
+                    graph.facts.drop_claims.push(key.clone());
+                }
+            }
+            if let Some(last) = range.last() {
+                graph.facts.drop_cursor = Some(last.clone());
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            graph.facts.substep = 6;
+            graph.facts.index = 0;
+            Self::graph_idle(true)
+        } else if graph.facts.substep == 6 {
+            let from = graph.facts.index;
+            let until = graph
+                .facts
+                .drop_claims
+                .len()
+                .min(from.saturating_add(GRAPH_STRIDE));
+            let victims: Vec<SelectionClaimKey> = graph.facts.drop_claims[from..until].to_vec();
+            for key in &victims {
+                graph.facts.claims.remove(key);
+            }
+            graph.facts.index = until;
+            if until >= graph.facts.drop_claims.len() {
+                graph.facts.substep = 7;
+            }
+            Self::graph_idle(true)
+        } else {
+            // The scratch plan has no strided drain: its maps are private
+            // to plan.rs. Dropping it whole matches the twin's rebuilt
+            // drop; a plan.rs drain is the followup for strict striding.
+            graph.facts.scratch = None;
+            graph.facts.scratch_storage = None;
+            graph.facts.advance(FactsStep::Done);
+            Self::graph_idle(true)
+        }
+    }
+
+    /// Handoff (§1.6): reserves the retired-file handoff and the installed
+    /// backing-lease storage. No files arrive from anywhere else; on a
+    /// backing refusal the empty handoff drops as a lease refund.
+    fn step_graph_handoff(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let Some(files) = graph.pins.retired_entry_count() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        let handoff = match RetiredFileHandoff::reserve(files, reserve) {
+            Ok(handoff) => handoff,
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+        };
+        match reserve.reserve(std::mem::size_of::<GraphBacking>() + OWNED_ALLOCATION_PADDING) {
+            Ok(storage) => {
+                graph.handoff = Some(handoff);
+                graph.backing_storage = Some(storage);
+                graph.phase = GraphPhase::RemovedCopy;
+            }
+            Err(_) => {
+                drop(handoff);
+                self.refuse_graph_before_native(graph);
+            }
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Whether the plan slot at `position` is removed by the graph: its
+    /// index is in the plan cursor's ascending removed list.
+    fn graph_slot_removed(graph: &CollectedGraph, position: usize, slots: &[plan::Slot]) -> bool {
+        match (graph.plan.removed(), slots.get(position)) {
+            (Some(removed), Some(slot)) => removed.binary_search(&slot.index).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// RemovedCopy (§1.6): removed plan slots are measured with
+    /// `RetainedInputMeasure`, reserved, cloned exact by `SlotCopy` into
+    /// an exactly preallocated `removed_rows`, and sealed into
+    /// `RetainedRetirementInput`. An empty removal list, or a logical
+    /// (Singles) leaf, closes without any copy or native call.
+    fn step_graph_removed_copy(
+        &mut self,
+        session: &mut dyn EngineSession,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let Some(removed) = graph.plan.removed() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        if removed.is_empty() {
+            graph.verdict = Some(Verdict::Closed);
+            graph.phase = GraphPhase::Install;
+            return Self::graph_idle(true);
+        }
+        if !session.collected_retirement_is_physical() {
+            graph.verdict = Some(Verdict::Closed);
+            graph.phase = GraphPhase::Install;
+            self.mark_partial(
+                "global native retirement",
+                "retired links on this kernel are closed by the Session's terminal detach",
+            );
+            return Self::graph_idle(true);
+        }
+        if graph.removed_measure.is_none() {
+            match RetainedInputMeasure::new(self.plan.slots.len()) {
+                Ok(measure) => {
+                    graph.removed_measure = Some(measure);
+                    graph.removed_index = 0;
+                    graph.removed_included = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                    return Self::graph_idle(true);
+                }
+            }
+        }
+        if graph.removed_storage.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.plan.slots.get(graph.removed_index) else {
+                    break;
+                };
+                if Self::graph_slot_removed(graph, graph.removed_index, &self.plan.slots) {
+                    let done = match graph
+                        .removed_measure
+                        .as_mut()
+                        .expect("the measure is seeded above")
+                        .step(source)
+                    {
+                        Ok(done) => done,
+                        Err(_) => {
+                            self.refuse_graph_before_native(graph);
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    if done {
+                        graph.removed_included += 1;
+                        graph.removed_index += 1;
+                    }
+                } else {
+                    graph.removed_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.removed_index < self.plan.slots.len() {
+                return Self::graph_idle(true);
+            }
+            let bytes = graph
+                .removed_measure
+                .as_ref()
+                .expect("the measure is seeded above")
+                .bytes();
+            match reserve.reserve(bytes) {
+                Ok(storage) => {
+                    graph.removed_storage = Some(storage);
+                    graph.removed_rows = Vec::with_capacity(graph.removed_included);
+                    graph.removed_copy = Some(SlotCopy::new());
+                    graph.removed_index = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.removed.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.plan.slots.get(graph.removed_index) else {
+                    break;
+                };
+                if Self::graph_slot_removed(graph, graph.removed_index, &self.plan.slots) {
+                    let cursor = graph.removed_copy.as_mut().expect("the copy opens at seal");
+                    if cursor.step(source, &mut graph.removed_rows) {
+                        graph.removed_index += 1;
+                    }
+                } else {
+                    graph.removed_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.removed_index < self.plan.slots.len() {
+                return Self::graph_idle(true);
+            }
+            let rows = std::mem::take(&mut graph.removed_rows);
+            let storage = graph
+                .removed_storage
+                .take()
+                .expect("the storage is reserved above");
+            debug_assert_eq!(
+                rows.capacity(),
+                rows.len(),
+                "removed rows are preallocated exact"
+            );
+            match RetainedRetirementInput::from_reserved_removed(rows, storage) {
+                Ok(removed) => {
+                    graph.removed = Some(removed);
+                    graph.phase = GraphPhase::NativePrepare;
+                }
+                Err(refusal) => {
+                    let (rows, storage) = refusal.into_removed();
+                    graph.removed_rows = rows;
+                    graph.removed_storage = Some(storage);
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        graph.phase = GraphPhase::NativePrepare;
+        Self::graph_idle(true)
+    }
+
+    /// Whether a no-witness native wait has run past the shared wedge
+    /// deadline: stamps the first quiet credit, trips once the whole
+    /// deadline observed no release. One constant, one clock for the
+    /// NativePoll wait and the owed-cancel wait (§1.9).
+    fn native_wedge_tripped(since: &mut Option<std::time::Instant>) -> bool {
+        let since = *since.get_or_insert_with(std::time::Instant::now);
+        since.elapsed() >= GRAPH_NATIVE_POLL_WEDGE_DEADLINE
+    }
+
+    /// Owed ticket cancel (§1.9 Prepare/Begin row): one cancel credit
+    /// per service credit until the release answers untouched (the input
+    /// comes back) or retained. Shared by NativePrepare and NativeBegin;
+    /// the caller stays in its phase while the cancel is owed. An interim
+    /// cancel claims no progress; a run that observes no release for the
+    /// whole wedge deadline falls through to the post-take incomplete stop.
+    fn step_native_cancel_owed(
+        &mut self,
+        session: &mut dyn EngineSession,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        match session.cancel_collected_static_retirement(None, graph.ticket.as_ref(), 1) {
+            Ok(progress) => match progress.state {
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    graph.removed = Some(input);
+                    graph.native_cancel_owed = false;
+                    self.refuse_graph_native_untouched(graph);
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedRetained => {
+                    graph.native_cancel_owed = false;
+                    self.refuse_graph_native_retained(
+                        graph,
+                        "the post-take cancel retained native ownership".into(),
+                    );
+                    Self::graph_idle(true)
+                }
+                // Preparing or any other interim state: stay owed without
+                // claiming progress. The cancel result carries no
+                // release-advancement witness (`used` is unconditionally 1
+                // here and the dispose/release sub-phase never surfaces), so
+                // no progress was observed. The bound is wall-time: a worker
+                // that releases nothing for the whole deadline is wedged, and
+                // the run falls through to the existing finite incomplete stop
+                // instead of spinning forever.
+                _ => {
+                    if Self::native_wedge_tripped(&mut graph.native_cancel_since) {
+                        // The take happened but the input never came back, so
+                        // the cancel failure keeps the Err row below: native
+                        // ownership is uncertain, never untouched.
+                        graph.native_cancel_owed = false;
+                        self.refuse_graph_native_retained(
+                            graph,
+                            format!(
+                                "native cancel observed no release for {}s",
+                                GRAPH_NATIVE_POLL_WEDGE_DEADLINE.as_secs()
+                            ),
+                        );
+                        return Self::graph_idle(true);
+                    }
+                    Self::graph_idle(false)
+                }
+            },
+            Err(error) => {
+                graph.native_cancel_owed = false;
+                self.refuse_graph_native_retained(graph, error.to_string());
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// NativePrepare (§1.6): one native prepare credit. Any progress with
+    /// a ticket stores it; `Prepared` advances to NativeBegin. Before the
+    /// take, an `Err` cancels once and refuses untouched; after the take,
+    /// the ticket cancel runs one credit at a time until it returns the
+    /// input (untouched) or retains it. The deferral scan runs first: a
+    /// `Split` carries the whole input onward (an empty whole closes
+    /// without a native call) and `NoPartial` passes through.
+    fn step_graph_native_prepare(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        if !graph.deferral_done {
+            if graph.removed.is_some() {
+                match session.defer_collected_partial_groups(q, &mut graph.removed, reserve, 1) {
+                    Ok(DeferralProgress::Yielded) => return Self::graph_idle(false),
+                    Ok(DeferralProgress::Scanning) => return Self::graph_idle(true),
+                    Ok(DeferralProgress::NoPartial(input)) => {
+                        graph.removed = Some(input);
+                        graph.deferral_done = true;
+                        return Self::graph_idle(true);
+                    }
+                    Ok(DeferralProgress::Split { whole, .. }) => {
+                        graph.partial_deferred = true;
+                        graph.deferral_done = true;
+                        if whole.removed_is_empty() {
+                            drop(whole);
+                            graph.removed = None;
+                            graph.verdict = Some(Verdict::Closed);
+                            graph.phase = GraphPhase::Install;
+                            return Self::graph_idle(true);
+                        }
+                        graph.removed = Some(whole);
+                        return Self::graph_idle(true);
+                    }
+                    Err(error) => {
+                        // Before the take: cancel once (result ignored),
+                        // refuse untouched, disclose once.
+                        if graph.removed.is_some() {
+                            let _ = session.cancel_collected_static_retirement(
+                                graph.removed.as_ref(),
+                                None,
+                                1,
+                            );
+                            self.refuse_graph_native_untouched(graph);
+                        } else if graph.ticket.is_some() {
+                            // After the take: the ticket cancel starts next
+                            // credit (one native call per credit).
+                            graph.native_cancel_owed = true;
+                        } else {
+                            // Defensive: taken but unticketed cannot cancel.
+                            self.refuse_graph_native_retained(graph, error.to_string());
+                        }
+                        return Self::graph_idle(true);
+                    }
+                }
+            }
+            graph.deferral_done = true;
+        }
+        // Owed cancel after a post-take prepare error: one cancel credit
+        // at a time until the release answers.
+        if graph.native_cancel_owed {
+            return self.step_native_cancel_owed(session, graph);
+        }
+        match session.prepare_collected_static_retirement(q, &mut graph.removed, reserve, 1) {
+            Ok(progress) => {
+                if let Some(ticket) = progress.ticket {
+                    graph.ticket = Some(ticket);
+                }
+                match progress.state {
+                    CollectedRetirementState::Prepared(_) => {
+                        graph.phase = GraphPhase::NativeBegin;
+                        Self::graph_idle(true)
+                    }
+                    CollectedRetirementState::RefusedUntouched(input) => {
+                        graph.removed = Some(input);
+                        self.refuse_graph_native_untouched(graph);
+                        Self::graph_idle(true)
+                    }
+                    CollectedRetirementState::RefusedRetained => {
+                        self.refuse_graph_native_retained(
+                            graph,
+                            "native prepare retained the taken input".into(),
+                        );
+                        Self::graph_idle(true)
+                    }
+                    CollectedRetirementState::Yielded => Self::graph_idle(progress.used != 0),
+                    // Preparing or any other interim state: stay.
+                    _ => Self::graph_idle(true),
+                }
+            }
+            Err(error) => {
+                if graph.removed.is_some() {
+                    // Before the take: cancel once (result ignored),
+                    // refuse untouched, disclose once.
+                    let _ =
+                        session.cancel_collected_static_retirement(graph.removed.as_ref(), None, 1);
+                    self.refuse_graph_native_untouched(graph);
+                } else if graph.ticket.is_some() {
+                    // After the take: the ticket cancel starts next
+                    // credit (one native call per credit).
+                    graph.native_cancel_owed = true;
+                } else {
+                    // Defensive: taken but unticketed cannot cancel.
+                    self.refuse_graph_native_retained(graph, error.to_string());
+                }
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// NativeBegin (§1.6): one native begin credit. `Transferring`
+    /// sets mutated and stays; `Pending` advances to NativePoll. A
+    /// missing ticket refuses by the mutated flag (defensive: Begin is
+    /// only reachable through Prepared). An `Err` before mutation owes
+    /// the ticket cancel (§1.9 Begin row), shared with NativePrepare.
+    fn step_graph_native_begin(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        if graph.native_cancel_owed {
+            return self.step_native_cancel_owed(session, graph);
+        }
+        let Some(ticket) = graph.ticket.as_ref() else {
+            if graph.mutated {
+                self.refuse_graph_native_retained(graph, "native begin without a ticket".into());
+            } else {
+                self.refuse_graph_native_untouched(graph);
+            }
+            return Self::graph_idle(true);
+        };
+        match session.begin_collected_static_retirement(q, ticket, 1) {
+            Ok(progress) => match progress.state {
+                CollectedRetirementState::Transferring => {
+                    graph.mutated = true;
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::Pending => {
+                    graph.phase = GraphPhase::NativePoll;
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    graph.removed = Some(input);
+                    self.refuse_graph_native_untouched(graph);
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedRetained => {
+                    self.refuse_graph_native_retained(
+                        graph,
+                        "native begin retained the taken input".into(),
+                    );
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::Yielded => Self::graph_idle(progress.used != 0),
+                // Preparing/Prepared or any other interim state: stay.
+                _ => Self::graph_idle(true),
+            },
+            Err(error) => {
+                if graph.mutated {
+                    self.refuse_graph_native_retained(graph, error.to_string());
+                } else if graph.ticket.is_some() {
+                    // Before mutation with a ticket: owe the cancel (§1.9
+                    // Begin row). The input comes back untouched credit by
+                    // credit instead of stranding the native cursor.
+                    graph.native_cancel_owed = true;
+                } else {
+                    let _ = session.cancel_collected_static_retirement(
+                        graph.removed.as_ref(),
+                        graph.ticket.as_ref(),
+                        1,
+                    );
+                    self.refuse_graph_native_untouched(graph);
+                }
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Install (§1.8): the first credit revalidates epoch plus Freeze
+    /// scalars (a mismatch after Closed retains, never restarts), then
+    /// sinks pins/modules/plan (steps 1-3), chains the old backing
+    /// (step 4) and swaps the Facts maps (steps 5-6). Later credits run
+    /// skips into counters (step 7, in live row order around the
+    /// invalidation disclosure), invalidated modules/fallbacks with the
+    /// legacy handling (step 8), the ObjectSkips plan append and the
+    /// epoch bump (step 9).
+    fn step_graph_install(&mut self, graph: &mut CollectedGraph) -> GraphService {
+        if graph.install_step == 0 {
+            if self.graph_inputs_epoch != graph.epoch
+                || self.pinned.revision() != graph.pins_revision
+                || self.plan.slots.len() != graph.plan_slots
+            {
+                self.refuse_graph_after_closed(graph);
+                return Self::graph_idle(true);
+            }
+            // Every sink is ready before the first swap: a later refusal
+            // must not leave the pins half-swapped. At install step 0 the
+            // plan was never installed, so a present removed list means
+            // Ready (a cancelled or unfinished cursor answers None).
+            if graph.pins.retired_entry_count().is_none()
+                || graph.rebind.modules().is_none()
+                || graph.plan.removed().is_none()
+                || graph.backing_storage.is_none()
+            {
+                self.refuse_graph_after_closed(graph);
+                return Self::graph_idle(true);
+            }
+            let pins_backing = match graph.pins.install_ready(&mut self.pinned) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    self.refuse_graph_after_closed(graph);
+                    return Self::graph_idle(true);
+                }
+            };
+            let modules_backing = match graph.rebind.install_ready(&mut self.modules) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    self.refuse_graph_after_closed(graph);
+                    return Self::graph_idle(true);
+                }
+            };
+            let plan_backing = match graph.plan.swap_ready(&mut self.plan) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    self.refuse_graph_after_closed(graph);
+                    return Self::graph_idle(true);
+                }
+            };
+            let Some(backing_storage) = graph.backing_storage.take() else {
+                self.refuse_graph_after_closed(graph);
+                return Self::graph_idle(true);
+            };
+            graph.retired_backing = self.graph_backing.replace(Box::new(GraphBacking {
+                pins: pins_backing,
+                modules: modules_backing,
+                plan: plan_backing,
+                storage: Some(backing_storage),
+                facts: std::mem::take(&mut graph.facts.live_storage),
+            }));
+            std::mem::swap(&mut graph.facts.claims, &mut self.selection_claims);
+            std::mem::swap(&mut graph.facts.tables, &mut self.selection_tables);
+            graph.old_claims = std::mem::take(&mut graph.facts.claims);
+            graph.old_tables = std::mem::take(&mut graph.facts.tables);
+            std::mem::swap(
+                &mut graph.facts.corroboration,
+                &mut self.counters.corroboration,
+            );
+            std::mem::swap(
+                &mut graph.facts.fallbacks,
+                &mut self.counters.manifest_fallbacks,
+            );
+            graph.old_corroboration = std::mem::take(&mut graph.facts.corroboration);
+            graph.old_fallbacks = std::mem::take(&mut graph.facts.fallbacks);
+            graph.install_invalidated = !graph.facts.invalidated_modules.is_empty()
+                || !graph.facts.invalidated_fallbacks.is_empty();
+            graph.installed = true;
+            if graph.partial_deferred {
+                self.mark_partial(
+                    "global native retirement",
+                    "physical close deferred to Session cleanup",
+                );
+            }
+            graph.install_step = 1;
+            graph.install_index = 0;
+            return Self::graph_idle(true);
+        }
+        match graph.install_step {
+            // Step 7, early rows: skip entries into counters with the
+            // legacy contains-dedup, in live row order.
+            1 => {
+                let mut units = 0usize;
+                while units < GRAPH_STRIDE {
+                    let Some(skip) = graph.facts.skips.pop_front() else {
+                        break;
+                    };
+                    attribution::note(&skip);
+                    let pair = (skip.subject.clone(), skip.reason.clone());
+                    if graph.facts.dedup.insert(pair) {
+                        self.counters.object_skips.push(skip);
+                    }
+                    units += 1;
+                }
+                if graph.facts.skips.is_empty() {
+                    graph.install_step = 2;
+                }
+                Self::graph_idle(true)
+            }
+            // Step 8: invalidated modules/fallbacks with the legacy
+            // handling after the retain rows: invalidate, project when
+            // nothing is staged, then the evidence disclosure. One
+            // credit, like the twin's single call sequence.
+            2 => {
+                if graph.install_invalidated {
+                    let modules = std::mem::take(&mut graph.facts.invalidated_modules);
+                    let fallbacks = std::mem::take(&mut graph.facts.invalidated_fallbacks);
+                    self.capture_facts
+                        .invalidate_discovery_proofs(modules, fallbacks);
+                    self.note_facts_mutated();
+                    if self.capture_facts.staged.is_none() {
+                        self.project_capture_facts();
+                    }
+                    self.mark_partial(
+                        "live discovery evidence",
+                        "a late identity collision invalidated prior exact fallback or corroboration evidence",
+                    );
+                    graph.facts.dedup.insert((
+                        "live discovery evidence".to_string(),
+                        "a late identity collision invalidated prior exact fallback or corroboration evidence"
+                            .to_string(),
+                    ));
+                }
+                graph.install_step = 3;
+                graph.install_index = 0;
+                Self::graph_idle(true)
+            }
+            // Step 7, Tables row: queued after the invalidation
+            // disclosure, in live row order. Borrows here; the plan
+            // append drains the buffer next.
+            3 => {
+                let len = graph.facts.table_skips.len();
+                let from = graph.install_index;
+                let until = len.min(from.saturating_add(GRAPH_STRIDE));
+                for position in from..until {
+                    let skip = graph.facts.table_skips[position].clone();
+                    attribution::note(&skip);
+                    let pair = (skip.subject.clone(), skip.reason.clone());
+                    if graph.facts.dedup.insert(pair) {
+                        self.counters.object_skips.push(skip);
+                    }
+                }
+                graph.install_index = until;
+                if until >= len {
+                    graph.install_step = 4;
+                    graph.install_index = 0;
+                }
+                Self::graph_idle(true)
+            }
+            // ObjectSkips plan append, first segment: the pre-deduped
+            // Facts delta. No contains check: Facts deduped it against
+            // the cursor plan the swap just installed.
+            4 => {
+                let mut units = 0usize;
+                while units < GRAPH_STRIDE {
+                    let Some(skip) = graph.facts.plan_skipped.pop_front() else {
+                        break;
+                    };
+                    self.plan.skipped.push(skip);
+                    units += 1;
+                }
+                if graph.facts.plan_skipped.is_empty() {
+                    graph.install_step = 5;
+                }
+                Self::graph_idle(true)
+            }
+            // ObjectSkips plan append, second segment: the invalidation
+            // disclosure, in live row order.
+            5 => {
+                if graph.install_invalidated
+                    && graph.facts.plan_dedup.insert((
+                        "live discovery evidence".to_string(),
+                        "a late identity collision invalidated prior exact fallback or corroboration evidence"
+                            .to_string(),
+                    ))
+                {
+                    self.plan.skipped.push(Skipped {
+                        subject: "live discovery evidence".into(),
+                        reason: "a late identity collision invalidated prior exact fallback or corroboration evidence"
+                            .into(),
+                    });
+                }
+                graph.install_step = 6;
+                Self::graph_idle(true)
+            }
+            // ObjectSkips plan append, last segment: the Tables-row
+            // skips, in live row order.
+            6 => {
+                let mut units = 0usize;
+                while units < GRAPH_STRIDE {
+                    let Some(skip) = graph.facts.table_skips.pop_front() else {
+                        break;
+                    };
+                    let pair = (skip.subject.clone(), skip.reason.clone());
+                    if graph.facts.plan_dedup.insert(pair) {
+                        self.plan.skipped.push(skip);
+                    }
+                    units += 1;
+                }
+                if graph.facts.table_skips.is_empty() {
+                    graph.install_step = 7;
+                }
+                Self::graph_idle(true)
+            }
+            // Step 9: the epoch bump, then Consume.
+            _ => {
+                self.note_graph_inputs_mutated();
+                graph.phase = GraphPhase::Consume;
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// NativePoll (§1.6): one native poll credit. `Pending` stays without
+    /// claiming progress; a run that observes no retirement progress for
+    /// the whole wedge deadline falls through to the finite incomplete
+    /// stop (§1.9). `Closed` splits the input into removed rows plus
+    /// storage, records the verdict and installs. A missing ticket refuses
+    /// by the mutated flag (defensive).
+    fn step_graph_native_poll(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        let Some(ticket) = graph.ticket.as_ref() else {
+            if graph.mutated {
+                self.refuse_graph_native_retained(graph, "native poll without a ticket".into());
+            } else {
+                self.refuse_graph_native_untouched(graph);
+            }
+            return Self::graph_idle(true);
+        };
+        match session.poll_collected_static_retirement(q, ticket, 1) {
+            Ok(progress) => match progress.state {
+                CollectedRetirementState::Pending => {
+                    // A stay-Pending poll claims no progress: the poll
+                    // result carries no batch-advancement witness (`used`
+                    // is unconditionally 1 here and the batch index never
+                    // surfaces), so no progress was observed. The bound is
+                    // wall-time: a worker that releases nothing for the
+                    // whole deadline is wedged, and the run falls through
+                    // to the existing finite incomplete stop instead of
+                    // spinning forever.
+                    if Self::native_wedge_tripped(&mut graph.native_poll_since) {
+                        // NativePoll is reachable only after native
+                        // mutation; the unmutated shape mirrors the Err row
+                        // below defensively.
+                        if graph.mutated {
+                            self.refuse_graph_native_retained(
+                                graph,
+                                format!(
+                                    "native poll observed no retirement progress for {}s",
+                                    GRAPH_NATIVE_POLL_WEDGE_DEADLINE.as_secs()
+                                ),
+                            );
+                        } else {
+                            let _ = session.cancel_collected_static_retirement(
+                                graph.removed.as_ref(),
+                                graph.ticket.as_ref(),
+                                1,
+                            );
+                            self.refuse_graph_native_untouched(graph);
+                        }
+                        return Self::graph_idle(true);
+                    }
+                    Self::graph_idle(false)
+                }
+                CollectedRetirementState::Closed(input) => {
+                    // Closed splits the input back into rows plus storage:
+                    // Reclaim step 3 drains the rows strided, so nothing of
+                    // removal size rides whole to Done.
+                    debug_assert!(graph.removed_rows.is_empty());
+                    debug_assert!(graph.removed_storage.is_none());
+                    let (rows, storage) = input.into_removed();
+                    graph.removed_rows = rows;
+                    graph.removed_storage = Some(storage);
+                    graph.verdict = Some(Verdict::Closed);
+                    graph.phase = GraphPhase::Install;
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    graph.removed = Some(input);
+                    self.refuse_graph_native_untouched(graph);
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedRetained => {
+                    self.refuse_graph_native_retained(
+                        graph,
+                        "native poll retained the taken input".into(),
+                    );
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::Yielded => Self::graph_idle(progress.used != 0),
+                // Preparing/Prepared/Transferring or any other interim
+                // state: stay.
+                _ => Self::graph_idle(true),
+            },
+            Err(error) => {
+                if graph.mutated {
+                    self.refuse_graph_native_retained(graph, error.to_string());
+                } else {
+                    let _ = session.cancel_collected_static_retirement(
+                        graph.removed.as_ref(),
+                        graph.ticket.as_ref(),
+                        1,
+                    );
+                    self.refuse_graph_native_untouched(graph);
+                }
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Consume (§1.7): retires the selected views and rejected keys
+    /// through the legacy effects. Step 0 closes ExpectedRemoval
+    /// binding coverage (strided); step 1 retires one view row per
+    /// credit; step 2 drops the rejected keys (strided); step 3
+    /// finalizes, then Reclaim. Publication stays quiet until Done.
+    fn step_graph_consume(
+        &mut self,
+        session: &mut dyn EngineSession,
+        collect: &mut DiscoveryCollector<'_>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        match graph.consume.step {
+            // Bindings: close ExpectedRemoval coverage, strided.
+            0 => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let mut leaves = 0;
+                while leaves < GRAPH_STRIDE {
+                    let next = match graph.consume.after_binding {
+                        None => self.selection_bindings.first_key_value().map(|(id, _)| *id),
+                        Some(after) => self
+                            .selection_bindings
+                            .range((Excluded(after), Unbounded))
+                            .next()
+                            .map(|(id, _)| *id),
+                    };
+                    let Some(id) = next else { break };
+                    graph.consume.after_binding = Some(id);
+                    let selected =
+                        self.selection_bindings.get(&id).is_some_and(|binding| {
+                            graph.selection.as_ref().is_some_and(|selection| {
+                                selection.retired().contains(&binding.view)
+                            }) && self.retirement_intents.get(&binding.view)
+                                == Some(&RetirementCause::ExpectedRemoval)
+                        });
+                    if selected && let Some(binding) = self.selection_bindings.get_mut(&id) {
+                        binding.coverage.close_naturally();
+                    }
+                    leaves += 1;
+                }
+                let done = match graph.consume.after_binding {
+                    None => true,
+                    Some(after) => self
+                        .selection_bindings
+                        .range((Excluded(after), Unbounded))
+                        .next()
+                        .is_none(),
+                };
+                if done {
+                    graph.consume.step = 1;
+                    graph.consume.after_view = None;
+                }
+                Self::graph_idle(true)
+            }
+            // Views: one row per credit.
+            1 => self.step_graph_consume_view(session, collect, graph),
+            // Rejected keys: drop, strided.
+            2 => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let mut leaves = 0;
+                while leaves < GRAPH_STRIDE {
+                    let next = match graph.consume.after_key {
+                        None => graph
+                            .selection
+                            .as_ref()
+                            .and_then(|selection| selection.rejected().first().copied()),
+                        Some(after) => graph.selection.as_ref().and_then(|selection| {
+                            selection
+                                .rejected()
+                                .range((Excluded(after), Unbounded))
+                                .next()
+                                .copied()
+                        }),
+                    };
+                    let Some(key) = next else { break };
+                    graph.consume.after_key = Some(key);
+                    self.pending_rejected_keys.remove(&key);
+                    leaves += 1;
+                }
+                let done = match graph.consume.after_key {
+                    None => true,
+                    Some(after) => graph.selection.as_ref().is_some_and(|selection| {
+                        selection
+                            .rejected()
+                            .range((Excluded(after), Unbounded))
+                            .next()
+                            .is_none()
+                    }),
+                };
+                if done {
+                    graph.consume.step = 3;
+                }
+                Self::graph_idle(true)
+            }
+            // Finalize, then Reclaim.
+            _ => {
+                self.finalize_expected_target_exit();
+                graph.phase = GraphPhase::Reclaim;
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// One Consume view row (§1.7): a causeless view drops from pending
+    /// retirements; a caused view runs one loader-retire call (the row
+    /// repeats across credits until the view's contexts complete — one
+    /// Finish action cannot clear two terminal journals in one credit)
+    /// and then the legacy removal effects. A row error restores the
+    /// graph at its Consume position (§1.9).
+    fn step_graph_consume_view(
+        &mut self,
+        session: &mut dyn EngineSession,
+        collect: &mut DiscoveryCollector<'_>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = match graph.consume.after_view {
+            None => graph
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.retired().first().copied()),
+            Some(after) => graph.selection.as_ref().and_then(|selection| {
+                selection
+                    .retired()
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied()
+            }),
+        };
+        let Some(view) = next else {
+            // Views exhausted: reject leftover handoffs once (always
+            // empty at Q — no record dispatch fills them), then drop
+            // the rejected keys.
+            let mut closure = PauseClosure::new(false);
+            self.reject_terminal_selection_handoffs(Vec::new(), &mut closure);
+            graph.consume.step = 2;
+            graph.consume.after_key = None;
+            return Self::graph_idle(true);
+        };
+        let Some(cause) = self.retirement_intents.get(&view).copied() else {
+            // No intent (pending before Q): only the pending entry drops.
+            self.pending_retirements.remove(&view);
+            graph.consume.after_view = Some(view);
+            return Self::graph_idle(true);
+        };
+        let mut handoffs = TerminalSelectionHandoffs::new();
+        let mut additions = false;
+        let mut closure = PauseClosure::new(false);
+        let retired = self.retire_loader_contexts(
+            view,
+            &mut handoffs,
+            session,
+            &mut additions,
+            &mut graph.consume.pending_views,
+            collect,
+            &mut closure,
+        );
+        // Findings merge back into the persistent intents, as legacy does.
+        for (found, found_cause) in std::mem::take(&mut graph.consume.pending_views) {
+            self.retirement_intents
+                .entry(found)
+                .and_modify(|current| {
+                    current.merge(found_cause);
+                })
+                .or_insert(found_cause);
+        }
+        let complete = match retired {
+            Ok((_, complete)) => complete,
+            Err(error) => {
+                self.fail_graph_consume_row(graph, error);
+                return Self::graph_idle(true);
+            }
+        };
+        if !complete {
+            return Self::graph_idle(true);
+        }
+        let mut service = Self::graph_idle(true);
+        if cause == RetirementCause::GenerationLost && matches!(self.scope, Scope::Pid(_)) {
+            service.named_generation_lost = true;
+        }
+        self.retirement_intents.remove(&view);
+        self.ready_expected_removals.remove(&view);
+        if cause == RetirementCause::ExpectedRemoval {
+            self.close_cgroup_admission_at_removal(view);
+            self.settle_leader_exits_at_removal([view]);
+            if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
+                // Never at Q: no ended-PID proof is taken here.
+                let owner = self.views.remove(index);
+                self.note_ended_loader_origin(&owner);
+            }
+            self.release_view_id(view);
+            self.scan_inputs.remove(&view);
+            self.arm_expected_target_exit(view);
+        }
+        // Last: the pending entry drops only after every effect lands.
+        self.pending_retirements.remove(&view);
+        graph.consume.after_view = Some(view);
+        service
+    }
+
+    /// A Consume row error (§1.9): the graph stays at its Consume
+    /// position with intents and pending retirements kept; the first
+    /// error text is recorded with the post-install reason. A deferred
+    /// batch is re-installed first (defensive: the collected collector
+    /// never produces one); when that refuses, the boxed error is kept
+    /// with the graph instead of dropped.
+    fn fail_graph_consume_row(&mut self, graph: &mut CollectedGraph, error: anyhow::Error) {
+        if graph.first_error.is_none() {
+            graph.first_error = Some(error.to_string());
+        }
+        if let Ok(mut deferred) = error.downcast::<DeferredDiscoveryItem>()
+            && let Some(batch) = deferred.terminal_batch.take()
+            && self.install_terminal_batch(batch, []).is_err()
+        {
+            graph.retained_error = Some(deferred.into());
+        }
+        graph.verdict = Some(Verdict::RefusedRetained);
+        self.collected_graph_refusal
+            .get_or_insert("terminal graph disposition failed after install");
+    }
+
+    /// Reclaim (§1.6): one sub-stage per credit, each up to `GRAPH_STRIDE`
+    /// leaves: the plan cursor, the rebind cursor against the installed
+    /// pins, the pins cursor, the removed/claim/table/raw leftovers, and
+    /// finally the retired backing — then Done. A cursor refusal forgets
+    /// the unprovable graph (§1.9) while Finish continues.
+    fn step_graph_reclaim(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        loop {
+            match graph.reclaim_step {
+                0 => match graph.plan.reclaim(GRAPH_STRIDE) {
+                    Ok(GraphStep::Ready) => {
+                        graph.reclaim_step = 1;
+                        return Self::graph_idle(true);
+                    }
+                    Ok(GraphStep::Advanced) => return Self::graph_idle(true),
+                    Ok(GraphStep::Yielded) => return Self::graph_idle(false),
+                    Err(error) => {
+                        self.forget_graph_reclaim(graph, format!("{error:?}"));
+                        return Self::graph_idle(true);
+                    }
+                },
+                1 => {
+                    let handoff = match graph.handoff.as_mut() {
+                        Some(handoff) => handoff,
+                        None => {
+                            self.forget_graph_reclaim(
+                                graph,
+                                "reclaim without a retired-file handoff".into(),
+                            );
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    match graph.rebind.reclaim_installed(
+                        &mut graph.pins,
+                        &self.pinned,
+                        handoff,
+                        reserve,
+                        GRAPH_STRIDE,
+                    ) {
+                        Ok(GraphStep::Ready) => {
+                            graph.reclaim_step = 2;
+                            return Self::graph_idle(true);
+                        }
+                        Ok(GraphStep::Advanced) => return Self::graph_idle(true),
+                        Ok(GraphStep::Yielded) => return Self::graph_idle(false),
+                        Err(error) => {
+                            self.forget_graph_reclaim(graph, format!("{error:?}"));
+                            return Self::graph_idle(true);
+                        }
+                    }
+                }
+                2 => {
+                    let handoff = match graph.handoff.as_mut() {
+                        Some(handoff) => handoff,
+                        None => {
+                            self.forget_graph_reclaim(
+                                graph,
+                                "reclaim without a retired-file handoff".into(),
+                            );
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    let selection = match graph.selection.as_ref() {
+                        Some(selection) => selection,
+                        None => {
+                            self.forget_graph_reclaim(
+                                graph,
+                                "reclaim without a sealed selection".into(),
+                            );
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    match graph.pins.reclaim_installed(
+                        &self.pinned,
+                        selection,
+                        handoff,
+                        reserve,
+                        GRAPH_STRIDE,
+                    ) {
+                        Ok(GraphStep::Ready) => {
+                            graph.reclaim_step = 3;
+                            return Self::graph_idle(true);
+                        }
+                        Ok(GraphStep::Advanced) => return Self::graph_idle(true),
+                        Ok(GraphStep::Yielded) => return Self::graph_idle(false),
+                        Err(error) => {
+                            self.forget_graph_reclaim(graph, format!("{error:?}"));
+                            return Self::graph_idle(true);
+                        }
+                    }
+                }
+                3 => {
+                    if graph.removed_rows.is_empty() {
+                        graph.reclaim_step = 4;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.removed_rows.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.removed_rows.is_empty() {
+                        graph.reclaim_step = 4;
+                    }
+                    return Self::graph_idle(true);
+                }
+                4 => {
+                    if graph.old_claims.is_empty() {
+                        graph.reclaim_step = 5;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_claims.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_claims.is_empty() {
+                        graph.reclaim_step = 5;
+                    }
+                    return Self::graph_idle(true);
+                }
+                5 => {
+                    if graph.old_tables.is_empty() {
+                        graph.reclaim_step = 6;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_tables.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_tables.is_empty() {
+                        graph.reclaim_step = 6;
+                    }
+                    return Self::graph_idle(true);
+                }
+                6 => {
+                    if graph.raw_rows.is_empty() {
+                        graph.reclaim_step = 7;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.raw_rows.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.raw_rows.is_empty() {
+                        graph.reclaim_step = 7;
+                    }
+                    return Self::graph_idle(true);
+                }
+                // T5 leaves: swapped-out corroboration/fallbacks plus the
+                // Facts index and dedup sets, one stride per credit.
+                7 => {
+                    if graph.old_corroboration.is_empty() {
+                        graph.reclaim_step = 8;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_corroboration.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_corroboration.is_empty() {
+                        graph.reclaim_step = 8;
+                    }
+                    return Self::graph_idle(true);
+                }
+                8 => {
+                    if graph.old_fallbacks.is_empty() {
+                        graph.reclaim_step = 9;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_fallbacks.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_fallbacks.is_empty() {
+                        graph.reclaim_step = 9;
+                    }
+                    return Self::graph_idle(true);
+                }
+                9 => {
+                    if graph.facts.dedup.is_empty() {
+                        graph.reclaim_step = 10;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.dedup.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.dedup.is_empty() {
+                        graph.reclaim_step = 10;
+                    }
+                    return Self::graph_idle(true);
+                }
+                10 => {
+                    if graph.facts.plan_dedup.is_empty() {
+                        graph.reclaim_step = 11;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.plan_dedup.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.plan_dedup.is_empty() {
+                        graph.reclaim_step = 11;
+                    }
+                    return Self::graph_idle(true);
+                }
+                11 => {
+                    if graph.facts.module_by_object.is_empty() {
+                        graph.reclaim_step = 12;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.module_by_object.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.module_by_object.is_empty() {
+                        graph.reclaim_step = 12;
+                    }
+                    return Self::graph_idle(true);
+                }
+                12 => {
+                    if graph.facts.module_objects.is_empty() {
+                        graph.reclaim_step = 13;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.module_objects.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.module_objects.is_empty() {
+                        graph.reclaim_step = 13;
+                    }
+                    return Self::graph_idle(true);
+                }
+                13 => {
+                    if graph.facts.live_views.is_empty() {
+                        graph.reclaim_step = 14;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.live_views.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.live_views.is_empty() {
+                        graph.reclaim_step = 14;
+                    }
+                    return Self::graph_idle(true);
+                }
+                14 => {
+                    if graph.facts.module_provider_objects.is_empty() {
+                        graph.reclaim_step = 15;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.module_provider_objects.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.module_provider_objects.is_empty() {
+                        graph.reclaim_step = 15;
+                    }
+                    return Self::graph_idle(true);
+                }
+                15 => {
+                    if graph.facts.slot_index.is_empty() {
+                        graph.reclaim_step = 16;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.slot_index.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.slot_index.is_empty() {
+                        graph.reclaim_step = 16;
+                    }
+                    return Self::graph_idle(true);
+                }
+                16 => {
+                    if graph.facts.active_keys.is_empty() {
+                        graph.reclaim_step = 17;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.active_keys.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.active_keys.is_empty() {
+                        graph.reclaim_step = 17;
+                    }
+                    return Self::graph_idle(true);
+                }
+                17 => {
+                    if graph.facts.drop_tables.is_empty() {
+                        graph.reclaim_step = 18;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.drop_tables.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.drop_tables.is_empty() {
+                        graph.reclaim_step = 18;
+                    }
+                    return Self::graph_idle(true);
+                }
+                // The sealed selection is dead after the pins reclaim
+                // (step 2); it drops in its own step instead of whole at
+                // Done. Strided draining needs a selection drain API.
+                18 => {
+                    graph.selection = None;
+                    graph.reclaim_step = 19;
+                    return Self::graph_idle(true);
+                }
+                _ => {
+                    drop(graph.retired_backing.take());
+                    graph.phase = GraphPhase::Done;
+                    return Self::graph_idle(true);
+                }
+            }
+        }
+    }
+
+    /// A Reclaim refusal (§1.9): the first error text is kept, the
+    /// disclosure ships once per Engine, the handoff moves to the Engine
+    /// chain, the forgotten counter bumps, and the graph is marked for
+    /// process-lifetime retention while Finish continues (not a refusal).
+    fn forget_graph_reclaim(&mut self, graph: &mut CollectedGraph, error: String) {
+        if graph.first_error.is_none() {
+            graph.first_error = Some(error);
+        }
+        self.mark_partial(
+            "collected graph reclamation",
+            "a retired graph buffer could not be proven reclaimable; it is retained until process exit",
+        );
+        if let Some(mut handoff) = graph.handoff.take() {
+            handoff.prev = self.retired_files.take();
+            self.retired_files = Some(handoff);
+        }
+        self.collected_graph_reclaim_forgotten =
+            self.collected_graph_reclaim_forgotten.saturating_add(1);
+        graph.reclaim_forgotten = true;
+    }
+
+    /// One bounded service of originals already transferred from the actual
+    /// Q-bounded transport. Acquisition, original dispatch, exit assessment,
+    /// and context cleanup are separate opportunities, even with work > 1.
+    /// This deliberately does not run an ordinary inventory/admission frame.
+    // Contract-pinned D1.2 signature (+transport_at_q); T4b keeps the arity.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn service_collected_finish_records_with(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        work: usize,
+        transport_at_q: bool,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> Result<BacklogOutcome> {
+        if work == 0 {
+            debug_assert!(records.is_empty() && malformed == 0);
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: false,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        let previous = self.collected_finish_actions.replace(1);
+        let result = self.with_live_frame(|engine| {
+            engine.service_collected_finish_records_inner(
+                session,
+                q,
+                reserve,
+                records,
+                malformed,
+                transport_at_q,
+                collect,
+            )
+        });
+        self.collected_finish_actions = previous;
+        result
+    }
+
+    // Mirrors the contract-pinned D1.2 arity above; T4b keeps it.
+    #[allow(clippy::too_many_arguments)]
+    fn service_collected_finish_records_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        transport_at_q: bool,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> Result<BacklogOutcome> {
+        let fresh = records.len().saturating_add(malformed as usize);
+        self.charge_discovery_drain(records.len(), malformed);
+        self.record_malformed_discovery(malformed);
+        self.pending_discovery_records
+            .extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }));
+        self.note_discovery_held_high_water(0);
+        // Keep every transferred original before the native preflight. Refusal
+        // neither drops inputs nor polls a ticket/advances an assessment.
+        self.update_counter_snapshot(session)?;
+        if self.pending_global_retirement.is_some() {
+            let (poll, mut outcome) = self
+                .poll_global_retirement_barrier(session)
+                .expect("the original pending ticket was just checked");
+            if poll == RetirementPoll::Refused {
+                // Refusal is terminal for Finish, never proof of native
+                // closure. Original records, ticket and ownership stay held.
+                bail!(
+                    "ordinary native retirement failed to prove completion; original static ownership remains uncertain; replacement admission is blocked"
+                );
+            }
+            // Ordinary polling intentionally has narrower readiness. Finish
+            // must still account for journals, assessments and retained graph.
+            outcome.pending = self.collected_finish_backlog_pending(session.staged_discovery_len());
+            return Ok(outcome);
+        }
+        if self.global_retirement_frame_owed {
+            self.dispose_collected_finish_recovery_hint();
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: true,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        // Barrier (§1.5): a live graph fences records, assessments and the
+        // journal; below, a request creates one graph on the first credit
+        // with an empty queue, no pending assessment and no open
+        // journal/batch, at transport Q and with no fresh records.
+        let create = self.collected_graph.is_none()
+            && self.collected_graph_requested
+            && transport_at_q
+            && fresh == 0
+            && self.pending_discovery_records.is_empty()
+            && self.collected_assessments_passed()
+            && self.terminal_journal.is_none()
+            && self.terminal_batch.is_none();
+        if self.collected_graph.is_some() || create {
+            if create {
+                match reserve.reserve(size_of::<CollectedGraph>() + OWNED_ALLOCATION_PADDING) {
+                    Ok(storage) => {
+                        // A fresh graph starts at the current input
+                        // generation: the constructor zero would
+                        // false-mismatch the Freeze epoch check after any
+                        // earlier graph mutated the inputs (Install step 9),
+                        // refusing and stalling every later graph at Freeze.
+                        let mut graph = Box::new(CollectedGraph::new(storage));
+                        graph.epoch = self.graph_inputs_epoch;
+                        self.collected_graph = Some(graph);
+                        self.collected_graph_requested = false;
+                        #[cfg(test)]
+                        {
+                            self.collected_graphs_created =
+                                self.collected_graphs_created.saturating_add(1);
+                        }
+                    }
+                    Err(_) => {
+                        // OD-8: the box could not be paid. Clear the request
+                        // (never a retry loop); the debt stays pending and
+                        // T4b's `failed` flag takes the finite I2 stop.
+                        self.collected_graph_requested = false;
+                        self.collected_graph_refusal
+                            .get_or_insert("terminal graph refused before native mutation");
+                        self.mark_partial(
+                            "live discovery transaction",
+                            "the bounded terminal graph could not be paid; its originals remain owned",
+                        );
+                        return Ok(BacklogOutcome {
+                            changed: false,
+                            progressed: false,
+                            pending: self
+                                .collected_finish_backlog_pending(session.staged_discovery_len()),
+                        });
+                    }
+                }
+            }
+            let step = self.step_collected_graph(session, q, reserve, collect);
+            if step.changed {
+                self.publish_batch_tail(true)?;
+            }
+            if step.named_generation_lost {
+                // Same text as the dispatch-path bail: one generation guard.
+                let witness = self
+                    .counters
+                    .object_skips
+                    .iter()
+                    .find(|skip| {
+                        skip.subject == "live discovery generation"
+                            && skip.reason.starts_with(
+                                "a retained process generation changed and was scheduled for conservative cleanup;",
+                            )
+                    })
+                    .map_or("enqueue witness unavailable", |skip| skip.reason.as_str());
+                bail!(
+                    "the named process generation changed during live discovery; {witness}; cancel_now={} mutation_stopped={}",
+                    self.cancellation_requested(),
+                    session.mutation_stopped(),
+                );
+            }
+            return Ok(BacklogOutcome {
+                changed: step.changed,
+                progressed: step.progressed,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        let mut additions = false;
+        let mut closure = PauseClosure::new(false);
+        let mut pending_views = PendingViewRetirements::new();
+        if self.terminal_journal.is_some() {
+            let before = self
+                .terminal_batch
+                .as_ref()
+                .map(|batch| (batch.len(), batch.complete));
+            if self
+                .terminal_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.complete)
+            {
+                // An incomplete journal owns its suffix. The supplied collector
+                // continues the actual Q/FIFO instead of waiting for the Engine
+                // backlog to become empty (which this journal itself prevents).
+                match self.collect_terminal_batch(session, collect)? {
+                    Ok(()) => {}
+                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                        Ok(incomplete) if incomplete.backlog || incomplete.capacity_blocked => {}
+                        Ok(incomplete) => return Err(incomplete.into()),
+                        Err(error) => return Err(error),
+                    },
+                }
+                return Ok(BacklogOutcome {
+                    changed: false,
+                    progressed: before
+                        != self
+                            .terminal_batch
+                            .as_ref()
+                            .map(|batch| (batch.len(), batch.complete)),
+                    pending: true,
+                });
+            }
+            let changed = self
+                .dispatch_terminal_batch(session, &mut additions, &mut pending_views, &mut closure)?
+                .unwrap_or(false);
+            if changed {
+                self.publish_batch_tail(true)?;
+            }
+            return Ok(BacklogOutcome {
+                changed,
+                progressed: changed
+                    || self.collected_finish_actions == Some(0)
+                    || before
+                        != self
+                            .terminal_batch
+                            .as_ref()
+                            .map(|batch| (batch.len(), batch.complete)),
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        self.take_frame_fresh_blocked();
+        if self.pending_discovery_records.is_empty() && !self.pending_leader_exit_views.is_empty() {
+            if self.collected_assessment_lap.clean < 2
+                && let Some(view) = self.next_collected_finish_assessment(transport_at_q)
+            {
+                self.settle_leader_exit_assessment(
+                    view,
+                    &mut pending_views,
+                    &mut additions,
+                    &mut closure,
+                );
+                return Ok(BacklogOutcome {
+                    changed: false,
+                    // A lap step is work; laps end (§1.5).
+                    progressed: true,
+                    pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+                });
+            }
+            if self.collected_assessment_lap.clean >= 2
+                && let Some(view) = self.pending_leader_exit_views.pop_first()
+            {
+                // R-26 N1 / OD-12: after two consecutive clean passes at Q,
+                // write one still-pending view off with the terminal rule: a
+                // counted link loss, no retirement, order entry cleared.
+                self.pending_leader_exit_order.remove(&view);
+                if self.counted_leader_exit_views.insert(view) {
+                    self.task_uprobe_link_losses = self.task_uprobe_link_losses.saturating_add(1);
+                }
+                return Ok(BacklogOutcome {
+                    changed: false,
+                    progressed: true,
+                    pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+                });
+            }
+            // Otherwise fall through to dispatch.
+        }
+        let before = self.pending_discovery_records.len();
+        let mut queued = self
+            .pending_discovery_records
+            .drain(..before.min(1))
+            .collect();
+        let suffix = self.pending_discovery_records.len();
+        let requested_before = self.collected_graph_requested;
+        let result = self.process_discovery_records(
+            session,
+            &mut queued,
+            &mut pending_views,
+            &mut additions,
+            collect,
+            &mut closure,
+        );
+        self.pending_discovery_records.extend(queued);
+        // Re-parked originals preceded the untouched suffix, even on error.
+        let returned = self.pending_discovery_records.len().saturating_sub(suffix);
+        if returned != 0 {
+            self.pending_discovery_records.rotate_right(returned);
+        }
+        let changed = result?;
+        if changed {
+            self.publish_batch_tail(true)?;
+        }
+        Ok(BacklogOutcome {
+            changed,
+            progressed: changed
+                || fresh != 0
+                || self.pending_discovery_records.len() < before
+                || (self.collected_graph_requested && !requested_before),
+            pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+        })
+    }
+
+    /// A settled native ticket owed a future ORDINARY admission frame. Finish
+    /// cancels only that scheduling hint; the original {pid, serial, owner,
+    /// exec binding} request and its existing pending/unserved disclosure stay
+    /// unchanged. This is neither a served/admitted credit nor a native receipt.
+    fn dispose_collected_finish_recovery_hint(&mut self) {
+        debug_assert!(self.pending_global_retirement.is_none());
+        self.global_retirement_frame_owed = false;
+        self.immediate_exec_recovery_frame = false;
+    }
+
+    fn next_collected_finish_assessment(&mut self, transport_at_q: bool) -> Option<ProcessViewId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let lap_ended = match self.collected_finish_assessment_after {
+            None => true,
+            Some(after) => self
+                .pending_leader_exit_views
+                .range((Excluded(after), Unbounded))
+                .next()
+                .is_none(),
+        };
+        if lap_ended {
+            if self.collected_finish_assessment_after.is_some() {
+                // A lap just ended: clean iff it queued nothing new and ran
+                // at Q throughout. Each call folds its transport into exactly
+                // the lap whose view it returns.
+                if !self.collected_assessment_lap.dirty && self.collected_assessment_lap.at_q {
+                    self.collected_assessment_lap.clean =
+                        self.collected_assessment_lap.clean.saturating_add(1);
+                } else {
+                    self.collected_assessment_lap.clean = 0;
+                }
+                if self.collected_assessment_lap.clean >= 2 {
+                    return None;
+                }
+            }
+            // Start the next (or first) lap.
+            self.collected_assessment_lap.dirty = false;
+            self.collected_assessment_lap.at_q = true;
+        }
+        self.collected_assessment_lap.at_q &= transport_at_q;
+        let next = self
+            .collected_finish_assessment_after
+            .and_then(|after| {
+                self.pending_leader_exit_views
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| self.pending_leader_exit_views.first().copied());
+        self.collected_finish_assessment_after = next;
+        next
+    }
+
+    /// Takes the frame's fresh-blocked flag for the scheduler: a set flag
+    /// schedules backlog service instead of a full sleep, then clears.
+    pub(crate) fn take_frame_fresh_blocked(&mut self) -> bool {
+        std::mem::replace(&mut self.frame_fresh_blocked, false)
+    }
+
+    /// Records a terminal drain stopping at the shared allowance with
+    /// terminal work unfinished: 4,096 items are held and unsettled while
+    /// the queue was never observed empty. The count is sticky evidence
+    /// and the strict lossless verdict must fail on it; the drain returns
+    /// without settling deferrals and never claims complete.
+    fn note_terminal_capacity_backlog(&mut self) {
+        self.terminal_capacity_backlog = self.terminal_capacity_backlog.saturating_add(1);
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss(
+            "terminal discovery drain",
+            "the terminal drain stopped at the shared discovery allowance with 4,096 items held unsettled and the queue never observed empty; terminal work is unfinished",
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_capacity_backlog_for_test(&self) -> u64 {
+        self.terminal_capacity_backlog
+    }
+
+    /// Records quiescence staging hitting the shared discovery allowance
+    /// with records still unread in the ring: at least one unit of terminal
+    /// work is unfinished. The count is an explicit lower bound — the
+    /// remainder stays unread, so it cannot be inventoried — and the strict
+    /// lossless verdict must fail on it.
+    pub(crate) fn note_quiesced_discovery_overflow(&mut self) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss(
+            "terminal discovery quiescence",
+            "quiescence staging reached the shared discovery allowance with at least one record still unread; terminal work is unfinished",
+        );
+    }
+
+    /// Notes the current held occupancy (pending plus terminal plus the
+    /// batch's in-flight records) into the diagnostic high-water mark.
+    fn note_discovery_held_high_water(&mut self, in_flight: usize) {
+        let held = self.discovery_held_len().saturating_add(in_flight);
+        self.discovery_held_high_water = self.discovery_held_high_water.max(held);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discovery_held_high_water_for_test(&self) -> usize {
+        self.discovery_held_high_water
+    }
+
+    /// One between-frames backlog opportunity: at most one 256-item
+    /// ordinary dispatch quantum from the retained FIFO (pending first,
+    /// then staged transfers plus fresh room) or one selected
+    /// pressure-service transaction. A backlog pass never rearms or
+    /// claims an owned pause, never touches the frame clock or counter,
+    /// never reads aggregate maps or renders, and never runs an ordinary
+    /// whole-scope tick. It reuses the frame's 200 ms work budget and
+    /// checkpoints, scoped to the opportunity.
+    pub(crate) fn service_backlog_quantum(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<BacklogOutcome> {
+        self.note_graph_inputs_mutated();
+        self.with_live_frame(|engine| engine.service_backlog_quantum_inner(session))
+    }
+
+    fn service_backlog_quantum_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<BacklogOutcome> {
+        if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
+            // Deferring mutation does not defer absolute producer-loss reads.
+            self.update_counter_snapshot(session)?;
+            let outcome = self
+                .poll_global_retirement_barrier(session)
+                .map(|(_, outcome)| outcome)
+                .unwrap_or(BacklogOutcome {
+                    changed: false,
+                    progressed: false,
+                    pending: true,
+                });
+            self.publish_batch_tail(false)?;
+            return Ok(outcome);
+        }
+        let passes_before = self.pressure_service_passes;
+        let staged_before = session.staged_discovery_len();
+        let retained_before = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(staged_before);
+        // The frame's fresh-blocked latch is one backlog opportunity, not
+        // a standing order: take it now so a later pending check reads
+        // the queues, and the pass below re-latches nothing. A pass that
+        // re-armed on every non-empty pull would zero-sleep against a
+        // sustained producer instead of returning to the readiness wait.
+        let fresh_was_blocked = self.take_frame_fresh_blocked();
+        // Retained FIFO first: pending records, then staged transfers
+        // plus fresh room. Nothing to do is a quiet outcome, not work.
+        if !fresh_was_blocked
+            && !self.pressure_rotation_pending
+            && self.pending_discovery_records.is_empty()
+            && staged_before == 0
+        {
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: false,
+                pending: false,
+            });
+        }
+        let mut malformed = 0u64;
+        // Work charges accrue only at an item's first accounting boundary:
+        // a pending-take replay was charged by its original batch, so only
+        // a fresh pull (staged transfers plus new ring reads, neither
+        // charged before) charges here.
+        let mut fresh_records = 0usize;
+        let queued: Vec<QueuedDiscoveryRecord> = if self.pending_discovery_records.is_empty() {
+            // Staged transfers plus fresh room: staged pops move their
+            // permits without reserving, and only fresh ring reads
+            // consume the shared allowance. A latch-only pass pulls
+            // fresh room the frame could not reach; an empty pull is a
+            // quiet pass, not a re-latch.
+            let budget = Cell::new(self.shared_allowance_remaining(session, 0));
+            // Never-stop: a transport failure applies the pulled prefix
+            // with a gap instead of aborting the backlog pass.
+            let (pulled, pulled_malformed) = match Self::collect_discovery_records_budgeted(
+                session,
+                &budget,
+                LIVE_DISCOVERY_DRAIN_QUANTUM,
+            ) {
+                Ok((pulled, pulled_malformed, _)) => (pulled, pulled_malformed),
+                Err(error) => {
+                    let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                    let pulled = incomplete.records;
+                    let pulled_malformed = incomplete.malformed;
+                    self.mark_partial(
+                            "live discovery transport",
+                            &format!(
+                                "discovery transport unavailable: dequeue failed after {} records ({} malformed); prefix applied",
+                                pulled.len(),
+                                pulled_malformed
+                            ),
+                        );
+                    (pulled, pulled_malformed)
+                }
+            };
+            malformed = pulled_malformed;
+            fresh_records = pulled.len();
+            pulled
+                .into_iter()
+                .map(|record| QueuedDiscoveryRecord {
+                    record,
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                })
+                .collect()
+        } else {
+            let take = self
+                .pending_discovery_records
+                .len()
+                .min(LIVE_DISCOVERY_DRAIN_QUANTUM);
+            self.pending_discovery_records.drain(..take).collect()
+        };
+        self.charge_discovery_drain(fresh_records, malformed);
+        // A backlog pass is never pause-owned: nothing here was handed to
+        // a pause stop, and no stale pause-held set survives into it.
+        self.held_records = BTreeSet::new();
+        self.record_malformed_discovery(malformed);
+        let rest_len = self.pending_discovery_records.len();
+        let mut queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session))
+        {
+            Ok(records) => records,
+            Err((error, records)) => {
+                // Counter authority failed: the quantum waits at the head
+                // of the queue, in order, for the next opportunity.
+                records
+                    .into_iter()
+                    .rev()
+                    .for_each(|record| self.pending_discovery_records.insert(0, record));
+                return Err(error);
+            }
+        };
+        let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
+        let mut deferred_exits = Vec::new();
+        if self.admits_generations() {
+            deferred_exits.extend(queued.extract_if(.., |queued| {
+                let record = &queued.record;
+                // 6.14 Option A: kind 7 defers like kind 6, so
+                // admission and coalescing see it in the same pass.
+                matches!(
+                    record.kind,
+                    DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                ) && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
+            }));
+        }
+        // The deferred exits above stay owned beside the queue while the
+        // nested pulls run: they count against the budget they share.
+        let nested_budget = Cell::new(self.shared_allowance_remaining(
+            session,
+            queued.len().saturating_add(deferred_exits.len()),
+        ));
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
+        let mut additions_allowed = true;
+        let mut closure = PauseClosure::new(malformed == 0);
+        let mut pending_views = PendingViewRetirements::new();
+        let leader_exit_assessments = self.pending_leader_exit_views.clone();
+        self.settle_leader_exit_assessments(
+            &leader_exit_assessments,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut closure,
+        );
+        let mut changed = self.process_discovery_records(
+            session,
+            &mut queued,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut collect,
+            &mut closure,
+        )?;
+        // Leftovers rejoin ahead of the unserviced rest (they were pulled
+        // earlier), except behind a held prefix the rotation restores
+        // below: the diverted stash stays adjacent to its parked prefix
+        // (episode atomicity, as in frames) with the rest after it.
+        let mut front_inserted = 0usize;
+        if self.pressure_service_passes != passes_before {
+            // One selected transaction per opportunity: the deferred tail
+            // waits for the next one instead of running a second pass.
+            queued.extend(deferred_exits);
+            if self.pressure_rotation_pending || self.frame_deferred {
+                self.pending_discovery_records.extend(queued);
+            } else {
+                front_inserted = queued.len();
+                queued
+                    .into_iter()
+                    .rev()
+                    .for_each(|record| self.pending_discovery_records.insert(0, record));
+            }
+        } else {
+            queued.extend(deferred_exits);
+            if !queued.is_empty() {
+                changed |= self.process_discovery_records(
+                    session,
+                    &mut queued,
+                    &mut pending_views,
+                    &mut additions_allowed,
+                    &mut collect,
+                    &mut closure,
+                )?;
+            }
+            front_inserted = queued.len();
+            queued
+                .into_iter()
+                .rev()
+                .for_each(|record| self.pending_discovery_records.insert(0, record));
+        }
+        // A re-park or a frame deferral appended behind the rest of the
+        // queue; restore FIFO order with the held prefix first.
+        if self.pressure_rotation_pending
+            || self.frame_deferred
+            || self.pending_global_retirement.is_some()
+        {
+            let mut held = self
+                .pending_discovery_records
+                .split_off(rest_len.saturating_add(front_inserted));
+            held.extend(std::mem::take(&mut self.pending_discovery_records));
+            self.pending_discovery_records = held;
+        }
+        // Publish exactly like a frame batch: an accepted plan change
+        // resyncs consumers synchronously; a quiet pass only bumps the
+        // tail-skip counter. Retirement intents queued above persist in
+        // engine state for the next frame's ordinary tick — the pass
+        // yields instead of running it.
+        self.publish_batch_tail(changed)?;
+        // Forward movement only: fresh acquisition, retained shrinkage
+        // through dispatch, a selected attempt, or a state change. A take
+        // or pull shed back whole shrinks nothing and acquires nothing
+        // settled, so it correctly reports no progress.
+        let retained_after = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(session.staged_discovery_len());
+        let progressed = changed
+            || self.pressure_service_passes != passes_before
+            || fresh_records != 0
+            || malformed != 0
+            || retained_after < retained_before;
+        Ok(BacklogOutcome {
+            changed,
+            progressed,
+            pending: self.discovery_backlog_pending(session.staged_discovery_len()),
+        })
     }
 
     pub(crate) fn apply_discovery_batch(
@@ -16473,7 +29112,16 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
-        let mut collect = Self::collect_discovery_records;
+        self.note_graph_inputs_mutated();
+        // Every nested pull in this batch shares one budget seeded from
+        // the shared allowance beside the batch-local records.
+        let nested_budget =
+            Cell::new(self.shared_allowance_remaining(
+                session,
+                records.len().saturating_add(malformed as usize),
+            ));
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
         self.apply_discovery_batch_with(
             session,
             records,
@@ -16497,6 +29145,8 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         deadline: Option<u64>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.note_graph_inputs_mutated();
+        self.continuity_deferred = false;
         self.budget.set_deadline(deadline);
         let result = self.apply_discovery_batch_inner(
             session,
@@ -16547,21 +29197,36 @@ impl Engine {
                 return Err(error);
             }
         };
+        if self.poll_global_retirement_barrier(session).is_some() {
+            self.pending_discovery_records = queued;
+            self.held_records.clear();
+            self.publish_batch_tail(false)?;
+            return Ok(DiscoveryBatchOutcome {
+                changed: false,
+                required_complete: false,
+            });
+        }
+        // Only an actual ordinary frame can discharge the owed frame; a
+        // backlog poll and consuming the run hint cannot make it disappear.
+        self.global_retirement_frame_owed = false;
         let fallback_due: BTreeSet<_> = self.pending_loader_scans.keys().copied().collect();
+        let loader_arm_due = self.pending_loader_arm_scans.clone();
         let mut records = queued;
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
-            records.retain(|queued| {
+            // Move-only: the deferred exits move out in encounter order;
+            // both sides keep their original relative order.
+            // 6.14 Option A: kind 7 defers like kind 6, so admission
+            // and coalescing see it in the same pass.
+            deferred_exits.extend(records.extract_if(.., |queued| {
                 let record = &queued.record;
-                let defer = record.kind == DISCOVERY_KIND_LEADER_EXIT
-                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32));
-                if defer {
-                    deferred_exits.push(queued.clone());
-                }
-                !defer
-            });
+                matches!(
+                    record.kind,
+                    DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                ) && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
+            }));
         }
 
         let mut additions_allowed = additions_allowed;
@@ -16583,6 +29248,14 @@ impl Engine {
             &mut closure,
         )?;
         records.extend(deferred_exits);
+        if self.pending_global_retirement.is_some() {
+            self.pending_discovery_records.append(&mut records);
+            self.publish_batch_tail(changed)?;
+            return Ok(DiscoveryBatchOutcome {
+                changed,
+                required_complete: false,
+            });
+        }
         if terminal_dispatch
             && let Some(terminal_changed) = self.continue_terminal_batch(
                 session,
@@ -16614,11 +29287,32 @@ impl Engine {
                 &mut closure,
             )?;
         }
+        if self.frame_deadline_ns.is_some()
+            && !terminal_dispatch
+            && !self.pause_owned_batch
+            && matches!(self.scope, Scope::Pid(_))
+        {
+            let catchup = self.service_loader_arm_scans(
+                loader_arm_due,
+                session,
+                &mut additions_allowed,
+                &mut pending_views,
+                !records.is_empty(),
+            )?;
+            changed |= catchup.changed();
+            if !catchup.required_complete() {
+                closure.fail();
+            }
+        }
         // A frame that deferred records runs no inventory pass: the next
-        // frame dispatches them first, then refreshes (H-1).
+        // frame dispatches them first, then refreshes (H-1). A head
+        // episode awaiting another rotation opportunity likewise runs no
+        // ordinary whole-scope tick behind its parked prefix: the next
+        // opportunity services the next snapshot entry first.
         if self.pending_retirements.is_empty()
             && self.pending_rejected_keys.is_empty()
             && !self.frame_deferred
+            && !self.pressure_rotation_pending
         {
             let mut tick_now = crate::attach::monotonic_ns;
             changed |= self.refresh_inventory(
@@ -16669,6 +29363,614 @@ impl Engine {
         &self.discovery
     }
 
+    /// The capture's `--exclude-module` records and inputs, for inventory
+    /// presentation (which renders from the coordinator, not from this
+    /// engine's projected `DiscoveryEvidence`).
+    pub(crate) fn budget_excluded_snapshot(
+        &self,
+    ) -> (
+        &[crate::discovery::scan::ExcludedRecord],
+        &[std::path::PathBuf],
+    ) {
+        (self.budget.excluded(), self.budget.excludes())
+    }
+
+    /// Cancels every pre-arm watch at scope end (packet 6.13, R2-D1-7):
+    /// each open watch closes with `until_ns` and `ended_by: scope_end`,
+    /// exactly once. A natural close preserves an earned `armed_idle`
+    /// claim with its closed bounds; every other watch reads `ended`.
+    pub fn end_prearm_watches(&mut self) {
+        self.end_prearm_watches_at(
+            crate::render::PrearmWatchEnd::ScopeEnd,
+            crate::attach::monotonic_ns(),
+        );
+    }
+
+    /// Ends every pre-arm watch's tracking for an explicit cause, exactly
+    /// once per watch, and re-renders the discovery records.
+    pub(crate) fn end_prearm_watches_at(
+        &mut self,
+        cause: crate::render::PrearmWatchEnd,
+        now: Option<u64>,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        self.prearm.end_all(cause, now);
+        self.retire_prematurely_ended_watch_slots();
+        self.rerender_prearm_watches();
+    }
+
+    /// Re-runs per-object held-fd checks on pre-arm watched objects and
+    /// publishes fresh `pinned_object_changed` brackets (R2-D1-8). Returns
+    /// the newly changed object ids (sticky: already-reported objects are
+    /// not returned again). An `fstat` failure records nothing here — the
+    /// attach path's global check is the backstop that surfaces it.
+    pub fn refresh_prearm_object_changes(&mut self) -> Vec<PinnedObjectId> {
+        self.refresh_prearm_object_changes_inner(false)
+    }
+
+    /// Held-FD change poll shared by mid-capture refreshes and terminal
+    /// close. Under an unknown terminal stop (`unknown_stop`) a newly
+    /// detected change still ends the watch with its exact bracket, but
+    /// the coverage end stays unknown: the detection ran in the blind
+    /// tail after the stop (packet 6.13 round-4, re-audit finding 1).
+    /// Watches already closed before the stop keep their first end either
+    /// way.
+    fn refresh_prearm_object_changes_inner(&mut self, unknown_stop: bool) -> Vec<PinnedObjectId> {
+        let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
+        let mut newly = Vec::new();
+        for id in ids {
+            match self.pinned.check_object_unchanged(id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let bracket = self.pinned.change_bracket(id);
+                    if let Some(watch) = self.prearm.get_mut(id) {
+                        let was_ended = watch.is_ended();
+                        match bracket {
+                            Some(bracket) if unknown_stop => {
+                                watch.note_object_changed_unknown_stop(bracket)
+                            }
+                            Some(bracket) => watch.note_object_changed(bracket),
+                            // Detected but the clock never yielded the
+                            // bounds: the end is still disclosed, only its
+                            // instants are not.
+                            None => {
+                                // Under an unknown stop the terminal
+                                // detection ran in the blind tail: disclose
+                                // the end, never a bound sampled past it.
+                                let bound = if unknown_stop {
+                                    None
+                                } else {
+                                    crate::attach::monotonic_ns()
+                                };
+                                watch.end(crate::render::PrearmWatchEnd::ObjectChanged, bound)
+                            }
+                        }
+                        if !was_ended {
+                            newly.push(id);
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if !newly.is_empty() {
+            self.retire_prematurely_ended_watch_slots();
+            self.rerender_prearm_watches();
+        }
+        newly
+    }
+
+    /// Deactivates the plan slots of prematurely ended watches
+    /// (`object_changed`, `health_loss`, `scope_uncertain`, `attached`):
+    /// no probe for them attaches after their `until_ns`, and the ordinary
+    /// `is_active` machinery agrees. Natural closes (`scope_end`, `stop`)
+    /// end the capture itself, so their slots stay untouched.
+    fn retire_prematurely_ended_watch_slots(&mut self) {
+        use crate::render::PrearmWatchEnd::*;
+        let premature: BTreeSet<plan::AttachKey> = self
+            .prearm
+            .watches()
+            .values()
+            .filter(|watch| {
+                matches!(
+                    watch.ended_by(),
+                    Some(ObjectChanged) | Some(HealthLoss) | Some(ScopeUncertain) | Some(Attached)
+                )
+            })
+            .flat_map(|watch| watch.declared().iter().copied())
+            .collect();
+        let indices: Vec<u32> = premature
+            .iter()
+            .filter_map(|key| self.plan.slot_index_for_key(*key))
+            .collect();
+        if !indices.is_empty() {
+            self.plan_rebuild_stable = false;
+        }
+        for index in indices {
+            self.plan.deactivate(index);
+        }
+    }
+
+    /// Re-renders current watch intervals into the discovery records after
+    /// a transition. Records whose modules left the plan keep their last
+    /// rendered state; attach keys are never touched here (assembly owns
+    /// them).
+    fn rerender_prearm_watches(&mut self) {
+        let objects: BTreeMap<plan::ModuleId, PinnedObjectId> = self
+            .plan
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        for record in &mut self.discovery.modules {
+            if let Some(object) = objects.get(&record.id) {
+                record.watch = self.prearm.get(*object).map(|watch| watch.render());
+            }
+        }
+    }
+
+    /// Records the capture's scope start (the `run` path overrides the
+    /// discover-entry instant with its pre-spawn instant).
+    pub(crate) fn set_scope_start_ns(&mut self, scope_start_ns: Option<u64>) {
+        self.prearm.set_scope_start_ns(scope_start_ns);
+    }
+
+    /// Whether this capture holds any pre-arm watch (packet 6.13): only
+    /// `watch` transitions need one — generic attach/window assembly runs
+    /// with or without watches.
+    pub(crate) fn has_prearm_watches(&self) -> bool {
+        !self.prearm.is_empty()
+    }
+
+    /// Evaluates every pre-arm watch against current link facts: unarmed
+    /// watches arm when their declared set links, armed watches verify
+    /// their links stay up, and watched objects are change-polled. The
+    /// capture-end path drives this; mid-capture tick driving is a
+    /// precision follow-up (end evaluation is conservative-correct:
+    /// stamps are historical facts, and unverified links truncate at the
+    /// arm instant).
+    #[cfg(test)]
+    pub(crate) fn refresh_prearm_liveness(
+        &mut self,
+        session: &impl EngineSession,
+        now: Option<u64>,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
+        for id in ids {
+            let links = self.declared_links(id, session);
+            if let Some(watch) = self.prearm.get_mut(id) {
+                watch.evaluate_arm(&links);
+                watch.verify_links(&links, now);
+            }
+        }
+        self.refresh_prearm_object_changes();
+        self.rerender_prearm_watches();
+    }
+
+    /// Health-gated liveness refresh for terminal close (packet 6.13
+    /// round-2, F2): watches whose terminal health is already dirty verify
+    /// link presence without advancing `last_verified_ns`, so a later
+    /// health truncation closes at the last proven-clean bound instead of
+    /// riding a link-only snapshot to the stop. Under an unknown stop
+    /// (`now` is `None`) a newly detected object change still ends its
+    /// watch with the exact bracket, but the coverage end stays unknown
+    /// (round-4, re-audit finding 1).
+    fn refresh_prearm_liveness_gated(
+        &mut self,
+        session: &impl EngineSession,
+        now: Option<u64>,
+        health_clean_by_object: &BTreeMap<PinnedObjectId, bool>,
+        global_clean: bool,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
+        for id in ids {
+            let links = self.declared_links(id, session);
+            if let Some(watch) = self.prearm.get_mut(id) {
+                watch.evaluate_arm(&links);
+                let clean = health_clean_by_object
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(global_clean);
+                watch.verify_links(&links, if clean { now } else { None });
+            }
+        }
+        self.refresh_prearm_object_changes_inner(now.is_none());
+        self.rerender_prearm_watches();
+    }
+
+    /// Builds R2-D1-6 pause-gate proofs for pre-armed objects whose whole
+    /// `[hold_start_ns, declared-set attach]` window the barrier covered.
+    /// The attach instant applies the same rule as assembly (every declared
+    /// member's real stamp, never a subset maximum); the capture must own
+    /// its child, the hold must be continuous, clocked on both bounds,
+    /// sane, and reach the attach instant, and every declared first-stamp
+    /// must precede the barrier release — the child may run its command
+    /// before the first *verified* pause stop, so a post-release stamp is
+    /// outside any proven hold. Anything else emits no proof, and assembly still
+    /// exact-matches each emitted interval against the would-be window, so
+    /// a mismatched hold fails closed there too.
+    fn pause_gate_exactness_proofs(
+        watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
+        plan: &plan::AttachPlan,
+        stamps: &BTreeMap<u32, u64>,
+        hold: Option<crate::discovery::pause::PauseGateHold>,
+        owned_run: bool,
+        release_ns: Option<u64>,
+    ) -> BTreeMap<PinnedObjectId, crate::prearm_module::ExactnessProof> {
+        if !owned_run {
+            return BTreeMap::new();
+        }
+        let Some(release) = release_ns else {
+            return BTreeMap::new();
+        };
+        let Some(hold) = hold.filter(|hold| hold.continuous) else {
+            return BTreeMap::new();
+        };
+        let (Some(start), Some(end)) = (hold.start_ns, hold.end_ns) else {
+            return BTreeMap::new();
+        };
+        if start > end {
+            return BTreeMap::new();
+        }
+        let mut proofs = BTreeMap::new();
+        for (object, watch) in watches {
+            let mut latest: Option<u64> = None;
+            for key in watch.declared() {
+                let Some(stamped_at) = plan
+                    .slot_index_for_key(*key)
+                    .and_then(|index| stamps.get(&index).copied())
+                else {
+                    latest = None;
+                    break;
+                };
+                latest = Some(latest.map_or(stamped_at, |known| known.max(stamped_at)));
+            }
+            let Some(attached_at) = latest else {
+                continue;
+            };
+            if attached_at > release {
+                continue;
+            }
+            if end >= attached_at {
+                proofs.insert(
+                    *object,
+                    crate::prearm_module::ExactnessProof {
+                        interval_start_ns: start,
+                        interval_end_ns: attached_at,
+                        kind: crate::prearm_module::ExactnessProofKind::PauseGateHeld,
+                    },
+                );
+            }
+        }
+        proofs
+    }
+
+    /// Ordering-evidence proofs (WU-13 P-C phase 2, §6.2): per-object
+    /// OrderingEvidence when the finalized witness verdict is Clear and
+    /// conditions 3-5 (ordering, pin identity, stamps) all agree.
+    /// Anything else yields no proof (today's window stays).
+    fn ordering_evidence_exactness_proofs(
+        watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
+        plan: &plan::AttachPlan,
+        stamps: &BTreeMap<u32, u64>,
+        verdict: &Option<BTreeMap<PinnedObjectId, WitnessProof>>,
+        scope_start: Option<u64>,
+        pins: &PinnedObjects,
+    ) -> BTreeMap<PinnedObjectId, crate::prearm_module::ExactnessProof> {
+        let mut proofs = BTreeMap::new();
+        let (Some(verdict), Some(scope_start)) = (verdict.as_ref(), scope_start) else {
+            return proofs;
+        };
+        for (object, watch) in watches {
+            let Some(input) = verdict.get(object) else {
+                continue;
+            };
+            if input.verdict != crate::attach::prearm_witness::FileVerdict::Clear {
+                continue;
+            }
+            // Condition 3: active strictly before the scope start, and the
+            // engine's scope start still equals the recorded stamp.
+            if input.active_ns >= scope_start {
+                continue;
+            }
+            if input.scope_start_ns != Some(scope_start) {
+                continue;
+            }
+            if !Self::witness_pin_matches(input.fd_dev, input.fd_ino, *object, pins) {
+                continue;
+            }
+            // Declared-set attached_at, the same rule as `assemble`.
+            let mut latest: Option<u64> = None;
+            for key in watch.declared() {
+                let Some(stamped_at) = plan
+                    .slot_index_for_key(*key)
+                    .and_then(|index| stamps.get(&index).copied())
+                else {
+                    latest = None;
+                    break;
+                };
+                latest = Some(latest.map_or(stamped_at, |known| known.max(stamped_at)));
+            }
+            let Some(attached_at) = latest else {
+                continue;
+            };
+            if input.walk_started_ns <= attached_at {
+                continue;
+            }
+            proofs.insert(
+                *object,
+                crate::prearm_module::ExactnessProof {
+                    interval_start_ns: scope_start,
+                    interval_end_ns: attached_at,
+                    kind: crate::prearm_module::ExactnessProofKind::OrderingEvidence,
+                },
+            );
+        }
+        proofs
+    }
+
+    /// Condition 4: the witness fd's `(st_dev, st_ino)` equals the pin's
+    /// own held fd identity. Same-domain by construction: raw keys are
+    /// maps-visible identities, which live in a different device domain
+    /// than fd stats on split filesystems (btrfs: fd `0:37` vs maps
+    /// `00:23` for the same file), so comparing the witness fd against
+    /// raw keys would refuse every proof there.
+    fn witness_pin_matches(
+        fd_dev: u64,
+        fd_ino: u64,
+        object: PinnedObjectId,
+        pins: &PinnedObjects,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        pins.file_for(object).is_some_and(|file| {
+            file.metadata()
+                .is_ok_and(|meta| meta.dev() == fd_dev && meta.ino() == fd_ino)
+        })
+    }
+
+    /// Finalizes the live witness after a successful start (§6.2): the
+    /// driver verdict's slots key to watched objects by pin identity.
+    /// Owned `run` sessions drop the witness without a verdict (inert);
+    /// no live witness (or a dropped one) is a no-op.
+    fn finalize_prearm_witness(&mut self, owned_run: bool) {
+        let live = self.prearm_witness_live.take();
+        let Some(live) = live else {
+            return;
+        };
+        let Some(verdict) = live.finalize(owned_run) else {
+            return;
+        };
+        self.prearm_witness = Some(Self::map_verdict_slots_to_objects(
+            self.prearm.watches(),
+            &self.pinned,
+            &verdict,
+        ));
+    }
+
+    /// Keys a driver verdict's input-ordered slots to watched objects by
+    /// pin identity (condition 4): a slot names every object whose pin's
+    /// held fd has the witness fd's `(st_dev, st_ino)`. Identities no
+    /// object pins are dropped, never attributed.
+    fn map_verdict_slots_to_objects(
+        watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
+        pins: &PinnedObjects,
+        verdict: &crate::attach::prearm_witness::WitnessVerdict,
+    ) -> BTreeMap<PinnedObjectId, WitnessProof> {
+        let mut map = BTreeMap::new();
+        for slot in &verdict.slots {
+            for object in watches.keys() {
+                if Self::witness_pin_matches(slot.fd_dev, slot.fd_ino, *object, pins) {
+                    map.insert(
+                        *object,
+                        WitnessProof {
+                            verdict: slot.verdict,
+                            active_ns: verdict.active_ns,
+                            scope_start_ns: verdict.scope_start_ns,
+                            walk_started_ns: verdict.walk_started_ns,
+                            fd_dev: slot.fd_dev,
+                            fd_ino: slot.fd_ino,
+                        },
+                    );
+                }
+            }
+        }
+        map
+    }
+
+    /// Closes the capture for every pre-arm watch (packet 6.13, R2-D1-4/5/7):
+    /// final link evaluation, idle qualification over the closed interval
+    /// (armed + clean terminal observation/scope/link health + no observed
+    /// use), the end for `cause`, and the evidence-assembly merge of attach
+    /// keys from real session stamps. `used` names modules with observed
+    /// calls; `attach_failures` are the session's `(slot, reason)` failures
+    /// for per-module health; `kernel`/`malformed_records` are the terminal
+    /// call-observation health the run path sampled beside the reports.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_prearm_capture(
+        &mut self,
+        session: &impl EngineSession,
+        cause: crate::render::PrearmWatchEnd,
+        used: &BTreeSet<plan::ModuleId>,
+        attach_failures: &[(u32, String)],
+        now: Option<u64>,
+        kernel: &crate::metrics::KernelEvidence,
+        malformed_records: u64,
+        hold: Option<crate::discovery::pause::PauseGateHold>,
+        owned_run: bool,
+        release_ns: Option<u64>,
+    ) {
+        // Generic attach/window assembly is independent of the optional
+        // pre-arm watch transitions below: a capture without pre-arm
+        // watches still gets its late-discovery windows assembled.
+        if !self.prearm.is_empty() {
+            // F2: terminal health is computed before any link verification,
+            // so a final link-only snapshot cannot advance the proven-clean
+            // bound when the counters already show loss.
+            let failed_slots: BTreeSet<u32> =
+                attach_failures.iter().map(|(slot, _)| *slot).collect();
+            let link_gap = self.physical_gap.open
+                || self.physical_gap.unknown
+                || self.physical_gap.episodes > 0
+                || self.task_uprobe_link_losses > 0
+                || self.multi_rebuild_gaps > 0;
+            let objects: BTreeMap<plan::ModuleId, PinnedObjectId> = self
+                .plan
+                .modules
+                .iter()
+                .map(|module| (module.id, module.object))
+                .collect();
+            let mut module_of: BTreeMap<PinnedObjectId, plan::ModuleId> = BTreeMap::new();
+            for (id, object) in &objects {
+                module_of.insert(*object, *id);
+            }
+            let mut health_by_object: BTreeMap<
+                PinnedObjectId,
+                (crate::prearm_module::PrearmHealth, bool),
+            > = BTreeMap::new();
+            for (object, module) in &module_of {
+                let own_failed = self.plan.slots.iter().any(|slot| {
+                    slot.module_ids.contains(module) && failed_slots.contains(&slot.index)
+                });
+                let health = crate::prearm_module::PrearmHealth {
+                    discovery_ring_loss: self.counter_snapshot.ring_loss,
+                    discovery_state_failures: self.counter_snapshot.export_state_failures,
+                    discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+                    discovery_truncated: self.discovery_truncated,
+                    malformed_discovery: self.malformed_discovery,
+                    discovery_abi_refusals: self.counter_snapshot.abi_refusals,
+                    kernel: *kernel,
+                    malformed_records,
+                    link_gap,
+                    own_attach_failures: own_failed,
+                };
+                let health_clean = crate::prearm_module::idle_health_clean(&health);
+                health_by_object.insert(*object, (health, health_clean));
+            }
+            let global_health = crate::prearm_module::PrearmHealth {
+                discovery_ring_loss: self.counter_snapshot.ring_loss,
+                discovery_state_failures: self.counter_snapshot.export_state_failures,
+                discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+                discovery_truncated: self.discovery_truncated,
+                malformed_discovery: self.malformed_discovery,
+                discovery_abi_refusals: self.counter_snapshot.abi_refusals,
+                kernel: *kernel,
+                malformed_records,
+                link_gap,
+                own_attach_failures: false,
+            };
+            let global_clean = crate::prearm_module::idle_health_clean(&global_health);
+            let gate: BTreeMap<PinnedObjectId, bool> = health_by_object
+                .iter()
+                .map(|(object, (_, clean))| (*object, *clean))
+                .collect();
+            self.refresh_prearm_liveness_gated(session, now, &gate, global_clean);
+            for (object, module) in &module_of {
+                let (health, health_clean) = &health_by_object[object];
+                if let Some(watch) = self.prearm.get_mut(*object) {
+                    watch.evaluate_idle(used.contains(module), *health_clean);
+                    // A health-dirty armed watch truncates at its last
+                    // proven-clean bound instead of riding to the natural end.
+                    if !health_clean
+                        && watch.render().state == crate::render::PrearmWatchState::Armed
+                    {
+                        watch.end(crate::prearm_module::prearm_loss_cause(health), now);
+                    }
+                }
+            }
+            self.prearm.end_all(cause, now);
+            // F3: a change detected after the stop must not extend the
+            // published bound past it.
+            self.prearm.clamp_all_to_stop(now);
+            self.rerender_prearm_watches();
+        }
+        let stamps: BTreeMap<u32, u64> = self
+            .plan
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                session
+                    .slot_attached_at(slot.index)
+                    .map(|stamp| (slot.index, stamp))
+            })
+            .collect();
+        // R2-D1-6 proofs behind explicitly empty windows: the pause-gate
+        // producer for owned `run` holds; later producers extend this map.
+        let mut proofs = BTreeMap::new();
+        proofs.extend(Self::pause_gate_exactness_proofs(
+            self.prearm.watches(),
+            &self.plan,
+            &stamps,
+            hold,
+            owned_run,
+            release_ns,
+        ));
+        // Owned `run` sessions never see ordering proofs, even with a
+        // planted verdict: the witness is dropped at finalize (§3 guard),
+        // and the call site withholds the verdict independently.
+        let verdict = if owned_run {
+            &None
+        } else {
+            &self.prearm_witness
+        };
+        proofs.extend(Self::ordering_evidence_exactness_proofs(
+            self.prearm.watches(),
+            &self.plan,
+            &stamps,
+            verdict,
+            self.prearm.scope_start_ns(),
+            &self.pinned,
+        ));
+        self.prearm
+            .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);
+        if !self.prearm.is_empty() {
+            // Retire after assembly: deactivation unresolves declared keys,
+            // and the stamps are historical facts the assembly must still read.
+            self.retire_prematurely_ended_watch_slots();
+        }
+    }
+
+    /// Current link facts for one watch's declared set: a key counts as
+    /// linked only through an active plan slot with a live session link.
+    fn declared_links(
+        &self,
+        id: PinnedObjectId,
+        session: &impl EngineSession,
+    ) -> Vec<crate::prearm_module::DeclaredLink> {
+        self.prearm
+            .get(id)
+            .map(|watch| {
+                watch
+                    .declared()
+                    .iter()
+                    .map(|key| {
+                        let index = self.plan.slot_index_for_key(*key);
+                        let active = index.is_some_and(|index| self.plan.is_active(index));
+                        let linked =
+                            active && index.is_some_and(|index| session.has_slot_link(index));
+                        let stamped_at = if active {
+                            index.and_then(|index| session.slot_attached_at(index))
+                        } else {
+                            None
+                        };
+                        crate::prearm_module::DeclaredLink {
+                            key: *key,
+                            linked,
+                            stamped_at,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Per-stage wall-time accumulation (Phase 2 measurement API): totals,
     /// invocation counts, and the longest indivisible operation.
     pub fn stage_timings(&self) -> &crate::timing::StageTimings {
@@ -16694,10 +29996,11 @@ impl Engine {
         for seen in self
             .refresh_requested
             .values()
-            .chain(self.newcomer_first_seen.values())
+            .map(|request| request.first_seen_ns)
+            .chain(self.newcomer_first_seen.values().copied())
             .flatten()
         {
-            let age = newcomer_age_ms(Some(*seen), now_ns);
+            let age = newcomer_age_ms(Some(seen), now_ns);
             oldest = match (oldest, age) {
                 (Some(known), Some(age)) => Some(known.max(age)),
                 (None, age) => age,
@@ -16717,6 +30020,74 @@ impl Engine {
     /// Loader-arm attempts driven by inventory.
     pub fn loader_arms(&self) -> u64 {
         self.loader_arms
+    }
+
+    /// A bounded snapshot of committed hooks backed by this Session's exact
+    /// link and the current retained loader. It proves no loader-hit timing.
+    pub(crate) fn active_loader_hook_count(&mut self, session: &dyn EngineSession) -> usize {
+        let contexts: Vec<_> = self
+            .loader_registry
+            .attached_contexts()
+            .map(|(id, _)| id)
+            .collect();
+        let mut count = 0;
+        for id in contexts {
+            let context = self
+                .loader_registry
+                .context(id)
+                .expect("a retained attached context");
+            let spec = context.spec.clone();
+            let cookie = context.cookie;
+            let Some(position) = self.views.iter().position(|view| view.id() == spec.view) else {
+                continue;
+            };
+            if self.retirement_intents.contains_key(&spec.view)
+                || !self.views[position].still_the_same()
+                || !self
+                    .pinned
+                    .view_claims(spec.view)
+                    .is_some_and(|claims| claims.pins.contains(&spec.loader))
+                || !self.pinned.object_unchanged(spec.loader).unwrap_or(false)
+                || !session.has_dynamic_loader(id, spec.loader, spec.hook.file_offset, cookie)
+            {
+                continue;
+            }
+            let Ok(Some(locator)) = Self::loader_locator(&self.views[position], &mut self.budget)
+            else {
+                continue;
+            };
+            let pin_key = self.pinned.summary(spec.loader).map(|loader| loader.key);
+            let loader_file = self.pinned.file_for(spec.loader);
+            let keys_agree = match (pin_key, loader_file) {
+                (Some(pin_key), Some(file)) => loader_pin_matches_locator(
+                    pin_key,
+                    locator.authority.loader_key,
+                    file,
+                    &mut self.budget,
+                    &KernelSelfMappingProbe,
+                ),
+                _ => false,
+            };
+            let valid = keys_agree
+                && loader_file.is_some_and(|file| {
+                    FileSnapshot::read(file).ok().as_ref()
+                        == Some(&locator.authority.interpreter_file)
+                })
+                && unique_mapping_for_offset(&locator.authority.loader_maps, spec.hook.file_offset)
+                    .is_ok_and(|current| {
+                        spec.mapping
+                            .as_ref()
+                            .is_none_or(|expected| current == *expected)
+                    });
+            // Agreeing current snapshots cannot replace the original retained pin.
+            if valid
+                && self.views[position].still_the_same()
+                && self.pinned.object_unchanged(spec.loader).unwrap_or(false)
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Batch-tail publications executed vs skipped as provably redundant.
@@ -16740,12 +30111,20 @@ impl Engine {
         self.counters.noise.clear();
     }
 
+    pub(crate) fn retain_return_probe_admission(
+        &mut self,
+        admission: crate::uretprobe_hazard::ReturnProbeAdmission,
+    ) {
+        self.return_probe_admission = Some(admission);
+    }
+
     pub fn start_session(
         &mut self,
         policy: CapturePolicy,
         ring_bytes: Option<u32>,
         backend: BackendSelection,
     ) -> Result<Session> {
+        self.note_graph_inputs_mutated();
         self.start_session_with(policy, None, None, ring_bytes, backend)
     }
 
@@ -16756,6 +30135,7 @@ impl Engine {
         ring_bytes: Option<u32>,
         backend: BackendSelection,
     ) -> Result<Session> {
+        self.note_graph_inputs_mutated();
         let generation = OwnedPauseGeneration::from_owned_child(child);
         self.start_session_with(policy, Some(generation), Some(child), ring_bytes, backend)
     }
@@ -16770,6 +30150,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.note_graph_inputs_mutated();
         let Some(view) = self
             .views
             .iter()
@@ -16868,11 +30249,215 @@ impl Engine {
             {
                 return Some(error);
             }
-            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM) {
+            // Staged plus Engine-held never exceeds the shared allowance;
+            // whatever does not fit waits in the ring for the next staging
+            // call after the first batch (producer ring loss counts a real
+            // ring overflow meanwhile).
+            let held = self.discovery_held_len();
+            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held) {
                 return Some(error);
             }
         }
         None
+    }
+
+    /// Counter spec for this start: `None` for every non-counter policy,
+    /// a sized production spec for `Counter` modes. Sizing charges nothing;
+    /// preparation inside the start chain funds the charges.
+    fn counter_spec_for_startup(
+        policy: CapturePolicy,
+        cpus: usize,
+        reserve: SemanticResourceReserver,
+    ) -> Result<Option<CounterSpec>> {
+        let Some(mode) = policy.counter_mode() else {
+            return Ok(None);
+        };
+        CounterSpec::for_production(mode, cpus, reserve)
+            .map(Some)
+            .map_err(|refusal| anyhow!("counter capture refused: {refusal:?}"))
+    }
+
+    /// Counter start budget: the affordable endpoint ceiling for the mode
+    /// at these CPUs, from the existing preparation sizing (never a
+    /// hand-written constant).
+    fn counter_start_budget(mode: CounterMode, cpus: usize) -> Result<CounterBudget> {
+        let ceiling = crate::attach::counter_banks::counter_affordable_endpoints(mode, cpus)
+            .map_err(|refusal| anyhow!("counter capture refused: {refusal:?}"))?;
+        let ceiling =
+            u64::try_from(ceiling).map_err(|_| anyhow!("counter ceiling does not fit u64"))?;
+        CounterBudget::new(ceiling).map_err(|refusal| anyhow!("{refusal}"))
+    }
+
+    /// Re-admit the retained plan under the counter start budget after the
+    /// attach-preparation retain loop. Stale-view removal rebuilds the plan
+    /// from the surviving views' scan inputs, which always lowers a Detailed
+    /// plan; without this the session holds prepared counter banks while the
+    /// Engine plan — and therefore the capture's counter owner inputs —
+    /// silently leaves the Counters policy.
+    fn restore_counters_policy_after_retain(&mut self, budget: CounterBudget) -> Result<()> {
+        if matches!(
+            self.plan.admission_policy(),
+            plan::AdmissionPolicy::Counters(kept) if kept == budget
+        ) {
+            return Ok(());
+        }
+        self.plan = self
+            .plan
+            .with_counters_policy(budget)
+            .map_err(|refusal| anyhow!("{refusal}"))?;
+        self.plan_rebuild_stable = false;
+        Ok(())
+    }
+
+    /// CPU count behind the counter preflight: the test seam when set,
+    /// otherwise the host topology.
+    fn counter_preflight_cpus(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cpus) = self.counter_cpus_override {
+            return cpus;
+        }
+        aya::util::nr_cpus().unwrap_or(0)
+    }
+
+    /// Memory preflight for a counter start: the requested endpoint count
+    /// must fit the kernel-map ceiling before any Session exists.
+    fn preflight_counter_start(&self, mode: CounterMode, requested_endpoints: usize) -> Result<()> {
+        let cpus = self.counter_preflight_cpus();
+        check_counter_endpoints_fit(mode, cpus, requested_endpoints)
+            .map_err(|refusal| anyhow!("{refusal}"))
+    }
+
+    /// Initial bank staging for counter captures, beside Detailed initial
+    /// attach. Refusals fail the start; the attempt restore drops the
+    /// session and its links.
+    fn stage_counter_initial(&mut self, session: &mut Session) -> Result<()> {
+        if self.plan.counter_consumed_end() as usize == self.plan.slots.len() {
+            // Nothing fresh: an empty capture proceeds unstaged.
+            return Ok(());
+        }
+        let reserve = self.counter_reserver();
+        match session.stage_counter_growth(&mut self.plan, &self.pinned, &reserve) {
+            BankPublication::Published { .. } => Ok(()),
+            publication => Err(anyhow!(
+                "{}",
+                counter_staging_refusal_text(&publication, session.last_counter_stage_check())
+            )),
+        }
+    }
+
+    /// Test-only state injection for Engine-driven counter cells: a
+    /// discovery-shaped Engine (scope, views, plan, pins, modules) without
+    /// running discovery. Production builds discovery through
+    /// `discover_plan`, which derives the plan FROM the modules; the seam
+    /// enforces the same invariant: every plan key must be re-observable
+    /// from an owning module entry, or the first loader-arming rebuild
+    /// legitimately retires it and counter staging refuses Topology on the
+    /// all-inactive plan.
+    #[cfg(test)]
+    pub(crate) fn inject_counter_start_state_for_test(
+        &mut self,
+        scope: Scope,
+        views: Vec<ProcessView>,
+        mut plan: plan::AttachPlan,
+        pinned: PinnedObjects,
+        modules: Vec<ReconciledModule>,
+    ) {
+        let owned: BTreeSet<(PinnedObjectId, u64)> = modules
+            .iter()
+            .flat_map(|module| {
+                module
+                    .scanned
+                    .tables
+                    .iter()
+                    .zip(module.entry_objects.iter())
+                    .flat_map(|(table, ids)| {
+                        table
+                            .entries
+                            .iter()
+                            .zip(ids.iter())
+                            .map(|(entry, object)| (*object, entry.file_offset))
+                    })
+            })
+            .collect();
+        for slot in &plan.slots {
+            assert!(
+                owned.contains(&(slot.object, slot.file_offset)),
+                "injected counter plan slot {} ({:?}@0x{:x}) has no owning module entry; \
+                 loader arming would retire it",
+                slot.index,
+                slot.object,
+                slot.file_offset
+            );
+        }
+        // Discovery allocates stable module IDs during admission; the seam
+        // must too, or capture-facts publication cannot resolve them.
+        self.capture_facts
+            .bind_plan_module_ids(&mut plan, &modules, &self.manifests, &pinned)
+            .expect("injected counter modules bind stable module IDs");
+        self.scope = scope;
+        self.views = views;
+        self.plan = plan;
+        self.pinned = pinned;
+        self.modules = modules;
+        self.plan_rebuild_stable = false;
+    }
+
+    /// Test-only counter growth step through the production apply path:
+    /// builds the candidate for these fresh slots and applies it. Returns
+    /// completions, static failures, and the cumulative counter PARTIAL
+    /// reasons.
+    #[cfg(test)]
+    pub(crate) fn apply_counter_growth_for_test(
+        &mut self,
+        session: &mut dyn EngineSession,
+        plan: plan::AttachPlan,
+        new: Vec<plan::Slot>,
+        pinned: PinnedObjects,
+    ) -> Result<(usize, usize, Vec<String>)> {
+        // Production candidates evolve from committed pins (absorb), so
+        // loader contexts always resolve; bare fresh pins would trip the
+        // missing-contexts admission and stage nothing.
+        let mut candidate_pins = self.pinned.clone();
+        for skip in candidate_pins.absorb(pinned) {
+            self.mark_partial(&skip.subject, &skip.reason);
+        }
+        let candidate = LiveCandidate {
+            pinned: candidate_pins,
+            modules: Vec::new(),
+            plan,
+            delta: plan::AttachDelta {
+                new,
+                replace: Vec::new(),
+                retire: Vec::new(),
+            },
+            views: BTreeSet::new(),
+            corroboration: Vec::new(),
+            manifest_fallbacks: Vec::new(),
+            selection_claims: BTreeMap::new(),
+            selection_tables: BTreeMap::new(),
+            selection_admission: None,
+            manifest_selection_admissions: Vec::new(),
+            manifest_inventory_slots: BTreeMap::new(),
+            loader_plan_proof: None,
+            exec_preservations: Vec::new(),
+            exec_completions: Vec::new(),
+            built_by_full_rebuild: false,
+        };
+        let mut additions_allowed = true;
+        let outcome =
+            self.apply_candidate(session, candidate, &mut additions_allowed, false, &[])?;
+        let partials = self
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject.contains("counter"))
+            .map(|skip| skip.reason.clone())
+            .collect();
+        Ok((
+            outcome.static_completions.len(),
+            outcome.static_failures.len(),
+            partials,
+        ))
     }
 
     fn start_session_with(
@@ -16883,14 +30468,46 @@ impl Engine {
         ring_bytes: Option<u32>,
         backend: BackendSelection,
     ) -> Result<Session> {
+        if let Some(mode) = policy.counter_mode() {
+            self.preflight_counter_start(mode, self.plan.slots.len())?;
+        }
         self.seed_initial_cgroup_views();
         let snapshot = self.begin_start_capture_attempt()?;
+        // Counter captures re-admit the discovery plan under the endpoint
+        // budget and prepare banks through the standard start chain; a
+        // failure below restores the pre-attempt plan.
+        let counter = Self::counter_spec_for_startup(
+            policy,
+            self.counter_preflight_cpus(),
+            self.counter_reserver(),
+        )?;
+        let counter_budget = if counter.is_some() {
+            let mode = policy
+                .counter_mode()
+                .expect("counter spec implies counter policy");
+            let budget = Self::counter_start_budget(mode, self.counter_preflight_cpus())?;
+            self.plan = self
+                .plan
+                .with_counters_policy(budget)
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+            self.plan_rebuild_stable = false;
+            Some(budget)
+        } else {
+            None
+        };
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
+        let admission = self.return_probe_admission.clone();
+        // 6.14 Option B: the kernel exe-identity read arms exactly when
+        // the engine armed extensive mode under a Detailed policy;
+        // a counter policy never forwards the bit even if the engine
+        // was armed. Hoisted: the closure below cannot borrow `self`
+        // while `start_retained_with` holds it.
+        let track_short_lived = self.extensive.enabled() && policy.allows_track_short_lived();
         let mut session =
             match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
-                Session::start(
+                Session::start_for_capture(
                     plan,
                     scope,
                     pinned,
@@ -16899,6 +30516,9 @@ impl Engine {
                     ring_bytes,
                     owned_child,
                     backend,
+                    counter.as_ref(),
+                    admission.clone(),
+                    track_short_lived,
                 )
             }) {
                 Ok(session) => session,
@@ -16906,16 +30526,22 @@ impl Engine {
                     return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
             };
+        if let Some(budget) = counter_budget
+            && let Err(error) = self.restore_counters_policy_after_retain(budget)
+        {
+            return self.finish_start_capture_attempt(snapshot, Err(error));
+        }
         self.record_session_lifecycle_tracking(&session);
         let result = (|| {
             // Lifecycle producers have been live since the load, and the
             // static attach can take seconds: stage what they produced
-            // before the per-view phases add more (RB-2).
-            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+            // before the per-view phases add more (RB-2), within the
+            // shared allowance the Engine still holds nothing of.
+            let held = self.discovery_held_len();
+            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
             let mut additions_allowed = true;
             let mut records = Vec::new();
             let mut pending_views = PendingViewRetirements::new();
-            let mut collect = Self::collect_discovery_records;
             let mut closure = PauseClosure::new(true);
             let mut fatal = None;
             let owned_generation = owned_child.map(OwnedChild::generation);
@@ -16962,9 +30588,17 @@ impl Engine {
                     &mut pending_views,
                     &mut closure,
                 );
+                // Counter captures stage banks where Detailed flows attach
+                // initial exports (inert for counter policies).
+                if policy.counter_mode().is_some() {
+                    self.stage_counter_initial(&mut session)?;
+                }
                 // Stage what the export attach let accumulate; the first
-                // batch applies it in ring order (RB-2).
-                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+                // batch applies it in ring order (RB-2). Anything past the
+                // shared allowance waits in the ring for the next staging
+                // call after that batch.
+                let held = self.discovery_held_len();
+                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
                 if owned_prearmed && let Some(generation) = owned_generation {
                     self.mark_owned_selection_pending(generation);
                 }
@@ -16974,6 +30608,11 @@ impl Engine {
                 crate::first_use_probe::DiscoveryStage::InitialExportsFinished,
                 &session,
             );
+            // The cleanup pass's nested pulls share one budget seeded
+            // from the shared allowance after all staging settled.
+            let nested_budget = Cell::new(self.shared_allowance_remaining(&session, records.len()));
+            let mut collect =
+                |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
             let cleanup = self.process_discovery_records(
                 &mut session,
                 &mut records,
@@ -16986,11 +30625,27 @@ impl Engine {
                 return Err(error);
             }
             cleanup?;
-            record_object_skips(&mut self.plan, &self.counters.object_skips);
+            record_object_skips(
+                &mut self.plan,
+                &self.counters.object_skips,
+                &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+            );
             self.publish_current_capture_facts()?;
             Ok(session)
         })();
-        self.finish_start_capture_attempt(snapshot, result)
+        let session = match self.finish_start_capture_attempt(snapshot, result) {
+            Ok(session) => session,
+            // A failed start drops the witness: no verdict, and no stale
+            // live witness survives for a later retry.
+            Err(error) => {
+                self.prearm_witness_live = None;
+                return Err(error);
+            }
+        };
+        // P-C phase 2 (§6.2): finalize after attach, before the return
+        // (hence before the ready line). Owned `run` drops it inert.
+        self.finalize_prearm_witness(owned_child.is_some());
+        Ok(session)
     }
 }
 
@@ -17007,8 +30662,37 @@ pub(crate) mod session_fixture {
 
     #[derive(Default)]
     pub(crate) struct ScriptedSession {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        pub(crate) reexec_diagnostic: Option<crate::attach::reexec_diagnostic::Diagnostic>,
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        pub(crate) diagnostic_at_preflight: Cell<Option<crate::attach::reexec_diagnostic::Record>>,
         pub(crate) capture_policy: Option<CapturePolicy>,
+        pub(crate) pid_continuity: Option<RefCell<crate::attach::PidSessionFixture>>,
+        pub(crate) global_retirement: Option<RefCell<crate::attach::RetirementFixture>>,
+        /// T4b seam: fail every `prepare_collected_static_retirement` call
+        /// (the G9 trigger for pre/post-take prepare errors).
+        pub(crate) fail_collected_prepare: Cell<bool>,
+        /// Test seam: fail every `begin_collected_static_retirement` call
+        /// (the trigger for a begin error before native mutation).
+        pub(crate) fail_collected_begin: Cell<bool>,
+        /// T4b seam: report a logical retirement leaf (the G24 Singles
+        /// twin takes no native path).
+        pub(crate) logical_retirement: Cell<bool>,
+        /// 6.14 Option A seam: the instance-continuity hooks are live
+        /// for this scripted capture. Default false (refused), matching
+        /// the trait's fail-closed default; a test proving `mapped` sets
+        /// it explicitly, never by relying on the default.
+        pub(crate) instance_hooks_live: Cell<bool>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
+        /// The staged FIFO, mirroring production: `stage_discovery` moves
+        /// scripted ring outcomes here, `discovery_dequeue` serves it
+        /// first, and staged items hold shared-allowance credits.
+        staged: VecDeque<crate::events::DiscoveryItem>,
+        /// Scripted pre-arm link facts (packet 6.13 residual tests): live
+        /// slot links plus their attach-complete stamps. Empty unless a test
+        /// sets them; production `Session` supplies the real ones.
+        pub(crate) scripted_links: BTreeSet<u32>,
+        pub(crate) scripted_stamps: BTreeMap<u32, u64>,
         pub(crate) counters: CounterSnapshot,
         /// One entry per upcoming `counter_snapshot` call; `true` fails it.
         counter_script: RefCell<VecDeque<bool>>,
@@ -17023,6 +30707,14 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slots: Vec<usize>,
         /// Exact slot identities of every `detach_slots` call, in order.
         pub(crate) detached_slot_indices: Vec<Vec<u32>>,
+        /// Exact targets requested through failed-attachment/selection cleanup,
+        /// distinct from retirement of accepted coverage.
+        pub(crate) failed_cleanup_slot_indices: Vec<Vec<u32>>,
+        /// Exact slot identities of every `replace_targets` call, in order.
+        pub(crate) replaced_slot_indices: Vec<Vec<u32>>,
+        /// Slot indices skipped as ended-watch targets by `attach_targets`
+        /// (packet 6.13, R2-D1-7), in call order.
+        pub(crate) skipped_ended: Vec<u32>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
         /// One entry per upcoming `detach_slots` call; `true` fails it
@@ -17036,6 +30728,13 @@ pub(crate) mod session_fixture {
         fail_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
         pub(crate) attached_slots: Vec<usize>,
+        /// Counter growth staging calls, as plan slot counts at call time.
+        pub(crate) staged_counter_calls: Vec<usize>,
+        /// Scripted counter staging outcomes, replayed in order.
+        pub(crate) counter_stage_script: VecDeque<BankPublication>,
+        /// Scripted last staging check name, reported for scripted
+        /// `Topology` refusals so tests can pin the refusal text.
+        pub(crate) scripted_last_check: Option<&'static str>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
         dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
@@ -17043,6 +30742,11 @@ pub(crate) mod session_fixture {
         pub(crate) dynamic_loader_attach_calls: usize,
         pub(crate) dynamic_loader_reports_added: bool,
         pub(crate) dynamic_loader_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64)>,
+        /// Runs once during the loader-link query, after the engine's first pin check.
+        pub(crate) before_dynamic_loader_query: RefCell<Option<Box<dyn FnOnce()>>>,
+        /// Runs once before the next loader link is installed. Tests use
+        /// actual child I/O here to map a provider after inventory's rescan.
+        pub(crate) before_dynamic_loader_attach: Option<Box<dyn FnOnce()>>,
         pub(crate) selection_table_read: Option<(MapEntry, ScannedTable)>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
@@ -17086,6 +30790,47 @@ pub(crate) mod session_fixture {
     }
 
     impl ScriptedSession {
+        fn detach_slots_with_ended(
+            &mut self,
+            slots: &[plan::Slot],
+            ended: Option<(&ProcessView, &crate::attach::EndedPidRetirement)>,
+        ) -> Result<DetachOutcome> {
+            self.detached_slots.push(slots.len());
+            self.detached_slot_indices
+                .push(slots.iter().map(|slot| slot.index).collect());
+            if let Some(Some(pid)) = self.detach_losses.pop_front() {
+                kill_and_reap(pid);
+            }
+            let untouched_refusal = if slots.is_empty() && self.pid_continuity.is_some() {
+                false
+            } else {
+                self.detach_slot_premutation_script
+                    .pop_front()
+                    .unwrap_or(false)
+            };
+            if untouched_refusal {
+                bail!("scripted program fd resolution failed before any link mutation");
+            }
+            let native_failure = if slots.is_empty() && self.pid_continuity.is_some() {
+                false
+            } else {
+                self.detach_slot_script.pop_front().unwrap_or(false)
+            };
+            let rebuild = self.pid_continuity.as_mut().map(|continuity| match ended {
+                Some((owner, proof)) => continuity
+                    .borrow_mut()
+                    .detach_ended_pid_slots(slots, owner, proof),
+                None => continuity.borrow_mut().detach(slots),
+            });
+            if native_failure {
+                self.detach_failures
+                    .push("scripted one-shot slot detach failed".into());
+                bail!("scripted one-shot slot detach failed");
+            }
+            Ok(rebuild
+                .unwrap_or_else(|| self.detach_rebuild_script.pop_front().unwrap_or_default()))
+        }
+
         /// A session whose ring holds exactly these records and whose producer
         /// counters authorize `loader_hits` loader records.
         pub(crate) fn with_records(
@@ -17213,17 +30958,280 @@ pub(crate) mod session_fixture {
     }
 
     impl EngineSession for ScriptedSession {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
+            self.reexec_diagnostic.clone()
+        }
+        fn has_slot_link(&self, slot: u32) -> bool {
+            self.scripted_links.contains(&slot)
+                || self
+                    .global_retirement
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().has_slot_link(slot))
+                || self
+                    .pid_continuity
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().has_slot_link(slot))
+        }
+        fn slot_attached_at(&self, slot: u32) -> Option<u64> {
+            self.scripted_stamps.get(&slot).copied()
+        }
+        fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
+            self.pid_continuity
+                .as_ref()
+                .map(|state| state.borrow().gap_summary())
+                .unwrap_or_default()
+        }
+        fn collected_retirement_is_physical(&self) -> bool {
+            !self.logical_retirement.get()
+        }
+        fn prepare_ended_pid_retirement(
+            &self,
+            view: &ProcessView,
+            slots: &[plan::Slot],
+        ) -> Option<crate::attach::EndedPidRetirement> {
+            self.pid_continuity
+                .as_ref()?
+                .borrow()
+                .prepare_ended_pid_retirement(view, slots)
+        }
+        fn mutation_stopped(&self) -> bool {
+            self.pid_continuity
+                .as_ref()
+                .is_some_and(|state| !self.detach_failures.is_empty() || state.borrow().stopped())
+        }
+        fn instance_hooks_refused(&self) -> bool {
+            !self.instance_hooks_live.get()
+        }
+        fn bind_exec(
+            &self,
+            view: &ProcessView,
+            serial: u64,
+            record: &DiscoveryRecord,
+        ) -> Option<crate::attach::ExecBinding> {
+            if self.mutation_stopped() {
+                return None;
+            }
+            self.pid_continuity
+                .as_ref()?
+                .borrow()
+                .bind(view, serial, record)
+        }
+        fn prepare_preservation(
+            &mut self,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            slots: &[plan::Slot],
+            ordinary: &[plan::Slot],
+            objects: &PinnedObjects,
+        ) -> Option<crate::attach::PreservationReceipt> {
+            if self.mutation_stopped() {
+                return None;
+            }
+            self.pid_continuity
+                .as_mut()?
+                .borrow_mut()
+                .prepare(binding, view, serial, slots, ordinary, objects)
+        }
+        fn validate_preservation(
+            &mut self,
+            receipt: &crate::attach::PreservationReceipt,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            objects: &PinnedObjects,
+        ) -> bool {
+            if self.mutation_stopped() {
+                return false;
+            }
+            self.pid_continuity.as_mut().is_some_and(|state| {
+                state
+                    .borrow_mut()
+                    .validate(receipt, binding, view, serial, objects)
+            })
+        }
         fn capture_policy(&self) -> CapturePolicy {
             self.capture_policy.unwrap_or(CapturePolicy::Allowlisted)
         }
 
+        fn prepare_completed_rearm(
+            &mut self,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            slots: &[plan::Slot],
+            ordinary: &[plan::Slot],
+            objects: &PinnedObjects,
+        ) -> Option<crate::attach::CompletedRearmReceipt> {
+            if self.mutation_stopped() {
+                return None;
+            }
+            self.pid_continuity
+                .as_mut()?
+                .borrow_mut()
+                .prepare_completed_rearm(binding, view, serial, slots, ordinary, objects)
+        }
+
+        fn validate_completed_rearm(
+            &mut self,
+            receipt: &crate::attach::CompletedRearmReceipt,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            objects: &PinnedObjects,
+        ) -> bool {
+            if self.mutation_stopped() {
+                return false;
+            }
+            self.pid_continuity.as_mut().is_some_and(|state| {
+                state
+                    .borrow_mut()
+                    .validate_completed_rearm(receipt, binding, view, serial, objects)
+            })
+        }
+
         fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
+            if let Some(item) = self.staged.pop_front() {
+                return Ok(Some(item));
+            }
             self.dequeues.pop_front().unwrap_or(Ok(None))
         }
 
-        fn stage_discovery(&mut self, _: usize) -> Result<usize> {
+        fn stage_discovery(
+            &mut self,
+            quantum: usize,
+            engine_held: usize,
+        ) -> Result<crate::attach::DiscoveryStageOutcome> {
             self.stage_calls += 1;
-            Ok(0)
+            let shared_cap = crate::attach::DiscoveryStage::CAPACITY.saturating_sub(engine_held);
+            let mut staged = 0;
+            let mut capacity_blocked = false;
+            while staged < quantum && self.staged.len() < shared_cap {
+                match self.dequeues.pop_front() {
+                    Some(Ok(Some(item))) => {
+                        self.staged.push_back(item);
+                        staged += 1;
+                    }
+                    Some(outcome) => {
+                        self.dequeues.push_front(outcome);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            if staged < quantum && self.staged.len() >= shared_cap {
+                capacity_blocked = true;
+            }
+            Ok(crate::attach::DiscoveryStageOutcome {
+                staged,
+                capacity_blocked,
+            })
+        }
+
+        fn staged_discovery_len(&self) -> usize {
+            self.staged.len()
+        }
+
+        fn collect_discovery_to_position(
+            &mut self,
+            _stop: usize,
+            quantum: usize,
+        ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+            // The script is the Q-bounded content: staged items first
+            // (ring order, like the session FIFO), then scripted
+            // dequeues, up to one quantum. The scripted Q never moves,
+            // so post-Q never fires; backlog reports scripted items
+            // past the quantum exactly.
+            if quantum == 0 {
+                return Ok((Vec::new(), 0, false, true));
+            }
+            let mut records = Vec::new();
+            let mut malformed = 0u64;
+            for _ in 0..quantum {
+                match EngineSession::discovery_dequeue(self)? {
+                    Some(crate::events::DiscoveryItem::Record(record)) => records.push(record),
+                    Some(crate::events::DiscoveryItem::Malformed) => {
+                        malformed = malformed.saturating_add(1);
+                    }
+                    None => return Ok((records, malformed, false, false)),
+                }
+            }
+            let backlog = !self.staged.is_empty()
+                || matches!(self.dequeues.front(), Some(Ok(Some(_))) | Some(Err(_)));
+            Ok((records, malformed, false, backlog))
+        }
+
+        fn prepare_collected_static_retirement(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            input: &mut Option<RetainedRetirementInput>,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            if self.fail_collected_prepare.get() {
+                bail!("scripted collected prepare refused");
+            }
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_prepare(input, reserve, work)
+        }
+
+        fn begin_collected_static_retirement(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            ticket: &CollectedRetirementTicket,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            if self.fail_collected_begin.get() {
+                bail!("scripted collected begin refused");
+            }
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_begin(ticket, work)
+        }
+
+        fn poll_collected_static_retirement(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            ticket: &CollectedRetirementTicket,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_poll(ticket, work)
+        }
+
+        fn cancel_collected_static_retirement(
+            &mut self,
+            input: Option<&RetainedRetirementInput>,
+            ticket: Option<&CollectedRetirementTicket>,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_cancel(input, ticket, work)
+        }
+
+        fn defer_collected_partial_groups(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            input: &mut Option<RetainedRetirementInput>,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<DeferralProgress> {
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_defer(input, reserve, work)
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -17266,6 +31274,12 @@ pub(crate) mod session_fixture {
         }
 
         fn preflight_targets(&self, targets: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            self.diagnostic_at_preflight.set(
+                self.reexec_diagnostic
+                    .as_ref()
+                    .and_then(crate::attach::reexec_diagnostic::Diagnostic::last_record),
+            );
             self.preflight_targets.borrow_mut().push(
                 targets
                     .iter()
@@ -17274,6 +31288,9 @@ pub(crate) mod session_fixture {
             );
             if let Some(Some(pid)) = self.preflight_losses.borrow_mut().pop_front() {
                 kill_and_reap(pid);
+            }
+            if let Some(continuity) = &self.pid_continuity {
+                continuity.borrow_mut().at_preflight();
             }
             let refused = self
                 .preflight_refusals
@@ -17290,12 +31307,47 @@ pub(crate) mod session_fixture {
         fn attach_targets(
             &mut self,
             slots: &[plan::Slot],
-            _: &PinnedObjects,
+            objects: &PinnedObjects,
+            ended: &BTreeSet<plan::AttachKey>,
         ) -> Result<TargetAttachResult> {
+            // Mirror production (packet 6.13, R2-D1-7): ended-watch targets
+            // skip, and the skip is recorded for the test to assert.
+            let filtered: Vec<plan::Slot>;
+            let slots: &[plan::Slot] = if ended.is_empty() {
+                slots
+            } else {
+                filtered = slots
+                    .iter()
+                    .filter(|slot| {
+                        let skip = ended.contains(&plan::AttachKey::of(slot));
+                        if skip {
+                            self.skipped_ended.push(slot.index);
+                        }
+                        !skip
+                    })
+                    .cloned()
+                    .collect();
+                &filtered
+            };
+            if !slots.is_empty()
+                && self
+                    .global_retirement
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().blocking())
+            {
+                bail!("actual global retirement quarantine blocks attachment");
+            }
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
             self.attached_slots.push(slots.len());
+            let physical = self
+                .pid_continuity
+                .as_mut()
+                .map(|continuity| continuity.borrow_mut().attach(slots, objects));
             if let Some(pid) = self.kill_on_attach.take() {
                 kill_and_reap(pid);
+            }
+            if let Some(physical) = physical {
+                return physical;
             }
             Ok((
                 slots
@@ -17307,36 +31359,116 @@ pub(crate) mod session_fixture {
             ))
         }
 
+        fn stage_counter_growth(
+            &mut self,
+            plan: &mut plan::AttachPlan,
+            objects: &PinnedObjects,
+            reserve: &SemanticResourceReserver,
+        ) -> BankPublication {
+            let _ = (objects, reserve);
+            self.staged_counter_calls.push(plan.slots.len());
+            let publication =
+                self.counter_stage_script
+                    .pop_front()
+                    .unwrap_or(BankPublication::Refused(BankRefusal::Shape(
+                        BankShapeCause::StagedWithoutBanks,
+                    )));
+            // Mirror real staging: publication consumes the scripted
+            // extent; refusals leave the plan untouched.
+            if let BankPublication::Published { extent, .. } = publication {
+                let _ = plan.consume_counter_extent(extent.first, extent.end);
+            }
+            publication
+        }
+
+        fn last_counter_stage_check(&self) -> Option<&'static str> {
+            self.scripted_last_check
+        }
+
         fn replace_targets(
             &mut self,
-            _: &mut plan::AttachPlan,
+            plan: &mut plan::AttachPlan,
             slots: &[plan::Slot],
-            _: &PinnedObjects,
+            objects: &PinnedObjects,
         ) -> Result<ReplacementOutcome> {
+            self.replaced_slot_indices
+                .push(slots.iter().map(|slot| slot.index).collect());
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
+            if let Some(continuity) = &mut self.pid_continuity {
+                let attached = continuity.borrow_mut().attach(slots, objects);
+                let (failed, completed) = match attached {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        for slot in slots {
+                            plan.deactivate(slot.index);
+                        }
+                        return Err(error);
+                    }
+                };
+                let failed_slots: Vec<_> = slots
+                    .iter()
+                    .filter(|slot| failed.contains(&slot.index))
+                    .cloned()
+                    .collect();
+                let rebuild = continuity.borrow_mut().detach(&failed_slots);
+                for slot in failed_slots {
+                    plan.deactivate(slot.index);
+                }
+                return Ok(ReplacementOutcome {
+                    completed,
+                    rebuild,
+                    failed_detach: false,
+                });
+            }
             Ok(ReplacementOutcome::default())
         }
 
         fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
-            self.detached_slots.push(slots.len());
-            self.detached_slot_indices
+            self.detach_slots_with_ended(slots, None)
+        }
+        fn begin_global_static_retirement(
+            &mut self,
+            slots: &[plan::Slot],
+        ) -> Result<Option<RetirementTicket>> {
+            self.global_retirement
+                .as_ref()
+                .map_or(Ok(None), |state| state.borrow_mut().begin(slots))
+        }
+        fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
+            self.global_retirement
+                .as_ref()
+                .map_or(RetirementPoll::Refused, |state| {
+                    state.borrow_mut().poll(ticket)
+                })
+        }
+
+        fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+            self.failed_cleanup_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
-            if let Some(Some(pid)) = self.detach_losses.pop_front() {
-                kill_and_reap(pid);
+            self.detach_slots_with_ended(slots, None)
+        }
+
+        fn detach_ended_pid_slots(
+            &mut self,
+            slots: &[plan::Slot],
+            owner: &ProcessView,
+            proof: &crate::attach::EndedPidRetirement,
+        ) -> Result<DetachOutcome> {
+            self.detach_slots_with_ended(slots, Some((owner, proof)))
+        }
+
+        fn has_dynamic_loader(
+            &self,
+            context: LoaderContextId,
+            object: PinnedObjectId,
+            file_offset: u64,
+            cookie: u64,
+        ) -> bool {
+            if let Some(before_query) = self.before_dynamic_loader_query.borrow_mut().take() {
+                before_query();
             }
-            if self
-                .detach_slot_premutation_script
-                .pop_front()
-                .unwrap_or(false)
-            {
-                bail!("scripted program fd resolution failed before any link mutation");
-            }
-            if self.detach_slot_script.pop_front().unwrap_or(false) {
-                self.detach_failures
-                    .push("scripted one-shot slot detach failed".into());
-                bail!("scripted one-shot slot detach failed");
-            }
-            Ok(self.detach_rebuild_script.pop_front().unwrap_or_default())
+            self.dynamic_loader_links
+                .contains(&(context, object, file_offset, cookie))
         }
 
         fn has_dynamic_export(
@@ -17392,6 +31524,9 @@ pub(crate) mod session_fixture {
             let identity = (context, object, file_offset, cookie);
             if self.dynamic_loader_links.contains(&identity) {
                 return Ok(false);
+            }
+            if let Some(before_attach) = self.before_dynamic_loader_attach.take() {
+                before_attach();
             }
             attachment_admission(&self.detach_failures, true)
                 .map_err(DynamicLoaderAttachFailure::Registry)?;
@@ -17514,6 +31649,58 @@ impl Engine {
         self.pending_discovery_records.len()
     }
 
+    /// Feed the same decoded fixture original through actual H-1 ingestion.
+    /// Exhausting this frame parks its record before dispatch; no test helper
+    /// writes the retained queue or the lifecycle processing result directly.
+    pub(crate) fn defer_finish_discovery_for_test(
+        &mut self,
+        record: DiscoveryRecord,
+    ) -> Result<()> {
+        let previous_budget = self.frame_work_budget_ns;
+        self.frame_work_budget_ns = 0;
+        let mut session = session_fixture::ScriptedSession::with_records([record], 0);
+        let result = self.drain_discovery_from(&mut session);
+        self.frame_work_budget_ns = previous_budget;
+        result.map(|_| ())
+    }
+
+    pub(crate) fn finish_discovery_head_for_test(&self) -> Option<(u32, u64, u8)> {
+        self.pending_discovery_records.first().map(|queued| {
+            (
+                (queued.record.pid_tgid >> 32) as u32,
+                queued.record.hook_ts_ns,
+                queued.record.kind,
+            )
+        })
+    }
+
+    /// Observe the real handler preconditions, not a ready/completion flag.
+    pub(crate) fn finish_exit_subject_for_test(&self, pid: u32, at: u64) -> (bool, bool, bool) {
+        (
+            self.admits_generations(),
+            self.views.iter().any(|view| view.pid() == pid),
+            self.admitted_cgroup_views
+                .values()
+                .any(|admission| admission.covers(at, pid)),
+        )
+    }
+
+    pub(crate) fn unmatched_finish_exit_for_test(&self, pid: u32, at: u64) -> bool {
+        self.unmatched_leader_exit_events.contains(&(pid, at))
+    }
+
+    /// A blank engine for cross-module tests that cannot name the private
+    /// constructor: pid scope on the test process, no views, no requests.
+    pub(crate) fn empty_for_test() -> Self {
+        Self::empty()
+    }
+
+    /// Charges the capture budget from cross-module tests: work charges
+    /// are observed exactly through the ceiling itself.
+    pub(crate) fn budget_charge_for_test(&mut self, units: u64) -> bool {
+        self.budget.charge(units)
+    }
+
     /// `(owner, dispatch_started, retry_used)` of the private lifecycle journal.
     pub(crate) fn terminal_journal_for_test(&self) -> Option<(LoaderContextId, bool, bool)> {
         self.terminal_journal
@@ -17545,5 +31732,437 @@ impl Engine {
 pub(crate) mod tests;
 
 #[cfg(test)]
+#[path = "prearm_witness_tests.rs"]
+mod prearm_witness_tests;
+
+#[cfg(test)]
+#[path = "engine_counter_tests.rs"]
+mod counter_tests;
+
+#[cfg(test)]
+#[path = "trace_system_seed_tests.rs"]
+mod trace_system_seed_tests;
+
+#[cfg(test)]
 #[path = "publication_tests.rs"]
 pub(crate) mod publication_tests;
+
+#[cfg(test)]
+#[path = "pressure_native_tests.rs"]
+pub(crate) mod pressure_native_tests;
+
+#[cfg(test)]
+mod reexec_diagnostic_evaluation_tests {
+    use super::session_fixture::ScriptedSession;
+    use super::*;
+    use std::cell::Cell;
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    use crate::attach::reexec_diagnostic::{Diagnostic, Outcome};
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    fn active_session(diag: &Diagnostic, refused: bool) -> ScriptedSession {
+        let mut session = if refused {
+            ScriptedSession::refusing_preflight()
+        } else {
+            ScriptedSession::default()
+        };
+        session.reexec_diagnostic = Some(diag.clone());
+        session
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_first_final_candidate_surround_actual_assembly() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for pass in [
+            InventoryDiagnosticPass::First,
+            InventoryDiagnosticPass::Final,
+        ] {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            diag.matched_exec();
+            let session = active_session(&diag, false);
+            let calls = Cell::new(0);
+            let before_operation = Cell::new(None);
+            let removed = BTreeSet::new();
+            let mut engine = Engine::empty();
+            let candidate = inventory_candidate_observed(
+                &session,
+                pass,
+                || [Some(0); 4],
+                || {
+                    calls.set(calls.get() + 1);
+                    before_operation.set(diag.last_record());
+                    engine.inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
+                },
+            )
+            .unwrap();
+            let control = Engine::empty()
+                .inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
+                .unwrap();
+            assert_eq!(calls.get(), 1, "the real assembly must execute once");
+            assert_eq!(
+                (
+                    candidate.plan.slots.len(),
+                    candidate.delta.new.len(),
+                    candidate.delta.replace.len(),
+                    candidate.delta.retire.len(),
+                    candidate.views.clone()
+                ),
+                (
+                    control.plan.slots.len(),
+                    control.delta.new.len(),
+                    control.delta.replace.len(),
+                    control.delta.retire.len(),
+                    control.views.clone()
+                ),
+                "the actual candidate result must remain unchanged"
+            );
+            observed.push((
+                before_operation
+                    .get()
+                    .map(|record| (record.phase, record.outcome)),
+                diag.last_record()
+                    .map(|record| (record.phase, record.outcome)),
+            ));
+            expected.push((
+                Some((pass.candidate_phase(), Outcome::Begin)),
+                Some((pass.candidate_phase(), Outcome::Ok)),
+            ));
+        }
+        assert_eq!(
+            observed, expected,
+            "first/final boundaries must surround actual assembly"
+        );
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_first_final_candidate_errors_propagate_once() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for pass in [
+            InventoryDiagnosticPass::First,
+            InventoryDiagnosticPass::Final,
+        ] {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            diag.matched_exec();
+            let session = active_session(&diag, false);
+            let calls = Cell::new(0);
+            let before_operation = Cell::new(None);
+            let result: Result<()> = inventory_candidate_observed(
+                &session,
+                pass,
+                || [Some(0); 4],
+                || {
+                    calls.set(calls.get() + 1);
+                    before_operation.set(diag.last_record());
+                    Err(anyhow!("scripted assembly failure"))
+                },
+            );
+            assert_eq!(calls.get(), 1, "the fallible operation must execute once");
+            assert_eq!(result.unwrap_err().to_string(), "scripted assembly failure");
+            observed.push((
+                before_operation
+                    .get()
+                    .map(|record| (record.phase, record.outcome)),
+                diag.last_record()
+                    .map(|record| (record.phase, record.outcome)),
+            ));
+            expected.push((
+                Some((pass.candidate_phase(), Outcome::Begin)),
+                Some((pass.candidate_phase(), Outcome::Error)),
+            ));
+        }
+        assert_eq!(
+            observed, expected,
+            "first/final error results require their own boundaries"
+        );
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_first_final_admission_surround_actual_preflight_refusals() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for pass in [
+            InventoryDiagnosticPass::First,
+            InventoryDiagnosticPass::Final,
+        ] {
+            for (refused, stale) in [(false, false), (true, false), (false, true)] {
+                let diag = Diagnostic::selected(true, true).unwrap();
+                diag.matched_exec();
+                let session = active_session(&diag, refused);
+                let control_session = if refused {
+                    ScriptedSession::refusing_preflight()
+                } else {
+                    ScriptedSession::default()
+                };
+                let removed = BTreeSet::new();
+                let mut engine = Engine::empty();
+                let mut candidate = engine
+                    .inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
+                    .unwrap();
+                if stale {
+                    candidate.views.insert(ProcessViewId(77));
+                }
+                let control = engine.inventory_candidate_admission(
+                    &control_session,
+                    &candidate,
+                    &removed,
+                    &[],
+                    &BTreeSet::new(),
+                );
+                let calls = Cell::new(0);
+                let admission = inventory_admission_observed(
+                    &session,
+                    pass,
+                    || [Some(0); 4],
+                    || {
+                        calls.set(calls.get() + 1);
+                        engine.inventory_candidate_admission(
+                            &session,
+                            &candidate,
+                            &removed,
+                            &[],
+                            &BTreeSet::new(),
+                        )
+                    },
+                );
+                assert_eq!(calls.get(), 1);
+                assert_eq!(
+                    session.preflight_targets.borrow().len(),
+                    1,
+                    "the real preflight must execute once"
+                );
+                assert_eq!(control_session.preflight_targets.borrow().len(), 1);
+                assert_eq!(admission.targets_ok, control.targets_ok);
+                assert!(admission.stale_views == control.stale_views);
+                assert!(admission.missing_contexts == control.missing_contexts);
+                assert!(admission.newly_rejected_keys == control.newly_rejected_keys);
+                assert_eq!(
+                    admission.refuses_candidate(),
+                    refused || stale,
+                    "the fixture must reach its intended actual admission branch"
+                );
+                observed.push((
+                    session
+                        .diagnostic_at_preflight
+                        .get()
+                        .map(|record| (record.phase, record.outcome)),
+                    diag.last_record()
+                        .map(|record| (record.phase, record.outcome)),
+                ));
+                expected.push((
+                    Some((pass.admission_phase(), Outcome::Begin)),
+                    Some((
+                        pass.admission_phase(),
+                        if refused || stale {
+                            Outcome::Refused
+                        } else {
+                            Outcome::Ok
+                        },
+                    )),
+                ));
+            }
+        }
+        assert_eq!(
+            observed, expected,
+            "first/final actual admission refusals require boundaries"
+        );
+    }
+
+    #[cfg(not(feature = "h6-reexec-diagnostic"))]
+    #[test]
+    fn reexec_diagnostic_off_candidate_admission_do_work_once_without_metadata() {
+        let session = ScriptedSession::default();
+        let removed = BTreeSet::new();
+        let metadata = Cell::new(0);
+        let calls = Cell::new(0);
+        let mut engine = Engine::empty();
+        let candidate = inventory_candidate_observed(
+            &session,
+            InventoryDiagnosticPass::First,
+            || {
+                metadata.set(metadata.get() + 1);
+                panic!("disabled candidate metadata evaluated")
+            },
+            || {
+                calls.set(calls.get() + 1);
+                engine.inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
+            },
+        )
+        .unwrap();
+        let admission = inventory_admission_observed(
+            &session,
+            InventoryDiagnosticPass::Final,
+            || {
+                metadata.set(metadata.get() + 1);
+                panic!("disabled admission metadata evaluated")
+            },
+            || {
+                calls.set(calls.get() + 1);
+                engine.inventory_candidate_admission(
+                    &session,
+                    &candidate,
+                    &removed,
+                    &[],
+                    &BTreeSet::new(),
+                )
+            },
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(admission.targets_ok && !admission.refuses_candidate());
+        assert_eq!(session.preflight_targets.borrow().len(), 1);
+        assert_eq!(metadata.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod backlog_transfer_tests {
+    use super::session_fixture::ScriptedSession;
+    use super::*;
+
+    fn loader_record_for(context: LoaderContextId, pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LOADER;
+        record.case_id = (context.get() - 1) as u8;
+        record.pid_tgid = u64::from(pid) << 32;
+        record
+    }
+
+    fn exec_record_for(pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_EXEC;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.hook_ts_ns = u64::MAX;
+        record
+    }
+
+    fn leader_exit_record_for(pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = u64::from(pid) << 32;
+        record
+    }
+
+    fn terminal_export() -> DynamicExportIdentity {
+        DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        }
+    }
+
+    fn queued(record: DiscoveryRecord) -> QueuedDiscoveryRecord {
+        QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }
+    }
+
+    /// H5 transfer seam: deferred leader exits stay owned while the
+    /// backlog quantum's nested pulls run, so they count against the
+    /// nested budget. At full occupancy the retirement drain reads
+    /// nothing fresh past the shared allowance.
+    #[test]
+    fn deferred_exits_count_against_backlog_nested_pull_budget() {
+        const DEFERRED: usize = 8;
+        const SPARES: usize = 16;
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        engine.scope = Scope::System;
+        // A full take: loader records for the retiring view plus
+        // deferred exits for unknown pids; the rest fills occupancy
+        // with filler that never names the retained pid.
+        for _ in 0..(LIVE_DISCOVERY_DRAIN_QUANTUM - DEFERRED) {
+            engine
+                .pending_discovery_records
+                .push(queued(loader_record_for(owner, pid)));
+        }
+        for index in 0..DEFERRED {
+            engine
+                .pending_discovery_records
+                .push(queued(leader_exit_record_for(7_000_000 + index as u32)));
+        }
+        for index in 0..(DISCOVERY_HELD_CAP - LIVE_DISCOVERY_DRAIN_QUANTUM) {
+            engine
+                .pending_discovery_records
+                .push(queued(exec_record_for(5_000_000 + index as u32)));
+        }
+        assert_eq!(engine.pending_discovery_records.len(), DISCOVERY_HELD_CAP);
+        let mut session = ScriptedSession::default();
+        session.detach_exports = vec![terminal_export()];
+        session.dequeues.extend((0..SPARES).map(|_| {
+            Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            )))
+        }));
+        engine
+            .service_backlog_quantum(&mut session)
+            .expect("the backlog quantum runs");
+        assert_eq!(
+            session.dequeues.len(),
+            SPARES,
+            "no fresh reads past the shared allowance"
+        );
+        assert!(
+            engine.discovery_held_len() + session.staged_discovery_len() <= DISCOVERY_HELD_CAP,
+            "retained holdings stay within the shared allowance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod view_log_tests {
+    use super::*;
+
+    #[test]
+    fn view_log_records_allocations_and_releases_with_gapless_ordinals() {
+        let mut engine = Engine::empty();
+        assert!(engine.view_log().is_empty());
+        let first = engine.allocate_view_id().unwrap();
+        let second = engine.allocate_view_id().unwrap();
+        assert_eq!(engine.view_log().len(), 2);
+        let ordinals: Vec<usize> = engine
+            .view_log()
+            .iter()
+            .map(|entry| entry.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 2]);
+        assert!(
+            engine
+                .view_log()
+                .iter()
+                .all(|entry| entry.kind == ViewLogKind::Allocated)
+        );
+        assert!(
+            engine
+                .view_log()
+                .iter()
+                .all(|entry| entry.armed == ViewLogArmed::Unarmed)
+        );
+        engine.release_view_id(first);
+        engine.release_view_id(second);
+        assert_eq!(engine.view_log().len(), 4);
+        let kinds: Vec<ViewLogKind> = engine.view_log().iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ViewLogKind::Allocated,
+                ViewLogKind::Allocated,
+                ViewLogKind::Released,
+                ViewLogKind::Released,
+            ]
+        );
+        let ordinals: Vec<usize> = engine
+            .view_log()
+            .iter()
+            .map(|entry| entry.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 2, 3, 4]);
+    }
+}

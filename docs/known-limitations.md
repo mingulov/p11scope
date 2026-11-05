@@ -1,5 +1,822 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+# Known limitations (v0.6.0)
+
+v0.6.0 answers "which application used which key, and how": inventory
+captures gain opt-in live key operations with per-category counts, and
+a counter capture can promote one endpoint to full detail while the
+rest stays aggregate. The list below is current for this release; the
+entries under Prior releases retain their historical context.
+
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+Strict scale and speed limits apply to captures actually using Multi. Eligible
+scoped Singles stays correct, finite and disclosed in `observation.attach` and
+`evidence.attach_backend`; it does not establish Multi performance coverage.
+Readiness bounds are disclosed harness parameters, never a cold-start SLA.
+
+## Known limitations in 0.6.0
+
+The following limits apply to the v0.6.0 release. Entries marked
+"verify at candidate" rest on the current integration tip and the final
+integration may still move them; the candidate pass confirms the numbers.
+
+- Key operations sustain 6,250 calls/s for 60 s with exact per-key rows
+  and no capture loss in every measured run at that rate; plain call
+  counts stay exact at 10,000 calls/s for 60 s. Above 6,250 calls/s the
+  16 MiB event ring can overflow between reads and key-operation
+  tracking ends with a named gap. Sustained 10,000 calls/s for key
+  operations is planned for 0.7.0. (verify at candidate: the final
+  integration re-runs the rate campaign)
+- Key-operation rows lag their calls: p99 from call return to visible
+  row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two
+  qualified 60 s runs), against the 1.5 s target; under host load it
+  rises toward about 4 s. (verify at candidate)
+- Key-operation tracking may not start at all in about 1 in 4 runs (3
+  of 12 measured cells, at every call rate): no birth is offered for
+  the tracked process, reported as `joint_birth_unoffered` with "Joint
+  birth unavailable; retained S1". Plain call counts stay exact in
+  those runs. (verify at candidate: a diagnosis lane is still working
+  this startup race)
+- On busy hosts the kernel can skip re-entrant runs of the mapping
+  hooks; each skip raises a new fault era. Calls across the skip are
+  shed with exact counts and a named cause, affected instance rows read
+  `uncertain`, and key-operation tracking ends with its own named gap
+  (`joint_seal_fault_changed_history_loss`) while plain counting
+  continues. (verify at candidate: the final integration adds an
+  explicit "continuity uncertain" flag on merged rows plus hook-miss
+  totals on the stop line)
+- A call from an untracked process that is still in progress when key
+  operations are sealed cannot be accounted for, so tracking ends
+  after about 6 s with a `joint audit made no progress` gap instead
+  of waiting for the run deadline. This ends tracking; it never
+  hangs, and the plain per-call counts are unaffected.
+- The memory of refused processes holds 16,448 entries. Past that,
+  every new untracked caller keeps the plain per-call view with the
+  same `joint_image_refused` reason; processes refused earlier stay
+  refused and tracked callers are unaffected. At one new foreign
+  client every 3 seconds that is about 14 hours of capture.
+- About 0.5% of `run` captures on overloaded hosts miss startup
+  entirely: the kernel delivers neither loader nor lifecycle records
+  for the whole run, so the child runs unwatched. Those runs report
+  PARTIAL (incomplete) with the named cause "loader BPF delivery
+  failure suspected"; no run reports a wrong count. No miss was seen on
+  quiet hosts (0/120 on Fedora). (verify at candidate)
+- A child process can use a provider before it is watched: calls made
+  before the watch starts are missed, and the affected watch reads
+  `unknown` with reason `use_before_admission`; the JSON also carries a
+  `before_semantic_boundary` gap ("physical provider use preceded first
+  observed semantic registration") and the late provider's unwatched
+  window. Affected runs read PARTIAL. Hold the child with `run --pause
+  auto` or keep it alive past attach. (verify at candidate: confirm the
+  exact incomplete marking)
+- Container providers carry named unproven cases: the container checks
+  use one kind node, and multi-node clusters, CRI-O and the cgroupfs
+  driver are not exercised. Docker shared image layers and copy-up, the
+  kind DaemonSet, attach into a pod, a pre-attached provider in a new
+  pod, a Knative pod scaled from zero, and a node-wide late provider (a
+  reported boundary) are the exercised shapes. A process that loaded a
+  provider before a copy-up is still attributed to the copied-up file
+  and its later calls are missed; restart such processes. (verify at
+  candidate: the final integration may add an overlay-identity witness
+  with its own named loss)
+- If the overlay-identity witness lands, each pass proves a different
+  8 refused callers: with more than 8, every caller alternates
+  between joined and the named loss across passes. While a caller
+  waits for its turn, its edge reads uncertain and its in-flight
+  operations end as unknown. (verify at candidate: the witness may
+  not land; without it the named loss stands every pass)
+- Strict speed claims apply only on kernels with working uprobe_multi,
+  normally 6.6 and newer: the rate and latency numbers above were
+  measured there. Older kernels stay correct with a finite stop but are
+  not speed-qualified; live capture refuses there with
+  `uprobe-multi-required`. (verify at candidate)
+- Per-key rows need p11scope to see the process start, or the provider
+  load, after capture begins. With `--pid` on an already-running
+  process whose provider is already loaded (for example a running
+  Firefox), object observations read `bootstrap_unavailable` and no
+  per-key rows are produced; call counts, mechanisms and the rest of
+  the inventory still work. To see key operations for an application,
+  start the observer first (`--system`, or a cgroup scope), then
+  launch the application (for Firefox: start the capture, then start
+  Firefox); an already-running process gives plain counts only. A
+  design that learns key facts from handles seen after capture start
+  is v0.7.0 work.
+
+Under a saturating multi-threaded flood (twelve threads spinning PKCS#11
+calls for 5 s, about 190,000 calls/s), the userspace drain can lose ring
+events on small hosts: on a quiet 3-vCPU sm1 host the twelve-thread
+flood lost 356,859 of ~976k events, disclosed as `event_loss` with
+PARTIAL coverage, while the same-volume six-thread flood completed
+947k calls with zero loss (sm1 live-triage measurements). vng guests
+(6.6/6.12/6.18/7.0/7.3.1) hold the twelve-thread flood
+in the same runs, except one v6.12 guest `mt-exact` failure observed in
+the same campaign — loss-free at twelve threads is typical off the
+small host, not guaranteed. For exact captures under a synthetic flood,
+size the workload to about two producer threads per CPU; no
+real-application rate is claimed.
+
+Measurement modes aggregate on eligible LP64 hosts, subject to independent
+feature/load limits. A refused counter-mode or Detailed start exits nonzero
+without writing a report or starting the requested `run` program. Latency
+banks grow with
+the host possible-CPU count and refuse with `counter-memory-limit`
+past the per-capture kernel-map memory cap on hosts with many CPUs.
+Counter banks share one 65,536-entry return-value pool, and
+saturation is reported in the collection health. Per-call
+profile/trace capture stays fixed at 512 attach slots (2,112 only in
+the WIDE source build). A recognized proxy closure array (p11-kit's fixed
+wrapper tables) is decided after all providers in every scope: whole when
+it fits (late-start, reserve-capped), otherwise a reserve-capped
+leading-templates prefix with a named partial gap only when the capture's
+first plan held the closure beside a non-closure provider, or when its
+opened file matches an operator-named `--module` path, and its published
+tables only when unnamed (mapped mid-capture, or alone in the first plan)
+— refused whole when none of those admit. Shared scope (`--system`,
+`--cgroup`) admits the same reserve-capped prefix with the same named
+`closure_prefix` partial gap. Its 6,530+
+endpoints exceed every current ceiling, so the proxy layer itself is only
+ever covered by that prefix (late-start beside a provider, or
+operator-named) or its published tables (mid-capture, or alone in the first
+plan) while the backends behind it attach (costs of covering
+it are
+measured in `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
+An ordinary provider that does not fit whole in a shared-scope Detailed
+capture is likewise admitted on the leading-tables prefix that fits,
+with a named `provider_prefix` partial gap stating attached versus
+needed endpoints; it is refused whole only when not even its strongest
+table fits within its reserve-aware budget, or when its corroborated
+(published) tables together do not fit — published tables stay atomic,
+since spilling one as uncorroborated would mislabel corroborated
+evidence. Inventory, counter and broad admission keep their
+complete-union whole rule.
+
+Endpoint selection (`--select-endpoint` with `--mode metrics` and
+`--counter-mode`) details one function from the broad counter's own
+cells between a selection-time read and the close read. It resolves
+on `--pid` and owned-`run` captures only; `--cgroup` and `--system`
+refuse by name. The name resolves once at start; a provider loaded
+after start needs `--prearm-module <provider.so>` (with `run`, usually
+required). If the watched process replaces itself (exec) between
+the two reads, the slot retires, the close boundary cannot be proven
+clean, or discovery ring loss, read failures, or truncation grow
+inside the window, the detail is withheld with a named reason while
+aggregate counts continue. A leader exit that is the last lifecycle
+record ends the window cleanly and the detail renders the calls made
+before the exit. Loader scans left unfinished by the exit itself, and
+loader rejects the exiting process explains, are counted apart as
+exit-only and do not void the detail; other truncation still counts,
+including loader rejects the observer cannot tie to the exit. Those
+withhold the detail as `broad_stopping`, so an owned `run`
+child that loads and exits at once may still void intermittently (about
+1 in 10 runs in local testing). A child that keeps running for a
+few seconds after its provider loads is unaffected (measured with a
+3-second gap). Each bracketing read samples the return-value table
+before the slot counters, so a call that completes between the two
+passes leaves a torn window and the detail is withheld as
+`broad_plan_topology`; against a busy `--pid` target this can withhold
+most windows.
+With `run`, a host whose kernel and userspace monotonic clocks cannot
+be compared (a time namespace offset, or a kernel without the time
+namespace files) refuses the selection as `promotion_scope_unsupported`.
+
+A capture follows at most 256 provider loads and tracks at most
+16,384 program images; past either limit the report carries a named
+gap and reads PARTIAL (full entries below). Stopping a very large
+capture can refuse its fixed 384 MiB graph pool: the stop ends as a
+finite incomplete stop, with retired objects still reported attached
+and the measured peak disclosed (full entry below).
+
+A timed run shorter than the first full pass (5–10 s on a busy host)
+discards the collection and reports 0 callers with a `no complete
+collection pass` gap and one informational stderr line. The first
+calls a provider makes after a late load can be missed before its
+probes land, and use before admission voids that watch (`unknown`,
+`use_before_admission`). Very short-lived callers can stay unbound or
+unattributed (see below); the `--track-short-lived` opt-in mode
+classifies their gaps into static-linkage hints and exit-time mapping
+verdicts instead of leaving bare counts, but full call attribution
+for them is still planned.
+Short-lived processes missed at system scale are counted only as gaps
+(`pid_descendant_gaps`); their calls through attached providers still
+count. A process whose main thread had already exited when the capture
+first met it is not admitted, and its calls are not counted.
+Every process admitted after the initial membership sweep — a fork child,
+an ambient fork, any newcomer — and every leader exit that matches no
+admitted generation counts `pid_descendant_gaps` and keeps the observation
+lossy, even when the owned counts prove exact. The gap is a true
+disclosure, not an over-broad one: between the process's birth and the
+observer's admission (and loader arming), it could have mapped, used, and
+unmapped a provider the observer never attached, leaving no trace the
+later scan could find. A capture whose scope forks, or a `--system`
+capture on a machine with any process churn, is therefore inherently
+`PARTIAL` on this axis; exact observation needs a quiescent scope. Loader
+hits are different: a load whose record resolves benignly — accepted,
+scan complete, no new provider, no suspicious close — is counted in
+`loader_discovery.benign_hits` and no longer gates exactness. What still
+gates it is an unaccounted hit: a new provider (a true late window), a
+close nobody's mapping explains, an incomplete scan, or a lost record.
+
+If a process exits while loader inspection is still pending, the report may
+include a `discovery_truncated` gap. Unread metadata remains unavailable;
+call coverage is evaluated separately.
+A post-exec instance whose semantics cannot be proven appears as a
+named gap (`gap [instance semantics refused] instance_unproven`), not
+a joined instance. If a multi-threaded program unloads and reloads a
+provider at the same address between two scans, the capture shows one
+instance; per-caller call totals are unaffected. Finalizing and
+re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
+is also one instance.
+
+v0.6.0 reports key operations when opted in with `inventory
+--key-operations` and rows populate: the `key operations:` line then
+counts completions per operation category, and the JSON report carries
+the rows under `object_observations`. Without the opt-in, or on a build
+without the journal object, the line reads `not reported (per-key
+tracking is off)`. A
+linked capture whose tracking never starts reads `unavailable
+(bootstrap_unavailable)`. Mechanisms and API results are reported as
+before. An ordinary native-retirement refusal during a `--manifest`
+capture ends the first stop with an incomplete report and a nonzero
+exit. Uncertain native ownership stays retained and replacement
+admission stays blocked; the refusal is not proof of clean detach.
+
+In v0.6.0 release builds, key operations use the per-key-tracking opt-in
+`p11scope inventory --key-operations` (default off),
+with the following birth-marker limits. If any watched call of a program is
+not fully captured — the call ran outside the selected scope, its binary
+interface was refused, or the call was dropped (a lost identity, start record
+or ring slot, or a thread killed in the middle of the call) — that program
+gets no key-operation rows for the rest of the capture. The program's call
+counts and per-function summaries continue; only its key-operation rows stay
+absent. For scope misses, widen the scope (`--cgroup` or `--system`);
+otherwise re-run the capture.
+
+Each recording can newly cover only a fixed number of programs (about 16.8
+million). Once that budget is spent, programs already in the report keep their
+key-operation rows, but programs started afterwards get none. Call counts
+continue for all programs. This happens only in very long captures or under
+extreme program-start churn; ordinary runs never reach the budget. Split the
+capture into shorter runs to stay under it.
+
+On 5.15 kernels, a program that starts while the kernel is momentarily busy
+recording it can miss coverage entirely: its later calls are counted but never
+joined to key-operation rows. This loses coverage for that program only; it
+never produces a wrong row. Re-run the capture so the program starts cleanly.
+
+Under `--pid`, only the named process contributes key operations; it stays
+covered when it replaces itself with a new program in place (an exec keeps the
+same process). Programs it starts while the capture runs (children) are not
+observed, even when they call the same provider. One narrow exception, with
+`--attach-backend singles` only: a child started with vfork (as with
+posix_spawn) that still shares the target's memory and calls the provider before
+starting its own program is marked as not covered. With `multi` the kernel drops
+such a call before p11scope sees it, so the child is simply not observed.
+(`auto` can pick either.) Neither case is verified live yet.
+
+At very high call rates the kernel's event ring of a native inventory capture
+can fill before p11scope reads it. The kernel then refuses new records but
+counts them, and p11scope reports every refusal: the report carries a
+`native capture events lost` gap, the stop line carries a separate `lost`
+count, and `observation.semantic_capture.events_lost` holds the same total.
+These records are counted only there, never in `unrouted_returns` or in the
+stop line's shed count. If p11scope cannot read the kernel's counter, the
+report carries a `native capture events loss unknown` gap instead, and
+`events_lost` is never lower once the counter has been read; until a later
+read succeeds it may undercount the real loss (the kernel's counter is
+cumulative, so that read restores the exact total). Two
+limits apply. Prompt draining of a full ring applies only when the capture has
+fallen back to its older path (after a `joint machine unavailable` gap), so it
+does not raise the call rate an ordinary capture keeps up with. The counter
+also counts records, not calls: under `--cgroup` or `--system`, a refused
+process-start (fork) record counts as one lost call, so the reported loss can
+be higher than the number of calls actually lost, never lower.
+
+A `semantic admission deferred` gap (reason
+`semantic_unavailable:no_receipt`) is a note, not a loss. It means a
+discovery pass could not yet scan a caller (usually one that has made no
+provider call the kernel has seen yet), so key-operation tracking for that
+caller starts at a later pass. Calls the caller makes in the meantime wait for that pass and are
+counted. If the caller is never admitted (for example, it exits first), each
+call it made is shed and reported under the separate
+`semantic calls unrouted` loss gap. Waiting calls also share one
+capture-wide queue of 1,024 calls: past it, later calls are shed even
+while their caller is still waiting to be admitted, and are reported in
+the same gap (`pending_capacity=N`). Every other
+`semantic admission refused` reason still marks a loss.
+
+In containers, a process that loaded a provider before the file was
+copied up is attributed to the copied-up file and its later calls are
+missed, with no marker in the output; restarting such processes is the
+workaround, and the kernel identity backend does not help (full entry
+below).
+
+Identity checks through the userspace backend need extra per-file checks on
+btrfs to identify mapped providers correctly. This affects
+`inventory --system --identity-backend userspace` and the userspace fallback
+when kernel identity is unavailable. A Fedora Linux 7.2.9 comparison of GNU
+builds using Rust 1.99.1, 400 processes and 8 mock providers on btrfs completed 10
+matched rounds with equal coverage. Against the earlier identity implementation,
+confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%); whole-pass p95 rose from
+255.444 to 288.012 ms (+12.75%). Those figures are the 2026-10-27 campaign
+(POST `b58ef1b5ec41bcb793b8741c3fc5ba62ae849d8e`, PRE R-14 `96624556`;
+H4A FAIL with coverage ok; paired-median total +6.50%, bootstrap 95%
+upper +8.10% within its 10% bar, wall ok; record
+`tmp/codex-v050/h4a-b58-status.md`). A second 2026-10-31 campaign at
+POST `ba92b4e2c29fc4db97b870ec1f0b28d4acabebef` (same PRE, same
+400-process/8-provider Btrfs shape, 40/40 runs) is also H4A FAIL with
+coverage ok: confirm-stage p95 168.529 to 178.216 ms (+5.75%),
+whole-pass p95 612.2 to 850.9 ms (+39.00%; absolutes derived in the
+analysis, the gate prints only the percentage), paired-median total
++37.83%, CI95 upper +43.53%, wall ok (controller record
+`tmp/muse-jobs/h4a-qual-verdict.md`, analysis `tmp/muse-jobs/616-analysis.md`).
+Absolute times are not comparable across campaigns, only
+within-campaign ratios are. These are measured costs for that workload, not
+bounds for every host. The default `--identity-backend auto` uses kernel
+identity where available. Further userspace speed work is unscheduled: the
+measured cost stands as disclosed until feasibility measurements identify
+removable work.
+
+On some overlayfs setups before Linux 6.8, p11scope may be unable to
+prove how a provider file appears in /proc maps: the opened file and
+its mappings legitimately carry different keys there, and the kernel
+check that reconciles them can come back inconclusive. The provider
+pin then carries the note `provider's maps rendering unproven;
+callers mapping it may stay unbound`, and callers mapping that provider
+may stay unbound. This key split does not happen on Linux 6.8 and later.
+
+On kernels before 6.8, two pre-arm shapes still disclose instead of
+joining. A manifest accepted without a scan in view, with the scan
+arriving on a later tick, keeps the manifest module on the fd-keyed
+entry while the scan files the maps-keyed entry; the live rebuild never
+re-files the manifest alias, so that tick still fails with `candidate
+contains the same exact provider more than once` (the initial build
+joins both halves, and the live rebuild joins the pre-arm half). And a
+live 6.6 capture whose scan and pre-arm halves join across the live id
+change keeps `unobserved_windows` as `[late_discovery,
+mapped_unattached]`: the exactness proof maps are keyed by object id
+and cannot span the fd-to-scan id change, so the windows stay disclosed
+rather than reading `[]`. Both are fail-closed disclosures; the
+structural merge, evidence union and exact observation hold.
+
+File identity on some filesystems has known edge cases, found by a
+dedicated test study on 2026-11-03 (Linux 7.0) and not yet covered by
+automated tests:
+
+- Btrfs: p11scope caches what it learned from inspecting a provider file,
+  keyed by the device and inode number shown in /proc maps, file size and
+  change time. That key does not include the Btrfs subvolume. Two different
+  files in two subvolumes created back to back matched on the whole key in
+  39 of 40 tries, so a later scan could reuse one file's inspection results
+  for another. This was reproduced at the file level only, not yet through a
+  full p11scope capture.
+- Btrfs snapshots keep the inode number, size, change time and content, and
+  a deleted subvolume's device number is reused at once by the next
+  subvolume or by an unrelated tmpfs or FUSE mount. An identity kept after
+  its file is released can therefore name a different file.
+- FUSE filesystems, and tmpfs mounted with `inode32`, can show two live
+  files with different content under identical identity values, including
+  the `/proc/<pid>/map_files` identity. File sweeps refuse FUSE, but other
+  identity checks do not yet, and none of them treat `inode32` tmpfs as
+  non-unique.
+- The overlay copy-up case described above also reproduces on Linux 7.0.
+- XFS, EROFS, squashfs, FUSE, `inode32` tmpfs, Btrfs snapshots, device
+  number reuse and same-path files in different mount namespaces are not
+  exercised by automated tests yet.
+
+These are edge cases for typical desktop and server systems. A fix for the
+Btrfs cache key, a non-unique-inode refusal on every identity check, and a
+filesystem test matrix in CI are planned for 0.7.0.
+
+Provider function tables can contain NULLs, unusable entries or fewer readable
+words than their version label suggests. Discovery retains usable targets
+around those gaps; an unread word is never treated as an observed NULL.
+Version metadata alone does not require a wider table. If the evidence cannot
+justify an API name, its target remains observable as `unknown`, count-only.
+Actual unavailable entries and incomplete observations remain disclosed.
+
+A `profile` or `trace` output has no per-run marker for calls made
+before a provider's probes landed, so a missed early burst reads the
+same as no calls. Inside a nested PID namespace (a kind node, a
+hostPID pod) a newly started process waits for the full discovery
+sweep, up to about 7 s, before its provider is attached. A late
+provider whose calls finished before its watch began shows that
+unwatched window in the JSON (`first_seen_ns` earlier than
+`since_ns`).
+
+A process that loads a provider, makes one call within about a
+millisecond, and unloads is not observed without `run --pause auto`.
+On Linux 7.0.14, for the four provider shapes measured under `p11scope
+run --trace` (32 runs at 0/10/100/1000 us load-to-call delays) with
+the default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
+each reporting PARTIAL with a proven drain and zero event loss: the
+transient exits before discovery attaches anything (0 slots, no
+modules). With `run --pause auto`, which holds the child at each
+loader hit until its probes attach, the same 32 runs captured the
+call every time (0 missed), but the caller stayed `Unknown executable`
+(0 attributed): a one-call transient leaves no second witness to name
+it. A repeat run on Fedora (Linux 7.2.9) with the same 32 runs showed
+the same split: with `--pause never` all 32 missed the call
+(0 attributed); with `--pause auto` all 32 captured it (0 missed) and
+the caller stayed `Unknown executable`. So for bursts of this shape,
+expect a load, one call, unload burst inside ~1 ms of the load to read
+the same as no calls unless the child is held with `--pause auto` or
+kept alive past attach. Only two kernels, four provider shapes and
+`run --trace` were measured.
+
+Container checks run for v0.5.0, each counted against an independent
+call ledger: Docker shared image layers and copy-up (Linux 7.0, and
+Fedora on Linux 7.2.9 with a private Docker daemon; since v0.6.0 the
+copy-up cells assert the stale mapper is unknown with the
+`original_file_unproven` gap and the fresh mapper exact), the kind
+DaemonSet, `attach-pod` into a kind pod from the node, a pre-attached
+provider in a newly created pod, a Knative pod scaled from zero, and a
+node-wide late provider that stays a reported boundary. They use one
+kind node; multi-node clusters, CRI-O and the cgroupfs driver are
+still not exercised.
+
+The Knative warm capture observed all 1,200 calls after attachment. The first
+cold request began before probes attached and observed only 84 of 1,200 calls,
+with no kernel event loss. That cold result is a disclosed pre-attachment
+coverage limit; it does not establish complete cold-start capture. Warm
+qualification still requires exact counts.
+
+The final 1,800-second SYSTEM+manifest soak passed on Fedora Linux 7.2.9
+with the default FULL build: a 1,860-second observation window captured
+162,003 calls from each of two callers, with zero lifecycle ring loss and a
+proven final drain. Maximum sampled RSS was 75.5 MiB (78.9 MiB recorded
+high-water mark). Semantic accounting separately
+reported 324,004 joined calls, two shed calls and 651 named-budget refusals;
+key operations remained unavailable. This is a measured 30-minute workload,
+not complete semantic attribution or a guarantee for other workloads. The
+earlier failed exact-count/final-drain run remains a historical failure.
+Longer runs (4 h, 24 h) remain unqualified. Startup and stop figures are
+declared per kernel, not a product guarantee.
+
+At high call rates the semantic lane can lose EVENTS records faster
+than it drains them: when the kernel ring is full it refuses new
+records (counted in `EVIDENCE_RING_LOSS`, never silently
+overwritten), and the observer discloses the cumulative loss in a
+`native capture events lost` gap with exact counts on the stop line
+(`lost`) and in `observation.semantic_capture.events_lost`. The
+counter counts records, not calls: at system/cgroup scope a refused
+FORK marker counts too, and on a linked (`--key-operations`) capture
+one call writes up to two records (its journal BEGIN and its END, or
+an ABANDON in place of the END), so one lost call can count up to
+twice. A linked capture therefore loads a 16 MiB EVENTS ring (about
+1.9 s of 10,000 calls/s; every other capture keeps 4 MiB), which costs
+12 MiB more locked kernel memory while that lane is active. The ring is
+read only between seals of the key-operation lane, so a seal longer than
+the ring's headroom still loses records, disclosed as above. Prompt saturated-tick commits apply to
+legacy lanes only; joint-machine lanes service the machine instead
+and disclose loss at each publish. Measured sustained rate (one
+busy 12-CPU development host, release observer): without
+`--key-operations`, every call was joined at 10,000 calls/s for 5, 20
+and 60 seconds with no lost records, and entry-to-apply p99 stayed at
+or below 236 ms; this excludes the time until the next publication.
+With `--key-operations`, the v0.6.0 measurements in
+[Known limitations in 0.6.0](#known-limitations-in-060) supersede the
+older lane numbers: key operations sustain 6,250 calls/s for 60 s with
+exact rows (plain counts stay exact at 10,000 calls/s), and
+key-operation rows lag their calls by about 1.6-1.9 s p99 in quiet
+runs. The older 1,000 calls/s ceiling and mid-run `authority_lost`
+stall describe the pre-integration lane, not this release. (verify at
+candidate: the final integration re-runs the rate campaign)
+
+In long system-wide runs, a live publication can rarely stop making
+progress. After 6 seconds without progress, p11scope abandons that
+publication with a named gap and keeps running, and the report marks
+coverage as partial. The capture does not hang, and nothing is
+silently dropped. Fixing the underlying stall is planned for a later
+release.
+
+`--prearm-module` pins the named provider before any mapping and watches
+its proved offsets (`watch` on the discovery record, with `attached_at_ns`
+and `unobserved_windows` merged at capture end). A quiet pre-armed interval
+is a stated watch interval, not proven-exact coverage, except on an owned
+`run` whose every declared probe attached at or before the barrier release
+while the barrier held the child from its start and whose pause gate
+completed a gap-free first epoch: that capture publishes an explicitly
+empty `unobserved_windows` on the pre-armed module. A `profile` or `trace`
+capture (`--pid`, `--cgroup`, `--system`; detailed and `--mode metrics`)
+whose mapping-instant witness finalized `Clear` for the object with every
+ordering condition met publishes one too.
+Every other capture still discloses its window, including any declared stamp
+dated after the release, and a missing `unobserved_windows` key claims
+nothing. `run` carries no ordering-evidence proof (the witness is inert
+there), nor does inventory. Spurious windows
+stay possible where attribution is conservative: provider unmaps by
+multi-threaded non-member processes, by remote and kthread contexts, member
+migrations within the subtree, and microsecond-scale latch/torn/pending
+events at close. Measured idle rate: 0 spurious windows in 186 runs on a
+busy desktop and Fedora (184 `[]`, 2 honestly absent;
+~1% unknown rather than a false claim). The finalize walk delays the ready
+line only with `--prearm-module`: about 0.2 s extrapolated on a 300k-VMA
+desktop (the pre-measurement estimate was 0.1 s), 0.71 s
+measured at 1M VMAs in a guest. Limits: at most 64 watched files, the
+observer must run in the initial pid namespace, LTO kernels are refused, and
+the walk fails closed past its 10 s deadline.
+Inventory accepts and retains pre-arm inputs, attaches proved offsets
+through the inventory lane, and reports one interval row per input in
+`prearm[]`. An in-place rewrite that preserves `(ino, size, ctime)`
+at the filesystem's granularity is undetectable by the retained-fd checks;
+heavier proof is later work.
+
+Extensive mode (`--track-short-lived`) publishes a `gap_exe_hints`
+split beside `pid_descendant_gaps`, labelled `STATIC HINT`. A hint
+resolves the dead executable's identity only against paths live scans
+already learned: a binary no scan ever saw (no newcomer scan before
+its exit, no surviving same-binary process) classifies `unknown`, as
+does anything past the published budgets (depth 2, 32 objects, 128
+edges, 1 MiB per executable, 64 MiB per capture, 255-byte names).
+`dlopen`-only provider use is invisible by design and reads
+`no_static_link_within_scope`, never a use claim. Inventory captures
+do not arm extensive mode yet, so they publish no split; trace,
+metrics, exact-`--pid` and owned-`run` captures likewise never arm
+it (the flag records no exe identity there). Hints never
+move call or attribution shares; exit records still settle no birth,
+admission, absence, or call (R57).
+
+The same opt-in publishes a `gap_exit_mappings` split beside
+`pid_descendant_gaps`: at exit the kernel reports the
+watched-provider slots it had recorded for the leader. `mapped`
+means a slot named a watched provider file with no disqualifying
+refusal; everything else reads `unknown`, including two systematic
+blind spots. Multi-threaded exits read `unknown`: a process with
+more than one mm user never localizes its mappings, so its empty
+slots are not a negative. Late watches read `unknown`: a watch
+inserted between the process's exec and its exit cannot see
+mappings established before it. Shared-mm exits, refused hooks,
+and local faults likewise read `unknown`. Admissions and overflow
+sentinels carry no verdict, and there is no "did not map" claim:
+nothing here proves a process did not map a watched provider.
+The live cell qualifying this split builds its fixtures on guest tmpfs
+inside virtme-ng guests rather than under `TMPDIR`, so a host `TMPDIR`
+naming the shared 9p tree cannot lend the fixtures remapped ownership
+or device identity.
+
+## Planned for later versions
+
+Shipped in 0.6.0 and no longer planned: live key operations
+(`inventory --key-operations`) and promoting one endpoint to full
+detail during a counter capture (`--select-endpoint`).
+
+- Ordering-evidence pre-arm exactness producer for non-`run` scopes,
+  inventory Detailed-subset activation, and same-granularity rewrite proof
+  (packet 6.13 follow-ups).
+- Longer bounded runs (4 h, 24 h).
+- Faster teardown on kernels without uprobe_multi.
+- A per-mechanism counter view and per-mechanism key-operation rows.
+- Journal/key-operation uniformity for unregistered mechanism ids
+  (0.7.0): in v0.6.0 key-operation rows name only registered
+  mechanisms.
+- A named unknown edge for a late provider's unwatched window.
+- Accounting for remaining exit-caused loader rejects that lack a
+  pid-and-hook-time binding to the ended process as exit-only, to
+  further cut the short-run void rate.
+- Tracking short-lived processes that exit before their first binding
+  (exit-time mapping verdicts shipped; full call attribution still planned).
+- Parallel BPF program loading for faster startup.
+- File identity edge cases on Btrfs subvolumes and snapshots, FUSE and
+  `inode32` tmpfs, with a filesystem test matrix in CI (0.7.0).
+- Post-quantum key details, cluster aggregation, telemetry,
+  enforcement, AArch64, extra capture fields and syscall/network
+  correlation.
+
+## Prior releases
+
+# Known limitations (v0.5.0)
+
+v0.5.0 release builds read object attributes by default (FULL); the P0
+build without attribute reads stays an explicit option. The entries
+under Prior releases below retain their historical context. Current host
+admission below supersedes their old kernel-floor and fallback claims.
+
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+Strict scale and speed limits apply to captures actually using Multi. Eligible
+scoped Singles stays correct, finite and disclosed in `observation.attach` and
+`evidence.attach_backend`; it does not establish Multi performance coverage.
+Readiness bounds are disclosed harness parameters, never a cold-start SLA.
+
+Measurement modes aggregate on eligible LP64 hosts, subject to independent
+feature/load limits. A refused counter-mode or Detailed start exits nonzero
+without writing a report or starting the requested `run` program. Latency
+banks grow with
+the host possible-CPU count and refuse with `counter-memory-limit`
+past the per-capture kernel-map memory cap on hosts with many CPUs.
+Counter banks share one 65,536-entry return-value pool, and
+saturation is reported in the collection health. Per-call
+profile/trace capture stays fixed at 512 attach slots (2,112 only in
+the WIDE source build).
+
+A capture follows at most 256 provider loads and tracks at most
+16,384 program images; past either limit the report carries a named
+gap and reads PARTIAL (full entries below). Stopping a very large
+capture can refuse its fixed 384 MiB graph pool: the stop ends as a
+finite incomplete stop, with retired objects still reported attached
+and the measured peak disclosed (full entry below).
+
+A timed run shorter than the first full pass (5–10 s on a busy host)
+discards the collection and reports 0 callers with a `no complete
+collection pass` gap and one informational stderr line. The first
+calls a provider makes after a late load can be missed before its
+probes land, and use before admission voids that watch (`unknown`,
+`use_before_admission`). Very short-lived callers can stay unbound or
+unattributed (see below); tracking them needs a later opt-in mode.
+Short-lived processes missed at system scale are counted only as gaps
+(`pid_descendant_gaps`); their calls through attached providers still
+count. A process whose main thread had already exited when the capture
+first met it is not admitted, and its calls are not counted.
+
+If a process exits while loader inspection is still pending, the report may
+include a `discovery_truncated` gap. Unread metadata remains unavailable;
+call coverage is evaluated separately.
+A post-exec instance whose semantics cannot be proven appears as a
+named gap (`gap [instance semantics refused] instance_unproven`), not
+a joined instance. If a multi-threaded program unloads and reloads a
+provider at the same address between two scans, the capture shows one
+instance; per-caller call totals are unaffected. Finalizing and
+re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
+is also one instance.
+
+This version reports no key operations, so the `key operations:`
+line always reads `not reported by this version (planned for 0.6.0)`;
+mechanisms and API results are reported as before. An ordinary native-retirement
+refusal during a `--manifest` capture ends the first stop with an incomplete
+report and a nonzero exit. Uncertain native ownership stays retained and
+replacement admission stays blocked; the refusal is not proof of clean detach.
+
+In containers, a process that loaded a provider before the file was
+copied up is attributed to the copied-up file and its later calls are
+missed, with no marker in the output; restarting such processes is the
+workaround, and the kernel identity backend does not help (full entry
+below).
+
+Identity checks through the userspace backend need extra per-file checks on
+btrfs to identify mapped providers correctly. This affects
+`inventory --system --identity-backend userspace` and the userspace fallback
+when kernel identity is unavailable. A Fedora Linux 7.2.9 comparison of GNU
+builds using Rust 1.99.1, 400 processes and 8 mock providers on btrfs completed 10
+matched rounds with equal coverage. Against the earlier identity implementation,
+confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%); whole-pass p95 rose from
+255.444 to 288.012 ms (+12.75%). These are measured costs for that workload, not
+bounds for every host. The default `--identity-backend auto` uses kernel
+identity where available. Further userspace speed work is planned for 0.5.x.
+
+On some overlayfs setups before Linux 6.8, p11scope may be unable to
+prove how a provider file appears in /proc maps: the opened file and
+its mappings legitimately carry different keys there, and the kernel
+check that reconciles them can come back inconclusive. The provider
+pin then carries the note `provider's maps rendering unproven;
+callers mapping it may stay unbound`, and callers mapping that provider
+may stay unbound. This key split does not happen on Linux 6.8 and later.
+
+Provider function tables can contain NULLs, unusable entries or fewer readable
+words than their version label suggests. Discovery retains usable targets
+around those gaps; an unread word is never treated as an observed NULL.
+Version metadata alone does not require a wider table. If the evidence cannot
+justify an API name, its target remains observable as `unknown`, count-only.
+Actual unavailable entries and incomplete observations remain disclosed.
+
+A `profile` or `trace` output has no per-run marker for calls made
+before a provider's probes landed, so a missed early burst reads the
+same as no calls. Inside a nested PID namespace (a kind node, a
+hostPID pod) a newly started process waits for the full discovery
+sweep, up to about 7 s, before its provider is attached. A late
+provider whose calls finished before its watch began shows that
+unwatched window in the JSON (`first_seen_ns` earlier than
+`since_ns`).
+
+A process that loads a provider, makes one call within about a
+millisecond, and unloads is not observed without `run --pause auto`.
+On Linux 7.0.14, for the four provider shapes measured under `p11scope
+run --trace` (32 runs at 0/10/100/1000 us load-to-call delays) with
+the default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
+each reporting PARTIAL with a proven drain and zero event loss: the
+transient exits before discovery attaches anything (0 slots, no
+modules). With `run --pause auto`, which holds the child at each
+loader hit until its probes attach, the same 32 runs captured the
+call every time (0 missed), but the caller stayed `Unknown executable`
+(0 attributed): a one-call transient leaves no second witness to name
+it. A repeat run on Fedora (Linux 7.2.9) with the same 32 runs showed
+the same split: with `--pause never` all 32 missed the call
+(0 attributed); with `--pause auto` all 32 captured it (0 missed) and
+the caller stayed `Unknown executable`. So for bursts of this shape,
+expect a load, one call, unload burst inside ~1 ms of the load to read
+the same as no calls unless the child is held with `--pause auto` or
+kept alive past attach. Only two kernels, four provider shapes and
+`run --trace` were measured.
+
+Container checks run for v0.5.0, each counted against an independent
+call ledger: Docker shared image layers and copy-up (Linux 7.0, and
+Fedora on Linux 7.2.9 with a private Docker daemon), the kind
+DaemonSet, `attach-pod` into a kind pod from the node, a pre-attached
+provider in a newly created pod, a Knative pod scaled from zero, and a
+node-wide late provider that stays a reported boundary. They use one
+kind node; multi-node clusters, CRI-O and the cgroupfs driver are
+still not exercised.
+
+The Knative warm capture observed all 1,200 calls after attachment. The first
+cold request began before probes attached and observed only 84 of 1,200 calls,
+with no kernel event loss. That cold result is a disclosed pre-attachment
+coverage limit; it does not establish complete cold-start capture. Warm
+qualification still requires exact counts.
+
+The final 1,800-second SYSTEM+manifest soak passed on Fedora Linux 7.2.9
+with the default FULL build: a 1,860-second observation window captured
+162,003 calls from each of two callers, with zero lifecycle ring loss and a
+proven final drain. Maximum sampled RSS was 75.5 MiB (78.9 MiB recorded
+high-water mark). Semantic accounting separately
+reported 324,004 joined calls, two shed calls and 651 named-budget refusals;
+key operations remained unavailable. This is a measured 30-minute workload,
+not complete semantic attribution or a guarantee for other workloads. The
+earlier failed exact-count/final-drain run remains a historical failure.
+Longer runs (4 h, 24 h) remain unqualified. Startup and stop figures are
+declared per kernel, not a product guarantee.
+
+In long system-wide runs, a live publication can rarely stop making
+progress. After 6 seconds without progress, p11scope abandons that
+publication with a named gap and keeps running, and the report marks
+coverage as partial. The capture does not hang, and nothing is
+silently dropped. Fixing the underlying stall is planned for a later
+release.
+
+## Planned for later versions
+
+- Live key operations (key type and size, sign/verify per key) in 0.6.0.
+- Promoting one endpoint to full detail during a counter capture, in 0.6.0.
+- Longer bounded runs (4 h, 24 h).
+- Faster teardown on kernels without uprobe_multi.
+- A per-mechanism counter view and per-mechanism key-operation rows.
+- A named unknown edge for the copy-up case above instead of silent
+  misattribution, and for a late provider's unwatched window.
+- Tracking short-lived processes that exit before their first binding.
+- Parallel BPF program loading for faster startup.
+- Post-quantum key details, cluster aggregation, telemetry,
+  enforcement, AArch64, extra capture fields and syscall/network
+  correlation.
+
+# Known limitations (v0.4.0)
+
+v0.4.0 is an intermediate source checkpoint with no new binary bundles.
+Its selected P0 build requires `--no-default-features --features
+stub-object-attributes`: object-attribute capture is not enabled
+(no BPF program reads object attributes). An ordinary source build defaults
+to FULL; `--no-default-features` alone does not select P0.
+In P0, every profile, metrics and trace
+document discloses this as structured evidence
+(`evidence.object_capture.available: false`, `reason: "not_enabled"`), and
+`p11scope doctor` names it in its `object-attribute capture` row. P0 retains
+bounded call/count/mechanism evidence; loss and completeness disclosures still
+apply. FULL and broader installed/package qualification remain open.
+
+The unreleased development checkpoint retains the existing metrics path when
+`--counter-mode` is omitted. Explicit `counts`, `timestamps` and `latency`
+requests are preparatory and refuse before capture setup. Useful public
+activation of those measurement modes remains outside this checkpoint;
+v0.5.0 activates them (see above).
+
+The G21 FULL-capture wrap legs (660 rounds in 900s, pid + system) are not
+qualified in v0.4.0: FULL is absent from the selected P0 build, and earlier legs
+exceeded their time budget (correctness of the
+wrap accounting proven through 169 fenced rounds pre-split; throughput
+red at ~2.3 s/round vs 1.36 s needed). These are historical scoped results.
+The T/U throughput work, shared-oracle rework and required green legs remain
+acceptance work; smaller focused checks do not qualify those legs.
+
+The full schema/consumer campaign remains open. Current exact identifiers
+include `p11scope/observed-profile/v3`, `p11scope/observed-profile/v3-metrics`
+and the inventory v1 family; see the
+[schema-identifier rules](../RELEASING.md#version-and-schema-identifier-rules).
+Their version spellings grant no cross-schema compatibility.
+
 # Known limitations (v0.3.0)
+
+Inventory accepts `--max-endpoints` from 1 through 8192, with the unchanged
+4096 default. This is a finite, capture-lifetime physical endpoint budget;
+unloading does not refund IDs. The 8192 candidate policy bound does not
+qualify native attach/stop cost, supported-kernel behavior or a release
+capacity envelope. Caller-pair, discovery-owner and work limits are separate,
+and selecting a larger endpoint budget does not increase them. Wider public
+native growth and resource measurements remain pending.
 
 User-facing limits of p11scope v0.3.0: per-edge entry counts end to end
 (DR-02 closed), load-instance continuity, and sharded discovery.
@@ -31,6 +848,33 @@ for the cut rows, the released-code build aa62b87 for the re-measured M1
 and R4 rows, the cut build 6abd2b7 (pool from 8 ranges) as the R4 base. Ranges below are
 the min..max of per-sample p95.
 
+## Offline inventory comparison
+
+`inventory diff` compares the supported projection of two saved inventory v1
+snapshots. Exact recorded executable paths are presentation groups; they do
+not prove equal executable bytes, processes or deployments. Module SHA-256
+matches content, not physical files or load instances. Host/boot, process,
+physical continuity and each side's scope completeness remain unknown,
+including for empty or gap-free inventories. Not observed after does not
+prove removal, and an unchanged projection is not compliance evidence.
+
+Counts remain separate lower-bound entry observations for independent windows;
+no count, time, gap-repeat or budget-counter delta is computed. Missing
+coverage, witnessed use without a count, loss, saturation and in-flight
+entries retain their limits. Instance and detailed semantic changes are not
+compared; physical-edge counts are never distributed across load instances.
+Missing executable paths/digests remain unresolved rather than matched by
+basename, path or build ID. Unknown clock units retain their raw numbers.
+
+The reader accepts only regular inventory v1 JSON files and applies all five
+[input limits](schema/inventory-diff-v1.md#input-and-compatibility) together.
+The row ceiling does not guarantee acceptance below other bounds, and there
+is no numeric report-size or RSS guarantee. Differences and unknown evidence
+exit 0; that status means the comparison succeeded, not complete coverage.
+See [the operator guide](usage.md#offline-inventory-comparison) for output
+publication and errors. This offline capability does not qualify new live
+capture behavior or establish the provenance of its input files.
+
 ## Kernels and backends
 
 ### Optimal path on 6.8 and later (uprobe-multi, probe-proven pid filter)
@@ -53,6 +897,10 @@ the min..max of per-sample p95.
 
 ### 5.15: per-offset links, slower detach, retirement unsettled at scale
 
+Historical measurements below predate v0.5 host admission. Stock non-Multi
+hosts are outside current live support; these failures remain historical failures.
+The old bounds are measurements, not a product startup SLA.
+
 - What the user sees: every provider entry gets its own per-offset link.
   Detach costs about 18 ms per link, so a 546-link teardown runs about
   9.7 s in a 5.15 guest, and a thousand-endpoint system capture misses the
@@ -73,7 +921,25 @@ the min..max of per-sample p95.
   Otherwise stays a documented correct-but-slow fallback per the
   kernel-tier directive.
 
+On kernels without uprobe_multi (5.15, 6.1), stopping a capture with many
+probes closes the probe links one at a time: about 18 ms per link in a
+5.15 guest and tens of ms per link on newer hosts using single links
+(host-dependent; for example, 4,227 links take roughly 1.3–5 minutes).
+The stop stays correct and finite with no cap: once the estimate reaches
+2 s, p11scope prints one up-front estimate line (computed at 50 ms per
+link, so on 5.15 it can overstate the wait), then the usual per-second
+progress, and a second Ctrl-C stops waiting and leaves the kernel to
+finish the remaining closes after exit. Measured on Fedora 7.2.9
+(5 vCPU) with the release candidate at 8,194 per-offset links (the
+singles path; `--attach-backend singles` selects it where multi-attach
+is available): attach 41 s, stop (link release) 339 s, about 41 ms per
+link.
+
 ### 5.15: physical-identity controls and non-leader exec unqualified
+
+Historical measurements below predate v0.5 host admission. Stock non-Multi
+hosts are outside current live support; these failures remain historical failures.
+The old bounds are measurements, not a product startup SLA.
 
 - What the user sees: on 5.15 only, four privileged regression cells fail
   that pass on 6.8+. `privileged_task4_detailed_physical_identity_controls`
@@ -115,8 +981,8 @@ the min..max of per-sample p95.
 
 - What the user sees: classic `profile`/`trace --attach-backend auto` no
   longer reads the 6.9 version floor (DR-CLASSIC-PID0, fixed in v0.2.0).
-  On 5.15 it uses per-offset links with the reason disclosed; on 6.8+
-  with a proven kernel pid filter it uses uprobe-multi with pid = target
+  On an eligible host it can use scoped per-offset links with the reason
+  disclosed; with a proven kernel pid filter it uses uprobe-multi with pid = target
   (never pid 0); elsewhere under `--pid` it uses per-offset links bound
   to the target.
 - Kernels/conditions: classic `--pid` on any kernel; multi needs the
@@ -127,6 +993,47 @@ the min..max of per-sample p95.
 - Workaround: none; the selection is automatic and honest.
 - Planned: classic system/cgroup Multi on 6.6–6.8 is probe-gated but not
   yet qualified on those kernels (DR-CLASSIC-F4-66-68, v0.3.0).
+
+### Startup includes sequential BPF program loading
+
+Historical measurements below predate v0.5 host admission. Stock non-Multi
+hosts are outside current live support; these failures remain historical failures.
+The old bounds are measurements, not a product startup SLA.
+
+- Historical measurements cover discovery to the `capturing:` line,
+  rather than complete observer startup. FULL default, 208 probes,
+  4 vCPUs: 6.6.157 4.5–4.9 s,
+  host 7.0 6.25–6.6 s, 6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s;
+  0-probe runs take the same time (5.15 14.8–21.5 s under host load),
+  showing that these historical runs spent most startup time loading
+  programs, rather than attaching probes.
+- Current FULL32 setup-only samples on Linux 7.0.0-38-generic with 12 visible CPUs
+  took 7.512, 13.133 and 17.217 s from observer launch to readiness.
+  The 7.512 s attempt had no usable syscall attribution. A separate
+  complete 13.133 s measurement attributed 96.5% of its post-discovery
+  interval to `BPF_PROG_LOAD`; it did not distinguish verifier, JIT or
+  other work inside that syscall. No GO was released in these diagnostics.
+- **Owner-approved test allowance, 2026-10-28:** use a 20 s observer
+  readiness bound for the harness's existing modern-kernel timer class,
+  preserving the preliminary borrowed-workload allowance at 8 s. Both
+  legacy timer allowances stay 30 s; that is historical test policy,
+  not permission to run capture on an ineligible non-Multi host.
+  The original 8 s FULL32 failure and three unrun cells remain unchanged.
+  These setup samples do not qualify calls, privacy, counts or zero loss.
+- In the FULL32 object cell, the 6 s capture, native fixture's 30 s GO
+  deadline and 30 s stop bound remain unchanged. The native GO clock
+  starts before observer startup;
+  a 20 s observer allowance does not guarantee the remaining setup and
+  stop-to-GO work fits. Missing either real readiness or GO still fails.
+- Disclosure: this entry and the canary harness's declared
+  per-kernel readiness bound, printed up front in every run as
+  `CANARY_READY_BOUND_DECLARED kernel=... seconds=...`. No environment
+  variable can replace the declared timer.
+- Workaround: keep the workload alive past attach (as in
+  [usage](usage.md#discovery-timing-and-optional-offline-discovery)),
+  while respecting the current Multi capability requirement.
+- Planned: parallel program loading stays an optional later speedup,
+  not a correctness fix.
 
 ## System scale and performance
 
@@ -373,15 +1280,20 @@ the min..max of per-sample p95.
 
 - What the user sees: long `--cgroup`/`--system` captures of busy hosts can
   spend the 16,384-identity budget (about an hour at 5 new processes/s);
-  later processes are counted only as identity refusals, and later callers
-  become identity refusals.
+  later processes get no identity: the capture prints
+  `p11scope: kernel could not give a process an identity (lifetime budget
+  of 16384 identities spent); its calls and fork records are not captured
+  and the report is PARTIAL`, counts each refusal in
+  `evidence.kernel_control.identity_unavailable` with
+  `identity_budget_exhausted: true`, and inventory callers show a `usage
+  coverage health regression` gap naming the refused identity counts.
 - Kernels/conditions: all kernels; Detailed `task_newtask` fork-wrapper
   ticket burn in `--system` Detailed subsets is unmeasured.
 - Disclosure: `evidence.kernel_control` (`identity_budget_exhausted`,
   `identity_unavailable`, `owner_admission_failures`), gaps, `PARTIAL`.
 - Workaround: `--pid` or a narrow `--cgroup`, or split the capture.
-- Planned: v0.3.0 (C6 30-minute churn cell from M5 projections; lazy
-  allocation, retirement/recycling, or a declared envelope).
+- Planned: reusable identity slots are not in 0.6.0; v0.6.0 keeps
+  the 16,384 budget with the named gaps above.
 
 ### Provisional P/N defaults (DR-07)
 
@@ -400,16 +1312,32 @@ the min..max of per-sample p95.
 
 ### Loader contexts 256 per capture, never recycled (X-1)
 
-- What the user sees: `profile`/`trace --system` with more than 256
-  short-lived `dlopen` processes leaves a late provider `dlopen` past 256
-  hooked views invisible to the loader path; only `discovery_truncated`
-  records it.
+- What the user sees: a capture that arms more than 256 provider loads
+  refuses the 257th with a named gap: `evidence.discovery_truncated`
+  counts it (`N discovery records truncated`), `evidence.skipped` keeps
+  the entry (`live loader arming`, or `owned initial-set discovery` on
+  the owned path, with `loader context capacity 256 is exhausted`),
+  `evidence.loader_discovery.strategies.unavailable` counts it, and the
+  report reads `PARTIAL`.
 - Kernels/conditions: all kernels; compounds per-process loader hooks
   (`OneProcess` scope, deep-scanned views only).
-- Disclosure: `discovery_truncated` counter.
+- Disclosure: `discovery_truncated`, `evidence.skipped`, `PARTIAL`.
 - Workaround: narrower scope, longer-lived providers.
-- Planned: v0.3.0 (recycle loader contexts and sweep after discovery loss;
-  attach `dl_debug_state` once per distinct ld.so inode with a cookie).
+- Planned: reusable loader contexts are not in 0.6.0; v0.6.0 keeps
+  the 256 limit with the named gap above.
+
+### Stop-time graph pool is one fixed 384 MiB accounting limit
+
+- What the user sees: the stop sequence accounts the collected call graph
+  against one fixed 384 MiB limit, sized for 8,192 endpoints, whatever
+  `--max-endpoints` is set to. A stop that would exceed it ends as a
+  finite incomplete stop, with the retired objects reported attached and
+  the measured peak disclosed.
+- Kernels/conditions: all kernels; the stop of a large capture.
+- Disclosure: the incomplete-stop report with the measured peak.
+- Workaround: fewer endpoints (`--module`, narrower scope).
+- Planned: stays one fixed accounting limit for every `--max-endpoints`
+  value.
 
 ### Scan-induced target stalls unmeasured (DR-39)
 
@@ -424,7 +1352,7 @@ the min..max of per-sample p95.
 
 ## Capture loss and coverage
 
-### Lifecycle ring loss under exec churn (M4) — clean at 100 and 1,000 exec/s with the 2 MiB ring
+### Lifecycle ring loss under exec churn (M4) — clean at 100 and 1,000 exec/s; 8 MiB ring since v0.6.0
 
 - What the user sees: at 448 processes, native lane: 100 exec/s loses
   nothing (0 lifecycle and 0 ring loss in all 6 samples); since v0.3.0
@@ -443,10 +1371,18 @@ the min..max of per-sample p95.
   all 12 samples (3 rounds of 1 cold + 1 warm per size), high-water
   6–11% of the ring, with one cold 448-process sample at 37%. Churn 0
   cells were not measured in this tier.
+- Since v0.6.0 the inventory ring is 8 MiB (about 9,100 records) and the
+  lane also drains it while the semantic lane starts. A Joint startup
+  under heavy unrelated churn (2 MiB ring, 8,192 held records) lost
+  17,977 lifecycle records before the first pass, so both bounds were
+  raised: 8 MiB of locked kernel memory per inventory capture (was
+  2 MiB), and up to 32,768 held records in user memory (about 29 MiB,
+  allocated only as records arrive; was 8,192, about 7.2 MiB).
 - Headroom is bounded by pass length, not by the ring alone: while a
-  pass collects, the lane holds at most 8,192 drained records and then
+  pass collects, the lane holds at most 32,768 drained records and then
   stops draining, so at 1,000 exec/s (about 2,100 records/s) a pass
-  absorbs about 4 s of held records plus about 1 s of ring. The peak
+  absorbs about 15 s of held records plus about 4 s of ring. The
+  measurements below used the 2 MiB ring and 8,192 held records. The peak
   fill came at the first pass in every sample above. On a contended
   host (builds running; excluded from the numbers above) cold first
   passes with 3.1–3.5 s of deep scan peaked at 73–79% of the ring with
@@ -493,6 +1429,23 @@ the min..max of per-sample p95.
 - Disclosure: none; exclusion is the definition of a caller, not a loss.
 - Workaround: none needed for ordinary loaders.
 - Planned: none.
+
+### Mechanism approval union past 1,024 publishes an official-first subset (v0.6.0)
+
+- What the user sees: the `MECH_SHAPE` map holds 1,024 mechanism ids. When
+  the approval union (the official PKCS#11 3.2 catalog plus the configured
+  registry) exceeds that, the session publishes the official catalog first
+  and then registered ids in ascending order up to the cap, instead of
+  refusing to start. Unpublished ids count through the existing unregistered
+  path (counted, never decoded). With the shipped registry (465 approved)
+  nothing is unpublished.
+- Kernels/conditions: all; a registry-growth event, not reachable today.
+- Disclosure: `evidence.unpublished_mechanisms` (count, 0 when nothing was
+  shed), the `unpublished mechanisms` gap, and `PARTIAL` when nonzero.
+  Render-side shape notes are computed over the published subset only.
+- Workaround: none needed; the capture continues with the subset.
+- Planned: the cap follows the map; growth past it stays a count-gapped
+  subset, never a refusal.
 
 ### Settlement always `unsettled`
 
@@ -544,14 +1497,38 @@ the min..max of per-sample p95.
 
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 
+- 2026-10-26 cold admission (qualified at the discovery seams): an
+  already-zombie thread-group leader with exactly one live survivor
+  admits as a caller with the survivor-served image and the leader
+  birth, and both identity backends then attribute its held mappings
+  exactly like the warm path. In a live capture today this reaches
+  only groups the observer already held a view of (their scans now
+  read the survivor's maps); a group first met after its leader died
+  is still not admitted. Two or more live survivors are refused
+  (admission names the ambiguity; a live scan reports such a group
+  like an exited one); a fully dead group keeps the generic gone
+  refusal. Cold callers make no native-use claim (they stay unproven
+  for native binding). Live-capture enumeration of a group first met
+  after its leader died still needs its follow-up.
+- Development checkpoint: discovery can classify a zombie-leader group as
+  exited even while a surviving thread runs, and omit that group from its
+  membership result. An absent group does not
+  prove that its provider use or surviving threads have ended. Complete
+  live-group inventory is not supported by this checkpoint.
 - What the user sees: a process whose thread-group leader has exited while
-  other threads keep running (a zombie leader) is never admitted as a
-  caller: it has no `callers[]` record and no edge, and its provider use
-  appears only as module-level `modules[].unbound_use` with the
-  `used by an unidentified caller image` gap. An exec chain whose images
+  other threads keep running (a zombie leader), and that the capture never
+  observed before the exit, or left with two or more running threads,
+  is still not admitted as a caller: it has no
+  `callers[]` record and no edge, and its provider use appears at most as
+  module-level `modules[].unbound_use` (only when another process got the
+  provider attached, with the `used by an unidentified caller image` gap);
+  otherwise only the `process view` gap marks the omission. An exec chain whose images
   exec within one pass likewise binds no image: its rows are unbound as
   `exec_after_admission`, `no_live_caller` or `before_admission`, and the
   retired callers' edges read `unknown`/`use_before_admission`.
+  A caller that execs into a different binary while a pass collects can
+  bind no image for the rest of the capture: its native calls survive
+  only as module-level `exec_after_admission`.
 - Kernels/conditions: all; `--system` scope (for `--pid`
   see DR-C3-2).
 - Disclosure: the pid-less `process view` gap ("a process in scope could
@@ -559,9 +1536,122 @@ the min..max of per-sample p95.
   (`rows`, `reasons`), `observation.native_witnesses.unbound_reasons`, and
   the per-pass `unbound_rows` of the event stream. No pid is named and no
   watch or positive claim is made for these processes.
-- Workaround: none for attribution; the module-level use is exact.
-- Planned: v0.3.0 (exact image identity, I2c; a zombie-leader admission
-  path that pins a live thread).
+- Workaround: none for complete caller coverage. Module-level observations
+  describe captured rows; they do not establish coverage of an omitted group.
+- Future work: live-capture enumeration of never-before-seen zombie
+  leaders; outside this intermediate checkpoint.
+
+### Overlay xino/copy-up identity divergences (D-C7-2/D-C7-3)
+
+- What the user sees: provider files reached through an overlay merge
+  can attribute differently depending on the kernel and on whether a
+  file was copied up (the first write through the merge copies the
+  lower file to the upper layer). Before 6.8 (lane A) a copy-up splits
+  identity: the pre-copy-up anchor names the lower file while new
+  mappers name the upper file, so neither side joins (no edge on
+  either backend, disclosed). Two mounts over one lower file join on
+  the kernel side only before 6.8 (D-C7-2: the kernel correctly
+  reports the same underlying file while the userspace side reports a
+  named mismatch), and never join on 6.8+ (lane B). A copy-up on
+  6.8+ keeps the overlay file number (D-C7-3). A process that loaded
+  the provider before the copy-up keeps running the original lower
+  file; since v0.6.0 inventory no longer attributes it to the
+  copied-up file. A provider file reached through overlayfs (or an
+  unproven filesystem) at the same key requires the kernel
+  original-file witness before its row joins, one query per file:
+  the kernel proves the association or the row is unknown with the
+  `original_file_unproven` gap — never a join to the fresh file, on
+  either identity backend, and the deep-scan row takes no userspace
+  `(dev, ino)` fallback. The row's original edge reads `ended`, its
+  later calls are not counted, and no new-module edge is emitted; a
+  process that maps the upper copy is still attributed exactly. The
+  sweep carries the same no-fallback rule: an overlay key (overlayfs
+  or an unproven filesystem) never takes the userspace `(dev, ino)`
+  fallback anywhere in the sweep ladder. A below-threshold batch still
+  runs the kernel for overlay keys, and an unavailable kernel run
+  yields the named `overlay_kernel_unavailable` maps-attribution loss
+  — never an edge. An overlay key in a batch forces the kernel run
+  for the whole batch: non-overlay requests there take kernel proofs
+  instead of the below-threshold userspace path (identical only in
+  batches with no overlay key) and spend the pass's 3-attempt budget.
+  In `inventory --system` with the kernel identity backend, a watched
+  overlay provider (attach-set exclusion, for example a provider
+  inside a container) proves through a private witness session with no
+  exclusions, one query per watched (pid, key) under a per-pass budget
+  of 8 queries; each pass starts past the queries the previous pass
+  spent, so with more than 8 refused callers every pass proves a
+  different 8 and each caller alternates between joined and the named
+  loss. A same-file verdict joins, anything else (another file,
+  failure, budget exhaustion) keeps the named loss, never a userspace
+  join. While a caller waits for its turn, its edge reads uncertain
+  and its in-flight operations end as unknown. The witness also
+  covers refused overlay ranges from unproven requests in an ordinary
+  kernel batch: callers the run never visited, demoted duplicates,
+  and zombie batches. A pass whose anchors never installed because
+  every anchor is watched takes the same witness route with no sweep
+  kernel run. The remaining sweep paths keep the named loss with no
+  witness query: cgroup-scoped collection (the userspace-only path),
+  a segment after the pass's third kernel run or another run failure
+  (sticky, deadline, stream, headroom), an oversized single caller
+  (which reads its ranges and then refuses), file-descriptor pressure
+  (every pid takes the immediate path, which reads and then refuses,
+  including its idle promotions), a failed kernel expectation or
+  anchor install that is not capture-excluded, a failed kernel
+  session setup (creation error or setup file-descriptor shortage,
+  which stays failed so every later pass takes the plain userspace
+  path), and the explicit userspace identity backend (which never
+  reaches the witness). The pure-userspace sweep reads the ranges and
+  then refuses the join; the kernel ladder refuses without reading
+  them, except the oversized, cgroup, immediate and failed-install
+  paths which read and then refuse (still never an edge).
+  One verdict covers the file: the deep-scan witness proves the first
+  witness-requiring caller range, and a same-file verdict joins every
+  range of the group. A process that maps one provider both before and
+  after a copy-up (mappings on both sides of the boundary) would join
+  its stale ranges with the fresh ones; per-range proving would
+  exhaust the per-scan budget on honest multi-range joins, so the
+  packet keeps one query per file and discloses this corner; the
+  witness runs at most 8 queries per process scan; past the budget
+  further provider files are unknown with the same gap, while files
+  that prove not to be providers never spend witness work. The sweep
+  witness instead requires every refused range of the key to prove the
+  held file from its one confirmation: one another-file range refuses
+  the whole key, one unproven range fails it closed (no extra query).
+  With xino off,
+  equal real file numbers on distinct layers collide on the overlay
+  device on 6.8+ (a named mismatch, never an edge), while before 6.8
+  each layer keeps its real device in the key so there is no
+  collision; with xino off after a copy-up the userspace edge follows
+  what the filesystem reports because file numbers there are
+  non-persistent.
+- Kernels/conditions: overlayfs merges with xino on, off, or
+  same-filesystem layers. Measured on 6.1.188 and 6.6.157 (lane A)
+  and on 7.0 (lane B: host, plus a 7.0.14 guest run); other 6.8+
+  kernels (6.8.0-142, 6.12.111, 7.2.6) have not run these cells.
+  Same-layer layouts behave like xino on: that avoids only the
+  xino-off collision, not the copy-up false edge. An overlay row is
+  only claimed when the stat-based xino check agrees with the
+  requested mode (never mountinfo).
+- Disclosure: a refused join surfaces as an `identity_mismatch` loss.
+  A stale copy-up mapping surfaces as an `original_file_unproven` gap
+  under the provider path, with one of four fixed causes (the witness
+  proved another file, the witness query budget was exhausted, the
+  witness was unavailable, the anchor binding failed). A swept overlay
+  caller with no covering kernel proof surfaces as an
+  `overlay_kernel_unavailable` maps-attribution loss (`inventory
+  --system` with the kernel identity backend first tries the private
+  witness session, 8 queries per pass; exhaustion keeps the same
+  loss).
+- Workaround: restart processes that loaded a provider before the file
+  changed inside the container (for example by chmod, touch or an
+  in-place write) to get exact attribution for their later calls.
+  `--identity-backend kernel` does not help here. Same-filesystem
+  layer layouts avoid only the xino-off collision.
+- Status: the copy-up stale join shipped fixed in v0.6.0 (kernel proof
+  or the named gap), and the sweep refuses its userspace fallback for
+  overlay keys (kernel proof, witness, or the named loss). The
+  xino-off collision and the pre-6.8 lane-A splits above remain
+  disclosed limits.
 
 ### Pre-admission use voids the watch (R-C51-1)
 
@@ -634,29 +1724,77 @@ the min..max of per-sample p95.
 - Planned: v0.3.0 (C5 R5 `bench-overhead.sh` with and without the double
   probe; C6).
 
-### `--json` to a stalled terminal blocks exit (C5.3 F7)
+### Final inventory stdout can be incomplete after backpressure or cancellation (C5.3 F7)
 
-- What the user sees: `inventory --json` writes the whole document to
-  stdout at exit; on a stalled terminal (for example after Ctrl-S) the
-  write blocks and the process does not exit until the terminal resumes.
-  A second signal does not exit early: the report is armed as written
-  only after that write completes.
-- Kernels/conditions: all; stdout is a terminal with stopped output.
-- Disclosure: none while stalled. No data is lost: `-o` and the event
-  stream's `ended` are already written.
-- Workaround: redirect stdout to a file, or rely on `-o` for the report.
-- Planned: v0.3.0 (review follow-up; pre-existing).
+- What the user sees: final inventory JSON/text continues while stdout
+  accepts bytes, even when the complete document takes more than five
+  seconds. Five seconds without a positive write fails stdout; a reader
+  pausing at least that long can receive only a prefix and lose the suffix.
+  A later delivered SIGINT/SIGTERM/SIGHUP cancels final stdout; the signal
+  already used to stop capture permits healthy output. A first signal after
+  a duration/key stop begins finalization also cancels. Incomplete output
+  gives exit 1. Dashboard text has no final stdout document.
+- Kernels/conditions: ordinary Linux pipe/FIFO and TTY/PTY backpressure
+  waits. Regular-file/block-device or arbitrary driver writes already in
+  the kernel, event sync, atomic report publication, scheduling and
+  unsettled native detach have no new wall-clock guarantee. Dashboard may
+  separately spend its existing bounded restore/notices budgets.
+- Disclosure: best-effort bounded stderr names no progress, cancellation
+  or I/O failure and exact locally accepted/total/remaining bytes. A
+  stopped stderr can hide the notice; exit 1 remains. Accepted bytes do not
+  prove consumer parsing, screen display or durability. A successfully
+  committed `-o` report and a sync-confirmed event stream remain available;
+  a failure of either sink means its respective guarantee does not hold.
+- Workaround: request independent `-o` output and keep stdout's reader
+  progressing. A truncated JSON prefix cannot be repaired by the unwritten
+  suffix. Dashboard restores saved termios before JSON, but a permanently
+  stopped screen may still need `reset` after output resumes; deliberate
+  stdout cancellation gives screen-restore retry zero wait budget.
 
-### Event-log write error loses the `-o` report (C5.4 I-4)
+### Returned event-log errors preserve independent reports (C5.4 I-4, fixed)
 
-- What the user sees: if the event stream (`--event-log`) fails while
-  writing the closing records (for example a full disk), `inventory`
-  aborts before writing the `-o` report, so the report is lost.
-- Kernels/conditions: all; event-log I/O errors (ENOSPC).
-- Disclosure: the returned I/O error; no partial report is written.
-- Workaround: keep the event log on a disk with free space (or omit
-  `--event-log` when only the `-o` report matters).
-- Planned: v0.3.0 (review follow-up; pre-existing).
+After the initial `started` record, a returned event-log error retires that
+writer and observation continues to its ordinary stop. Inventory attempts
+the independent atomic `-o` report and final stdout, identifies each failed
+sink, and exits nonzero. The event file may contain a partial record; no
+replacement `ended` is invented. An `ended` record may be visible after its
+subsequent sync failed, so the record alone does not confirm durable
+completion. Event creation and the initial `started` write remain fail-fast.
+This fixes returned errors only; stalled final stdout remains limited as
+described above.
+
+### Slow stdout can truncate a live trace stream
+
+When stdout is a slow pipe, trace output that cannot be delivered within
+the bounded wait is dropped and counted as dropped bytes
+(`scheduling.sink_dropped_bytes`), which can cut the last stdout line;
+the report then reads PARTIAL. The `-o` file is always complete: every
+line is written to it, and a file write failure is an error rather than
+a silent drop.
+
+### Runtime-built function tables need publication evidence or a manifest
+
+- What the user sees: automatic discovery finds no table in the
+  provider's file-backed data, attaches 0 probes, and reports
+  `discovery skipped <path> — no function table was found in its
+  file-backed data; ...`. A table stored only in runtime allocation is
+  outside the file-data scan's reach. A getter return observed after its
+  watch attaches can supply the table; earlier returns are not replayed.
+  SoftHSM 2.6.1 on Ubuntu keeps its table in the file and needs no manifest.
+- Kernels/conditions: all kernels; any provider that builds its
+  function table at run time instead of keeping it in the file.
+- Disclosure: the `discovery skipped` line above, which ends with the
+  `p11scope-discover` command that observes the provider, and the
+  0-probe attach count.
+- Workaround: build a manifest with the offline helper and pass it to
+  the capture: `p11scope-discover --module <path> -o manifest.json`,
+  then `--manifest manifest.json` on the capture command. This supplies
+  validated targets to Detailed captures, inventory's ordinary count plan and
+  its optional S1 lane. Count inputs must match a provider mapped in the
+  selected scope and pass identity/ABI checks before shared admission; they
+  do not grant object or interface-selection authority.
+- Planned: automatic discovery of run-time-built tables is planned for
+  a later version.
 
 ## Scopes (cgroup and pod)
 
@@ -823,18 +1961,21 @@ the min..max of per-sample p95.
 
 ## Platform
 
-### Linux x86-64 only; 5.15 floor; parked platforms
+### Linux x86-64 and Multi-capable live hosts
 
-- What the user sees: AArch64, cgroup v1 and kernels below 5.15 are out
-  of scope. There is no runtime kernel-version check: an unsupported
-  kernel is expected to fail at BPF load with the generic hint (which
-  names the 5.15 floor, BTF and lockdown), but that path has not been
-  observed on a real sub-5.15, no-BTF or lockdown host. Release binaries
-  are x86-64 only.
-- Kernels/conditions: anything below 5.15 or off x86-64.
-- Disclosure: the load-failure hint; `doctor`.
-- Workaround: run on x86-64 Linux 5.15+ with BTF.
-- Planned: stays out of scope (owner-declined for v0.2.0; confirm in §7).
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+BTF, permissions, scope, identity/ABI and required feature checks still apply.
+Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
 
 ### `run` under `sudo` clears supplementary groups (DR-56)
 
@@ -860,9 +2001,11 @@ the min..max of per-sample p95.
 ### Helper runs vendor code unsandboxed (DR-64)
 
 - What the user sees: `p11scope-discover` executes provider code in its own
-  unprivileged process (drops groups/IDs/capabilities, restores dumpability
-  only for bounded `/proc/self/mem` reads) but without a seccomp/Landlock
-  jail.
+  unprivileged process with capabilities cleared and `no_new_privs` set.
+  Elevated invocations clear supplementary groups when changing identity;
+  ordinary non-root invocations may retain their non-root groups. It reads
+  through a preopened `/proc/self/mem` descriptor and keeps dumpability
+  disabled while provider code runs. This is not a seccomp/Landlock jail.
 - Kernels/conditions: all helper runs.
 - Disclosure: usage attested-capture workflow; helper must match the
   provider ABI/libc and never carries capabilities or set-id.
@@ -872,17 +2015,17 @@ the min..max of per-sample p95.
 
 ## Packaging
 
-### Toolchain: 1.98.1 only; 1.88 MSRV retired
+### Toolchain: 1.99.1 only; 1.88 MSRV retired
 
 - What the user sees: the release compiler (`.release-rust-version`,
-  currently 1.98.1) is the only supported toolchain (edition 2024, Linux
+  currently 1.99.1) is the only supported toolchain (edition 2024, Linux
   x86-64). The 1.88 floor and its CI job are gone; build containers use
-  `rust:1.98.1`. `crates/ebpf-common` stays at rust-version 1.97 because
+  `rust:1.99.1`. `crates/ebpf-common` stays at rust-version 1.97 because
   the pinned BPF nightly-2026-05-20 (rustc 1.97) also compiles it.
 - Kernels/conditions: all builds.
 - Disclosure: `README.md` build section, `docs/development.md`, contract
   test `ebpf_common_rust_version_matches_the_bpf_nightly`.
-- Workaround: install 1.98.1 (`mise install`).
+- Workaround: install 1.99.1 (`mise install`).
 - Planned: v0.3.0 (C7 BPF campaign: bump the nightly in one verifier/vng
   matrix run, then raise `ebpf-common` to the release major.minor).
 

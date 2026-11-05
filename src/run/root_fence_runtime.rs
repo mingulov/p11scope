@@ -216,6 +216,7 @@ fn document(
         session.dynamic_per_offset_attached(),
         session.static_multi_attached(),
         session.attach_backend_evidence(),
+        session.object_capture_evidence(),
         session.attach_failures(),
         &reports,
         kernel,
@@ -234,6 +235,8 @@ fn document(
         render::SchedulingEvidence::default(),
         None,
         None,
+        None,
+        session.unpublished_mechanisms(),
     );
     evidence.mark_terminal_drain_unproven();
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
@@ -294,12 +297,17 @@ fn scenario(
     receive(&mut stream, b"READY\n", Instant::now() + TIMEOUT)?;
     let scope = Scope::Pid(pid);
     let args = CaptureArgs {
+        track_short_lived: false,
         kind,
         modules: vec![stage.join("provider.so")],
+        exclude_modules: vec![],
         manifests: vec![stage.join("provider.json")],
+        prearm_modules: vec![],
         hooks: crate::discovery::hooks::HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,

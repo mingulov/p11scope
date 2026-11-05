@@ -132,13 +132,15 @@ dependencies = [
 
 [[package]]
 name = "pkcs11-abi"
-version = "0.2.0"
-source = "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b22520ce6d38bad855bf40fae23d1487ced2b7987137f87e4b15eff52b4234"
 
 [[package]]
 name = "pkcs11-module"
-version = "0.2.0"
-source = "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89858b774eabafaf53eebbbd5cf5d75b2bfdfa43f5916fa27a5828f5ff38ada1"
 dependencies = [
  "pkcs11-abi",
 ]

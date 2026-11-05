@@ -28,6 +28,7 @@ pub enum SafeCurve {
 }
 
 /// Compare the entire target word; excluded/unknown selectors gain no reads.
+#[inline(always)]
 pub const fn safe_attribute_kind(raw: u64) -> Option<SafeAttributeKind> {
     match raw {
         0x0000 => Some(SafeAttributeKind::Class),
@@ -60,7 +61,7 @@ pub const fn valid_safe_attribute_length(
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
         (SafeAttributeKind::Class, 0..=4)
-        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x3a | 0x3b)
+        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41)
         | (SafeAttributeKind::Token, 0 | 1)
         | (SafeAttributeKind::ValueLen, 16 | 24 | 32)
         | (SafeAttributeKind::ModulusBits, 1024 | 2048 | 3072 | 4096 | 8192) => Some(value as u16),
@@ -93,6 +94,12 @@ pub enum ObjectAction {
     Find,
     GetAttributes,
     SetAttributes,
+    /// `C_EncapsulateKey` (T0): one key input, one named scalar
+    /// result, no template reads.
+    Encapsulate,
+    /// `C_DecapsulateKey` (T0): one key input, one named scalar
+    /// result, no template reads.
+    Decapsulate,
 }
 
 /// Additional entry evidence needed before result-pointer/template access.
@@ -176,6 +183,18 @@ pub fn object_descriptor(function: u32) -> Option<ObjectCaptureDescriptor> {
             result_pointer_args: [7, ARG_NONE],
             template_args: [(5, 6), (ARG_NONE, ARG_NONE)],
             ..ObjectCaptureDescriptor::new(ObjectAction::Unwrap)
+        },
+        // T0 KEM: key input at arg 2, scalar result at arg 7, no
+        // template pairs (never authorized, never read).
+        "C_EncapsulateKey" => ObjectCaptureDescriptor {
+            input_args: [2, ARG_NONE],
+            result_pointer_args: [7, ARG_NONE],
+            ..ObjectCaptureDescriptor::new(ObjectAction::Encapsulate)
+        },
+        "C_DecapsulateKey" => ObjectCaptureDescriptor {
+            input_args: [2, ARG_NONE],
+            result_pointer_args: [7, ARG_NONE],
+            ..ObjectCaptureDescriptor::new(ObjectAction::Decapsulate)
         },
         "C_DestroyObject" => ObjectCaptureDescriptor {
             input_args: [1, ARG_NONE],

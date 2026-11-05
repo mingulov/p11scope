@@ -82,9 +82,12 @@ class ReleaseSealFixture:
         (self.repo / "scripts/fixtures").mkdir()
         shutil.copy2(ROOT / "scripts/fixtures/hammer.c", self.repo / "scripts/fixtures/hammer.c")
         shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
         for arguments in (
             ["init", "--quiet", "-b", "task7"], ["add", "-A"],
-            ["-c", "user.email=task7@example.invalid", "-c", "user.name=task7",
+            ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.email=task7@example.invalid", "-c", "user.name=task7",
              "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "pristine release driver"],
         ):
             result = self.command(["git", "-C", str(self.repo), *arguments])
@@ -134,7 +137,8 @@ class ReleaseSealFixture:
                       METADATA_COMMAND=[sys.executable, "-I", self.base / "metadata.py",
                                         self.prepared.config_path, toolchain])
         rustup_target = self.fake_bin / "rustup"
-        self.template("rustup.sh.in", rustup_target, TOOLCHAIN=toolchain)
+        self.template("rustup.sh.in", rustup_target, TOOLCHAIN=toolchain,
+                      RELEASE_RUST=(self.repo / ".release-rust-version").read_text().strip())
         proxy_target = self.fake_bin / "rustup-proxy-target"
         self.inert(proxy_target)
         cargo_target = rustup_target
@@ -191,7 +195,7 @@ class ReleaseSealFixture:
         shutil.copyfile(FIXTURES / "inert.sh", destination)
         destination.chmod(0o700)
 
-    def run_to_sudo_probe(self, extra_env=()):
+    def run_to_sudo_probe(self, extra_env=(), *, arguments=None):
         caller_path = ":".join((str(self.tripwire_bin), str(self.fake_bin), os.environ.get("PATH", ""),
                                 "/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin"))
         overrides = {"PATH": caller_path, "HOME": str(self.home), "TMPDIR": str(self.seal_parent)}
@@ -200,6 +204,7 @@ class ReleaseSealFixture:
         for name in BUILD_INPUT_VARIABLES:
             environment.pop(name, None)
         environment.update(overrides)
-        output = self.command(["/bin/sh", str(self.repo / "scripts/build-release.sh"), str(self.root)],
+        output = self.command(["/bin/sh", str(self.repo / "scripts/build-release.sh"),
+                               *(arguments if arguments is not None else [str(self.root)])],
                               environment=environment, overrides=overrides, removed=BUILD_INPUT_VARIABLES)
         return SealedDriverRun(self, output)

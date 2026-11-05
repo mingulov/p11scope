@@ -19,8 +19,18 @@ pub(crate) const MAX_PENDING_REFRESH: usize = 256;
 
 /// Reconciliation cadence: every Nth over-cap inventory pass runs the
 /// bounded maps slice; the passes between serve queued and rotated work
-/// without reading maps. Provisional — ratify by measurement.
-pub(crate) const RECONCILE_EVERY_N_OVER_CAP_PASSES: u64 = 4;
+/// without reading maps. Ratified at 2 by the unparked-head settle
+/// measurement (round 2): at 4, sweeps average ~4 of the eviction
+/// budget and 256 owned cannot settle within the guard; the slice,
+/// eviction budget and cooldown are unchanged, only sweeps run twice as
+/// often. The 256 view cap and the 120 s guard stay as they are.
+pub(crate) const RECONCILE_EVERY_N_OVER_CAP_PASSES: u64 = 2;
+
+/// Under-cap polling cadence: every Nth under-cap inventory tick runs a
+/// polling round. Kept at the old value 4, decoupled from the over-cap
+/// reconcile cadence: under-cap captures have no eviction pressure, so
+/// they keep their historical I/O rate (round 3, I1).
+pub(crate) const UNDER_CAP_POLL_EVERY_N_TICKS: u64 = 4;
 
 /// Reconcile slice size: at most this many maps snapshots per sweep.
 /// Provisional — ratify by measurement.
@@ -33,9 +43,14 @@ pub(crate) const RECONCILE_QUANTUM_NS: u64 = 50_000_000;
 
 /// Exploratory rotation: at most this many provider-free views are evicted
 /// per reconcile pass to make room for rarity-selected newcomers. Ordinary
-/// passes never evict, so steady-state ticks displace nothing.
-/// Provisional — ratify by measurement.
-pub(crate) const MAX_EXPLORATORY_EVICTIONS_PER_PASS: usize = 8;
+/// passes never evict, so steady-state ticks displace nothing. Raised to 32
+/// by the unparked-head settle measurement (round 2): at 16, the fattest
+/// admission gates pin at the cap (12 of 68 busy gates admit exactly 16)
+/// while sweeps average ~4, so the cap binds burst throughput without
+/// binding steady state; 32 still displaces at most an eighth of a full
+/// capture per pass. The 256 view cap, the 120 s guard, the slice, the
+/// per-tick admission bound and the cooldown stay as they are.
+pub(crate) const MAX_EXPLORATORY_EVICTIONS_PER_PASS: usize = 32;
 
 /// Eviction cooldown: a pid evicted as exploratory is ineligible for
 /// re-selection for this many reconcile sweeps, so rotation walks forward
@@ -75,6 +90,32 @@ pub(crate) enum InventoryCadence {
     Reconcile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryScanClass {
+    Retained,
+    Newcomer,
+}
+
+/// The H1 fairness-accounting cursors a pressure service pass must leave
+/// untouched: pass counts, rotation cursors, the scan-class alternation and
+/// the tick deadline. Restored verbatim after each selected transaction, so
+/// pressure service never consumes an ordinary tick's polling round,
+/// reconcile turn or alternation share. Cooling entries are real admission
+/// facts, not accounting, and are never restored.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FairnessCheckpoint {
+    over_cap_passes: u64,
+    cursor: Option<u32>,
+    reconcile_sweeps: u64,
+    new_view_cursor: Option<u32>,
+    retained_view_cursor: Option<u32>,
+    first_scan_class: InventoryScanClass,
+    tick_scan_started: bool,
+    tick_deadline_ns: Option<u64>,
+    under_cap_ticks: u64,
+    poll_cursor: Option<u32>,
+}
+
 /// The per-capture discovery schedule. Reconciliation, polling and new-view
 /// admission have independent cursors so failed candidates cannot monopolize
 /// a bounded tick, including when the whole scope fits under the view cap.
@@ -98,6 +139,9 @@ pub(crate) struct DiscoveryScheduler {
     cooldown_sweeps: u64,
     max_new_views: usize,
     new_view_cursor: Option<u32>,
+    retained_view_cursor: Option<u32>,
+    first_scan_class: InventoryScanClass,
+    tick_scan_started: bool,
     tick_quantum_ns: u64,
     under_cap_ticks: u64,
     poll_cursor: Option<u32>,
@@ -120,6 +164,9 @@ impl DiscoveryScheduler {
             cooldown_sweeps: RECONCILE_EVICTION_COOLDOWN_SWEEPS,
             max_new_views: MAX_NEW_VIEWS_PER_TICK,
             new_view_cursor: None,
+            retained_view_cursor: None,
+            first_scan_class: InventoryScanClass::Retained,
+            tick_scan_started: false,
             tick_quantum_ns: TICK_DEEP_SCAN_QUANTUM_NS,
             tick_deadline_ns: None,
             under_cap_ticks: 0,
@@ -211,23 +258,73 @@ impl DiscoveryScheduler {
     /// Rotate sorted newcomers past the last attempted process, even if that
     /// attempt could not retain or scan it. Successful admission alone cannot
     /// advance fairness when lower PIDs remain unreadable on every tick.
+    /// Production admission uses this while view slots are free and
+    /// `new_view_order_pending_first` once they are scarce.
     pub(crate) fn new_view_order(&self, pids: &[u32]) -> Vec<u32> {
         Self::rotated_after(pids, self.new_view_cursor)
+    }
+
+    /// Newcomer order with event-driven priority (Lane-A P2a): pids holding
+    /// queued refresh requests first, then rotation candidates, each class
+    /// rotated after the cursor. Ordinary ticks serve event-driven work
+    /// before exploratory rotation by design; without the priority, freed
+    /// view slots refill with ascending ambient candidates while pending
+    /// newcomers starve. The pending class drains, so rotation is delayed,
+    /// never starved. `pids` must be sorted ascending.
+    pub(crate) fn new_view_order_pending_first(
+        &self,
+        pids: &[u32],
+        pending: &BTreeSet<u32>,
+    ) -> Vec<u32> {
+        let (queued, exploratory): (Vec<u32>, Vec<u32>) =
+            pids.iter().copied().partition(|pid| pending.contains(pid));
+        let mut ordered = Self::rotated_after(&queued, self.new_view_cursor);
+        ordered.extend(Self::rotated_after(&exploratory, self.new_view_cursor));
+        ordered
     }
 
     /// Called only after the tick's time and capacity checks permit an attempt.
     /// Work deferred before an attempt keeps its place for the next tick.
     pub(crate) fn note_new_view_attempt(&mut self, pid: u32) {
         self.new_view_cursor = Some(pid);
+        self.note_scan_attempt(InventoryScanClass::Newcomer);
+    }
+
+    /// Rotate retained views by their capture-local IDs. Failures advance
+    /// the cursor; views deferred before an actual scan keep their turn.
+    pub(crate) fn retained_view_order(&self, ids: &[u32]) -> Vec<u32> {
+        Self::rotated_after(ids, self.retained_view_cursor)
+    }
+
+    pub(crate) fn note_retained_view_attempt(&mut self, id: u32) {
+        self.retained_view_cursor = Some(id);
+        self.note_scan_attempt(InventoryScanClass::Retained);
+    }
+
+    /// When both classes are ready, give the other class the first chance
+    /// after the class that actually started the preceding service pass.
+    /// An expired tick or an absent candidate does not consume a turn.
+    pub(crate) fn newcomers_first(&self, retained_ready: bool, newcomer_ready: bool) -> bool {
+        newcomer_ready && (!retained_ready || self.first_scan_class == InventoryScanClass::Newcomer)
+    }
+
+    fn note_scan_attempt(&mut self, class: InventoryScanClass) {
+        if !self.tick_scan_started {
+            self.tick_scan_started = true;
+            self.first_scan_class = match class {
+                InventoryScanClass::Retained => InventoryScanClass::Newcomer,
+                InventoryScanClass::Newcomer => InventoryScanClass::Retained,
+            };
+        }
     }
 
     /// Counts one under-cap inventory tick and reports whether it runs a
-    /// polling round: every fourth, mirroring the reconcile cadence, so
-    /// quiet under-cap ticks keep their no-op behavior between rounds.
+    /// polling round: every fourth, on its own cadence, so quiet
+    /// under-cap ticks keep their no-op behavior between rounds.
     pub(crate) fn begin_under_cap_tick(&mut self) -> bool {
         self.under_cap_ticks = self.under_cap_ticks.saturating_add(1);
         self.under_cap_ticks
-            .is_multiple_of(RECONCILE_EVERY_N_OVER_CAP_PASSES)
+            .is_multiple_of(UNDER_CAP_POLL_EVERY_N_TICKS)
     }
 
     /// The pids rotated to start after the poll cursor, for fair
@@ -248,6 +345,7 @@ impl DiscoveryScheduler {
     /// already-expired deadline: with no clock there is no bounded phase,
     /// so new scan work defers rather than running blind.
     pub(crate) fn begin_deep_scan_tick(&mut self, now_ns: Option<u64>) {
+        self.tick_scan_started = false;
         self.tick_deadline_ns =
             Some(now_ns.map_or(0, |now| now.saturating_add(self.tick_quantum_ns)));
     }
@@ -293,6 +391,41 @@ impl DiscoveryScheduler {
     /// Parks the cursor past the last pid a reconcile slice read.
     pub(crate) fn advance_cursor(&mut self, last_read: u32) {
         self.cursor = Some(last_read);
+    }
+
+    /// Snapshots the H1 fairness-accounting cursors before a pressure
+    /// service pass. The pass runs its selected transaction, then
+    /// `restore_fairness` puts every cursor back: the selected attempt is
+    /// recorded in the pressure episode's own counters, never in H1 shares.
+    pub(crate) fn fairness_checkpoint(&self) -> FairnessCheckpoint {
+        FairnessCheckpoint {
+            over_cap_passes: self.over_cap_passes,
+            cursor: self.cursor,
+            reconcile_sweeps: self.reconcile_sweeps,
+            new_view_cursor: self.new_view_cursor,
+            retained_view_cursor: self.retained_view_cursor,
+            first_scan_class: self.first_scan_class,
+            tick_scan_started: self.tick_scan_started,
+            tick_deadline_ns: self.tick_deadline_ns,
+            under_cap_ticks: self.under_cap_ticks,
+            poll_cursor: self.poll_cursor,
+        }
+    }
+
+    /// Restores H1 fairness accounting after a pressure service pass. Cooling
+    /// entries stay as the transaction left them: an admission or departure
+    /// it observed is a real fact, not a consumed share.
+    pub(crate) fn restore_fairness(&mut self, checkpoint: FairnessCheckpoint) {
+        self.over_cap_passes = checkpoint.over_cap_passes;
+        self.cursor = checkpoint.cursor;
+        self.reconcile_sweeps = checkpoint.reconcile_sweeps;
+        self.new_view_cursor = checkpoint.new_view_cursor;
+        self.retained_view_cursor = checkpoint.retained_view_cursor;
+        self.first_scan_class = checkpoint.first_scan_class;
+        self.tick_scan_started = checkpoint.tick_scan_started;
+        self.tick_deadline_ns = checkpoint.tick_deadline_ns;
+        self.under_cap_ticks = checkpoint.under_cap_ticks;
+        self.poll_cursor = checkpoint.poll_cursor;
     }
 
     pub(crate) fn quantum_ns(&self) -> u64 {
@@ -341,6 +474,11 @@ impl DiscoveryScheduler {
     #[cfg(test)]
     pub(crate) fn reconcile_sweeps_for_test(&self) -> u64 {
         self.reconcile_sweeps
+    }
+
+    #[cfg(test)]
+    pub(crate) fn under_cap_ticks_for_test(&self) -> u64 {
+        self.under_cap_ticks
     }
 
     #[cfg(test)]
@@ -396,9 +534,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// The reconciliation cadence: ordinary passes serve queued and rotated
-    /// work; every Nth over-cap pass runs the bounded maps slice instead.
+    /// work; every second over-cap pass runs the bounded maps slice instead,
+    /// so owned processes waiting on evictions settle within the guard.
     #[test]
-    fn cadence_is_ordinary_until_every_nth_over_cap_pass() {
+    fn cadence_is_ordinary_until_every_second_over_cap_pass() {
         let mut scheduler = DiscoveryScheduler::new();
         let cadences: Vec<InventoryCadence> =
             (0..8).map(|_| scheduler.begin_over_cap_pass()).collect();
@@ -406,11 +545,11 @@ mod tests {
             cadences,
             [
                 InventoryCadence::Ordinary,
-                InventoryCadence::Ordinary,
+                InventoryCadence::Reconcile,
                 InventoryCadence::Ordinary,
                 InventoryCadence::Reconcile,
                 InventoryCadence::Ordinary,
-                InventoryCadence::Ordinary,
+                InventoryCadence::Reconcile,
                 InventoryCadence::Ordinary,
                 InventoryCadence::Reconcile,
             ]
@@ -449,6 +588,74 @@ mod tests {
         let pids = [1, 2, 3];
         let exclude = BTreeSet::new();
         assert!(DiscoveryScheduler::rotation_window(&pids, &exclude, 0).is_empty());
+    }
+
+    /// Lane-A P2a: the admission window serves pending-request newcomers
+    /// before rotation candidates, with cursor fairness inside each class.
+    #[test]
+    fn pending_requests_sort_before_rotation_candidates() {
+        let scheduler = DiscoveryScheduler::new();
+        let pending: BTreeSet<u32> = [7, 3].into_iter().collect();
+        assert_eq!(
+            scheduler.new_view_order_pending_first(&[1, 3, 5, 7, 9], &pending),
+            vec![3, 7, 1, 5, 9]
+        );
+        // No pending: identical to the plain rotation order.
+        assert_eq!(
+            scheduler.new_view_order_pending_first(&[1, 3, 5], &BTreeSet::new()),
+            scheduler.new_view_order(&[1, 3, 5])
+        );
+        // The cursor rotates inside each class independently.
+        let mut rotated = DiscoveryScheduler::new();
+        rotated.note_new_view_attempt(5);
+        assert_eq!(
+            rotated.new_view_order_pending_first(&[1, 3, 5, 7, 9], &pending),
+            vec![7, 3, 9, 1, 5]
+        );
+    }
+
+    /// A fairness checkpoint covers every H1 accounting cursor: after
+    /// polling rounds, reconcile passes, scan attempts and a deep-scan
+    /// tick, restoring returns each observable cursor and the alternation
+    /// to its checkpoint, while a real admission fact (cooling cleared)
+    /// survives the restore.
+    #[test]
+    fn fairness_checkpoint_restores_h1_accounting_but_keeps_admission_facts() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.note_new_view_attempt(7);
+        scheduler.note_retained_view_attempt(3);
+        scheduler.advance_poll_cursor(11);
+        scheduler.advance_cursor(13);
+        for _ in 0..3 {
+            scheduler.begin_under_cap_tick();
+        }
+        scheduler.begin_over_cap_pass();
+        let checkpoint = scheduler.fairness_checkpoint();
+        let order_before = scheduler.new_view_order(&[5, 7, 9]);
+        let retained_before = scheduler.retained_view_order(&[1, 3, 5]);
+        let alternation_before = scheduler.newcomers_first(true, true);
+        scheduler.begin_under_cap_tick();
+        scheduler.begin_over_cap_pass();
+        scheduler.begin_deep_scan_tick(Some(1_000));
+        scheduler.note_new_view_attempt(9);
+        scheduler.note_retained_view_attempt(5);
+        scheduler.advance_poll_cursor(17);
+        scheduler.advance_cursor(19);
+        scheduler.note_evicted(21);
+        assert_ne!(scheduler.new_view_order(&[5, 7, 9]), order_before);
+        scheduler.note_admitted(21);
+        scheduler.note_evicted(23);
+        scheduler.restore_fairness(checkpoint);
+        assert_eq!(scheduler.new_view_order(&[5, 7, 9]), order_before);
+        assert_eq!(scheduler.retained_view_order(&[1, 3, 5]), retained_before);
+        assert_eq!(scheduler.newcomers_first(true, true), alternation_before);
+        assert_eq!(scheduler.under_cap_ticks_for_test(), 3);
+        assert_eq!(scheduler.over_cap_passes(), 1);
+        assert_eq!(scheduler.cursor_for_test(), Some(13));
+        assert!(!scheduler.cooling_down(21));
+        assert!(!scheduler.is_stale(21));
+        assert!(scheduler.cooling_down(23));
+        assert!(scheduler.is_stale(23));
     }
 
     /// The reconcile slice starts after the cursor and wraps past the end,
@@ -496,7 +703,7 @@ mod tests {
     fn eviction_cooldown_expires_after_configured_sweeps() {
         let mut scheduler = DiscoveryScheduler::new();
         scheduler.set_cooldown_sweeps_for_test(2);
-        for _ in 0..4 {
+        for _ in 0..2 {
             scheduler.begin_over_cap_pass();
         }
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 1);
@@ -505,11 +712,9 @@ mod tests {
         assert!(scheduler.is_stale(7));
         assert_eq!(scheduler.cooling_for_test(), vec![7]);
         assert_eq!(scheduler.cooling_len(), 1);
-        for _ in 0..3 {
-            scheduler.begin_over_cap_pass();
-        }
+        scheduler.begin_over_cap_pass();
         assert!(scheduler.cooling_down(7), "ordinary passes age nothing");
-        for _ in 0..4 {
+        for _ in 0..2 {
             scheduler.begin_over_cap_pass();
         }
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 2);
@@ -517,7 +722,7 @@ mod tests {
             scheduler.cooling_down(7),
             "one elapsed sweep is still cooling"
         );
-        for _ in 0..4 {
+        for _ in 0..2 {
             scheduler.begin_over_cap_pass();
         }
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 3);
@@ -585,8 +790,58 @@ mod tests {
         );
     }
 
-    /// Under-cap ticks poll every fourth, mirroring the reconcile cadence,
-    /// and the poll cursor round-robins queueing past the last queued pid.
+    #[test]
+    fn retained_attempt_cursor_rotates_wraps_and_survives_departure() {
+        let mut scheduler = DiscoveryScheduler::new();
+        assert_eq!(scheduler.retained_view_order(&[0, 2, 4]), [0, 2, 4]);
+        scheduler.note_retained_view_attempt(0);
+        assert_eq!(scheduler.retained_view_order(&[0, 2, 4]), [2, 4, 0]);
+        scheduler.note_retained_view_attempt(2);
+        assert_eq!(scheduler.retained_view_order(&[0, 4]), [4, 0]);
+        scheduler.note_retained_view_attempt(4);
+        assert_eq!(scheduler.retained_view_order(&[0, 2, 4]), [0, 2, 4]);
+        assert!(scheduler.retained_view_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn ready_scan_classes_alternate_after_the_first_actual_attempt() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.newcomers_first(true, true));
+        scheduler.note_retained_view_attempt(1);
+        scheduler.note_new_view_attempt(10);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(scheduler.newcomers_first(true, true));
+        scheduler.note_new_view_attempt(10);
+        scheduler.note_retained_view_attempt(2);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.newcomers_first(true, true));
+        assert!(scheduler.newcomers_first(false, true));
+        assert!(!scheduler.newcomers_first(true, false));
+        assert!(!scheduler.newcomers_first(false, false));
+    }
+
+    #[test]
+    fn expired_ticks_preserve_attempt_cursor_and_class_turn() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.note_retained_view_attempt(1);
+        scheduler.set_tick_quantum_ns_for_test(0);
+        for now in [Some(0), None] {
+            scheduler.begin_deep_scan_tick(now);
+            assert!(scheduler.tick_expired(now));
+            assert_eq!(scheduler.retained_view_order(&[1, 2]), [2, 1]);
+            assert!(scheduler.newcomers_first(true, true));
+        }
+        scheduler.set_tick_quantum_ns_for_test(1);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.tick_expired(Some(0)));
+        scheduler.note_new_view_attempt(10);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.newcomers_first(true, true));
+    }
+
+    /// Under-cap ticks poll every fourth, on their own cadence, and the
+    /// poll cursor round-robins queueing past the last queued pid.
     #[test]
     fn under_cap_ticks_poll_every_fourth_in_poll_cursor_order() {
         let mut scheduler = DiscoveryScheduler::new();
@@ -607,13 +862,13 @@ mod tests {
     fn exploration_bound_frames_round_up_whole_sweeps() {
         assert_eq!(DiscoveryScheduler::exploration_bound_frames(0, 8), 0);
         assert_eq!(DiscoveryScheduler::exploration_bound_frames(5, 0), u64::MAX);
-        assert_eq!(DiscoveryScheduler::exploration_bound_frames(1, 8), 4);
-        assert_eq!(DiscoveryScheduler::exploration_bound_frames(8, 8), 4);
-        assert_eq!(DiscoveryScheduler::exploration_bound_frames(9, 8), 8);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(1, 8), 2);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(8, 8), 2);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(9, 8), 4);
         assert_eq!(
             DiscoveryScheduler::exploration_bound_frames(44, 8),
-            24,
-            "six sweeps at the four-frame cadence"
+            12,
+            "six sweeps at the two-frame cadence"
         );
     }
 }

@@ -1,0 +1,4242 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Private collect/audit/route/scan orchestration. This does not activate a
+//! semantic reducer or alter physical counts (the later activation tasks).
+#![cfg_attr(not(test), allow(dead_code))]
+
+use crate::attach::Session;
+use crate::attach::capture::{NativeDomainId, ReadWindow};
+use crate::attach::image_query::{CompleteEpochs, ImageQueryRefusal, ImageScanProof};
+use crate::discovery::caller_registry::now_ns;
+use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
+use crate::discovery::instances::{
+    CallFacts, EntryIp, InstanceId, InstanceRouter, MAX_INSTANCES, MAX_PENDING, ObserveOutcome,
+    RELOAD_NOT_EXCLUDED_LABEL, Route, RouterLimits, UnknownReason,
+};
+use crate::events::{DecodedEventRecord, DiscoveryItem};
+use crate::process::{PidPin, process_start_time};
+use crate::semantics_objects::journal::joint_driver::{CollectedCallOrigin, H0Delivery};
+use crate::semantics_objects::journal::{
+    BirthKind, BootstrapReceipt, JournalAdapter, JournalBirthCut, JournalDomainProof,
+};
+use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
+use p11scope_ebpf_common::{EventRecord, ImageIdentity, event_type};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
+use std::ops::ControlFlow;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Endpoint {
+    pub(crate) object: PinnedObjectId,
+    pub(crate) file_slot: u32,
+    pub(crate) offset: u64,
+}
+
+/// Current registration authority is separate from historical Joined calls.
+/// Only the synchronous accepted scan path may mint this move-only receipt.
+pub(crate) struct CurrentPartitionReceipt {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    pin: Arc<PidPin>,
+    endpoint: Endpoint,
+    attachment_slot: u32,
+    watched: RetainedInventoryTarget,
+    epochs: CompleteEpochs,
+    fence: u64,
+    deadline: Instant,
+    ids: Vec<InstanceId>,
+    birth: Option<(
+        u64,
+        JournalBirthCut,
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    )>,
+}
+impl CurrentPartitionReceipt {
+    /// Tests-only receipt: merge tests script receipt plumbing (order,
+    /// bounds) that only the synchronous accepted scan path mints.
+    /// Production construction stays move-only.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        pin: Arc<PidPin>,
+        endpoint: Endpoint,
+        attachment_slot: u32,
+        watched: RetainedInventoryTarget,
+        epochs: CompleteEpochs,
+        fence: u64,
+        deadline: Instant,
+        ids: Vec<InstanceId>,
+    ) -> Self {
+        Self {
+            domain,
+            image,
+            pin,
+            endpoint,
+            attachment_slot,
+            watched,
+            epochs,
+            fence,
+            deadline,
+            ids,
+            birth: None,
+        }
+    }
+
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn image(&self) -> ImageIdentity {
+        self.image
+    }
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        self.endpoint
+    }
+    pub(crate) fn instances(&self) -> &[InstanceId] {
+        &self.ids
+    }
+    pub(crate) fn original_pin(&self) -> &Arc<PidPin> {
+        &self.pin
+    }
+    pub(crate) fn attachment_slot(&self) -> u32 {
+        self.attachment_slot
+    }
+    /// The actual watched file retained by the accepted owner scan. This
+    /// accessor transfers no construction or renewal authority.
+    pub(crate) fn watched(&self) -> &RetainedInventoryTarget {
+        &self.watched
+    }
+    /// Nested allocations owned by this receipt. Its inline holder and
+    /// shared file/export Arcs are accounted for by their existing owners.
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        let capacity = self.ids.capacity();
+        capacity
+            .checked_mul(std::mem::size_of::<InstanceId>())?
+            .checked_add(if capacity == 0 {
+                0
+            } else {
+                crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+            })?
+            .checked_add(self.watched.retained_copy_allocation_charge()?)
+    }
+
+    /// Read-only association with this accepted original New. Presence alone
+    /// grants nothing: native consumption still validates the real partition.
+    pub(crate) fn birth_quantum(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity> {
+        self.birth.as_ref().map(|(_, _, quantum)| *quantum)
+    }
+
+    fn matches_admitted_partition(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> bool {
+        let (domain, image, router, _) = input.journal_binding();
+        domain == self.domain && image == self.image && self.ids.contains(&router)
+    }
+
+    pub(crate) fn matches_birth_admission(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        proof: &JournalDomainProof,
+    ) -> bool {
+        self.matches_admitted_partition(input)
+            && proof.matches_admitted(input)
+            && self.birth_quantum().is_some_and(|quantum| {
+                input
+                    .collected_origin()
+                    .is_some_and(|origin| origin.in_quantum(quantum))
+            })
+            && binding.domain() == self.domain
+            && binding.image() == self.image
+            && binding.caller() == input.journal_binding().3
+            && binding.scope_current()
+            && Arc::ptr_eq(&binding.pin(), &self.pin)
+            && binding
+                .provider_for_endpoint(self.endpoint)
+                .is_some_and(|provider| provider.module() == input.provider_module())
+    }
+    #[allow(clippy::result_large_err)] // Refusal returns the original receipt without allocating or discarding its custody.
+    pub(crate) fn into_birth_candidate(mut self) -> Result<H0BirthCandidate, Self> {
+        let Some((capture, cut, quantum)) = self.birth.take() else {
+            return Err(self);
+        };
+        Ok(H0BirthCandidate {
+            receipt: self,
+            capture,
+            cut,
+            quantum,
+        })
+    }
+}
+
+/// Moves the existing bounded H0 receipt; no duplicate partition or queue.
+pub(crate) struct H0BirthCandidate {
+    receipt: CurrentPartitionReceipt,
+    capture: u64,
+    cut: JournalBirthCut,
+    quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+}
+
+pub(crate) struct CommittedAbsenceBirth {
+    proof: crate::attach::image_query::ImageAbsenceProof,
+    pin: Arc<PidPin>,
+    watched: RetainedInventoryTarget,
+    capture: u64,
+    cut: JournalBirthCut,
+}
+
+impl CommittedAbsenceBirth {
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        self.watched.retained_copy_allocation_charge()
+    }
+
+    pub(crate) fn matches_binding_target(
+        &self,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: PinnedObjectId,
+    ) -> bool {
+        self.proof.domain() == binding.domain()
+            && self.proof.image() == binding.image()
+            && Arc::ptr_eq(&self.pin, &binding.pin())
+            && self.watched.same_object_as(pins, object)
+    }
+
+    /// Select the original negative without classifying its freshness. A
+    /// stale fence/epoch/closure must reach finish_birth and fail permanently,
+    /// rather than silently falling back to a different birth kind.
+    pub(crate) fn matches_current(&self, current: &CurrentPartitionReceipt) -> bool {
+        current
+            .birth
+            .as_ref()
+            .is_some_and(|(capture, _, _)| *capture == self.capture)
+            && self.proof.domain() == current.domain
+            && self.proof.image() == current.image
+            && self.proof.file_slot() == current.endpoint.file_slot
+            && Arc::ptr_eq(&self.pin, &current.pin)
+            && Arc::ptr_eq(
+                &self.watched.retirement_lease(),
+                &current.watched.retirement_lease(),
+            )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // Read the exact original subject; no scalar minting port.
+    pub(crate) fn matches_origin(
+        &self,
+        capture: &SemanticCapture,
+        producers: &crate::attach::SessionDrainProducers,
+        image: ImageIdentity,
+        pin: &Arc<PidPin>,
+        endpoint: Endpoint,
+        attached: &crate::attach::AttachedSemanticSet,
+        adapter: &JournalAdapter,
+    ) -> bool {
+        self.capture == capture.identity
+            && self.proof.domain() == capture.router.domain()
+            && self.proof.domain() == producers.native_domain()
+            && self.proof.image() == image
+            && self.proof.file_slot() == endpoint.file_slot
+            && Arc::ptr_eq(&self.pin, pin)
+            && capture
+                .bindings
+                .get(&image.task_cookie)
+                .is_some_and(|binding| {
+                    binding.current && binding.image == image && Arc::ptr_eq(&binding.pin, pin)
+                })
+            && self.proof.attach_generation() == attached.generation()
+            && attached.domain() == self.proof.domain()
+            && self.proof.fence() == capture.router.fence()
+            && self.watched.check_unchanged() == Ok(true)
+            && adapter.retains_producers(producers)
+            && adapter.quiet_sighting_at(image, &self.cut)
+    }
+}
+
+/// One-shot authorization minted only after the original H0 candidate, its
+/// admission and any required committed absence have been checked together.
+/// Native freshness observations cannot construct this subject-bound value.
+pub(crate) struct ValidatedH0Birth {
+    proof: JournalDomainProof,
+    birth: BirthKind,
+    cut: JournalBirthCut,
+    closure_generation: u64,
+    evidence: crate::semantics_objects::journal::SessionBirthEvidence,
+}
+impl ValidatedH0Birth {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        JournalDomainProof,
+        BirthKind,
+        JournalBirthCut,
+        u64,
+        crate::semantics_objects::journal::SessionBirthEvidence,
+    ) {
+        (
+            self.proof,
+            self.birth,
+            self.cut,
+            self.closure_generation,
+            self.evidence,
+        )
+    }
+}
+
+pub(crate) struct RetainedBirthWitness {
+    candidate: H0BirthCandidate,
+    admission: crate::attach::BirthAdmissionBinding,
+    original: CollectedCallOrigin,
+    receipt: BootstrapReceipt,
+}
+impl RetainedBirthWitness {
+    pub(crate) fn receipt(&self) -> &BootstrapReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        self.candidate.receipt.owned_storage_bytes()
+    }
+
+    pub(crate) fn matches_binding_target(
+        &self,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: PinnedObjectId,
+    ) -> bool {
+        let current = &self.candidate.receipt;
+        current.domain == binding.domain()
+            && current.image == binding.image()
+            && Arc::ptr_eq(&current.pin, &binding.pin())
+            && current.endpoint.object == object
+            && current.watched.same_object_as(pins, object)
+    }
+
+    /// The original candidate and proof are private native-validated values.
+    /// Equal key/ordinal words from a different collected allocation fail.
+    pub(crate) fn matches_admitted(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> bool {
+        self.candidate.receipt.matches_admitted_partition(input)
+            && self.receipt.proof().matches_admitted(input)
+            && input.collected_origin() == Some(self.original)
+    }
+
+    pub(crate) fn matches_original(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        proof: &JournalDomainProof,
+    ) -> bool {
+        self.matches_admitted(input)
+            && self.receipt.proof() == *proof
+            && binding.domain() == self.candidate.receipt.domain
+            && binding.image() == self.candidate.receipt.image
+            && binding.caller() == input.journal_binding().3
+            && binding.scope_current()
+            && Arc::ptr_eq(&binding.pin(), &self.candidate.receipt.pin)
+            && binding
+                .provider_for_endpoint(self.candidate.receipt.endpoint)
+                .is_some_and(|provider| provider.module() == input.provider_module())
+    }
+
+    fn validate_scope(
+        &self,
+        attachment: &crate::attach::AttachedSemanticSet,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        if !Arc::ptr_eq(&binding.pin(), &self.candidate.receipt.pin) {
+            return Err(crate::attach::BirthObservationRefusal::BindingMismatch);
+        }
+        if attachment.generation() != self.receipt.closure_generation() {
+            return Err(crate::attach::BirthObservationRefusal::GenerationMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fresh_evidence(
+        &self,
+        session: &mut Session,
+        capture: &SemanticCapture,
+        attachment: &crate::attach::AttachedSemanticSet,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.validate_scope(attachment, binding)?;
+        let deadline = Instant::now()
+            .checked_add(capture.limits.scan_slice)
+            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+        capture.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &self.candidate,
+            true,
+        )?;
+        let evidence = {
+            let maps = session.instance_maps();
+            let mut rows = crate::attach::LiveBirthRows::over(&maps, binding);
+            crate::attach::observe_retained_birth(
+                &mut rows,
+                binding,
+                attachment,
+                &self.admission,
+                self.receipt.birth(),
+            )?
+        };
+        capture.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &self.candidate,
+            true,
+        )?;
+        if Instant::now() >= deadline {
+            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+        }
+        Ok(evidence)
+    }
+
+    /// Test-only recheck over substituted I/O: the scan window is measured
+    /// on the fixture clock, like every other bound on this path, so a
+    /// descheduled test thread never reads a stale window. The production
+    /// [`Self::fresh_evidence`] port keeps the wall clock for real I/O.
+    #[cfg(test)]
+    fn fresh_evidence_with(
+        &self,
+        io: &mut impl CaptureIo,
+        rows: &mut impl crate::attach::BirthRowReader,
+        capture: &SemanticCapture,
+        attachment: &crate::attach::AttachedSemanticSet,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.validate_scope(attachment, binding)?;
+        let deadline = io
+            .now()
+            .checked_add(capture.limits.scan_slice)
+            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+        capture.validate_birth_candidate(io, &self.candidate, true)?;
+        let evidence = crate::attach::observe_retained_birth(
+            rows,
+            binding,
+            attachment,
+            &self.admission,
+            self.receipt.birth(),
+        )?;
+        capture.validate_birth_candidate(io, &self.candidate, true)?;
+        if io.now() >= deadline {
+            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+        }
+        Ok(evidence)
+    }
+}
+
+/// A seal borrows fresh Session I/O over the same retained witness each time.
+#[allow(dead_code)] // Kept inactive until the controller accepts the authority foundation.
+pub(crate) struct RetainedBirthSource<'a> {
+    pub(crate) witness: &'a RetainedBirthWitness,
+    pub(crate) session: &'a mut Session,
+    pub(crate) capture: &'a SemanticCapture,
+    pub(crate) attachment: &'a crate::attach::AttachedSemanticSet,
+    pub(crate) binding:
+        &'a crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+}
+impl crate::semantics_objects::journal::BirthEvidenceSource for RetainedBirthSource<'_> {
+    fn take_birth_evidence(
+        &mut self,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.witness
+            .fresh_evidence(self.session, self.capture, self.attachment, self.binding)
+    }
+}
+impl fmt::Debug for CurrentPartitionReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentPartitionReceipt(<private>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentReceiptRefusal {
+    Domain,
+    Custody,
+    Attachment,
+    Epoch,
+    Partition,
+    Deadline,
+    Audit,
+    Stopped,
+}
+
+/// I/O observations only. The capture owner applies all receipt decisions.
+struct ReceiptState {
+    image: ImageIdentity,
+    epochs: CompleteEpochs,
+    watched: RetainedInventoryTarget,
+}
+
+/// One latch belongs to one retained physical-authority episode, within the
+/// coordinator's existing record budgets. H0 scans cannot reopen an episode.
+struct PhysicalGapEpisode {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    pin: Arc<PidPin>,
+    applied: AtomicBool,
+}
+
+/// Task3's completed physical adjudicator alone gains the production factory.
+/// A provisional scan marker or scalar caller fact cannot construct a gap.
+/// This slice requires an already accepted H0 cookie-to-original-Arc binding;
+/// handling a genuine gap before that first scan remains a Task3 prerequisite.
+pub(crate) struct PhysicalSemanticGap {
+    episode: Arc<PhysicalGapEpisode>,
+}
+impl fmt::Debug for PhysicalSemanticGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PhysicalSemanticGap(<private>)")
+    }
+}
+impl PhysicalSemanticGap {
+    /// Sole production factory: the coordinator's final physical
+    /// adjudication mints one gap per proven genuine-loss episode from
+    /// the binding's domain, image and stable custody Arc. Fields stay
+    /// private, Debug stays redacted, and the episode starts unapplied;
+    /// H0 re-checks custody, image and association at the cut. The finite
+    /// loss cause travels with the finalizer's loss mapping, not here.
+    pub(crate) fn adjudicated(
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        pin: Arc<PidPin>,
+    ) -> Self {
+        Self {
+            episode: Arc::new(PhysicalGapEpisode {
+                domain,
+                image,
+                pin,
+                applied: AtomicBool::new(false),
+            }),
+        }
+    }
+    #[cfg(test)]
+    fn test_episode(domain: NativeDomainId, image: ImageIdentity, pin: Arc<PidPin>) -> Self {
+        Self {
+            episode: Arc::new(PhysicalGapEpisode {
+                domain,
+                image,
+                pin,
+                applied: AtomicBool::new(false),
+            }),
+        }
+    }
+    #[cfg(test)]
+    fn test_repeat(&self) -> Self {
+        Self {
+            episode: self.episode.clone(),
+        }
+    }
+}
+
+/// How long a retained never-bound image waits for its binding proof
+/// before its records expire mid-run as Unobserved. Generous against
+/// the observed ~10 s bind delay at system scale; past it the records
+/// shed with the existing disclosure instead of occupying the pending
+/// budget until stop.
+const RETAINED_IMAGE_HORIZON: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+pub(crate) struct TickLimits {
+    pub(crate) records: usize,
+    pub(crate) scans: usize,
+    pub(crate) terminal_reads: usize,
+    pub(crate) bindings: usize,
+    pub(crate) pending_for: Duration,
+    pub(crate) scan_slice: Duration,
+}
+impl Default for TickLimits {
+    fn default() -> Self {
+        Self {
+            records: MAX_PENDING,
+            scans: 4,
+            terminal_reads: 16,
+            bindings: MAX_INSTANCES,
+            pending_for: Duration::from_secs(2),
+            scan_slice: Duration::from_millis(50),
+        }
+    }
+}
+
+/// Opaque result of the actual audited router; raw inputs never render.
+/// Slice D carries the private validated object tail alongside the base
+/// record through the same owned call; S1 keeps reading the base.
+pub(crate) struct RoutedCall {
+    domain: NativeDomainId,
+    decoded: DecodedEventRecord,
+    route: Route,
+    endpoint: Option<Endpoint>,
+    token: Option<u64>,
+    collected_origin: Option<CollectedCallOrigin>,
+}
+impl RoutedCall {
+    /// Tests-only call: finalizer and terminal tests script Joined calls
+    /// with timeline tokens that only the audited router mints.
+    /// Production construction stays move-only.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        decoded: DecodedEventRecord,
+        route: Route,
+        endpoint: Option<Endpoint>,
+        token: Option<u64>,
+    ) -> Self {
+        Self {
+            domain,
+            decoded,
+            route,
+            endpoint,
+            token,
+            collected_origin: None,
+        }
+    }
+
+    pub(crate) fn token(&self) -> Option<u64> {
+        self.token
+    }
+    pub(crate) fn collected_origin(&self) -> Option<CollectedCallOrigin> {
+        self.collected_origin
+    }
+    pub(crate) fn position(&self) -> Option<u64> {
+        self.token
+    }
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn record(&self) -> &EventRecord {
+        &self.decoded.base
+    }
+    pub(crate) fn joint_resource(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin> {
+        self.decoded
+            .joint_resource
+            .filter(|origin| origin.matches_native(self.domain))
+    }
+    /// Move-only tail handoff to the sole consuming runtime adapter
+    /// (`CallEvidence::from_routed`): no borrower observes the tail.
+    pub(crate) fn into_object_tail(self) -> Option<ValidatedObjectCall> {
+        self.decoded.object
+    }
+    pub(crate) fn image(&self) -> ImageIdentity {
+        self.decoded.base.event.image
+    }
+    pub(crate) fn route(&self) -> Route {
+        self.route
+    }
+    pub(crate) fn endpoint(&self) -> Option<Endpoint> {
+        self.endpoint
+    }
+}
+
+/// Aggregate a dropped batch or report's unjoined calls by their finite
+/// shed label: Unknown routes under their reason label, Pending routes
+/// under `pending`. Joined calls are already counted in joined and are
+/// not shed, so the stop-line identity holds across the drop.
+pub(crate) fn unjoined_shed_counts(outcomes: &[TickOutcome]) -> BTreeMap<&'static str, u64> {
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for outcome in outcomes {
+        let TickOutcome::Call(call) = outcome else {
+            continue;
+        };
+        let label = match call.route() {
+            Route::Joined(_) => continue,
+            Route::Unknown(reason) => reason.label(),
+            Route::Pending => "pending",
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+    counts
+}
+
+impl fmt::Debug for RoutedCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RoutedCall")
+            .field("route", &self.route)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Tests-only record: finalizer and terminal tests script Joined calls
+/// with routing continuity that only the audited router mints. The helper
+/// lives in the allowlisted router plumbing so non-allowed test fixtures
+/// never name the private routing fields. Production construction stays
+/// move-only.
+#[cfg(test)]
+pub(crate) fn event_record_with_routing(
+    event: p11scope_ebpf_common::Event,
+    stamp: p11scope_ebpf_common::InstanceStamp,
+    ip: u64,
+) -> EventRecord {
+    EventRecord {
+        event,
+        continuity: p11scope_ebpf_common::InstanceContinuity {
+            entry_stamp: stamp,
+            return_stamp: stamp,
+            entry_ip: ip,
+        },
+    }
+}
+
+pub(crate) enum InvalidationScope {
+    CoverageFailed,
+    AuthorityExhausted,
+    FaultEra,
+    ImageRetired(ImageIdentity),
+    TaskRetired(u64),
+    File {
+        image: ImageIdentity,
+        file_slot: u32,
+    },
+    InstancesRetired {
+        image: ImageIdentity,
+        file_slot: u32,
+        ids: Vec<InstanceId>,
+    },
+    Stopped,
+}
+pub(crate) struct Invalidation {
+    domain: NativeDomainId,
+    scope: InvalidationScope,
+    position: Option<u64>,
+}
+impl Invalidation {
+    pub(crate) fn position(&self) -> Option<u64> {
+        self.position
+    }
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn scope(&self) -> &InvalidationScope {
+        &self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        scope: InvalidationScope,
+        position: Option<u64>,
+    ) -> Self {
+        Self {
+            domain,
+            scope,
+            position,
+        }
+    }
+
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        self.scope.owned_storage_bytes()
+    }
+}
+
+impl InvalidationScope {
+    /// Nested id-list bytes owned by this scope. Only `InstancesRetired`
+    /// owns heap ids; every other scope is inline. The match stays
+    /// exhaustive so a future id-carrying scope must account itself here.
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        match self {
+            InvalidationScope::InstancesRetired { ids, .. } => {
+                let capacity = ids.capacity();
+                capacity
+                    .checked_mul(std::mem::size_of::<InstanceId>())?
+                    .checked_add(if capacity == 0 {
+                        0
+                    } else {
+                        crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+                    })
+            }
+            InvalidationScope::CoverageFailed
+            | InvalidationScope::AuthorityExhausted
+            | InvalidationScope::FaultEra
+            | InvalidationScope::ImageRetired(_)
+            | InvalidationScope::TaskRetired(_)
+            | InvalidationScope::File { .. }
+            | InvalidationScope::Stopped => Some(0),
+        }
+    }
+}
+impl fmt::Debug for Invalidation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match &self.scope {
+            InvalidationScope::CoverageFailed => "Invalidation(CoverageFailed)",
+            InvalidationScope::AuthorityExhausted => "Invalidation(AuthorityExhausted)",
+            InvalidationScope::FaultEra => "Invalidation(FaultEra)",
+            InvalidationScope::ImageRetired(_) => "Invalidation(ImageRetired)",
+            InvalidationScope::TaskRetired(_) => "Invalidation(TaskRetired)",
+            InvalidationScope::File { .. } => "Invalidation(File)",
+            InvalidationScope::InstancesRetired { .. } => "Invalidation(InstancesRetired)",
+            InvalidationScope::Stopped => "Invalidation(Stopped)",
+        })
+    }
+}
+pub(crate) struct OtherRecord {
+    domain: NativeDomainId,
+    record: EventRecord,
+    position: Option<u64>,
+}
+impl OtherRecord {
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn record(&self) -> &EventRecord {
+        &self.record
+    }
+    pub(crate) fn position(&self) -> Option<u64> {
+        self.position
+    }
+}
+impl fmt::Debug for OtherRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OtherRecord(<private>)")
+    }
+}
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // H7 slice D: Call is the common outcome and carries the 240 B validated object tail inline; outcomes stay allocation-free per tick.
+pub(crate) enum TickOutcome {
+    Call(RoutedCall),
+    Invalidation(Invalidation),
+    Other(OtherRecord),
+}
+impl TickOutcome {
+    /// Whether this outcome is an H0 invalidation (a negative):
+    /// bounded stashes and merges shed positives first so loss
+    /// boundaries survive overflow.
+    pub(crate) fn is_invalidation(&self) -> bool {
+        matches!(self, TickOutcome::Invalidation(_))
+    }
+
+    /// This outcome's H0 position, when the allocator issued one. A
+    /// missing position means allocator exhaustion, never a gap the
+    /// finalizer may skip.
+    pub(crate) fn position(&self) -> Option<u64> {
+        match self {
+            TickOutcome::Call(call) => call.token(),
+            TickOutcome::Invalidation(invalidation) => invalidation.position(),
+            TickOutcome::Other(other) => other.position(),
+        }
+    }
+
+    /// Nested allocations owned by this outcome. Calls and other records
+    /// are fully inline (their event records are `Copy`); only an
+    /// invalidation may own a heap id list.
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        match self {
+            TickOutcome::Call(_) | TickOutcome::Other(_) => Some(0),
+            TickOutcome::Invalidation(invalidation) => invalidation.owned_storage_bytes(),
+        }
+    }
+}
+
+/// One B17 reload-not-excluded disclosure in the semantic-capture report:
+/// the finite label plus the affected identity, pushed once per identity
+/// on its first tainted continuation. No epochs, ranges or addresses.
+/// Redacted Debug: the private image never prints.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ReloadNotExcludedReport {
+    pub(crate) label: &'static str,
+    pub(crate) image: ImageIdentity,
+    pub(crate) file_slot: u32,
+    pub(crate) ids: Vec<InstanceId>,
+}
+
+impl std::fmt::Debug for ReloadNotExcludedReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadNotExcludedReport")
+            .field("label", &self.label)
+            .field("image", &"<private>")
+            .field("file_slot", &self.file_slot)
+            .field("ids", &self.ids.len())
+            .finish()
+    }
+}
+
+/// B17 W2 terminal projection of the per-capture reload disclosure
+/// ledger: the capture-monotonic router count snapshots plus one entry
+/// per tainted identity, in `(file_slot, ids)` order. `pub` for the
+/// `render::Evidence` field; the module stays `pub(crate)`, so no new
+/// nameable public API escapes. The private image key (task cookie and
+/// exec id) groups the ledger but never renders: entries name only the
+/// watched file slot and the public-safe capture-local instance IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceReloadNotExcluded {
+    pub continued_across_global: u64,
+    pub joined_across_global: u64,
+    pub identities: Vec<ReloadNotExcludedIdentity>,
+}
+
+/// One tainted identity in [`InstanceReloadNotExcluded`]: the watched
+/// file slot plus the continued instance IDs. No cookie, exec id,
+/// epoch, range or address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadNotExcludedIdentity {
+    pub file_slot: u32,
+    pub ids: Vec<u64>,
+}
+#[derive(Default, Debug)]
+pub(crate) struct TickReport {
+    outcomes: Vec<TickOutcome>,
+    current: Vec<CurrentPartitionReceipt>,
+    pub(crate) collected_calls: usize,
+    pub(crate) scans: usize,
+    pub(crate) observations: Vec<ObserveOutcome>,
+    pub(crate) scan_refusals: Vec<ImageQueryRefusal>,
+    /// B17 W1 disclosures drained from the router beside the observation
+    /// losses: one entry per newly tainted identity, drained once.
+    pub(crate) reload_not_excluded: Vec<ReloadNotExcludedReport>,
+    /// B17 W1 router totals at drain time: observations that took the
+    /// global-only continuation arm, and calls that joined through a
+    /// tainted entry. Capture-monotonic and saturating, like the
+    /// router counters they snapshot.
+    pub(crate) continued_across_global: u64,
+    pub(crate) joined_across_global: u64,
+    /// B17 carried disclosure-identity shed: identities shed past an
+    /// accumulator cap upstream (stash, collected union, stop union).
+    /// Saturating u32, so the pinned report size holds; the ledger
+    /// folds it into its cumulative counter at stage time. Never a
+    /// refused endpoint.
+    pub(crate) reload_shed: u32,
+    /// Guard signals for the Joint no-progress tripwire: scans attempted
+    /// for awaited keys this tick (joined-refresh scans excluded), whether
+    /// any job for an awaited key still has a future deadline, and whether
+    /// any retained hold for an awaited image is inside its horizon.
+    pub(crate) pending_scans: usize,
+    pub(crate) awaited_jobs_pending: bool,
+    pub(crate) awaited_hold_pending: bool,
+    /// H3 disposition inputs (H8): every position below the watermark
+    /// was allocated by this tick or earlier; the awaiting floor is the
+    /// minimum route-waiting position; the shed floor is the minimum
+    /// merge-shed position; exhaustion marks a dead allocator.
+    allocated_below: u64,
+    awaiting_floor: Option<u64>,
+    shed_floor: Option<u64>,
+    exhausted: bool,
+    /// This tick's collection stopped at its record quantum with more
+    /// possibly waiting: the driver commits promptly so the next
+    /// service drains again. Retained deliveries never set this.
+    pub(crate) collection_saturated: bool,
+}
+
+fn pending_q_array_bytes<T>(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_mul(std::mem::size_of::<T>())?
+        .checked_add(if capacity == 0 {
+            0
+        } else {
+            crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+        })
+}
+
+/// Only this module constructs an owner from the nonrecycled Capture identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CollectedH0Owner(u64);
+
+/// Move-only acknowledgement minted only after the real collected leaf ran
+/// all H0 routing and stamped its actual allocation watermark. The retained
+/// raw quantum checks the exact identity before applying any scalar.
+pub(crate) struct CollectedH0Disposition {
+    quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    native: NativeDomainId,
+    owner: CollectedH0Owner,
+    allocated_below: u64,
+    pending: bool,
+}
+
+/// Constructed only after the Q-checked final Capture.stop below. Neither an
+/// ordinary tick disposition nor a caller's completion word has this type.
+pub(crate) struct CollectedH0FinishDisposition {
+    disposition: CollectedH0Disposition,
+    position: u64,
+}
+
+impl CollectedH0FinishDisposition {
+    pub(crate) fn into_parts(self) -> (CollectedH0Disposition, u64) {
+        (self.disposition, self.position)
+    }
+}
+
+impl CollectedH0Disposition {
+    pub(crate) fn for_quantum(
+        self,
+        quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        native: NativeDomainId,
+    ) -> Option<(CollectedH0Owner, u64, bool)> {
+        (self.quantum == quantum && self.native == native && self.allocated_below != 0).then_some((
+            self.owner,
+            self.allocated_below,
+            self.pending,
+        ))
+    }
+}
+
+/// One shared reload-disclosure union for every accumulator merge
+/// (collected union, pending-Q union, collected stop union, stashed
+/// merge): the incoming identities append behind the kept side under
+/// one cumulative `MAX_INSTANCES` cap while the count snapshots
+/// max-merge. Past the cap the incoming tail sheds (counted) and
+/// the merge still succeeds: disclosures never refuse a semantic
+/// merge. The union never exceeds the cap: the incoming side
+/// truncates to the remaining room first, so a prepaid accumulator
+/// absorbs it without reallocating. Returns shed identities.
+pub(crate) fn union_reload_disclosures(
+    kept: &mut Vec<ReloadNotExcludedReport>,
+    kept_continued: &mut u64,
+    kept_joined: &mut u64,
+    mut incoming: Vec<ReloadNotExcludedReport>,
+    incoming_continued: u64,
+    incoming_joined: u64,
+) -> u32 {
+    let room = MAX_INSTANCES.saturating_sub(kept.len());
+    let shed = incoming.len().saturating_sub(room);
+    incoming.truncate(room);
+    kept.append(&mut incoming);
+    *kept_continued = (*kept_continued).max(incoming_continued);
+    *kept_joined = (*kept_joined).max(incoming_joined);
+    debug_assert!(kept.len() <= MAX_INSTANCES);
+    u32::try_from(shed).unwrap_or(u32::MAX)
+}
+
+impl TickReport {
+    /// Tests-only report: finalizer and terminal tests script batches
+    /// that only the audited collect→audit→route path mints. Production
+    /// construction stays move-only.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        outcomes: Vec<TickOutcome>,
+        current: Vec<CurrentPartitionReceipt>,
+    ) -> Self {
+        Self {
+            outcomes,
+            current,
+            ..Self::default()
+        }
+    }
+
+    /// Drain this report's current-partition receipts (refresh stashing).
+    pub(crate) fn take_current(&mut self) -> Vec<CurrentPartitionReceipt> {
+        std::mem::take(&mut self.current)
+    }
+
+    /// Drain this report's outcomes (refresh stashing preserves
+    /// invalidations beside the receipts).
+    pub(crate) fn take_outcomes(&mut self) -> Vec<TickOutcome> {
+        std::mem::take(&mut self.outcomes)
+    }
+
+    /// Merge lane-stashed refresh receipts behind this tick's own: fresh
+    /// receipts first, stashed appended, truncated to batch capacity so
+    /// the merged batch never refuses on bounds. Returns shed receipts.
+    pub(crate) fn merge_stashed_current(&mut self, stashed: Vec<CurrentPartitionReceipt>) -> u64 {
+        self.current.extend(stashed);
+        let shed = self.current.len().saturating_sub(MAX_INSTANCES);
+        self.current.truncate(MAX_INSTANCES);
+        debug_assert!(self.current.len() <= MAX_INSTANCES);
+        shed as u64
+    }
+
+    /// Merge lane-stashed refresh outcomes behind this tick's own,
+    /// truncated to batch capacity like the receipts. Returns shed
+    /// outcomes. Truncation sheds positives first: a merged
+    /// invalidation is H2's loss boundary, while a shed call is
+    /// disclosed through the refusal count. Positions increase
+    /// monotonically, so the oldest outcome still carries the minimum
+    /// barrier when only invalidations remain. Sheds record their
+    /// minimum position for H3 disposition; a shed outcome without a
+    /// position records allocator exhaustion.
+    pub(crate) fn merge_stashed_outcomes(&mut self, stashed: Vec<TickOutcome>) -> u64 {
+        self.outcomes.extend(stashed);
+        let mut shed = 0u64;
+        while self.outcomes.len() > MAX_INSTANCES {
+            let at = self
+                .outcomes
+                .iter()
+                .position(|outcome| !outcome.is_invalidation())
+                .unwrap_or(0);
+            let dropped = self.outcomes.remove(at);
+            match dropped.position() {
+                Some(position) => {
+                    self.shed_floor = Some(
+                        self.shed_floor
+                            .map_or(position, |floor| floor.min(position)),
+                    );
+                }
+                None => self.exhausted = true,
+            }
+            shed += 1;
+        }
+        debug_assert!(self.outcomes.len() <= MAX_INSTANCES);
+        shed
+    }
+
+    /// Merge lane-stashed reload disclosures behind this tick's own
+    /// through the shared disclosure union: one cumulative batch
+    /// cap, max-merged count snapshots, counted shed. Returns shed
+    /// disclosures as u32 (the disclosure-shed vocabulary; receipt
+    /// and outcome shed stays u64 beside the refused-endpoint
+    /// total). Fresh disclosures stay ahead of stashed ones; the
+    /// snapshots are capture-monotonic router totals, so the maximum
+    /// wins and totals survive even when identities shed.
+    pub(crate) fn merge_stashed_disclosures(
+        &mut self,
+        stashed: Vec<ReloadNotExcludedReport>,
+        continued_across_global: u64,
+        joined_across_global: u64,
+    ) -> u32 {
+        union_reload_disclosures(
+            &mut self.reload_not_excluded,
+            &mut self.continued_across_global,
+            &mut self.joined_across_global,
+            stashed,
+            continued_across_global,
+            joined_across_global,
+        )
+    }
+
+    /// Whether the report carries nothing a batch must preserve:
+    /// no outcomes, receipts, disclosures, count snapshots or
+    /// carried shed. A disclosure, a nonzero snapshot or a nonzero
+    /// carried shed is evidence, never quiet: dropping a
+    /// counts-only report would lose the router totals, and dropping
+    /// a shed-only report would lose the loss itself.
+    pub(crate) fn is_quiet(&self) -> bool {
+        self.outcomes.is_empty()
+            && self.current.is_empty()
+            && self.reload_not_excluded.is_empty()
+            && self.continued_across_global == 0
+            && self.joined_across_global == 0
+            && self.reload_shed == 0
+    }
+
+    /// H3 disposition inputs for the finalizer: the allocation
+    /// watermark, route-waiting floor, shed floor, and exhaustion.
+    pub(crate) fn allocated_below(&self) -> u64 {
+        self.allocated_below
+    }
+    pub(crate) fn awaiting_floor(&self) -> Option<u64> {
+        self.awaiting_floor
+    }
+    pub(crate) fn shed_floor(&self) -> Option<u64> {
+        self.shed_floor
+    }
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Absorb the lane stash's shed floor at merge time: shed positions
+    /// from stash overflow join this batch's own merge sheds. The stash
+    /// resets on handoff, so each shed reports exactly once.
+    pub(crate) fn absorb_shed_floor(&mut self, floor: Option<u64>) {
+        if let Some(floor) = floor {
+            self.shed_floor = Some(self.shed_floor.map_or(floor, |at| at.min(floor)));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_with_disposition(
+        outcomes: Vec<TickOutcome>,
+        current: Vec<CurrentPartitionReceipt>,
+        awaiting_floor: Option<u64>,
+        shed_floor: Option<u64>,
+        exhausted: bool,
+    ) -> Self {
+        Self {
+            outcomes,
+            current,
+            awaiting_floor,
+            shed_floor,
+            exhausted,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn into_outcomes(self) -> Vec<TickOutcome> {
+        self.outcomes
+    }
+    pub(crate) fn outcomes(&self) -> &[TickOutcome] {
+        &self.outcomes
+    }
+    pub(crate) fn current(&self) -> &[CurrentPartitionReceipt] {
+        &self.current
+    }
+    pub(crate) fn into_parts(self) -> (Vec<TickOutcome>, Vec<CurrentPartitionReceipt>) {
+        (self.outcomes, self.current)
+    }
+    pub(crate) fn calls(&self) -> impl Iterator<Item = &RoutedCall> {
+        self.outcomes.iter().filter_map(|item| match item {
+            TickOutcome::Call(call) => Some(call),
+            _ => None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Health {
+    fault: u64,
+    sticky: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionStatus {
+    Complete,
+    Malformed,
+    ReadError,
+}
+impl CollectionStatus {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ReadError, _) | (_, Self::ReadError) => Self::ReadError,
+            (Self::Malformed, _) | (_, Self::Malformed) => Self::Malformed,
+            _ => Self::Complete,
+        }
+    }
+}
+struct Collection {
+    records: Vec<DecodedEventRecord>,
+    status: CollectionStatus,
+    /// The poll stopped at its record quantum with more possibly
+    /// waiting: the ring likely still holds uncollected records.
+    quantum_exhausted: bool,
+}
+
+struct ScanJob {
+    image: ImageIdentity,
+    endpoint: Endpoint,
+    slot: u32,
+    pin: Arc<PidPin>,
+    deadline: Instant,
+    birth_cut: Option<(
+        JournalBirthCut,
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    )>,
+}
+impl ScanJob {
+    fn key(&self) -> (u64, u64, u32) {
+        (
+            self.image.task_cookie,
+            self.image.exec_id,
+            self.endpoint.file_slot,
+        )
+    }
+}
+
+/// Only I/O is substituted in tests; all decisions use the same tick below.
+trait CaptureIo {
+    fn domain(&self) -> Option<NativeDomainId>;
+    fn now(&self) -> Instant;
+    fn collect(&mut self, limit: usize) -> Collection;
+    fn health(&mut self) -> Result<Health, ()>;
+    fn raise_fault(&mut self) -> Result<u64, ()>;
+    fn retained_attachment(
+        &self,
+        slot: u32,
+    ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal>;
+    fn receipt_state(
+        &mut self,
+        pin: &Arc<PidPin>,
+        image: ImageIdentity,
+        endpoint: Endpoint,
+        slot: u32,
+        deadline: Instant,
+    ) -> Result<ReceiptState, CurrentReceiptRefusal>;
+    fn endpoint(&self, slot: u32) -> Option<Endpoint>;
+    fn target(&self, pid: u32) -> Option<Arc<PidPin>>;
+    fn scan(
+        &mut self,
+        job: &ScanJob,
+        deadline: Instant,
+        fence: u64,
+        current_fence: &dyn Fn() -> u64,
+    ) -> Result<ImageScanProof, ImageQueryRefusal>;
+    fn scan_selected(
+        &mut self,
+        pin: &Arc<PidPin>,
+        endpoint: Endpoint,
+        deadline: Instant,
+        fence: u64,
+        current_fence: &dyn Fn() -> u64,
+    ) -> Result<ImageScanProof, ImageQueryRefusal>;
+    /// The current `INSTANCE_COUNT.storage_null` counter for the Q1(b)
+    /// fail-closed gate, when the backend can read it. `None` keeps the
+    /// legacy continuity rule.
+    fn storage_null(&mut self) -> Option<u64> {
+        None
+    }
+}
+
+const LIVE_DISCOVERY_QUANTUM: usize = 16;
+
+// Private H0 collection services the lane's own retained DISCOVERY cursor
+// without applying publications or granting Inventory authority.
+fn service_discovery_quantum(
+    quantum: usize,
+    mut dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+) -> CollectionStatus {
+    let mut discovery_status = CollectionStatus::Complete;
+    for _ in 0..quantum {
+        match dequeue() {
+            Ok(Some(DiscoveryItem::Record(_))) => {}
+            Ok(Some(DiscoveryItem::Malformed)) => discovery_status = CollectionStatus::Malformed,
+            Ok(None) => break,
+            Err(_) => {
+                discovery_status = CollectionStatus::ReadError;
+                break;
+            }
+        }
+    }
+    discovery_status
+}
+
+fn collect_attested_with<T>(
+    owner: &mut T,
+    limit: usize,
+    mut dequeue: impl FnMut(&mut T) -> anyhow::Result<Option<DiscoveryItem>>,
+    collect_events: impl FnOnce(&mut T, usize) -> Collection,
+) -> Collection {
+    let discovery_status = service_discovery_quantum(LIVE_DISCOVERY_QUANTUM, || dequeue(owner));
+    // Even an unavailable DISCOVERY reader must not starve the genuine EVENTS
+    // prefix. Preserve it and let H0's existing failure path forbid routing.
+    let mut collection = collect_events(owner, limit);
+    collection.status = collection.status.combine(discovery_status);
+    collection
+}
+
+fn collect_session_events(session: &mut Session, limit: usize) -> Collection {
+    let Ok((drain, table)) = session.event_drain_with_object_table() else {
+        return Collection {
+            records: Vec::new(),
+            status: CollectionStatus::ReadError,
+            quantum_exhausted: false,
+        };
+    };
+    collect_event_prefix(drain, table, limit)
+}
+
+fn collect_event_prefix<S: crate::events::RecordSource>(
+    drain: &mut crate::events::EventDrain<S>,
+    table: Option<
+        &[p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
+             p11scope_ebpf_common::MAX_DESCRIPTORS as usize],
+    >,
+    limit: usize,
+) -> Collection {
+    let malformed = drain.malformed();
+    let mut records = Vec::with_capacity(limit);
+    // Only the attested allowlisted lane decodes 608-byte records;
+    // every other lane stays 368-byte-only through the same cursor.
+    // The closures never break early, so a true return means the poll
+    // stopped at its quantum with more possibly waiting (both polls
+    // report true at the quantum, matching `poll`'s documented
+    // convention).
+    let quantum_exhausted = match table {
+        Some(table) => drain.poll_object_records(Some(limit), table, |record| {
+            records.push(record);
+            ControlFlow::Continue(())
+        }),
+        None => drain.poll_records(Some(limit), |record| {
+            records.push(DecodedEventRecord {
+                joint_resource: None,
+                base: record,
+                object: None,
+            });
+            ControlFlow::Continue(())
+        }),
+    };
+    let status = if drain.malformed() != malformed {
+        CollectionStatus::Malformed
+    } else {
+        CollectionStatus::Complete
+    };
+    Collection {
+        records,
+        status,
+        quantum_exhausted,
+    }
+}
+
+struct SessionIo<'a> {
+    session: &'a mut Session,
+    targets: &'a [Arc<PidPin>],
+}
+impl CaptureIo for SessionIo<'_> {
+    fn domain(&self) -> Option<NativeDomainId> {
+        self.session.native_domain()
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn collect(&mut self, limit: usize) -> Collection {
+        collect_attested_with(
+            self.session,
+            limit,
+            Session::discovery_dequeue,
+            collect_session_events,
+        )
+    }
+    fn health(&mut self) -> Result<Health, ()> {
+        self.session.audit_image_continuity().map_err(|_| ())?;
+        let maps = self.session.instance_maps();
+        Ok(Health {
+            fault: maps.fault().map_err(|_| ())?,
+            sticky: maps.sticky().map_err(|_| ())?,
+        })
+    }
+    fn raise_fault(&mut self) -> Result<u64, ()> {
+        self.session.instance_maps().raise_fault().map_err(|_| ())
+    }
+    fn retained_attachment(
+        &self,
+        slot: u32,
+    ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal> {
+        self.session.semantic_receipt_target(slot)
+    }
+    fn receipt_state(
+        &mut self,
+        pin: &Arc<PidPin>,
+        image: ImageIdentity,
+        endpoint: Endpoint,
+        slot: u32,
+        deadline: Instant,
+    ) -> Result<ReceiptState, CurrentReceiptRefusal> {
+        let (image, epochs, watched) = self
+            .session
+            .semantic_receipt_state(pin, image, endpoint, slot, deadline)?;
+        Ok(ReceiptState {
+            image,
+            epochs,
+            watched,
+        })
+    }
+    fn endpoint(&self, slot: u32) -> Option<Endpoint> {
+        self.session.instance_endpoint(slot)
+    }
+    fn target(&self, pid: u32) -> Option<Arc<PidPin>> {
+        self.targets.iter().find(|pin| pin.pid() == pid).cloned()
+    }
+    fn scan(
+        &mut self,
+        job: &ScanJob,
+        deadline: Instant,
+        fence: u64,
+        current: &dyn Fn() -> u64,
+    ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        let window = ReadWindow::new(16_384, deadline).map_err(|_| ImageQueryRefusal::Deadline)?;
+        self.session
+            .scan_image(&job.pin, job.endpoint.object, window, fence, current)
+    }
+    fn scan_selected(
+        &mut self,
+        pin: &Arc<PidPin>,
+        endpoint: Endpoint,
+        deadline: Instant,
+        fence: u64,
+        current: &dyn Fn() -> u64,
+    ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        let window = ReadWindow::new(16_384, deadline).map_err(|_| ImageQueryRefusal::Deadline)?;
+        self.session
+            .scan_image(pin, endpoint.object, window, fence, current)
+    }
+    fn storage_null(&mut self) -> Option<u64> {
+        self.session
+            .instance_maps()
+            .counters()
+            .map(|counters| counters.storage_null)
+            .ok()
+    }
+}
+
+struct Awaiting {
+    record: DecodedEventRecord,
+    endpoint: Option<Endpoint>,
+    collected_origin: Option<CollectedCallOrigin>,
+}
+
+/// Only this owner's actual collection allocator constructs the position.
+pub(crate) struct H0Allocation(u64);
+impl H0Allocation {
+    pub(crate) fn ordinal(self) -> u64 {
+        self.0
+    }
+}
+struct TaskBinding {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    pin: Arc<PidPin>,
+    current: bool,
+}
+
+/// Only a retained owning binding can mint this proof, and only after the
+/// original pidfd itself becomes READY. Retain the Arc through deadbit commit.
+pub(crate) struct TerminalTaskProof {
+    domain: NativeDomainId,
+    cookie: u64,
+    _pin: Arc<PidPin>,
+}
+impl TerminalTaskProof {
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn cookie(&self) -> u64 {
+        self.cookie
+    }
+}
+
+pub(crate) struct SemanticCapture {
+    identity: u64,
+    router: InstanceRouter,
+    limits: TickLimits,
+    next_token: u64,
+    awaiting: BTreeMap<u64, Awaiting>,
+    jobs: VecDeque<ScanJob>,
+    bindings: BTreeMap<u64, TaskBinding>,
+    /// Post-attach retention cutover (clock ticks since boot, rounded up
+    /// at construction). `None` disables retention: every pin-less drain
+    /// sheds immediately, exactly as before.
+    retention_attach_ticks: Option<u64>,
+    /// Pin-less images held for the imminent binding: first-drain
+    /// monotonic ns per image, for registration backdating, plus the
+    /// capture-clock retention instant for the horizon. Membership only;
+    /// the records wait in `awaiting`/router-pending under the existing
+    /// pending budget. Entries leave when their records are gone and no
+    /// binding holds the cookie, or when the retention horizon expires
+    /// them; a joined image keeps its drain stamp for conversion. At
+    /// most one entry per pending or bound image.
+    retained: BTreeMap<(u64, u64), (u64, Instant)>,
+    terminal_cursor: u64,
+    /// Fairness among tick-local Joined partitions when Pending scans leave
+    /// fewer scan slots than the later calls need. This carries no authority.
+    joined_refresh_cursor: Option<(u64, u64, u32)>,
+    fault: u64,
+    sticky: u64,
+    image_failed: bool,
+    exhausted: bool,
+    /// A scoped quantum failure failed this tick's batch: every call in it
+    /// routes CoverageFault exactly as under `image_failed`, but the flag
+    /// clears when the batch ends, so the next tick audits normally. Set
+    /// only by `fail_quantum_coverage`, only for a collected delivery
+    /// whose audit proves a bounded loss.
+    batch_failed: bool,
+    /// A discovery-only live service can run while the previous H0 batch is
+    /// retained. Keep failures until the next collection audits its real prefix.
+    pending_discovery_status: CollectionStatus,
+    stopped: bool,
+    continuity_cuts: u64,
+    /// Last tick's scan count and refusals, for the stuck-transaction
+    /// diagnostic only. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    last_tick_scans_for_test: usize,
+    #[cfg(test)]
+    last_tick_refusals_for_test: Vec<ImageQueryRefusal>,
+    /// Last scan refusal per awaited (cookie, exec, file) key, for the
+    /// stuck-transaction diagnostic only. Test-visible.
+    #[cfg(test)]
+    last_refusal_by_key_for_test: BTreeMap<(u64, u64, u32), ImageQueryRefusal>,
+    /// First failed collected quantum's audit, latched for the
+    /// stuck-transaction diagnostic only. Later (usually empty,
+    /// healthy) quanta must not overwrite the failure that shed.
+    /// Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    first_failed_quantum_audit_for_test:
+        Option<crate::semantics_objects::journal::JournalCollection>,
+}
+
+pub(crate) type PendingH3Original<'a> = (
+    Option<u64>,
+    Option<CollectedCallOrigin>,
+    &'a EventRecord,
+    Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
+);
+/// Coverage-failure state for the stuck-transaction diagnostic only:
+/// (capture image_failed, pending discovery complete, (router
+/// image_failed, faulted key count, faulted-overflow latch), router
+/// counters). Test-visible; production behavior never reads it.
+#[cfg(test)]
+pub(crate) type RouterCoverageForTest = (
+    bool,
+    bool,
+    (bool, usize, bool),
+    crate::discovery::instances::RouterCounters,
+);
+static NEXT_SEMANTIC_CAPTURE: AtomicU64 = AtomicU64::new(0);
+
+/// Lane-attach cutover in clock ticks since boot: `/proc/uptime` read at
+/// H0 construction (production constructs H0 right after the session
+/// attaches), rounded up to whole ticks. A task whose `/proc` start time
+/// is strictly later provably started after attach; both readings share
+/// the boot-time basis. `None` (unreadable clock) disables retention,
+/// failing closed to immediate shed.
+pub(crate) fn current_uptime_ticks() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = text.split_ascii_whitespace().next()?.parse().ok()?;
+    // SAFETY: sysconf with _SC_CLK_TCK only reads a constant.
+    let per_sec: u64 = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }
+        .try_into()
+        .ok()
+        .filter(|tps| *tps > 0)?;
+    let ticks = (secs * per_sec as f64).ceil();
+    if ticks.is_finite() && ticks >= 0.0 {
+        Some(ticks as u64)
+    } else {
+        None
+    }
+}
+
+impl SemanticCapture {
+    pub(crate) fn new(session: &Session, limits: TickLimits) -> anyhow::Result<Self> {
+        let domain = session
+            .native_domain()
+            .ok_or_else(|| anyhow::anyhow!("native image domain unavailable"))?;
+        Self::in_domain(domain, limits)
+    }
+    fn in_domain(domain: NativeDomainId, limits: TickLimits) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            limits.records > 0
+                && limits.records <= MAX_PENDING
+                && limits.scans > 0
+                && limits.scans <= MAX_PENDING
+                && limits.terminal_reads > 0
+                && limits.terminal_reads <= MAX_INSTANCES
+                && limits.bindings > 0
+                && limits.bindings <= MAX_INSTANCES
+                && !limits.pending_for.is_zero()
+                && !limits.scan_slice.is_zero(),
+            "invalid semantic work limits"
+        );
+        let identity = NEXT_SEMANTIC_CAPTURE
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                last.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("semantic capture identity exhausted"))?
+            + 1;
+        Ok(Self {
+            identity,
+            router: InstanceRouter::new(domain, RouterLimits::default()),
+            limits,
+            next_token: 1,
+            awaiting: BTreeMap::new(),
+            jobs: VecDeque::new(),
+            bindings: BTreeMap::new(),
+            retention_attach_ticks: current_uptime_ticks(),
+            retained: BTreeMap::new(),
+            terminal_cursor: 0,
+            joined_refresh_cursor: None,
+            fault: 0,
+            sticky: 0,
+            image_failed: false,
+            exhausted: false,
+            batch_failed: false,
+            pending_discovery_status: CollectionStatus::Complete,
+            stopped: false,
+            continuity_cuts: 0,
+            #[cfg(test)]
+            last_tick_scans_for_test: 0,
+            #[cfg(test)]
+            last_tick_refusals_for_test: Vec::new(),
+            #[cfg(test)]
+            last_refusal_by_key_for_test: BTreeMap::new(),
+            #[cfg(test)]
+            first_failed_quantum_audit_for_test: None,
+        })
+    }
+    /// The classic attested lane owns this Session and its sole cursor. This
+    /// hook never reads EVENTS, allocates positions or constructs a batch.
+    pub(crate) fn service_live_discovery(&mut self, session: &mut Session) {
+        if self.stopped || session.native_domain() != Some(self.router.domain()) {
+            self.pending_discovery_status = CollectionStatus::ReadError;
+            return;
+        }
+        self.service_live_discovery_with(|| session.discovery_dequeue());
+    }
+
+    /// Bounded live-discovery service, shared by the running unlinked-journal
+    /// machine and the linked-DD pump. Transport
+    /// faults stay sticky and refuse even when an audited original needs no
+    /// further H0 tick. This creates no empty-prefix or publication evidence.
+    pub(crate) fn service_live_discovery_until(
+        &mut self,
+        session: &mut Session,
+        work: usize,
+        deadline: Instant,
+    ) -> anyhow::Result<usize> {
+        if session.native_domain() != Some(self.router.domain()) {
+            self.pending_discovery_status = CollectionStatus::ReadError;
+            anyhow::bail!("foreign semantic DISCOVERY Session");
+        }
+        self.service_live_discovery_until_with(work, deadline, || session.discovery_dequeue())
+    }
+
+    fn service_live_discovery_until_with(
+        &mut self,
+        work: usize,
+        deadline: Instant,
+        mut dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+    ) -> anyhow::Result<usize> {
+        if self.stopped {
+            self.pending_discovery_status = CollectionStatus::ReadError;
+        }
+        anyhow::ensure!(
+            !self.stopped && work <= crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            "semantic DISCOVERY service unavailable"
+        );
+        let mut records = 0;
+        let status = service_discovery_quantum(work, || {
+            // Ending this service quantum is not an observed-empty proof.
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let item = dequeue()?;
+            records += usize::from(item.is_some());
+            Ok(item)
+        });
+        self.pending_discovery_status = self.pending_discovery_status.combine(status);
+        anyhow::ensure!(
+            self.pending_discovery_status == CollectionStatus::Complete,
+            "semantic DISCOVERY transport failed"
+        );
+        Ok(records)
+    }
+
+    fn service_live_discovery_with(
+        &mut self,
+        dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+    ) {
+        let status = service_discovery_quantum(
+            crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            dequeue,
+        );
+        self.pending_discovery_status = self.pending_discovery_status.combine(status);
+    }
+
+    pub(crate) fn router(&self) -> &InstanceRouter {
+        &self.router
+    }
+    /// Test-only drain reach for the live twins: production `accept_scan`
+    /// already consumes this queue into every TickReport, so live twins
+    /// assert the positive disclosure from the report and use this only to
+    /// pin queue-level negative/terminal emptiness.
+    #[cfg(test)]
+    pub(crate) fn take_reload_not_excluded_for_test(
+        &mut self,
+    ) -> Vec<crate::discovery::instances::ReloadNotExcluded> {
+        self.router.take_reload_not_excluded()
+    }
+    pub(crate) fn continuity_cuts(&self) -> u64 {
+        self.continuity_cuts
+    }
+
+    /// Acquire while the original H0 owner is idle, after the quiet prefix was
+    /// ingested and before any later appearance. Both cursor snapshots must
+    /// be empty; a BUSY reservation is not an absence boundary.
+    #[allow(dead_code)] // The later lane activation calls this idle acquisition port.
+    pub(crate) fn acquire_absence_birth(
+        &mut self,
+        session: &mut Session,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+    ) -> Result<CommittedAbsenceBirth, crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if !self.awaiting.is_empty() || !self.jobs.is_empty() || self.stopped {
+            return Err(Refusal::CurrentPartition);
+        }
+        let producers = session.drain_producers().ok_or(Refusal::StreamCut)?;
+        let before = session
+            .event_drain()
+            .map_err(|_| Refusal::StreamCut)?
+            .consumption_cut()
+            .map_err(|_| Refusal::StreamCut)?;
+        if !before.is_drained() {
+            return Err(Refusal::StreamCut);
+        }
+        let endpoint = session
+            .instance_endpoint(slot)
+            .ok_or(Refusal::AttachmentMismatch)?;
+        let pin = binding.pin();
+        let deadline = Instant::now()
+            .checked_add(self.limits.scan_slice)
+            .ok_or(Refusal::CurrentPartition)?;
+        let proof = session
+            .prove_image_absence(
+                &pin,
+                endpoint.object,
+                ReadWindow::new(16_384, deadline).map_err(|_| Refusal::CurrentPartition)?,
+                self.router.fence(),
+                || self.router.fence(),
+            )
+            .map_err(|_| Refusal::CurrentPartition)?;
+        let after = session
+            .event_drain()
+            .map_err(|_| Refusal::StreamCut)?
+            .consumption_cut()
+            .map_err(|_| Refusal::StreamCut)?;
+        self.commit_absence_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            proof,
+            before,
+            after,
+            binding,
+            attachment,
+            slot,
+            adapter,
+            &producers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_absence_with(
+        &self,
+        io: &mut impl CaptureIo,
+        proof: crate::attach::image_query::ImageAbsenceProof,
+        before: crate::events::EventsConsumptionCut,
+        after: crate::events::EventsConsumptionCut,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<CommittedAbsenceBirth, crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        self.birth_health_with(io)?;
+        if self.stopped
+            || !self.awaiting.is_empty()
+            || !self.jobs.is_empty()
+            || io.domain() != Some(self.router.domain())
+            || !binding.scope_current()
+            || proof.domain() != self.router.domain()
+            || proof.image() != binding.image()
+            || attachment.domain() != self.router.domain()
+            || proof.attach_generation() != attachment.generation()
+            || proof.fence() != self.router.fence()
+        {
+            return Err(Refusal::CurrentPartition);
+        }
+        if proof.fence() != self.router.fence()
+            || proof.epochs().fault != self.fault
+            || proof.epochs().sticky != self.sticky
+        {
+            return Err(Refusal::NegativeFenceMismatch);
+        }
+        let endpoint = io.endpoint(slot).ok_or(Refusal::AttachmentMismatch)?;
+        if proof.file_slot() != endpoint.file_slot {
+            return Err(Refusal::AppearanceForeign);
+        }
+        let pin = binding.pin();
+        if !self
+            .bindings
+            .get(&proof.image().task_cookie)
+            .is_some_and(|retained| {
+                retained.current
+                    && retained.image == proof.image()
+                    && Arc::ptr_eq(&retained.pin, &pin)
+            })
+            || !matches!(
+                pin.original_generation_state(),
+                Ok(crate::process::OriginalGenerationState::Current)
+            )
+        {
+            return Err(Refusal::CustodyLost);
+        }
+        if !before.is_drained() || !after.is_drained() || !before.same_boundary(&after) {
+            return Err(Refusal::StreamCut);
+        }
+        let cut = adapter
+            .resolve_birth_cut(&after, producers)
+            .map_err(|_| Refusal::StreamCut)?;
+        if !adapter.quiet_sighting_at(proof.image(), &cut) {
+            return Err(Refusal::AbsenceHistory);
+        }
+        let watched = io
+            .retained_attachment(slot)
+            .map_err(|_| Refusal::AttachmentMismatch)?;
+        if watched.check_unchanged() != Ok(true) {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        Ok(CommittedAbsenceBirth {
+            proof,
+            pin,
+            watched,
+            capture: self.identity,
+            cut,
+        })
+    }
+
+    fn birth_health_with(
+        &self,
+        io: &mut impl CaptureIo,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if self.stopped
+            || self.exhausted
+            || self.image_failed
+            || io.domain() != Some(self.router.domain())
+        {
+            return Err(Refusal::CurrentPartition);
+        }
+        let health = io.health().map_err(|_| Refusal::CurrentPartition)?;
+        if health.fault != self.fault || health.sticky != self.sticky || health.sticky != 0 {
+            return Err(Refusal::CurrentPartition);
+        }
+        Ok(())
+    }
+
+    /// Read-only birth checks never run H0's mutating audit or consume pending
+    /// originals. The next actual H0 tick publishes every negative/resolution.
+    fn validate_birth_candidate(
+        &self,
+        io: &mut impl CaptureIo,
+        candidate: &H0BirthCandidate,
+        retained: bool,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if candidate.capture != self.identity {
+            return Err(Refusal::CurrentPartition);
+        }
+        self.birth_health_with(io)?;
+        let receipt = &candidate.receipt;
+        let binding = self
+            .bindings
+            .get(&receipt.image.task_cookie)
+            .ok_or(Refusal::CustodyLost)?;
+        if !binding.current
+            || binding.domain != receipt.domain
+            || binding.image != receipt.image
+            || !Arc::ptr_eq(&binding.pin, &receipt.pin)
+            || receipt.pin.pidfd().is_err()
+        {
+            return Err(Refusal::CustodyLost);
+        }
+        if !retained && io.now() >= receipt.deadline {
+            return Err(Refusal::CurrentPartition);
+        }
+        if !self.receipt_partition_matches(receipt) {
+            return Err(Refusal::CurrentPartition);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint) {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        let target = io
+            .retained_attachment(receipt.attachment_slot)
+            .map_err(|_| Refusal::AttachmentMismatch)?;
+        if !Arc::ptr_eq(
+            &target.retirement_lease(),
+            &receipt.watched.retirement_lease(),
+        ) || target.check_unchanged() != Ok(true)
+            || receipt.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        let deadline = io
+            .now()
+            .checked_add(self.limits.scan_slice)
+            .ok_or(Refusal::CurrentPartition)?;
+        let deadline = if retained {
+            deadline
+        } else {
+            deadline.min(receipt.deadline)
+        };
+        let state = io
+            .receipt_state(
+                &receipt.pin,
+                receipt.image,
+                receipt.endpoint,
+                receipt.attachment_slot,
+                deadline,
+            )
+            .map_err(|_| Refusal::CurrentPartition)?;
+        self.birth_health_with(io)?;
+        if io.now() >= deadline
+            || state.image != receipt.image
+            || state.epochs != receipt.epochs
+            || !self.receipt_partition_matches(receipt)
+        {
+            return Err(Refusal::CurrentPartition);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
+            || !Arc::ptr_eq(
+                &state.watched.retirement_lease(),
+                &receipt.watched.retirement_lease(),
+            )
+            || state.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_birth(
+        &self,
+        mut candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+        rows: &mut impl crate::attach::BirthRowReader,
+    ) -> Result<RetainedBirthWitness, crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        let (native, image, router, _) = admitted.journal_binding();
+        if native != candidate.receipt.domain
+            || image != candidate.receipt.image
+            || !candidate.receipt.ids.contains(&router)
+            || !proof.matches_admitted(admitted)
+            || !admitted
+                .collected_origin()
+                .is_some_and(|origin| origin.in_quantum(candidate.quantum))
+            || !Arc::ptr_eq(&binding.pin(), &candidate.receipt.pin)
+        {
+            return Err(Refusal::BindingMismatch);
+        }
+        let birth = if let Some(absence) = absence {
+            if absence.capture != self.identity
+                || !Arc::ptr_eq(&absence.pin, &candidate.receipt.pin)
+                || !Arc::ptr_eq(
+                    &absence.watched.retirement_lease(),
+                    &candidate.receipt.watched.retirement_lease(),
+                )
+                || absence.proof.domain() != native
+                || absence.proof.image() != image
+                || absence.proof.file_slot() != candidate.receipt.endpoint.file_slot
+                || absence.proof.attach_generation() != attachment.generation()
+            {
+                return Err(Refusal::AppearanceForeign);
+            }
+            if absence.proof.fence() != self.router.fence()
+                || candidate.receipt.fence != absence.proof.fence()
+            {
+                return Err(Refusal::NegativeFenceMismatch);
+            }
+            let before = absence.proof.epochs();
+            let after = candidate.receipt.epochs;
+            if after.local < before.local
+                || after.global < before.global
+                || (after.local == before.local && after.global == before.global)
+                || after.fault != before.fault
+            {
+                return Err(Refusal::AppearanceNotAdvanced);
+            }
+            if !absence.cut.same_stream(&candidate.cut)
+                || !adapter.quiet_sighting_at(image, &absence.cut)
+            {
+                return Err(Refusal::AbsenceHistory);
+            }
+            candidate.cut = absence.cut;
+            BirthKind::AbsenceAppearance
+        } else {
+            BirthKind::ExecMarker
+        };
+        if !adapter.accepts_birth_cut(&candidate.cut) {
+            return Err(Refusal::StreamCut);
+        }
+        let admission = crate::attach::BirthAdmissionBinding::from_admitted(admitted);
+        let evidence =
+            crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?;
+        let authorization = ValidatedH0Birth {
+            proof: *proof,
+            birth,
+            cut: candidate.cut.clone(),
+            closure_generation: attachment.generation(),
+            evidence,
+        };
+        let grant = crate::semantics_objects::journal::SessionBirthGrant::issue(authorization);
+        let receipt =
+            BootstrapReceipt::attest(adapter, &grant).map_err(|_| Refusal::AbsenceHistory)?;
+        Ok(RetainedBirthWitness {
+            candidate,
+            admission,
+            original: admitted
+                .collected_origin()
+                .expect("the actual admitted origin was validated before native observation"),
+            receipt,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_birth(
+        &mut self,
+        session: &mut Session,
+        candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+    ) -> Result<RetainedBirthWitness, crate::attach::BirthObservationRefusal> {
+        let deadline = Instant::now()
+            .checked_add(self.limits.scan_slice)
+            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+        self.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &candidate,
+            false,
+        )?;
+        let witness = {
+            let maps = session.instance_maps();
+            let mut rows = crate::attach::LiveBirthRows::over(&maps, binding);
+            self.finish_birth(
+                candidate, absence, admitted, binding, attachment, proof, adapter, &mut rows,
+            )?
+        };
+        self.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &witness.candidate,
+            false,
+        )?;
+        if Instant::now() >= deadline {
+            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+        }
+        Ok(witness)
+    }
+    pub(crate) fn validate_current(
+        &mut self,
+        session: &mut Session,
+        receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
+    ) -> Result<(), CurrentReceiptRefusal> {
+        self.validate_current_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            receipt,
+            report,
+        )
+    }
+    fn validate_current_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
+    ) -> Result<(), CurrentReceiptRefusal> {
+        use CurrentReceiptRefusal as Refusal;
+        if io.domain() != Some(self.router.domain()) || receipt.domain != self.router.domain() {
+            return Err(Refusal::Domain);
+        }
+        if self.stopped {
+            return Err(Refusal::Stopped);
+        }
+        let binding = self
+            .bindings
+            .get(&receipt.image.task_cookie)
+            .ok_or(Refusal::Custody)?;
+        if !binding.current
+            || binding.domain != receipt.domain
+            || binding.image != receipt.image
+            || !Arc::ptr_eq(&binding.pin, &receipt.pin)
+            || receipt.pin.pidfd().is_err()
+        {
+            return Err(Refusal::Custody);
+        }
+        if io.now() >= receipt.deadline {
+            return Err(Refusal::Deadline);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint) {
+            return Err(Refusal::Attachment);
+        }
+        let target = io.retained_attachment(receipt.attachment_slot)?;
+        if !Arc::ptr_eq(
+            &target.retirement_lease(),
+            &receipt.watched.retirement_lease(),
+        ) || target.check_unchanged() != Ok(true)
+            || receipt.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::Attachment);
+        }
+        if !self.audit(io, report) {
+            return Err(Refusal::Audit);
+        }
+        if !self.receipt_partition_matches(receipt) {
+            return Err(Refusal::Partition);
+        }
+        let Some(slice_end) = io.now().checked_add(self.limits.scan_slice) else {
+            self.exhaust(report);
+            return Err(Refusal::Deadline);
+        };
+        let deadline = slice_end.min(receipt.deadline);
+        let state = io.receipt_state(
+            &receipt.pin,
+            receipt.image,
+            receipt.endpoint,
+            receipt.attachment_slot,
+            deadline,
+        );
+        if !self.audit(io, report) {
+            return Err(Refusal::Audit);
+        }
+        // A failed native read is permanent even when the later audit itself
+        // succeeded. Ordinary epoch/attachment refusals do not restamp proof.
+        let state = match state {
+            Err(Refusal::Audit) => {
+                self.fail_coverage(io, report);
+                return Err(Refusal::Audit);
+            }
+            result => result?,
+        };
+        if io.now() >= deadline {
+            return Err(Refusal::Deadline);
+        }
+        if state.image != receipt.image || state.epochs != receipt.epochs {
+            return Err(Refusal::Epoch);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
+            || !Arc::ptr_eq(
+                &state.watched.retirement_lease(),
+                &receipt.watched.retirement_lease(),
+            )
+            || state.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::Attachment);
+        }
+        if !self.receipt_partition_matches(receipt) {
+            return Err(Refusal::Partition);
+        }
+        Ok(())
+    }
+    fn receipt_partition_matches(&self, receipt: &CurrentPartitionReceipt) -> bool {
+        self.router.current_partition_matches(
+            receipt.domain,
+            receipt.image,
+            receipt.endpoint.file_slot,
+            receipt.epochs,
+            receipt.fence,
+            &receipt.ids,
+        )
+    }
+    pub(crate) fn apply_physical_gaps(
+        &mut self,
+        session: &mut Session,
+        gaps: Vec<PhysicalSemanticGap>,
+    ) -> anyhow::Result<TickReport> {
+        self.apply_physical_gaps_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            gaps,
+        )
+    }
+
+    /// Only the Capture that routed this actual collection may extend its
+    /// H0 disposition. Native-domain equality alone does not bind an owner.
+    pub(crate) fn validate_collected_preparation(
+        &self,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        quantum.validate_h0_cut(CollectedH0Owner(self.identity))
+    }
+
+    /// Check actual owner/original association without allocating scratch.
+    /// A different Raw's waiters are preserved, and may not share any image
+    /// selected by this expiry because the router expires a whole image.
+    /// `Ok(0)` is a fully validated original none of whose calls still
+    /// waits here; each caller decides what that means for it.
+    fn pending_h0_at_q_selection(
+        &self,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        quantum.validate_pending_finish(adapter, producers, discovery, q)?;
+        quantum.validate_pending_h0_owner(CollectedH0Owner(self.identity), self.next_token)?;
+        if self.stopped || self.router.domain() != producers.native_domain() {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if self.awaiting.len() > MAX_PENDING {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        let selected = |waiting: &Awaiting| {
+            waiting
+                .collected_origin
+                .is_some_and(|origin| origin.in_quantum(quantum.h0_identity()))
+        };
+        let mut count = 0usize;
+        for (position, waiting) in &self.awaiting {
+            if selected(waiting) {
+                let origin = waiting
+                    .collected_origin
+                    .ok_or(RawQuantumRefusal::Admission)?;
+                if !quantum.matches_pending_h0_original(*position, origin, &waiting.record, adapter)
+                {
+                    return Err(RawQuantumRefusal::Admission);
+                }
+                let Some(facts) = self
+                    .router
+                    .pending_facts()
+                    .find(|facts| facts.token == *position)
+                else {
+                    return Err(RawQuantumRefusal::Admission);
+                };
+                if facts.domain != self.router.domain()
+                    || facts.image != waiting.record.base.event.image
+                    || facts.entry != waiting.record.base.continuity.entry_stamp
+                    || facts.ret != waiting.record.base.continuity.return_stamp
+                    || facts.ip != EntryIp::new(waiting.record.base.continuity.entry_ip)
+                    || facts.attached_offset != waiting.endpoint.map(|endpoint| endpoint.offset)
+                {
+                    return Err(RawQuantumRefusal::Admission);
+                }
+                count += 1;
+            } else if self.awaiting.values().any(|candidate| {
+                selected(candidate)
+                    && candidate.record.base.event.image == waiting.record.base.event.image
+            }) {
+                return Err(RawQuantumRefusal::Admission);
+            }
+        }
+        // Every route the scoped router operation can emit must still have
+        // its SAME original awaiting record in this Capture.
+        for facts in self.router.pending_facts() {
+            if self
+                .awaiting
+                .values()
+                .any(|waiting| selected(waiting) && waiting.record.base.event.image == facts.image)
+                && !self.awaiting.get(&facts.token).is_some_and(selected)
+            {
+                return Err(RawQuantumRefusal::Admission);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Complete checked envelope for the incoming report, its coexistence
+    /// with the paid accumulator, scoped-image/job scratch and counter growth.
+    /// The finite counters keep their existing H0 retention class; the extra
+    /// S1 lease owns report/scratch overlap, not the eventual router-node drop.
+    /// `Ok(None)`: the validated original has no call waiting here any more
+    /// (a pass refresh between hooks resolved it into the lane stash), so
+    /// there is nothing to expire or pay for at Q.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn pending_h0_at_q_storage_bytes(
+        &self,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<Option<usize>, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal>
+    {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        let count = self.pending_h0_at_q_selection(quantum, adapter, producers, discovery, q)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let bytes = (|| {
+            std::mem::size_of::<TickReport>()
+                .checked_add(pending_q_array_bytes::<TickOutcome>(count)?.checked_mul(2)?)?
+                .checked_add(pending_q_array_bytes::<(u64, u64)>(count)?)?
+                .checked_add(pending_q_array_bytes::<(u64, u64, u32)>(
+                    self.awaiting.len(),
+                )?)?
+                .checked_add(self.router.pending_expiry_storage_bytes()?)
+        })();
+        bytes.map(Some).ok_or(RawQuantumRefusal::Capacity)
+    }
+
+    /// Resolve only validated original waiters into the caller's already-paid
+    /// report. No ring poll, scan, global fault, new position or Stop occurs.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)] // Keep original owner, Q and caller-owned output explicit.
+    fn resolve_collected_pending_at_q_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        let count = self.pending_h0_at_q_selection(quantum, adapter, producers, discovery, q)?;
+        if count == 0 {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        if io.domain() != Some(self.router.domain()) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if report.outcomes.capacity() != 0
+            || report.current.capacity() != 0
+            || report.observations.capacity() != 0
+            || report.scan_refusals.capacity() != 0
+            || report.reload_not_excluded.capacity() != 0
+            || report.allocated_below != 0
+            || report.awaiting_floor.is_some()
+            || report.shed_floor.is_some()
+            || report.exhausted
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let mut images = Vec::new();
+        let mut remaining_keys = Vec::new();
+        images
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        remaining_keys
+            .try_reserve_exact(self.awaiting.len())
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        report
+            .outcomes
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        if images.capacity() != count
+            || remaining_keys.capacity() != self.awaiting.len()
+            || report.outcomes.capacity() != count
+        {
+            return Err(RawQuantumRefusal::Allocation);
+        }
+        for waiting in self.awaiting.values().filter(|waiting| {
+            waiting
+                .collected_origin
+                .is_some_and(|origin| origin.in_quantum(quantum.h0_identity()))
+        }) {
+            let image = waiting.record.base.event.image;
+            images.push((image.task_cookie, image.exec_id));
+        }
+        images.sort_unstable();
+        images.dedup();
+        let domain = self.router.domain();
+        let awaiting = &mut self.awaiting;
+        self.router
+            .expire_images_into(&images, &mut |token, route| {
+                if let Some(waiting) = awaiting.remove(&token) {
+                    Self::emit_in_domain(
+                        domain,
+                        Some(token),
+                        waiting.record,
+                        waiting.endpoint,
+                        route,
+                        waiting.collected_origin,
+                        report,
+                    );
+                }
+            });
+        if self.awaiting.is_empty() {
+            self.jobs.clear();
+        } else {
+            remaining_keys.extend(self.awaiting.values().map(Self::pending_key));
+            remaining_keys.sort_unstable();
+            remaining_keys.dedup();
+            self.jobs
+                .retain(|job| remaining_keys.binary_search(&job.key()).is_ok());
+        }
+        self.stamp_disposition(report);
+        self.note_collected_disposition(quantum, report)
+            .map_err(|_| RawQuantumRefusal::DispositionMismatch)?;
+        Ok(())
+    }
+
+    /// Checked incoming/union peak for the final empty original. Outstanding
+    /// H0 originals must have reached their earlier actual Q dispositions.
+    pub(crate) fn collected_stop_at_q_storage_bytes(
+        &self,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        quantum.validate_final_stop(adapter, producers, discovery, q)?;
+        quantum.validate_pending_h0_owner(CollectedH0Owner(self.identity), self.next_token)?;
+        if self.stopped || self.router.domain() != producers.native_domain() {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if !self.awaiting.is_empty() || self.router.pending_facts().next().is_some() {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        if self.exhausted || self.next_token.checked_add(1).is_none() {
+            return Err(RawQuantumRefusal::IdentityExhausted);
+        }
+        std::mem::size_of::<TickReport>()
+            .checked_add(
+                pending_q_array_bytes::<TickOutcome>(1)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(RawQuantumRefusal::Capacity)?,
+            )
+            .ok_or(RawQuantumRefusal::Capacity)
+    }
+
+    pub(crate) fn owns_collected_finish(&self, owner: CollectedH0Owner) -> bool {
+        self.stopped && owner == CollectedH0Owner(self.identity)
+    }
+
+    /// All fallible checks/reserves precede the actual Stop mutation. The
+    /// caller already owns the complete declared report/union allowance.
+    pub(crate) fn stop_collected_at_q(
+        &mut self,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        self.collected_stop_at_q_storage_bytes(quantum, adapter, producers, discovery, q)?;
+        if report.outcomes.capacity() != 0
+            || report.current.capacity() != 0
+            || report.observations.capacity() != 0
+            || report.scan_refusals.capacity() != 0
+            || report.reload_not_excluded.capacity() != 0
+            || report.allocated_below != 0
+            || report.awaiting_floor.is_some()
+            || report.shed_floor.is_some()
+            || report.exhausted
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        report
+            .outcomes
+            .try_reserve_exact(1)
+            .map_err(|_| RawQuantumRefusal::Capacity)?;
+        if report.outcomes.capacity() != 1 {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        let position = self.next_token;
+        // The existing Stop core writes into the caller's already-paid output;
+        // there are no unresolved images/temporary expiry buffers at this gate.
+        self.stop_into(report);
+        quantum.note_h0_finish(
+            CollectedH0FinishDisposition {
+                disposition: CollectedH0Disposition {
+                    quantum: quantum.h0_identity(),
+                    native: self.router.domain(),
+                    owner: CollectedH0Owner(self.identity),
+                    allocated_below: report.allocated_below(),
+                    pending: report.awaiting_floor().is_some(),
+                },
+                position,
+            },
+            adapter,
+            producers,
+        )
+    }
+
+    /// Normal Session forwarding to the same private Capture operation.
+    /// Session/Q association precedes all report allocation or route mutation.
+    #[allow(dead_code)] // Pending-at-Q forwarding remains inactive in the ordinary driver.
+    #[allow(clippy::too_many_arguments)] // Explicit original custody and caller-owned output.
+    pub(crate) fn resolve_collected_pending_at_q(
+        &mut self,
+        session: &mut Session,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        if !session.matches_collected_finish_q(q)
+            || !session
+                .drain_producers()
+                .as_ref()
+                .is_some_and(|own| own.same_producers(producers))
+        {
+            return Err(
+                crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::ForeignCapture,
+            );
+        }
+        self.resolve_collected_pending_at_q_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            quantum,
+            adapter,
+            producers,
+            discovery,
+            q,
+            report,
+        )
+    }
+
+    /// Expire every remaining collected waiter for the no-progress guard's
+    /// true stall (no job, no hold, no deadline, no scan): the same disclosed
+    /// `unobserved` shed as the deadline expiry, keeping already-joined
+    /// outcomes. Every waiter the owning capture still holds expires,
+    /// whatever quantum minted it; the quantum's disposition advances to
+    /// not-pending. No ring poll, scan, fault or Stop occurs.
+    pub(crate) fn expire_collected_remaining_for_guard(
+        &mut self,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        quantum.validate_pending_h0_owner(CollectedH0Owner(self.identity), self.next_token)?;
+        if self.stopped {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if self.awaiting.len() > MAX_PENDING {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        if report.outcomes.capacity() != 0
+            || report.current.capacity() != 0
+            || report.observations.capacity() != 0
+            || report.scan_refusals.capacity() != 0
+            || report.reload_not_excluded.capacity() != 0
+            || report.allocated_below != 0
+            || report.awaiting_floor.is_some()
+            || report.shed_floor.is_some()
+            || report.exhausted
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let count = self.awaiting.len();
+        if count == 0 {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        report
+            .outcomes
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        if images.capacity() != count || report.outcomes.capacity() != count {
+            return Err(RawQuantumRefusal::Allocation);
+        }
+        for waiting in self.awaiting.values() {
+            let image = waiting.record.base.event.image;
+            images.push((image.task_cookie, image.exec_id));
+        }
+        images.sort_unstable();
+        images.dedup();
+        let domain = self.router.domain();
+        let awaiting = &mut self.awaiting;
+        self.router
+            .expire_images_into(&images, &mut |token, route| {
+                if let Some(waiting) = awaiting.remove(&token) {
+                    Self::emit_in_domain(
+                        domain,
+                        Some(token),
+                        waiting.record,
+                        waiting.endpoint,
+                        route,
+                        waiting.collected_origin,
+                        report,
+                    );
+                }
+            });
+        self.jobs.clear();
+        self.stamp_disposition(report);
+        self.note_collected_disposition(quantum, report)
+            .map_err(|_| RawQuantumRefusal::DispositionMismatch)?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_physical_gaps_collected(
+        &mut self,
+        session: &mut Session,
+        gaps: Vec<PhysicalSemanticGap>,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        self.apply_physical_gaps_collected_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            gaps,
+            quantum,
+        )
+    }
+
+    fn apply_physical_gaps_collected_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        gaps: Vec<PhysicalSemanticGap>,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        self.validate_collected_preparation(quantum)
+            .map_err(|reason| anyhow::anyhow!("retained semantic cut owner: {reason:?}"))?;
+        let mut report = self.apply_physical_gaps_with(io, gaps)?;
+        // Even an already-applied or exhausted cut carries the real current
+        // floors and allocator state. Do not manufacture a clean watermark.
+        self.stamp_disposition(&mut report);
+        self.note_collected_disposition(quantum, &report)?;
+        Ok(report)
+    }
+    fn apply_physical_gaps_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        gaps: Vec<PhysicalSemanticGap>,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(
+            !self.stopped && gaps.len() <= MAX_INSTANCES,
+            "invalid physical gap publication"
+        );
+        // Validate the whole bounded publication before audit, CAS or state
+        // mutation. Equal numeric PID or a duplicated fd is not this Arc.
+        for gap in &gaps {
+            let episode = &gap.episode;
+            let binding = self
+                .bindings
+                .get(&episode.image.task_cookie)
+                .ok_or_else(|| anyhow::anyhow!("physical gap custody unavailable"))?;
+            anyhow::ensure!(
+                episode.domain == self.router.domain()
+                    && binding.domain == episode.domain
+                    && Arc::ptr_eq(&episode.pin, &binding.pin)
+                    && (episode.applied.load(Ordering::SeqCst) || binding.image == episode.image),
+                "foreign physical gap authority"
+            );
+        }
+        let mut report = TickReport::default();
+        if gaps
+            .iter()
+            .all(|gap| gap.episode.applied.load(Ordering::SeqCst))
+            || self.image_failed
+            || self.exhausted
+        {
+            return Ok(report);
+        }
+        if !self.audit(io, &mut report) {
+            return Ok(report);
+        }
+        let Some(cuts) = self.continuity_cuts.checked_add(1) else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        let Ok(raised) = io.raise_fault() else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        self.continuity_cuts = cuts; // Count actual successful userspace advances.
+        let Ok(health) = io.health() else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        if raised <= self.fault
+            || raised > u64::from(u32::MAX)
+            || health.fault < raised
+            || health.fault > u64::from(u32::MAX)
+            || health.sticky != 0
+        {
+            self.exhaust(&mut report);
+            return Ok(report);
+        }
+        // This shared audited path clears old observations, resolves old
+        // pending calls and allocates one position after all issued records.
+        if !self.audit_health(health, &mut report) {
+            return Ok(report);
+        }
+        for gap in gaps {
+            gap.episode.applied.store(true, Ordering::SeqCst);
+        }
+        Ok(report)
+    }
+    pub(crate) fn tick(
+        &mut self,
+        session: &mut Session,
+        targets: &[Arc<PidPin>],
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
+        self.tick_with(&mut SessionIo { session, targets })
+    }
+    /// One bounded no-call refresh through the same owned Session, endpoint
+    /// and original pin. The freshly selected image comes only from the seal.
+    pub(crate) fn refresh(
+        &mut self,
+        session: &mut Session,
+        pin: Arc<PidPin>,
+        slot: u32,
+    ) -> anyhow::Result<TickReport> {
+        self.refresh_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            pin,
+            slot,
+        )
+    }
+    fn refresh_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        pin: Arc<PidPin>,
+        slot: u32,
+    ) -> anyhow::Result<TickReport> {
+        let mut report = self.refresh_with_inner(io, pin, slot, None)?;
+        self.stamp_disposition(&mut report);
+        Ok(report)
+    }
+
+    /// Refresh against the original pre-H0 cut, without routing or acknowledging
+    /// any of its records. The same Capture owns the later collected tick.
+    #[allow(clippy::too_many_arguments)] // Borrow the original raw and its existing producer/ledger owners together.
+    pub(crate) fn refresh_collected(
+        &mut self,
+        session: &mut Session,
+        pin: Arc<PidPin>,
+        slot: u32,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> anyhow::Result<TickReport> {
+        self.refresh_collected_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            pin,
+            slot,
+            quantum,
+            adapter,
+            producers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // The real I/O leaf retains the same original authority borrows.
+    fn refresh_collected_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        pin: Arc<PidPin>,
+        slot: u32,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> anyhow::Result<TickReport> {
+        quantum
+            .validate_refresh(adapter, producers)
+            .map_err(|reason| anyhow::anyhow!("retained semantic refresh: {reason:?}"))?;
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        quantum
+            .h0_input(self.router.domain(), self.limits.records)
+            .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        quantum
+            .pin_h0_owner(CollectedH0Owner(self.identity))
+            .map_err(|reason| anyhow::anyhow!("retained semantic owner: {reason:?}"))?;
+        let birth_cut = quantum
+            .birth_cut()
+            .cloned()
+            .map(|cut| (cut, quantum.h0_identity()));
+        let mut report = self.refresh_with_inner(io, pin, slot, birth_cut)?;
+        self.stamp_disposition(&mut report);
+        Ok(report)
+    }
+
+    /// Stamp one tick's H3 disposition inputs: the allocation watermark
+    /// (every position below it was minted by this tick or earlier),
+    /// the route-waiting floor, and allocator exhaustion. The finalizer
+    /// carries these into disposition evidence.
+    fn stamp_disposition(&self, report: &mut TickReport) {
+        report.allocated_below = self.next_token;
+        report.awaiting_floor = self.awaiting.keys().next().copied();
+        report.exhausted = report.exhausted || self.exhausted;
+    }
+
+    pub(crate) fn pending_h3_watermark(&self) -> Option<(u64, Option<u64>, u64)> {
+        (!self.stopped && !self.image_failed && !self.exhausted && self.sticky == 0).then_some((
+            self.next_token,
+            self.awaiting.keys().next().copied(),
+            self.fault,
+        ))
+    }
+
+    /// Borrow the original pending records; no copied queue or manufactured
+    /// allocation accompanies the lane's continuation inspection.
+    pub(crate) fn pending_h3_originals(&self) -> impl Iterator<Item = PendingH3Original<'_>> {
+        self.awaiting.iter().map(|(position, waiting)| {
+            (
+                Some(*position),
+                waiting.collected_origin,
+                &waiting.record.base,
+                waiting.record.joint_resource,
+            )
+        })
+    }
+
+    /// First failed collected quantum's audit, if any tick delivered
+    /// a failed quantum. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn first_failed_quantum_audit_for_test(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::JournalCollection> {
+        self.first_failed_quantum_audit_for_test
+    }
+
+    /// Coverage-failure state for the stuck-transaction diagnostic only:
+    /// (capture image_failed, pending discovery complete, router
+    /// image_failed, faulted key count, faulted-overflow latch, router
+    /// counters). Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn router_coverage_for_test(&self) -> RouterCoverageForTest {
+        (
+            self.image_failed,
+            self.pending_discovery_status == CollectionStatus::Complete,
+            self.router.coverage_state_for_test(),
+            self.router.counters(),
+        )
+    }
+
+    /// Test-only stuck-transaction diagnostic: awaiting tokens grouped by
+    /// (pin present, job present, job deadline remaining, last scan
+    /// refusal, binding present/current, retained hold inside its horizon),
+    /// plus the last tick's scan count and refusals. Counts only; no pids,
+    /// paths or argument values.
+    #[cfg(test)]
+    pub(crate) fn stuck_waiters_for_test(&self, now: std::time::Instant) -> String {
+        use std::collections::BTreeMap;
+        fn refusal_name(refusal: &ImageQueryRefusal) -> &'static str {
+            match refusal {
+                ImageQueryRefusal::Policy => "Policy",
+                ImageQueryRefusal::Coverage => "Coverage",
+                ImageQueryRefusal::Custody => "Custody",
+                ImageQueryRefusal::Deadline => "Deadline",
+                ImageQueryRefusal::Capacity => "Capacity",
+                ImageQueryRefusal::Exhausted => "Exhausted",
+                ImageQueryRefusal::Stream => "Stream",
+                ImageQueryRefusal::Unknown => "Unknown",
+                ImageQueryRefusal::Unstable => "Unstable",
+                ImageQueryRefusal::Empty => "Empty",
+                ImageQueryRefusal::Fence => "Fence",
+                ImageQueryRefusal::Present => "Present",
+            }
+        }
+        type GroupKey = (bool, bool, Option<u64>, &'static str, bool, bool, bool);
+        let mut groups: BTreeMap<GroupKey, usize> = BTreeMap::new();
+        for waiting in self.awaiting.values() {
+            let key = Self::pending_key(waiting);
+            let image = waiting.record.base.event.image;
+            let job = self.jobs.iter().find(|job| job.key() == key);
+            let job_present = job.is_some();
+            let remaining_ms = job.map(|job| {
+                job.deadline
+                    .checked_duration_since(now)
+                    .map(|left| left.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0)
+            });
+            let last_refusal = self
+                .last_refusal_by_key_for_test
+                .get(&key)
+                .map(refusal_name)
+                .unwrap_or("none");
+            let binding = self.bindings.get(&image.task_cookie);
+            let binding_present = binding.is_some();
+            let binding_current = binding.is_some_and(|binding| binding.current);
+            // A pin is present when a job or a binding still holds its Arc;
+            // pin-less waiters have neither.
+            let pin_present = job_present || binding_present;
+            let retained_hold = self
+                .retained
+                .get(&(image.task_cookie, image.exec_id))
+                .is_some_and(|(_, at)| {
+                    now.checked_duration_since(*at)
+                        .is_none_or(|age| age <= RETAINED_IMAGE_HORIZON)
+                });
+            *groups
+                .entry((
+                    pin_present,
+                    job_present,
+                    remaining_ms,
+                    last_refusal,
+                    binding_present,
+                    binding_current,
+                    retained_hold,
+                ))
+                .or_default() += 1;
+        }
+        let mut refusal_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for refusal in self.last_tick_refusals_for_test.iter() {
+            *refusal_counts.entry(refusal_name(refusal)).or_default() += 1;
+        }
+        let groups_text = groups
+            .iter()
+            .map(
+                |((pin, job, remaining, refusal, bind, current, hold), count)| {
+                    format!(
+                        "pin={} job={} rem={} ref={} bind={} cur={} hold={}:n={}",
+                        u8::from(*pin),
+                        u8::from(*job),
+                        remaining.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms")),
+                        refusal,
+                        u8::from(*bind),
+                        u8::from(*current),
+                        u8::from(*hold),
+                        count,
+                    )
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(",");
+        let refusals_text = refusal_counts
+            .iter()
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "awaiting={} scans={} refusals=[{}] groups=[{}]",
+            self.awaiting.len(),
+            self.last_tick_scans_for_test,
+            refusals_text,
+            groups_text,
+        )
+    }
+
+    fn refresh_with_inner(
+        &mut self,
+        io: &mut impl CaptureIo,
+        pin: Arc<PidPin>,
+        slot: u32,
+        birth_cut: Option<(
+            JournalBirthCut,
+            crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        )>,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        // One storage_null snapshot per scan pass for the Q1(b) gate.
+        self.router.note_storage_null(io.storage_null());
+        let mut report = TickReport::default();
+        if !self.audit(io, &mut report) {
+            return Ok(report);
+        }
+        let Some(endpoint) = io.endpoint(slot) else {
+            report.scan_refusals.push(ImageQueryRefusal::Coverage);
+            return Ok(report);
+        };
+        // The scan I/O window stays one slice (as in the tick path's
+        // attempt deadline), while the minted proof stays provable for
+        // the full pending window: a quiet provider's refresh receipt
+        // waits the normal pass interval for the next tick batch, and a
+        // 50ms receipt deadline would expire it first. Validation still
+        // re-proves custody, attachment, epochs and partition live.
+        let Some(scan_deadline) = io.now().checked_add(self.limits.scan_slice) else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        let Some(proof_deadline) = io.now().checked_add(self.limits.pending_for) else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        let fence = self.router.fence();
+        report.scans = 1;
+        let result = io.scan_selected(&pin, endpoint, scan_deadline, fence, &|| {
+            self.router.fence()
+        });
+        let healthy = self.audit(io, &mut report);
+        // The break is recorded from the already-obtained result
+        // before the slice check: a scan that proves the module
+        // unmapped breaks continuity even when the slice elapsed
+        // mid-scan.
+        if matches!(result, Err(ImageQueryRefusal::Empty)) {
+            self.note_refresh_absence(&pin, endpoint.file_slot);
+        }
+        if io.now() >= scan_deadline {
+            report.scan_refusals.push(ImageQueryRefusal::Deadline);
+        } else if healthy {
+            match result {
+                Ok(proof) => {
+                    // Retry custody: when an earlier accepted refresh
+                    // retained an Arc for this task and the bind then
+                    // failed, the retry offers a fresh duplicate. Adopt
+                    // H0's retained Arc instead so the retry reuses the
+                    // same custody; `accept_scan` still gates domain,
+                    // exec monotonicity and currency afterwards.
+                    let pin = self
+                        .bindings
+                        .get(&proof.image().task_cookie)
+                        .map(|binding| binding.pin.clone())
+                        .unwrap_or(pin);
+                    let job = ScanJob {
+                        image: proof.image(),
+                        endpoint,
+                        slot,
+                        pin,
+                        deadline: proof_deadline,
+                        birth_cut,
+                    };
+                    self.accept_scan(io, proof, &job, fence, &mut report);
+                }
+                Err(refusal) => {
+                    // A scan that proves the module unmapped breaks router
+                    // continuity for the refresh target, so a later reload
+                    // mints instead of reviving the old ID. The refusal
+                    // carries no image (the scan mints none), so the task
+                    // is identified through H0's own binding: a bind retry
+                    // reuses H0's retained Arc exactly, and a truly unbound
+                    // candidate holds no observations to break.
+                    if refusal == ImageQueryRefusal::Empty {
+                        self.note_refresh_absence(&pin, endpoint.file_slot);
+                    }
+                    report.scan_refusals.push(refusal);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn note_refresh_absence(&mut self, pin: &Arc<PidPin>, file: u32) {
+        let images: Vec<ImageIdentity> = self
+            .bindings
+            .values()
+            .filter(|binding| Arc::ptr_eq(&binding.pin, pin))
+            .map(|binding| binding.image)
+            .collect();
+        for image in images {
+            self.router.note_proven_absence(image, file);
+        }
+    }
+
+    fn emit(
+        &self,
+        token: Option<u64>,
+        record: DecodedEventRecord,
+        endpoint: Option<Endpoint>,
+        route: Route,
+        collected_origin: Option<CollectedCallOrigin>,
+        report: &mut TickReport,
+    ) {
+        Self::emit_in_domain(
+            self.router.domain(),
+            token,
+            record,
+            endpoint,
+            route,
+            collected_origin,
+            report,
+        );
+    }
+
+    fn emit_in_domain(
+        domain: NativeDomainId,
+        token: Option<u64>,
+        record: DecodedEventRecord,
+        endpoint: Option<Endpoint>,
+        route: Route,
+        collected_origin: Option<CollectedCallOrigin>,
+        report: &mut TickReport,
+    ) {
+        report.outcomes.push(TickOutcome::Call(RoutedCall {
+            domain,
+            decoded: record,
+            route,
+            endpoint,
+            token,
+            collected_origin,
+        }));
+    }
+    fn allocate_position(&mut self) -> Option<u64> {
+        if self.exhausted {
+            return None;
+        }
+        let next = self
+            .next_token
+            .checked_add(1)
+            .filter(|_| self.next_token != 0)?;
+        let position = self.next_token;
+        self.next_token = next;
+        Some(position)
+    }
+    fn invalidate(&mut self, scope: InvalidationScope, report: &mut TickReport) {
+        let position = self.allocate_position();
+        report
+            .outcomes
+            .push(TickOutcome::Invalidation(Invalidation {
+                domain: self.router.domain(),
+                scope,
+                position,
+            }));
+        if position.is_none() && !self.exhausted {
+            self.exhaust(report);
+        }
+    }
+    fn resolve(&mut self, outcomes: Vec<(u64, Route)>, report: &mut TickReport) {
+        for (token, route) in outcomes {
+            if let Some(waiting) = self.awaiting.remove(&token) {
+                self.emit(
+                    Some(token),
+                    waiting.record,
+                    waiting.endpoint,
+                    route,
+                    waiting.collected_origin,
+                    report,
+                );
+            }
+        }
+    }
+    fn fail_coverage(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) {
+        if !self.image_failed {
+            self.image_failed = true;
+            self.invalidate(InvalidationScope::CoverageFailed, report);
+            // Permanent router failure does not depend on this ordinary raise.
+            let _ = io.raise_fault();
+        }
+        let resolved = self.router.fail_image_coverage();
+        self.resolve(resolved, report);
+        self.jobs.clear();
+    }
+    /// The scoped twin of [`Self::fail_coverage`] for a collected delivery
+    /// whose quantum audit proves a bounded loss with stable eras: this
+    /// tick behaves exactly as under coverage failure (its batch routes
+    /// CoverageFault, history is failed, the fault era advances, the loss
+    /// is disclosed), but nothing latches, so the next tick audits
+    /// normally and fresh scans re-prove. Legacy drain failures keep the
+    /// permanent path: without the quantum audit the scope is unknowable.
+    /// The scoped argument needs the era advance: when the raise itself
+    /// fails, old-era stamps stay routable, so this falls back to
+    /// [`Self::fail_coverage`] instead of recovering.
+    fn fail_quantum_coverage(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) {
+        if io.raise_fault().is_err() {
+            self.fail_coverage(io, report);
+            return;
+        }
+        self.invalidate(InvalidationScope::CoverageFailed, report);
+        let resolved = self.router.fail_quantum_coverage();
+        self.resolve(resolved, report);
+        self.jobs.clear();
+        self.batch_failed = true;
+    }
+    fn exhaust(&mut self, report: &mut TickReport) {
+        if !self.exhausted {
+            let position = self.allocate_position();
+            self.exhausted = true;
+            report
+                .outcomes
+                .push(TickOutcome::Invalidation(Invalidation {
+                    domain: self.router.domain(),
+                    scope: InvalidationScope::AuthorityExhausted,
+                    position,
+                }));
+        }
+        let resolved = self.router.refuse_exhaustion();
+        self.resolve(resolved, report);
+        self.jobs.clear();
+    }
+    fn audit(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) -> bool {
+        if self.pending_discovery_status != CollectionStatus::Complete {
+            self.fail_coverage(io, report);
+            return false;
+        }
+        let Ok(health) = io.health() else {
+            self.fail_coverage(io, report);
+            return false;
+        };
+        self.audit_health(health, report)
+    }
+    fn audit_health(&mut self, health: Health, report: &mut TickReport) -> bool {
+        if health.fault > u64::from(u32::MAX) || health.fault < self.fault {
+            self.exhaust(report);
+            return false;
+        }
+        if health.fault != self.fault || health.sticky != self.sticky {
+            self.invalidate(InvalidationScope::FaultEra, report);
+            self.fault = health.fault;
+            self.sticky = health.sticky;
+        }
+        let resolved = self.router.audit(health.fault, health.sticky, 0);
+        self.resolve(resolved, report);
+        self.prune_jobs();
+        !self.image_failed && !self.exhausted && health.sticky == 0
+    }
+    fn pending_key(waiting: &Awaiting) -> (u64, u64, u32) {
+        let image = waiting.record.base.event.image;
+        (
+            image.task_cookie,
+            image.exec_id,
+            u32::from(waiting.record.base.continuity.entry_stamp.file_slot_plus1).saturating_sub(1),
+        )
+    }
+    fn prune_jobs(&mut self) {
+        let keys: std::collections::BTreeSet<_> =
+            self.awaiting.values().map(Self::pending_key).collect();
+        self.jobs.retain(|job| keys.contains(&job.key()));
+    }
+    fn expire(&mut self, image: ImageIdentity, report: &mut TickReport) {
+        let resolved = self.router.expire_image(image);
+        self.resolve(resolved, report);
+    }
+
+    /// Hold one drained pin-less image iff its task provably started
+    /// after the lane attached: the fresh `/proc` start time (clock
+    /// ticks, the same basis as the cutover) is strictly later. A pid
+    /// reused between the BPF record and this read observes another
+    /// task's start, but the later join still requires the full image
+    /// (cookie plus exec) to match the bound scan proof, and cookies are
+    /// never reused, so a wrongly held image never joins: it waits under
+    /// the pending budget until stop. Unreadable or older tasks return
+    /// false and shed exactly as before.
+    fn retain_post_attach(&mut self, now: Instant, pid: u32, image: ImageIdentity) -> bool {
+        let Some(attach) = self.retention_attach_ticks else {
+            return false;
+        };
+        let Ok(start) = process_start_time(pid) else {
+            return false;
+        };
+        if start <= attach {
+            return false;
+        }
+        self.retained
+            .entry((image.task_cookie, image.exec_id))
+            .or_insert_with(|| (now_ns(), now));
+        true
+    }
+
+    /// First-drain stamp of a retained image, for registration
+    /// backdating: the batch observed the calls then, even though the
+    /// binding proof only completed later.
+    pub(crate) fn retained_registration_ns(&self, image: ImageIdentity) -> Option<u64> {
+        self.retained
+            .get(&(image.task_cookie, image.exec_id))
+            .map(|(ns, _)| *ns)
+    }
+
+    fn refuse_binding(&mut self, image: ImageIdentity, report: &mut TickReport) {
+        let resolved = self.router.refuse_image_pending(
+            self.router.domain(),
+            image,
+            UnknownReason::BindingCapacity,
+        );
+        self.resolve(resolved, report);
+        self.prune_jobs();
+    }
+
+    fn terminal_tasks(&mut self, report: &mut TickReport) {
+        // Cursor advances for errors and nonready pins too; one READY pin
+        // with aliases still spends one work unit per cookie association.
+        let mut keys: Vec<_> = self
+            .bindings
+            .range((
+                std::ops::Bound::Excluded(self.terminal_cursor),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(&cookie, _)| cookie)
+            .take(self.limits.terminal_reads)
+            .collect();
+        if keys.len() < self.limits.terminal_reads {
+            keys.extend(
+                self.bindings
+                    .range(..=self.terminal_cursor)
+                    .map(|(&cookie, _)| cookie)
+                    .take(self.limits.terminal_reads - keys.len()),
+            );
+        }
+        for cookie in keys {
+            self.terminal_cursor = cookie;
+            let binding = &self.bindings[&cookie];
+            if binding.domain != self.router.domain()
+                || binding.pin.pidfd().is_err()
+                || !matches!(binding.pin.wait_ready(Some(Duration::ZERO)), Ok(true))
+            {
+                continue;
+            }
+            let proof = TerminalTaskProof {
+                domain: binding.domain,
+                cookie,
+                _pin: binding.pin.clone(),
+            };
+            if let Some(resolved) = self.router.retire_task(proof) {
+                self.invalidate(InvalidationScope::TaskRetired(cookie), report);
+                self.resolve(resolved, report);
+                self.bindings.remove(&cookie); // deadbit committed before pin release
+            }
+        }
+        self.prune_jobs();
+    }
+
+    fn accept_scan(
+        &mut self,
+        io: &mut impl CaptureIo,
+        proof: ImageScanProof,
+        job: &ScanJob,
+        fence: u64,
+        report: &mut TickReport,
+    ) {
+        // Production calls this immediately after the fresh synchronous scan
+        // and its postscan audit. No deferred seal queue can roll bindings back.
+        if proof.domain() != self.router.domain()
+            || proof.image() != job.image
+            || proof.file_slot() != job.endpoint.file_slot
+            || proof.fence() != fence
+            || fence != self.router.fence()
+        {
+            report.scan_refusals.push(ImageQueryRefusal::Fence);
+            #[cfg(test)]
+            self.last_refusal_by_key_for_test
+                .insert(job.key(), ImageQueryRefusal::Fence);
+            return;
+        }
+        if io.endpoint(job.slot) != Some(job.endpoint) {
+            report.scan_refusals.push(ImageQueryRefusal::Custody);
+            #[cfg(test)]
+            self.last_refusal_by_key_for_test
+                .insert(job.key(), ImageQueryRefusal::Custody);
+            return;
+        }
+        if let Some(existing) = self.bindings.get(&job.image.task_cookie) {
+            if existing.domain != self.router.domain()
+                || !Arc::ptr_eq(&existing.pin, &job.pin)
+                || job.image.exec_id < existing.image.exec_id
+                || !existing.current
+            {
+                report.scan_refusals.push(ImageQueryRefusal::Custody);
+                #[cfg(test)]
+                self.last_refusal_by_key_for_test
+                    .insert(job.key(), ImageQueryRefusal::Custody);
+                return;
+            }
+        } else if self.bindings.len() >= self.limits.bindings {
+            self.refuse_binding(job.image, report);
+            return;
+        }
+        let prior_ids =
+            self.router
+                .current_instances(self.router.domain(), job.image, job.endpoint.file_slot);
+        let epochs = proof.epochs();
+        let watched = io.retained_attachment(job.slot).ok();
+        let (outcome, resolved) = self.router.observe(proof);
+        let accepted = matches!(outcome, ObserveOutcome::New | ObserveOutcome::Continued);
+        // These losses come from the actual eviction, not a counter inference.
+        for loss in self.router.take_observation_losses() {
+            self.invalidate(
+                InvalidationScope::InstancesRetired {
+                    image: loss.image,
+                    file_slot: loss.file_slot,
+                    ids: loss.ids,
+                },
+                report,
+            );
+        }
+        // B17 W1: drain the newly tainted identities beside the losses.
+        // Draining reports the qualification; the router keeps its sticky
+        // taint and counters. Non-verdict: no outcome or decision changes.
+        for disclosure in self.router.take_reload_not_excluded() {
+            report.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: disclosure.image,
+                file_slot: disclosure.file_slot,
+                ids: disclosure.ids,
+            });
+        }
+        let counters = self.router.counters();
+        report.continued_across_global = counters.continued_across_global;
+        report.joined_across_global = counters.joined_across_global;
+        if outcome == ObserveOutcome::New && !prior_ids.is_empty() {
+            self.invalidate(
+                InvalidationScope::InstancesRetired {
+                    image: job.image,
+                    file_slot: job.endpoint.file_slot,
+                    ids: prior_ids,
+                },
+                report,
+            );
+        }
+        if outcome == ObserveOutcome::CoverageFault {
+            self.invalidate(
+                InvalidationScope::File {
+                    image: job.image,
+                    file_slot: job.endpoint.file_slot,
+                },
+                report,
+            );
+        }
+        if accepted && !self.exhausted {
+            let prior: Vec<_> = self
+                .bindings
+                .values()
+                .filter(|binding| {
+                    binding.current
+                        && binding.image != job.image
+                        && Arc::ptr_eq(&binding.pin, &job.pin)
+                })
+                .map(|binding| binding.image)
+                .collect();
+            for image in prior {
+                self.bindings
+                    .get_mut(&image.task_cookie)
+                    .expect("retained binding")
+                    .current = false;
+                let retired = self.router.retire_image(image);
+                self.invalidate(InvalidationScope::ImageRetired(image), report);
+                self.resolve(retired, report);
+            }
+            self.bindings.insert(
+                job.image.task_cookie,
+                TaskBinding {
+                    domain: self.router.domain(),
+                    image: job.image,
+                    pin: job.pin.clone(),
+                    current: true,
+                },
+            );
+            let ids = self.router.current_instances(
+                self.router.domain(),
+                job.image,
+                job.endpoint.file_slot,
+            );
+            if self.router.current_partition_matches(
+                self.router.domain(),
+                job.image,
+                job.endpoint.file_slot,
+                epochs,
+                fence,
+                &ids,
+            ) && let Some(watched) = watched
+                && watched.check_unchanged() == Ok(true)
+            {
+                report.current.push(CurrentPartitionReceipt {
+                    domain: self.router.domain(),
+                    image: job.image,
+                    pin: job.pin.clone(),
+                    endpoint: job.endpoint,
+                    attachment_slot: job.slot,
+                    watched,
+                    epochs,
+                    fence,
+                    deadline: job.deadline,
+                    ids,
+                    birth: if outcome == ObserveOutcome::New {
+                        job.birth_cut
+                            .clone()
+                            .map(|(cut, quantum)| (self.identity, cut, quantum))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+        report.observations.push(outcome);
+        // Invalidation exhaustion cannot leak a previously computed join.
+        if self.exhausted {
+            self.resolve(
+                resolved
+                    .into_iter()
+                    .map(|(token, _)| (token, Route::Unknown(UnknownReason::AuthorityExhausted)))
+                    .collect(),
+                report,
+            );
+        } else {
+            self.resolve(resolved, report);
+        }
+    }
+    fn tick_with(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
+        let mut report = self.tick_with_inner(io, None)?;
+        self.stamp_disposition(&mut report);
+        Ok(report)
+    }
+
+    fn tick_collected_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        quantum
+            .h0_input(self.router.domain(), self.limits.records)
+            .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        // Pin before routing, including a tick that later refuses. A second
+        // Capture must not consume an original after a partial first tick.
+        quantum
+            .pin_h0_owner(CollectedH0Owner(self.identity))
+            .map_err(|reason| anyhow::anyhow!("retained semantic owner: {reason:?}"))?;
+        // Snapshot before delivery borrows the quantum: latch the
+        // first failed audit for the stuck-transaction diagnostic.
+        #[cfg(test)]
+        let audit = quantum.collection_audit_for_test();
+        let delivery = quantum
+            .h0_delivery(self.router.domain(), self.limits.records)
+            .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        #[cfg(test)]
+        if delivery.failed && self.first_failed_quantum_audit_for_test.is_none() {
+            self.first_failed_quantum_audit_for_test = Some(audit);
+        }
+        let mut report = self.tick_with_inner(io, Some(delivery))?;
+        self.stamp_disposition(&mut report);
+        self.note_collected_disposition(quantum, &report)?;
+        Ok(report)
+    }
+
+    fn note_collected_disposition(
+        &self,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        report: &TickReport,
+    ) -> anyhow::Result<()> {
+        quantum
+            .note_h0_report(CollectedH0Disposition {
+                quantum: quantum.h0_identity(),
+                native: self.router.domain(),
+                owner: CollectedH0Owner(self.identity),
+                allocated_below: report.allocated_below(),
+                pending: report.awaiting_floor().is_some(),
+            })
+            .map_err(|reason| anyhow::anyhow!("retained semantic disposition: {reason:?}"))?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Thin Session wrapper; ordinary lane selection remains inactive.
+    pub(crate) fn tick_collected(
+        &mut self,
+        session: &mut Session,
+        targets: &[Arc<PidPin>],
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
+        self.tick_collected_with(&mut SessionIo { session, targets }, quantum)
+    }
+
+    fn tick_with_inner(
+        &mut self,
+        io: &mut impl CaptureIo,
+        collected: Option<H0Delivery<'_>>,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        // One storage_null snapshot per scan pass for the Q1(b) gate.
+        self.router.note_storage_null(io.storage_null());
+        let mut report = TickReport::default();
+        let mut owned;
+        let is_collected = collected.is_some();
+        let (records, status, mut positions, birth_cut, failed_permanent) = match collected {
+            Some(input) => (
+                input.records,
+                if input.failed {
+                    CollectionStatus::ReadError
+                } else {
+                    CollectionStatus::Complete
+                },
+                Some(input.positions),
+                input.birth_cut.map(|cut| (cut, input.quantum)),
+                input.failed_permanent,
+            ),
+            None => {
+                owned = io.collect(self.limits.records);
+                owned.status = owned.status.combine(std::mem::replace(
+                    &mut self.pending_discovery_status,
+                    CollectionStatus::Complete,
+                ));
+                report.collection_saturated = owned.quantum_exhausted;
+                // Legacy drain failures stay permanent: without the
+                // quantum audit their scope is unknowable.
+                (owned.records.as_slice(), owned.status, None, None, true)
+            }
+        };
+        let collection_failed =
+            status != CollectionStatus::Complete || records.len() > self.limits.records;
+        // Positions belong to first collection, including noncalls. Pending
+        // resolutions retain them; delivery order is deliberately not FIFO.
+        let batch: Vec<_> = records
+            .iter()
+            .take(self.limits.records)
+            .copied()
+            .enumerate()
+            .map(|(index, record)| {
+                let position = self.allocate_position();
+                if position.is_none() {
+                    self.exhaust(&mut report);
+                }
+                let origin = position.and_then(|position| {
+                    positions
+                        .as_mut()
+                        .map(|positions| positions.allocate(index, H0Allocation(position)))
+                });
+                (position, record, origin)
+            })
+            .collect();
+        // Joined calls already have a route, but later publications need a
+        // fresh owner proof. These interests are bounded by this collection
+        // and never enter the Pending queue or renew its original deadlines.
+        let mut joined_interests = BTreeMap::new();
+        // A malformed/read-error prefix still contains genuine consumed
+        // records. Keep their positions, then forbid every positive route.
+        // A collected delivery whose audit proves a bounded loss fails
+        // scoped (this tick only); anything else latches coverage.
+        if collection_failed {
+            if failed_permanent {
+                self.fail_coverage(io, &mut report);
+            } else {
+                self.fail_quantum_coverage(io, &mut report);
+            }
+        }
+        // Collection never routes; every batch (including empty batches) audits.
+        let _ = self.audit(io, &mut report);
+        self.terminal_tasks(&mut report);
+        for (position, record, origin) in batch {
+            if record.base.event.event_type != event_type::CALL {
+                report.outcomes.push(TickOutcome::Other(OtherRecord {
+                    domain: self.router.domain(),
+                    record: record.base,
+                    position,
+                }));
+                continue;
+            }
+            report.collected_calls += 1;
+            let endpoint = io.endpoint(record.base.event.slot);
+            let Some(token) = position else {
+                self.emit(
+                    None,
+                    record,
+                    endpoint,
+                    Route::Unknown(UnknownReason::AuthorityExhausted),
+                    origin,
+                    &mut report,
+                );
+                continue;
+            };
+            if endpoint.is_none_or(|ep| {
+                u32::from(record.base.continuity.entry_stamp.file_slot_plus1) != ep.file_slot + 1
+            }) {
+                self.emit(
+                    Some(token),
+                    record,
+                    endpoint,
+                    Route::Unknown(UnknownReason::NoFile),
+                    origin,
+                    &mut report,
+                );
+                continue;
+            }
+            let facts = CallFacts {
+                token,
+                domain: self.router.domain(),
+                image: record.base.event.image,
+                entry: record.base.continuity.entry_stamp,
+                ret: record.base.continuity.return_stamp,
+                ip: EntryIp::new(record.base.continuity.entry_ip),
+                attached_offset: endpoint.map(|e| e.offset),
+            };
+            // A scoped quantum failure routes this tick's batch exactly
+            // as latched coverage would; the flag clears below, so the
+            // next tick routes normally again.
+            let route = if self.batch_failed {
+                Route::Unknown(UnknownReason::CoverageFault)
+            } else {
+                self.router.route(facts)
+            };
+            if route != Route::Pending {
+                if matches!(route, Route::Joined(_)) {
+                    let endpoint = endpoint.expect("checked owned endpoint");
+                    let image = record.base.event.image;
+                    let key = (image.task_cookie, image.exec_id, endpoint.file_slot);
+                    joined_interests.entry(key).or_insert((
+                        image,
+                        endpoint,
+                        record.base.event.slot,
+                        (record.base.event.pid_tgid >> 32) as u32,
+                    ));
+                }
+                self.emit(Some(token), record, endpoint, route, origin, &mut report);
+                continue;
+            }
+            self.awaiting.insert(
+                token,
+                Awaiting {
+                    record,
+                    endpoint,
+                    collected_origin: origin,
+                },
+            );
+            let image = record.base.event.image;
+            if !self.bindings.contains_key(&image.task_cookie)
+                && self.bindings.len() >= self.limits.bindings
+            {
+                self.refuse_binding(image, &mut report);
+                continue;
+            }
+            let pid = (record.base.event.pid_tgid >> 32) as u32;
+            let Some(pin) = io.target(pid) else {
+                // No binding pin yet: a live tick holds a provably
+                // post-attach task's first burst for the imminent
+                // binding; everything else sheds exactly as before
+                // (R-34). A collected transaction fixes its binding set
+                // at Binding, so no later pin can arrive for these
+                // records: they expire instead of waiting out the
+                // quantum for a bind that cannot land in time.
+                let hold = !is_collected && self.retain_post_attach(io.now(), pid, image);
+                if !hold {
+                    self.expire(image, &mut report);
+                }
+                continue;
+            };
+            let endpoint = endpoint.expect("checked owned endpoint");
+            let key = (image.task_cookie, image.exec_id, endpoint.file_slot);
+            if !self.jobs.iter().any(|job| job.key() == key) {
+                let Some(deadline) = io.now().checked_add(self.limits.pending_for) else {
+                    self.exhaust(&mut report);
+                    continue;
+                };
+                self.jobs.push_back(ScanJob {
+                    image,
+                    endpoint,
+                    slot: record.base.event.slot,
+                    pin,
+                    deadline,
+                    birth_cut: birth_cut.clone(),
+                });
+            }
+        }
+        self.batch_failed = false;
+        self.prune_jobs();
+        let expired: Vec<_> = self
+            .jobs
+            .iter()
+            .filter(|job| io.now() >= job.deadline)
+            .map(|job| job.image)
+            .collect();
+        for image in expired {
+            self.expire(image, &mut report);
+        }
+        self.prune_jobs();
+        // Retained images with no records left and no binding holding the
+        // cookie are gone (shed without ever binding); the rest keep
+        // waiting for their binding's scan proof, and joined images keep
+        // their drain stamp for conversion.
+        let awaited: BTreeSet<(u64, u64)> = self
+            .awaiting
+            .values()
+            .map(|waiting| {
+                let image = waiting.record.base.event.image;
+                (image.task_cookie, image.exec_id)
+            })
+            .collect();
+        self.retained
+            .retain(|key, _| awaited.contains(key) || self.bindings.contains_key(&key.0));
+        // Visit each initial queued job at most once. Refused peers rotate.
+        let attempts = self.limits.scans.min(self.jobs.len());
+        let mut attempted_keys = BTreeSet::new();
+        for _ in 0..attempts {
+            let Some(job) = self.jobs.pop_front() else {
+                break;
+            };
+            if io.now() >= job.deadline {
+                self.expire(job.image, &mut report);
+                continue;
+            }
+            report.scans += 1;
+            attempted_keys.insert(job.key());
+            let fence = self.router.fence();
+            let Some(slice_end) = io.now().checked_add(self.limits.scan_slice) else {
+                self.exhaust(&mut report);
+                break;
+            };
+            let attempt_deadline = slice_end.min(job.deadline);
+            let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
+            let healthy = self.audit(io, &mut report);
+            // The break is recorded from the already-obtained result
+            // before the expiry branch: a scan that proves the module
+            // unmapped breaks continuity even when the job expires on
+            // this same tick.
+            if matches!(result, Err(ImageQueryRefusal::Empty)) {
+                self.router
+                    .note_proven_absence(job.image, job.endpoint.file_slot);
+            }
+            if io.now() >= job.deadline {
+                self.expire(job.image, &mut report);
+            } else if healthy && io.now() < attempt_deadline {
+                match result {
+                    Ok(proof) => {
+                        self.accept_scan(io, proof, &job, fence, &mut report);
+                    }
+                    Err(refusal) => {
+                        // A scan that proves the module unmapped breaks
+                        // router continuity for the job's key, so a later
+                        // reload mints instead of reviving the old ID.
+                        if refusal == ImageQueryRefusal::Empty {
+                            self.router
+                                .note_proven_absence(job.image, job.endpoint.file_slot);
+                        }
+                        report.scan_refusals.push(refusal);
+                        #[cfg(test)]
+                        self.last_refusal_by_key_for_test.insert(job.key(), refusal);
+                    }
+                }
+            }
+            if self
+                .awaiting
+                .values()
+                .any(|waiting| Self::pending_key(waiting) == job.key())
+            {
+                self.jobs.push_back(job);
+            }
+        }
+        // Pending keeps its existing queue, deadlines, and first claim on
+        // the shared scan cap. Sweep only this tick's Joined interests in a
+        // separate cyclic order; a refusal advances the cursor as well.
+        let mut joined_keys: Vec<_> = joined_interests
+            .keys()
+            .filter(|key| !attempted_keys.contains(*key))
+            .copied()
+            .collect();
+        let split = self.joined_refresh_cursor.map_or(0, |cursor| {
+            joined_keys.partition_point(|key| *key <= cursor)
+        });
+        joined_keys.rotate_left(split);
+        for key in joined_keys {
+            if report.scans >= self.limits.scans
+                || self.image_failed
+                || self.exhausted
+                || self.sticky != 0
+            {
+                break;
+            }
+            let (image, endpoint, slot, pid) = joined_interests[&key];
+            let Some(pin) = io.target(pid) else {
+                continue;
+            };
+            let Some(binding) = self.bindings.get(&image.task_cookie) else {
+                continue;
+            };
+            if binding.domain != self.router.domain()
+                || !binding.current
+                || binding.image != image
+                || pin.pid() != pid
+                || !Arc::ptr_eq(&pin, &binding.pin)
+                || !pin.still_the_same()
+            {
+                continue;
+            }
+            let now = io.now();
+            let (Some(proof_deadline), Some(slice_end)) = (
+                now.checked_add(self.limits.pending_for),
+                now.checked_add(self.limits.scan_slice),
+            ) else {
+                self.exhaust(&mut report);
+                break;
+            };
+            let job = ScanJob {
+                image,
+                endpoint,
+                slot,
+                pin,
+                deadline: proof_deadline,
+                birth_cut: birth_cut.clone(),
+            };
+            report.scans += 1;
+            self.joined_refresh_cursor = Some(key);
+            let fence = self.router.fence();
+            let attempt_deadline = slice_end.min(proof_deadline);
+            let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
+            let healthy = self.audit(io, &mut report);
+            // The break is recorded from the already-obtained result
+            // before the slice check: a scan that proves the module
+            // unmapped breaks continuity even when the slice elapsed
+            // mid-scan.
+            if matches!(result, Err(ImageQueryRefusal::Empty)) {
+                self.router
+                    .note_proven_absence(job.image, job.endpoint.file_slot);
+            }
+            if io.now() >= attempt_deadline {
+                report.scan_refusals.push(ImageQueryRefusal::Deadline);
+                #[cfg(test)]
+                self.last_refusal_by_key_for_test
+                    .insert(job.key(), ImageQueryRefusal::Deadline);
+            } else if healthy {
+                match result {
+                    Ok(proof) => self.accept_scan(io, proof, &job, fence, &mut report),
+                    Err(refusal) => {
+                        // A scan that proves the module unmapped breaks
+                        // router continuity for the job's key, so a later
+                        // reload mints instead of reviving the old ID.
+                        if refusal == ImageQueryRefusal::Empty {
+                            self.router
+                                .note_proven_absence(job.image, job.endpoint.file_slot);
+                        }
+                        report.scan_refusals.push(refusal);
+                        #[cfg(test)]
+                        self.last_refusal_by_key_for_test.insert(job.key(), refusal);
+                    }
+                }
+            }
+        }
+        // Retained images that never bind get a bounded horizon: past it
+        // their records expire mid-run as Unobserved (the existing shed
+        // disclosure) instead of occupying the pending budget until stop.
+        // Bound images are skipped: their scans resolve or refuse them.
+        let over_horizon: Vec<ImageIdentity> = self
+            .retained
+            .iter()
+            .filter(|((cookie, _), (_, at))| {
+                io.now()
+                    .checked_duration_since(*at)
+                    .is_some_and(|age| age > RETAINED_IMAGE_HORIZON)
+                    && !self
+                        .bindings
+                        .get(cookie)
+                        .is_some_and(|binding| binding.current)
+            })
+            .map(|((cookie, exec), _)| ImageIdentity {
+                task_cookie: *cookie,
+                exec_id: *exec,
+            })
+            .collect();
+        for image in over_horizon {
+            self.expire(image, &mut report);
+            self.retained.remove(&(image.task_cookie, image.exec_id));
+        }
+        report.pending_scans = attempted_keys.len();
+        let now = io.now();
+        report.awaited_jobs_pending = self.jobs.iter().any(|job| {
+            now < job.deadline
+                && self
+                    .awaiting
+                    .values()
+                    .any(|waiting| Self::pending_key(waiting) == job.key())
+        });
+        report.awaited_hold_pending = self.awaiting.values().any(|waiting| {
+            let image = waiting.record.base.event.image;
+            self.retained
+                .get(&(image.task_cookie, image.exec_id))
+                .is_some_and(|(_, at)| {
+                    now.checked_duration_since(*at)
+                        .is_none_or(|age| age <= RETAINED_IMAGE_HORIZON)
+                })
+        });
+        #[cfg(test)]
+        {
+            self.last_tick_scans_for_test = report.scans;
+            self.last_tick_refusals_for_test = report.scan_refusals.clone();
+        }
+        Ok(report)
+    }
+    pub(crate) fn stop(&mut self) -> TickReport {
+        let mut report = TickReport::default();
+        self.stop_into(&mut report);
+        report
+    }
+
+    fn stop_into(&mut self, report: &mut TickReport) {
+        if self.stopped {
+            self.stamp_disposition(report);
+            return;
+        }
+        self.stopped = true;
+        self.invalidate(InvalidationScope::Stopped, report);
+        let images: Vec<_> = self
+            .awaiting
+            .values()
+            .map(|w| w.record.base.event.image)
+            .collect();
+        for image in images {
+            self.expire(image, report);
+        }
+        self.jobs.clear();
+        self.retained.clear();
+        self.stamp_disposition(report);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_actual_absence_birth_fixture() {
+    tests::actual_absence_birth_fixture();
+}
+
+#[cfg(test)]
+pub(crate) fn deliver_collected_raw_for_resource_test(
+    raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    domain: NativeDomainId,
+) -> TickReport {
+    tests::deliver_collected_raw_for_resource_test(raw, domain)
+}
+
+#[cfg(test)]
+mod discovery_service_tests {
+    use super::*;
+    use crate::events::{BoundedRecordSource, DiscoveryDrain, EventDrain, ScriptedRecords};
+    use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, DiscoveryRecord, Event};
+
+    struct Readers {
+        discovery: DiscoveryDrain<ScriptedRecords>,
+        events: EventDrain<ScriptedRecords>,
+    }
+
+    impl Readers {
+        fn new(discovery: Vec<Vec<u8>>, events: Vec<Vec<u8>>) -> Self {
+            let discovery_bound = discovery.len();
+            let events_bound = events.len();
+            Self {
+                discovery: DiscoveryDrain::over(ScriptedRecords::records(
+                    discovery,
+                    discovery_bound,
+                )),
+                events: EventDrain::over(ScriptedRecords::records(events, events_bound)),
+            }
+        }
+
+        fn collect(&mut self, limit: usize) -> Collection {
+            collect_attested_with(
+                self,
+                limit,
+                |readers| Ok(readers.discovery.dequeue()),
+                |readers, limit| collect_event_prefix(&mut readers.events, None, limit),
+            )
+        }
+    }
+
+    fn lifecycle() -> Vec<u8> {
+        // This wire type contains only integer fields; all reserved bytes stay zero.
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = (7u64 << 32) | 7;
+        record.hook_ts_ns = 1;
+        record.kind = DISCOVERY_KIND_EXEC;
+        unsafe {
+            std::slice::from_raw_parts(
+                (&record as *const DiscoveryRecord).cast::<u8>(),
+                std::mem::size_of::<DiscoveryRecord>(),
+            )
+        }
+        .to_vec()
+    }
+
+    fn event(ts_ns: u64) -> Vec<u8> {
+        crate::events::event_bytes(&Event {
+            ts_ns,
+            pid_tgid: (7u64 << 32) | 7,
+            event_type: event_type::CALL,
+            ..Event::default()
+        })
+    }
+
+    #[test]
+    fn live_collection_advances_owned_discovery_before_terminal_drain() {
+        let mut readers = Readers::new(vec![lifecycle(); 33], vec![event(1), event(2), event(3)]);
+        assert_eq!(readers.discovery.source().consumer(), 0);
+        for (remaining, consumed, ts_ns) in [(17, 128, 1), (1, 256, 2), (0, 264, 3)] {
+            let collected = readers.collect(1);
+            assert!(collected.status == CollectionStatus::Complete);
+            assert_eq!(collected.records.len(), 1);
+            assert_eq!(collected.records[0].base.event.ts_ns, ts_ns);
+            assert_eq!(readers.discovery.source().remaining(), remaining);
+            assert_eq!(readers.discovery.source().consumer(), consumed);
+        }
+    }
+
+    #[test]
+    fn malformed_discovery_spends_quantum_without_starving_events() {
+        let mut readers = Readers::new(vec![vec![0]; 34], vec![event(1), event(2), event(3)]);
+        for (remaining, ts_ns) in [(18, 1), (2, 2), (0, 3)] {
+            let collected = readers.collect(1);
+            assert!(collected.status == CollectionStatus::Malformed);
+            assert_eq!(collected.records.len(), 1);
+            assert_eq!(collected.records[0].base.event.ts_ns, ts_ns);
+            assert_eq!(readers.discovery.source().remaining(), remaining);
+        }
+    }
+
+    #[test]
+    fn discovery_read_error_keeps_each_events_prefix() {
+        let mut readers = Readers::new(vec![], vec![event(1), event(2)]);
+        for ts_ns in [1, 2] {
+            let collected = collect_attested_with(
+                &mut readers,
+                1,
+                |_| anyhow::bail!("owned discovery reader unavailable"),
+                |readers, limit| collect_event_prefix(&mut readers.events, None, limit),
+            );
+            assert!(collected.status == CollectionStatus::ReadError);
+            assert_eq!(collected.records.len(), 1);
+            assert_eq!(collected.records[0].base.event.ts_ns, ts_ns);
+        }
+        assert_eq!(readers.events.source().remaining(), 0);
+    }
+
+    #[test]
+    fn empty_discovery_keeps_empty_events_complete() {
+        let mut readers = Readers::new(vec![], vec![]);
+        let collected = readers.collect(1);
+        assert!(collected.status == CollectionStatus::Complete);
+        assert!(collected.records.is_empty());
+        assert_eq!(readers.discovery.source().consumer(), 0);
+        assert_eq!(readers.events.source().consumer(), 0);
+    }
+
+    #[test]
+    fn discovery_service_respects_zero_events_limit() {
+        let mut readers = Readers::new(vec![lifecycle(); 17], vec![event(1)]);
+        let collected = readers.collect(0);
+        assert!(collected.status == CollectionStatus::Complete);
+        assert!(collected.records.is_empty());
+        assert_eq!(readers.discovery.source().remaining(), 1);
+        assert_eq!(readers.events.source().remaining(), 1);
+        assert_eq!(readers.events.source().consumer(), 0);
+    }
+
+    #[test]
+    fn discovery_success_preserves_events_malformed_prefix_and_limit() {
+        let mut readers = Readers::new(vec![lifecycle()], vec![event(1), vec![0], event(2)]);
+        let collected = readers.collect(2);
+        assert!(collected.status == CollectionStatus::Malformed);
+        assert_eq!(collected.records.len(), 1);
+        assert_eq!(collected.records[0].base.event.ts_ns, 1);
+        assert_eq!(readers.events.source().remaining(), 1);
+        let next = readers.collect(1);
+        assert!(next.status == CollectionStatus::Complete);
+        assert_eq!(next.records[0].base.event.ts_ns, 2);
+    }
+
+    #[test]
+    fn discovery_malformed_preserves_events_read_error_and_prefix() {
+        let mut readers = Readers::new(vec![vec![0]], vec![event(1)]);
+        let collected = collect_attested_with(
+            &mut readers,
+            1,
+            |readers| Ok(readers.discovery.dequeue()),
+            |readers, limit| {
+                let mut collected = collect_event_prefix(&mut readers.events, None, limit);
+                // The EVENTS cursor was obtained and yielded a genuine prefix before failure.
+                collected.status = CollectionStatus::ReadError;
+                collected
+            },
+        );
+        assert!(collected.status == CollectionStatus::ReadError);
+        assert_eq!(collected.records.len(), 1);
+        assert_eq!(collected.records[0].base.event.ts_ns, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests;

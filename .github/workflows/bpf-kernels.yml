@@ -1,0 +1,805 @@
+name: bpf-kernels
+# Trial (early-BPF-load-checks plan, Task 5 step 1): load every BPF program
+# on the LTS kernels inside KVM guests on hosted runners, and once more on
+# the runner kernel itself without a VM. Not a required check yet.
+#
+# A separate file from ci.yml on purpose: ci.yml's dedupe/archive-log job
+# lists are pinned by hosted_pipeline_* contract tests that read ci.yml
+# only, and any scripts/ lane named outside its scripts job fails
+# hosted_pipeline_names_every_unrun_privileged_lane. This trial keeps those
+# lists untouched; promote it (or delete it) without touching ci.yml.
+#
+# How it works: bpf-load-build compiles the default observer (release
+# features, no P11SCOPE_SMALL_*), the verifier-stats probe and the
+# lib-test executable once and ships all three as a 1-day artifact,
+# because a cargo target plus kernel trees do not fit the 14 GB runner
+# disk twice. Each bpf-load-kernels shard
+# downloads that artifact, boots its own kernel's guest with virtme-ng,
+# and runs scripts/check-bpf-load-kernels.sh for that one kernel.
+# Kernels come precompiled from the Ubuntu mainline repository: each
+# guest job downloads its kernel without booting (`vng --dry-run`),
+# verifies the debs against the pinned sums in
+# tests/fixtures/vng-kernel-sha256sums/, and caches exactly
+# ~/.cache/virtme-ng/<version>/ by kernel version. Re-record the sums
+# on every kernel or vng bump: sha256sum the amd64/*.deb files vng
+# keeps per version (image + modules, never headers).
+# kvm-probe is the Stage 0 canary (host KVM facts plus one timed guest
+# boot); bpf-load-host closes the gap that CI compares BPF objects but
+# never loads them on the runner kernel. lib-cells-kernels runs the
+# kernel-sensitive privileged lib-cell subset in 6.6/6.12 guests.
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: bpf-kernels-${{ github.ref }}
+  cancel-in-progress: true
+# Tool versions, read by both the install step and the cache key (as in
+# ci.yml), so a version bump can never be served an older binary.
+env:
+  CI_TOOL_BPF_LINKER: 0.10.4
+  CI_VNG_VERSION: "1.41"
+jobs:
+  # The canary: prove /dev/kvm is usable, print the host facts the guest
+  # jobs depend on, and boot one v6.6.157 guest with uname -r, timed.
+  # FAILs honestly when KVM is absent; nothing after the facts is a guess.
+  kvm-probe:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The kernel sums file checked below; no test runs here.
+          fetch-depth: 1
+      - name: Host facts
+        shell: bash
+        run: |
+          uname -r
+          ls -l /dev/kvm || echo "MISSING: /dev/kvm"
+          echo "--- lockdown ---"
+          cat /sys/kernel/security/lockdown 2>/dev/null || echo "MISSING: /sys/kernel/security/lockdown"
+          echo "--- sysctl ---"
+          cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "MISSING: kernel.perf_event_paranoid"
+          cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo "MISSING: kernel.unprivileged_bpf_disabled"
+          echo "--- btf ---"
+          ls -l /sys/kernel/btf/vmlinux 2>/dev/null || echo "MISSING: /sys/kernel/btf/vmlinux"
+          echo "--- kernel config (BPF/uprobe) ---"
+          if [ -r "/boot/config-$(uname -r)" ]; then
+            grep -E 'CONFIG_BPF|CONFIG_UPROBE' "/boot/config-$(uname -r)" || echo "no BPF/uprobe lines in /boot/config-$(uname -r)"
+          elif [ -r /proc/config.gz ]; then
+            zcat /proc/config.gz | grep -E 'CONFIG_BPF|CONFIG_UPROBE' || echo "no BPF/uprobe lines in /proc/config.gz"
+          else
+            echo "MISSING: no /boot/config-$(uname -r) and no /proc/config.gz"
+          fi
+          echo "--- resources ---"
+          nproc
+          free -g
+          df -h
+      - name: Enable KVM for the runner user
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          ls -l /dev/kvm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+      - name: Install pinned virtme-ng
+        shell: bash
+        run: |
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      # Cache keys (as in ci.yml): the runner image, so an image update
+      # starts the kernel cache cold.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/v6.6.157
+          key: vng-kernel-v6.6.157-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # vng downloads over bare HTTPS with no checksum, and a cache hit
+      # skips its fetch entirely, so the sums are checked here on every
+      # run: download without booting first (a no-op on a cache hit),
+      # then verify the exact deb set before the first boot. A mismatch
+      # fails the job naming the kernel.
+      - name: Verify the v6.6.157 download
+        shell: bash
+        run: |
+          vng --dry-run --run v6.6.157 >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/v6.6.157/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/v6.6.157.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: v6.6.157" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: v6.6.157 (re-record the sums)" >&2; exit 1; }
+      - name: Boot one guest and time it
+        shell: bash
+        run: |
+          qemu-system-x86_64 --version | head -1
+          time vng --run v6.6.157 --user root --cpus 4 --memory 4G --exec "uname -r"
+  # Build once, run per kernel: the default observer plus the probe, with
+  # their sha256, as a 1-day artifact. The toolchain, apt, bpf-linker and
+  # dependency-preparation steps are copied from ci.yml's tests job.
+  bpf-load-build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs (as in
+      # the tests job); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      # Cache keys (as in ci.yml): the runner image, and the apt C
+      # toolchain that build scripts invoke.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      # bpf-linker (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      # Network acquisition is explicit and precedes every offline validation.
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # Build products only (as in ci.yml), restored after the sources are
+      # reconstructed and fetched and saved only when this job succeeds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-bpf-load-build-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      # The trial tests the default build only: the same features the
+      # release uses, with the size-override environment unset.
+      - name: Prove the default build environment
+        shell: bash
+        run: |
+          if env | grep -E '^(P11SCOPE_SMALL_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+            echo "refusing: size-override environment is set" >&2
+            exit 1
+          fi
+          echo "default features, no size overrides"
+      - name: Build the default observer
+        shell: bash
+        run: |
+          cargo +"$(cat .release-rust-version)" build --locked --offline
+          test -x target/debug/p11scope
+      - name: Prove the default object carries no gate
+        shell: bash
+        run: |
+          # I2, gate-0 side: the default cell must test a gate-0 object.
+          # The build script always emits the gate flag line; here it must
+          # be 0 (never 1), and the OUT_DIR Detailed object must not carry
+          # the gate maps.
+          grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=0' target/debug/build/p11scope-*/output
+          if grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=1' target/debug/build/p11scope-*/output; then
+            echo "refusing: a gate-1 build-script output is present" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          detailed=(target/debug/build/p11scope-*/out/p11scope-ebpf)
+          test "${#detailed[@]}" -ge 1
+          for obj in "${detailed[@]}"; do
+            if nm "$obj" | grep -Eq ' (IMAGE_BANK_SELECT|TASK_COOKIE_B)$'; then
+              echo "refusing: gate maps in the default Detailed object: $obj" >&2
+              exit 1
+            fi
+          done
+          echo "default Detailed object carries no gate maps"
+          journal=(target/debug/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1)
+          test "${#journal[@]}" -ge 1
+          for obj in "${journal[@]}"; do
+            if nm "$obj" | grep -Eq ' (IMAGE_BANK_SELECT|TASK_COOKIE_B)$'; then
+              echo "refusing: gate maps in the default journal object: $obj" >&2
+              exit 1
+            fi
+          done
+          echo "default journal object carries no gate maps"
+      - name: Build the verifier-stats probe
+        shell: bash
+        run: |
+          python3 -I scripts/measure-verifier-headroom.py build "$RUNNER_TEMP/probe"
+          test -f "$RUNNER_TEMP/probe/verifier-stats-probe.so"
+      - name: Build the lib-test executable for the guest cells
+        shell: bash
+        run: |
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" test --locked --offline --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
+          lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/lib-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$lib"
+          cp -p "$lib" "$RUNNER_TEMP/lib-tests"
+      - name: Stage the artifact
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bpf-load-inputs"
+          cp -p target/debug/p11scope "$RUNNER_TEMP/probe/verifier-stats-probe.so" "$RUNNER_TEMP/lib-tests" "$RUNNER_TEMP/bpf-load-inputs/"
+          (cd "$RUNNER_TEMP/bpf-load-inputs" && sha256sum p11scope verifier-stats-probe.so lib-tests > SHA256SUMS)
+          cat "$RUNNER_TEMP/bpf-load-inputs/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-load-inputs
+          path: ${{ runner.temp }}/bpf-load-inputs/
+          if-no-files-found: error
+          retention-days: 1
+  # One kernel per job. A guest that cannot boot or a missing table is a
+  # FAIL, never a skip: the driver exits nonzero and the step has no
+  # guard that could swallow it.
+  bpf-load-kernels:
+    needs: bpf-load-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+        include:
+          # Combined refusal controls, never an old positive campaign.
+          - kernel: v6.1.188
+            refusal_control: true
+          # 5.15 refuses with the same named reason (OD32) and additionally
+          # runs the identity cell for its denied branch.
+          - kernel: v5.15.221
+            refusal_control: true
+            denial_branch: denied
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Scripts only (driver + report); no custody test runs here.
+          fetch-depth: 1
+      - name: Enable KVM for the runner user
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+      - name: Install pinned virtme-ng
+        shell: bash
+        run: |
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      # Cache keys (as in ci.yml): the runner image, so an image update
+      # starts the kernel cache cold.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      # One cache entry per kernel (that kernel's Ubuntu mainline debs
+      # plus vng's extracted boot/lib trees, ~370-590 MB). A miss costs
+      # a download, never a build. Exact key only, no restore-keys (as
+      # in ci.yml).
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # vng downloads over bare HTTPS with no checksum, and a cache hit
+      # skips its fetch entirely, so the sums are checked here on every
+      # run: download without booting first (a no-op on a cache hit),
+      # then verify the exact deb set before the first boot. A mismatch
+      # fails the job naming the kernel.
+      - name: Verify the kernel download
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }} (re-record the sums)" >&2; exit 1; }
+      - name: Download the observer, probe and lib tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bpf-load-inputs
+          # Under the workspace (hence under $HOME): vng hides host /tmp
+          # and /var/tmp from the guest, and the driver passes these
+          # paths into the guest command.
+          path: bpf-load-inputs
+      - name: Run the load check for this kernel
+        if: matrix.refusal_control != true
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-out"
+          scripts/check-bpf-load-kernels.sh \
+            "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
+            "$GITHUB_WORKSPACE/bpf-load-inputs/verifier-stats-probe.so" \
+            "$GITHUB_WORKSPACE/bpf-load-out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+          test -s "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+          # Fail when the guest doctor exits nonzero, as the host job does.
+          grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+          # shell: bash runs with -eo pipefail, so a failing driver
+          # already fails the step through the pipe; still require the
+          # driver's own verdict line, pinning the pass to OVERALL: PASS
+          # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
+          grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+      - name: Check each stock pre-Multi host refuses before capture side effects
+        if: matrix.refusal_control == true
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-out"
+          denial_args=()
+          if [ -n "${{ matrix.denial_branch }}" ]; then
+            denial_args=(--libtest "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests" --denial "${{ matrix.denial_branch }}")
+          fi
+          python3 -I scripts/check-multi-host-refusal.py "${denial_args[@]}" \
+            "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
+            "$GITHUB_WORKSPACE/bpf-load-out/refusal-${{ matrix.kernel }}" "${{ matrix.kernel }}" \
+            | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+      - name: Upload the table and doctor output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-load-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/bpf-load-out/refusal-${{ matrix.kernel }}/result.json
+            ${{ github.workspace }}/bpf-load-out/refusal-${{ matrix.kernel }}/guest.log
+            ${{ github.workspace }}/bpf-load-out/table-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-out/doctor-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-out/probe-${{ matrix.kernel }}.jsonl
+            ${{ github.workspace }}/bpf-load-out/vng-${{ matrix.kernel }}.log
+            ${{ github.workspace }}/bpf-load-out/inventory-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-out/inventory-probe-${{ matrix.kernel }}.jsonl
+            ${{ github.workspace }}/bpf-load-out/vng-inv-${{ matrix.kernel }}.log
+            ${{ github.workspace }}/bpf-load-out/counter-*-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-out/counter-*-probe-${{ matrix.kernel }}.jsonl
+            ${{ github.workspace }}/bpf-load-out/vng-counter-*-${{ matrix.kernel }}.log
+          if-no-files-found: error
+          retention-days: 7
+  # Gate-1 (loader gate) build: the same default observer plus the
+  # probe with P11SCOPE_LOADER_GATE=1, as a 1-day artifact. Separate
+  # target cache key from the gate-0 build above: the two jobs run on
+  # different runners, and the key must never serve a gate-0 target
+  # tree (or vice versa) as a warm cache.
+  bpf-load-gate1-build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      P11SCOPE_LOADER_GATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs (as in
+      # the tests job); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      # Cache keys (as in ci.yml): the runner image, and the apt C
+      # toolchain that build scripts invoke.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      # bpf-linker (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      # Network acquisition is explicit and precedes every offline validation.
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # Build products only (as in ci.yml), restored after the sources are
+      # reconstructed and fetched and saved only when this job succeeds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-bpf-load-gate1-build-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      # The gate-1 cell tests the loader-gate Detailed object: the gate
+      # define on, the size-override environment unset.
+      - name: Prove the gate-1 build environment
+        shell: bash
+        run: |
+          test "${P11SCOPE_LOADER_GATE:-}" = 1
+          if env | grep -E '^(P11SCOPE_SMALL_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+            echo "refusing: size-override environment is set" >&2
+            exit 1
+          fi
+          echo "loader gate on, no size overrides"
+      - name: Build the gate-1 observer
+        shell: bash
+        run: |
+          cargo +"$(cat .release-rust-version)" build --locked --offline
+          test -x target/debug/p11scope
+          # The journal leg needs a manifest for the guest SoftHSM.
+          cargo +"$(cat .release-rust-version)" build --locked --offline -p p11scope-discover
+          test -x target/debug/p11scope-discover
+      - name: Prove the gate-1 object carries the gate
+        shell: bash
+        run: |
+          # I2: the gate-1 cell must test a gate-1 object. Gate-0 counts
+          # fit under every gate-1 budget, so a mis-built gate-0 observer
+          # would pass and the 512 tripwire would go quiet: the
+          # environment check above is not enough. Require the build
+          # script's gate flag in its output and the gate maps in the
+          # OUT_DIR Detailed object.
+          grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=1' target/debug/build/p11scope-*/output
+          detailed=(target/debug/build/p11scope-*/out/p11scope-ebpf)
+          test "${#detailed[@]}" -ge 1
+          for obj in "${detailed[@]}"; do
+            nm "$obj" | grep -q ' IMAGE_BANK_SELECT$'
+            nm "$obj" | grep -q ' TASK_COOKIE_B$'
+          done
+          echo "gate-1 Detailed object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
+          # The production journal object is a Detailed flavor, so a
+          # gate-1 build gates it too; system sessions load it.
+          journal=(target/debug/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1)
+          test -f "${journal[0]}"
+          for obj in "${journal[@]}"; do
+            nm "$obj" | grep -q ' IMAGE_BANK_SELECT$'
+            nm "$obj" | grep -q ' TASK_COOKIE_B$'
+          done
+          echo "gate-1 journal object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
+      - name: Build the verifier-stats probe
+        shell: bash
+        run: |
+          python3 -I scripts/measure-verifier-headroom.py build "$RUNNER_TEMP/probe"
+          test -f "$RUNNER_TEMP/probe/verifier-stats-probe.so"
+      - name: Stage the artifact
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bpf-load-gate1-inputs"
+          cp -p target/debug/p11scope target/debug/p11scope-discover "$RUNNER_TEMP/probe/verifier-stats-probe.so" "$RUNNER_TEMP/bpf-load-gate1-inputs/"
+          (cd "$RUNNER_TEMP/bpf-load-gate1-inputs" && sha256sum p11scope p11scope-discover verifier-stats-probe.so > SHA256SUMS)
+          cat "$RUNNER_TEMP/bpf-load-gate1-inputs/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-load-gate1-inputs
+          path: ${{ runner.temp }}/bpf-load-gate1-inputs/
+          if-no-files-found: error
+          retention-days: 1
+  # Gate-1 loads: one kernel per job. The gate-1 delta is the Detailed
+  # flavor alone (Inventory and counter objects are byte-identical to
+  # gate-0, proven host-side by scripts/check-gate0-identity.py): doctor
+  # loads the Detailed object, scored as detailed-gate1/<root>, and a
+  # linked system inventory loads the production journal object (also
+  # a Detailed flavor, so gated too), scored as journal-gate1/<root>. A
+  # guest that cannot boot, a refused load, a missing table or a
+  # nonzero doctor exit is a FAIL, never a skip.
+  bpf-load-gate1-kernels:
+    needs: bpf-load-gate1-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Scripts only (driver + report); no custody test runs here.
+          fetch-depth: 1
+      - name: Enable KVM for the runner user
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+      - name: Install pinned virtme-ng
+        shell: bash
+        run: |
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      # Cache keys (as in ci.yml): the runner image, so an image update
+      # starts the kernel cache cold.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      # One cache entry per kernel (that kernel's Ubuntu mainline debs
+      # plus vng's extracted boot/lib trees, ~370-590 MB). A miss costs
+      # a download, never a build. Exact key only, no restore-keys (as
+      # in ci.yml).
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # vng downloads over bare HTTPS with no checksum, and a cache hit
+      # skips its fetch entirely, so the sums are checked here on every
+      # run: download without booting first (a no-op on a cache hit),
+      # then verify the exact deb set before the first boot. A mismatch
+      # fails the job naming the kernel.
+      - name: Verify the kernel download
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }} (re-record the sums)" >&2; exit 1; }
+      - name: Download the gate-1 observer and probe
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bpf-load-gate1-inputs
+          # Under the workspace (hence under $HOME): vng hides host /tmp
+          # and /var/tmp from the guest, and the driver passes these
+          # paths into the guest command.
+          path: bpf-load-gate1-inputs
+      - name: Run the gate-1 load check for this kernel
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-gate1-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-gate1-out"
+          scripts/check-bpf-load-gate1.sh \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/verifier-stats-probe.so" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
+          test -s "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
+          # Fail when the guest doctor exits nonzero, as the host job does.
+          grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
+          # shell: bash runs with -eo pipefail, so a failing driver
+          # already fails the step through the pipe; still require the
+          # driver's own verdict line, pinning the pass to OVERALL: PASS
+          # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
+          grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
+      # The guest runs the host userspace, so the SoftHSM provider, the
+      # ledger caller's compiler and the manifest come from the runner.
+      - run: sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 softhsm2 libsofthsm2 gcc
+      - name: Run the gate-1 journal load check for this kernel
+        shell: bash
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope-discover"
+          module=$(python3 -I scripts/release-matrix-contract.py --select-module)
+          test -f "$module"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out"
+          "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope-discover" --module "$module" \
+            -o "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json"
+          scripts/check-bpf-load-journal.sh --object journal-gate1 \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/verifier-stats-probe.so" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          grep -q '^# object: journal-gate1$' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          # A gate-1 journal row must be budgeted, never the unbudgeted
+          # loaded-plus-headroom fallback.
+          grep -q '"pass": true' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out/results.jsonl"
+          if grep -q 'unbudgeted' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out/results.jsonl"; then
+            echo "gate-1 journal row is unbudgeted" >&2
+            exit 1
+          fi
+      - name: Upload the table and doctor output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-load-gate1-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-gate1-out/doctor-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-gate1-out/probe-${{ matrix.kernel }}.jsonl
+            ${{ github.workspace }}/bpf-load-gate1-out/vng-${{ matrix.kernel }}.log
+            ${{ github.workspace }}/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/results.jsonl
+          if-no-files-found: error
+          retention-days: 7
+  # Kernel-sensitive lib cells in guests: PID-scope tiers, PID-filter
+  # Multi cells, the identity iterator, counter readers and the uretprobe
+  # hazard probe (scripts/ci/lib-cells-vng.sh). One guest per kernel; the
+  # script judges every cell and exits nonzero on any failure.
+  lib-cells-kernels:
+    needs: bpf-load-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [v6.6.157, v6.12.111]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Scripts only (the guest driver); no test runs here.
+          fetch-depth: 1
+      - name: Enable KVM for the runner user
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static gcc libp11-kit-dev softhsm2 qemu-system-x86 qemu-utils seabios ipxe-qemu
+      - name: Install pinned virtme-ng
+        shell: bash
+        run: |
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      # Cache keys (as in ci.yml): the runner image, so an image update
+      # starts the kernel cache cold.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # Same checksum gate as the load jobs: download without booting,
+      # then verify the exact deb set before the first boot.
+      - name: Verify the kernel download
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }} (re-record the sums)" >&2; exit 1; }
+      - name: Download the observer, probe and lib tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bpf-load-inputs
+          # Under the workspace (hence under $HOME): vng hides host /tmp
+          # and /var/tmp from the guest, and the driver passes these
+          # paths into the guest command.
+          path: bpf-load-inputs
+      - name: Run the lib-cell subset in this kernel's guest
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests"
+          mkdir -p "$GITHUB_WORKSPACE/lib-cells-out"
+          scripts/ci/lib-cells-vng.sh \
+            "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests" \
+            "$GITHUB_WORKSPACE/lib-cells-out" "${{ matrix.kernel }}"
+      - name: Upload the cell results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lib-cells-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/lib-cells-out/results.jsonl
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/status.txt
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/uname.txt
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/vng-console.log
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/cell-*.log
+          if-no-files-found: error
+          retention-days: 7
+  # No VM: load every BPF program on the runner kernel itself with sudo
+  # and file the same table.
+  bpf-load-host:
+    needs: bpf-load-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The report script only; no custody test runs here.
+          fetch-depth: 1
+      - name: Download the observer, probe and lib tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bpf-load-inputs
+          path: bpf-load-inputs
+      - name: Load every program on the host kernel
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-host-out"
+          OUT="$GITHUB_WORKSPACE/bpf-load-host-out"
+          OBSERVER="$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
+          PROBE="$GITHUB_WORKSPACE/bpf-load-inputs/verifier-stats-probe.so"
+          # The redirects happen inside the root shell: sudo closes file
+          # descriptors past stderr (the process-substitution precedent), so
+          # an outer 9> file would never reach the probe. `env` sets the
+          # variables after sudo's own environment strip; plain
+          # `sudo VAR=...` needs a SETENV sudoers tag the runner lacks.
+          rc=0
+          # LD_PRELOAD is set inside the root shell for the observer only,
+          # as in the guest driver; preloading the probe into the shell too
+          # left the stats file empty on the first hosted run.
+          sudo bash -c 'LD_PRELOAD="$3" P11SCOPE_VERIFIER_STATS_FD=9 "$0" doctor 9>"$1" >"$2" 2>&1' \
+            "$OBSERVER" "$OUT/probe-host.jsonl" "$OUT/doctor-host.txt" "$PROBE" || rc=$?
+          echo "doctor rc=$rc"
+          for f in "$OUT/probe-host.jsonl" "$OUT/doctor-host.txt"; do
+            if [ -e "$f" ]; then
+              sudo chown "$(id -un):$(id -gn)" "$f"
+            fi
+          done
+          grep 'host program preflight' "$OUT/doctor-host.txt" | head -1 || echo "no host program preflight line"
+          # The witness leg: /bin/true is a universal identified ELF for
+          # --prearm-module (any identified file pins; the load gate
+          # scores BPF loads, never verdicts), so no provider install.
+          # Cgroup scope: the only scope that loads p11_pw_migrate.
+          wrc=0
+          sudo bash -c 'LD_PRELOAD="$3" P11SCOPE_VERIFIER_STATS_FD=9 "$0" profile --cgroup /sys/fs/cgroup --prearm-module /bin/true --attach-backend multi --duration 5s 9>"$1" >"$2" 2>&1' \
+            "$OBSERVER" "$OUT/witness-probe-host.jsonl" "$OUT/witness-host.txt" "$PROBE" || wrc=$?
+          echo "witness rc=$wrc"
+          for f in "$OUT/witness-probe-host.jsonl" "$OUT/witness-host.txt"; do
+            if [ -e "$f" ]; then
+              sudo chown "$(id -un):$(id -gn)" "$f"
+            fi
+          done
+          SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
+          # Stable kernel label: the future budgets file keys the host leg
+          # as `host` (guests use the vX.Y.Z matrix value). Never
+          # `host-$(uname -r)` here: the runner release changes under us
+          # and the report's exact-string budget lookup would fail every
+          # host root. The real release is recorded below for attribution.
+          python3 -I scripts/bpf-load-report.py --kernel host \
+            --observer-sha256 "$SHA" "$OUT/probe-host.jsonl" 2>&1 | tee "$OUT/table-host.txt"
+          test -s "$OUT/table-host.txt"
+          echo "# host-release: $(uname -r)" >>"$OUT/table-host.txt"
+          python3 -I scripts/bpf-load-report.py --object prearm-witness --kernel host \
+            --observer-sha256 "$SHA" "$OUT/witness-probe-host.jsonl" 2>&1 | tee "$OUT/table-witness-host.txt"
+          test -s "$OUT/table-witness-host.txt"
+          echo "# host-release: $(uname -r)" >>"$OUT/table-witness-host.txt"
+          test "$rc" -eq 0
+          test "$wrc" -eq 0
+      - name: Upload the table and doctor output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-load-host
+          path: |
+            ${{ github.workspace }}/bpf-load-host-out/table-host.txt
+            ${{ github.workspace }}/bpf-load-host-out/doctor-host.txt
+            ${{ github.workspace }}/bpf-load-host-out/probe-host.jsonl
+            ${{ github.workspace }}/bpf-load-host-out/table-witness-host.txt
+            ${{ github.workspace }}/bpf-load-host-out/witness-host.txt
+            ${{ github.workspace }}/bpf-load-host-out/witness-probe-host.jsonl
+          if-no-files-found: error
+          retention-days: 7

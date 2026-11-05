@@ -5,8 +5,8 @@
 
 use super::*;
 use p11scope_ebpf_common::inventory_callers::{
-    entry::{record_caller_use_with, CallerEntryFailure, CallerEntryIo, PairInsertError},
-    CallerEvidence, CallerObjectKey, CallerObjectUse, EndpointObject, CALLER_EVIDENCE_CELLS,
+    CALLER_EVIDENCE_CELLS, CallerEvidence, CallerObjectKey, CallerObjectUse, EndpointObject,
+    entry::{CallerEntryFailure, CallerEntryIo, PairInsertError, record_caller_use_with},
 };
 
 /// Placeholders: preparation must select explicit endpoint N and pair P limits

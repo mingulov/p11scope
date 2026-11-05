@@ -58,6 +58,42 @@ fn embedded_scalar_helpers_have_exact_linkage_btf_bodies_and_real_calls() {
     );
 }
 
+#[test]
+fn embedded_object_capture_globals_have_exact_scalar_abis_and_calls() {
+    let directory = tempfile::tempdir().expect("temporary scalar object capture mutations");
+    let object = directory.path().join("p11scope-ebpf");
+    std::fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_OBJECT_CAPTURE_OBJECT", &object)
+        .env(
+            "P11SCOPE_OBJECT_CAPTURE_FULL",
+            if cfg!(feature = "stub-object-attributes") {
+                "0"
+            } else {
+                "1"
+            },
+        )
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "ObjectCaptureGlobalsTests.test_object_capture_globals_linkage_signature_and_calls",
+        ])
+        .output()
+        .expect("run actual scalar capture ABI and call mutations");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "scalar capture globals: {report}");
+    assert!(report.contains("Ran 1 test"), "zero selection: {report}");
+    assert!(
+        !report.contains("skipped"),
+        "skipped scalar proof: {report}"
+    );
+}
+
 /// Relocation itself is an object transformation. Distinct sentinel descriptors
 /// exercise the real Aya parser/relocator without creating or loading BPF maps.
 #[test]
@@ -119,6 +155,8 @@ fn native_bpf_map_decoder_contracts() {
         "MapDefsTests.test_root_helpers",
         "MapDefsTests.test_json_and_legacy_cli",
         "MapDefsTests.test_runner_guards",
+        "MapDefsTests.test_frozen_map_names_survive_kernel_truncation",
+        "Ia32SpanProofTests.test_saved_sentinel_requires_proven_full_width_register_flow",
     ];
     let output = Command::new("python3")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -126,10 +164,59 @@ fn native_bpf_map_decoder_contracts() {
         .args(cases)
         .output()
         .expect("run required native map decoder tests");
-    assert!(
-        output.status.success(),
-        "native map decoder suite failed: stdout={} stderr={}",
+    let report = format!(
+        "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        output.status.success(),
+        "native map decoder suite: {report}"
+    );
+    assert!(report.contains("Ran 13 tests"), "zero selection: {report}");
+    assert!(report.contains("\nOK\n"), "skipped decoder proof: {report}");
+}
+
+/// Release marker-OFF inventory and future native marker call-site twins.
+#[test]
+fn embedded_birth_marker_twins_are_driven() {
+    let cases = [
+        "JournalMarkerInventoryTests.test_gate_variant_accepts_gate_maps_with_markers",
+        "JournalMarkerInventoryTests.test_release_detailed_marker_absence_accepts",
+        "JournalMarkerInventoryTests.test_release_detailed_stale_marker_inventory_refused",
+        "JournalMarkerInventoryTests.test_release_half_linked_marker_globals_refused",
+        "JournalMarkerInventoryTests.test_inventory_with_marker_map_refused",
+        "JournalMarkerInventoryTests.test_inventory_with_marker_symbols_refused",
+        "JournalMarkerInventoryTests.test_release_stale_marker_wrong_abi_refused",
+        "JournalMarkerInventoryTests.test_core_instance_helper_missing_still_refused",
+        "JournalMarkerInventoryTests.test_marker_helper_boundary",
+        "JournalMarkerInventoryTests.test_marker_helper_boundary_refuses_user_read",
+        "JournalMarkerInventoryTests.test_marker_single_global_refused",
+        "JournalMarkerCallSiteTests.test_marker_calls_healthy_diagnostic",
+        "JournalMarkerCallSiteTests.test_marker_calls_healthy_default",
+        "JournalMarkerCallSiteTests.test_marker_calls_without_markers_skipped",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_entry_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_ia32_entry_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_return_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_continuation_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_exec_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_exit_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_types_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_pair_refused",
+    ];
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "tests/python/test_bpf_map_defs.py"])
+        .args(cases)
+        .output()
+        .expect("run birth marker twins");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "birth marker twins: {report}");
+    assert!(report.contains("Ran 23 tests"), "zero selection: {report}");
+    assert!(report.contains("\nOK\n"), "skipped marker proof: {report}");
 }

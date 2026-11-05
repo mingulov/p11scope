@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Drive `p11scope inventory --dashboard` under a pty and verify it.
 
-Waits for a dashboard frame, scrolls once with `j` (asserting the
-footer scroll marker advances — the stdin→key→scroll→render path),
+All modes exercise the scan dashboard explicitly; they do not need live BPF
+host admission. Waits for a dashboard frame, scrolls once with `j` (asserting
+the footer scroll marker advances — the stdin→key→scroll→render path),
 sends `q`, then asserts: exit 0 well before `--duration` (the key
 quit the run), alternate-screen enter and exit sequences bracket
 the frames (terminal restored), and the stderr frame accounting
@@ -31,6 +32,13 @@ first frame sends Ctrl-S (raw mode keeps IXON: the terminal stops taking
 output), then `q`; the restore is shed. Ctrl-Q comes 4 s later, once the
 report is written: the restore retried after the report must then reach
 the terminal (alternate screen left, cursor shown) and say so.
+
+Mode `app-first`: `BINARY PID DURATION BUDGET app-first`. The owned
+app-first-driver maps app-p1.so and app-p2.so. Verify both named associations
+at 80x24, resize to 40x10, scroll to the later module, enlarge, then quit and
+verify terminal restoration. This mode always uses the unprivileged scan lane.
+Optional trailing `48 12` selects the U6 compact dimensions and checks the
+evidence/gaps navigation without changing the default 40x10 journey.
 """
 
 import fcntl
@@ -47,6 +55,46 @@ import termios
 import time
 
 
+class PtyChild:
+    """Keep a forked child's PID owned until its one reap, then retire it."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.reaped = False
+
+    def wait(self, options: int) -> tuple[int, int]:
+        try:
+            done, status = os.waitpid(self.pid, options)
+        except ChildProcessError:
+            self.reaped = True
+            raise
+        if done != 0:
+            self.reaped = True
+        return done, status
+
+    def cleanup(self) -> None:
+        if self.reaped:
+            return
+        # Reap an exited child without signaling it; ECHILD also retires
+        # custody if another wait has already consumed this child's exit.
+        try:
+            done, _ = self.wait(os.WNOHANG)
+        except OSError:
+            return
+        if done != 0:
+            return
+        # This single-threaded driver has no competing reaper. Until the
+        # wait below, even an intervening exit keeps this PID reserved.
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            self.wait(0)
+        except OSError:
+            pass
+
+
 def main() -> int:
     if len(sys.argv) > 5 and sys.argv[5] == "stall":
         return stall_mode()
@@ -54,6 +102,8 @@ def main() -> int:
         return stderr_mode()
     if len(sys.argv) > 5 and sys.argv[5] == "xoff":
         return xoff_mode()
+    if len(sys.argv) > 5 and sys.argv[5] == "app-first":
+        return app_first_mode()
     binary, pid, duration, budget = (
         sys.argv[1],
         sys.argv[2],
@@ -61,11 +111,15 @@ def main() -> int:
         float(sys.argv[4]),
     )
     duration_secs = float(duration)
-    argv = [binary, "inventory", "--pid", pid, "--dashboard", "--duration", duration]
+    argv = [
+        binary, "inventory", "--pid", pid, "--capture", "scan",
+        "--dashboard", "--duration", duration,
+    ]
     child, master = pty.fork()
     if child == 0:
         os.execv(binary, argv)
         os._exit(127)  # unreachable; pacifies linters
+    child = PtyChild(child)
     # A real 80x24 window (openpty defaults to 0x0, which the dashboard
     # would only fall back from — here the queried size is asserted).
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -112,7 +166,7 @@ def main() -> int:
         status = None
         eof = False
         while time.monotonic() - start < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -147,14 +201,7 @@ def main() -> int:
                 break
             output.extend(chunk)
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
 
     elapsed = time.monotonic() - start
@@ -180,6 +227,201 @@ def main() -> int:
     return 0
 
 
+def app_first_mode() -> int:
+    binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+    compact_width, compact_height = (40, 10)
+    if len(sys.argv) > 6:
+        assert sys.argv[6:] == ["48", "12"], "app-first accepts only optional 48 12"
+        compact_width, compact_height = (48, 12)
+    argv = [
+        binary, "inventory", "--pid", pid, "--capture", "scan", "--dashboard",
+        "--duration", duration,
+    ]
+    launch_read, launch_write = os.pipe()
+    child, master = pty.fork()
+    if child == 0:
+        os.close(launch_write)
+        os.read(launch_read, 1)
+        os.close(launch_read)
+        os.execv(binary, argv)
+        os._exit(127)
+    child = PtyChild(child)
+    os.close(launch_read)
+    output = bytearray()
+    start = time.monotonic()
+    status = None
+    excerpts = []
+
+    def resize(width: int, height: int) -> None:
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+
+    def complete_frame(mark: int, height: int, predicate) -> str:
+        """Require every row, including the footer, from a fresh full repaint."""
+        cursor = mark
+        while time.monotonic() - start < budget:
+            raw = bytes(output)
+            frame_start = raw.find(b"\x1b[H", cursor)
+            while frame_start >= 0:
+                next_start = raw.find(b"\x1b[H", frame_start + 3)
+                frame_end = next_start if next_start >= 0 else len(raw)
+                frame = raw[frame_start:frame_end]
+                # Each row ends with erase-to-end-of-line. The last row is
+                # the footer; a partial PTY read is never a complete frame.
+                if frame.count(b"\x1b[K") >= height:
+                    text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", frame).decode("utf-8")
+                    lines = text.replace("\r", "").split("\n")
+                    text = "\n".join(lines[:height])
+                    if predicate(text):
+                        return text
+                    cursor = frame_end
+                elif next_start >= 0:
+                    cursor = next_start
+                else:
+                    break
+                frame_start = raw.find(b"\x1b[H", cursor)
+            if not read_some(master, output, 0.1):
+                break
+        raise AssertionError("timed out waiting for a complete matching dashboard frame")
+
+    try:
+        # Record terminal settings before the observer can enter raw mode.
+        initial_termios = termios.tcgetattr(master)
+        resize(80, 24)
+        os.write(launch_write, b"1")
+        first = complete_frame(0, 24, lambda text: "scroll 0/1" in text
+                               and "app-p1.so" in text and "app-p2.so" in text)
+        associations = re.findall(r"app-first-driver \[(c\d+)\] -> (app-p[12]\.so) \[(m\d+)\]", first)
+        assert len(associations) == 2, f"two named initial associations: {first}"
+        caller_ids = {caller for caller, _, _ in associations}
+        assert len(caller_ids) == 1, f"one owned caller: {associations}"
+        caller_id = associations[0][0]
+        modules = {name: module for _, name, module in associations}
+        assert len(set(modules.values())) == 2, f"physical modules remain separate: {modules}"
+        # Navigation follows the rendered edge order, rather than assuming
+        # module IDs were assigned in the fixture's argument order.
+        first_name, first_id = associations[0][1:]
+        later_name, later_id = associations[1][1:]
+        assert f"pid {pid} incarnation 0" in first, first
+        excerpts.append(("80x24 initial", first))
+
+        if compact_width == 48:
+            mark = len(output)
+            os.write(master, b"\t")
+            evidence = complete_frame(mark, 24, lambda text: "[evidence]" in text)
+            assert "coverage unknown (scan only)" in evidence, evidence
+            excerpts.append(("80x24 scan coverage evidence", evidence))
+            mark = len(output)
+            os.write(master, b"\t")
+            gaps = complete_frame(mark, 24, lambda text: "showing gaps" in text)
+            assert "exact image authority unavailable" in gaps, gaps
+            excerpts.append(("80x24 recorded gap ledger", gaps))
+            mark = len(output)
+            os.write(master, b"\t")
+            complete_frame(mark, 24, lambda text: "[summary]" in text)
+
+        mark = len(output)
+        resize(compact_width, compact_height)
+        initial_range = "summary 1-2/2" if compact_width == 48 else "summary 1-1/2"
+        compact = complete_frame(mark, compact_height, lambda text: "(minimal)" in text
+                                 and initial_range in text and "tab d x q quit" in text)
+        assert f"application app-first-driver [{caller_id}]" in compact, compact
+        assert f"module {first_name} [{first_id}]" in compact, compact
+        assert "Module mapped; activity not captured" in compact, compact
+        assert "totals: 1 callers 2 modules 2 edges" in compact, compact
+        assert all(len(line) <= compact_width for line in compact.splitlines()), compact
+        excerpts.append((f"{compact_width}x{compact_height} first association", compact))
+
+        mark = len(output)
+        os.write(master, b"j")
+        later = complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
+        assert f"application app-first-driver [{caller_id}]" in later, later
+        assert f"module {later_name} [{later_id}]" in later, later
+        assert f"module {first_name} [{first_id}]" not in later, later
+        assert "Module mapped; activity not captured" in later, later
+        assert "totals: 1 callers 2 modules 2 edges" in later, later
+        assert all(len(line) <= compact_width for line in later.splitlines()), later
+        excerpts.append((f"{compact_width}x{compact_height} after j", later))
+
+        if compact_width == 48:
+            # The scan coverage limit remains visible in each named summary;
+            # the gaps page also makes the lack of exact image authority reachable.
+            mark = len(output)
+            os.write(master, b"\t")
+            evidence = complete_frame(mark, compact_height, lambda text: text.splitlines()[-1].startswith("evidence "))
+            assert "coverage unknown (scan only)" in evidence, evidence
+            excerpts.append(("48x12 scan coverage evidence", evidence))
+            mark = len(output)
+            os.write(master, b"\t")
+            complete_frame(mark, compact_height, lambda text: text.splitlines()[-1].startswith("gaps "))
+            # Page switching retains the selected index. Return to the first
+            # recorded gap so host-specific later gaps cannot replace this one.
+            mark = len(output)
+            os.write(master, b"k")
+            gaps = complete_frame(mark, compact_height, lambda text: text.splitlines()[-1].startswith("gaps 1-"))
+            assert "exact image authority unavailable" in gaps, gaps
+            assert all(len(line) <= compact_width for line in gaps.splitlines()), gaps
+            excerpts.append(("48x12 recorded gap ledger", gaps))
+            mark = len(output)
+            os.write(master, b"\t")
+            # DR37: the identity-held promotion cursor keeps the j-selected
+            # pair across the evidence/gaps detour (gaps keys never reselect
+            # the edge cursor), and the summary view follows it on tab-back
+            # (src/inventory/dashboard.rs: reselect_on_edge_entry; usage.md:
+            # `d` acts on the selected caller/provider pair).
+            complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
+            mark = len(output)
+            os.write(master, b"j")
+            # Still at the bottom: j clamps and the retained pair stays shown.
+            complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
+
+        mark = len(output)
+        resize(80, 24)
+        # DR37: the enabled full footer ("j/k scroll, tab details, d promote,
+        # x cancel, q quit") truncates past 80 columns, so "q quit" no longer
+        # renders; pin the DR37 keys instead (src/inventory/dashboard.rs:948).
+        enlarged = complete_frame(mark, 24, lambda text: "scroll 1/1" in text and "d promote" in text)
+        assert f"app-first-driver [{caller_id}] -> {later_name} [{later_id}]" in enlarged, enlarged
+        assert f"pid {pid} incarnation 0" in enlarged, enlarged
+        assert "presence mapped | capture scan only | activity not covered" in enlarged, enlarged
+        assert "entries ?" in enlarged, enlarged
+        excerpts.append(("80x24 enlarged after j", enlarged))
+        os.write(master, b"q")
+        eof = False
+        while time.monotonic() - start < budget:
+            done, code = child.wait(os.WNOHANG)
+            if done != 0:
+                status = code
+                break
+            if eof:
+                time.sleep(0.05)
+            else:
+                eof = not read_some(master, output, 0.1)
+        assert status is not None, "timed out waiting for q exit"
+        while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
+            pass
+        elapsed = time.monotonic() - start
+        assert os.waitstatus_to_exitcode(status) == 0, f"exit status {status}"
+        assert elapsed < float(duration) - 15, f"q did not quit early: {elapsed:.1f}s"
+        entered = output.find(b"\x1b[?1049h")
+        restored = output.rfind(b"\x1b[?1049l")
+        assert 0 <= entered < restored, "alternate-screen enter/exit did not bracket frames"
+        assert b"\x18\x1b[?25h\x1b[?1049l" in output[entered:], "cursor and screen restore sequence missing"
+        assert termios.tcgetattr(master) == initial_termios, "terminal settings not restored"
+        assert b"dashboard frames:" in output, "frame accounting missing"
+    except (AssertionError, OSError) as error:
+        return fail(str(error), output, child)
+    finally:
+        child.cleanup()
+        os.close(master)
+        os.close(launch_write)
+
+    for label, text in excerpts:
+        print(f"pty-dashboard-app-first frame ({label}):\n{text}")
+    print(f"pty-dashboard-app-first: {len(output)} bytes in {elapsed:.1f}s, exit=0")
+    print("pty-dashboard-app-first: PASS (names, IDs, compact resize, later module, enlargement, q, restoration)")
+    return 0
+
+
 def read_some(master: int, output: bytearray, wait: float) -> bool:
     """One read within `wait`; False once the slave side closed."""
     ready, _, _ = select.select([master], [], [], wait)
@@ -199,12 +441,14 @@ def stall_mode() -> int:
     binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
     stall_secs, report = float(sys.argv[6]), sys.argv[7]
     argv = [
-        binary, "inventory", "--pid", pid, "--dashboard", "--duration", duration, "-o", report,
+        binary, "inventory", "--pid", pid, "--capture", "scan",
+        "--dashboard", "--duration", duration, "-o", report,
     ]
     child, master = pty.fork()
     if child == 0:
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     # A large window: big frames fill the pty buffer within seconds.
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 200, 0, 0))
     output = bytearray()
@@ -219,15 +463,15 @@ def stall_mode() -> int:
         stall_mark = len(output)
         stall_began = time.monotonic()
         while time.monotonic() - stall_began < stall_secs:
-            done, _ = os.waitpid(child, os.WNOHANG)
+            done, _ = child.wait(os.WNOHANG)
             if done != 0:
                 return fail("the dashboard exited during the stall", output, child)
             time.sleep(0.5)
-        os.kill(child, signal.SIGINT)
+        os.kill(child.pid, signal.SIGINT)
         interrupted = time.monotonic()
         eof = False
         while time.monotonic() - interrupted < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -241,14 +485,7 @@ def stall_mode() -> int:
         while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
             pass
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
 
     exit_code = os.waitstatus_to_exitcode(status)
@@ -299,7 +536,8 @@ def stderr_mode() -> int:
     path = sys.argv[7] if route == "file" else None
     sleeper = subprocess.Popen(["sleep", "3"])
     argv = [
-        binary, "inventory", "--pid", str(sleeper.pid), "--dashboard", "--duration", duration,
+        binary, "inventory", "--pid", str(sleeper.pid), "--capture", "scan",
+        "--dashboard", "--duration", duration,
     ]
     child, master = pty.fork()
     if child == 0:
@@ -308,6 +546,7 @@ def stderr_mode() -> int:
             os.dup2(fd, 2)
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
     output = bytearray()
     start = time.monotonic()
@@ -316,7 +555,7 @@ def stderr_mode() -> int:
         eof = False
         while time.monotonic() - start < budget:
             sleeper.poll()
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -329,14 +568,7 @@ def stderr_mode() -> int:
         while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
             pass
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
         sleeper.kill()
         sleeper.wait()
@@ -373,11 +605,15 @@ def stderr_mode() -> int:
 
 def xoff_mode() -> int:
     binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
-    argv = [binary, "inventory", "--pid", pid, "--dashboard", "--duration", duration]
+    argv = [
+        binary, "inventory", "--pid", pid, "--capture", "scan",
+        "--dashboard", "--duration", duration,
+    ]
     child, master = pty.fork()
     if child == 0:
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     output = bytearray()
     start = time.monotonic()
@@ -393,7 +629,7 @@ def xoff_mode() -> int:
         os.write(master, b"q")
         quit_at = time.monotonic()
         while time.monotonic() - quit_at < 4.0:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 return fail("exited before the terminal read again", output, child)
             read_some(master, output, 0.1)
@@ -401,7 +637,7 @@ def xoff_mode() -> int:
         os.write(master, b"\x11")  # Ctrl-Q: the terminal reads again.
         eof = False
         while time.monotonic() - quit_at < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -415,14 +651,7 @@ def xoff_mode() -> int:
         while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
             pass
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
 
     exit_code = os.waitstatus_to_exitcode(status)
@@ -431,7 +660,7 @@ def xoff_mode() -> int:
         ("exit 0", exit_code == 0, f"exit={exit_code}"),
         ("alternate screen left after Ctrl-Q", b"\x1b[?1049l" in after, ""),
         ("cursor shown after Ctrl-Q", b"\x1b[?25h" in after, ""),
-        ("retry said so", b"screen restored after the report" in after, ""),
+        ("retry said so", b"p11scope: dashboard screen restored (the terminal read again)" in after, ""),
     ]
     failed = [f"{name} ({detail})" for name, ok, detail in checks if not ok]
     print(f"pty-dashboard-xoff: exit={exit_code} {exit_secs:.2f}s after q")
@@ -443,17 +672,10 @@ def xoff_mode() -> int:
     return 0
 
 
-def fail(message: str, output: bytearray, child: int) -> int:
+def fail(message: str, output: bytearray, child: PtyChild) -> int:
     print(f"pty-dashboard FAILED: {message}")
     print(output[-2000:].decode("utf-8", "replace"))
-    try:
-        os.kill(child, 9)
-    except OSError:
-        pass
-    try:
-        os.waitpid(child, 0)
-    except OSError:
-        pass
+    child.cleanup()
     return 1
 
 

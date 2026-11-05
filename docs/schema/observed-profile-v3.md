@@ -14,8 +14,128 @@ the profile identifier, the `lane` discriminator, the six original additions
 below, the six residual additions (`drain_proven`, `verdict_detail`,
 `uretprobe_override`, `handoff_child_pid`, `p11scope_env`, `pid_namespace`), the stop-gate
 outcome (`stop_quiescence`), the verdict
-classes (`gap_classes` and its three published inputs), and row identity
-(`functions[].target`, `functions[].ordinals`, table linkage `exports`).
+classes (`gap_classes` and its three published inputs), row identity
+(`functions[].target`, `functions[].ordinals`, table linkage `exports`),
+and the `modules_skipped[]` named-prefix delta below.
+
+`modules_skipped[]` extends the inherited v2 row: a module new to a
+shared-scope Detailed capture may attach in part, as a named
+leading-tables prefix, instead of being refused whole. Such a module
+appears in both `discovery[]` and `modules_skipped[]`; its `reason`
+opens with the attached-vs-total counts — `A of N endpoints attached;
+calls through the others are not counted (provider_prefix)` for an
+ordinary provider, or `M of N template tables attached; calls through
+the others are not counted (closure_prefix)` for a late-start proxy
+closure array — rather than with `module needs`. The whole-refusal
+(`module needs …`) and growth-omission (`admitted module needs …`)
+openings are unchanged, and every kind — whole refusal, growth
+omission, and either named prefix — forces `PARTIAL`. The
+`inspect --system` catalog files a prefix-admitted object under
+`refused` with the same named-gap reason; its attached-vs-needed
+counts are in the reason text.
+
+The inherited `functions[].latency_ns` timing-availability shapes also apply
+to v3: counts has null timing, timestamps has measured total/max and null
+percentiles, and latency retains the histogram object. A measured zero is
+distinct from unavailable timing. These shapes do not change count authority
+or combine aggregate and semantic-detail totals.
+
+When a capture uses the prepared cumulative-counter reader, its evidence also
+contains optional `counter_collection` metadata. Legacy captures omit this
+object. Its exact keys are `mode`, `generation`, `read_window`, `status`,
+`health`, `discontinuity`, and `failure`. Mode and positive generation identify
+the accepted native read. `read_window` is either the measured monotonic
+`{started_ns, finished_ns}` interval or null when that interval is unavailable;
+it does not assert an atomic snapshot. Cached display ticks keep the original
+read window and do not acquire another native read.
+
+`status: "fresh"` has null failure and accepted health
+`{saturated: false, contended: false}`. A failed attempt retains the previous
+accepted rows, mode, generation, and window with `status: "stale"`, null health,
+and a finite failure cause; observed saturation or contention remains explicit
+as `saturated` or `contended`. A generation change sets sticky `discontinuity`.
+Either failure or discontinuity adds `counter_collection` to the observation
+gap causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
+An unavailable initial read cannot produce zero measurements, and a terminal
+report requires a new successful collection and projection. This metadata
+does not select a backend or add capture fields.
+
+When a metrics+counter capture carries an endpoint selection (`--select-endpoint`),
+the terminal evidence also contains an optional additive `selected_detail`
+envelope. Captures without the flag omit it. Its keys are `selection` (the
+requested endpoint plus its resolved slot, or the named refusal when the
+resolve attempt failed or the window voided), `events` (window and driver
+rows in tick order), and the close products `lineage`, `aggregate`, and
+`detail`, which are absent until a window closes with recorded detail
+deltas. K0 windows render `aggregate` and `detail` and omit `lineage`.
+The envelope never merges into `counter_summary` — aggregate and detail
+ledgers stay independent, so promotion and demotion cannot double-count.
+If any resolve step cannot complete, or the window voids (exec of the
+watched process, slot retirement, capture loss, or an unclean close
+boundary), the envelope names the refusal and the aggregate alone
+carries the capture.
+
+The envelope's nested shape is closed. `selection` always names `endpoint`
+and carries `slot` together with `file_offset` exactly when the name
+resolved, the slot group's `names`, and a finite `refusal` word
+(`endpoint_unknown`, a `promotion_*` word or an adapter word; reports
+written before K0 may carry the retired `bundle_unavailable`). A
+resolved selection may still carry a refusal for a later step the host
+could not complete. The selection record never publishes process
+identity: there is no PID/TID field. `events` is always present
+(possibly empty); each row is one closed shape — a window row
+(`reserved`, `bound`, `cas_won`, `cas_refused`, `closed`,
+`cancelled_unactivated`, with request/caller/provider/seq and an optional
+note), a `close_refused` row (view, endpoint offset, gate word), a
+`reserve_refused` row (adapter word, nullable seq), a `start_refused` row
+(human reason word), or a `promotion_outcome` row (`refused`/`ended` with
+the human reason word, `active` with the confirmed pair). K0 windows emit
+no event rows. `lineage` joins one window to its broad rows (request,
+view, endpoint offset, broad and detail generations, bracketing seqs and
+marks, nullable drift, `after_read` matched/unavailable/`mismatched:*`).
+`aggregate` renders the broad deltas over the window interval and
+`detail` the selected slot's own broad cells over the same window; both
+carry per-mode cells (counts bare, timestamps with totals, latency with
+buckets) and never a combined total.
+
+When a Detailed capture's semantic lane discloses a global-only instance
+continuation, the terminal profile-lane evidence also contains an
+optional additive `instance_reload_not_excluded` object. Captures
+without a disclosing producer omit it (absent, never zero or null).
+The key projects the capture's staged coordinator ledger at the
+terminal evidence; a capture whose path stages no semantic lane (the
+profile loops stage none) omits it. The metrics lane never carries
+it, and the terminal trace `EVIDENCE` object carries it under the
+same rule. When the router counted tainted
+continuations but minted no identity to name (mint exhaustion), the key
+is still present with the exact snapshots and an empty `identities`
+list: the router is the producer then, so absent-never-zero does not
+apply. The `identities` entries may also be incomplete while the
+snapshots stay exact when the capture discloses a "reload disclosure
+identities shed" gap: past an accumulator cap, identities shed
+(counted) but the router totals still merge. Its keys are
+`continued_across_global` and `joined_across_global` (the
+capture-monotonic router snapshots: tainted continuations observed and
+calls joined through a tainted entry) and `identities` (one entry per
+tainted identity, in `(file_slot, ids)` order; empty under mint
+exhaustion). Each entry names the
+watched `file_slot` and the continued capture-local instance `ids`.
+Entries carry no task cookie, exec id, epoch, range or address: the
+private image key groups the ledger but never renders. The key is
+informational only: it never feeds shares, verdicts, `gap_classes` or
+`completeness`, and never forces `PARTIAL`. Like `selected_detail`, it
+is a v3-additive disclosure that introduces no new schema revision.
+
+When a capture passes `--exclude-module`, its evidence also contains
+optional additive `excluded_modules` and `unmatched_excludes` keys.
+Captures without the flag omit both. `excluded_modules` lists one row
+per distinct excluded file with `path`, `dev`, `ino` (the opened file's
+fstat identity) and `processes` (how many in-scope processes mapped
+it); `unmatched_excludes` lists the inputs that matched no mapped
+file, in operator order. Like the disclosure above, these keys never
+feed shares, verdicts, `gap_classes` or `completeness`: excluded
+modules are a declared choice, not a loss, and the rest of the capture
+can still be `exact`.
 
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
@@ -26,6 +146,19 @@ parameter/template representations in the inherited schema are not default
 capture promises. Missing metadata is not evidence that the application used
 none. Scan-only function slots remain semantics-unverified/count-only; an
 accepted explicit manifest attests only its exact object/name/offset claims.
+
+Every `mechanisms[]` entry carries `registered`: `true` for an id the
+BPF return path found in `MECH_SHAPE`, `false` for an unregistered
+publication. Unregistered ids are public constants, so v3 documents
+list each 32-bit one as a bare hex number with its call/error counts
+(`params: null`, never decoded, never named) instead of only the
+`evidence.unregistered_mechanisms`
+total, which still counts every occurrence. Ids above `0xFFFFFFFF`
+count in the total only. Like `selected_detail`,
+this is a v3-additive disclosure that introduces no new schema
+revision; historical v2 documents list registered ids only and lack
+the `registered` key. `cgroups[].mechanisms[]` rows carry the same
+`registered` flag with the same meaning.
 
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten
@@ -41,17 +174,22 @@ capture, and a consumer must dispatch on the top-level `lane` field
 
 - The **profile** lane (`render::profile_json`, verdict
   `verdict_with_selection(true)`) embeds `versioned_evidence`: the full base
-  set plus the five profile-only fields `interface_selection`,
-  `attach_mechanisms`, `attach_backend`, `pid_descendant_gaps`, and
+  set plus the four profile-only fields `interface_selection`,
+  `attach_mechanisms`, `pid_descendant_gaps`, and
   `multi_rebuild_gaps`. Its
   verdict is selection-aware: a descendant gap, a rebuild gap, or any
   selection loss forces `PARTIAL`.
 - The **metrics** lane (`render::json`, verdict
-  `verdict_with_selection(false)`) embeds `Evidence` directly, so the five
+  `verdict_with_selection(false)`) embeds `Evidence` directly, so the four
   `#[serde(skip)]` profile-only fields above are absent. Its verdict is
   selection-blind by construction: the same capture that reads `PARTIAL` as
   profile over a descendant gap reads `COMPLETE`-eligible as metrics, with no
   contradiction — the metrics verdict never saw the selection state.
+
+Both current v3 lanes include `attach_backend`: the existing Session's
+`selection`, `fallback`, and `scope_filter` metadata. This disclosure does not
+add selection verdict authority to metrics. Historical v2-metrics documents
+retain their old shape without `attach_backend`.
 
 The terminal trace `EVIDENCE` object follows the profile lane: it carries the
 four versioned-only fields and no `lane` key (it is an evidence object, not a
@@ -70,7 +208,9 @@ discriminator value.
   array truncates with `selection_truncated` set.
 - `standard_exports`: sorted, unique `{module, status}` objects. `status` is
   exactly `present`, `outside_module`, `legacy_absent`, `required_absent`, or
-  `unresolved`.
+  `unresolved`. The historical absence labels both describe a known absent
+  optional export; neither asserts a provider-version requirement. Current
+  captures emit `legacy_absent` for known absence regardless of table metadata.
 - `inventory_surfaces`: at most 512 sorted `{module, ordinal, kind}` objects.
   `kind` is `legacy` or `interface`; `ordinal` starts at zero and is contiguous
   within each module.
@@ -97,10 +237,12 @@ to this class before the record leaves the probe. Name classes are `null`, `exac
 and belong to the tuple's module. `table_match` is true exactly when this array
 is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 `none`: inventory authority requires a readable successful result and at least
-one match; count-only authority has no match and is limited to a successful
-request and result whose names are both `exact_standard`, whose returned
-version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags class is `zero`
-or `fork_safe`.
+one match. Count-only authority has no match and requires a successful query
+with a non-null table observation whose targets passed identity and ABI checks.
+Names, version labels and returned flag classes do not decide count-only
+support. A null table cannot authorize counts; an unreadable version header
+can coexist with individually validated function targets. Unknown API names
+remain `unknown`, with the observed ordinals preserved.
 Count-only authority applies to a live or offline selection-only target, grants
 no inventory match, is semantically unauthorized, and forces `PARTIAL`. The
 profile tuple does not expose a helper selector or `semantic_authorized` field;
@@ -116,7 +258,19 @@ result (a null table output) is handled uniformly with nonzero `rv`: null
 `uprobe-multi`, derived only from successfully owned links. Before the
 uprobe-multi attachment slice, a nonempty array can contain only `per-offset`.
 
-`attach_backend` says how the session chose its static attach backend, as
+`unpublished_mechanisms` is a u64 count, always present: approved mechanism
+ids the `MECH_SHAPE` publication could not fit. When the approval union
+(the official PKCS#11 3.2 catalog plus the configured registry) exceeds
+the map's 1,024 entries, the session publishes the official catalog first
+and then registered ids in ascending order up to the cap, instead of
+refusing to start; this count gaps the unpublished tail. Unpublished ids
+count through the existing unregistered path (counted, never decoded),
+and render-side shape notes are computed over the published subset only.
+With the shipped registry the count is 0. Nonzero forces `PARTIAL` with
+the `unpublished_mechanisms` attribution cause.
+
+`attach_backend` is always present in both v3 lanes and says how the session
+chose its static attach backend, as
 the inventory document's `observation.attach` does. The backend is chosen by
 functional probes, never by the kernel version:
 - `selection`: the operator's `--attach-backend` (`auto`, `multi` or
@@ -136,6 +290,15 @@ functional probes, never by the kernel version:
 
 A PID-scoped uprobe-multi link never names pid 0.
 
+`object_capture` is always present in both v3 lanes and says whether this
+build captures object attributes (build scope, identical for every capture
+of the binary). It never gates the verdict — P0 scope is complete when P0
+facts are complete; this disclaims attribute coverage instead of claiming it:
+- `available`: boolean; `false` in v0.4.0 stub builds, `true` in FULL builds.
+- `reason`: finite machine reason when unavailable, else `null`. The one
+  v0.4.0 reason is `not_enabled`: the stub feature compiled attribute
+  capture out.
+
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
 tracking is not attached there. For cgroup scope it counts destination-
@@ -154,6 +317,51 @@ outside W3's completeness claim. A novel unmatched exit latches one lower-bound
 overflow increment when the bounded ledger is full. If admission already
 counted the gap, coalescing overflow marks `PARTIAL` without another increment.
 Replays and further unremembered keys do not increment again.
+
+`gap_exe_hints` is present if and only if the capture armed extensive
+mode (`--track-short-lived`); otherwise the key is absent, never null.
+Arming is confined to profile (non-metrics) `--cgroup`/`--system`
+captures: on trace, metrics, exact-`--pid` and `run` captures the flag
+records nothing and the key stays absent.
+It classifies the novel unmatched-exit subpopulation of
+`pid_descendant_gaps` (admissions and overflow sentinels carry no hint)
+into finite static-linkage classes: `links_provider` (the dead
+executable names a pinned watched provider within two `DT_NEEDED`
+steps), `links_pkcs11_loader` (it names `libp11-kit.so.0`),
+`no_static_link_within_scope` (the in-scope needed set completed with
+neither), and `unknown` (unverifiable or over budget — never a partial
+result presented as complete). Every publication carries
+`"label": "STATIC HINT"` and the scope string
+`"D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB
+capture-bytes<=64MiB names<=255B verdicts<=1024"`. The four counts are
+saturating u64s summing to the analyzed subpopulation, never to
+`pid_descendant_gaps` itself. Hints are never calls, never verdicts,
+never merged into call or attribution shares, and settle no birth,
+admission, absence, or call (R57). `dlopen`-only provider use is
+invisible by design and reads `no_static_link_within_scope`.
+
+`gap_exit_mappings` is present under the same arming rule (extensive
+profile `--cgroup`/`--system` captures only; absent, never null,
+otherwise). It splits the same novel unmatched-exit subpopulation of
+`pid_descendant_gaps` (admissions and overflow sentinels carry no
+verdict) by the kernel's exit-time answer: `mapped` (the kernel
+recorded a localized mapping of a watched provider file by the
+exiting leader at some point while watched, with no disqualifying
+refusal; the cells persist across unmap and exec, so this never
+means the file was still mapped at the exit instant) and `unknown`
+(no record, shared mm, refused hooks, late watch, local fault, or
+empty slots). It is a kernel observation, not a static hint, so
+it carries no label or scope: the
+value is exactly `{"mapped", "unknown"}` as saturating u64s summing
+to the classified subpopulation, never to `pid_descendant_gaps`
+itself. Multi-threaded exits read `unknown`: a process with more
+than one mm user never localizes its mappings, so its empty slots
+are not a negative. A late watch (inserted between the process's
+exec and its exit) reads `unknown` for the same reason: mappings
+established before the watch are invisible. The two counts never
+feed calls, callers, shares, verdicts, or births, and an exit never
+settles a call (R57). There is no "did not map" publication: nothing
+here proves a process did not map a watched provider.
 
 `task_uprobe_link_losses` is a saturating u64 count of matched leader-exit
 records whose retained process generation proved that a member of the process
@@ -198,6 +406,47 @@ samples only: a short capture with no periodic tick reports null max even
 though the start/readiness/end samples hold RSS. `tail_publishes`/
 `tail_skips` count executed versus provably redundant batch-tail
 publications.
+
+## Pre-arm watch keys on `evidence.discovery[]`
+
+Modules named by `--prearm-module` (packet 6.13) carry `watch`; only
+`watch` is pre-arm-only. `attached_at_ns` and `unobserved_windows` merge at
+evidence assembly onto every module with attach stamps, including generic
+captures without pre-arm watches (a module that missed the initial build
+discloses `late_discovery`). `sources` gains the one new label
+`"prearm"` (canonical order `scan`, `manifest`, `prearm`); pre-arm-only
+modules read `corroboration: ["uncorroborated"]`, and pre-arm never emits
+decoded tables. `watch` is `{since_ns, state, until_ns?, ended_by?,
+changed?}`: `state` is exactly `pinned_unarmed`, `armed`, `armed_idle`,
+`unavailable`, or `ended`; `since_ns` is always present (null until armed);
+`until_ns`/`ended_by` appear only when the end actually happened
+(`ended_by` is exactly `attached`, `scope_end`, `stop`, `object_changed`,
+`health_loss`, or `scope_uncertain`); `changed` is the
+`{last_ok_ns, detected_ns, previous_ino}` uncertainty bracket.
+`attached_at_ns` is null or a `CLOCK_MONOTONIC` instant, merged at evidence
+assembly from real attach-complete stamps. `unobserved_windows` is a list of
+`{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
+`late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
+absent means undisclosed, and an explicitly empty list reads as exact only
+with an R2-D1-6 proof behind it. Key presence never proves exactness. The
+pause-gate proof ships for owned `run` only: `[]` appears on a pre-armed
+module only when every declared probe attached at or before the barrier
+release while the child was barrier-held from its start — the spawn barrier
+from start to release, then the pause gate's frozen first hold (continuous,
+both bounds clocked, every member stamped, every first-stamp at or before
+the release) — and the window stays in every other capture, including any
+declared stamp dated after the release (the child may run its command
+before the first *verified* pause stop). The
+ordering-evidence proof ships for `profile` and `trace` (`--pid`, `--cgroup`,
+`--system`; detailed and `--mode metrics` policies): `[]` appears on a
+pre-armed module exactly when the mapping-instant witness finalized `Clear`
+for the object's slot with its hooks active strictly before the scope start,
+the witness fd matching the pin's held fd, and the finalize walk starting
+after the declared set's attach instant. `run` carries no ordering-evidence
+proof (the witness is inert there; owned holds keep the pause-gate proof),
+nor does inventory; the window stays wherever any condition refuses. The
+empty list asserts only the pre-attach span; a later loss still discloses on
+`watch` (`ended_by: health_loss`) without reopening it.
 
 ## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 
@@ -257,9 +506,18 @@ trace evidence object. Historical documents predate them (see Migration).
   that disagrees.
 - `semantic_unverified_slots`, `unprotected_live_windows` (0 or 1: a live
   loader or export window no confirmed pause owner protected, inferred from
-  `loader_discovery.hits > 0` and `pause` other than `sigstop`), and
-  `module_unresolved_slots` (the number of `functions[].module_unresolved`
-  rows) are the three verdict inputs that were previously unpublished.
+  an unaccounted loader hit — `loader_discovery.hits` above `benign_hits` —
+  and `pause` other than `sigstop`), and `module_unresolved_slots` (the
+  number of `functions[].module_unresolved` rows) are the three verdict
+  inputs that were previously unpublished.
+- Static detach history uses the existing `skipped` record with name
+  `discovery subject` and one of two fixed reasons: `static probe coverage gap
+  incomplete` or `static probes detached and exact pairs reattached`. The first
+  includes open or clock-unknown intervals; the second requires all affected
+  exact pairs and comparable clocks to have completed. Both retain observation
+  loss through the `skipped` cause after recovery. They carry no missing-call
+  count or per-provider/per-call interval and do not change
+  `unprotected_live_windows` or define a previously unknown `attach_gap_ms`.
 - `uretprobe_override` is `null` when the hazard preflight proceeded clean,
   else `{flag, reason}`: the exact `--allow-uretprobe-on-confined-target`
   flag plus the preflight's reason for requiring it. Disclosed, never a
@@ -303,6 +561,40 @@ positions share one target. `discovery[].tables[]` adds the linkage value
 and `functions[]` rows). Export linkage presents standard names only: scan-found
 slots stay semantics-unverified and count-only whatever their linkage.
 
+## Initialize claim on `functions[]` rows
+
+Every `functions[]` row that names `C_Initialize` and has at least one
+positively counted return carries an optional `initialization` object,
+rendered in both the profile and metrics lanes under every counter mode
+from the row's own `rv_counts` at render time — no new read, no new
+retention:
+
+- `outcome` is the outcome class over that row's completed calls: `ok`
+  (every counted return was `CKR_OK`), `already_initialized` (every
+  counted return was `CKR_CRYPTOKI_ALREADY_INITIALIZED`), `error` (every
+  counted return was anything else, `CKR_PENDING` included — the outcome
+  vocabulary has no pending word), or `mixed` (more than one class
+  occurred). Zero counts assert nothing observed and are ignored.
+- `potential_provider` is present and `true` exactly when at least one
+  completed call returned `CKR_OK` or
+  `CKR_CRYPTOKI_ALREADY_INITIALIZED`: the row's module answered as an
+  initialized Cryptoki at least once. It is a likelihood, never proof of
+  provider identity — a stub that returns `CKR_OK` qualifies — and it
+  carries no operator attestation.
+
+The claim is row-scoped: an aliased row that names `C_Initialize` among
+its names reports the row's own outcomes without splitting counts into
+guessed per-name shares. Rows that do not name exactly `C_Initialize`,
+and Initialize rows without positively counted returns, omit the key
+(absent, never null or false): absence means Initialize was not
+observed on that row (unknown, per OD35). The live function table marks
+qualifying rows with the same words (`[init: <outcome>]`, plus
+`, potential provider` when the likelihood holds).
+
+Like `selected_detail` and `instance_reload_not_excluded`, this is a
+v3-additive disclosure that introduces no new schema revision: the
+`functions[]` item shape stays open and the key stays optional.
+
 ## Kernel control evidence
 
 `kernel_control` is always present in every v3 profile, v3-metrics, and
@@ -343,8 +635,8 @@ this addition touches the `capture` section only.
 
 ## Completeness and terminal trace
 
-Any truncation, uncovered provider, export status other than `present` or
-`legacy_absent`, count-only tuple, successful tuple with `none` authority,
+Any truncation, uncovered provider, export status other than `present`,
+`legacy_absent` or historical `required_absent`, count-only tuple, successful tuple with `none` authority,
 nonzero descendant gap, nonzero rebuild gap, or nonzero
 `task_uprobe_link_losses` or `abi_refusals` forces
 `evidence.completeness` to `PARTIAL`. The ordinary terminal trace
@@ -363,6 +655,29 @@ trace event lines never contain request/result selection data.
 The v3 profile evidence object and v3-metrics evidence object each have a
 closed exact key set. Unknown fields are rejected. Historical v2-metrics
 documents retain their old closed key set and do not contain the new counter.
+
+## Never-stop gap reasons
+
+`evidence.skipped[]` gains three finite reasons (in addition to the v2 list).
+Each record is `{name: "discovery subject", reason}` with `reason` exactly one
+of:
+
+- `manifest object unavailable`: one `--manifest` object could not be pinned
+  (unreadable, changed during hash, identity-mismatched with no scanned
+  replacement, out-of-segment offset, or over the shared byte budget). Good
+  sibling objects still pin; the capture continues and reads `PARTIAL`.
+- `prearm object unavailable`: one `--prearm-module` path could not be pinned.
+  Good sibling paths still pin; the capture continues and reads `PARTIAL`.
+- `discovery transport unavailable`: one live discovery-ring dequeue failed
+  after a prefix was already pulled. The prefix is applied, the failure is
+  counted here, and the capture continues to the next tick.
+
+Counts are array lengths; no path, PID, or error chain leaves diagnostics.
+
+`evidence.pause_unavailable` (integer, required, default 0) counts `--pause
+always` degrades that collected unpaused instead of aborting. Each forces
+`PARTIAL` via the `pause_unavailable` gap cause; `evidence.pause` reads
+`partial` when either `pause_partial` or `pause_unavailable` is nonzero.
 
 ## Migration
 

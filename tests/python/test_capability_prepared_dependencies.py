@@ -73,7 +73,10 @@ class CapabilityFixture:
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
         subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                         "add", "."], cwd=self.repo, check=True)
-        subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                         "commit", "-qm", "fixture"], cwd=self.repo, check=True)
         self.environment = os.environ.copy()
         self.environment.update({

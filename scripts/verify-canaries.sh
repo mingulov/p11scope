@@ -6,6 +6,52 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+usage() {
+    echo "usage: $0 [--capture-mode full|p0] [--prebuilt-dir ABS_DIR] [--object-pilot] | --capture-mode full|p0 --object-pilot --prepare-object-inputs ABSENT_DIR | --self-test" >&2
+    exit 2
+}
+CAPTURE_MODE=full
+capture_selected=0
+SELF_TEST=0
+PREBUILT_DIR=
+PREPARE_OBJECT_INPUTS=
+OBJECT_PILOT=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --capture-mode)
+            [ "$#" -ge 2 ] && [ "$capture_selected" -eq 0 ] || usage
+            case $2 in full|p0) CAPTURE_MODE=$2 ;; *) usage ;; esac
+            capture_selected=1
+            shift 2
+            ;;
+        --prebuilt-dir)
+            [ "$#" -ge 2 ] && [ -z "$PREBUILT_DIR" ] || usage
+            case $2 in /*) PREBUILT_DIR=$2 ;; *) usage ;; esac
+            shift 2
+            ;;
+        --object-pilot)
+            [ "$OBJECT_PILOT" -eq 0 ] || usage
+            OBJECT_PILOT=1
+            shift
+            ;;
+        --prepare-object-inputs)
+            [ "$#" -ge 2 ] && [ -z "$PREPARE_OBJECT_INPUTS" ] || usage
+            case $2 in /*) PREPARE_OBJECT_INPUTS=$2 ;; *) usage ;; esac
+            shift 2
+            ;;
+        --self-test)
+            [ "$#" -eq 1 ] && [ "$capture_selected" -eq 0 ] \
+                && [ -z "$PREBUILT_DIR" ] && [ -z "$PREPARE_OBJECT_INPUTS" ] && [ "$OBJECT_PILOT" -eq 0 ] || usage
+            SELF_TEST=1
+            shift
+            ;;
+        *) usage ;;
+    esac
+done
+[ -z "$PREPARE_OBJECT_INPUTS" ] || {
+    [ "$OBJECT_PILOT" -eq 1 ] && [ -z "$PREBUILT_DIR" ] && [ "$SELF_TEST" -eq 0 ] || usage
+}
+
 WORK=${P11SCOPE_RECEIPT_WORK-target/canaries}
 if [ "${P11SCOPE_RECEIPT_WORK+set}" = set ]; then
     case $WORK in /*) ;; *) echo "P11SCOPE_RECEIPT_WORK must be absolute" >&2; exit 2 ;; esac
@@ -18,16 +64,23 @@ case $TARGET_BITS in
     *) echo "P11SCOPE_CANARY_TARGET_BITS must be 32 or 64" >&2; exit 2 ;;
 esac
 
+case $CAPTURE_MODE in
+    full) OBJECT_ATTRIBUTES=present ;;
+    p0) OBJECT_ATTRIBUTES=absent ;;
+esac
+
 assert_lanes() {
     case ${1-} in
-        --hostile-starts|--fault-starts)
-            sudo python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS"
+        --hostile-starts|--fault-starts|--object-starts)
+            sudo python3 -I scripts/check-canary-evidence.py \
+                --object-attributes "$OBJECT_ATTRIBUTES" "$@" "$TARGET_BITS"
             ;;
-        *) python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS" ;;
+        *) python3 -I scripts/check-canary-evidence.py \
+               --object-attributes "$OBJECT_ATTRIBUTES" "$@" "$TARGET_BITS" ;;
     esac
 }
 
-if [ "${1-}" = "--self-test" ]; then
+if [ "$SELF_TEST" -eq 1 ]; then
     python3 -I scripts/check-capture-evidence.py --self-test
     assert_lanes --self-test
     python3 -I tests/python/test_canary_evidence.py --target-bits "$TARGET_BITS" -v
@@ -37,7 +90,43 @@ if [ "${1-}" = "--self-test" ]; then
 fi
 
 P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
+case $P11SCOPE_PRODUCT_BUILD_MODE in ordinary|prepared) ;; *) usage ;; esac
 . scripts/product-build.sh
+
+if [ -n "$PREPARE_OBJECT_INPUTS" ]; then
+    python3 -I - "$PREPARE_OBJECT_INPUTS" "${P11SCOPE_RECEIPT_WORK-}" <<'PY' || exit 2
+from pathlib import Path
+import runpy
+import sys
+api = runpy.run_path('scripts/release-matrix-contract.py')
+try:
+    api['validate_canary_destination'](Path(sys.argv[1]), sys.argv[2] or None)
+except (OSError, ValueError) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(2)
+PY
+    CANARY_BUILD_REV=$(git rev-parse HEAD) || exit 2
+    CANARY_BUILD_TREE=$(git rev-parse 'HEAD^{tree}') || exit 2
+    git diff --quiet HEAD -- || { echo 'canary input build requires clean tracked source' >&2; exit 2; }
+fi
+
+if [ -n "$PREBUILT_DIR" ]; then
+    PREBUILT_DIR=$(python3 -I - "$PREBUILT_DIR" "$TARGET_BITS" "$OBJECT_PILOT" \
+        "${P11SCOPE_RECEIPT_WORK-}" "${TMPDIR:-/tmp}" <<'PY'
+from pathlib import Path
+import runpy
+import sys
+try:
+    api = runpy.run_path('scripts/release-matrix-contract.py')
+    inputs = api['validate_canary_payloads'](Path(sys.argv[1]), int(sys.argv[2]),
+        full=sys.argv[3] == '0', work=sys.argv[4] or None, temporary=sys.argv[5])
+except (OSError, ValueError):
+    print('prebuilt canary inputs: missing, untrusted, overlapping or wrong ELF ABI', file=sys.stderr)
+    raise SystemExit(2)
+print(inputs)
+PY
+    ) || exit 2
+fi
 
 . scripts/lib.sh
 require_non_root_caller
@@ -52,9 +141,7 @@ require_non_root_caller
 (umask 077; mkdir -p "$WORK")
 WORK=$(cd "$WORK" && pwd -P)
 
-command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
-command -v clang-18 >/dev/null || { echo "clang-18 required"; exit 1; }
-command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
+[ -n "$PREPARE_OBJECT_INPUTS" ] || command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 WPID=
 WORKLOAD_STARTTIME=
@@ -70,18 +157,60 @@ cleanup() {
 }
 . scripts/cleanup-traps.sh
 
+canary_build_step() {
+    canary_build_role=$1
+    shift
+    "$@" || return "$?"
+    if [ -n "$PREPARE_OBJECT_INPUTS" ]; then
+        python3 -I - "$WORK/canary-build.commands.jsonl" "$canary_build_role" "$@" <<'PY'
+import json
+from pathlib import Path
+import sys
+with Path(sys.argv[1]).open('a') as stream:
+    stream.write(json.dumps({'role': sys.argv[2], 'argv': sys.argv[3:],
+        'cwd': str(Path.cwd()), 'exit': 0}) + '\n')
+PY
+    fi
+}
+[ -z "$PREPARE_OBJECT_INPUTS" ] || rm -f "$WORK/canary-build.commands.jsonl"
+
+P11SCOPE_FEATURE=
+FEATURE_BPF=
+TASK_STORAGE_FIXTURE=
+if [ -n "$PREBUILT_DIR" ]; then
+    P11SCOPE_DEFAULT=$PREBUILT_DIR/p11scope
+    P11SCOPE_FEATURE=$PREBUILT_DIR/p11scope-diagnostic
+    P11SCOPE_DISCOVER=$PREBUILT_DIR/p11scope-discover
+    CANARY_WORKLOAD=$PREBUILT_DIR/canary_workload
+    MATRIX_PROVIDER=$PREBUILT_DIR/matrix-provider.so
+    PRIVACY_PROVIDER=$PREBUILT_DIR/privacy-provider.so
+    TASK_STORAGE_READER=$PREBUILT_DIR/dump-task-storage
+    TASK_STORAGE_OBJECT=$PREBUILT_DIR/dump-task-storage.bpf.o
+    TASK_STORAGE_FIXTURE=$PREBUILT_DIR/task-storage-canary
+    DEFAULT_BPF=$PREBUILT_DIR/default-ebpf
+    FEATURE_BPF=$PREBUILT_DIR/diagnostic-ebpf
+else
+command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
+command -v clang-18 >/dev/null || { echo "clang-18 required"; exit 1; }
 echo "=== build ==="
-rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build"
+rm -rf "$WORK/default-build" "$WORK/helper-build"
+set -- --release --workspace
+[ "$CAPTURE_MODE" != p0 ] || set -- "$@" --features stub-object-attributes
+canary_build_step observer p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+    "$@" --target-dir "$WORK/default-build"
+canary_features=unsafe-unvalidated-metadata
+[ "$CAPTURE_MODE" != p0 ] || canary_features=$canary_features,stub-object-attributes
+if [ "$OBJECT_PILOT" -eq 0 ]; then
+rm -rf "$WORK/feature-build"
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --target-dir "$WORK/default-build"
-p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --features unsafe-unvalidated-metadata \
+    --release --workspace --features "$canary_features" \
     --target-dir "$WORK/feature-build"
-P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
 P11SCOPE_FEATURE="$WORK/feature-build/release/p11scope"
+fi
+P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
 case $TARGET_BITS in
     32)
-        p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+        canary_build_step helper p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
             --release -p p11scope-discover \
             --target i686-unknown-linux-gnu --target-dir "$WORK/helper-build"
         P11SCOPE_DISCOVER="$WORK/helper-build/i686-unknown-linux-gnu/release/p11scope-discover"
@@ -89,23 +218,28 @@ case $TARGET_BITS in
     64) P11SCOPE_DISCOVER="$WORK/default-build/release/p11scope-discover" ;;
 esac
 rm -rf "$WORK/task-storage-reader"
-scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
+canary_build_step reader scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
 TASK_STORAGE_READER=$WORK/task-storage-reader/dump-task-storage
 TASK_STORAGE_OBJECT=$WORK/task-storage-reader/dump-task-storage.bpf.o
 # The seed fixture is x86-64 only and is always built unprivileged, never under sudo.
+if [ "$OBJECT_PILOT" -eq 0 ]; then
 rm -rf "$WORK/task-storage-canary"
 scripts/build-task-storage-canary.sh "$WORK/task-storage-canary"
 TASK_STORAGE_FIXTURE=$WORK/task-storage-canary/task-storage-canary
-sudo -n true 2>/dev/null || { echo "existing sudo authorization required"; exit 1; }
-gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
+fi
+canary_build_step workload gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
-gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
+canary_build_step matrix-provider gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
     -o "$WORK/matrix-provider.so" crates/discover/tests/fixture/version_matrix.c
-gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
+canary_build_step privacy-provider gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
     -o "$WORK/privacy-provider.so" crates/discover/tests/fixture/version_matrix.c
-python3 -I - "$TARGET_BITS" "$WORK/canary_workload" "$WORK/matrix-provider.so" \
-    "$WORK/privacy-provider.so" "$P11SCOPE_DISCOVER" "$P11SCOPE_DEFAULT" \
-    "$P11SCOPE_FEATURE" <<'PY'
+CANARY_WORKLOAD=$WORK/canary_workload
+MATRIX_PROVIDER=$WORK/matrix-provider.so
+PRIVACY_PROVIDER=$WORK/privacy-provider.so
+set -- "$CANARY_WORKLOAD" "$MATRIX_PROVIDER" "$PRIVACY_PROVIDER" "$P11SCOPE_DISCOVER" \
+    "$P11SCOPE_DEFAULT" "$TASK_STORAGE_READER"
+[ "$OBJECT_PILOT" -eq 1 ] || set -- "$@" "$P11SCOPE_FEATURE" "$TASK_STORAGE_FIXTURE"
+python3 -I - "$TARGET_BITS" "$@" <<'PY'
 from pathlib import Path
 import struct
 import sys
@@ -113,31 +247,65 @@ import sys
 bits = int(sys.argv[1])
 expected_target = (1 if bits == 32 else 2, 3 if bits == 32 else 62)
 for path in map(Path, sys.argv[2:6]):
-    header = path.read_bytes()[:20]
+    with path.open('rb') as handle:
+        header = handle.read(20)
+    assert len(header) == 20, path
     actual = (header[4], struct.unpack_from("<H", header, 18)[0])
     assert header[:4] == b"\x7fELF" and header[5] == 1 and actual == expected_target, (
         path, bits, actual
     )
 for path in map(Path, sys.argv[6:]):
-    header = path.read_bytes()[:20]
+    with path.open('rb') as handle:
+        header = handle.read(20)
+    assert len(header) == 20, path
     actual = (header[4], struct.unpack_from("<H", header, 18)[0])
     assert header[:4] == b"\x7fELF" and header[5] == 1 and actual == (2, 62), (path, actual)
 print(f"target/helper ELF{bits} and x86-64 observers: OK")
 PY
+if [ "$OBJECT_PILOT" -eq 0 ]; then
+set -- "$WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "feature BPF object is not unique"; exit 1; }
+FEATURE_BPF=$1
+fi
+set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "default BPF object is not unique"; exit 1; }
+DEFAULT_BPF=$1
+fi
+if [ -n "$PREPARE_OBJECT_INPUTS" ]; then
+    python3 -I - "$PREPARE_OBJECT_INPUTS" "$WORK" "$CAPTURE_MODE" "$TARGET_BITS" \
+        "$P11SCOPE_PRODUCT_BUILD_MODE" "$CANARY_BUILD_REV" "$CANARY_BUILD_TREE" <<'PY'
+from pathlib import Path
+import runpy
+import sys
+api = runpy.run_path('scripts/release-matrix-contract.py')
+try:
+    api['export_canary_inputs'](Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]),
+        sys.argv[5], sys.argv[6], sys.argv[7])
+except (OSError, ValueError, TypeError) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1)
+PY
+    exit 0
+fi
 python3 -I scripts/dump-owned-bpf-maps.py --self-test
 # CGROUP_FILTER is witnessed by the kernel's refusal to look it up, so prove on
 # this kernel that the refusal is still what a cgroup_array answers. A kernel
 # that started returning values would leave every lane green under an oracle
 # that no longer describes it.
+sudo -n true 2>/dev/null || { echo "existing sudo authorization required"; exit 1; }
 sudo python3 -I scripts/dump-owned-bpf-maps.py --refusal-probe
-
-set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
-[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "default BPF object is not unique"; exit 1; }
-DEFAULT_BPF=$1
-set -- "$WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
-[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "feature BPF object is not unique"; exit 1; }
-FEATURE_BPF=$1
+if [ "$OBJECT_PILOT" -eq 1 ]; then
+python3 -I scripts/check-bpf-map-defs.py --inventory default "$DEFAULT_BPF"
+else
 python3 -I scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATURE_BPF"
+fi
+if [ -n "$PREBUILT_DIR" ]; then
+echo "journal object check skipped: prebuilt inputs carry no journal ELF"
+else
+set -- "$WORK"/default-build/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "journal BPF object is not unique"; exit 1; }
+python3 -I scripts/check-bpf-map-defs.py --inventory journal "$1"
+fi
 
 refuse_lane_destinations() {
     for candidate in "$WORK/$1".* "$WORK"/mapdump_*_"$1".json "$WORK"/mapdump_*_"$1".bin; do
@@ -167,7 +335,7 @@ run_lane() {
 
     echo "=== $lane ($build $kind) ==="
     refuse_lane_destinations "$lane"
-    (set -C; exec "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
+    (set -C; exec "$CANARY_WORKLOAD" "$MATRIX_PROVIDER" matrix \
         "$WORK/$lane.ready" "$WORK/$lane.go" "$WORK/$lane.done" "$WORK/$lane.finish" \
         > "$WORK/$lane.workload.log" 2>&1) &
     WPID=$!
@@ -197,6 +365,7 @@ run_lane() {
         *) [ "$kind" = metrics ] && lane_privacy=aggregate-only || lane_privacy=allowlisted ;;
     esac
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$lane" --variant "$lane_variant" --mode "$kind" --privacy "$lane_privacy" \
         --target-bits "$TARGET_BITS" --workload-mode matrix \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
@@ -229,10 +398,11 @@ run_lane() {
 
 echo "=== discover deterministic matrix providers ==="
 "$P11SCOPE_DISCOVER" \
-    --module "$WORK/matrix-provider.so" -o "$WORK/matrix-manifest.json"
+    --module "$MATRIX_PROVIDER" -o "$WORK/matrix-manifest.json"
 "$P11SCOPE_DISCOVER" \
-    --module "$WORK/privacy-provider.so" -o "$WORK/privacy-manifest.json"
+    --module "$PRIVACY_PROVIDER" -o "$WORK/privacy-manifest.json"
 
+if [ "$OBJECT_PILOT" -eq 0 ]; then
 while read -r lane build kind; do
     run_lane "$lane" "$build" "$kind"
 done <<'LANES'
@@ -244,6 +414,7 @@ feature-unsafe-profile feature-unsafe profile
 feature-unsafe-trace feature-unsafe trace
 aggregate-only-metrics default metrics
 LANES
+fi
 
 run_start_lane() {
     start_lane=$1
@@ -262,7 +433,7 @@ run_start_lane() {
             echo "existing START compatibility destination" >&2; exit 1;
         }
     fi
-    (set -C; exec "$WORK/canary_workload" "$WORK/privacy-provider.so" "$start_mode" \
+    (set -C; exec "$CANARY_WORKLOAD" "$PRIVACY_PROVIDER" "$start_mode" \
         "$WORK/$start_lane.ready" "$WORK/$start_lane.go" \
         > "$WORK/$start_lane.workload.log" 2>&1) &
     WPID=$!
@@ -293,6 +464,7 @@ run_start_lane() {
         *) start_variant=diagnostic ;;
     esac
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$start_lane" --variant "$start_variant" --mode profile --privacy "$start_privacy" \
         --target-bits "$TARGET_BITS" --workload-mode "$start_mode" \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
@@ -341,6 +513,7 @@ run_start_lane() {
     fi
 }
 
+if [ "$OBJECT_PILOT" -eq 0 ]; then
 echo "=== live safe START policy: hostile exact-name and mechanism controls ==="
 while read -r lane build; do
     run_start_lane "$lane" "$build" blocked 4 --hostile-starts
@@ -351,6 +524,139 @@ BLOCKED_LANES
 
 echo "=== live diagnostic START policy: distinct template faults ==="
 run_start_lane feature-unsafe-fault feature-unsafe faults 2 --fault-starts
+fi
+
+# H7 slice D object cells: the completion phase drives all 25 named object
+# functions (matrix-shaped barrier, immediate provider) and the blocked
+# phase parks four object workers (blocking provider) for the stopped
+# side-row acquisition; the object oracle replays the independent ledger
+# against 608-byte records, exact offsets and cleanup on both.
+run_object_cell() {
+    object_lane=$1
+    object_blocked_lane=${object_lane}-blocked
+    echo "=== $object_lane (default profile, object completion) ==="
+    refuse_lane_destinations "$object_lane"
+    (set -C; exec "$CANARY_WORKLOAD" "$MATRIX_PROVIDER" object \
+        "$WORK/$object_lane.ready" "$WORK/$object_lane.go" "$WORK/$object_lane.done" "$WORK/$object_lane.finish" \
+        > "$WORK/$object_lane.workload.log" 2>&1) &
+    WPID=$!
+    WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
+        echo "$object_lane workload identity unavailable"
+        exit 1
+    }
+    object_ready_attempt=0
+    while [ ! -f "$WORK/$object_lane.ready" ] && [ "$object_ready_attempt" -lt 160 ]; do
+        kill -0 "$WPID" 2>/dev/null || { echo "$object_lane workload exited before ready"; exit 1; }
+        object_ready_attempt=$((object_ready_attempt + 1))
+        sleep 0.05
+    done
+    test -f "$WORK/$object_lane.ready" || { echo "$object_lane workload never became ready"; exit 1; }
+    object_completed_pid=$WPID
+    sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
+        --lane "$object_lane" --variant default --mode profile --privacy allowlisted \
+        --target-bits "$TARGET_BITS" --workload-mode object \
+        --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
+        --out-dir "$WORK" --prefix "$WORK/$object_lane" \
+        --ready "$WORK/$object_lane.ready" --go "$WORK/$object_lane.go" \
+        --done "$WORK/$object_lane.done" --finish "$WORK/$object_lane.finish" \
+        --observer-log "$WORK/$object_lane.observer.log" --workload-log "$WORK/$object_lane.workload.log" \
+        --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- \
+        "$P11SCOPE_DEFAULT" profile --manifest "$WORK/matrix-manifest.json" --pid "$WPID" \
+        --mode profile --duration 6 -o "$WORK/$object_lane.output"
+    reclaim_root_output "$WORK"/mapdump_*_"$object_lane".json "$WORK"/mapdump_*_"$object_lane".bin \
+        "$WORK/$object_lane".*.raw "$WORK/$object_lane.observer.log"
+    for handshake in "$WORK/$object_lane".go "$WORK/$object_lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
+    if wait "$WPID"; then
+        WPID=
+        WORKLOAD_STARTTIME=
+    else
+        status=$?
+        echo "$object_lane workload failed: $status"
+        exit "$status"
+    fi
+    reclaim_root_output "$WORK/$object_lane.output"
+    python3 -I scripts/check-capture-evidence.py canary "$object_lane" "$WORK/$object_lane.output" \
+        "$TARGET_BITS"
+
+    echo "=== $object_blocked_lane (default profile, blocked object subset) ==="
+    refuse_lane_destinations "$object_blocked_lane"
+    (set -C; exec "$CANARY_WORKLOAD" "$PRIVACY_PROVIDER" object-blocked \
+        "$WORK/$object_blocked_lane.ready" "$WORK/$object_blocked_lane.go" \
+        > "$WORK/$object_blocked_lane.workload.log" 2>&1) &
+    WPID=$!
+    WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
+        echo "$object_blocked_lane workload identity unavailable"
+        exit 1
+    }
+    object_blocked_pid=$WPID
+    object_blocked_ready_attempt=0
+    while [ ! -f "$WORK/$object_blocked_lane.ready" ] && [ "$object_blocked_ready_attempt" -lt 160 ]; do
+        kill -0 "$WPID" 2>/dev/null || {
+            echo "$object_blocked_lane workload exited before complete READY"
+            exit 1
+        }
+        object_blocked_ready_attempt=$((object_blocked_ready_attempt + 1))
+        sleep 0.05
+    done
+    test -f "$WORK/$object_blocked_lane.ready" || {
+        echo "$object_blocked_lane workload never published complete READY"
+        exit 1
+    }
+    sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
+        --lane "$object_blocked_lane" --variant default --mode profile --privacy allowlisted \
+        --target-bits "$TARGET_BITS" --workload-mode object-blocked \
+        --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
+        --out-dir "$WORK" --prefix "$WORK/$object_blocked_lane" \
+        --ready "$WORK/$object_blocked_lane.ready" --go "$WORK/$object_blocked_lane.go" \
+        --done "$WORK/$object_blocked_lane.done" --finish "$WORK/$object_blocked_lane.finish" \
+        --observer-log "$WORK/$object_blocked_lane.observer.log" --workload-log "$WORK/$object_blocked_lane.workload.log" \
+        --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- \
+        "$P11SCOPE_DEFAULT" profile --manifest "$WORK/privacy-manifest.json" --pid "$WPID" \
+        --mode profile --duration 8 -o "$WORK/$object_blocked_lane.output"
+    reclaim_root_output "$WORK"/mapdump_*_"$object_blocked_lane".json "$WORK"/mapdump_*_"$object_blocked_lane".bin \
+        "$WORK/$object_blocked_lane".*.raw "$WORK/$object_blocked_lane.observer.log"
+    for handshake in "$WORK/$object_blocked_lane".go "$WORK/$object_blocked_lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
+    assert_lanes --object-starts "$WORK/mapdump_manifest_$object_lane.json" \
+        "$WORK/mapdump_manifest_$object_blocked_lane.json" \
+        "$WORK/$object_lane.workload.log" "$WORK/$object_blocked_lane.workload.log" \
+        "$object_completed_pid" "$object_blocked_pid"
+    process_matches_starttime "$WPID" "$WORKLOAD_STARTTIME" || {
+        echo "$object_blocked_lane workload exited before object oracle completed"
+        exit 1
+    }
+    signal_verified_process TERM "$WPID" "$WORKLOAD_STARTTIME" || {
+        echo "$object_blocked_lane workload could not be terminated"
+        exit 1
+    }
+    if wait "$WPID"; then
+        object_blocked_status=0
+    else
+        object_blocked_status=$?
+    fi
+    [ "$object_blocked_status" -eq 143 ] || {
+        echo "$object_blocked_lane workload exit status $object_blocked_status, expected SIGTERM status 143"
+        exit 1
+    }
+    WPID=
+    WORKLOAD_STARTTIME=
+    reclaim_root_output "$WORK/$object_blocked_lane.output"
+}
+
+if [ "$TARGET_BITS" = 32 ]; then
+    echo "=== live object cell: H7 slice D finite producer (ia32) ==="
+    run_object_cell object-ia32
+else
+    echo "=== live object cell: H7 slice D finite producer (lp64) ==="
+    run_object_cell object-lp64
+fi
 
 run_owned_lane() {
     owned_lane=$1
@@ -364,9 +670,10 @@ run_owned_lane() {
     refuse_lane_destinations "$owned_lane"
     set -- "$owned_observer" run --manifest "$WORK/matrix-manifest.json" \
         --mode metrics --pause never --duration 35 -o "$WORK/$owned_lane.output" -- \
-        "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
+        "$CANARY_WORKLOAD" "$MATRIX_PROVIDER" matrix \
         "$WORK/$owned_lane.ready" "$WORK/$owned_lane.go" "$WORK/$owned_lane.done" "$WORK/$owned_lane.finish"
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$owned_lane" --variant "$owned_variant" --mode metrics --privacy aggregate-only \
         --target-bits "$TARGET_BITS" --workload-mode matrix --workload-origin owned \
         --out-dir "$WORK" --prefix "$WORK/$owned_lane" \
@@ -385,12 +692,14 @@ run_owned_lane() {
         "$TARGET_BITS"
 }
 
+if [ "$OBJECT_PILOT" -eq 0 ]; then
 while read -r owned_lane owned_build; do
     run_owned_lane "$owned_lane" "$owned_build"
 done <<'OWNED_LANES'
 owned-default-metrics default
 owned-feature-metrics feature
 OWNED_LANES
+fi
 
 run_task_storage_seed_stage() {
     # A private out-dir distinct from the lane work root: no seed artifact may
@@ -419,8 +728,12 @@ run_task_storage_seed_stage() {
     done
 }
 
-run_task_storage_seed_stage
-
-echo "=== assert capture-policy matrix ==="
-assert_lanes "$WORK"
-echo "=== canary matrix: ALL OK ==="
+if [ "$OBJECT_PILOT" -eq 1 ]; then
+    assert_lanes --object-pilot "$WORK"
+    echo "=== object canary pilot: ALL OK (2 cells) ==="
+else
+    run_task_storage_seed_stage
+    echo "=== assert capture-policy matrix ==="
+    assert_lanes "$WORK"
+    echo "=== canary matrix: ALL OK ==="
+fi

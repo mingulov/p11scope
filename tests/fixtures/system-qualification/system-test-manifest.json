@@ -1,7 +1,8 @@
 {
   "schema": "p11scope/system-test-manifest/v1",
-  "ledger_sha256": "7be02ab50d7daf4378c9121848840f4e0a6b39c49043b650f8a9a4fda6b1ecae",
-  "deferred_sha256": "b40d74c471ba102813e7eeb4e44ba3064233b5d83c771cd167067f1b3b623d1b",
+  "ledger_sha256": "cfcb543b6617ea2612762bb5baa89e2815d722c9559b9e89c9fb15b2e1f0d39b",
+  "deferred_sha256": "b4d79c724341bc850542f3777d2cc2ecc3b76b48a7411e7865637de2201e5750",
+  "bounded_scope_sha256": "f33d5e79154056422784cacc6ffd87ba356123f105e3e3ded8ba9a1df1be89a2",
   "subject": null,
   "cells": [
     {
@@ -13,7 +14,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: uretprobe-vs-seccomp fail-open. Existing check: `the_full_verdict_target_matrix_fails_closed` + oracle `exact_terminal_verdict`. Final execution not recorded.",
@@ -34,7 +36,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: completeness always PARTIAL. Existing check: oracle `exact_terminal_verdict`. Final execution not recorded.",
@@ -55,7 +58,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: CI tests stale -p1, ships -p2. Existing check: `tests/python/test_ci_dependency_selection.py`. Final execution not recorded.",
@@ -76,10 +80,11 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
-      "limitation": "source-fixed: no hosted E2E in CI. Existing check: `ci.yml` privileged-e2e job. Final execution not recorded.",
+      "limitation": "source-fixed: manual Ubuntu 26.04 hosted E2E configured. Existing check: `ci.yml` privileged-e2e four-cell count/window job. Final execution not recorded.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},
@@ -160,7 +165,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: untyped evidence constructor. Existing check: NONE-YET. Final execution not recorded.",
@@ -181,7 +187,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: doctor always reads T0. Existing check: `tier_classification_reads_the_row_bpf_checks_actually_emits`. Final execution not recorded.",
@@ -202,7 +209,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: unsafe-decoder build SPOF. Existing check: NONE-YET. Final execution not recorded.",
@@ -223,7 +231,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: shared-stdout O_NONBLOCK leak. Existing check: `stdout_sink_from_a_pipe_leaves_the_shared_description_blocking` (+socket/file). Final execution not recorded.",
@@ -244,7 +253,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: metrics/profile split undocumented. Existing check: oracle lane discriminator. Final execution not recorded.",
@@ -265,7 +275,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: sixth skip reason rejected. Existing check: `tests/python/test_skip_reason_vocabulary.py`. Final execution not recorded.",
@@ -286,7 +297,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: future-minor tables invisible. Existing check: skip-reason vocab test (7 reasons). Final execution not recorded.",
@@ -307,7 +319,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: unnamed live-child handoff. Existing check: oracle `handoff_child_pid` pin. Final execution not recorded.",
@@ -328,7 +341,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "refuted: silent history loss facet. Existing check: NONE-YET. Final execution not recorded.",
@@ -370,7 +384,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: hidden 10M trace cap. Existing check: NONE-YET. Final execution not recorded.",
@@ -433,7 +448,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: inspect --json non-JSON path. Existing check: `soft_diagnosis_failure_with_json_prints_a_failure_document`. Final execution not recorded.",
@@ -538,7 +554,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: pause-auto wedge. Existing check: `operator_stop_delivers_sigterm_to_a_held_child_then_escalates_within_the_bound`. Final execution not recorded.",
@@ -559,7 +576,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: invisible P11SCOPE_* switches. Existing check: oracle `p11scope_env` pin. Final execution not recorded.",
@@ -580,7 +598,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: no advisory scanning. Existing check: `cargo audit` + `cargo deny check` (ci checks-and-e2e). Final execution not recorded.",
@@ -601,7 +620,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: release bytes never built in CI. Existing check: `ci.yml` release-preview job. Final execution not recorded.",
@@ -622,7 +642,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: suite time + flakes. Existing check: `scripts/run-flake-quarantine.sh` (ci quarantine job). Final execution not recorded.",
@@ -643,7 +664,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: docs/help drift. Existing check: `usage_doc_documents_every_cli_flag` + `tests/python/test_help_usage_drift.py`. Final execution not recorded.",
@@ -685,7 +707,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: dual-backend equivalence gate. Existing check: NONE-YET. Final execution not recorded.",
@@ -811,7 +834,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "refuted: function_id per-call hotspot. Existing check: NONE-YET. Final execution not recorded.",
@@ -832,7 +856,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: cfg(test) in prod modules. Existing check: NONE-YET. Final execution not recorded.",
@@ -853,7 +878,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: no coverage measurement. Existing check: `cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83). Final execution not recorded.",
@@ -916,7 +942,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: aya fork, no exit plan. Existing check: NONE-YET. Final execution not recorded.",
@@ -937,7 +964,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: dead Tracker::identify. Existing check: NONE-YET. Final execution not recorded.",
@@ -1021,7 +1049,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: AtomicFile must-use/stat. Existing check: `final_name_is_never_stated_only_renamed_over`. Final execution not recorded.",
@@ -1063,7 +1092,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: schema-doc precision debt. Existing check: `tests/python/test_schema_json.py`. Final execution not recorded.",
@@ -1084,7 +1114,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: unsafe w/o Safety docs. Existing check: NONE-YET. Final execution not recorded.",
@@ -1105,7 +1136,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: no shared lint config. Existing check: NONE-YET. Final execution not recorded.",
@@ -1126,7 +1158,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: mapped-file SIGBUS race. Existing check: NONE-YET. Final execution not recorded.",
@@ -1210,7 +1243,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: SUDO_UID selector semantics. Existing check: NONE-YET. Final execution not recorded.",
@@ -1399,7 +1433,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: doctor render newline split. Existing check: NONE-YET. Final execution not recorded.",
@@ -1420,7 +1455,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: notes sprawl, no runbook. Existing check: NONE-YET. Final execution not recorded.",
@@ -1462,7 +1498,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: BPF diagnostic notes. Existing check: NONE-YET. Final execution not recorded.",
@@ -1483,7 +1520,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: no Python entry point; ignored. Existing check: NONE-YET. Final execution not recorded.",
@@ -1504,7 +1542,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: no script lint in CI. Existing check: `shellcheck -S error scripts/` + `ruff check scripts/ tests/python/`. Final execution not recorded.",
@@ -1546,7 +1585,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "required-open: edition split; re-export nit. Existing check: NONE-YET. Final execution not recorded.",
@@ -1586,7 +1626,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: overlay-collapse uncertainty. Existing check: NONE-YET. Final execution not recorded.",
@@ -1607,7 +1648,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: --system breadth operator-gated. Existing check: NONE-YET. Final execution not recorded.",
@@ -1628,7 +1670,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: no privsep; unsigned BPF obj. Existing check: NONE-YET. Final execution not recorded.",
@@ -1649,7 +1692,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: full view cap blocks explore. Existing check: `e06_unique_provider_reached_within_bounded_frames` + T6/T12 live replay. Final execution not recorded.",
@@ -1670,7 +1714,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: budget rescan retires cover. Existing check: `e07_unchanged_complete_loader_rescan_retires_nothing` + live replay. Final execution not recorded.",
@@ -1691,7 +1736,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: C_GetInterface admission gaps. Existing check: `f_e08_named_gi_heap_matches_list_element` + live replay. Final execution not recorded.",
@@ -1712,7 +1758,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: interface rescans burn life. Existing check: `e09_repeated_interface_rescans_charge_once_but_work_every_time`. Final execution not recorded.",
@@ -1733,7 +1780,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: harness invents collapse cause. Existing check: `tests/python/test_measure_e03.py` (21 tests). Final execution not recorded.",
@@ -1754,7 +1802,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "source-fixed: async cross-process collision. Existing check: `e20_collision_tombstone_lifecycle_matrix` + live E20 same-domain check NOT implemented (open, T9). Final execution not recorded.",
@@ -1775,7 +1824,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "refuted: insecure-defaults x14. Existing check: NONE-YET. Final execution not recorded.",
@@ -1796,7 +1846,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: STRIDE mitigated x4. Existing check: NONE-YET. Final execution not recorded.",
@@ -1817,7 +1868,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "refuted: differential cleared. Existing check: NONE-YET. Final execution not recorded.",
@@ -1838,7 +1890,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "refuted: mutants killed. Existing check: NONE-YET. Final execution not recorded.",
@@ -1859,7 +1912,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: verified-safe notes. Existing check: NONE-YET. Final execution not recorded.",
@@ -1880,7 +1934,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: OASIS grounding gap. Existing check: NONE-YET. Final execution not recorded.",
@@ -2179,7 +2234,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "refuted: function_id hoist. Existing check: NONE-YET. Final execution not recorded.",
@@ -2933,7 +2989,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "regression",
       "limitation": "accepted-boundary: oracle pins 3.2/104 shape (P3). Existing check: NONE-YET. Final execution not recorded.",
@@ -3080,10 +3137,11 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
-      "limitation": "Review input: Keep required. This review moved its own frozen inputs out of TMPDIR. Historical evidence preservation still needs an inventory; the host has `/var/tmp` 30-day cleanup policy. Do not solve it by globally disabling cleanup. Required check: T0/T13: copy only referenced evidence to a durable bundle, checksum/readback, retain raw red results No execution claimed.",
+      "limitation": "Review input: Keep required for product integrity. Current AGENTS supersedes routine agent-work retention bundles; verification-time checksum custody replaces durable bundles. The host keeps its `/var/tmp` 30-day cleanup policy. Do not solve it by globally disabling cleanup. Required check: T0/T13: referenced product evidence checksum/readback validates at verification, raw red results diagnosed loudly, no routine retention bundle No execution claimed.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},
@@ -3164,7 +3222,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Ledger now exists: 147 rows, 90 required-open, six unowned. Old claim of no ledger is retired. Required check: T0: assign six owners and bind required rows to checks; T13 final disposition audit No execution claimed.",
@@ -3185,7 +3244,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Reconcile against current tests/recent full runs; do not inherit every old line-number diagnosis. Recent 100 ms timing flake remains relevant. Required check: Owning lifecycle/engine task + T13: deterministic causal repair, original full-run failure retained, exact affected selector No execution claimed.",
@@ -3248,7 +3308,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Route the recorded BPF/common/spike mismatch to the owner/legal decision. This review makes no legal ruling. Required check: T13: recorded disposition, artifact/source license inventory and matching checks before distribution No execution claimed.",
@@ -3311,7 +3372,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Preserve as input, not fresh proof. No external reviewer launch is needed. Required check: T0/T6/T7: rule each finding against current source; starvation, discovery ring pressure, repeated loader hooks and fork traffic cost No execution claimed.",
@@ -3458,7 +3520,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Revalidate and deduplicate; bind material findings to their changed boundary. Required check: T0 then T3/T5/T6/T13 as applicable: concrete repro/test per accepted finding, no blanket closed state No execution claimed.",
@@ -3479,7 +3542,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Close with evidence or an explicit decision, not another undirected experiment. Required check: T0/T2/T7: hypothesis, smallest discriminating case, cost/result, selected mechanism or rejected option No execution claimed.",
@@ -3500,10 +3564,11 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
-      "limitation": "Review input: Required where it affects reproduction; otherwise maintenance. Required check: T0/T11/T13: archived scripts and manifests, paths resolvable, hashes validated, stale path diagnosed loudly No execution claimed.",
+      "limitation": "Review input: Required where it affects reproduction; otherwise maintenance. Verified work lives in commits per current AGENTS, not in a separate retention bundle. Required check: T0/T11/T13: committed scripts and manifests, paths resolvable, hashes validated, stale path diagnosed loudly No execution claimed.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},
@@ -3521,7 +3586,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Keep actual decisions visible. Publishing, pushing, unrelated cleanup and vendor access are not implied by this audit. Required check: T13: concrete deliverable/decision/dependency; do independent work while unavailable access blocks only its claim No execution claimed.",
@@ -3561,7 +3627,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Speed work is secondary. Coverage percentages do not replace missing semantic/privileged tests. Required check: T13: required body inventory, bounded test runtime diagnostics, retain existing meaningful coverage gate No execution claimed.",
@@ -3832,7 +3899,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Pull boundary-specific properties/fuzz seeds into owning tasks; run bounded campaign again on final parsers. Required check: T3/T5/T8/T9; T12 final campaign No execution claimed.",
@@ -3895,7 +3963,8 @@
       "evidence_level": "artifact",
       "kernel_profile": "ordinary",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "deferred-gate",
       "limitation": "Review input: Reconcile each AR/W8/8c/8d/pin-refresh obligation with current source and an executable or decision gate; do not import obsolete task order. Required check: T0/T13 No execution claimed.",
@@ -4191,7 +4260,8 @@
       "kernel_profile": "current/default",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "capture",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
@@ -4216,7 +4286,8 @@
       "kernel_profile": "current/default",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "capture",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
@@ -4241,7 +4312,8 @@
       "kernel_profile": "current/default",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "capture",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
@@ -4266,12 +4338,39 @@
       "kernel_profile": "current/default",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "capture",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
       "test_ids": [
         "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"
+      ],
+      "command": [],
+      "artifact_hashes": {},
+      "evidence_paths": [],
+      "outcome": "NOT_RUN",
+      "receipt": null,
+      "receipt_sha256": null
+    },
+    {
+      "id": "T7.default.inventory_n6531_lp64",
+      "owner_task": "T7",
+      "requirement_ids": [
+        "R06",
+        "R10"
+      ],
+      "evidence_level": "live-mechanism",
+      "kernel_profile": "current/default",
+      "required_for_claims": [
+        "system-product",
+        "t7-static",
+        "bounded-release"
+      ],
+      "expected_behavior": "capture",
+      "limitation": "Private static mechanism only; no public, growth or performance claim.",
+      "test_ids": [
+        "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64"
       ],
       "command": [],
       "artifact_hashes": {},
@@ -4291,7 +4390,8 @@
       "kernel_profile": "current/default",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "expected-refusal",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
@@ -4316,7 +4416,8 @@
       "kernel_profile": "current/default",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "capture",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
@@ -4341,7 +4442,8 @@
       "kernel_profile": "current/wide",
       "required_for_claims": [
         "system-product",
-        "t7-static"
+        "t7-static",
+        "bounded-release"
       ],
       "expected_behavior": "capture",
       "limitation": "Private static mechanism only; no public, growth or performance claim.",
@@ -4373,7 +4475,8 @@
       "evidence_level": "installed",
       "kernel_profile": "linux-5.15/default",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "installed-contract",
       "limitation": "Install and run final packaging artifact; source-tree binaries are insufficient.",
@@ -4403,7 +4506,8 @@
       "evidence_level": "installed",
       "kernel_profile": "linux-5.15/wide",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "installed-contract",
       "limitation": "Install and run final packaging artifact; source-tree binaries are insufficient.",
@@ -4433,7 +4537,8 @@
       "evidence_level": "installed",
       "kernel_profile": "current/default",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "installed-contract",
       "limitation": "Install and run final packaging artifact; source-tree binaries are insufficient.",
@@ -4463,7 +4568,8 @@
       "evidence_level": "installed",
       "kernel_profile": "current/wide",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "installed-contract",
       "limitation": "Install and run final packaging artifact; source-tree binaries are insufficient.",
@@ -4487,12 +4593,15 @@
       "evidence_level": "soak",
       "kernel_profile": "current/default",
       "required_for_claims": [
-        "system-product"
+        "system-product",
+        "bounded-release"
       ],
       "expected_behavior": "continuous-owned-workload",
       "minimum_duration_s": 1800,
       "limitation": "Actual wall time with independent workload/loss and resource accounting required.",
-      "test_ids": [],
+      "test_ids": [
+        "soak.1800s::continuous-owned-workload"
+      ],
       "command": [],
       "artifact_hashes": {},
       "evidence_paths": [],
@@ -4517,7 +4626,9 @@
       "expected_behavior": "continuous-owned-workload",
       "minimum_duration_s": 14400,
       "limitation": "Actual wall time with independent workload/loss and resource accounting required.",
-      "test_ids": [],
+      "test_ids": [
+        "soak.14400s::continuous-owned-workload"
+      ],
       "command": [],
       "artifact_hashes": {},
       "evidence_paths": [],
@@ -4542,7 +4653,9 @@
       "expected_behavior": "continuous-owned-workload",
       "minimum_duration_s": 86400,
       "limitation": "Actual wall time with independent workload/loss and resource accounting required.",
-      "test_ids": [],
+      "test_ids": [
+        "soak.86400s::continuous-owned-workload"
+      ],
       "command": [],
       "artifact_hashes": {},
       "evidence_paths": [],

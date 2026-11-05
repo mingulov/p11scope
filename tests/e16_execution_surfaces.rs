@@ -36,6 +36,8 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod support;
 
+use support::DieWithParent as _;
+
 const NO_TABLE_MARKER: &str = "no function table was found in its file-backed data";
 const REGISTRY_FACTORIES: [&str; 5] = [
     "C_GetFunctionList",
@@ -298,6 +300,7 @@ impl HeldDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        command.die_with_parent();
         let mut guard = support::ChildGuard::new(command.spawn().unwrap());
         let stdin = guard.child.stdin.take();
         let stderr = guard.child.stderr.take().unwrap();
@@ -427,12 +430,17 @@ impl HeldDriver {
 
 fn args_for(pid: u32, hint: &Path) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: vec![hint.to_path_buf()],
+        exclude_modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,

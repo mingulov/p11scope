@@ -46,19 +46,21 @@
 //! `(st_dev, st_ino)` of mapped provider-candidate ranges — metadata, never
 //! file contents. Paths come only from matched provider mappings.
 
-use crate::discovery::caller_registry::ExeIdentity;
+use crate::discovery::caller_registry::{ColdMint, ExeIdentity};
 use crate::discovery::engine::is_provider_mapping;
 use crate::discovery::identity::{
     ExaminedObject, FileIdentity, MapFilesDir, MappedFile, PinnedObjectId,
 };
 use crate::discovery::proof_stats::{ProofStatPool, RangeStat, stat_batch};
+use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, MAPS_CEILING_REASON, MAPS_ENTRY_CEILING_REASON,
     SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, duplicate_exec_coverage,
 };
 use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, mapped_path};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Why one unselected process mapping a known provider object was not
 /// attributed to it. Counted per category at scope level; the per-pid
@@ -97,10 +99,14 @@ pub(crate) enum AttributionLoss {
     /// `map_files` entry was read (unmapped or remapped during the
     /// confirmation): the proof is impossible this pass, not unprivileged.
     MappingChanged,
+    /// The key needs the kernel proof (overlayfs or an unproven
+    /// filesystem) and its kernel run was unavailable: no userspace
+    /// `(dev, ino)` fallback, never an edge.
+    OverlayKernelUnavailable,
 }
 
 impl AttributionLoss {
-    pub(crate) const ALL: [AttributionLoss; 11] = [
+    pub(crate) const ALL: [AttributionLoss; 12] = [
         Self::GenerationChanged,
         Self::ExecChanged,
         Self::ConfirmUnreadable,
@@ -112,6 +118,7 @@ impl AttributionLoss {
         Self::IdentityMismatch,
         Self::MapFilesUnavailable,
         Self::MappingChanged,
+        Self::OverlayKernelUnavailable,
     ];
 
     /// Stable category label (`scan.attribution_losses` keys).
@@ -128,6 +135,7 @@ impl AttributionLoss {
             Self::IdentityMismatch => "identity_mismatch",
             Self::MapFilesUnavailable => "map_files_unavailable",
             Self::MappingChanged => "mapping_changed",
+            Self::OverlayKernelUnavailable => "overlay_kernel_unavailable",
         }
     }
 }
@@ -199,6 +207,15 @@ pub(crate) struct KnownKeyIndex {
     /// allowlisted filesystem: any range under them is that file, so they
     /// skip the per-range `map_files` stat (DR-C1b-3).
     identity_keys: BTreeSet<ObjectKey>,
+    /// Match keys whose held file sits on overlayfs or an unproven
+    /// filesystem ([`MappedFile::is_overlay_or_unproven`], from the same
+    /// `statfs` the index already reads — no new read): the sweep never
+    /// falls back to userspace identity for them. Never an identity key.
+    overlay_keys: BTreeSet<ObjectKey>,
+    /// Optional per-pass anchor equivalence classes. Only validated anchor
+    /// aliases may be installed by a future proof adapter.
+    match_slots: BTreeMap<ObjectKey, BTreeSet<Slot>>,
+    examined_slots: BTreeMap<ObjectKey, BTreeSet<Slot>>,
 }
 
 impl KnownKeyIndex {
@@ -253,6 +270,9 @@ impl KnownKeyIndex {
                     if mapped.key_is_identity(*key) {
                         index.identity_keys.insert(*key);
                     }
+                    if mapped.is_overlay_or_unproven() {
+                        index.overlay_keys.insert(*key);
+                    }
                     index.by_key.insert(*key, (object, mapped.identity));
                 }
                 // No privilege to read map_files: nothing can be proven.
@@ -303,23 +323,109 @@ impl KnownKeyIndex {
             .collect()
     }
 
+    /// A backend installs only complete, validated per-pass anchor alias
+    /// classes. An empty class clears expectations and fails kernel proof.
+    #[allow(dead_code)] // D3a tests the seam; D3b/D3c install real anchors.
+    pub(crate) fn set_kernel_slots(
+        &mut self,
+        key: ObjectKey,
+        slots: BTreeSet<Slot>,
+    ) -> Result<(), &'static str> {
+        let target = match self.classify(key) {
+            KeyClass::Match(_) => &mut self.match_slots,
+            KeyClass::Examined => &mut self.examined_slots,
+            _ => return Err("the key has no comparable expected object"),
+        };
+        if slots.is_empty() {
+            target.remove(&key);
+        } else {
+            target.insert(key, slots);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_kernel_slots(&mut self) {
+        self.match_slots.clear();
+        self.examined_slots.clear();
+    }
+
     /// Whether any range under `key` is its file without a per-range stat.
     fn key_is_identity(&self, key: ObjectKey) -> bool {
         self.identity_keys.contains(&key)
+    }
+
+    /// Whether `key` needs the kernel proof: overlayfs or an unproven
+    /// filesystem, so userspace identity never proves it.
+    pub(crate) fn is_overlay_key(&self, key: ObjectKey) -> bool {
+        self.overlay_keys.contains(&key)
+    }
+
+    /// The match keys that need the kernel proof, for the ladder's
+    /// no-fallback refusal.
+    pub(crate) fn overlay_keys(&self) -> &BTreeSet<ObjectKey> {
+        &self.overlay_keys
     }
 
     fn match_identity(&self, key: ObjectKey) -> Option<FileIdentity> {
         self.by_key.get(&key).map(|(_, identity)| *identity)
     }
 
+    /// The pinned object and expected identity behind a match key, for the
+    /// sweep witness (which borrows the held file, never a path reopen).
+    pub(crate) fn match_pin(&self, key: ObjectKey) -> Option<(PinnedObjectId, FileIdentity)> {
+        self.by_key.get(&key).copied()
+    }
+
     fn examined_identities(&self, key: ObjectKey) -> Option<&BTreeSet<FileIdentity>> {
         self.examined.get(&key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kernel_slots_for_test(&self, key: ObjectKey) -> Option<&BTreeSet<Slot>> {
+        self.match_slots
+            .get(&key)
+            .or_else(|| self.examined_slots.get(&key))
     }
 }
 
 /// `map_files` identities read for the mapped ranges that needed them,
 /// keyed by `(start, end)`.
-pub(crate) type MappedIdentities = BTreeMap<(u64, u64), Result<FileIdentity, String>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Slot(pub u32);
+
+/// Evidence answers a requested range only; keys, permissions and paths
+/// continue to come from the pinned maps snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // D3a is userspace-only; D3c supplies kernel evidence.
+pub(crate) enum RangeProof {
+    MapFiles(FileIdentity),
+    Kernel(Slot),
+    KernelNone,
+    NotMapped,
+    Unavailable(String),
+    /// The kernel run was unavailable for an overlay key, so the ladder
+    /// refused the userspace proof without reading it: never an edge.
+    /// Distinct from [`RangeProof::Unavailable`] (a read was attempted and
+    /// failed), which keeps its own loss even for overlay keys.
+    OverlayRefused,
+    /// The K1 private witness session proved this overlay range is the
+    /// held file in the kernel (no attach-set exclusions): joins like a
+    /// sweep kernel proof. Only the sweep witness mints this, under its
+    /// per-pass budget; budget exhaustion keeps [`RangeProof::OverlayRefused`].
+    Witnessed,
+}
+
+impl From<Result<FileIdentity, String>> for RangeProof {
+    fn from(result: Result<FileIdentity, String>) -> Self {
+        match result {
+            Ok(identity) => Self::MapFiles(identity),
+            Err(error) if error == RANGE_NOT_MAPPED => Self::NotMapped,
+            Err(error) => Self::Unavailable(error),
+        }
+    }
+}
+
+pub(crate) type MappedIdentities = BTreeMap<(u64, u64), RangeProof>;
 
 /// A confirmation read that held: the generation the pin proved and the
 /// maps snapshot read while it held, between two equal exe reads.
@@ -477,12 +583,16 @@ impl Classified<'_> {
         for (key, group) in std::mem::take(&mut self.examined_pending) {
             let proven = index.key_is_identity(key)
                 || index.examined_identities(key).is_some_and(|files| {
-                    group.iter().all(|entry| {
-                        matches!(
-                            mapped.get(&(entry.start, entry.end)),
-                            Some(Ok(identity)) if files.contains(identity)
-                        )
-                    })
+                    group
+                        .iter()
+                        .all(|entry| match mapped.get(&(entry.start, entry.end)) {
+                            Some(RangeProof::MapFiles(identity)) => files.contains(identity),
+                            Some(RangeProof::Kernel(slot)) => index
+                                .examined_slots
+                                .get(&key)
+                                .is_some_and(|slots| slots.contains(slot)),
+                            _ => false,
+                        })
                 });
             if proven {
                 continue;
@@ -490,7 +600,7 @@ impl Classified<'_> {
             if group.iter().any(|entry| {
                 matches!(
                     mapped.get(&(entry.start, entry.end)),
-                    Some(Err(error)) if error == RANGE_NOT_MAPPED
+                    Some(RangeProof::NotMapped)
                 )
             }) {
                 changed.insert(key);
@@ -507,7 +617,7 @@ impl Classified<'_> {
             group.iter().any(|entry| {
                 matches!(
                     mapped.get(&(entry.start, entry.end)),
-                    Some(Err(error)) if error == RANGE_NOT_MAPPED
+                    Some(RangeProof::NotMapped)
                 )
             })
         })
@@ -530,16 +640,34 @@ fn classify_snapshot<'a>(index: &KnownKeyIndex, entries: &'a [MapEntry]) -> Clas
 }
 
 /// Whether every range of a matched group (its caller ranges: see
-/// [`is_caller_range`]) is the held object's file.
+/// [`is_caller_range`]) is the held object's file. `overlay` marks a key
+/// that needs the kernel proof: agreeing userspace identity still refuses
+/// with the named loss (a stale overlay mapping keeps the fresh upper
+/// `(dev, ino)`), and so does a ladder refusal marker.
 fn prove_match(
     expected: FileIdentity,
+    slots: Option<&BTreeSet<Slot>>,
     group: &[&MapEntry],
     mapped: &MappedIdentities,
+    overlay: bool,
 ) -> Result<(), (AttributionLoss, String)> {
     for entry in group {
         match mapped.get(&(entry.start, entry.end)) {
-            Some(Ok(identity)) if *identity == expected => {}
-            Some(Ok(identity)) => {
+            Some(RangeProof::MapFiles(identity)) if *identity == expected => {
+                if overlay {
+                    return Err((
+                        AttributionLoss::OverlayKernelUnavailable,
+                        format!(
+                            "the range {:x}-{:x} matches the pinned object by userspace \
+                             identity, but the key needs the kernel proof (overlayfs or an \
+                             unproven filesystem): no userspace fallback",
+                            entry.start, entry.end
+                        ),
+                    ));
+                }
+            }
+            Some(RangeProof::Kernel(slot)) if slots.is_some_and(|slots| slots.contains(slot)) => {}
+            Some(RangeProof::MapFiles(identity)) => {
                 return Err((
                     AttributionLoss::IdentityMismatch,
                     format!(
@@ -554,7 +682,7 @@ fn prove_match(
                     ),
                 ));
             }
-            Some(Err(error)) if error == RANGE_NOT_MAPPED => {
+            Some(RangeProof::NotMapped) => {
                 return Err((
                     AttributionLoss::MappingChanged,
                     format!(
@@ -564,7 +692,16 @@ fn prove_match(
                     ),
                 ));
             }
-            Some(Err(error)) => {
+            Some(RangeProof::Kernel(_)) | Some(RangeProof::KernelNone) => {
+                return Err((
+                    AttributionLoss::IdentityMismatch,
+                    format!(
+                        "the range {:x}-{:x} does not prove the held object's anchor",
+                        entry.start, entry.end
+                    ),
+                ));
+            }
+            Some(RangeProof::Unavailable(error)) => {
                 return Err((
                     AttributionLoss::MapFilesUnavailable,
                     format!(
@@ -573,6 +710,19 @@ fn prove_match(
                     ),
                 ));
             }
+            Some(RangeProof::OverlayRefused) => {
+                return Err((
+                    AttributionLoss::OverlayKernelUnavailable,
+                    format!(
+                        "the range {:x}-{:x} needs the kernel proof (overlayfs or an \
+                         unproven filesystem) and no kernel proof covered it",
+                        entry.start, entry.end
+                    ),
+                ));
+            }
+            // The private witness session proved this range is the held
+            // file in the kernel: joins like a sweep kernel proof.
+            Some(RangeProof::Witnessed) => {}
             None => {
                 return Err((
                     AttributionLoss::MapFilesUnavailable,
@@ -609,6 +759,9 @@ pub(crate) fn attribute_unselected(
     let mut out = SweepAttribution::default();
     let prove = index.map_files_keys();
     for (pid, phase_one) in sweep {
+        if budget.has_collection_work() && !budget.poll_collection(2) {
+            break;
+        }
         attribute_one(
             &mut out,
             *pid,
@@ -641,6 +794,9 @@ pub(crate) fn attribute_one(
     probe: &mut dyn MemberProbe,
     budget: &mut CaptureWorkBudget,
 ) {
+    if budget.has_collection_work() && !budget.poll_collection(phase_one.len() as u64 + 1) {
+        return;
+    }
     if selected.contains(&pid) {
         return;
     }
@@ -740,7 +896,13 @@ pub(crate) fn attribute_one(
     for (key, object, group) in &confirmed.matches {
         let proven = match index.match_identity(*key) {
             Some(_) if index.key_is_identity(*key) => Ok(()),
-            Some(expected) => prove_match(expected, group, &read.mapped),
+            Some(expected) => prove_match(
+                expected,
+                index.match_slots.get(key),
+                group,
+                &read.mapped,
+                index.is_overlay_key(*key),
+            ),
             None => Err((
                 AttributionLoss::KeyRejected,
                 "the key lost its proof".into(),
@@ -787,6 +949,49 @@ pub(crate) fn attribute_one(
         objects,
         unexamined: confirmed.unexamined.len(),
     });
+}
+
+/// The first snapshot decides preparation only; fresh confirmation maps
+/// remain the sole source of a matched caller's facts.
+pub(crate) enum PreparationKind {
+    Settled,
+    Idle(Vec<(u64, u64)>),
+    Confirm,
+}
+
+pub(crate) fn preparation_kind(
+    pid: u32,
+    phase_one: &[MapEntry],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+) -> PreparationKind {
+    if selected.contains(&pid) || unavailable.contains(&pid) {
+        return PreparationKind::Settled;
+    }
+    let first = classify_snapshot(index, phase_one);
+    if first
+        .matches
+        .iter()
+        .any(|(_, _, group)| usable_path(group).is_ok())
+    {
+        PreparationKind::Confirm
+    } else {
+        let ranges = first.pending_ranges(index);
+        if ranges.is_empty() {
+            PreparationKind::Settled
+        } else {
+            PreparationKind::Idle(ranges)
+        }
+    }
+}
+
+pub(crate) fn idle_needs_promotion(
+    index: &KnownKeyIndex,
+    phase_one: &[MapEntry],
+    mapped: &MappedIdentities,
+) -> bool {
+    classify_snapshot(index, phase_one).pending_changed(mapped)
 }
 
 /// Recheck every matched object once, after every confirmation read: a
@@ -925,10 +1130,435 @@ pub(crate) fn budget_refusal(reason: &str) -> bool {
     .contains(&reason)
 }
 
+/// Conservative FD allowance for one collection's attribution stage. The
+/// boundaries depend on this policy, never on actual executor concurrency.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentPolicy {
+    pub headroom: usize,
+    pub workers: usize,
+    pub retained: usize,
+    pub max_ranges: usize,
+}
+
+const FD_RESERVE: usize = 64;
+const IMMEDIATE_FDS: usize = 3;
+pub(crate) const FD_RESOURCE_REASON: &str = "confirmation file-descriptor headroom is unavailable";
+pub(crate) const FD_CENSUS_REASON: &str = "identity file-descriptor census is unavailable";
+const FD_CENSUS_ENTRIES: usize = 65_536;
+
+#[cfg(test)]
+thread_local! {
+    static CENSUS_CALLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_censuses_for_test<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CENSUS_CALLS.set(self.0);
+        }
+    }
+    let restore = Restore(CENSUS_CALLS.replace(Some(0)));
+    let result = body();
+    let count = CENSUS_CALLS.get().expect("census counter is scoped");
+    drop(restore);
+    (result, count)
+}
+
+#[cfg(test)]
+fn record_census_for_test() {
+    CENSUS_CALLS.set(CENSUS_CALLS.get().map(|count| count + 1));
+}
+
+/// A partial count never becomes an allowance. `within` also represents a
+/// unavailable clock or expired enclosing budget in injected callers.
+fn census_allowance<E>(
+    soft: usize,
+    mut entries: impl Iterator<Item = Result<(), E>>,
+    max_entries: usize,
+    mut within: impl FnMut() -> bool,
+) -> Result<usize, String> {
+    let mut count = 0usize;
+    while count < max_entries {
+        if !within() {
+            return Err(FD_CENSUS_REASON.into());
+        }
+        let entry = entries.next();
+        if !within() {
+            return Err(FD_CENSUS_REASON.into());
+        }
+        match entry {
+            None => {
+                drop(entries);
+                let open = count
+                    .checked_sub(1)
+                    .ok_or_else(|| FD_CENSUS_REASON.to_string())?;
+                return Ok(soft.saturating_sub(open).saturating_sub(FD_RESERVE));
+            }
+            Some(Err(_)) => return Err(FD_CENSUS_REASON.into()),
+            Some(Ok(())) => count += 1,
+        }
+    }
+    Err(FD_CENSUS_REASON.into())
+}
+
+impl SegmentPolicy {
+    /// Strict opt-in census, bounded cooperatively by time and entry count.
+    /// All current FDs, including an offered File, count here. The directory
+    /// closes before returning; only its own one descriptor is removed.
+    pub(crate) fn try_snapshot(max_workers: usize, candidates: usize) -> Result<Self, String> {
+        #[cfg(test)]
+        record_census_for_test();
+        let started = std::time::Instant::now();
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit initializes the writable limit on success.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return Err(FD_CENSUS_REASON.into());
+        }
+        // SAFETY: the successful getrlimit initialized limit.
+        let soft = usize::try_from(unsafe { limit.assume_init() }.rlim_cur)
+            .map_err(|_| FD_CENSUS_REASON.to_string())?;
+        let census =
+            std::fs::read_dir("/proc/self/fd").map_err(|_| FD_CENSUS_REASON.to_string())?;
+        let headroom = census_allowance(
+            soft,
+            census.map(|entry| entry.map(|_| ())),
+            FD_CENSUS_ENTRIES,
+            || {
+                std::time::Instant::now()
+                    .checked_duration_since(started)
+                    .is_some_and(|elapsed| elapsed <= std::time::Duration::from_millis(10))
+            },
+        )?;
+        Ok(Self::from_headroom(headroom, max_workers, candidates))
+    }
+
+    pub(crate) fn from_headroom(headroom: usize, max_workers: usize, candidates: usize) -> Self {
+        let workers = (headroom.saturating_sub(IMMEDIATE_FDS) / 3)
+            .min(max_workers.min(crate::discovery::sweep_shards::MAX_SHARD_THREADS))
+            .min(candidates);
+        let retained = if workers == 0 {
+            0
+        } else {
+            headroom
+                .saturating_sub(IMMEDIATE_FDS + 2 * workers)
+                .min(candidates)
+        };
+        Self {
+            headroom,
+            workers,
+            retained,
+            max_ranges: crate::discovery::scan::MapsReadLimits::LIVE.max_entries,
+        }
+    }
+
+    /// Census is taken at the quiescent attribution boundary. The census
+    /// directory counts itself; it is closed before that one FD is removed.
+    pub(crate) fn snapshot(max_workers: usize, candidates: usize) -> Self {
+        #[cfg(test)]
+        record_census_for_test();
+        fn allowance() -> Option<usize> {
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            // SAFETY: getrlimit initializes the writable limit on success.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: the successful getrlimit above initialized limit.
+            let soft = usize::try_from(unsafe { limit.assume_init() }.rlim_cur).ok()?;
+            let mut census = std::fs::read_dir("/proc/self/fd").ok()?;
+            let mut count = 0usize;
+            for entry in census.by_ref() {
+                entry.ok()?;
+                count = count.checked_add(1)?;
+            }
+            drop(census);
+            let open = count.checked_sub(1)?;
+            Some(
+                soft.checked_sub(open)
+                    .and_then(|left| left.checked_sub(FD_RESERVE))
+                    .unwrap_or(0),
+            )
+        }
+        match allowance() {
+            Some(headroom) => Self::from_headroom(headroom, max_workers, candidates),
+            // An unknown census authorizes one bounded immediate operation,
+            // whose real open failures remain fail-closed. Never a batch.
+            None => Self::from_headroom(IMMEDIATE_FDS, 0, candidates),
+        }
+    }
+
+    fn reserved(self) -> usize {
+        usize::from(self.headroom >= IMMEDIATE_FDS) * IMMEDIATE_FDS
+            + self.retained
+            + 2 * self.workers
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LeaseClass {
+    Retained,
+    Worker,
+    ImmediatePin,
+    ImmediateIo,
+}
+
+#[derive(Debug, Default)]
+struct ReservationState {
+    policy: SegmentPolicy,
+    used: [usize; 4],
+    peak: [usize; 4],
+    peak_total: usize,
+    examined: usize,
+    peak_examined: usize,
+    examined_limit: usize,
+    census_complete: bool,
+    peak_allowance: usize,
+}
+
+/// All speculative pins, accepted pins, rereads and phase-D operations use
+/// this same physical owner; work-budget shadows never clone its allowance.
+#[derive(Clone)]
+pub(crate) struct ReservationOwner {
+    state: Arc<Mutex<ReservationState>>,
+}
+
+impl ReservationOwner {
+    pub(crate) fn new(policy: SegmentPolicy) -> Self {
+        assert!(policy.reserved() <= policy.headroom);
+        Self {
+            state: Arc::new(Mutex::new(ReservationState {
+                policy,
+                peak_allowance: policy.reserved(),
+                ..ReservationState::default()
+            })),
+        }
+    }
+
+    /// The deep-scan phase reserves custody without starting confirmation
+    /// workers. Its immediate envelope remains available for scan I/O.
+    pub(crate) fn for_examined(policy: SegmentPolicy, cap: usize) -> Self {
+        assert_eq!((policy.workers, policy.retained), (0, 0));
+        let owner = Self::new(policy);
+        let mut state = owner.state.lock().unwrap();
+        state.examined_limit = cap.min(policy.headroom.saturating_sub(policy.reserved()));
+        state.peak_allowance = policy.reserved() + state.examined_limit;
+        drop(state);
+        owner
+    }
+
+    pub(crate) fn examined_capacity(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        if state.census_complete {
+            0
+        } else {
+            state.examined_limit
+        }
+    }
+
+    pub(crate) fn examined(&self) -> Result<FdLease, String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.census_complete || state.examined >= state.examined_limit {
+            return Err(FD_RESOURCE_REASON.into());
+        }
+        state.examined += 1;
+        state.peak_examined = state.peak_examined.max(state.examined);
+        state.peak_total = state
+            .peak_total
+            .max(state.examined + state.used.iter().sum::<usize>());
+        drop(state);
+        Ok(FdLease {
+            owner: self.clone(),
+            cell: 4,
+            count: 1,
+            immediate_io: false,
+        })
+    }
+
+    /// The new census already counts all live custody, admitted and session
+    /// FDs. Only additional confirmation handles spend its new allowance.
+    /// No active worker/pin may cross this phase boundary.
+    pub(crate) fn reconcile(&self, policy: SegmentPolicy) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.census_complete || state.used != [0; 4] || policy.reserved() > policy.headroom {
+            return Err("identity FD census requires a quiescent collection boundary".into());
+        }
+        let allowance = policy
+            .reserved()
+            .checked_add(state.examined)
+            .ok_or_else(|| FD_RESOURCE_REASON.to_string())?;
+        state.policy = policy;
+        state.census_complete = true;
+        state.peak_allowance = state.peak_allowance.max(allowance);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn examined_for_test(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.examined, state.peak_examined)
+    }
+
+    fn reserve(&self, class: LeaseClass, count: usize) -> Result<FdLease, String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let policy = state.policy;
+        let (cell, limit) = match class {
+            LeaseClass::Retained => (0, policy.retained),
+            LeaseClass::Worker => (1, 2 * policy.workers),
+            LeaseClass::ImmediatePin => (2, usize::from(policy.headroom >= IMMEDIATE_FDS)),
+            LeaseClass::ImmediateIo => (3, usize::from(policy.headroom >= IMMEDIATE_FDS) * 2),
+        };
+        let next = state.used[cell]
+            .checked_add(count)
+            .filter(|next| *next <= limit)
+            .ok_or_else(|| FD_RESOURCE_REASON.to_string())?;
+        state.used[cell] = next;
+        state.peak[cell] = state.peak[cell].max(next);
+        let total = state.examined + state.used.iter().sum::<usize>();
+        state.peak_total = state.peak_total.max(total);
+        let custody = if state.census_complete {
+            state.examined
+        } else {
+            state.examined_limit
+        };
+        assert!(total <= policy.reserved() + custody);
+        drop(state);
+        Ok(FdLease {
+            owner: self.clone(),
+            cell,
+            count,
+            immediate_io: matches!(class, LeaseClass::ImmediateIo),
+        })
+    }
+
+    pub(crate) fn batch(&self) -> IoResources {
+        IoResources {
+            owner: self.clone(),
+            immediate: false,
+        }
+    }
+    pub(crate) fn immediate(&self) -> IoResources {
+        IoResources {
+            owner: self.clone(),
+            immediate: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> ([usize; 4], [usize; 4], usize, usize) {
+        let state = self.state.lock().unwrap();
+        (
+            state.used,
+            state.peak,
+            state.peak_total,
+            state.peak_allowance,
+        )
+    }
+}
+
+/// A lease has no handle itself. Its actual owner drops the handle first.
+pub(crate) struct FdLease {
+    owner: ReservationOwner,
+    cell: usize,
+    count: usize,
+    immediate_io: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProofPools<'p> {
+    pub batch: Option<&'p ProofStatPool>,
+    pub immediate: Option<&'p ProofStatPool>,
+}
+
+impl<'p> ProofPools<'p> {
+    fn for_lease(self, lease: Option<&FdLease>) -> Option<&'p ProofStatPool> {
+        if lease.is_some_and(|lease| lease.immediate_io) {
+            self.immediate
+        } else {
+            self.batch
+        }
+    }
+}
+
+impl Drop for FdLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cell = if self.cell == 4 {
+            &mut state.examined
+        } else {
+            &mut state.used[self.cell]
+        };
+        *cell = cell
+            .checked_sub(self.count)
+            .expect("a physical lease is returned once");
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IoResources {
+    owner: ReservationOwner,
+    immediate: bool,
+}
+
+impl IoResources {
+    pub(crate) fn same_owner(&self, owner: &ReservationOwner) -> bool {
+        Arc::ptr_eq(&self.owner.state, &owner.state)
+    }
+    pub(crate) fn pin(&self) -> Result<FdLease, String> {
+        self.owner.reserve(
+            if self.immediate {
+                LeaseClass::ImmediatePin
+            } else {
+                LeaseClass::Retained
+            },
+            1,
+        )
+    }
+    pub(crate) fn transient(&self) -> Result<FdLease, String> {
+        self.owner.reserve(
+            if self.immediate {
+                LeaseClass::ImmediateIo
+            } else {
+                LeaseClass::Worker
+            },
+            2,
+        )
+    }
+}
+
+/// Declaration order closes the real pin before its reservation returns.
+pub(crate) struct ReservedPin<P> {
+    pub pin: P,
+    pub _lease: Option<FdLease>,
+}
+
+/// An owned preparation has no references into its maps vector. It can move
+/// between workers and the caller while retaining the original live pin.
+pub(crate) struct PreparedConfirmation<P> {
+    pub pin: ReservedPin<P>,
+    pub before: ExeIdentity,
+    pub entries: Vec<MapEntry>,
+    pub ranges: Vec<(u64, u64)>,
+    /// The validated survivor for a zombie-leader confirm, minted by
+    /// `mint_member` and moved here after the reads. Scoped to this one
+    /// confirm phase: the finish consumes it, so it always drops before
+    /// any census boundary.
+    pub member: Option<RetainedGroupMember>,
+}
+
 /// The OS operations one confirmation needs, behind a seam so the
 /// decision order is unit-testable.
 pub(crate) trait ConfirmIo {
     type Pin;
+    /// Borrow the original retained pin for a per-PID iterator. A missing
+    /// pidfd requires userspace; never reopen one from a numeric PID.
+    fn borrowed_pidfd<'a>(&self, _pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        None
+    }
     /// The `map_files` identity of `[start, end)` in `pid`; `Err` equal to
     /// [`RANGE_NOT_MAPPED`] when no mapping (or no process) is there now.
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String>;
@@ -944,23 +1574,88 @@ pub(crate) trait ConfirmIo {
             .map(|&(start, end)| self.mapped_file(pid, start, end))
             .collect()
     }
+    fn mapped_files_reserved(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        lease: Option<FdLease>,
+    ) -> Vec<Result<FileIdentity, String>> {
+        let results = self.mapped_files(pid, ranges);
+        drop(lease);
+        results
+    }
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String>;
     fn start_time(&self, pin: &Self::Pin) -> Option<u64>;
     fn still_the_same(&self, pin: &Self::Pin) -> bool;
     fn exe(&self, pid: u32) -> Option<ExeIdentity>;
     fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String>;
     fn gone(&self, pid: u32) -> bool;
+    /// Mint (and stash) the validated group member for a zombie-leader
+    /// confirm, so reads route to the live survivor. Called once per
+    /// prepare, right after `open`, with the confirm pin the member's
+    /// original must derive from (never a fresh numeric reopen); `Ok`
+    /// with no stash means the ordinary path (a live leader, no lone
+    /// survivor, or any custody refusal — a zombie then stays exited).
+    /// `Err` only when the proof could not be attempted (spent budget
+    /// or deadline), which the caller reports as the loss instead of
+    /// an exit.
+    fn mint_member(
+        &mut self,
+        _pid: u32,
+        _pin: &Self::Pin,
+        _budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        Ok(())
+    }
+    /// Move the stashed member into the preparation. Called once per
+    /// prepare, after the reads it served.
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        None
+    }
+    /// Return a taken member to the stash for range proofs. The
+    /// preparation takes the member for the finish, but userspace range
+    /// proofs route via the stash: the driver returns it before the
+    /// reads and takes it back before the finish. The default drops
+    /// (IOs without a stash); live confirms carry `None` either way.
+    fn return_member(&mut self, _pid: u32, _member: Option<RetainedGroupMember>) {
+        drop(_member);
+    }
 }
 
 /// The proof reads of `ranges` keyed by range. A range whose result is
 /// missing (never expected) is left out, which every consumer reads as
 /// unproven: fail closed.
-fn read_ranges<Io: ConfirmIo>(io: &mut Io, pid: u32, ranges: &[(u64, u64)]) -> MappedIdentities {
+pub(crate) fn read_ranges_reserved<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    ranges: &[(u64, u64)],
+    resources: Option<&IoResources>,
+) -> MappedIdentities {
+    if ranges.is_empty() {
+        return MappedIdentities::new();
+    }
+    let lease = match resources.map(IoResources::transient).transpose() {
+        Ok(lease) => lease,
+        Err(error) => {
+            return ranges
+                .iter()
+                .map(|&range| (range, RangeProof::Unavailable(error.clone())))
+                .collect();
+        }
+    };
     ranges
         .iter()
         .copied()
-        .zip(io.mapped_files(pid, ranges))
+        .zip(
+            io.mapped_files_reserved(pid, ranges, lease)
+                .into_iter()
+                .map(RangeProof::from),
+        )
         .collect()
+}
+
+fn read_ranges<Io: ConfirmIo>(io: &mut Io, pid: u32, ranges: &[(u64, u64)]) -> MappedIdentities {
+    read_ranges_reserved(io, pid, ranges, None)
 }
 
 /// The unpinned proof reads of `ranges` (each once): charged in order
@@ -972,6 +1667,22 @@ pub(crate) fn stat_unpinned<Io: ConfirmIo>(
     ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
 ) -> MappedIdentities {
+    if budget.has_collection_work() {
+        let mut answers = MappedIdentities::new();
+        for &range in ranges {
+            if answers.contains_key(&range) {
+                continue;
+            }
+            if budget.spend(1).is_err() {
+                break;
+            }
+            answers.insert(
+                range,
+                RangeProof::from(io.mapped_file(pid, range.0, range.1)),
+            );
+        }
+        return answers;
+    }
     let mut charged = Vec::new();
     let mut seen = BTreeSet::new();
     for &range in ranges {
@@ -986,62 +1697,172 @@ pub(crate) fn stat_unpinned<Io: ConfirmIo>(
     read_ranges(io, pid, &charged)
 }
 
+/// The opt-in adapter's idle fallback charges once and closes proof-directory
+/// custody under the same owner. The default userspace function is unchanged.
+pub(crate) fn stat_unpinned_reserved<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    ranges: &[(u64, u64)],
+    budget: &mut CaptureWorkBudget,
+    resources: &IoResources,
+) -> MappedIdentities {
+    let mut charged = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut answers = MappedIdentities::new();
+    for &range in ranges {
+        if !seen.insert(range) {
+            continue;
+        }
+        if budget.spend(1).is_err() {
+            break;
+        }
+        if budget.has_collection_work() {
+            answers.extend(read_ranges_reserved(io, pid, &[range], Some(resources)));
+        } else {
+            charged.push(range);
+        }
+    }
+    if !budget.has_collection_work() {
+        answers = read_ranges_reserved(io, pid, &charged, Some(resources));
+    }
+    answers
+}
+
 /// One confirmation: pin, exe, maps re-read, exe again, then the pin must
 /// still hold and both exe reads agree. Only then does the snapshot count.
-pub(crate) fn confirm_with<Io: ConfirmIo>(
+pub(crate) fn lost_with<Io: ConfirmIo>(
+    io: &Io,
+    pid: u32,
+    loss: AttributionLoss,
+    detail: String,
+) -> Confirmation {
+    if io.gone(pid) {
+        Confirmation::Exited
+    } else {
+        Confirmation::Lost(loss, detail)
+    }
+}
+
+fn stopped_confirmation() -> Confirmation {
+    Confirmation::Lost(
+        AttributionLoss::Budget,
+        "cgroup confirmation stopped or shared work allowance exhausted".into(),
+    )
+}
+
+pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
     prove: &BTreeSet<ObjectKey>,
     budget: &mut CaptureWorkBudget,
-) -> Confirmation {
-    let lost = |io: &Io, loss: AttributionLoss, detail: String| {
-        if io.gone(pid) {
-            Confirmation::Exited
-        } else {
-            Confirmation::Lost(loss, detail)
-        }
-    };
-    let pin = match io.open(pid) {
-        Ok(pin) => pin,
-        Err(error) => return lost(io, AttributionLoss::ConfirmUnreadable, error),
-    };
-    let Some(before) = io.exe(pid) else {
-        return lost(
+    resources: Option<&IoResources>,
+) -> Result<PreparedConfirmation<Io::Pin>, Confirmation> {
+    let controlled = budget.has_collection_work();
+    if controlled && !budget.poll_collection(1) {
+        return Err(stopped_confirmation());
+    }
+    let transient = resources
+        .map(IoResources::transient)
+        .transpose()
+        .map_err(|error| Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error))?;
+    let lease = resources
+        .map(IoResources::pin)
+        .transpose()
+        .map_err(|error| Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error))?;
+    let pin = io
+        .open(pid)
+        .map(|pin| ReservedPin { pin, _lease: lease })
+        .map_err(|error| lost_with(io, pid, AttributionLoss::ConfirmUnreadable, error))?;
+    if controlled && !budget.poll_collection(1) {
+        return Err(stopped_confirmation());
+    }
+    // The open phase routes zombie leaders to member custody before any
+    // read: exe, maps and map_files then serve the live survivor. The
+    // mint derives its original from this confirm pin, never by number.
+    io.mint_member(pid, &pin.pin, budget)?;
+    let before = io.exe(pid).ok_or_else(|| {
+        lost_with(
             io,
+            pid,
             AttributionLoss::ConfirmUnreadable,
             "the exe identity could not be read".into(),
-        );
-    };
-    let entries = match io.maps(pid, budget) {
-        Ok(entries) => entries,
-        Err(reason) if budget_refusal(&reason) => {
-            return Confirmation::Lost(AttributionLoss::Budget, reason);
+        )
+    })?;
+    if controlled && !budget.poll_collection(1) {
+        return Err(stopped_confirmation());
+    }
+    let read = io.maps(pid, budget);
+    let entries = read.map_err(|reason| {
+        if budget_refusal(&reason) {
+            Confirmation::Lost(AttributionLoss::Budget, reason)
+        } else {
+            lost_with(io, pid, AttributionLoss::ConfirmUnreadable, reason)
         }
-        Err(reason) => return lost(io, AttributionLoss::ConfirmUnreadable, reason),
-    };
-    // The map_files proof is read while the pin holds; `still_the_same`
-    // below proves it was this generation's mapping.
-    // Every range is charged first, in order, exactly as one read at a
-    // time would charge it; only then are the charged ranges read (on the
-    // proof-stat pool when there is one), so a ceiling stops at the same
-    // range and never yields a partial proof.
+    })?;
+    if controlled && !budget.poll_collection(entries.len() as u64 + 1) {
+        return Err(stopped_confirmation());
+    }
     let ranges = proof_ranges(&entries, prove);
-    for _ in &ranges {
-        if let Err(reason) = budget.spend(1) {
-            return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
+    // The scoped collector deliberately uses its immediate serial adapter:
+    // spend its shared allowance at each proof read, so a returning read can
+    // stop the suffix. Ordinary segments charge their full request set here.
+    if !controlled {
+        for _ in &ranges {
+            budget
+                .spend(1)
+                .map_err(|reason| Confirmation::Lost(AttributionLoss::Budget, reason.into()))?;
         }
     }
-    let mapped = read_ranges(io, pid, &ranges);
-    let after = io.exe(pid);
-    if !io.still_the_same(&pin) {
-        return lost(
+    drop(transient);
+    Ok(PreparedConfirmation {
+        pin,
+        before,
+        entries,
+        ranges,
+        member: io.take_member(),
+    })
+}
+
+/// Live final checks consume the original pin only after all segment proofs.
+pub(crate) fn finish_confirmation<Io: ConfirmIo>(
+    io: &Io,
+    pid: u32,
+    prepared: PreparedConfirmation<Io::Pin>,
+    mapped: MappedIdentities,
+    resources: Option<&IoResources>,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    let controlled = budget.has_collection_work();
+    if controlled && !budget.poll_collection(1) {
+        return stopped_confirmation();
+    }
+    let _transient = match resources.map(IoResources::transient).transpose() {
+        Ok(lease) => lease,
+        Err(error) => return Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error),
+    };
+    // The member exe re-read serves zombie leaders, whose own exe link
+    // is unreadable; live confirms see the ordinary read unchanged. A
+    // carried member is the ONLY exe authority: when its re-proof
+    // refuses (a same-binary nonleader exec released the survivor TID
+    // while the TGID exe serves the same binary), falling back to the
+    // TGID exe would confirm on pre-exec proofs.
+    let after = match prepared.member.as_ref() {
+        Some(member) => member.read_exe_identity(),
+        None => io.exe(pid),
+    };
+    if controlled && !budget.poll_collection(1) {
+        return stopped_confirmation();
+    }
+    if !io.still_the_same(&prepared.pin.pin) {
+        return lost_with(
             io,
+            pid,
             AttributionLoss::GenerationChanged,
             "the process generation changed during the confirmation read".into(),
         );
     }
     match after {
-        Some(after) if after == before => {}
+        Some(after) if after == prepared.before => {}
         Some(_) => {
             return Confirmation::Lost(
                 AttributionLoss::ExecChanged,
@@ -1049,14 +1870,18 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
             );
         }
         None => {
-            return lost(
+            return lost_with(
                 io,
+                pid,
                 AttributionLoss::ConfirmUnreadable,
                 "the exe identity could not be re-read".into(),
             );
         }
     }
-    let Some(start_time) = io.start_time(&pin) else {
+    if controlled && !budget.poll_collection(1) {
+        return stopped_confirmation();
+    }
+    let Some(start_time) = io.start_time(&prepared.pin.pin) else {
         return Confirmation::Lost(
             AttributionLoss::ConfirmUnreadable,
             "the start time is unreadable; the generation cannot be joined".into(),
@@ -1064,10 +1889,52 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
     };
     Confirmation::Confirmed(ConfirmedRead {
         start_time,
-        exe: before,
-        entries,
+        exe: prepared.before,
+        entries: prepared.entries,
         mapped,
     })
+}
+
+pub(crate) fn confirm_with_resources<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    prove: &BTreeSet<ObjectKey>,
+    budget: &mut CaptureWorkBudget,
+    resources: Option<&IoResources>,
+) -> Confirmation {
+    let mut prepared = match prepare_confirmation(io, pid, prove, budget, resources) {
+        Ok(prepared) => prepared,
+        Err(confirmation) => return confirmation,
+    };
+    // The preparation took the member for the finish, but range proofs
+    // route via the IO stash: return it for the reads, take it back for
+    // the finish. Live confirms carry `None`, so this is a no-op there.
+    io.return_member(pid, prepared.member.take());
+    let mapped = if budget.has_collection_work() {
+        let mut mapped = MappedIdentities::new();
+        for &range in &prepared.ranges {
+            if let Err(reason) = budget.spend(1) {
+                // The member stays stashed in the IO and drops with it;
+                // the next mint clears any reuse.
+                return Confirmation::Lost(AttributionLoss::Budget, reason.into());
+            }
+            mapped.extend(read_ranges_reserved(io, pid, &[range], resources));
+        }
+        mapped
+    } else {
+        read_ranges_reserved(io, pid, &prepared.ranges, resources)
+    };
+    prepared.member = io.take_member();
+    finish_confirmation(io, pid, prepared, mapped, resources, budget)
+}
+
+pub(crate) fn confirm_with<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    prove: &BTreeSet<ObjectKey>,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    confirm_with_resources(io, pid, prove, budget, None)
 }
 
 /// The `map_files` error that means "no mapping is at this range now":
@@ -1090,29 +1957,191 @@ fn map_files_error(error: std::io::Error) -> String {
 /// `map_files` stats relative to one `/proc/<pid>/map_files` directory
 /// (DR-C1b-3), opened at the first range and dropped with this value, so
 /// it is never held past the confirmation or stat batch that opened it.
-#[derive(Default)]
+/// Zombie leaders additionally stash one retained survivor (with its own
+/// private owner) for the current confirm; live leaders never touch it.
 pub(crate) struct OsConfirmIo<'p> {
     map_files: Option<(u32, Result<Arc<HeldMapFiles>, String>)>,
     /// The collection's proof-stat pool (`None`: read on this thread).
-    pool: Option<&'p ProofStatPool>,
+    pools: ProofPools<'p>,
+    #[cfg(test)]
+    observer: Option<Arc<Mutex<ProofTrace>>>,
+    /// The stashed survivor for the current zombie-leader confirm,
+    /// keyed by pid: `mint_member` sets it, `take_member` moves it out.
+    /// Reads route through it only for its own pid.
+    member: Option<(u32, RetainedGroupMember)>,
+    /// The member's minter, kept alive exactly while the member lives:
+    /// the member only borrows it, so dropping this first would refuse
+    /// every member read. A `ReservedPin`: the dup'd pidfd closes before
+    /// its member-owner lease returns, like every other held FD.
+    minter: Option<ReservedPin<Arc<crate::process::PidPin>>>,
+    /// A cold-minted member handed in from outside (never minted here),
+    /// waiting for its pid's next prepare, with its minter. Separate
+    /// from the stash so a handoff never disturbs an in-flight confirm;
+    /// the mint prologue moves a matching validated handoff into the
+    /// stash and drops any other.
+    handed: Option<(u32, RetainedGroupMember)>,
+    handed_minter: Option<ReservedPin<Arc<crate::process::PidPin>>>,
+    /// The member's private reservation owner: exactly two retained
+    /// slots (the member directory plus the dup'd original pidfd) plus
+    /// one transient unit, sized for a single confirm. The confirm path
+    /// that needs no shared owner (and the shared census, which never
+    /// sees member leases) both stay untouched.
+    member_owner: ReservationOwner,
+}
+
+impl Default for OsConfirmIo<'_> {
+    fn default() -> Self {
+        Self::with_pool(None)
+    }
+}
+
+/// The local-syscall grace for a member mint: a handful of nonblocking
+/// reads, capped by the confirm budget's own deadline when it has one.
+/// Expiry fails closed (no member, ordinary path).
+const MINT_DEADLINE_GRACE: Duration = Duration::from_secs(1);
+
+fn member_owner() -> ReservationOwner {
+    // Exactly the reserved envelope for one member (two retained slots —
+    // the member directory plus the dup'd original pidfd — and one
+    // transient unit, inside the immediate floor): the minimal policy
+    // `ReservationOwner::new` accepts.
+    ReservationOwner::new(SegmentPolicy {
+        headroom: 7,
+        workers: 1,
+        retained: 2,
+        max_ranges: 0,
+    })
+}
+
+fn mint_deadline(budget: &CaptureWorkBudget) -> Instant {
+    let grace = Instant::now() + MINT_DEADLINE_GRACE;
+    let capped = budget.effective_deadline_ns().and_then(|limit| {
+        let clock = crate::attach::monotonic_ns()?;
+        let left = limit.checked_sub(clock)?;
+        Instant::now().checked_add(Duration::from_nanos(left))
+    });
+    capped.map(|deadline| deadline.min(grace)).unwrap_or(grace)
+}
+
+/// The lone survivor hint for a zombie leader: exactly one non-leader
+/// task listed. Zero survivors (a dead group) and ambiguous groups
+/// (several survivors) both yield `None` — the ordinary path, which
+/// stays exited for a zombie.
+fn lone_survivor_tid(pid: u32, budget: &mut CaptureWorkBudget) -> Option<u32> {
+    if budget.spend(1).is_err() {
+        return None;
+    }
+    let mut lone = None;
+    let mut extra = false;
+    let entries = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    for entry in entries {
+        let tid: u32 = entry.ok()?.file_name().to_string_lossy().parse().ok()?;
+        if tid == pid {
+            continue;
+        }
+        if lone.is_some() {
+            extra = true;
+            break;
+        }
+        lone = Some(tid);
+    }
+    if extra { None } else { lone }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProofTrace {
+    pub opened: usize,
+    pub closed: usize,
+    pub reads: Vec<(u32, u64, u64, std::thread::ThreadId, Option<String>)>,
 }
 
 /// A held `map_files` directory as a pool-shareable proof source, with
 /// `ENOENT` read as [`RANGE_NOT_MAPPED`].
-struct HeldMapFiles(MapFilesDir);
+#[derive(Clone, Default)]
+struct DropFence(Arc<(Mutex<bool>, Condvar)>);
+
+impl DropFence {
+    fn wait(&self) {
+        let (closed, changed) = &*self.0;
+        let mut closed = closed.lock().unwrap_or_else(|error| error.into_inner());
+        while !*closed {
+            closed = changed
+                .wait(closed)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+    fn complete(&self) {
+        let (closed, changed) = &*self.0;
+        *closed.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        changed.notify_all();
+    }
+}
+
+struct HeldMapFiles {
+    dir: Option<MapFilesDir>,
+    lease: Option<FdLease>,
+    closed: DropFence,
+    #[cfg(test)]
+    observer: Option<(u32, Arc<Mutex<ProofTrace>>)>,
+}
+
+impl Drop for HeldMapFiles {
+    fn drop(&mut self) {
+        // Result delivery does not establish final Arc destruction. Close
+        // the actual FD first, return its capacity, then signal observers.
+        drop(self.dir.take());
+        drop(self.lease.take());
+        #[cfg(test)]
+        if let Some((_, observer)) = &self.observer {
+            observer.lock().unwrap().closed += 1;
+        }
+        self.closed.complete();
+    }
+}
 
 impl RangeStat for HeldMapFiles {
     fn stat(&self, start: u64, end: u64) -> Result<FileIdentity, String> {
-        self.0.identity(start, end).map_err(map_files_error)
+        #[cfg(test)]
+        if let Some((pid, observer)) = &self.observer {
+            let thread = std::thread::current();
+            observer.lock().unwrap().reads.push((
+                *pid,
+                start,
+                end,
+                thread.id(),
+                thread.name().map(str::to_owned),
+            ));
+        }
+        self.dir
+            .as_ref()
+            .expect("the proof directory is live")
+            .identity(start, end)
+            .map_err(map_files_error)
     }
 }
 
 impl OsConfirmIo<'_> {
     /// The directory of `pid`, opened at its first range.
-    fn held(&mut self, pid: u32) -> Result<Arc<HeldMapFiles>, String> {
+    fn held(&mut self, pid: u32, lease: Option<FdLease>) -> Result<Arc<HeldMapFiles>, String> {
         if self.map_files.as_ref().is_none_or(|(held, _)| *held != pid) {
             let dir = MapFilesDir::open(pid)
-                .map(|dir| Arc::new(HeldMapFiles(dir)))
+                .map(|dir| {
+                    #[cfg(test)]
+                    if let Some(observer) = &self.observer {
+                        observer.lock().unwrap().opened += 1;
+                    }
+                    Arc::new(HeldMapFiles {
+                        dir: Some(dir),
+                        lease,
+                        closed: DropFence::default(),
+                        #[cfg(test)]
+                        observer: self
+                            .observer
+                            .as_ref()
+                            .map(|observer| (pid, observer.clone())),
+                    })
+                })
                 .map_err(map_files_error);
             self.map_files = Some((pid, dir));
         }
@@ -1123,11 +2152,95 @@ impl OsConfirmIo<'_> {
     }
 }
 
+impl OsConfirmIo<'_> {
+    fn release_directory(&mut self) {
+        let held = self.map_files.take();
+        let closed = held
+            .as_ref()
+            .and_then(|(_, dir)| dir.as_ref().ok())
+            .map(|dir| dir.closed.clone());
+        drop(held);
+        if let Some(closed) = closed {
+            closed.wait();
+        }
+    }
+
+    pub(crate) fn with_pool(pool: Option<&ProofStatPool>) -> OsConfirmIo<'_> {
+        Self::with_pools(ProofPools {
+            batch: pool,
+            immediate: pool,
+        })
+    }
+
+    pub(crate) fn with_pools(pools: ProofPools<'_>) -> OsConfirmIo<'_> {
+        OsConfirmIo {
+            map_files: None,
+            pools,
+            #[cfg(test)]
+            observer: None,
+            member: None,
+            minter: None,
+            handed: None,
+            handed_minter: None,
+            member_owner: member_owner(),
+        }
+    }
+
+    /// Hand a cold-minted survivor into this confirm's routing: the next
+    /// prepare for `pid` re-validates it and uses it instead of minting.
+    /// The handoff MOVES custody — the hander drops its own handles —
+    /// and the member's leases move with it (no new FD opens here; the
+    /// minter clone names the hander's already-held description, so it
+    /// carries no new lease).
+    #[cfg_attr(not(test), allow(dead_code))] // Reached only by tests today.
+    pub(crate) fn hand_cold_member(&mut self, pid: u32, minted: ColdMint) {
+        self.handed = Some((pid, minted.member));
+        self.handed_minter = Some(ReservedPin {
+            pin: minted.minter,
+            _lease: None,
+        });
+    }
+
+    /// The stashed survivor, only for the confirm pid that minted it.
+    fn member_for(&self, pid: u32) -> Option<&RetainedGroupMember> {
+        self.member
+            .as_ref()
+            .filter(|(minted, _)| *minted == pid)
+            .map(|(_, member)| member)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observing(mut self, observer: Arc<Mutex<ProofTrace>>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+}
+
 impl ConfirmIo for OsConfirmIo<'_> {
     type Pin = crate::process::PidPin;
 
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
-        self.held(pid)?.stat(start, end)
+        // One range through the stashed survivor when this pid minted it:
+        // sequential, on this thread (zombie confirms are rare; no pool),
+        // with the custody refusal dominating any lookup result.
+        if let Some(member) = self.member_for(pid) {
+            let result = member.stat_map_file(start, end);
+            #[cfg(test)]
+            if let Some(observer) = &self.observer {
+                let thread = std::thread::current();
+                observer.lock().unwrap().reads.push((
+                    pid,
+                    start,
+                    end,
+                    thread.id(),
+                    thread.name().map(str::to_owned),
+                ));
+            }
+            return result;
+        }
+        let result = self.held(pid, None).and_then(|dir| dir.stat(start, end));
+        self.release_directory();
+        result
     }
 
     fn mapped_files(
@@ -1135,14 +2248,42 @@ impl ConfirmIo for OsConfirmIo<'_> {
         pid: u32,
         ranges: &[(u64, u64)],
     ) -> Vec<Result<FileIdentity, String>> {
-        match self.held(pid) {
-            Ok(dir) => stat_batch(self.pool, dir, ranges),
-            Err(error) => vec![Err(error); ranges.len()],
+        self.mapped_files_reserved(pid, ranges, None)
+    }
+
+    fn mapped_files_reserved(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        lease: Option<FdLease>,
+    ) -> Vec<Result<FileIdentity, String>> {
+        if ranges.is_empty() {
+            return Vec::new();
         }
+        // Member stats use the member's private owner internally; the
+        // shared batch lease simply drops unused.
+        if self.member_for(pid).is_some() {
+            drop(lease);
+            return ranges
+                .iter()
+                .map(|&(start, end)| self.mapped_file(pid, start, end))
+                .collect();
+        }
+        let pool = self.pools.for_lease(lease.as_ref());
+        let result = match self.held(pid, lease) {
+            Ok(dir) => stat_batch(pool, dir, ranges),
+            Err(error) => vec![Err(error); ranges.len()],
+        };
+        self.release_directory();
+        result
     }
 
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
         crate::process::PidPin::open(pid)
+    }
+
+    fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        pin.pidfd().ok()
     }
 
     fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
@@ -1154,6 +2295,11 @@ impl ConfirmIo for OsConfirmIo<'_> {
     }
 
     fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        // The member exe reads relative to the retained survivor
+        // directory, never the caller registry.
+        if let Some(member) = self.member_for(pid) {
+            return member.read_exe_identity();
+        }
         crate::discovery::caller_registry::read_exe_identity(pid)
     }
 
@@ -1164,7 +2310,167 @@ impl ConfirmIo for OsConfirmIo<'_> {
     }
 
     fn gone(&self, pid: u32) -> bool {
+        // A provably live survivor means the group is not gone, zombie
+        // leader or not; when no member validates this stays unchanged.
+        if self
+            .member_for(pid)
+            .is_some_and(|member| member.selector().is_ok())
+        {
+            return false;
+        }
         crate::process::generation_gone(pid) || crate::process::process_is_zombie(pid)
+    }
+
+    fn mint_member(
+        &mut self,
+        pid: u32,
+        pin: &Self::Pin,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        // A fresh stash every prepare: an early `Err` return skips the
+        // take, so anything left here belongs to an older confirm.
+        self.member = None;
+        self.minter = None;
+        // A handed cold member takes precedence over a fresh mint: it is
+        // re-validated (never trusted blind), then moved into the stash
+        // it would have minted. A handoff for another pid, or one that
+        // no longer validates, drops and the ordinary mint runs.
+        let handed_matches = self
+            .handed
+            .as_ref()
+            .is_some_and(|(handed_pid, member)| *handed_pid == pid && member.selector().is_ok());
+        if handed_matches {
+            let (_, member) = self.handed.take().expect("a handed member matched");
+            self.member = Some((pid, member));
+            self.minter = self.handed_minter.take();
+            return Ok(());
+        }
+        self.handed = None;
+        self.handed_minter = None;
+        if !crate::process::process_is_zombie(pid) {
+            return Ok(());
+        }
+        if let Some(reason) = budget.check_deadline_now() {
+            return Err(Confirmation::Lost(AttributionLoss::Budget, reason.into()));
+        }
+        let tid = match lone_survivor_tid(pid, budget) {
+            Some(tid) => tid,
+            None => return Ok(()),
+        };
+        // The original is the confirm pin's own pidfd (duplicated),
+        // never a fresh numeric reopen: a reopen could name a recycled
+        // pid's new process. Its lease is reserved before the dup, like
+        // every other held FD.
+        let lease = match self.member_owner.batch().pin() {
+            Ok(lease) => lease,
+            Err(_) => return Ok(()),
+        };
+        let original = match pin.try_clone() {
+            Ok(pin) => Arc::new(pin),
+            Err(_) => return Ok(()),
+        };
+        let deadline = mint_deadline(budget);
+        match RetainedGroupMember::acquire(&original, tid, &self.member_owner, budget, deadline) {
+            Ok(member) => {
+                self.member = Some((pid, member));
+                self.minter = Some(ReservedPin {
+                    pin: original,
+                    _lease: Some(lease),
+                });
+                Ok(())
+            }
+            // Any custody refusal keeps the ordinary path (a zombie
+            // then stays exited); a spent budget self-corrects, because
+            // the ordinary maps read fails the same budget afterwards.
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        self.member.take().map(|(_, member)| member)
+    }
+
+    fn return_member(&mut self, pid: u32, member: Option<RetainedGroupMember>) {
+        // The minter never moves (take leaves it): the returned member's
+        // borrow stays valid for the proof reads.
+        match member {
+            Some(member) => self.member = Some((pid, member)),
+            None => self.member = None,
+        }
+    }
+}
+
+/// The original-file witness's confirm IO: every `map_files` proof is
+/// refused, so a confirm that loses its kernel run yields unavailable
+/// proofs instead of a userspace `(dev, ino)` edge. Everything else
+/// (pins, maps, exe, generation checks, member custody) delegates
+/// untouched — including [`ConfirmIo::borrowed_pidfd`], without which
+/// the kernel run itself would fall back.
+pub(crate) struct WitnessNoFallback<Io> {
+    inner: Io,
+}
+
+impl<Io> WitnessNoFallback<Io> {
+    pub(crate) fn new(inner: Io) -> Self {
+        Self { inner }
+    }
+}
+
+/// The refusal every userspace proof attempt gets. Fixed: the witness
+/// maps it to the gap, never to an edge.
+pub(crate) const WITNESS_NO_USERSPACE_PROOF: &str =
+    "the original-file witness refuses userspace proof";
+
+impl<Io: ConfirmIo> ConfirmIo for WitnessNoFallback<Io> {
+    type Pin = Io::Pin;
+
+    fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        self.inner.borrowed_pidfd(pin)
+    }
+
+    fn mapped_file(&mut self, _pid: u32, _start: u64, _end: u64) -> Result<FileIdentity, String> {
+        Err(WITNESS_NO_USERSPACE_PROOF.to_string())
+    }
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        self.inner.open(pid)
+    }
+
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        self.inner.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        self.inner.still_the_same(pin)
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.inner.exe(pid)
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.inner.maps(pid, budget)
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+
+    fn mint_member(
+        &mut self,
+        pid: u32,
+        pin: &Self::Pin,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        self.inner.mint_member(pid, pin, budget)
+    }
+
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        self.inner.take_member()
+    }
+
+    fn return_member(&mut self, pid: u32, member: Option<RetainedGroupMember>) {
+        self.inner.return_member(pid, member);
     }
 }
 
@@ -1172,6 +2478,11 @@ impl crate::discovery::confirm_shards::ShardableIo for OsConfirmIo<'_> {
     type Maps = std::fs::File;
 
     fn open_maps(&mut self, pid: u32) -> std::io::Result<Self::Maps> {
+        // The survivor's maps, not the dead leader's empty ones. `maps`
+        // delegates to this opener, so both route together.
+        if let Some(member) = self.member_for(pid) {
+            return member.open_maps().map_err(std::io::Error::other);
+        }
         std::fs::File::open(format!("/proc/{pid}/maps"))
     }
 
@@ -1193,10 +2504,7 @@ impl MemberProbe for OsMemberProbe<'_> {
         prove: &BTreeSet<ObjectKey>,
         budget: &mut CaptureWorkBudget,
     ) -> Confirmation {
-        let mut io = OsConfirmIo {
-            map_files: None,
-            pool: self.pool,
-        };
+        let mut io = OsConfirmIo::with_pool(self.pool);
         confirm_with(&mut io, pid, prove, budget)
     }
 
@@ -1206,10 +2514,7 @@ impl MemberProbe for OsMemberProbe<'_> {
         ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> MappedIdentities {
-        let mut io = OsConfirmIo {
-            map_files: None,
-            pool: self.pool,
-        };
+        let mut io = OsConfirmIo::with_pool(self.pool);
         stat_unpinned(&mut io, pid, ranges, budget)
     }
 }

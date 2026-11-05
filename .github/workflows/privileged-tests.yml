@@ -1,0 +1,1464 @@
+name: privileged-tests
+# The default privileged lib-test campaign on hosted runners (root, real
+# runner kernel, BTF). Ordinary CI runs only the unprivileged default
+# tests, so before this workflow the curated privileged cells ran only by
+# hand on a maintainer's hosts.
+#
+# A separate file from ci.yml on purpose, as bpf-kernels.yml: ci.yml's
+# dedupe/archive-log job lists are pinned by hosted_pipeline_* contract
+# tests that read ci.yml only. tests/python/test_privileged_tests_workflow.py
+# pins this file's toolchain and action revisions to ci.yml instead.
+#
+# How it works:
+# - privileged-build compiles the lib-test executable and the observer
+#   (default features, no P11SCOPE_SMALL_*), lists the curated default
+#   cells with scripts/run-privileged-lib-tests.sh --list, and ships all
+#   three as a 1-day artifact. The default build also builds
+#   P11SCOPE_JOURNAL_PROOF=1 and runs the two root_proof_tests
+#   (unprivileged, cached after the first run);
+# - privileged-build-journal compiles the same pair with
+#   P11SCOPE_JOURNAL=1 for the journal-only cells, as a separate job so
+#   a journal failure never skips the default shards;
+# - each privileged-shard job checks out the same commit at the same
+#   absolute path (the lib tests compile their C fixtures from the
+#   source tree), takes every SHARDS-th cell from the list and runs them
+#   through the curated runner as root;
+# - privileged-summary proves the shards together ran every listed cell
+#   exactly once, fails on any FAIL, SKIP or missing result, enforces the
+#   floor file tests/privileged-campaign.json (listed count never drops
+#   below the floor, no curated name disappears without a reviewed floor
+#   edit) and judges P11SCOPE_CELL_BRANCH lines against its per-environment
+#   expectation table (pending entries are allowed absent until WP-2 lands);
+# - privileged-btrfs runs the btrfs campaign (--include-btrfs) with the
+#   runner's own loop-mounted image, and privileged-overlay runs the
+#   overlay campaign (--include-overlay) plus the copy-up expected
+#   failure; both fail on any FAIL, SKIP or leaked mount.
+# - privileged-second-flavor runs the journal-only cells (the five linked
+#   key-operations cells plus the sealed drain linkage) from the journal
+#   build with exact selectors; a SKIP fails the job. Pending cells may be
+#   absent until WU-2a lands, but must PASS when present;
+# - system-scale, public-cli and browser-cells run the installed-behavior
+#   jobs from the release observer. New scripts/ci/<name>.sh cells run
+#   through scripts/ci/run-cell-script.sh (which validates results.jsonl
+#   with scripts/ci/check-cell-results.py) packed into these existing jobs,
+#   never as new jobs: WP-3 real-providers and WP-7 stop-races in
+#   system-scale, WP-4 breadth and WP-5 legacy32 in public-cli.
+# Weekly campaign: workflow_dispatch input campaign selects default, long
+# (--include-long) or all (long plus the fixture-skip groups once WP-2 adds
+# them). GitHub schedules run only on the default branch, so the weekly run
+# is a dispatch on the dev tip, never a schedule trigger here.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: Lib campaign (default, long adds --include-long, all adds fixture-skip groups once WP-2 lands them)
+        type: choice
+        options: [default, long, all]
+        default: default
+permissions:
+  contents: read
+concurrency:
+  group: privileged-tests-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CI_TOOL_BPF_LINKER: 0.10.4
+  CI_VNG_VERSION: "1.41"
+  CI_PLAYWRIGHT_VERSION: 1.64.0
+  # Keep in step with the privileged-shard matrix below.
+  SHARDS: 8
+jobs:
+  privileged-build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-privileged-build-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/proof/debug/.fingerprint
+            target/proof/debug/build
+            target/proof/debug/deps
+            target/proof/debug/incremental
+          key: target-privileged-proof-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Prove the default build environment
+        shell: bash
+        run: |
+          if env | grep -E '^(P11SCOPE_SMALL_|P11SCOPE_JOURNAL=|P11SCOPE_JOURNAL_PROOF=|P11SCOPE_BIRTH_MARKER=|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+            echo "refusing: size-override or flavor environment is set" >&2
+            exit 1
+          fi
+          echo "default features, no size overrides"
+      - name: Build the lib-test executable and the observer
+        shell: bash
+        env:
+          CAMPAIGN: ${{ inputs.campaign || 'default' }}
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" build --locked --offline -p p11scope -p p11scope-discover
+          cargo +"$toolchain" test --locked --offline --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
+          lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/lib-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$lib"
+          out="$RUNNER_TEMP/privileged-inputs-default"
+          mkdir -p "$out/bin"
+          cp -p "$lib" "$out/lib-tests"
+          cp -p target/debug/p11scope target/debug/p11scope-discover "$out/bin/"
+          # The curated list verifies itself against the binary's own
+          # ignored-test list and fails on drift.
+          scripts/run-privileged-lib-tests.sh --list "$out/lib-tests" >"$out/list.txt"
+          case "$CAMPAIGN" in
+            default)
+              awk '/^default \(/{f=1;next} /^(long|skipped) \(/{f=0} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
+              ;;
+            long|all)
+              # long adds --include-long cells; all adds the fixture-skip
+              # groups too once WP-2 lands their runner flags (same as long
+              # until then).
+              awk '/^default \(/{f=1;next} /^skipped \(/{f=0} /^long \(/{next} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
+              ;;
+            *) echo "unknown campaign: $CAMPAIGN" >&2; exit 1 ;;
+          esac
+          count=$(wc -l <"$out/selectors.txt")
+          declared=$(sed -n 's/^default (\([0-9]*\)).*/\1/p' "$out/list.txt")
+          long_declared=$(sed -n 's/^long (\([0-9]*\).*/\1/p' "$out/list.txt")
+          echo "campaign $CAMPAIGN cells: $count (declared default $declared long $long_declared)"
+          test "$count" -gt 0
+          case "$CAMPAIGN" in
+            default) test "$count" -eq "$declared" ;;
+            long|all) test "$count" -eq $((declared + long_declared)) ;;
+          esac
+          (cd "$out" && sha256sum lib-tests bin/p11scope bin/p11scope-discover selectors.txt >SHA256SUMS)
+          cat "$out/SHA256SUMS"
+      - name: Build P11SCOPE_JOURNAL_PROOF=1 and run root_proof_tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          # Separate target dir: the proof build must not poison the default
+          # target/debug cache the next run restores.
+          P11SCOPE_JOURNAL_PROOF=1 cargo +"$toolchain" test --locked --offline --lib \
+            --target-dir target/proof --no-run --message-format=json >"$RUNNER_TEMP/proof-build.jsonl"
+          lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/proof-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$lib"
+          # Unprivileged: the proof compiles a native bridge with clang-18 and
+          # loads no BPF. Both tests must pass with nonzero counts.
+          "$lib" semantics_objects::journal::root_proof_tests --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/proof.log"
+          grep -q 'test result: ok. 2 passed' "$RUNNER_TEMP/proof.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-inputs-default
+          path: ${{ runner.temp }}/privileged-inputs-default/
+          if-no-files-found: error
+          retention-days: 1
+  # Second flavor today: P11SCOPE_JOURNAL=1. Once WU-2b makes journal
+  # plus birth marker the default (ruling CP-1), the second flavor
+  # becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0.
+  privileged-build-journal:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-privileged-build-journal-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Prove the journal build environment
+        shell: bash
+        env:
+          P11SCOPE_JOURNAL: '1'
+        run: |
+          test "${P11SCOPE_JOURNAL:-}" = 1
+          if env | grep -E '^(P11SCOPE_SMALL_|P11SCOPE_JOURNAL_PROOF=|P11SCOPE_BIRTH_MARKER=|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+            echo "refusing: size-override or flavor environment is set" >&2
+            exit 1
+          fi
+          echo "journal flavor: P11SCOPE_JOURNAL=1, no size overrides"
+      - name: Build the journal lib-test executable and the observer
+        shell: bash
+        env:
+          P11SCOPE_JOURNAL: '1'
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" build --locked --offline -p p11scope -p p11scope-discover
+          cargo +"$toolchain" test --locked --offline --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
+          lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/lib-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$lib"
+          out="$RUNNER_TEMP/privileged-inputs-journal"
+          mkdir -p "$out/bin"
+          cp -p "$lib" "$out/lib-tests"
+          cp -p target/debug/p11scope target/debug/p11scope-discover "$out/bin/"
+          scripts/run-privileged-lib-tests.sh --list "$out/lib-tests" >"$out/list.txt"
+          # Journal flavor runs six exact cells in privileged-second-flavor,
+          # not the sharded campaign; keep the list for the presence check.
+          awk '/^default \(/{f=1;next} /^(long|skipped) \(/{f=0} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
+          (cd "$out" && sha256sum lib-tests bin/p11scope bin/p11scope-discover selectors.txt >SHA256SUMS)
+          cat "$out/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-inputs-journal
+          path: ${{ runner.temp }}/privileged-inputs-journal/
+          if-no-files-found: error
+          retention-days: 1
+  privileged-shard:
+    needs: privileged-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Runtime tools only: gcc (and -m32) for the C fixtures, SoftHSM2 and
+      # p11-kit for the provider workloads, opensc (pkcs11-tool) for the
+      # pause wrapper cells, e2fsprogs for the ext4 cell.
+      - run: sudo apt-get update && sudo apt-get install -y gcc gcc-multilib jq libp11-kit-dev opensc p11-kit python3 softhsm2 e2fsprogs util-linux
+      - name: Download the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs-default
+          path: ${{ runner.temp }}/privileged-inputs
+      - name: Run this shard's cells as root
+        shell: bash
+        env:
+          CAMPAIGN: ${{ inputs.campaign || 'default' }}
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          awk -v n="$SHARDS" -v s="${{ matrix.shard }}" '(NR - 1) % n == s' "$in/selectors.txt" >"$RUNNER_TEMP/shard.txt"
+          echo "shard ${{ matrix.shard }} of $SHARDS campaign $CAMPAIGN: $(wc -l <"$RUNNER_TEMP/shard.txt") cells"
+          test -s "$RUNNER_TEMP/shard.txt"
+          header=/usr/include/p11-kit-1/p11-kit
+          test -f "$header/pkcs11.h"
+          sudo -n true
+          uname -a
+          out="$RUNNER_TEMP/privileged-out"
+          mkdir -m 700 "$out"
+          rc=0
+          extra=()
+          case "$CAMPAIGN" in
+            default) ;;
+            long|all)
+              extra+=(--include-long)
+              # all adds the fixture-skip groups too once WP-2 lands their
+              # runner flags (same as long until then).
+              ;;
+            *) echo "unknown campaign: $CAMPAIGN" >&2; exit 1 ;;
+          esac
+          # `env` sets the variables after sudo's own environment strip.
+          mapfile -t cells <"$RUNNER_TEMP/shard.txt"
+          sudo -n env PKCS11_HEADER_DIR="$header" \
+            P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
+            P11SCOPE_DISCOVER_BIN="$in/bin/p11scope-discover" \
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${extra[@]}" "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          cp "$out/run/results.txt" "$RUNNER_TEMP/results-${{ matrix.shard }}.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "shard ${{ matrix.shard }} has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+      - name: Upload the shard results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-shard-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/results-${{ matrix.shard }}.txt
+            ${{ runner.temp }}/privileged-out/run/results.txt
+            ${{ runner.temp }}/privileged-out/run/logs/
+          if-no-files-found: warn
+          retention-days: 7
+  # Every listed cell ran exactly once across the shards and passed; the
+  # floor file stops a quiet curation shrink and the branch table judges
+  # which dual-outcome arm each cell took.
+  privileged-summary:
+    needs: [privileged-build, privileged-shard]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Download the default list
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs-default
+          path: ${{ runner.temp }}/all/privileged-inputs-default
+      - name: Download every shard's results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: privileged-shard-*
+          path: ${{ runner.temp }}/all
+      - name: Prove full coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          all="$RUNNER_TEMP/all"
+          sort "$all/privileged-inputs-default/selectors.txt" >"$RUNNER_TEMP/want.txt"
+          : >"$RUNNER_TEMP/got.txt"
+          : >"$RUNNER_TEMP/full.txt"
+          for shard in $(seq 0 $((SHARDS - 1))); do
+            f="$all/privileged-shard-$shard/results-$shard.txt"
+            if [ ! -s "$f" ]; then
+              echo "MISSING results for shard $shard" >&2
+              continue
+            fi
+            awk '$1 == "PASS" || $1 == "FAIL" || $1 == "SKIP" {print $1, $2}' "$f" >>"$RUNNER_TEMP/got.txt"
+            grep -E '^(PASS|FAIL|SKIP) ' "$f" >>"$RUNNER_TEMP/full.txt" || true
+          done
+          awk '{print $2}' "$RUNNER_TEMP/got.txt" | sort >"$RUNNER_TEMP/ran.txt"
+          echo "listed $(wc -l <"$RUNNER_TEMP/want.txt"), reported $(wc -l <"$RUNNER_TEMP/ran.txt")"
+          for status in PASS FAIL SKIP; do
+            echo "$status $(awk -v s="$status" '$1 == s' "$RUNNER_TEMP/got.txt" | wc -l)"
+          done
+          awk '$1 != "PASS"' "$RUNNER_TEMP/got.txt"
+          bad=0
+          if ! diff -u "$RUNNER_TEMP/want.txt" "$RUNNER_TEMP/ran.txt"; then
+            echo "the shards did not run every listed cell exactly once" >&2
+            bad=1
+          fi
+          if awk '$1 != "PASS"' "$RUNNER_TEMP/got.txt" | grep -q .; then
+            bad=1
+          fi
+          test "$bad" -eq 0
+      - name: Enforce the campaign floor and branch expectations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/want.txt" "$RUNNER_TEMP/full.txt" tests/privileged-campaign.json <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          want = {line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()}
+          full = [line for line in Path(sys.argv[2]).read_text().splitlines() if line.strip()]
+          campaign = json.loads(Path(sys.argv[3]).read_text())
+          assert campaign.get("schema") == "p11scope/privileged-campaign/v1", "floor schema"
+          floor = campaign["default_floor"]
+          cells = campaign["default_cells"]
+          assert floor == len(cells), "floor count must equal the listed names"
+          assert len(cells) == len(set(cells)), "floor names must be unique"
+          print(f"floor {floor}, listed {len(want)}")
+          if len(want) < floor:
+              raise SystemExit(f"listed count {len(want)} dropped below the floor {floor}")
+          missing = sorted(set(cells) - want)
+          if missing:
+              raise SystemExit("curated names disappeared without a reviewed floor edit: " + ", ".join(missing[:5]))
+          print(f"floor ok: all {len(cells)} curated names listed")
+          branches = {line.split()[1]: line for line in full if len(line.split()) >= 2}
+          expectations = campaign.get("branch_expectations", {})
+          checked = 0
+          for cell, rule in sorted(expectations.items()):
+              expected = rule.get("ci")
+              status = rule.get("status", "expected")
+              if status == "pending":
+                  print(f"BRANCH pending {cell} (expects {expected} on CI once WP-2 lands)")
+                  continue
+              if cell not in branches:
+                  if cell not in want:
+                      print(f"BRANCH skip {cell}: not in this campaign")
+                      continue
+                  raise SystemExit(f"missing result for branched cell {cell}")
+              line = branches[cell]
+              found = re.findall(r"branch=([A-Za-z0-9_.-]+)", line)
+              print(f"BRANCH {cell} expected {expected} found {found or 'none'}")
+              if expected not in found:
+                  raise SystemExit(f"cell {cell} did not take the expected {expected} branch on CI: {line}")
+              checked += 1
+          print(f"branch ok: {checked} expected cells judged")
+          PY
+  # Journal-flavor cells from the journal build: the five linked
+  # key-operations cells plus the sealed drain linkage, with exact
+  # selectors. A SKIP fails the job. Pending cells (the five, until WU-2a
+  # lands) may be absent from the binary, but must PASS when present.
+  privileged-second-flavor:
+    needs: privileged-build-journal
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install -y gcc gcc-multilib jq libp11-kit-dev p11-kit python3 softhsm2 e2fsprogs util-linux
+      - name: Download the journal build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs-journal
+          path: ${{ runner.temp }}/privileged-inputs-journal
+      - name: Run the journal cells as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs-journal"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          sudo -n true
+          uname -a
+          # Presence comes from the journal build's own list, never from a
+          # direct --ignored run: the curated runner stays the only executor.
+          python3 -I - tests/privileged-campaign.json "$in/list.txt" "$RUNNER_TEMP/wanted.txt" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          campaign = json.loads(Path(sys.argv[1]).read_text())
+          listed = Path(sys.argv[2]).read_text()
+          second = campaign["second_flavor"]
+          pending = set(second.get("pending", []))
+          wanted = []
+          for cell in second["cells"]:
+              present = f"\n{cell}\n" in f"\n{listed}\n" or f"\n{cell} :: " in listed
+              if present:
+                  wanted.append(cell)
+                  print(f"WANT {cell}")
+              elif cell in pending:
+                  print(f"PENDING absent {cell} (allowed until WU-2a lands)")
+              else:
+                  raise SystemExit(f"expected journal cell absent from the binary: {cell}")
+          assert wanted, "no journal cells present"
+          Path(sys.argv[3]).write_text("\n".join(wanted) + "\n")
+          PY
+          mapfile -t cells <"$RUNNER_TEMP/wanted.txt"
+          out="$RUNNER_TEMP/privileged-out"
+          mkdir -m 700 "$out"
+          rc=0
+          header=/usr/include/p11-kit-1/p11-kit
+          sudo -n env PKCS11_HEADER_DIR="$header" \
+            P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "journal flavor has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+          # Exact-list check: every wanted cell reported PASS exactly once.
+          python3 -I - "$RUNNER_TEMP/wanted.txt" "$out/run/results.txt" <<'PY'
+          import sys
+          from pathlib import Path
+          wanted = sorted(line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip())
+          reported = sorted(line.split()[1] for line in Path(sys.argv[2]).read_text().splitlines() if line.startswith("PASS "))
+          assert wanted, "no wanted journal cells"
+          if wanted != reported:
+              raise SystemExit(f"journal exact-list mismatch: wanted {wanted}, reported {reported}")
+          print(f"journal ok: {len(wanted)} cells PASS")
+          PY
+      - name: Upload the journal results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-second-flavor
+          path: |
+            ${{ runner.temp }}/privileged-out/run/results.txt
+            ${{ runner.temp }}/privileged-out/run/logs/
+          if-no-files-found: warn
+          retention-days: 7
+  # The btrfs campaign: the 14 cells that need TMPDIR on btrfs. The
+  # curated runner loop-mounts its own image for them (no ambient
+  # btrfs needed) and tears it down afterwards; the cleanup step
+  # re-runs the idempotent teardown so a mount never leaks past the job.
+  privileged-btrfs:
+    needs: privileged-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y btrfs-progs gcc python3 softhsm2 util-linux
+      - name: Download the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs-default
+          path: ${{ runner.temp }}/privileged-inputs
+      - name: Run the btrfs campaign cells as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          # Selectors come from the curated --list sections, never from a
+          # hand-kept copy: a renamed cell fails the count check loudly.
+          awk '/^btrfs \(/{f=1;next} /^(overlay|expected-failures) \(/{f=0} f' "$in/list.txt" \
+            | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/btrfs-cells.txt"
+          count=$(wc -l <"$RUNNER_TEMP/btrfs-cells.txt")
+          declared=$(sed -n 's/^btrfs (\([0-9][0-9]*\)[,)].*/\1/p' "$in/list.txt")
+          echo "btrfs cells: $count (declared $declared)"
+          test "$count" -gt 0
+          test "$count" -eq "$declared"
+          sudo -n true
+          uname -a
+          out="$RUNNER_TEMP/privileged-btrfs-out"
+          mkdir -m 700 "$out"
+          rc=0
+          mapfile -t cells <"$RUNNER_TEMP/btrfs-cells.txt"
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-btrfs "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "btrfs campaign has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+      - name: Upload the btrfs results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-btrfs
+          path: |
+            ${{ runner.temp }}/privileged-btrfs-out/run/results.txt
+            ${{ runner.temp }}/privileged-btrfs-out/run/logs/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Clean up the btrfs mount
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/privileged-btrfs-out/run"
+          sudo -n scripts/ci/prepare-btrfs-tmpdir.sh --teardown "$out/btrfs.img" "$out/btrfs-mnt" || true
+          leaked=0
+          if mount | grep -F "$out" >/dev/null; then leaked=1; fi
+          if sudo -n losetup -a 2>/dev/null | grep -F "$out" >/dev/null; then leaked=1; fi
+          if [ "$leaked" -ne 0 ]; then
+            echo "btrfs teardown leaked a mount or loop device under $out" >&2
+            exit 1
+          fi
+  # The overlay campaign: the K1 deep-scan twins plus the copy-up
+  # no-re-edge positive (lane B only; each mounts its own loop
+  # overlays and fails loud elsewhere). The xino parity cell already
+  # runs in the default shards.
+  privileged-overlay:
+    needs: privileged-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y e2fsprogs gcc python3 softhsm2 util-linux
+      - name: Download the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs-default
+          path: ${{ runner.temp }}/privileged-inputs
+      - name: Run the overlay campaign cells as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          # Selectors come from the curated --list sections, never from a
+          # hand-kept copy: a renamed cell fails the count check loudly.
+          awk '/^overlay \(/{f=1;next} /^expected-failures \(/{f=0} f' "$in/list.txt" \
+            | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/overlay-cells.txt"
+          count=$(wc -l <"$RUNNER_TEMP/overlay-cells.txt")
+          declared=$(sed -n 's/^overlay (\([0-9][0-9]*\)[,)].*/\1/p' "$in/list.txt")
+          echo "overlay cells: $count (declared $declared)"
+          test "$count" -gt 0
+          test "$count" -eq "$declared"
+          sudo -n true
+          uname -a
+          out="$RUNNER_TEMP/privileged-overlay-out"
+          mkdir -m 700 "$out"
+          rc=0
+          mapfile -t cells <"$RUNNER_TEMP/overlay-cells.txt"
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-overlay "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "overlay campaign has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+      - name: Upload the overlay results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-overlay
+          path: |
+            ${{ runner.temp }}/privileged-overlay-out/run/results.txt
+            ${{ runner.temp }}/privileged-overlay-out/run/logs/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Verify no overlay mounts leaked
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/privileged-overlay-out"
+          mounts=$(mount | awk -v out="$out" '$3 ~ ("^" out "/") {print $3}')
+          if [ -n "$mounts" ]; then
+            while IFS= read -r mp; do sudo -n umount -l "$mp" || true; done <<<"$mounts"
+            echo "overlay cells leaked mounts under $out" >&2
+            exit 1
+          fi
+          if sudo -n losetup -a 2>/dev/null | grep -F "$out" >/dev/null; then
+            echo "overlay cells leaked a loop device under $out" >&2
+            exit 1
+          fi
+  # The release observer for the installed-behavior jobs below: the four
+  # system-scale cells, the public CLI cells on the runner kernel and in
+  # virtme-ng guests, and the real-browser cells.
+  release-build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Prove the default build environment
+        shell: bash
+        run: |
+          if env | grep -E '^(P11SCOPE_SMALL_|P11SCOPE_JOURNAL=|P11SCOPE_JOURNAL_PROOF=|P11SCOPE_BIRTH_MARKER=|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+            echo "refusing: size-override or flavor environment is set" >&2
+            exit 1
+          fi
+      - name: Build the release observer and discovery helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +"$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover
+          out="$RUNNER_TEMP/release-inputs"
+          mkdir -p "$out"
+          cp -p target/release/p11scope target/release/p11scope-discover "$out/"
+          (cd "$out" && sha256sum p11scope p11scope-discover >SHA256SUMS)
+          cat "$out/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs/
+          if-no-files-found: error
+          retention-days: 1
+  # System scale: --pid and --system, each in metrics and profile mode,
+  # against a 20,000-call SoftHSM workload with exact expected counts, a
+  # valid capture window, zero loss and a proven final drain (the same
+  # cells and oracle as ci.yml's manual privileged-e2e job). WP-3
+  # real-providers and WP-7 stop-races run here later through
+  # scripts/ci/run-cell-script.sh, packed into this job's 45-minute budget.
+  system-scale:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Prepare owned test storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          work=/var/tmp/p11scope-ws-tmp
+          if [[ ! -e "$work" ]]; then mkdir -m 700 "$work"; fi
+          test -d "$work" && test ! -L "$work" && test -O "$work"
+          test "$(stat -c %a "$work")" = 700
+          echo "TMPDIR=$work" >>"$GITHUB_ENV"
+      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq libpcsclite1 opensc-pkcs11 p11-kit-modules procps python3 softhsm2 util-linux
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run four system-scale cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          ulimit -n 65536
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          uname -a
+          test -r /sys/kernel/btf/vmlinux
+          doctor_status=0
+          sudo -n env TMPDIR="$TMPDIR" "$in/p11scope" doctor >"$TMPDIR/doctor.txt" 2>&1 || doctor_status=$?
+          printf "%s\n" "$doctor_status" >"$TMPDIR/doctor-status.txt"
+          cat "$TMPDIR/doctor.txt"
+          python3 -I - "$TMPDIR/doctor.txt" "$doctor_status" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          if int(sys.argv[2]) not in (0, 1):
+              raise RuntimeError("doctor did not finish with a supported verdict")
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          for name in ("uprobe-multi attach (own libc)", "uretprobe vs seccomp"):
+              rows = [line for line in lines if line.startswith(name)]
+              if len(rows) != 1 or re.fullmatch(re.escape(name) + r" \.* ok(?:[ \t].*)?", rows[0]) is None:
+                  raise RuntimeError("functional doctor row missing, duplicated or not ok: " + name)
+          print("doctor functional rows ok")
+          PY
+          scripts/system-scope-measure.sh --scope both --mode both \
+            --duration 8 --n-calls 20000 --binary "$in/p11scope" --no-build \
+            --work "$TMPDIR/system-scale"
+      # A named capture starting beside an unpublished p11-kit closure array:
+      # the observer must start PARTIAL with the closure gap named, then
+      # attach the three providers the holder loads after attach and count
+      # exactly 18 calls over 242 slots. The pre-fix observer refuses to
+      # start here, so this cell guards that startup rule.
+      - name: Run p11-kit pid-startup cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          scripts/verify-p11kit-pid-startup.sh \
+            --binary "$RUNNER_TEMP/release-inputs/p11scope" \
+            --work "$TMPDIR/p11kit-pid-startup"
+      - name: Validate the four capture records
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - "$TMPDIR/system-scale/matrix.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          def require(ok, reason):
+              if not ok:
+                  raise RuntimeError(reason)
+
+          matrix = json.loads(Path(sys.argv[1]).read_text())
+          require(matrix.get("schema") == "p11scope/system-scope-matrix/v1", "matrix schema")
+          expected = {"pid/metrics", "pid/profile", "system/metrics", "system/profile"}
+          records = matrix["records"]
+          require(set(records) == expected, "four distinct capture records required")
+          for key in sorted(expected):
+              row = records[key]
+              condition = row["condition"]
+              require(key == condition["scope"] + "/" + condition["mode"], "cell identity")
+              require(condition["n_calls"] == 20000, "expected workload size")
+              truth = row["truth_vs_observed"]
+              require(truth["truth"]["C_GenerateRandom"] == 20000, "nonzero workload truth")
+              require(truth["counts_match"] is True, key + ": expected-count oracle failed")
+              require(row["window"]["window_valid"] is True, key + ": capture window oracle failed")
+              harness = row["harness"]
+              require(harness["observer_exit"] == 0, key + ": observer exit")
+              require(harness["observer_timed_out"] is False, key + ": observer timeout")
+              require(harness["observer_signal"] is None, key + ": observer signal")
+              evidence = row["evidence"]
+              for name in ("event_loss", "semantic_capture_failures"):
+                  value = evidence["counters"][name]
+                  require(type(value) is int and value == 0, key + ": capture loss counter " + name)
+              pending = evidence["in_flight_at_end"]
+              require(type(pending) is int and pending == 0, key + ": calls remain in flight")
+              report = json.loads(Path(row["artifacts"]["report"]).read_text())
+              require(report["evidence"]["drain_proven"] is True, key + ": final drain unproven")
+              print("PASS " + key + " expected_random_calls=20000")
+          PY
+      - name: Upload the system-scale results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: system-scale
+          path: |
+            /var/tmp/p11scope-ws-tmp/doctor.txt
+            /var/tmp/p11scope-ws-tmp/doctor-status.txt
+            /var/tmp/p11scope-ws-tmp/system-scale/matrix.json
+            /var/tmp/p11scope-ws-tmp/system-scale/*/summary.txt
+            /var/tmp/p11scope-ws-tmp/system-scale/*/stderr.txt
+          if-no-files-found: warn
+          retention-days: 7
+  # The public CLI cells (doctor, profile/metrics/trace --pid, a
+  # multi-threaded exact count, --system, run, SIGINT and refusal
+  # controls) as root: on the runner kernel and in virtme-ng guests. The
+  # host leg runs through scripts/ci/run-cell-script.sh as the template
+  # proof; WP-4 breadth and WP-5 legacy32 extend here, packed into this
+  # job's matrix, never as new jobs.
+  public-cli:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Newest mainline first-class: add each new release (7.4 when it ships).
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq procps python3 softhsm2 util-linux
+      - name: Enable KVM and install pinned virtme-ng
+        if: matrix.kernel != 'host'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - if: matrix.kernel != 'host'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      - name: Verify the kernel download
+        if: matrix.kernel != 'host'
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }}" >&2; exit 1; }
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          # Under the workspace (hence under /home): vng hides host /tmp
+          # and /var/tmp from the guest.
+          path: release-inputs
+      - name: Run the public CLI cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$GITHUB_WORKSPACE/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/cli-out"
+          rc=0
+          if [ "${{ matrix.kernel }}" = host ]; then
+            uname -a
+            # Ruling CI-GAP-1: the hosted host system cell discloses shared-
+            # runner descendant exits as runner noise. VNG guests keep the
+            # strict no-gap mode (no flag on the guest leg below).
+            # Template proof: the host leg runs through run-cell-script.sh,
+            # which validates with check-cell-results.py (smoke allow-listed).
+            sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/run-cell-script.sh public-cli-host "$in/p11scope" "$out/cells" \
+              --allow-nonqualifying trace-pid \
+              --expected-failure profile-cgroup --expected-failure trace-cgroup \
+              --expected-failure inventory-cgroup --expected-failure profile-pid-ia32 \
+              --expected-failure run-ia32 \
+              --require doctor --require profile-pid --require names-pid --require verdict-pid \
+              --require metrics-pid --require trace-pid --require run-short --require run-cover \
+              --require mt-exact --require system --require sigint --require second-sigint \
+              --require fifo-refused \
+              >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
+            sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+            tail -40 "$RUNNER_TEMP/qual.log"
+          else
+            scripts/qualify-public-cli-vng.sh "${{ matrix.kernel }}" "$in/p11scope" "$out" || rc=$?
+            tail -40 "$out/qual.log" || true
+            cat "$out/uname.txt" || true
+          fi
+          echo "qualify rc=$rc"
+          # The wrapper translates the documented nonqualifying-smoke exit 2
+          # to 0 when results exist; the per-cell checks below still decide.
+          python3 -I - "$out/cells/results.jsonl" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          cells = {row["cell"]: row for row in rows}
+          need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
+                  "run-short", "run-cover", "run-prearm", "mt-exact", "system", "sigint", "second-sigint",
+                  "fifo-refused", "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
+                  "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
+                  "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
+                  "select-endpoint-pid", "select-endpoint-system",
+                  "profile-pid-ia32", "run-ia32", "startup-to-capturing"}
+          problems = sorted("missing cell " + name for name in need - set(cells))
+          # trace-pid stays nonqualifying smoke; the gap cells below are
+          # declared expected-failures with named product reasons.
+          # run-short, run-cover and metrics-cgroup are qualified now
+          # that their observation gaps closed; inventory-cgroup shows
+          # the owned-module gap signature on every kernel, so it is
+          # declared everywhere. The harness emits expected only on
+          # the known signatures, qualified on pass.
+          smoke_cells = {"trace-pid"}
+          expected_cells = {"profile-cgroup", "trace-cgroup", "inventory-cgroup",
+                            "profile-pid-ia32", "run-ia32"}
+          actual_expected = set()
+          actual_smoke = set()
+          for row in rows:
+              cell, qual = row["cell"], row["qualification"]
+              if qual == "expected-failure":
+                  actual_expected.add(cell)
+                  if row["pass"]:
+                      status = "UNEXPECTED PASS"
+                      problems.append("unexpected pass " + cell)
+                  elif cell in expected_cells:
+                      status = "EXPECTED"
+                  else:
+                      status = "UNDECLARED EXPECTED"
+                      problems.append("undeclared expected " + cell)
+              elif qual == "nonqualifying":
+                  if cell in smoke_cells:
+                      actual_smoke.add(cell)
+                      status = "SMOKE"
+                  else:
+                      status = "FAIL"
+                      problems.append("non-smoke nonqualifying " + cell)
+              elif row["pass"] and qual == "failed":
+                  status = "INCONSISTENT"
+                  problems.append("inconsistent row " + cell)
+              elif not row["pass"]:
+                  status = "FAIL"
+                  problems.append("failed cell " + cell)
+              else:
+                  status = "PASS"
+              print(status, cell, row["detail"][:200])
+          for name in sorted(expected_cells - actual_expected):
+              problems.append("missing expected " + name)
+          for name in sorted(actual_expected - expected_cells):
+              problems.append("extra expected " + name)
+          for name in sorted(smoke_cells - actual_smoke):
+              problems.append("missing smoke " + name)
+          for name in sorted(actual_smoke - smoke_cells):
+              problems.append("extra smoke " + name)
+          if problems:
+              raise SystemExit("\n".join(problems))
+          PY
+          if [ "${{ matrix.kernel }}" = host ]; then
+            # Workflow-side doctor check (the lane script belongs to WP-4):
+            # the same two functional rows must read ok on the host.
+            python3 -I - "$out/cells/doctor.out" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          for name in ("uprobe-multi attach (own libc)", "uretprobe vs seccomp"):
+              rows = [line for line in lines if line.startswith(name)]
+              if len(rows) != 1 or re.fullmatch(re.escape(name) + r" \.* ok(?:[ \t].*)?", rows[0]) is None:
+                  raise RuntimeError("functional doctor row missing, duplicated or not ok: " + name)
+          print("doctor functional rows ok (public-cli host)")
+          PY
+          fi
+      - name: Upload the CLI results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-cli-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/cli-out/cells/results.jsonl
+            ${{ github.workspace }}/cli-out/cells/summary.txt
+            ${{ github.workspace }}/cli-out/cells/doctor.out
+            ${{ github.workspace }}/cli-out/cells/*.stderr
+            ${{ github.workspace }}/cli-out/cells/*.json
+            ${{ github.workspace }}/cli-out/qual.log
+            ${{ github.workspace }}/cli-out/vng-console.log
+            ${{ runner.temp }}/qual.log
+          if-no-files-found: warn
+          retention-days: 7
+  # The two ia32 public-CLI cells with a real i386 provider: this job
+  # installs libsofthsm2:i386, which cannot coexist with the amd64
+  # provider the main legs use, so it stays separate. The main legs
+  # keep both ia32 cells as declared expected-failures.
+  public-cli-ia32:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n dpkg --add-architecture i386 && sudo -n apt-get update && sudo -n apt-get install -y gcc jq procps python3 libsofthsm2:i386 softhsm2:i386 gcc-multilib libc6-dev-i386
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the ia32 cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/cli-ia32-out"
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_PUBLIC_CLI_ONLY_IA32=1 scripts/qualify-public-cli.sh "$in/p11scope" "$out/cells"
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          # The shared closed-set gate (as the host leg): the ia32 cells
+          # route through judge and pass with owned-provider-counts.
+          python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
+            --require profile-pid-ia32 --require run-ia32
+      - name: Upload the ia32 results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-cli-ia32
+          path: |
+            ${{ github.workspace }}/cli-ia32-out/cells/results.jsonl
+            ${{ github.workspace }}/cli-ia32-out/cells/summary.txt
+            ${{ github.workspace }}/cli-ia32-out/cells/*.stderr
+            ${{ github.workspace }}/cli-ia32-out/cells/*.json
+          if-no-files-found: warn
+          retention-days: 7
+  # SoftHSM 2.7 table-shape exact cells: a synthetic 68-slot provider
+  # labelled {3,2} plus the stock module as control, each through the
+  # profile-pid and system public-CLI cells. The Ubuntu runner's stock
+  # SoftHSM 2.6.1 is the control (a 2.7 stock would fail for the shape
+  # reason, so the job asserts the 2.6.x stock first).
+  legacy32-shape:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y binutils gcc jq procps python3 softhsm2 util-linux
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the legacy32 shape cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          stock_ver=$(dpkg-query -W -f='${Version}' softhsm2)
+          echo "stock SoftHSM: $stock_ver"
+          case "$stock_ver" in
+            2.6.*) ;;
+            *) echo "stock control needs SoftHSM 2.6.x, have $stock_ver" >&2; exit 1 ;;
+          esac
+          out="$GITHUB_WORKSPACE/legacy32-out"
+          # Ruling CI-GAP-1, as in the public-cli host leg: the system
+          # cells disclose shared-runner descendant exits as runner noise.
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/legacy32-shape.sh "$in/p11scope" "$out"
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          python3 -I - "$out/results.jsonl" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          cells = {row["cell"]: row for row in rows}
+          need = {"legacy32-pid", "legacy32-system", "stock-pid", "stock-system"}
+          problems = sorted("missing cell " + name for name in need - set(cells))
+          problems += sorted("extra cell " + name for name in set(cells) - need)
+          for row in rows:
+              status = "PASS" if row["pass"] else "FAIL"
+              print(status, row["cell"], row["qualification"], row["detail"][:200])
+              if not row["pass"] or row["qualification"] != "qualified":
+                  problems.append("unqualified cell " + row["cell"])
+          if problems:
+              raise SystemExit("\n".join(problems))
+          PY
+      - name: Upload the legacy32 results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: legacy32-shape
+          path: |
+            ${{ github.workspace }}/legacy32-out/results.jsonl
+            ${{ github.workspace }}/legacy32-out/legacy32/qual.log
+            ${{ github.workspace }}/legacy32-out/legacy32/results.jsonl
+            ${{ github.workspace }}/legacy32-out/stock/qual.log
+            ${{ github.workspace }}/legacy32-out/stock/results.jsonl
+          if-no-files-found: warn
+          retention-days: 7
+  # Dual-outcome integration tests as root with the positive branch
+  # required: run_lifecycle, pause, t2_cold_start and ux_journeys cells
+  # plus the second-SIGINT report cell (13 rows, all qualified; the
+  # script judges the branch of each cell, not just its exit code).
+  # Root-required, consistent with the cell template.
+  root-integration:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-root-integration-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Build the five integration test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" test --locked --offline --no-run \
+            --test run_lifecycle --test pause --test t2_cold_start \
+            --test ux_journeys --test run_abandon_report \
+            --message-format=json >"$RUNNER_TEMP/root-build.jsonl"
+          bindir="$GITHUB_WORKSPACE/root-test-bins"
+          mkdir -p "$bindir"
+          for target in run_lifecycle pause t2_cold_start ux_journeys run_abandon_report; do
+            exe=$(jq -r --arg t "$target" 'select(.reason == "compiler-artifact" and .target.name == $t and (.target.kind | any(. == "test"))) | .executable' "$RUNNER_TEMP/root-build.jsonl" | grep -v '^null$' | tail -1)
+            test -x "$exe"
+            cp -p "$exe" "$bindir/$target"
+          done
+          ls -l "$bindir"
+      - name: Run the root-integration cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/root-integration-out"
+          sudo -n scripts/ci/run-root-integration.sh "$in/p11scope" "$out" "$GITHUB_WORKSPACE/root-test-bins"
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          # Inline exact-set check (the WP-1 checker takes this over
+          # with --require when that lane ports; same 13 cells).
+          python3 -I - "$out/results.jsonl" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          cells = {row["cell"]: row for row in rows}
+          need = {"run_lifecycle::an_owned_run_reports_the_exact_child_status_and_reaps_it",
+                  "run_lifecycle::a_signalled_child_reports_the_signal_status_the_shell_would",
+                  "run_lifecycle::duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_for",
+                  "run_lifecycle::the_run_only_evidence_field_reaches_the_written_document",
+                  "pause::omitted_pause_is_never_and_publishes_the_neutral_lattice",
+                  "pause::explicit_auto_falls_back_to_a_partial_attempt_instead_of_failing",
+                  "pause::explicit_always_refuses_rather_than_completing_unpaused",
+                  "t2_cold_start::cold_start_profile_lane_is_honest_without_ambient_state",
+                  "t2_cold_start::cold_start_run_lane_is_honest_without_ambient_state",
+                  "ux_journeys::b6_doctor_reports_rows_and_verdict",
+                  "ux_journeys::b7_run_refuses_without_capture_lane",
+                  "ux_journeys::t3_f3_doctor_verdict_ends_with_newline",
+                  "run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130"}
+          problems = sorted("missing cell " + name for name in need - set(cells))
+          problems += sorted("extra cell " + name for name in set(cells) - need)
+          for row in rows:
+              status = "PASS" if row["pass"] else "FAIL"
+              print(status, row["cell"], row["qualification"], row["detail"][:200])
+              if not row["pass"] or row["qualification"] != "qualified":
+                  problems.append("unqualified cell " + row["cell"])
+          if problems:
+              raise SystemExit("\n".join(problems))
+          PY
+      - name: Upload the root-integration results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: root-integration
+          path: |
+            ${{ github.workspace }}/root-integration-out/results.jsonl
+            ${{ github.workspace }}/root-integration-out/summary.txt
+            ${{ github.workspace }}/root-integration-out/*.log
+          if-no-files-found: warn
+          retention-days: 7
+  # P2-8 pre-arm witness CLI cells (tests/prearm_witness_cli.rs): exact
+  # profile/trace counts through the real command line against SoftHSM.
+  # The P-B re-file is integrated, so the early-workload twin runs on
+  # every leg including v6.6.157 (no pre-6.8 gate). One matrix like
+  # public-cli: the host runner kernel plus the four pinned guests; the
+  # guest legs run the same host-built test binary inside vng.
+  witness-cli:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-witness-cli-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Enable KVM and install pinned virtme-ng
+        if: matrix.kernel != 'host'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      - if: matrix.kernel != 'host'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      - name: Verify the kernel download
+        if: matrix.kernel != 'host'
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }}" >&2; exit 1; }
+      - name: Build the witness CLI test target
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" build --locked --offline -p p11scope -p p11scope-discover
+          cargo +"$toolchain" test --locked --offline --no-run --test prearm_witness_cli --message-format=json >"$RUNNER_TEMP/witness-build.jsonl"
+          exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "prearm_witness_cli" and (.target.kind | any(. == "test"))) | .executable' "$RUNNER_TEMP/witness-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$exe"
+          echo "WITNESS_TESTBIN=$exe" >>"$GITHUB_ENV"
+      - name: Run the witness CLI cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          out="$GITHUB_WORKSPACE/witness-cli-out"
+          if [ "${{ matrix.kernel }}" = host ]; then
+            uname -a
+            sudo -n scripts/ci/run-witness-cli.sh "$WITNESS_TESTBIN" "$out/cells"
+            sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          else
+            scripts/ci/witness-cli-vng.sh "$WITNESS_TESTBIN" "$out" "${{ matrix.kernel }}"
+          fi
+          # The shared closed-set gate: the same 6 cells on every leg,
+          # all exact-positive.
+          python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
+            --require privileged_profile_pid_prearm_clean_exact_counts \
+            --require privileged_profile_cgroup_prearm_clean_exact_counts \
+            --require privileged_profile_system_prearm_clean_exact_counts \
+            --require privileged_profile_metrics_system_prearm_clean_exact_counts \
+            --require privileged_profile_pid_prearm_twin_exact_window \
+            --require privileged_trace_system_prearm_clean_exact_counts
+      - name: Upload the witness CLI results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: witness-cli-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/witness-cli-out/cells/results.jsonl
+            ${{ github.workspace }}/witness-cli-out/cells/summary.txt
+            ${{ github.workspace }}/witness-cli-out/cells/*.log
+            ${{ github.workspace }}/witness-cli-out/uname.txt
+            ${{ github.workspace }}/witness-cli-out/run.log
+            ${{ github.workspace }}/witness-cli-out/vng-console.log
+          if-no-files-found: warn
+          retention-days: 7
+  # Real browsers: Firefox and Chromium started through Playwright with
+  # a SoftHSM token, observed by the release binary as root, in strict
+  # mode (a missing prerequisite fails instead of skipping).
+  browser-cells:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y libnss3-tools openssl opensc python3 python3-venv softhsm2
+      - name: Install pinned Playwright and its browsers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/pw"
+          "$RUNNER_TEMP/pw/bin/pip" install --quiet "playwright==$CI_PLAYWRIGHT_VERSION"
+          "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium firefox
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the browser cells (strict)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          mkdir -m 700 "$RUNNER_TEMP/browser-tmp"
+          P11SCOPE_BIN="$in/p11scope" P11SCOPE_BROWSER_STRICT=1 TMPDIR="$RUNNER_TEMP/browser-tmp" \
+            "$RUNNER_TEMP/pw/bin/python" -I tests/python/test_browser_cells.py -v 2>&1 | tee "$RUNNER_TEMP/browser.log"
+      - name: Upload the browser log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-cells
+          path: ${{ runner.temp }}/browser.log
+          if-no-files-found: warn
+          retention-days: 7

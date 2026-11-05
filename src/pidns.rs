@@ -263,6 +263,21 @@ pub(crate) mod test_seam {
     }
 }
 
+/// Cgroup userspace discovery and native identity share initial task numbering.
+/// This refusal cannot recommend cgroup scope as a namespace workaround.
+pub(crate) fn require_inventory_cgroup_numbering(numbering: &PidNumbering) -> Result<()> {
+    if numbering.agrees() {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(NumberingMismatch(format!(
+        "{MISMATCH_CODE}: refusing cgroup inventory: userspace discovery and native image \
+         identity require the initial PID namespace and matching procfs; observer is {}, \
+         procfs numbering is {}. Run with the initial task numbering and its matching /proc",
+        numbering.observer.label(),
+        numbering.proc_view.label(),
+    ))))
+}
+
 /// Refuses a PID-scoped capture unless `/proc` PIDs are proven to be the
 /// kernel's PIDs. `what` names the operator's request (`--pid 42`, `run`,
 /// `inventory --pid 42`). The kernel-side scope filter keys on initial-

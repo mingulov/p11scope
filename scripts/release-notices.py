@@ -244,6 +244,9 @@ def make_config(metadata, root, recipe):
 
 
 def toolchain_payload(root, recipe):
+    release_rust = checked_bytes(root / ".release-rust-version").decode("utf-8").strip()
+    if sum(item["name"] == release_rust for item in recipe["toolchains"]) != 1:
+        raise NoticeError("notice recipe must name the current release compiler exactly once")
     payload, facts = {}, []
     for item in recipe["toolchains"]:
         rustc = Path(run(["rustup", "which", "--toolchain", item["name"], "rustc"], root))

@@ -28,19 +28,22 @@ MAPS = {name: checker.map_def(*shape) for name, shape in {
     "CGROUP_FILTER": (8, 4, 4, 1), "TAIL_CALLS": (3, 4, 4, 2),
     "STACK_GUARD": (3, 4, 4, 1),
     "EVIDENCE": (6, 4, 8, 9), "COUNTERS": (6, 4, 8, 5),
-    "DISCOVERY": (27, 0, 0, 2097152), "DISCOVERY_STATE": (1, 24, 24, 64),
+    "DISCOVERY": (27, 0, 0, 8388608), "DISCOVERY_STATE": (1, 24, 24, 64),
     "THREAD_OWNER": (29, 4, 544, 0, 1), "OWNER_CTL": (2, 4, 56, 1),
     "USAGE": (2, 4, 8, 1), "USAGE_CONFIG": (2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": (6, 4, 8, 3), "ENDPOINT_OBJECT": (2, 4, 8, 1, 128),
     "CALLER_USE": (1, 24, 40, 1), "CALLER_EVIDENCE": (6, 4, 8, 4),
     "TASK_COOKIE": (29, 4, 8, 0, 1), "COOKIE_CTL": (2, 4, 40, 1),
+    "INV_BASELINE_RQ": (1, 4, 16, 1024, 129),
+    "INV_BASELINE_CT": (2, 4, 56, 1),
 }.items()}
 PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
-            "interface_return", "sched_process_exec", "sched_process_exit"}
-SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg",
-           "p11_link_current_identity"}
+            "interface_return", "sched_process_exec", "sched_process_exit",
+            "p11_inventory_image_baseline"}
+SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg", "p11_exec_dumpability",
+           "p11_exe_identity", "p11_link_current_identity", "p11_link_current_cookie"}
 MASK = (1 << 64) - 1
 VALUE = 40  # CALLER_USE layout version 2: the 32-byte witness plus entry_count
 COUNT = 32  # entry_count offset: the only CALLER_USE bytes BPF may change
@@ -61,6 +64,9 @@ class CallerManifestTests(unittest.TestCase):
             if variant.endswith("small-discovery"):
                 maps["DISCOVERY"]["max_entries"] = 4096
             checker.validate_inventory(variant, maps, PROGRAMS, SYMBOLS)
+            with self.subTest(variant=variant, missing_exec=True), self.assertRaisesRegex(RuntimeError, "missing required .text helpers"):
+                checker.validate_inventory(variant, maps, PROGRAMS,
+                                           SYMBOLS - {"p11_exec_dumpability"})
             for name in maps:
                 for field in checker.MAP_FIELDS:
                     changed = {key: dict(value) for key, value in maps.items()}
@@ -72,16 +78,22 @@ class CallerManifestTests(unittest.TestCase):
         for root in PROGRAMS:
             with self.subTest(missing=root), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
                 checker.validate_inventory("inventory-callers", MAPS, PROGRAMS - {root}, SYMBOLS)
-        for root in ("p11_entry", "p11_return", "task_newtask", "iterator"):
+        for root in ("p11_entry", "p11_return", "task_newtask", "iterator",
+                     "p11_selected_bootstrap", "p11_selected_cgroup_migrate"):
             with self.subTest(extra=root), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
                 checker.validate_inventory("inventory-callers", MAPS, PROGRAMS | {root}, SYMBOLS)
         for name in ("START", "EVENTS", "ROOT_CTL", "p11_link_emit_fork", "p11_link_fork_allowed",
-                     "p11_root_current_exit", "p11_owner_start_get", "p11_link_task_identity"):
+                     "p11_root_current_exit", "p11_owner_start_get", "p11_link_task_identity",
+                     "SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL",
+                     "p11_selected_current_allowed", "p11_selected_invalidate_tgid"):
             with self.subTest(symbol=name), self.assertRaises(RuntimeError):
                 checker.validate_inventory("inventory-callers", MAPS, PROGRAMS, SYMBOLS | {name})
         with self.assertRaises(RuntimeError):
             checker.validate_inventory("inventory-callers", MAPS, PROGRAMS,
                                        SYMBOLS - {"p11_link_current_identity"})
+        with self.assertRaises(RuntimeError):
+            checker.validate_inventory("inventory-callers", MAPS, PROGRAMS,
+                                       SYMBOLS - {"p11_link_current_cookie"})
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
             checker.validate_inventory("inventory", MAPS, PROGRAMS, SYMBOLS)
 

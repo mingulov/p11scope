@@ -30,6 +30,14 @@ typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK
 #ifndef NO_GET_INTERFACE
 #define NO_GET_INTERFACE 0
 #endif
+#ifndef INTERFACE_ONLY_FIXTURE
+#define INTERFACE_ONLY_FIXTURE 0
+#endif
+#if INTERFACE_ONLY_FIXTURE
+#define INVENTORY_EXPORT __attribute__((visibility("hidden")))
+#else
+#define INVENTORY_EXPORT
+#endif
 #ifndef UNKNOWN_FLAGS_FIXTURE
 #define UNKNOWN_FLAGS_FIXTURE 0
 #endif
@@ -104,7 +112,7 @@ static void fill(void) {
 #endif
 }
 
-CK_RV C_GetFunctionList(void **pp) {
+INVENTORY_EXPORT CK_RV C_GetFunctionList(void **pp) {
     fill();
     *pp = &legacy;
     return CKR_OK;
@@ -114,7 +122,7 @@ static char name_std[] = "PKCS 11";
 static char name_vendor[] = "Vendor NetHSM-Ext";
 static unsigned char vendor_blob[64]; /* opaque vendor "table": never walked */
 
-CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
+INVENTORY_EXPORT CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
     fill();
     if (!count) return CKR_ARGUMENTS_BAD;
     if (!out) { *count = 3; return CKR_OK; }

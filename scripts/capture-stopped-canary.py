@@ -10,6 +10,7 @@ No Python result alone qualifies a live kernel, BPF build or target ABI.
 """
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -46,6 +47,13 @@ LANES = {
     'feature-unsafe-fault': ('diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'faults'),
     'owned-default-metrics': ('default', 'metrics', 'aggregate-only', 'matrix'),
     'owned-feature-metrics': ('diagnostic', 'metrics', 'aggregate-only', 'matrix'),
+    # H7 slice D object cells: the completion phase drives all 25 named
+    # object functions (matrix-shaped barrier), the blocked phase parks
+    # four object workers for the stopped side-row acquisition.
+    'object-lp64': ('default', 'profile', 'allowlisted', 'object'),
+    'object-lp64-blocked': ('default', 'profile', 'allowlisted', 'object-blocked'),
+    'object-ia32': ('default', 'profile', 'allowlisted', 'object'),
+    'object-ia32-blocked': ('default', 'profile', 'allowlisted', 'object-blocked'),
 }
 OWNED_LANES = frozenset(('owned-default-metrics', 'owned-feature-metrics'))
 OWNED_DURATION_SECONDS = 35
@@ -53,8 +61,45 @@ OWNED_CHILD_WAIT_SECONDS = 5
 MAP_TYPES = {1: 'hash', 2: 'array', 3: 'prog_array', 5: 'percpu_hash',
              6: 'percpu_array', 8: 'cgroup_array', 9: 'lru_hash', 27: 'ringbuf',
              29: 'task_storage'}
+# G23/IMAGE: Linux reports only permanent map flags on the live map
+# object and moves WRONLY to the created FD (the product loader checks
+# the original owned FD separately). The pinned ELF policy still
+# declares 17 for these two private hashes; the live comparison below
+# expects exactly the kernel's report. No other map or field is
+# narrowed: any other live value still fails.
+LIVE_IMAGE_MAP_FLAGS = {"IMAGE_CONTINUITY": 1, "IMAGE_TGID_INDEX": 1}
+# b992999b: `--mode metrics` selects CapturePolicy::AggregateOnly, which
+# wants no instance hooks, so the loader sizes these three IMAGE maps to
+# one entry (the image_query contract accepts count=1 when not full).
+# The pinned ELF policy still declares full sizes; the live comparison
+# below expects exactly the loader's size-1 report for these maps on
+# aggregate-only lanes. No other map, field, or lane is narrowed: any
+# other live value still fails.
+AGGREGATE_ONLY_SINGLETON_MAPS = frozenset({
+    "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"})
 STOP_SECONDS = 30
-READY_SECONDS = 8
+# Declared per-kernel canary readiness bounds: declared, measured and
+# disclosed test parameters per kernel/host (correctness and zero loss stay
+# hard gates). Keyed by the running kernel's major.minor from os.uname():
+# kernels at or above MODERN_READY_KERNEL use READY_SECONDS; the legacy
+# kernels in LEGACY_READY_KERNELS, where the kernel verifies each BPF
+# program load several times slower, use READY_SECONDS_LEGACY_KERNEL. Any
+# other kernel refuses rather than guesses, and no environment variable
+# overrides these bounds. Historical FULL-default discovery-to-capturing on
+# 4 vCPUs: 6.6.157 4.5-4.9 s, host 7.0 6.25-6.6 s, 6.1.188 16.7-17.4 s,
+# 5.15.221 17.0-20.2 s (0-probe 14.8-21.5 s under host load); the 30 s
+# legacy bound holds margin over those measured maxima under load. Current
+# FULL32 whole-observer setup samples on a supported host were 7.512, 13.133
+# and 17.217 s; the complete syscall diagnostic attributed 96.5% of the
+# post-discovery interval to BPF_PROG_LOAD. The owner approved the measured
+# 20 s observer allowance on 2026-10-28; the original 8 s failure remains.
+# Preliminary borrowed-workload roster/custody checks keep their old 8 s
+# allowance rather than composing two 20 s phases before the native GO bound.
+READY_SECONDS = 20
+WORKLOAD_ROSTER_SECONDS = 8
+READY_SECONDS_LEGACY_KERNEL = 30
+LEGACY_READY_KERNELS = frozenset(((5, 15), (6, 1)))
+MODERN_READY_KERNEL = (6, 6)
 RESUME_SECONDS = 5
 OBSERVER_WAIT_SECONDS = 20
 PUBLICATION_SECONDS = 10
@@ -107,7 +152,13 @@ def sanitized(phase, error):
         else:
             # Do not use str(error): accepted legacy validators can attach raw
             # bytes, and subprocess failures can attach argv/stdout/stderr.
-            if isinstance(item, custody.DeadlineExpired):
+            population = dumper.population_diagnostic(item)
+            ring = evidence.ring_diagnostic(item)
+            if population is not None:
+                kind = population
+            elif ring is not None:
+                kind = ring
+            elif isinstance(item, custody.DeadlineExpired):
                 kind = 'phase deadline expired'
             else:
                 kind = type(item).__name__
@@ -129,6 +180,40 @@ def remaining(deadline, maximum=None):
     value = deadline - time.monotonic()
     require(math.isfinite(value) and value > 0, 'phase deadline expired')
     return min(value, maximum) if maximum is not None else value
+
+
+def ready_bound_seconds(release, *, workload_roster=False):
+    """Declared canary readiness bound in seconds for a kernel release.
+
+    The release's leading major.minor selects the bound: legacy kernels
+    from LEGACY_READY_KERNELS use READY_SECONDS_LEGACY_KERNEL, kernels
+    at or above MODERN_READY_KERNEL use READY_SECONDS for observer startup
+    or WORKLOAD_ROSTER_SECONDS for preliminary borrowed-workload checks.
+    Anything else (older, unknown or unparseable) refuses rather than guesses.
+    This selects a canary timer; it does not admit a host for live capture.
+    """
+    match = re.match(r'(\d+)\.(\d+)', release) if isinstance(release, str) else None
+    if match is None:
+        raise CaptureError('unparseable kernel release for canary readiness')
+    key = (int(match.group(1)), int(match.group(2)))
+    if key in LEGACY_READY_KERNELS:
+        return READY_SECONDS_LEGACY_KERNEL
+    if key >= MODERN_READY_KERNEL:
+        return WORKLOAD_ROSTER_SECONDS if workload_roster else READY_SECONDS
+    if re.fullmatch(r'[A-Za-z0-9._+~-]{1,64}', release):
+        raise CaptureError(f'canary readiness has no declared bound for kernel {release}')
+    raise CaptureError('canary readiness has no declared bound for this kernel')
+
+
+def declared_kernel_label(release):
+    """Single-line kernel label for the declared readiness bound line.
+
+    Real releases use [A-Za-z0-9._+~-]; anything else (including control
+    characters from a corrupt or hostile uname string) is replaced so the
+    CANARY_READY_BOUND_DECLARED line stays one parseable line. The bound
+    itself never depends on the suffix, only on major.minor.
+    """
+    return re.sub(r'[^A-Za-z0-9._+~-]', '?', release)[:64]
 
 
 def unique_object(pairs):
@@ -242,7 +327,7 @@ def validate_config(config):
     destinations = [config.go, config.finish, config.observer_log, Path(f'{config.prefix}.output'),
                     config.out_dir / f'mapdump_manifest_{config.lane}.json',
                     config.out_dir / f'mapdump_snapshot_{config.lane}.json']
-    if config.workload_mode == 'matrix':
+    if config.workload_mode in ('matrix', 'object'):
         destinations.append(config.done)
     if config.workload_origin == 'owned':
         destinations.append(config.ready)
@@ -268,7 +353,8 @@ def ready_roster(config, deadline):
             and doc['schema'] == 'p11scope/canary-roster/v1'
             and doc['mode'] == config.workload_mode and type(doc['pid']) is int
             and doc['pid'] == config.workload_pid, 'invalid READY identity or schema')
-    count = {'matrix': 0, 'blocked': 4, 'faults': 2}[config.workload_mode]
+    count = {'matrix': 0, 'blocked': 4, 'faults': 2, 'object': 0,
+             'object-blocked': 4}[config.workload_mode]
     tasks = doc['tasks']
     require(isinstance(tasks, list) and len(tasks) == count + 1, 'incomplete READY roster')
     tids, indices, leaders = set(), set(), 0
@@ -331,7 +417,7 @@ def start_bindings(entries, tasks, config, *, complete):
                 and slot < 512 and padding == 0, 'invalid START worker key')
         start = evidence.decode_start(evidence.bpftool_bytes(entry['value'], evidence.CALL_START_SIZE))
         index = workers[tid]['call_index']
-        base = 0x301 if config.workload_mode == 'blocked' else 0x401
+        base = {'blocked': 0x301, 'faults': 0x401, 'object-blocked': 0x501}[config.workload_mode]
         require(start['session'] == base + index, 'START session contradicts READY call')
         bindings[tid], slots[index] = key, slot
         starts.append(start)
@@ -339,9 +425,42 @@ def start_bindings(entries, tasks, config, *, complete):
         require(set(bindings) == set(workers), 'incomplete START worker keys')
         if config.workload_mode == 'blocked':
             require(slots[1] == slots[2] == slots[3] and slots[0] != slots[1], 'START runtime slot relationship mismatch')
+        elif config.workload_mode == 'object-blocked':
+            require(len(set(slots.values())) == 4, 'START object runtime slots must differ')
         else:
             require(slots[0] != slots[1], 'START fault runtime slots must differ')
     return bindings, starts
+
+
+def assert_blocked_semantics(config, ordinary, starts, workload_text):
+    """Dispatch the real stopped-map semantic oracle after ownership joins."""
+    if config.workload_mode == 'blocked':
+        lines = [line.removeprefix('P11SCOPE_POINTERS ') for line in workload_text().splitlines()
+                 if line.startswith('P11SCOPE_POINTERS ')]
+        require(len(lines) == 1, 'missing exact hostile pointer record')
+        evidence.assert_hostile_records(starts, json.loads(lines[0], object_pairs_hook=unique_object))
+    elif config.workload_mode == 'object-blocked':
+        lines = [line.removeprefix('P11SCOPE_OBJECT_POINTERS ') for line in workload_text().splitlines()
+                 if line.startswith('P11SCOPE_OBJECT_POINTERS ')]
+        require(len(lines) == 1, 'missing exact object pointer record')
+        start_keys, starts_by_tid = set(), {}
+        for cell in ordinary['START']:
+            key = evidence.bpftool_bytes(cell['key'], 16)
+            tid = evidence.u64(key, 0) & 0xffffffff
+            require(key not in start_keys and tid not in starts_by_tid, 'duplicate object START identity')
+            start_keys.add(key)
+            starts_by_tid[tid] = evidence.decode_start(evidence.bpftool_bytes(cell['value'], evidence.CALL_START_SIZE))
+        rows = [(evidence.bpftool_bytes(cell['key'], 16),
+                 evidence.decode_object_start(evidence.bpftool_bytes(cell['value'], 432)))
+                for cell in ordinary['OBJECT_START']]
+        require(len(rows) == len(start_keys) and {key for key, _ in rows} == start_keys,
+                'object side keys differ from exact START ownership')
+        evidence.assert_object_side_rows(rows, starts_by_tid,
+            json.loads(lines[0], object_pairs_hook=unique_object), config.target_bits)
+    else:
+        cells = [cell for cell in ordinary['EVIDENCE'] if evidence.u32(evidence.bpftool_bytes(cell['key'], 4), 0) == 5]
+        require(len(cells) == 1, 'missing fault evidence cell')
+        evidence.assert_fault_records(starts, evidence.value_total(cells[0].get('values', [])))
 
 
 class LiveMaps:
@@ -379,7 +498,7 @@ class LiveMaps:
         maps = [dumper.normalize_map_metadata(dumper.one(self._json(
             ['bpftool', '-j', 'map', 'show', 'id', str(map_id)], deadline, bound=65536)), map_id)
                 for map_id in ids]
-        validate_inventory(maps, self.config.variant)
+        validate_inventory(maps, self.config.variant, self.config.privacy)
         group.snapshot(deadline)
         return sorted(maps, key=lambda item: item['name'])
 
@@ -427,6 +546,36 @@ class LiveMaps:
     def ring_records(self, positions):
         return {name: reader.read_records(positions[name]) for name, reader in self.rings.items()}
 
+    def verify_object_scrub(self, maps, deadline):
+        """Read the original retained FDs after the observer's normal exit.
+
+        Require actual native Q before asking whether the hash is empty; a
+        stopped process or a closed observer FD is not a quiescence proof.
+        This performs no writes, opens no replacement map and builds nothing.
+        """
+        by_name = {item['name']: item for item in maps}
+        stop_fd = self.fd_by_id[by_name['STOP_GATE']['id']]
+        object_fd = self.fd_by_id[by_name['OBJECT_START']['id']]
+        libc = ctypes.CDLL(None, use_errno=True)
+        key, value = ctypes.create_string_buffer(4), ctypes.create_string_buffer(8)
+        attr = ctypes.create_string_buffer(dumper.BPF_ATTR_MAP_ELEM.pack(
+            stop_fd, 0, ctypes.addressof(key), ctypes.addressof(value), 0), dumper.BPF_ATTR_MAP_ELEM.size)
+        remaining(deadline)
+        require(libc.syscall(dumper.BPF_SYSCALL, 1, ctypes.byref(attr), ctypes.sizeof(attr)) == 0,
+                'retained STOP_GATE lookup failed')
+        remaining(deadline)
+        require(struct.unpack('<Q', value.raw)[0] == 1 << 63,
+                'retained object scrub lacks native quiescence')
+        next_key = ctypes.create_string_buffer(16)
+        attr = ctypes.create_string_buffer(dumper.BPF_ATTR_MAP_ELEM.pack(
+            object_fd, 0, 0, ctypes.addressof(next_key), 0), dumper.BPF_ATTR_MAP_ELEM.size)
+        ctypes.set_errno(0)
+        result = libc.syscall(dumper.BPF_SYSCALL, 4, ctypes.byref(attr), ctypes.sizeof(attr))
+        error = ctypes.get_errno()
+        remaining(deadline)
+        require(result < 0 and error == errno.ENOENT,
+                'retained OBJECT_START was not completely scrubbed and removed')
+
     def close(self):
         issues = []
         for name, reader in self.rings.items():
@@ -446,7 +595,7 @@ class LiveMaps:
             raise CaptureError(issues) from None
 
 
-def validate_inventory(maps, variant):
+def validate_inventory(maps, variant, privacy='allowlisted'):
     expected = definitions.SAFE_MAPS if variant == 'default' else definitions.UNSAFE_MAPS
     require(isinstance(maps, list) and len(maps) == len(expected)
             and {item['name'] for item in maps} == set(expected)
@@ -454,9 +603,77 @@ def validate_inventory(maps, variant):
     for item in maps:
         dumper.snapshot_map_metadata(item)
         wanted = expected[item['name']]
+        live_flags = LIVE_IMAGE_MAP_FLAGS.get(item['name'], wanted['flags'])
+        live_max = (1 if privacy == 'aggregate-only'
+                    and item['name'] in AGGREGATE_ONLY_SINGLETON_MAPS
+                    else wanted['max_entries'])
         require((item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
-                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], wanted['max_entries'], wanted['flags']),
+                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], live_max, live_flags),
                 f'map definition mismatch name={item["name"]}')
+
+
+def continuity_map_category(maps, ordinary, *, variant, privacy):
+    """Finite setup facts from the selected observer's already retained maps.
+
+    Full inventory validation binds IMAGE/instance maps to this acquisition;
+    the real raw-cell decoder requires complete, unique array indices. Only
+    INSTANCE_GEN's exact coverage cell3 is authority, never an unrelated row.
+    `map-facts-present` says nothing about a particular call's stamp join.
+    """
+    try:
+        if (type(maps) is not list or type(ordinary) is not dict
+                or any(type(item) is not dict for item in maps)):
+            return 'unknown'
+        validate_inventory(maps, variant, privacy)
+        by_name = {item['name']: item for item in maps}
+        decoded = {name: dumper.normalize_map_dump(ordinary[name], by_name[name])
+                   for name in ('INSTANCE_GEN', 'SLOT_FILE', 'WATCHED_FILES')}
+        generations = {evidence.u32(evidence.bpftool_bytes(row['key'], 4), 0):
+                       evidence.u64(evidence.bpftool_bytes(row['value'], 8), 0)
+                       for row in decoded['INSTANCE_GEN']}
+        coverage = generations[3]
+        slots = [evidence.u32(evidence.bpftool_bytes(row['value'], 4), 0)
+                 for row in decoded['SLOT_FILE']]
+        watched = [evidence.u32(evidence.bpftool_bytes(row['value'], 4), 0)
+                   for row in decoded['WATCHED_FILES']]
+        file_bound = by_name['WATCHED_FILES']['max_entries']
+        if len(set(watched)) != len(watched):
+            return 'unknown'
+    except (AssertionError, KeyError, TypeError, ValueError, RuntimeError, struct.error):
+        # An optional diagnostic never renders decoder context or replaces
+        # the ring's original refusal when map facts are missing/ambiguous.
+        return 'unknown'
+    if coverage == 0:
+        return 'coverage-disabled'
+    if coverage == 2:
+        return 'coverage-failed'
+    if coverage != 1:
+        return 'unknown'
+    if any(value > file_bound for value in slots):
+        return 'slot-files-invalid'
+    if any(value >= file_bound for value in watched):
+        return 'watched-files-invalid'
+    assigned = set(slots) - {0}
+    if not assigned:
+        return 'slot-files-empty'
+    if not watched:
+        return 'watched-files-empty'
+    if not assigned <= {value + 1 for value in watched}:
+        return 'slot-files-invalid'
+    return 'map-facts-present'
+
+
+def retained_ring_records(source, positions, maps, ordinary, *, variant, privacy):
+    category = continuity_map_category(maps, ordinary, variant=variant, privacy=privacy)
+    try:
+        return source.ring_records(positions)
+    except evidence.RingRecordRefusal as error:
+        if type(error) is evidence.RingRecordRefusal:
+            name, refusal = getattr(error, 'ring_name', None), getattr(error, 'category', None)
+            if (type(name) is str and name == 'EVENTS'
+                    and type(refusal) is str and refusal == 'discard'):
+                error.continuity_category = category
+        raise
 
 
 class AcquisitionFiles:
@@ -710,7 +927,7 @@ class Coordinator:
         create_control(cfg.go, lambda: setattr(self, 'go_created', True))
         self.check('GO-created', deadline)
         maps, bindings = None, None
-        if cfg.workload_mode == 'matrix':
+        if cfg.workload_mode in ('matrix', 'object'):
             wait_done(cfg, workload, deadline, self.check)
         else:
             maps = source.inventory(observer.group, deadline)
@@ -772,9 +989,13 @@ class Coordinator:
             self.files.write(self.files.stage / f'mapdump_{item["name"]}_{cfg.lane}.bin', raw)
             values[item['name']] = raw
         self.check('retained-rings', deadline)
-        rings = source.ring_records(positions)
+        rings = retained_ring_records(source, positions, maps, ordinary,
+                                      variant=cfg.variant, privacy=cfg.privacy)
         for name, rows in rings.items():
-            raw = b''.join(rows)
+            # Frame each record with its 8-byte ring header (length plus
+            # zero flags) so mixed 368/608-byte EVENTS forms split exactly
+            # in the final scan; the kernel padding lives only in strides.
+            raw = b''.join(struct.pack('<II', len(row), 0) + row for row in rows)
             self.files.write(evidence.ring_raw_path(self.files.stage / cfg.lane, name), raw)
             values[name] = raw
         self.check('after-identities', deadline)
@@ -796,12 +1017,20 @@ class Coordinator:
                     {'cookie': row['role'] == 'leader' and cfg.mode != 'metrics',
                      'owner': row['role'] == 'worker', 'root': owned and row['role'] == 'leader'} for row in tasks]
         receipt_lane = 'owned-root' if owned else 'external'
+        instance_gen = next(item for item in maps if item['name'] == 'INSTANCE_GEN')
+        instance_gen = {**instance_gen, 'cells': ordinary['INSTANCE_GEN']}
         bound = dumper.reconcile_task_storage(task_maps, records, expected=expected, before=before, after=after,
-                                             controls=controls, lane=receipt_lane, small_state=False)
+                                             controls=controls, instance_gen=instance_gen,
+                                             lane=receipt_lane, small_state=False)
         if cfg.mode == 'metrics':
             require(evidence.u64(controls['COOKIE_CTL']['value'], 8) == 0, 'aggregate-only cookie allocation history')
-        if cfg.workload_mode == 'matrix':
+        if cfg.workload_mode in ('matrix', 'object'):
             require(not ordinary['START'], 'completed matrix START is not empty')
+            if cfg.workload_mode == 'object':
+                # Post-return cleanup: every completed object call retired
+                # its side row before the ring record submitted.
+                require(not ordinary['OBJECT_START'],
+                        'completed object OBJECT_START is not empty')
         else:
             final_bindings, starts = start_bindings(ordinary['START'], tasks, cfg, complete=True)
             require(bindings == final_bindings, 'START keys changed after readiness')
@@ -810,16 +1039,8 @@ class Coordinator:
             require(all(evidence.u32(record['value'], 536) == 1 for record in records
                         if record['map_id'] == owner_id and any(record['value'])),
                     'THREAD_OWNER start_count contradicts START worker keys')
-            if cfg.workload_mode == 'blocked':
-                lines = [line.removeprefix('P11SCOPE_POINTERS ') for line in
-                         read_bytes(cfg.workload_log, MAX_LOG_BYTES, deadline).decode().splitlines()
-                         if line.startswith('P11SCOPE_POINTERS ')]
-                require(len(lines) == 1, 'missing exact hostile pointer record')
-                evidence.assert_hostile_records(starts, json.loads(lines[0], object_pairs_hook=unique_object))
-            else:
-                cells = [cell for cell in ordinary['EVIDENCE'] if evidence.u32(evidence.bpftool_bytes(cell['key'], 4), 0) == 5]
-                require(len(cells) == 1, 'missing fault evidence cell')
-                evidence.assert_fault_records(starts, evidence.value_total(cells[0].get('values', [])))
+            assert_blocked_semantics(cfg, ordinary, starts, lambda:
+                read_bytes(cfg.workload_log, MAX_LOG_BYTES, deadline).decode())
         evidence.assert_retained_ring_records(rings, cfg.lane, cfg.workload_pid, positions)
         acquisition = uuid.uuid4().hex
         receipt = {'contract': dumper.STOPPED_SNAPSHOT_CONTRACT, 'acquisition_id': acquisition,
@@ -829,7 +1050,11 @@ class Coordinator:
             raw = values[item['name']]
             row = {'id': item['id'], 'acquisition_id': acquisition, 'phase': 'stopped',
                    'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
-            if item['type'] == 'task_storage':
+            if item['name'] == 'PROC_EPOCH':
+                # This global continuity control may change outside the
+                # stopped workload. Retain all values, never iterator IDs.
+                row.update(phase='sampled', record_count=len(raw) // item['bytes_value'])
+            elif item['type'] == 'task_storage':
                 row['records'] = bound[item['name']]
             elif item['type'] == 'ringbuf':
                 # The two kernel byte counters the retained bytes were read
@@ -884,14 +1109,18 @@ class Coordinator:
         issues, observer, workload, log = [], None, None, None
         owned = False
         try:
+            release = os.uname().release
+            ready_seconds = ready_bound_seconds(release)
+            print(f'CANARY_READY_BOUND_DECLARED kernel={declared_kernel_label(release)} seconds={ready_seconds}', flush=True)
             validate_config(self.config)
+            evidence.set_object_attributes(getattr(self.config, 'object_attributes', 'present'))
             self.signals.enter()
             self.owner = custody.Custody(cleanup_seconds=RESUME_SECONDS)
             self.owner.__enter__()
             evidence.initialize(self.config.target_bits)
             owned = self.config.workload_origin == 'owned'
             if not owned:
-                ready_deadline = time.monotonic() + READY_SECONDS
+                ready_deadline = time.monotonic() + ready_bound_seconds(release, workload_roster=True)
                 tasks = ready_roster(self.config, ready_deadline)
                 workload = self.owner.borrow(self.config.workload_pid, self.config.generation, role='workload')
                 workload.snapshot(ready_deadline,
@@ -906,7 +1135,7 @@ class Coordinator:
             except BaseException:
                 os.close(fd)
                 raise
-            ready_deadline = time.monotonic() + READY_SECONDS
+            ready_deadline = time.monotonic() + ready_seconds
             observer = self.owner.launch(self.config.observer_args, stdout=log, stderr=log,
                                          deadline=ready_deadline if owned else None)
             if owned:
@@ -914,7 +1143,7 @@ class Coordinator:
                 self.owned_observer_deadline = (time.monotonic() + OWNED_DURATION_SECONDS
                                                 + OBSERVER_WAIT_SECONDS)
             else:
-                self.readiness(observer, time.monotonic() + READY_SECONDS)
+                self.readiness(observer, time.monotonic() + ready_seconds)
             self.stopped_deadline = time.monotonic() + STOP_SECONDS
             self.acquire(observer, workload, tasks)
         except BaseException as error:
@@ -927,7 +1156,9 @@ class Coordinator:
                         group.resume(resume_deadline, allow_successful_exit=allow_exit)
                     except BaseException as error:
                         issues.extend(sanitized(f'resume-{group.role}', error))
-            if self.source is not None:
+            hold_object_maps = (getattr(self.config, 'workload_mode', None) == 'object-blocked'
+                                and not issues)
+            if self.source is not None and not hold_object_maps:
                 try:
                     self.source.close()
                 except BaseException as error:
@@ -937,7 +1168,7 @@ class Coordinator:
                     self.finish_owned_observer(observer, workload)
                 except BaseException as error:
                     issues.extend(sanitized('owned-handoff', error))
-            if self.go_created and self.config.workload_mode == 'matrix':
+            if self.go_created and self.config.workload_mode in ('matrix', 'object'):
                 try:
                     create_control(self.config.finish)
                     if owned and not issues:
@@ -962,6 +1193,22 @@ class Coordinator:
                     require(self.final_privacy_present(privacy_deadline), 'observer privacy marker missing')
                 except BaseException as error:
                     issues.extend(sanitized('observer-privacy', error))
+            if self.source is not None and hold_object_maps:
+                try:
+                    if not issues:
+                        deadline = time.monotonic() + PUBLICATION_SECONDS
+                        self.check('post-stop-object-scrub', deadline)
+                        workload.snapshot(deadline,
+                            expected={row['tid']: row['generation'] for row in tasks})
+                        self.source.verify_object_scrub(self.maps, deadline)
+                        self.check('post-stop-object-scrub-complete', deadline)
+                except BaseException as error:
+                    issues.extend(sanitized('post-stop-object-scrub', error))
+                finally:
+                    try:
+                        self.source.close()
+                    except BaseException as error:
+                        issues.extend(sanitized('acquisition-resources', error))
             if log is not None:
                 try:
                     log.close()
@@ -998,6 +1245,8 @@ def parse_args(argv):
                  'ready', 'go', 'done', 'finish', 'observer-log', 'workload-log', 'reader', 'obj'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--workload-origin', choices=('external', 'owned'), default='external')
+    parser.add_argument('--object-attributes', choices=('present', 'absent'), default='present',
+                        help='FULL capture expects inspected values; the stub build expects zero/uninspected bytes')
     parser.add_argument('--target-bits', required=True, type=int)
     for name in ('workload-pid', 'generation'):
         parser.add_argument('--' + name, type=int)

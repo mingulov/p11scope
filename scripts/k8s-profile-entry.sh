@@ -14,10 +14,15 @@ usage() {
     cat >&2 <<'EOF'
 usage: k8s-profile-entry (--pod-uid UID | --cid HEX64)
                          [--command profile|trace|doctor] [-- p11scope-args...]
+       k8s-profile-entry --print-pod-cgroup [--pod-uid UID] [--cid HEX64]
 
   --pod-uid UID       target pod UID (metadata.uid); every container in the pod
   --cid HEX64         target container id (status.containerStatuses[].containerID
                       without the runtime:// prefix); its whole pod is captured
+  --print-pod-cgroup  print the resolved pod cgroup path and exit (no capture);
+                      accepts --pod-uid and --cid together, in which case the
+                      container's pod must carry that UID (how the host wrapper
+                      scripts/attach-pod.sh resolves its scope)
   --command CMD       p11scope subcommand run against the pod cgroup
                       (default: profile)
   --                  everything after this is passed to p11scope verbatim,
@@ -30,6 +35,8 @@ EOF
 POD_UID=
 CID=
 COMMAND=profile
+COMMAND_GIVEN=0
+PRINT_POD_CGROUP=
 OBSERVER=${P11SCOPE_OBSERVER:-/usr/local/bin/p11scope}
 CGROUP_ROOT=${P11SCOPE_CGROUP_ROOT:-/sys/fs/cgroup}
 
@@ -55,8 +62,11 @@ valid_cid() {
 # `pod<uid>` and the bare id (containerd) or `crio-<id>` (CRI-O). Only the
 # containerd + systemd layout is exercised on a real node (scripts/kind-e2e.sh);
 # the others are checked against a synthetic hierarchy in --self-test.
+# With both selectors set (--print-pod-cgroup from the host wrapper), the
+# candidates come from the container id and valid_pod_cgroup_path binds the
+# surviving match to the UID.
 pod_cgroup_candidates() {
-    if [ -n "$POD_UID" ]; then
+    if [ -n "$POD_UID" ] && [ -z "$CID" ]; then
         underscored=$(printf '%s' "$POD_UID" | tr '-' '_')
         find "$CGROUP_ROOT" -maxdepth 6 -type d \
             \( -name "*-pod$underscored.slice" -o -name "pod$POD_UID" \) -print 2>/dev/null
@@ -190,7 +200,10 @@ self_test() {
                "--pod-uid $uid --cid $cid" "--pod-uid $uid --command run" \
                "--pod-uid $uid --command" "--pod-uid $uid --bogus" "--bogus" \
                "--cid xyz" "--cid gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg" \
-               "--cid ${cid}0" "--pod NAME"; do
+               "--cid ${cid}0" "--pod NAME" "--print-pod-cgroup" \
+               "--print-pod-cgroup --command profile --pod-uid $uid" \
+               "--print-pod-cgroup --command trace --cid $cid" \
+               "--print-pod-cgroup --pod-uid UPPER"; do
         status=0
         # shellcheck disable=SC2086
         sh "$0" $bad >/dev/null 2>&1 || status=$?
@@ -256,6 +269,29 @@ self_test() {
     mkdir -p "$systemd_pod/cri-containerd-$cid.scope/inner/cri-containerd-$c5.scope"
     POD_UID='' CID=$c5
     if resolve_pod_cgroup 2>/dev/null; then echo "nested decoy container accepted: $POD_CG" >&2; exit 1; fi
+    # Both selectors together (the host wrapper's --print-pod-cgroup call):
+    # the container's pod, bound to the UID.
+    POD_UID=$uid CID=$cid
+    resolve_pod_cgroup 2>/dev/null && [ "$POD_CG" = "$systemd_pod" ] \
+        || { echo "uid+cid lookup failed: $POD_CG" >&2; exit 1; }
+    POD_UID=$u2 CID=$cid
+    if resolve_pod_cgroup 2>/dev/null; then echo "uid+cid mismatch accepted: $POD_CG" >&2; exit 1; fi
+    # One container id under two valid pod cgroups is refused loudly, never
+    # guessed; the UID binding narrows it back to exactly one valid match.
+    c6=6666666666666666666666666666666666666666666666666666666666666666
+    u6=66666666-6666-6666-6666-666666666666
+    u7=77777777-7777-7777-7777-777777777777
+    u6_=$(printf '%s' "$u6" | tr '-' '_')
+    u7_=$(printf '%s' "$u7" | tr '-' '_')
+    pod6=$root/kubepods.slice/kubepods-pod${u6_}.slice
+    pod7=$root/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod${u7_}.slice
+    mkdir -p "$pod6/cri-containerd-$c6.scope" "$pod7/cri-containerd-$c6.scope"
+    POD_UID='' CID=$c6
+    if resolve_pod_cgroup 2>"$root/amb.err"; then echo "ambiguous cid accepted: $POD_CG" >&2; exit 1; fi
+    grep -q "refusing" "$root/amb.err" || { echo "ambiguous cid was not refused loudly" >&2; exit 1; }
+    POD_UID=$u6 CID=$c6
+    resolve_pod_cgroup 2>/dev/null && [ "$POD_CG" = "$pod6" ] \
+        || { echo "uid+cid disambiguation failed: $POD_CG" >&2; exit 1; }
     # Exact shape checks, independent of the filesystem.
     for good in "$systemd_pod" "$root/kubepods/burstable/pod$u2" "$root/kubepods/pod$u2" \
                 "$root/kubepods.slice/kubepods-pod$u5_.slice" \
@@ -287,6 +323,20 @@ self_test() {
     if require_cgroup_v2 2>/dev/null; then echo "cgroup v2 check passed without cgroup.controllers" >&2; exit 1; fi
     : > "$root/cgroup.controllers"
     require_cgroup_v2 || { echo "cgroup v2 check failed with cgroup.controllers" >&2; exit 1; }
+    # --print-pod-cgroup end to end, exactly as the host wrapper drives it:
+    # stdout carries only the path, ambiguity and mismatch fail loudly.
+    out=$(P11SCOPE_CGROUP_ROOT=$root sh "$0" --print-pod-cgroup \
+        --pod-uid "$uid" --cid "$cid" 2>"$root/print.err") \
+        || { echo "print-pod-cgroup failed" >&2; cat "$root/print.err" >&2; exit 1; }
+    [ "$out" = "$systemd_pod" ] || { echo "print-pod-cgroup printed [$out]" >&2; exit 1; }
+    if P11SCOPE_CGROUP_ROOT=$root sh "$0" --print-pod-cgroup --cid "$c6" 2>"$root/print2.err"; then
+        echo "print-pod-cgroup accepted an ambiguous cid" >&2; exit 1
+    fi
+    grep -q "refusing" "$root/print2.err" || { echo "ambiguous print was not refused loudly" >&2; exit 1; }
+    if P11SCOPE_CGROUP_ROOT=$root sh "$0" --print-pod-cgroup \
+            --pod-uid "$u2" --cid "$cid" 2>/dev/null; then
+        echo "print-pod-cgroup accepted a uid mismatch" >&2; exit 1
+    fi
     # Visible processes: 0 entries (outside this PID namespace) do not count.
     printf '0\n0\n' > "$systemd_pod/cri-containerd-$cid.scope/cgroup.procs"
     [ -z "$(visible_pids "$systemd_pod")" ] || { echo "invisible pids counted" >&2; exit 1; }
@@ -306,7 +356,8 @@ while [ "$#" -gt 0 ]; do
     case $1 in
         --pod-uid) [ "$#" -ge 2 ] || usage; POD_UID=$2; shift 2 ;;
         --cid) [ "$#" -ge 2 ] || usage; CID=$2; shift 2 ;;
-        --command) [ "$#" -ge 2 ] || usage; COMMAND=$2; shift 2 ;;
+        --command) [ "$#" -ge 2 ] || usage; COMMAND=$2; COMMAND_GIVEN=1; shift 2 ;;
+        --print-pod-cgroup) PRINT_POD_CGROUP=1; shift ;;
         --) shift; break ;;
         -h|--help) usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
@@ -314,17 +365,33 @@ while [ "$#" -gt 0 ]; do
 done
 
 case $COMMAND in profile|trace|doctor) ;; *) echo "--command must be profile, trace or doctor" >&2; usage ;; esac
-if [ -n "$POD_UID" ] && [ -n "$CID" ]; then
+if [ -n "$PRINT_POD_CGROUP" ]; then
+    [ "$COMMAND_GIVEN" -eq 0 ] || { echo "--command and --print-pod-cgroup are mutually exclusive" >&2; usage; }
+    { [ -n "$POD_UID" ] || [ -n "$CID" ]; } || {
+        echo "one of --pod-uid or --cid is required" >&2
+        usage
+    }
+elif [ -n "$POD_UID" ] && [ -n "$CID" ]; then
     echo "pass exactly one of --pod-uid and --cid" >&2
+    usage
+elif [ -z "$POD_UID" ] && [ -z "$CID" ]; then
+    echo "one of --pod-uid or --cid is required" >&2
     usage
 fi
 if [ -n "$POD_UID" ]; then
     valid_uid "$POD_UID" || { echo "--pod-uid must be a lowercase pod UID" >&2; usage; }
-elif [ -n "$CID" ]; then
+fi
+if [ -n "$CID" ]; then
     valid_cid "$CID" || { echo "--cid must be 64 lowercase hex chars" >&2; usage; }
-else
-    echo "one of --pod-uid or --cid is required" >&2
-    usage
+fi
+
+# Resolution-only mode for the host wrapper: stdout carries exactly the pod
+# cgroup path. Decoys and refusals go to stderr, like everywhere else.
+if [ -n "$PRINT_POD_CGROUP" ]; then
+    require_cgroup_v2 || exit 1
+    resolve_pod_cgroup || exit 1
+    printf '%s\n' "$POD_CG"
+    exit 0
 fi
 
 [ -x "$OBSERVER" ] || { echo "$OBSERVER is missing" >&2; exit 1; }

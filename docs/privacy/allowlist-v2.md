@@ -23,8 +23,14 @@ helper and never executes provider code.
 | Descendant/rebuild loss | Saturating userspace counters; cgroup ingress gaps are authenticated by membership-refresh admission or a scoped leader-exit boundary, never by creator-event identity. No task, PID, generation, link, or timing identity crosses the render boundary. | `evidence.pid_descendant_gaps` and `evidence.multi_rebuild_gaps`. |
 | Task-uprobe link loss | A matched leader-exit record is settled against the retained generation-bound `ProcessView`; no process identity or independent `/proc` probe is captured. | Aggregate-only `evidence.task_uprobe_link_losses`, counted once per affected process view; nonzero forces `PARTIAL`. |
 | Function row identity | The pinned provider object and an attached slot's exact file offset, both already fixed by hash-pinned discovery; the standard-list positions that reach that target come from the decoded table layout. Export corroboration compares a table's slot targets with the same object's `.dynsym` definitions of the standard names. | `functions[].target` (`{dev, ino, sha256}` of the pinned object, already published as provider module identity, plus the in-file offset) and `functions[].ordinals` (`{table_file_offset, ordinal}`); `discovery[].tables[].linkage` value `exports` with an `exports_agreeing` count. These are file facts of the pinned provider, never a runtime address, pointer, call argument or process identity. |
-| Kernel control state | The native owner, identity and root-affiliation control cells, read by userspace at every snapshot and at terminal. They hold only sticky reason bits and saturating counters. | `evidence.kernel_control`: a halt boolean, finite owner-poison and root-failure reason names, and u64 counts of owner admission and identity refusals. No task, PID, address or cookie. Any halt, refusal or failure forces a concrete-gap `PARTIAL`. |
+| Kernel control state | The native owner, identity and root-affiliation control cells, read by userspace at every snapshot and at terminal. They hold only sticky reason bits and saturating counters. Separately, each event carries the current task's one-bit root-affiliation tag read from BPF task storage (set at thread birth); the tag is a private join input, never a published identity. | `evidence.kernel_control`: a halt boolean, finite owner-poison and root-failure reason names, and u64 counts of owner admission and identity refusals. No task, PID, address or cookie. Any halt, refusal or failure forces a concrete-gap `PARTIAL`. |
 | Unsupported or target-incompatible execution mode | A scoped probe refuses an execution-mode selector outside the qualified Linux LP64/ia32 set, or one that does not match the width specialization selected from the retained pinned object, before target-memory decoding. | Aggregate-only u64 `evidence.abi_refusals`; no selector, register contents, address or process identity is published. Nonzero forces `PARTIAL`. |
+| Kernel VMA identity proof | During system inventory with the kernel identity backend (the default automatic choice once a pass needs an identity proof), a standalone identity object walks tasks with `iter/task_vma`, checking each task's pid/tgid against the pass scope, and for every in-scope file mapping reads its executable flag, plus start, end and the owning file's kernel inode reference for executable ones. Inode references are compared inside kernel-only maps and never leave the kernel. | Private per-range records for executable-range join only; the same ranges are already visible to the observer in `/proc/PID/maps`. Kept for the pass only. No range, address, verdict or inode is published. |
+| Fork birth record | In Detailed captures under cgroup/system scope only (never PID scope, never aggregate), the `task_newtask` hook reads the clone flags, the child task reference, the child tgid and the parent and child images' task cookie plus exec id. | A private fork record in the kernel event ring, kept for capture-lifetime scope/descendant tracking only. Creator tgid and child pid never cross the render boundary. |
+| Exec same-task class | In Detailed and inventory captures, the exec hook reads the tracepoint's old-pid argument and the current memory's dumpability bit; both collapse to one finite class (`unknown`, `same-task candidate`, `task replaced`). | A private discovery lifecycle record, kept for the capture only. |
+| Exec task ticket | In InventoryCallers objects, and in Detailed objects only while short-lived tracking is armed outside aggregate captures, under cgroup/system scope only (never PID scope, where admission is by PID number alone), after scope admission and successful lifecycle ring reservation, the exec hook obtains the current kernel task's group leader and uses the existing TASK_COOKIE storage/COOKIE_CTL allocator, with the same 16,384-ticket nonwrapping limit and bounded CAS attempts. It reads no target address, argument, key, handle, path, mm content or exec ID. InventoryGlobal has no identity maps and emits no ticket; counter objects carry no ticket helper and emit no ticket. | The existing eight-byte `DiscoveryRecord.binding_id` word carries the original task ticket only for EXEC (kind5); zero means unavailable, and PID-scope EXEC records always carry zero. One transient same-domain comparison uses the existing retained-pidfd TASK_COOKIE lookup, with liveness checked before and after. The record and ticket remain private to this capture and never enter public output. Allocation/read/configuration/quota failure retains zero and grants no collection-window transition authority; it does not reset identity or discard unrelated usable provider observations. |
+| Post-attach birth marker | In FULL and P0 builds, after scope admission and closure, the exec hook reads the current group leader's `self_exec_id` word. It is compiled into the Detailed object (default; `P11SCOPE_BIRTH_MARKER=0` omits it there, `=1` adds it to any Detailed build), where it never runs because ordinary captures publish no generation, and into the journal object whenever the journal is built (`P11SCOPE_JOURNAL=0` omits it), where it runs only under `inventory --key-operations`. Unlike the exec task ticket, the marker does read the exec ID. Under PID scope it first reads the leader's `start_boottime` once and compares it in kernel with the target's start tick, which userspace publishes from `/proc/PID/stat` into the read-only `PID_START_TICK` map; a mismatch writes nothing. | One `self_exec_id` word into the leader's private `PROC_EPOCH` record, deciding only whether that process's key operations report as complete; never published. The start time is compared only, never stored or published. See [Post-attach birth marker](allowlist-v3.md#post-attach-birth-marker-object-journal-slice-d). |
+| Counter banks | In counter builds only (opt-in build flags; ordinary FULL, P0 and inventory captures never create them): per-endpoint cells holding entered/returned/error counts, plus per-(endpoint, return value) counts. Timestamp and latency builds add per-endpoint totals and maxima (latency adds 32 buckets), fed by one kernel-clock read per entry and return; the counts flavor reads no clock. No argument, pointer or user-memory read feeds any of them. | Aggregate counter maps only, kept for the capture; the key is endpoint and return value, never mechanism or identity. |
 
 The existing offline exception remains narrow: `p11scope inspect` and an
 explicit `p11scope-discover` inventory may display provider interface names
@@ -85,8 +91,12 @@ It has a bounded CK_RV. `null_output` and `unreadable_interface` require
 `provider_changed` may coexist with a factual non-null result. With a factual
 non-null result, `unreadable_name` requires a `null` or `unreadable` result
 name; `unreadable_version` requires an `unreadable` result version; and
-`unreadable_table` requires a `null`, `v3_0`, `v3_1`, or `v3_2` result version.
-Every helper failure requires `authority=none` and a null `selection_table`.
+`unreadable_table` requires a `null`, `v2_40`, `v3_0`, `v3_1`, `v3_2`, or
+`other` result version. An unreadable name/version, a short readable table or
+an unusable function word can retain a validated table with count-only
+authority. Null outputs, unreadable interface descriptors, changed provider
+identity and unproved provider ownership still have `authority=none` and a
+null `selection_table`.
 Authority is exactly `inventory`,
 `selection_count_only`, or `none`. That failure class is exactly `null_output`,
 `unreadable_interface`, `unreadable_name`, `unreadable_version`,
@@ -100,17 +110,34 @@ bounds, and both agreement fields are boolean.
 
 There are at most ten tables. Each table id is 0 through 9; a non-null
 `selection_table` refers to that exact id. Every table is referenced by a
-successful count-only query, and orphan tables are forbidden. A table has
-version 3.0, 3.1, or 3.2, a bounded walk of at
-most 104 classified standard function slots, and
-`semantic_authorized=false`. Selection records contain no raw interface names or pointers,
-addresses, function-table contents, or helper error strings. Only the
-existing offline inventory-name exception may retain raw names; selection
-queries and tables never do.
+successful count-only query, and orphan tables are forbidden. Version values
+are metadata, never proof of allocated extent. Sparse and partial observations
+retain canonical ordinals and individually resolved targets under the existing
+offline inventory identity, hash, mapping and ABI rules. A missing word is not
+an observed NULL. Query names, version classes and returned flags do not gate
+count-only observations; they grant no semantic or inventory authority.
 
-Each table id is an integer from 0 through 9, its version is 3.0, 3.1, or 3.2,
-its walk is exactly `full`, and it contains at most 104 function records with
-`semantic_authorized=false`.
+Each table id is an integer from 0 through 9, its version is metadata, its
+walk is `full`, `known_prefix`, or `unreadable`, and it contains at most 104
+canonical function records with `semantic_authorized=false`.
+
+The existing mandatory selected-table version tuple uses `(0, 0)` solely as an
+unknown-header placeholder when the referencing query says `unreadable`, its
+failure is `unreadable_version`, and its unreadable-walk diagnostic explicitly
+identifies unavailable version metadata. An actual observed version 0.0 has
+result version class `other`, so it cannot be confused with this placeholder.
+Metadata-only changes are disclosed separately from missing function words.
+
+Selection queries retain no raw interface names, pointers, table words or
+helper error strings. Tables reuse the existing bounded canonical function
+resolution records; unreadable-walk diagnostics contain fixed acquisition text
+and ordinal counts. The existing offline inventory-name exception may retain
+raw names; selection queries and tables do not. Public capture artifacts keep
+only the existing finite metadata classes and validated target summaries.
+
+This compatibility clarification follows owner OD35. The ten-query request
+matrix, capture fields, maximum 104-word bound and prohibited data are unchanged;
+allowlist-v1 is unchanged.
 
 ## Still prohibited
 

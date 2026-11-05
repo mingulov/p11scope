@@ -45,6 +45,7 @@
 # Usage: scripts/kind-e2e.sh [--keep] | --self-test
 #   --keep  keep the cluster and images for debugging (prints how to delete)
 # Environment:
+#   P11SCOPE_K8S_TOKEN         optional owned image token (short DNS label)
 #   P11SCOPE_K8S_CLUSTER       cluster name (default p11scope-e2e-<time>-<pid>);
 #                              refused if a cluster of that name already exists
 #   P11SCOPE_K8S_OBSERVER_BIN  prebuilt static x86-64 p11scope to package
@@ -75,6 +76,57 @@ valid_cluster() {
     esac
 }
 
+# Exactly one complete gated JSON ledger with 6xN successes (gated.c prints
+# `READY pid=` once and one `LEDGER {...}` line with complete/attempts/
+# successful), the same rule as the container-cell drivers.
+ledger_check() {
+    python3 -I - "$1" "$2" <<'PY'
+import json, sys
+path, iters = sys.argv[1], int(sys.argv[2])
+ledgers = []
+ready = 0
+with open(path, encoding="utf-8") as handle:
+    for line in handle:
+        if line.startswith("READY "):
+            ready += 1
+        elif line.startswith("LEDGER "):
+            ledgers.append(json.loads(line[len("LEDGER "):]))
+if ready < 1 or len(ledgers) != 1:
+    raise SystemExit(f"want >=1 READY and 1 LEDGER, got {ready} and {len(ledgers)}")
+ledger = ledgers[0]
+if ledger.get("schema") != "p11scope/public-cli-ledger/v1":
+    raise SystemExit("bad ledger schema")
+if ledger.get("complete") is not True:
+    raise SystemExit("ledger incomplete")
+functions = ledger.get("functions")
+if not isinstance(functions, list) or len(functions) != 6:
+    raise SystemExit("want 6 ledger functions")
+names = set()
+for row in functions:
+    if row.get("attempts") != iters or row.get("successful") != iters:
+        raise SystemExit(f"ledger row is not 6x{iters}: {row}")
+    names.add(row.get("name"))
+if len(names) != 6:
+    raise SystemExit("ledger function names are not distinct")
+PY
+}
+
+ledger_is() {
+    ledger_tmp=$(mktemp "${TMPDIR:-/tmp}/p11scope-kind-ledger-XXXXXX") || return 1
+    kc -n "$WL_NS" logs "$1" > "$ledger_tmp" || {
+        echo "cannot read logs for $1" >&2
+        rm -f "$ledger_tmp"
+        return 1
+    }
+    ledger_check "$ledger_tmp" "$2" || {
+        echo "$1 did not ledger $2 clean iterations" >&2
+        cat "$ledger_tmp" >&2
+        rm -f "$ledger_tmp"
+        return 1
+    }
+    rm -f "$ledger_tmp"
+}
+
 self_test() {
     python3 -I "$ORACLE" --self-test
     sh scripts/k8s-profile-entry.sh --self-test
@@ -102,6 +154,37 @@ self_test() {
         sh "$0" $bad >/dev/null 2>&1 || status=$?
         [ "$status" -eq 2 ] || { echo "kind-e2e exited $status (want 2) for: [$bad]" >&2; exit 1; }
     done
+    # The K pods print the JSON ledger: holder-entry execs the gated client
+    # built from tests/fixtures/public-cli/gated.c. Each form goes through
+    # ledger_is with a stubbed kc, no cluster.
+    kc() {
+        cat "$LEDGER_STUB_LOG"
+    }
+    ledger_stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-kind-ledger-XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$ledger_stub'" EXIT
+    printf '%s\n' 'READY pid=1' \
+        'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":400},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
+        > "$ledger_stub/good.log"
+    printf '%s\n' 'READY pid=1' 'LEDGER iterations=400 nonzero_rv=0' > "$ledger_stub/legacy.log"
+    printf '%s\n' 'READY pid=1' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":false,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":400},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
+        > "$ledger_stub/incomplete.log"
+    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":399,"successful":399}]}' \
+        > "$ledger_stub/short.log"
+    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":399},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
+        > "$ledger_stub/failed.log"
+    printf '%s\n' 'READY pid=1' > "$ledger_stub/missing.log"
+    LEDGER_STUB_LOG=$ledger_stub/good.log
+    ledger_is stub-pod 400 || { echo "good JSON LEDGER refused" >&2; exit 1; }
+    for bad in legacy incomplete short failed missing; do
+        LEDGER_STUB_LOG=$ledger_stub/$bad.log
+        if ledger_is stub-pod 400 >/dev/null 2>&1; then
+            echo "bad LEDGER accepted: $bad" >&2
+            exit 1
+        fi
+    done
+    rm -rf "$ledger_stub"
+    trap - EXIT
     echo "kind-e2e self-test: OK"
     exit 0
 }
@@ -122,7 +205,8 @@ for command in docker kind kubectl python3 timeout; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 1; }
 done
 
-TOKEN=$(date +%s)-$$
+TOKEN=${P11SCOPE_K8S_TOKEN:-$(date +%s)-$$}
+valid_cluster "$TOKEN" || { echo "image token must be a short DNS label" >&2; exit 1; }
 CLUSTER=${P11SCOPE_K8S_CLUSTER:-p11scope-e2e-$TOKEN}
 valid_cluster "$CLUSTER" || { echo "cluster name must be a short DNS label: $CLUSTER" >&2; exit 1; }
 NODE=$CLUSTER-control-plane
@@ -245,7 +329,8 @@ timeout --signal=TERM --kill-after=10s 900s kind create cluster --name "$CLUSTER
 unlock_step
 lock_step
 timeout --signal=TERM --kill-after=10s 1200s \
-    kind load docker-image --name "$CLUSTER" "$OBS_IMAGE" "$HOLD_IMAGE"
+    python3 -I scripts/kubernetes-runtime.py load-images --cluster "$CLUSTER" \
+    ${P11SCOPE_K8S_NODE_IMAGE:+--node-image "$P11SCOPE_K8S_NODE_IMAGE"} "$OBS_IMAGE" "$HOLD_IMAGE"
 unlock_step
 
 echo "=== apply deploy/k8s as documented (directory apply; image names rendered) ==="
@@ -327,14 +412,6 @@ release() {
         wait_log "$pod" '^LEDGER ' 120
     done
 }
-ledger_is() {
-    kc -n "$WL_NS" logs "$1" | grep -qx "LEDGER iterations=$2 nonzero_rv=0" || {
-        echo "$1 did not ledger $2 clean iterations" >&2
-        kc -n "$WL_NS" logs "$1" >&2
-        return 1
-    }
-}
-
 OBS=$(kc -n "$OBS_NS" get pod -l app.kubernetes.io/component=observer -o jsonpath='{.items[0].metadata.name}')
 [ -n "$OBS" ] || { echo "no observer pod" >&2; exit 1; }
 observe() {

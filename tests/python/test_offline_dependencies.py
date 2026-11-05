@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -143,7 +144,9 @@ def digest(value: bytes) -> str:
 
 
 class OfflineFixture:
-    def __init__(self, temporary: Path):
+    def __init__(self, temporary: Path, *, shared_repository: Path | None = None,
+                 shared: bool = True):
+        self.has_shared = shared
         self.root = temporary / "source root with spaces"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "third-party/patches/demo-1.0.0").mkdir(parents=True)
@@ -195,11 +198,44 @@ class OfflineFixture:
         }) + "\n", encoding="utf-8")
 
         self.shared_url = "https://example.invalid/shared-dependency"
-        self.shared_revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=REPOSITORY, check=True,
-            stdout=subprocess.PIPE, text=True,
-        ).stdout.strip()
-        shared_source = f"git+{self.shared_url}?rev={self.shared_revision}#{self.shared_revision}"
+        git_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        # Fixed test data keeps the revision identical across related refusal scenes.
+        git_environment.update({
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "Offline fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "Offline fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        })
+
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *arguments],
+                cwd=shared_repository, env=git_environment,
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ).stdout
+
+        if shared:
+            if shared_repository is None:
+                shared_repository = temporary / "shared Git repository"
+                shared_repository.mkdir()
+                shared_files = {
+                    "Cargo.toml": "[package]\nname = 'shared'\nversion = '0.1.0'\n",
+                    "src.rs": "shared payload\n",
+                    "LICENSE-APACHE": "fixture Apache license\n",
+                    "LICENSE-MIT": "fixture MIT license\n",
+                }
+                for name, content in shared_files.items():
+                    (shared_repository / name).write_text(content, encoding="utf-8")
+                git("-c", "init.templateDir=", "init", "-q", "--object-format=sha1", "--initial-branch=fixture")
+                git("add", "--", *shared_files)
+                git("commit", "-qm", "fixture: shared dependency")
+            self.shared_revision = git("rev-parse", "HEAD").strip()
+            shared_source = f"git+{self.shared_url}?rev={self.shared_revision}#{self.shared_revision}"
+        else:
+            self.shared_revision = None
+            shared_source = None
         (self.root / "Cargo.lock").write_text(self._lock(shared_source, root=True), encoding="utf-8")
         (self.root / "crates/ebpf/Cargo.lock").write_text(
             self._lock(shared_source, root=False), encoding="utf-8"
@@ -221,17 +257,16 @@ class OfflineFixture:
 
         self.shared = temporary / "shared source"
         self.shared.mkdir()
-        subprocess.run(
-            ["git", "bundle", "create", str(self.shared / "source.bundle"), "HEAD"],
-            cwd=REPOSITORY, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        if shared:
+            git("bundle", "create", str(self.shared / "source.bundle"), "HEAD")
         (self.shared / "LICENSE-APACHE").write_text("fixture Apache license\n", encoding="utf-8")
         (self.shared / "LICENSE-MIT").write_text("fixture MIT license\n", encoding="utf-8")
 
         self.vendor_template = temporary / "Cargo vendor result"
         self.vendor_template.mkdir()
         self._vendor_package("registry-1.2.3", "registry", "1.2.3", "registry payload\n", "a" * 64)
-        self._vendor_package("shared-0.1.0", "shared", "0.1.0", "shared payload\n", None)
+        if shared:
+            self._vendor_package("shared-0.1.0", "shared", "0.1.0", "shared payload\n", None)
         self._vendor_package("sysdep-0.0.1", "sysdep", "0.0.1", "sysroot payload\n", "b" * 64)
 
         self.tools = temporary / "selected tools with spaces"
@@ -269,12 +304,17 @@ class OfflineFixture:
                 info.size = len(content)
                 archive.addfile(info, io.BytesIO(content))
 
-    def _lock(self, shared_source: str, *, root: bool) -> str:
+    def _lock(self, shared_source: str | None, *, root: bool) -> str:
         local = "fixture-root" if root else "fixture-ebpf"
         registry = "\n[[package]]\nname = 'registry'\nversion = '1.2.3'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '" + "a" * 64 + "'\n" if root else ""
-        return (
+        text = (
             "version = 4\n\n[[package]]\nname = '" + local + "'\nversion = '0.1.0'\n"
             + registry
+        )
+        if shared_source is None:
+            return text
+        return (
+            text
             + "\n[[package]]\nname = 'shared'\nversion = '0.1.0'\nsource = '"
             + shared_source + "'\n"
         )
@@ -341,18 +381,25 @@ class OfflineFixture:
         (self.tools / "bpf-metadata.json").write_text(json.dumps(bpf_metadata), encoding="utf-8")
 
     def run(self, phase: str, *, payload: Path | None = None, prefix: Path | None = None,
-            environment: dict[str, str] | None = None, check_prepared: bool = False):
+            environment: dict[str, str] | None = None, check_prepared: bool = False,
+            shared_source: str | Path | None = "default"):
         command = [sys.executable, "-I", str(self.root / "scripts/offline-dependencies.py"), phase]
         if phase == "assemble":
             command += [
                 "--output", str(self.output), "--candidate-recipe", str(self.candidate),
-                "--archive-dir", str(self.archive_dir), "--shared-source", str(self.shared),
+                "--archive-dir", str(self.archive_dir),
                 "--prefix", str(prefix or self.prefix),
                 "--stable-cargo", str(self.tools / "stable cargo"),
                 "--stable-rustc", str(self.tools / "stable rustc"),
                 "--bpf-cargo", str(self.tools / "bpf cargo"),
                 "--bpf-rustc", str(self.tools / "bpf rustc"),
             ]
+            if shared_source == "default":
+                selected = self.shared if self.has_shared else None
+            else:
+                selected = shared_source
+            if selected is not None:
+                command += ["--shared-source", str(selected)]
         else:
             command += [
                 "--payload", str(payload or self.output),
@@ -400,6 +447,47 @@ class OfflineDependenciesTests(unittest.TestCase):
         for needle in needles:
             self.assertIn(needle, result.stderr)
 
+    def test_synthetic_shared_bundle_is_owned_single_commit_history(self):
+        owned = Path(self.temporary.name).resolve()
+        real_run = subprocess.run
+        git_commands = []
+
+        def owned_git_only(command, *args, **kwargs):
+            if command[0] == "git":
+                cwd = Path(kwargs.get("cwd", Path.cwd())).resolve()
+                self.assertTrue(cwd.is_relative_to(owned),
+                                f"synthetic fixture consulted product history: {command!r}")
+                git_commands.append(command)
+            return real_run(command, *args, **kwargs)
+
+        with patch.dict(os.environ, {"GIT_DIR": str(owned / "unrelated missing repository")}), \
+                patch.object(subprocess, "run", side_effect=owned_git_only):
+            fixture = self.fixture
+        self.assertTrue(git_commands)
+        helper = load_module(HELPER, "owned_shared_bundle_helper")
+        bundle = fixture.shared / "source.bundle"
+        self.assertEqual(helper._bundle_revision(bundle), fixture.shared_revision)
+        for relative in ("Cargo.lock", "crates/ebpf/Cargo.lock"):
+            shared, _ = helper._locked_dependencies([fixture.root / relative])
+            self.assertEqual(shared, {"url": fixture.shared_url, "revision": fixture.shared_revision})
+
+        repository = owned / "independent bundle import"
+        (repository / "objects").mkdir(parents=True)
+        (repository / "refs").mkdir()
+        (repository / "HEAD").write_text("ref: refs/heads/unused\n", encoding="ascii")
+        environment = helper._isolated_git_environment()
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", f"--git-dir={repository}", *arguments], env=environment,
+                check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ).stdout
+
+        git("bundle", "unbundle", str(bundle))
+        self.assertEqual(git("rev-list", "--count", fixture.shared_revision).strip(), "1")
+        self.assertEqual(git("ls-tree", "-r", "--name-only", fixture.shared_revision).splitlines(),
+                         ["Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT", "src.rs"])
+
     def test_maintained_recipe_matches_repository_inputs_and_both_shared_lock_identities(self):
         helper = load_module(HELPER, "maintained_offline_dependency_recipe")
         preparer = load_module(PREPARER, "maintained_offline_dependency_preparer")
@@ -419,6 +507,42 @@ class OfflineDependenciesTests(unittest.TestCase):
             with self.subTest(input=relative):
                 shared, _ = helper._locked_dependencies([REPOSITORY / relative])
                 self.assertEqual(recipe["shared_git"], shared)
+
+    def test_fixed_recipe_rejects_owned_workspace_and_preparation_drift(self):
+        # Exercise the real input binder without a payload, tools or a bundle of
+        # product history. Only the files that contribute to these hashes copy.
+        helper = load_module(HELPER, "owned_offline_dependency_inputs")
+        preparer = load_module(PREPARER, "owned_offline_dependency_preparer")
+        manifest = helper._strict_manifest(REPOSITORY, preparer)
+        recipe = helper._read_json(REPOSITORY / "third-party/offline-dependencies.json", "fixed recipe")
+        root = Path(self.temporary.name) / "owned inputs"
+        files = {"third-party/sources.json"}
+        for name in manifest["workspace_manifests"]:
+            files.update((name, str(Path(name).parent / "Cargo.lock")))
+        for record in manifest["packages"]:
+            files.update(record["patches"])
+        for name in files:
+            destination = root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((REPOSITORY / name).read_bytes())
+        healthy = helper.check_fixed_recipe_inputs(root, recipe, manifest, preparer)
+        self.assertEqual(healthy["workspaces"], recipe["workspaces"])
+        self.assertEqual(healthy["preparation"], recipe["preparation"])
+        changes = [(name, "workspace lock or manifest input changed")
+                   for name in sorted(files) if name.endswith(("Cargo.toml", "Cargo.lock"))]
+        changes += [("third-party/sources.json", "sources manifest input changed"),
+                    (manifest["packages"][0]["patches"][0], "package recipe input changed")]
+        for name, error in changes:
+            with self.subTest(input=name):
+                path = root / name
+                original = path.read_bytes()
+                try:
+                    path.write_bytes(original + b"\n")
+                    with self.assertRaisesRegex(helper.OfflineDependencyError, error):
+                        helper.check_fixed_recipe_inputs(root, recipe, manifest, preparer)
+                finally:
+                    path.write_bytes(original)
+        self.assertEqual(helper.check_fixed_recipe_inputs(root, recipe, manifest, preparer), healthy)
 
     def test_assemble_runs_fixed_offline_resolver_and_produces_complete_payload(self):
         self.fixture.assemble()
@@ -913,6 +1037,39 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertEqual(receipt["project_source"]["revision"], "1" * 40)
         self.assertEqual(receipt["payload_tree_sha256"], association["payload_tree_sha256"])
 
+    def test_internal_content_validation_accepts_raw_snapshot_without_public_origin_bypass(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        self.fixture.export_manifest.unlink()
+        helper = load_module(self.root_helper, "offline_raw_snapshot")
+        receipt, tool = helper._verify_payload_contents(
+            self.fixture.root, self.fixture.output,
+            self.fixture.tools / "nightly rustc", self.fixture.preparer
+        )
+        self.assertNotIn("project_source", receipt)
+        self.assertEqual(receipt["payload_tree_sha256"],
+                         json.loads(self.fixture.candidate.read_text())["payload_tree_sha256"])
+        self.assertEqual(tool["path"], str(self.fixture.tools / "nightly rustc"))
+        self.assert_refused(self.fixture.run("verify"), "source identity")
+        self.assertFalse(Path(f"{self.fixture.prefix}.verify.receipt.json").exists())
+
+    def test_internal_content_validation_still_rejects_corruption_and_checks_prepared_read_only(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        self.fixture.export_manifest.unlink()
+        helper = load_module(self.root_helper, "offline_raw_corruption")
+        arguments = (self.fixture.root, self.fixture.output,
+                     self.fixture.tools / "nightly rustc", self.fixture.preparer)
+        receipt, _ = helper._verify_payload_contents(*arguments)
+        target = self.fixture.root / "third-party/src/demo-1.0.0-p1/value.txt"
+        before = (target.read_bytes(), target.stat().st_mtime_ns)
+        self.assertEqual(helper._verify_payload_contents(*arguments, reconstruct=False)[0], receipt)
+        self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+        delivered = self.fixture.output / "vendor/registry-1.2.3/src.rs"
+        delivered.write_text("corrupt delivered file\n")
+        with self.assertRaisesRegex(helper.OfflineDependencyError, "checksum"):
+            helper._verify_payload_contents(*arguments, reconstruct=False)
+
     def test_v2_source_identity_refuses_open_or_malformed_association_and_unknown_schema(self):
         self.fixture.assemble()
         self.fixture.approve()
@@ -995,6 +1152,103 @@ class OfflineDependenciesTests(unittest.TestCase):
             "verify", prefix=self.fixture.prefix.parent / "numeric recipe"
         )
         self.assert_refused(result, "fixed recipe")
+
+    def git_free_fixture(self):
+        root = Path(self.temporary.name) / "git free"
+        root.mkdir()
+        fixture = OfflineFixture(root, shared=False)
+        fixture.testcase = self
+        return fixture
+
+    def test_git_free_locks_assemble_and_verify_with_null_shared_recipe(self):
+        fixture = self.git_free_fixture()
+        fixture.assemble()
+        recipe = json.loads(fixture.candidate.read_text(encoding="utf-8"))
+        self.assertEqual(set(recipe), {"schema_version", "workspaces", "preparation", "nightly",
+                                      "shared_git", "payload_tree_sha256"})
+        self.assertIsNone(recipe["shared_git"])
+        shared = fixture.output / "provenance/shared"
+        self.assertEqual({path.name for path in shared.iterdir()}, {"packages.json"})
+        self.assertEqual(json.loads((shared / "packages.json").read_text(encoding="utf-8")),
+                         {"schema_version": 1, "source": None, "licenses": {}, "packages": []})
+        fixture.approve()
+        result = fixture.run("verify")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_git_free_locked_dependencies_report_no_shared_revision(self):
+        fixture = self.git_free_fixture()
+        helper = load_module(HELPER, "git_free_locked_dependencies")
+        for relative in ("Cargo.lock", "crates/ebpf/Cargo.lock"):
+            shared, _ = helper._locked_dependencies([fixture.root / relative])
+            self.assertIsNone(shared)
+        _, vendored = helper._locked_dependencies([fixture.root / "Cargo.lock"])
+        self.assertEqual(vendored["registry-1.2.3"]["kind"], "registry")
+        self.assertNotIn("shared-0.1.0", vendored)
+
+    def test_assemble_binds_shared_source_to_lock_identity(self):
+        git_free = self.git_free_fixture()
+        refused = git_free.run("assemble", shared_source=git_free.shared)
+        self.assert_refused(refused, "contain no Git revision")
+        self.assertFalse(git_free.output.exists())
+        self.assertFalse(git_free.candidate.exists())
+        refused = self.fixture.run("assemble", shared_source=None)
+        self.assert_refused(refused, "shared source directory is required")
+        self.assertFalse(self.fixture.output.exists())
+        self.assertFalse(self.fixture.candidate.exists())
+
+    def test_git_free_verify_refuses_shared_provenance_tamper(self):
+        fixture = self.git_free_fixture()
+        helper = load_module(HELPER, "git_free_verify_tamper")
+        fixture.assemble()
+        fixture.approve()
+        pristine = Path(self.temporary.name) / "pristine"
+        shutil.copytree(fixture.output, pristine)
+        origin_name = helper.SHARED_LICENSES[0]
+        mutations = (
+            ("spurious bundle", lambda shared: (shared / "source.bundle").write_bytes(b"forged\n"),
+             "unexpected payload entry"),
+            ("spurious origin file", lambda shared: (shared / origin_name).write_text("forged\n"),
+             "unexpected payload entry"),
+        )
+        for index, (label, mutate, needle) in enumerate(mutations):
+            with self.subTest(label=label):
+                payload = Path(self.temporary.name) / f"tampered {index}"
+                shutil.copytree(pristine, payload)
+                mutate(payload / "provenance/shared")
+                for path in (payload / "provenance/shared").iterdir():
+                    if path.name != "packages.json":
+                        path.chmod(0o644)
+                self.assert_refused(fixture.run("verify", payload=payload), needle)
+        records = (
+            ("claimed source",
+             {"schema_version": 1, "source": {"url": "https://example.invalid/x", "revision": "0" * 40},
+              "licenses": {}, "packages": []}),
+            ("claimed packages",
+             {"schema_version": 1, "source": None, "licenses": {},
+              "packages": [{"name": "shared", "version": "0.1.0"}]}),
+        )
+        for index, (label, record) in enumerate(records):
+            with self.subTest(label=label):
+                payload = Path(self.temporary.name) / f"record {index}"
+                shutil.copytree(pristine, payload)
+                (payload / "provenance/shared/packages.json").write_text(json.dumps(record))
+                self.assert_refused(fixture.run("verify", payload=payload),
+                                    "shared package provenance mismatch")
+
+    def test_replacement_config_without_shared_git_replaces_only_crates_io(self):
+        fixture = self.git_free_fixture()
+        helper = load_module(HELPER, "git_free_replacement_config")
+        payload = fixture.output
+        config = helper.replacement_config(payload, None)
+        self.assertEqual(config.count(b"replace-with"), 1)
+        self.assertNotIn(b"git+", config)
+        parsed = helper.tomllib.loads(config.decode("utf-8"))
+        self.assertEqual(parsed["source"]["vendored-sources"]["directory"], str(payload / "vendor"))
+        self.assertTrue(parsed["net"]["offline"])
+        relative = helper.replacement_config(payload, None, vendor_path="deps/vendor")
+        self.assertIn(b'directory = "deps/vendor"', relative)
+        with self.assertRaises(helper.OfflineDependencyError):
+            helper.replacement_config(payload, None, vendor_path="../vendor")
 
     @property
     def root_helper(self):

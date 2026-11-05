@@ -13,7 +13,10 @@ SAME command; the script narrows `--all-targets` to one partition:
 - `rest`: every target the gate selects except `artifact_contracts`
   (`--lib --bins --examples --benches` plus one `--test` per integration test
   target, read from `cargo metadata`, so a new test target joins `rest`
-  without anyone editing the workflow).
+  without anyone editing the workflow). `rest` proves from the combined
+  cargo output that every binary cargo ran printed a libtest summary
+  with total > 0 (the one testless bin is pinned, not proved) and that
+  every selected target ran a section (a silently skipped target fails).
 - `contracts:K/N`: shard K of N of `artifact_contracts`. The test list comes
   from the compiled binary (`-- --list --format terse`), the shards from a
   greedy longest-first assignment over the checked-in weights
@@ -28,7 +31,12 @@ listed - assigned). A shard with no tests is an error, never a silent green
 (libtest with no filter would run everything; with a filter that matches
 nothing it runs nothing and exits 0). Every shard computes the same plan
 from the same list, so the N shards together run every listed test exactly
-once; `plan` prints that partition and checks it.
+once; `plan` prints that partition and checks it. `rest` proves from the
+combined output that every binary cargo ran printed a libtest summary
+with total > 0, naming any binary that prints none or runs zero (the
+testless p11scope bin is pinned, and a nonzero pin fails as stale),
+and that every selected target ran (an expected target with no
+`Running` section fails naming it).
 
 Under `cargo llvm-cov` the script names the raw profiles after the partition
 (LLVM_PROFILE_FILE_NAME) so profiles from different runners never collide,
@@ -76,6 +84,22 @@ RESULT = re.compile(
     r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
     r"(\d+) measured; (\d+) filtered out;"
 )
+RUNNING_HEADER = re.compile(r"^\s*Running (\S+) (\S+) \((.*?)\)\s*$")
+# Integration tests and benches print the target source without a kind word:
+# `Running tests/foo.rs (target/debug/deps/foo-<hash>)`.
+RUNNING_SRC_HEADER = re.compile(r"^\s*Running (\S+) \((.*?)\)\s*$")
+BARE_RUNNING_HEADER = re.compile(r"^\s*Running (\S+)\s*$")
+DOCTEST_HEADER = re.compile(r"^\s*Doc-tests (\S+)\s*$")
+# A header-looking line that matches none of the known forms: failing
+# closed keeps a future cargo format from merging its summary into the
+# previous section and masking that section's verdict.
+UNKNOWN_HEADER = re.compile(r"^\s*(Running|Doc-tests)\b")
+# The one rest binary that legitimately holds no tests: the p11scope bin
+# is CLI dispatch only (src/main.rs), so its total-0 summary is pinned,
+# not proved. (binary stem, target source) from the Running header; a
+# nonzero pinned binary fails the pin as stale, so the exemption cannot
+# linger after a test is added.
+REST_ZERO_TEST_PIN = ("p11scope", "src/main.rs")
 
 
 class PartitionError(Exception):
@@ -225,12 +249,121 @@ def verify_summary(output, assigned, listed):
         )
 
 
-def run_capture(command, env=None):
-    """Run, echo stdout as it arrives, and return (status, stdout)."""
+def rest_binary_stem(path):
+    """Binary name minus the cargo metadata hash (`p11scope-<hash>`)."""
+    return re.sub(r"-[0-9a-f]{16}$", "", path.rsplit("/", 1)[-1])
+
+
+def rest_expected_targets(metadata):
+    """(binary stem, package-relative source) cargo must run for rest.
+
+    Lib, bin and integration-test targets run only when their `test` flag
+    is set; rest selects tests by name but only names `test = true`
+    targets, so a `test = false` test is never selected and never runs.
+    Examples and benches run under `--examples`/`--benches` even with
+    `test = false` (observed on cargo 1.99.1: every workspace example
+    carries the default `test = false` and ran a section in the real
+    rest output; benches on a scratch project), so they are always
+    expected. The sharded `artifact_contracts` target runs in the
+    contracts partitions, never here.
+    """
+    members = set(metadata["workspace_members"])
+    expected = set()
+    for package in metadata["packages"]:
+        if package["id"] not in members:
+            continue
+        root = str(Path(package["manifest_path"]).parent) + "/"
+        for target in package["targets"]:
+            kind = tuple(target["kind"])
+            if kind == ("test",) and target["name"] == SHARDED_TARGET:
+                continue
+            if kind in (("lib",), ("bin",), ("test",)) \
+                    and not target.get("test", True):
+                continue
+            if kind not in (("lib",), ("bin",), ("example",), ("bench",), ("test",)):
+                continue
+            src = target["src_path"]
+            src = src.removeprefix(root)
+            expected.add((target["name"].replace("-", "_"), src))
+    return expected
+
+
+def verify_rest_output(output, expected=None):
+    """Every binary cargo ran proved a nonzero libtest selection.
+
+    Cargo's `Running` headers (stderr) delimit one section per binary;
+    the binary's own summary is its section's last `test result:` line
+    (a nested libtest run inside a test can only print earlier). A
+    `Doc-tests` header starts its own section so a doctest summary can
+    never stand in for its lib's. A header-looking line that matches
+    none of the known forms fails naming the line, so every section
+    ends at the next header of any form. When `expected` (from
+    `rest_expected_targets`) is given, every expected target must have
+    run a section: a selected target cargo silently skips fails naming
+    it instead of passing invisibly.
+    """
+    sections = []  # [(src, binary, [lines])]
+    for line in output.splitlines():
+        modern = RUNNING_HEADER.match(line)
+        if modern is not None:
+            _kind, src, binary = modern.groups()
+            sections.append((src, binary, []))
+            continue
+        srcheader = RUNNING_SRC_HEADER.match(line)
+        if srcheader is not None:
+            src, binary = srcheader.groups()
+            sections.append((src, binary, []))
+            continue
+        doctest = DOCTEST_HEADER.match(line)
+        if doctest is not None:
+            sections.append((None, f"Doc-tests {doctest.group(1)}", []))
+            continue
+        bare = BARE_RUNNING_HEADER.match(line)
+        if bare is not None:
+            sections.append((None, bare.group(1), []))
+            continue
+        if UNKNOWN_HEADER.match(line):
+            raise PartitionError(f"unrecognized rest header: {line.strip()}")
+        if sections:
+            sections[-1][2].append(line)
+    if not sections:
+        raise PartitionError("no test binaries ran in the rest output")
+    for src, binary, lines in sections:
+        results = [match for match in map(RESULT.match, lines) if match]
+        if not results:
+            raise PartitionError(
+                f"rest binary {binary} printed no libtest summary")
+        passed, failed, ignored, measured, _filtered = map(
+            int, results[-1].groups())
+        total = passed + failed + ignored + measured
+        pinned = (rest_binary_stem(binary), src) == REST_ZERO_TEST_PIN
+        if total == 0 and not pinned:
+            raise PartitionError(f"rest binary {binary} ran 0 tests")
+        if total > 0 and pinned:
+            raise PartitionError(
+                f"rest binary {binary} ran {total} tests but is pinned as "
+                "testless in REST_ZERO_TEST_PIN; delete the pin")
+    if expected is not None:
+        ran = {(rest_binary_stem(binary), src)
+               for src, binary, _lines in sections if src is not None}
+        for stem, src in sorted(expected):
+            if (stem, src) not in ran:
+                raise PartitionError(
+                    f"rest never ran target {src} ({stem}): no Running section")
+
+
+def run_capture(command, env=None, capture_stderr=False):
+    """Run, echo output as it arrives, and return (status, output).
+
+    With capture_stderr, cargo's stderr (the Running headers) joins the
+    captured output so rest sections delimit; otherwise stderr flows to
+    the console as before.
+    """
     print("+ " + " ".join(command), flush=True)
     with subprocess.Popen(
-        command, cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace",
+        command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if capture_stderr else None,
+        text=True, encoding="utf-8", errors="replace",
     ) as process:
         captured = []
         for line in process.stdout:
@@ -271,7 +404,14 @@ def run_partition(spec, command, runner=run_capture, metadata=cargo_metadata,
     kind, shard, shards = parse_partition(spec)
     env = coverage_env(command, spec)
     if kind == "rest":
-        status, _ = runner(narrowed(command, rest_selection(metadata(command))), env)
+        meta = metadata(command)
+        status, output = runner(
+            narrowed(command, rest_selection(meta)), env,
+            capture_stderr=True,
+        )
+        if status != 0:
+            return status  # cargo or a test already failed the partition
+        verify_rest_output(output, rest_expected_targets(meta))
         return status
     names = list_tests(command, env, runner)
     assigned, loads = plan(names, shards, weights or load_weights())
@@ -336,13 +476,396 @@ def coverage_objects(debug_dir):
             continue
         if path.suffix in (".d", ".rlib", ".rmeta", ".so") or path.is_symlink():
             continue
-        if path.is_file() and os.stat(path).st_mode & 0o111:
-            found.append(relative)
+        if path.is_file():
+            metadata = os.stat(path)
+            if metadata.st_mode & 0o111:
+                found.append(relative)
     return found
+
+
+# A test that pins its own executable is refused once instrumented
+# (the coverage libtest binary exceeds the scanner's object limit),
+# so pinnable-object fixtures use the small owned object instead. The
+# packer enforces the actual risk as a source guard: a self path
+# (`current_exe()`, `/proc/self/exe`, or a same-function binding
+# derived from one) must never reach a size-gated scanner entry — the
+# path gates, the path-forwarding helpers, the scanned-module gates,
+# or a test-binary copy. Re-exec spawns, comparisons, `real_scan_pin`
+# (std-fs synthesized, no gate) and bounded reads are not pins.
+_SELF_PIN_PATH_GATES = (
+    "open_object", "open_rooted_object", "object_facts",
+    "pin_as_manifest_object", "identity_and_key", "validated_identity",
+    "validated_identity_with_probe", "identify",
+    "stable_selection_maps_with_probe",
+)
+_SELF_PIN_STRUCT_GATES = (
+    "pin_test_module", "pin_test_modules", "pin_scanned_object",
+    "pin_scanned_objects", "pin_scanned_view_objects",
+)
+_SELF_PIN_HANDLE_INITS = ("Command::new", "File::open", "OpenOptions")
+_SELF_PIN_FN = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+(?:\"[^\"]*\"\s+)?)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\(\<]"
+)
+_SELF_PIN_LET = re.compile(r"\blet\s+(mut\s+)?(.+?)\s*=\s*", re.S)
+
+# The two self-pin flows the guard reports but excuses, as
+# (file, test function). Each is benign by a mechanism its own test
+# pins; `check_self_pin_allowlist` fails a stale entry loudly.
+SELF_PIN_ALLOWLIST = frozenset({
+    ("src/discovery/engine_tests.rs",
+     "exact_loader_pin_is_view_owned_but_not_a_provider_module"),
+    ("tests/manifest_pinning.rs",
+     "a_retargeted_path_is_skipped_as_an_identity_mismatch"),
+})
+
+
+def _self_pin_stripped(text):
+    """Blank strings, chars and comments; keep newlines and offsets.
+
+    A `"/proc/self/exe"` literal survives: used as a path it is the
+    source itself, and blanking it would blind the guard.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    def blank_string(a, b):
+        blank(a, b)
+        # Only the path spelling survives: a `current_exe()` inside a
+        # string is a message, never a path value.
+        segment = text[a:b]
+        spelling = "/proc/self/exe"
+        k = segment.find(spelling)
+        while k >= 0:
+            for t, ch in enumerate(spelling):
+                out[a + k + t] = ch
+            k = segment.find(spelling, k + 1)
+
+    while i < n:
+        ch = text[i]
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif ch == "r" and i + 1 < n and text[i + 1] in "#\"":
+            match = re.match(r"r(#+)?\"", text[i:])
+            if match:
+                close = "\"" + (match.group(1) or "")
+                j = text.find(close, i + match.end())
+                j = n if j < 0 else j + len(close)
+                blank_string(i, j)
+                i = j
+            else:
+                i += 1
+        elif ch in "\"'":
+            if ch == "'" and re.match(r"'[A-Za-z_][A-Za-z0-9_]*[^']",
+                                      text[i:i + 20]):
+                i += 1  # a lifetime, not a char
+                continue
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == ch:
+                    j += 1
+                    break
+                if text[j] == "\n" and ch == "'":
+                    break
+                j += 1
+            blank_string(i, j)
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _self_pin_fn_spans(text):
+    """(name, start, end, body start line) for every fn item."""
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    spans = []
+    for i, line in enumerate(lines):
+        match = _SELF_PIN_FN.match(line)
+        if not match:
+            continue
+        j, column, brace = i, match.end(), None
+        while j < len(lines):
+            for k, ch in enumerate(lines[j][column if j == i else 0:]):
+                if ch == ";":
+                    brace = None
+                    j = len(lines)
+                    break
+                if ch == "{":
+                    brace = offsets[j] + (column if j == i else 0) + k
+                    j = len(lines)
+                    break
+            else:
+                j += 1
+                continue
+            break
+        if brace is None:
+            continue
+        depth, end = 0, None
+        for k in range(brace, len(text)):
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = k + 1
+                    break
+        if end is None:
+            continue
+        spans.append((match.group(1), offsets[i] + match.start(), end,
+                      text.count("\n", 0, brace) + 1))
+    return spans
+
+
+def _self_pin_balanced(text, open_index):
+    depth = 0
+    for k in range(open_index, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:k], k
+    return None, None
+
+
+def _self_pin_stmt_end(text, i):
+    depth, k = 0, i
+    while k < len(text):
+        ch = text[k]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return k
+        k += 1
+    return -1
+
+
+def _self_pin_used(name, expr):
+    # A bare binding use, not a field (`x.name`) or a path (`name::x`).
+    return re.search(r"(?<![\w\.:])%s\b(?!\s*::)" % re.escape(name),
+                     expr) is not None
+
+
+def _self_pin_tainted(expr, tainted):
+    if "current_exe()" in expr or "/proc/self/exe" in expr:
+        return True
+    return any(_self_pin_used(name, expr) for name in tainted)
+
+
+def _self_pin_tail(init):
+    # A block's value is its tail expression; any other initializer is
+    # judged whole (conservative through closures and chains).
+    stripped = init.strip()
+    if not stripped.startswith("{"):
+        return init
+    depth, end = 0, None
+    for k, ch in enumerate(stripped):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = k
+                break
+    inner = stripped[1:end if end is not None else len(stripped)]
+    parts, depth, current = [], 0, []
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == ";" and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    tails = [part for part in (p.strip() for p in parts) if part]
+    return tails[-1] if tails else ""
+
+
+def _self_pin_lets(body):
+    """(names, init, pos) for plain, tuple and single-wrap lets."""
+    out = []
+    for match in _SELF_PIN_LET.finditer(body):
+        pattern = match.group(2).strip()
+        names = []
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s*(?:::[^=]*)?", pattern):
+            base = re.split(r"\s*:", pattern)[0]
+            if base not in ("_", ""):
+                names = [base]
+        elif pattern.startswith("("):
+            inner, _ = _self_pin_balanced(pattern, 0)
+            if inner is not None:
+                names = [ident for ident in
+                         re.findall(r"[A-Za-z_][A-Za-z0-9_]*", inner)
+                         if ident not in ("mut", "_")]
+        else:
+            wrapped = re.match(r"(?:Some|Ok|Err)\s*\(\s*(mut\s+)?"
+                               r"([A-Za-z_][A-Za-z0-9_]*)\s*\)$", pattern)
+            if wrapped and wrapped.group(2) != "_":
+                names = [wrapped.group(2)]
+            else:
+                continue
+        if not names:
+            continue
+        end = _self_pin_stmt_end(body, match.end())
+        if end < 0:
+            continue
+        out.append((names, body[match.end():end], match.start()))
+    return out
+
+
+def _self_pin_scan_function(body):
+    lets = _self_pin_lets(body)
+    tainted = set()
+    for _ in range(10):
+        grown = False
+        for names, init, _ in lets:
+            if any(marker in init for marker in _SELF_PIN_HANDLE_INITS):
+                continue  # a child or handle, never a path
+            if _self_pin_tainted(_self_pin_tail(init), tainted):
+                for name in names:
+                    if name not in tainted:
+                        tainted.add(name)
+                        grown = True
+        for found in re.finditer(r"\b(?:std::)?fs::copy\s*\(", body):
+            args, _ = _self_pin_balanced(body, found.end() - 1)
+            if args is None:
+                continue
+            parts = args.split(",", 1)
+            if len(parts) == 2 and _self_pin_tainted(parts[0], tainted):
+                target = re.search(r"[A-Za-z_][A-Za-z0-9_]*", parts[1])
+                if target and target.group(0) not in tainted:
+                    tainted.add(target.group(0))
+                    grown = True
+        for found in re.finditer(r"\bmapped_object\s*\(", body):
+            args, _ = _self_pin_balanced(body, found.end() - 1)
+            if args is not None and _self_pin_tainted(args, tainted):
+                owners = [entry for entry in lets if entry[2] < found.start()
+                          and _self_pin_stmt_end(body, entry[2]) > found.start()]
+                for names, _, _ in owners[-1:]:
+                    for name in names:
+                        if name not in tainted:
+                            tainted.add(name)
+                            grown = True
+        for found in re.finditer(r"\bScannedModule\s*\{", body):
+            owners = [entry for entry in lets if entry[2] < found.start()
+                      and _self_pin_stmt_end(body, entry[2]) > found.start()]
+            if not owners:
+                continue
+            window = body[found.start():found.start() + 3000]
+            if _self_pin_tainted(window, tainted):
+                for name in owners[-1][0]:
+                    if name not in tainted:
+                        tainted.add(name)
+                        grown = True
+        if not grown:
+            break
+    violations = []
+    for gate in _SELF_PIN_PATH_GATES + _SELF_PIN_STRUCT_GATES:
+        # `tracker.identify(pid)` is a different function; the path
+        # gate is never a method call.
+        prefix = r"(?<![\w\.])" if gate == "identify" else r"\b"
+        for found in re.finditer(prefix + r"%s\s*\(" % re.escape(gate),
+                                 body):
+            args, _ = _self_pin_balanced(body, found.end() - 1)
+            if args is not None and _self_pin_tainted(args, tainted):
+                lineno = body.count("\n", 0, found.start()) + 1
+                violations.append((gate, lineno))
+    for found in re.finditer(r"\b(?:std::)?fs::copy\s*\(", body):
+        args, _ = _self_pin_balanced(body, found.end() - 1)
+        if args is not None and _self_pin_tainted(args.split(",", 1)[0],
+                                                  tainted):
+            lineno = body.count("\n", 0, found.start()) + 1
+            violations.append(("fs::copy", lineno))
+    return violations
+
+
+def scan_self_pins(root):
+    """Every (file, line, function, gate) where a self path reaches a pin."""
+    hits = []
+    for top in ("src", "tests", "crates"):
+        base = Path(root) / top
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.rs")):
+            if "target" in path.parts:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8")
+                if "current_exe" not in raw and "/proc/self/exe" not in raw:
+                    continue
+                text = _self_pin_stripped(raw)
+                spans = _self_pin_fn_spans(text)
+                for name, start, end, first in spans:
+                    chars = list(text[start:end])
+                    for _, inner, inner_end, _ in spans:
+                        if start < inner and inner_end <= end:
+                            for k in range(inner - start, inner_end - start):
+                                if chars[k] != "\n":
+                                    chars[k] = " "
+                    for gate, lineno in _self_pin_scan_function("".join(chars)):
+                        hits.append((path.relative_to(root).as_posix(),
+                                     first + lineno - 1, name, gate))
+            except PartitionError:
+                raise
+            except Exception as error:
+                raise PartitionError(f"cannot scan {path}: {error}")
+    return sorted(hits)
+
+
+def self_pin_violations(root=None):
+    """Non-allowlisted self-pin hits under root (default: this checkout)."""
+    root = ROOT if root is None else Path(root)
+    return [hit for hit in scan_self_pins(root)
+            if (hit[0], hit[2]) not in SELF_PIN_ALLOWLIST]
+
+
+def check_self_pin_allowlist(root=None):
+    """Every allowlist entry must still violate, or it is stale."""
+    root = ROOT if root is None else Path(root)
+    hit = {(rel, function) for rel, _, function, _ in scan_self_pins(root)}
+    stale = sorted(SELF_PIN_ALLOWLIST - hit)
+    if stale:
+        raise PartitionError(
+            "stale self-pin allowlist entries (fixed sites drop their entry): "
+            + "; ".join(f"{rel}::{function}" for rel, function in stale)
+        )
 
 
 def coverage_pack(spec, target_dir, output_dir):
     target_dir, output_dir = Path(target_dir), Path(output_dir)
+    hits = self_pin_violations()
+    if hits:
+        detail = "; ".join(f"{rel}:{line} ({function} -> {gate})"
+                           for rel, line, function, gate in hits)
+        raise PartitionError(
+            "a test pins the test binary instead of the small owned fixture: "
+            + detail
+        )
+    check_self_pin_allowlist()
     prefix = f"p11scope-{slug(spec)}-"
     profiles = sorted(p for p in target_dir.glob("*.profraw") if p.name.startswith(prefix))
     strays = sorted(p.name for p in target_dir.glob("*.profraw") if not p.name.startswith(prefix))
@@ -426,25 +949,51 @@ def _expect_error(function, *args):
 
 def _fake_metadata(extra=()):
     targets = [
-        {"name": "p11scope", "kind": ["lib"], "test": True},
-        {"name": "p11scope", "kind": ["bin"], "test": True},
-        {"name": "example", "kind": ["example"], "test": False},
-        {"name": SHARDED_TARGET, "kind": ["test"], "test": True},
-        {"name": "zeta", "kind": ["test"], "test": True},
-        {"name": "alpha", "kind": ["test"], "test": True},
-        {"name": "untested", "kind": ["test"], "test": False},
-        {"name": "build-script-build", "kind": ["custom-build"], "test": False},
+        {"name": "p11scope", "kind": ["lib"], "test": True,
+         "src_path": "/fake/src/lib.rs"},
+        {"name": "p11scope", "kind": ["bin"], "test": True,
+         "src_path": "/fake/src/main.rs"},
+        {"name": "example", "kind": ["example"], "test": False,
+         "src_path": "/fake/examples/example.rs"},
+        {"name": SHARDED_TARGET, "kind": ["test"], "test": True,
+         "src_path": "/fake/tests/artifact_contracts.rs"},
+        {"name": "zeta", "kind": ["test"], "test": True,
+         "src_path": "/fake/tests/zeta.rs"},
+        {"name": "alpha", "kind": ["test"], "test": True,
+         "src_path": "/fake/tests/alpha.rs"},
+        {"name": "untested", "kind": ["test"], "test": False,
+         "src_path": "/fake/tests/untested.rs"},
+        {"name": "build-script-build", "kind": ["custom-build"], "test": False,
+         "src_path": "/fake/build.rs"},
     ]
     return {
         "workspace_members": ["root", "member"],
         "packages": [
-            {"id": "root", "name": "p11scope", "targets": targets},
+            {"id": "root", "name": "p11scope", "targets": targets,
+             "manifest_path": "/fake/Cargo.toml"},
             {"id": "member", "name": "member",
-             "targets": [{"name": "alpha", "kind": ["test"], "test": True}, *extra]},
+             "targets": [{"name": "beta", "kind": ["test"], "test": True,
+                          "src_path": "/fake/member/tests/beta.rs"}, *extra],
+             "manifest_path": "/fake/member/Cargo.toml"},
             {"id": "dep", "name": "dep",
-             "targets": [{"name": "outside", "kind": ["test"], "test": True}]},
+             "targets": [{"name": "outside", "kind": ["test"], "test": True,
+                          "src_path": "/fake/dep/tests/outside.rs"}],
+             "manifest_path": "/fake/dep/Cargo.toml"},
         ],
     }
+
+
+def _full_rest_sections(extra=()):
+    """Every fake rest target healthy: lib, pinned-zero bin, example, alpha, member beta, zeta."""
+    return [
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("p11scope-1a2b3c4d5e6f7891", "src/main.rs", (0, 0, 0, 0)),
+        ("example-1a2b3c4d5e6f7892", "examples/example.rs", (1, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7893", "tests/alpha.rs", (3, 0, 2, 0)),
+        ("beta-1a2b3c4d5e6f7895", "tests/beta.rs", (3, 0, 0, 0)),
+        ("zeta-1a2b3c4d5e6f7894", "tests/zeta.rs", (2, 0, 0, 0)),
+        *extra,
+    ]
 
 
 class _FakeLibtest:
@@ -454,8 +1003,8 @@ class _FakeLibtest:
         self.names, self.nested, self.drop = names, nested, drop
         self.ran, self.commands = [], []
 
-    def __call__(self, command, env):
-        self.commands.append((command, env))
+    def __call__(self, command, env, capture_stderr=False):
+        self.commands.append((command, env, capture_stderr))
         args = command[command.index("--") + 1:]
         if args[:1] == ["--list"]:
             return 0, "".join(f"{name}: test\n" for name in self.names)
@@ -471,6 +1020,45 @@ class _FakeLibtest:
             f"{len(self.names) - len(selected)} filtered out; finished in 0.01s"
         )
         return 0, "\n".join(lines) + "\n"
+
+
+class _FakeRest:
+    """Canned combined cargo output: Running headers plus libtest summaries."""
+
+    def __init__(self, sections, status=0):
+        # sections: [(binary, src, summary)] where summary is
+        # (passed, failed, ignored, measured) or None for no summary.
+        # A ("Doc-tests <lib>", None, summary) section renders a doctest
+        # header. Header forms mirror real cargo 1.99.1 output: the
+        # three-token `unittests` form for lib/bin/example targets, the
+        # two-token form for integration tests and benches.
+        self.sections, self.status = sections, status
+        self.commands = []
+
+    def __call__(self, command, env, capture_stderr=False):
+        self.commands.append((command, env, capture_stderr))
+        lines = []
+        for binary, src, summary in self.sections:
+            if src is None and binary.startswith("Doc-tests "):
+                lines.append(f"     {binary}")
+            elif src is None:
+                lines.append(f"     Running target/debug/deps/{binary}")
+            elif src.startswith(("tests/", "benches/")):
+                lines.append(f"     Running {src} (target/debug/deps/{binary})")
+            else:
+                lines.append(f"     Running unittests {src} (target/debug/deps/{binary})")
+            lines.append("")
+            if summary is None:
+                continue
+            total = sum(summary)
+            noun = "test" if total == 1 else "tests"
+            lines.append(f"running {total} {noun}")
+            passed, failed, ignored, measured = summary
+            lines.append(
+                f"test result: ok. {passed} passed; {failed} failed; "
+                f"{ignored} ignored; {measured} measured; 0 filtered out; finished in 0.01s"
+            )
+        return self.status, "\n".join(lines) + "\n"
 
 
 def self_test():
@@ -500,7 +1088,7 @@ def self_test():
     # rest: every workspace integration target with test = true but the sharded one.
     selection = rest_selection(_fake_metadata())
     assert selection == ["--lib", "--bins", "--examples", "--benches",
-                         "--test", "alpha", "--test", "zeta"], selection
+                         "--test", "alpha", "--test", "beta", "--test", "zeta"], selection
     assert narrowed(gate, selection) == gate[:-1] + selection
     _expect_error(rest_selection, {"workspace_members": [], "packages": []})
     _expect_error(rest_selection, _fake_metadata(
@@ -549,9 +1137,10 @@ def self_test():
                                    metadata=None, weights=table)
             assert status == 0
         assert sorted(fake.ran) == sorted(listed), (shards, len(fake.ran))
-        for command, env in fake.commands:
+        for command, env, capture_stderr in fake.commands:
             assert command[:7] == gate[:6] + ["--test"] and command[7] == SHARDED_TARGET, command
             assert env.get("LLVM_PROFILE_FILE_NAME") == os.environ.get("LLVM_PROFILE_FILE_NAME")
+            assert capture_stderr is False
     # A test that silently does not run makes its shard fail.
     dropped = _FakeLibtest(listed, drop="case_010")
     try:
@@ -563,16 +1152,193 @@ def self_test():
         raise AssertionError("a dropped test went unnoticed")
     # rest runs the narrowed gate once; llvm-cov profiles are named per partition.
     seen = []
-    status = run_partition("rest", cov, runner=lambda c, e: (seen.append((c, e)) or (0, "")),
+
+    def rest_ok(command, env, capture_stderr=False):
+        seen.append((command, env, capture_stderr))
+        _, output = _FakeRest(_full_rest_sections())(command, env)
+        return 0, output
+
+    status = run_partition("rest", cov, runner=rest_ok,
                            metadata=lambda c: _fake_metadata(), weights=table)
     assert status == 0 and len(seen) == 1
     assert seen[0][0] == narrowed(cov, ["--lib", "--bins", "--examples", "--benches",
-                                        "--test", "alpha", "--test", "zeta"])
+                                        "--test", "alpha", "--test", "beta", "--test", "zeta"])
     assert seen[0][1]["LLVM_PROFILE_FILE_NAME"] == "p11scope-rest-%p-%m.profraw"
+    assert seen[0][2] is True
     fake = _FakeLibtest(listed)
     run_partition("contracts:2/3", cov, runner=fake, metadata=None, weights=table)
     assert all(env["LLVM_PROFILE_FILE_NAME"] == "p11scope-contracts-2-of-3-%p-%m.profraw"
-               for _, env in fake.commands)
+               for _, env, _ in fake.commands)
+
+    # rest proves a nonzero selection per binary: every binary cargo ran
+    # must print a libtest summary with total > 0, else the partition fails
+    # naming the binary. The exit status rule stays: a failing run fails
+    # without summary verification.
+    healthy = _FakeRest(_full_rest_sections())
+    assert run_partition("rest", gate, runner=healthy,
+                         metadata=lambda c: _fake_metadata()) == 0
+    # The expected set is exactly the runnable rest targets: the sharded
+    # target, the test=false integration target, the build script and the
+    # non-member package stay out, while the test=false example stays in.
+    assert rest_expected_targets(_fake_metadata()) == {
+        ("p11scope", "src/lib.rs"), ("p11scope", "src/main.rs"),
+        ("example", "examples/example.rs"), ("alpha", "tests/alpha.rs"),
+        ("beta", "tests/beta.rs"), ("zeta", "tests/zeta.rs"),
+    }
+    # Benches run under `--benches` even with `test = false`, so a
+    # test=false bench is expected like the test=false example above;
+    # test=false lib/bin targets never run under the rest selection.
+    with_bench = _fake_metadata([{
+        "name": "criterion-bench", "kind": ["bench"], "test": False,
+        "src_path": "/fake/member/benches/criterion-bench.rs",
+    }])
+    assert ("criterion_bench", "benches/criterion-bench.rs") in \
+        rest_expected_targets(with_bench)
+    not_built = _fake_metadata([
+        {"name": "member-lib", "kind": ["lib"], "test": False,
+         "src_path": "/fake/member/src/lib.rs"},
+        {"name": "member-bin", "kind": ["bin"], "test": False,
+         "src_path": "/fake/member/src/main.rs"},
+    ])
+    selected = rest_expected_targets(not_built)
+    assert ("member_lib", "src/lib.rs") not in selected
+    assert ("member_bin", "src/main.rs") not in selected
+    zero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("zeta-1a2b3c4d5e6f7892", "tests/zeta.rs", (0, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=zero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "zeta-1a2b3c4d5e6f7892" in str(error), error
+    else:
+        raise AssertionError("a zero-test rest binary went unnoticed")
+    missing = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7891", "tests/alpha.rs", None),
+    ])
+    try:
+        run_partition("rest", gate, runner=missing,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "alpha-1a2b3c4d5e6f7891" in str(error), error
+    else:
+        raise AssertionError("a rest binary without a summary went unnoticed")
+    failing = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+    ], status=101)
+    assert run_partition("rest", gate, runner=failing,
+                         metadata=lambda c: _fake_metadata()) == 101
+    bare_zero = _FakeRest([
+        ("bare-1a2b3c4d5e6f7893", None, (0, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=bare_zero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "bare-1a2b3c4d5e6f7893" in str(error), error
+    else:
+        raise AssertionError("a bare-form zero-test binary went unnoticed")
+    bare_healthy = _FakeRest(_full_rest_sections([
+        ("bare-1a2b3c4d5e6f7893", None, (2, 0, 0, 0)),
+    ]))
+    assert run_partition("rest", gate, runner=bare_healthy,
+                         metadata=lambda c: _fake_metadata()) == 0
+    # The p11scope bin is CLI dispatch only (src/main.rs holds no tests),
+    # so its total-0 summary is pinned, not proved: any other zero-test
+    # binary still fails, and a nonzero bin fails the pin as stale.
+    pinned_zero = _FakeRest(_full_rest_sections())
+    assert run_partition("rest", gate, runner=pinned_zero,
+                         metadata=lambda c: _fake_metadata()) == 0
+    pinned_nonzero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/main.rs", (1, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=pinned_nonzero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "REST_ZERO_TEST_PIN" in str(error), error
+    else:
+        raise AssertionError("a stale zero-test pin went unnoticed")
+    # A Doc-tests section is its own proof: its summary must not stand in
+    # for the lib's, and a zero doctest run fails naming the doctests.
+    doctest_healthy = _FakeRest(_full_rest_sections([
+        ("Doc-tests p11scope", None, (4, 0, 0, 0)),
+    ]))
+    assert run_partition("rest", gate, runner=doctest_healthy,
+                         metadata=lambda c: _fake_metadata()) == 0
+    doctest_zero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("Doc-tests p11scope", None, (0, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=doctest_zero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "Doc-tests p11scope" in str(error), error
+    else:
+        raise AssertionError("a zero-test doctest run went unnoticed")
+    # A selected target cargo never runs leaves no section and must fail
+    # naming it, instead of passing silently.
+    skipped = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("p11scope-1a2b3c4d5e6f7891", "src/main.rs", (0, 0, 0, 0)),
+        ("example-1a2b3c4d5e6f7892", "examples/example.rs", (1, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7893", "tests/alpha.rs", (3, 0, 0, 0)),
+        ("beta-1a2b3c4d5e6f7895", "tests/beta.rs", (3, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=skipped,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "tests/zeta.rs" in str(error), error
+    else:
+        raise AssertionError("a selected target with no section went unnoticed")
+    # The member target is expected and required: a run missing only
+    # its section fails naming it, so member coverage cannot hide
+    # behind a root target of the same name.
+    member_missing = _FakeRest([
+        section for section in _full_rest_sections()
+        if not section[0].startswith("beta-")
+    ])
+    try:
+        run_partition("rest", gate, runner=member_missing,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "tests/beta.rs" in str(error), error
+    else:
+        raise AssertionError("a missing member section went unnoticed")
+    # An unrecognized header form fails closed naming the line: the
+    # unknown section's healthy summary must not merge into the
+    # previous section and mask its zero.
+    def unknown_header(command, env, unknown, capture_stderr=False):
+        head, tail = _full_rest_sections()[0], _full_rest_sections()[1:]
+        _, before = _FakeRest([(head[0], head[1], (0, 0, 0, 0))])(command, env)
+        _, after = _FakeRest(tail)(command, env)
+        return 0, before + unknown + after
+
+    for unknown in (
+        "     Running test suites for extra-stuff\n\n"
+        "running 3 tests\n"
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; "
+        "0 filtered out; finished in 0.01s\n",
+        "     Doc-tests extra-stuff 1.0\n\n"
+        "running 2 tests\n"
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+        "0 filtered out; finished in 0.01s\n",
+    ):
+        header = unknown.splitlines()[0].strip()
+        try:
+            run_partition("rest", gate,
+                          runner=lambda c, e, capture_stderr=False, u=unknown: unknown_header(c, e, u),
+                          metadata=lambda c: _fake_metadata())
+        except PartitionError as error:
+            assert header in str(error), error
+        else:
+            raise AssertionError(f"an unrecognized rest header went unnoticed: {header}")
+    assert healthy.commands and healthy.commands[0][2] is True, \
+        "rest must capture stderr so Running headers delimit binaries"
 
     # The checked-in table loads and is a real table.
     default, seconds = load_weights()
@@ -591,6 +1357,76 @@ def self_test():
         table = weights_from_reports([report])
         assert table == {"target": SHARDED_TARGET, "default_seconds": 0.1,
                          "seconds": {"slow": 12.3}}, table
+
+    # The packer archives whatever cargo-llvm-cov needs, however
+    # large: the retired size tripwire mistook the instrumented
+    # binary's size for self-pin failures. A sparse over-limit
+    # executable packs (the full shape matrix lives in the
+    # test_ci_test_partition.py suite).
+    with tempfile.TemporaryDirectory() as temporary:
+        tree = Path(temporary) / "llvm-cov-target"
+        debug = tree / "debug"
+        (debug / "deps").mkdir(parents=True)
+        library = debug / "deps" / "liblarge.rlib"
+        with library.open("wb") as output:
+            output.truncate(256 * 1024 * 1024 + 1)
+        library.chmod(0o755)
+        fat = debug / "deps" / "coverage-test"
+        with fat.open("wb") as output:
+            output.truncate(256 * 1024 * 1024 + 1)
+        fat.chmod(0o755)
+        assert coverage_objects(debug) == [Path("deps/coverage-test")]
+
+    # The self-pin guard: a direct pin, a test-binary copy and a
+    # module-struct flow flag; spawns, comparisons and bounded reads
+    # pass.
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "src").mkdir()
+        (root / "src" / "v.rs").write_text(
+            "fn t() {\n"
+            "    let exe = std::env::current_exe().unwrap();\n"
+            "    let key = object_facts(&exe).0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "c.rs").write_text(
+            "fn t() {\n"
+            "    std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "s.rs").write_text(
+            "fn t() {\n"
+            "    let exe = std::env::current_exe().unwrap();\n"
+            "    let module = ScannedModule { path: exe.display().to_string() };\n"
+            "    let ok = pin_scanned_objects(pid, &[module], &mut budget).unwrap();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "b.rs").write_text(
+            "fn t() {\n"
+            "    let mut child = std::process::Command::new("
+            "std::env::current_exe().unwrap());\n"
+            "    let self_exe = std::env::current_exe().unwrap();\n"
+            "    assert_ne!(other, self_exe);\n"
+            "    let fd = std::fs::File::open(\"/proc/self/exe\").unwrap();\n"
+            "    let slot = read_map_slot(&fd);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        hits = scan_self_pins(root)
+        assert [(rel, fn) for rel, _, fn, _ in hits] == [
+            ("src/c.rs", "t"), ("src/s.rs", "t"), ("src/v.rs", "t")], hits
+        assert [gate for _, _, _, gate in hits] == [
+            "fs::copy", "pin_scanned_objects", "object_facts"], hits
+        assert self_pin_violations(root) == hits
+        try:
+            check_self_pin_allowlist(root)
+        except PartitionError:
+            pass  # the clean fixture holds no allowlisted site
+        else:
+            raise AssertionError("a clean tree must starve the allowlist")
 
     # coverage-pack / coverage-unpack round trip, fail-closed on gaps.
     with tempfile.TemporaryDirectory() as temporary:

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 from fixture_common import CONFIG, record, refuse, save, state
 
@@ -120,6 +121,8 @@ elif operation == "create":
     identity = f'{current["count"]:064d}'
     current["ids"][identity] = name
     current["names"][name] = identity
+    if CONFIG.get("probe_build_jobs"):
+        current.setdefault("create_arguments", {})[identity] = arguments
     mounts = [arguments[i + 1] for i, value in enumerate(arguments[:-1]) if value == "-v"]
     for mount in mounts:
         parts = mount.split(":")
@@ -148,6 +151,26 @@ elif operation == "start":
     # closure there, as the pinned image does: the fixture reads it from
     # the production script's own heredoc, so the driver's cmp still runs.
     mounted = current.get("mounts", {}).get(resolve(arguments[-1]), {})
+    if CONFIG.get("probe_build_jobs") and "/receipt" in mounted:
+        identity = resolve(arguments[-1])
+        create = current["create_arguments"][identity]
+        body = create[create.index("-ec") + 1]
+        lines = body.splitlines()
+        cargo_line = next(i for i, line in enumerate(lines) if line.lstrip().startswith("cargo build "))
+        # Execute the real setup and Cargo invocation, stopping before the
+        # unrelated provider runtime. Only owned receipt paths are writable;
+        # every reached external command is a harmless dedicated probe.
+        prefix = "\n".join(lines[:cargo_line + 1]).replace("/receipt", mounted["/receipt"])
+        child_bin = Path(CONFIG["probe_bin"])
+        environment = {"PATH": str(child_bin), "P11SCOPE_CONTAINER_FIXTURE": os.environ["P11SCOPE_CONTAINER_FIXTURE"],
+                       "P11SCOPE_PROBE_CONTAINER": identity}
+        for index, value in enumerate(create[:-1]):
+            if value == "-e":
+                key, setting = create[index + 1].split("=", 1)
+                environment[key] = setting
+        result = subprocess.run(["/bin/sh", "-ec", prefix], env=environment, timeout=10)
+        if result.returncode:
+            raise SystemExit(result.returncode)
     if "/src" in mounted and "/receipt" in mounted:
         script = Path(mounted["/src"]) / "scripts/verify-discover-containers.sh"
         text = script.read_text()

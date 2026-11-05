@@ -3,6 +3,244 @@ use super::*;
 use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
 use p11scope_ebpf_common::{Event, capture, event_type};
 
+#[test]
+fn profile_counter_consumers_share_collection_at_both_terminal_paths() {
+    let source = include_str!("../run.rs");
+    let profile = source
+        .split_once("fn capture_profile(")
+        .unwrap()
+        .1
+        .split_once("fn write_json_report")
+        .unwrap()
+        .0;
+    assert_eq!(
+        profile
+            .matches("metrics::CaptureCollection::new(counter_inputs)")
+            .count(),
+        1
+    );
+    assert_eq!(profile.matches("collection.fresh(").count(), 1);
+    let compact: String = profile.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert_eq!(compact.matches("context.6.terminal(").count(), 1);
+    assert_eq!(
+        profile.matches("&mut collection,").count(),
+        2,
+        "both normal and quiesce-error finalizers retain the actual live collector"
+    );
+    let terminal = profile.split_once("fn run_terminal(").unwrap().1;
+    assert!(!terminal.contains("last_snapshot"));
+    assert!(!terminal.contains("profile_tick_snapshot("));
+}
+
+#[test]
+fn profile_counter_modes_share_the_live_and_terminal_collection() {
+    use p11scope_ebpf_common::CounterMode;
+    for mode in [
+        CounterMode::Counts,
+        CounterMode::Timestamps,
+        CounterMode::Latency,
+    ] {
+        let mut fixture = metrics::ConsumerFixture::new();
+        let mut cache = None;
+        let live = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: true,
+                render: true,
+            },
+            &mut cache,
+            || fixture.fresh(mode, 1, 5, None),
+        )
+        .unwrap();
+        assert_eq!(live.reports()[0].calls, 5);
+        assert_eq!(live.reports()[0].mode, mode);
+        assert_eq!(live.reports()[0].rv_counts[&0x1_0000_0001], 2);
+        let terminal = fixture.terminal(mode, 1, 8, None).unwrap();
+        assert_eq!(terminal.reports()[0].calls, 8);
+        assert_eq!(metrics::ConsumerFixture::delta(&terminal), Some(3));
+        assert!(metrics::ConsumerFixture::terminal_eligible(&terminal));
+        assert_eq!(fixture.reads(), (2, 0));
+    }
+}
+
+#[test]
+fn profile_counter_cached_ticks_make_zero_native_calls() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut fixture = metrics::ConsumerFixture::new();
+    let mut cache = None;
+    let first = profile_tick_snapshot(
+        ProfileFrame {
+            since_frame: Duration::ZERO,
+            fresh_snapshot: true,
+            render: true,
+        },
+        &mut cache,
+        || fixture.fresh(CounterMode::Counts, 1, 5, None),
+    )
+    .unwrap();
+    for _ in 0..4 {
+        let cached = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: false,
+                render: false,
+            },
+            &mut cache,
+            || panic!("a cached tick cannot acquire another native read"),
+        )
+        .unwrap();
+        assert_eq!(cached.counter_collection(), first.counter_collection());
+        assert_eq!(cached.reports(), first.reports());
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&cached));
+    }
+    assert_eq!(fixture.reads(), (1, 0));
+    let next = fixture.terminal(CounterMode::Counts, 1, 9, None).unwrap();
+    assert_eq!(metrics::ConsumerFixture::delta(&next), Some(4));
+    assert_eq!(fixture.reads(), (2, 0));
+}
+
+#[test]
+fn profile_counter_terminal_requires_a_new_successful_observation() {
+    use metrics::ConsumerFault;
+    use p11scope_ebpf_common::CounterMode;
+    for (fault, cause) in [
+        (ConsumerFault::ReadRvs, "read_rvs"),
+        (ConsumerFault::RowTopology, "topology"),
+        (ConsumerFault::Saturated, "saturated"),
+        (ConsumerFault::Contended, "contended"),
+    ] {
+        let mut fixture = metrics::ConsumerFixture::new();
+        let live = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&live.clone()));
+        let stale = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: true,
+                render: true,
+            },
+            &mut None,
+            || fixture.fresh(CounterMode::Counts, 1, 8, Some(fault)),
+        )
+        .unwrap();
+        assert_eq!(stale.reports()[0].calls, 5);
+        let metadata = stale.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "stale");
+        assert_eq!(metadata["failure"], cause);
+        assert!(metadata["health"].is_null());
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&stale));
+        let error = fixture
+            .terminal(CounterMode::Counts, 1, 9, Some(fault))
+            .unwrap_err();
+        assert!(error.to_string().contains(cause), "{error:#}");
+        assert_eq!(fixture.reads(), (3, 0));
+    }
+}
+
+#[test]
+fn profile_counter_initial_unavailability_cannot_fabricate_zero_measurements() {
+    use metrics::ConsumerFault;
+    use p11scope_ebpf_common::CounterMode;
+    for fault in [
+        ConsumerFault::ReadRvs,
+        ConsumerFault::RowTopology,
+        ConsumerFault::Saturated,
+        ConsumerFault::Contended,
+    ] {
+        let mut fixture = metrics::ConsumerFixture::new();
+        let mut cache = None;
+        let result = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: true,
+                render: true,
+            },
+            &mut cache,
+            || fixture.fresh(CounterMode::Counts, 1, 5, Some(fault)),
+        );
+        assert!(result.is_err());
+        assert!(
+            cache.is_none(),
+            "no initial unavailable result may become a report"
+        );
+        assert_eq!(fixture.reads(), (1, 0));
+    }
+}
+
+#[test]
+fn profile_counter_captures_keep_independent_collection_baselines() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut a = metrics::ConsumerFixture::new();
+    let mut b = metrics::ConsumerFixture::new();
+    a.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    b.fresh(CounterMode::Counts, 1, 9, None).unwrap();
+    let a = a.terminal(CounterMode::Counts, 1, 8, None).unwrap();
+    let b = b.terminal(CounterMode::Counts, 1, 14, None).unwrap();
+    assert_eq!(a.reports()[0].calls, 8);
+    assert_eq!(b.reports()[0].calls, 14);
+    assert_eq!(metrics::ConsumerFixture::delta(&a), Some(3));
+    assert_eq!(metrics::ConsumerFixture::delta(&b), Some(5));
+}
+
+#[test]
+fn profile_counter_generation_and_stale_status_keep_accepted_identity() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut fixture = metrics::ConsumerFixture::new();
+    fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    let changed = fixture.fresh(CounterMode::Timestamps, 2, 7, None).unwrap();
+    let metadata = changed.counter_collection().unwrap();
+    assert_eq!(metadata["mode"], "timestamps");
+    assert_eq!(metadata["generation"], 2);
+    assert_eq!(metadata["status"], "fresh");
+    assert_eq!(metadata["discontinuity"], true);
+    let stale = fixture
+        .fresh(
+            CounterMode::Latency,
+            3,
+            10,
+            Some(metrics::ConsumerFault::ReadRvs),
+        )
+        .unwrap();
+    let metadata = stale.counter_collection().unwrap();
+    assert_eq!(metadata["mode"], "timestamps");
+    assert_eq!(metadata["generation"], 2);
+    assert_eq!(
+        metadata["read_window"],
+        changed.counter_collection().unwrap()["read_window"]
+    );
+    assert_eq!(metadata["status"], "stale");
+    assert_eq!(stale.reports()[0].mode, CounterMode::Timestamps);
+    assert_eq!(stale.reports()[0].calls, 7);
+}
+
+#[test]
+fn profile_counter_failed_read_preserves_additional_native_kernel_evidence() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut fixture = metrics::ConsumerFixture::new();
+    fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    let stale = fixture
+        .fresh(
+            CounterMode::Timestamps,
+            2,
+            8,
+            Some(metrics::ConsumerFault::KernelLoss),
+        )
+        .unwrap();
+    assert_eq!(
+        stale.kernel_evidence().ring_loss,
+        7,
+        "counter evidence is never metrics-masked"
+    );
+    assert_eq!(stale.kernel_evidence().start_insert_failures, 3);
+    assert_eq!(
+        stale.counter_collection().unwrap()["failure"],
+        "kernel_evidence"
+    );
+    assert_eq!(stale.counter_collection().unwrap()["mode"], "counts");
+    assert_eq!(stale.counter_collection().unwrap()["generation"], 1);
+    assert_eq!(stale.reports()[0].calls, 5);
+    assert_eq!(fixture.reads(), (2, 0));
+}
+
 fn open_plan() -> crate::plan::AttachPlan {
     crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
         index: 0,
@@ -210,8 +448,10 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
 
 /// I1: a quiesce-block failure settles like a capture-loop failure.
 /// Settlement (pause cleanup plus policy settlement in production) runs
-/// with the loop's real end, then detach runs, and every error — quiesce,
-/// settlement, detach — is retained in the returned error.
+/// with the loop's real end, then publication seals the report from
+/// partial state, then detach runs. Every error — quiesce, settlement,
+/// publication, detach — is retained in the returned error. Publication
+/// needs the settled disposition, so a settlement failure skips it.
 #[test]
 fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
     #[derive(Clone, Copy)]
@@ -243,6 +483,10 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
                 Ok(())
             },
             |phases| {
+                phases.push("publish");
+                Ok(())
+            },
+            |phases| {
                 phases.push("detach");
                 if matches!(case, Case::DetachError | Case::BothError) {
                     anyhow::bail!("detach failure");
@@ -252,8 +496,13 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
         );
         // Settlement runs (not skipped) with the loop's real end, before
         // detach — the `--duration` handoff end survives a quiesce failure.
+        // Publication runs between them exactly when settlement succeeded.
         assert_eq!(settled_end, Some(CaptureEnd::DurationExpired));
-        assert_eq!(phases, ["settle", "detach"]);
+        if matches!(case, Case::SettleError | Case::BothError) {
+            assert_eq!(phases, ["settle", "detach"]);
+        } else {
+            assert_eq!(phases, ["settle", "publish", "detach"]);
+        }
         let message = format!("{error:#}");
         assert!(
             message.contains("quiesce failure"),
@@ -285,6 +534,38 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
     }
 }
 
+/// I1: a publication failure behind a quiesce failure keeps its own
+/// layer, and detach still runs behind both.
+#[test]
+fn quiesce_error_with_publish_failure_labels_publication_and_still_detaches() {
+    let mut phases = Vec::new();
+    let error = finish_quiesce_error(
+        anyhow::anyhow!("quiesce failure"),
+        Ok(CaptureEnd::Signal),
+        &mut phases,
+        |phases, _| {
+            phases.push("settle");
+            Ok(())
+        },
+        |phases| {
+            phases.push("publish");
+            anyhow::bail!("seal failure");
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+    );
+    assert_eq!(phases, ["settle", "publish", "detach"]);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("quiesce failure")
+            && message.contains("seal failure")
+            && message.contains("terminal publication"),
+        "publication error lost or mislabeled: {message}"
+    );
+}
+
 /// I1: a loop failure plus a quiesce failure keeps both errors (the loop
 /// error is the capture failure, the quiesce error attaches to it), and
 /// settlement runs with `Error` — a failed loop never hands a child back.
@@ -302,11 +583,16 @@ fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
             Ok(())
         },
         |phases| {
+            phases.push("publish");
+            Ok(())
+        },
+        |phases| {
             phases.push("detach");
             Ok(())
         },
     );
     assert_eq!(settled_end, Some(CaptureEnd::Error));
+    // A failed loop keeps settle-and-detach without a report.
     assert_eq!(phases, ["settle", "detach"]);
     let message = format!("{error:#}");
     assert!(
@@ -1884,7 +2170,7 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
         flags: p11scope_ebpf_common::instance::STAMP_VALID,
     };
     let record = p11scope_ebpf_common::EventRecord {
-        event: open_event(11),
+        event: canary_event(),
         continuity: p11scope_ebpf_common::InstanceContinuity {
             entry_ip: IP,
             entry_stamp: stamp,
@@ -1894,7 +2180,7 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
     let plan = open_plan();
     let mut state = semantics::State::new(&plan);
     let mut tracker = tracker();
-    let mut tracer = trace::Tracer::new(&plan);
+    let mut tracer = canary_tracer(&plan);
     let mut malformed_records = 0;
     let mut context = context(plan, []);
     context.out_file = Some(Vec::new());
@@ -2183,6 +2469,23 @@ mod continuity_canary {
 
 use continuity_canary::{ContinuityCanary, struct_bytes};
 
+// Public canary input is fixed, independently of the observer's clock/PID.
+// The scripted EVENTS domain supplies CALL history, not native PID authority.
+const CANARY_PID: u32 = 4242;
+const CANARY_MONO_NS: u64 = 1100;
+
+fn canary_event() -> Event {
+    Event {
+        ts_ns: CANARY_MONO_NS,
+        pid_tgid: u64::from(CANARY_PID) << 32,
+        ..open_event(11)
+    }
+}
+
+fn canary_tracer(plan: &crate::plan::AttachPlan) -> trace::Tracer {
+    trace::tracer_with_test_wall_anchor(plan, CANARY_MONO_NS, 0)
+}
+
 /// Sentinel entry IP, shared with the trace-only test above.
 const CANARY_IP: u64 = 0x7E5C_A1AB_1E5E_C0DE;
 
@@ -2218,7 +2521,7 @@ fn canary_continuity() -> p11scope_ebpf_common::InstanceContinuity {
 
 fn canary_record() -> p11scope_ebpf_common::EventRecord {
     p11scope_ebpf_common::EventRecord {
-        event: open_event(11),
+        event: canary_event(),
         continuity: canary_continuity(),
     }
 }
@@ -2237,7 +2540,7 @@ fn drive_trace_capture(record: &[u8]) -> TraceDrive {
     let plan = open_plan();
     let mut state = semantics::State::new(&plan);
     let mut tracker = tracker();
-    let mut tracer = trace::Tracer::new(&plan);
+    let mut tracer = canary_tracer(&plan);
     let mut malformed_records = 0;
     let mut context = context(plan, []);
     context.out_file = Some(Vec::new());
@@ -2335,6 +2638,7 @@ fn canary_reports() -> Vec<crate::metrics::SlotReport> {
         module: Some(crate::plan::ModuleId(0)),
         module_ambiguous: false,
         module_unresolved: false,
+        mode: p11scope_ebpf_common::CounterMode::Latency,
         calls: 1,
         errors: 0,
         in_flight: 0,
@@ -2375,11 +2679,13 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         ModuleView, Presence, Presentation,
     };
     Presentation {
+        caller_metadata: crate::caller_metadata::runtime::MetadataFrame::default(),
         scope_label: "pid 4242".into(),
         started_ns: 1_000,
         ended_ns: 2_000,
         passes: 1,
         usage_feed: true,
+        semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
         native_witnesses: crate::discovery::native_binding::BindingCensus {
             rows: 0,
             bound: 0,
@@ -2468,7 +2774,18 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             budget: None,
             repeats: 1,
         }],
+        instances: Vec::new(),
+        semantic_edges: Vec::new(),
+        instance_reload_not_excluded: None,
+        render_index: Default::default(),
         gaps_suppressed: 0,
+        excluded_modules: Vec::new(),
+        unmatched_excludes: Vec::new(),
+        object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
+            1,
+            "bootstrap_unavailable",
+        ),
+        prearm: Vec::new(),
         budgets: BudgetView {
             callers_limit: 8,
             callers_occupied: 1,
@@ -2494,6 +2811,17 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             semantic_occupied: 0,
             semantic_unknown_edges: 1,
             semantic_refused: 0,
+            instances_limit: 4096,
+            instances_occupied: 0,
+            instances_refused: 0,
+            instance_semantic_occupied: 0,
+            instance_semantic_unknown_edges: 0,
+            instance_semantic_refused: 0,
+            instance_negative_limit: 4096,
+            instance_negative_occupied: 0,
+            instance_negative_refused: 0,
+            instance_negative_exhausted: false,
+            instance_semantic_resources: Default::default(),
             retained_limit: 16,
             retained: 1,
             retained_suppressed: 0,
@@ -2666,7 +2994,7 @@ fn failing_drain_error(record: &[u8]) -> String {
     let plan = open_plan();
     let mut state = semantics::State::new(&plan);
     let mut tracker = tracker();
-    let mut tracer = trace::Tracer::new(&plan);
+    let mut tracer = canary_tracer(&plan);
     let mut writer = TerminalWriter {
         fail: true,
         bytes: Vec::new(),
@@ -2754,6 +3082,28 @@ fn assert_must_detect(canary: &ContinuityCanary, surfaces: &[(String, Vec<u8>)])
     }
 }
 
+#[test]
+fn continuity_canary_public_metadata_is_deterministic() {
+    let record = canary_record();
+    assert_eq!(
+        record.event.pid_tgid,
+        4242u64 << 32,
+        "a canary fixture must not depend on the ambient observer PID"
+    );
+    assert_eq!(record.event.ts_ns, 1100);
+    let driven = drive_trace_capture(&crate::events::record_bytes(&record));
+    assert!(
+        driven.stdout.starts_with(
+            b"00:00:00.000000 Unknown executable (PID 4242, TID 0) sess#1 C_OpenSession "
+        ),
+        "the actual capture/render path must use fixed canary clock and PID metadata: {}",
+        String::from_utf8_lossy(&driven.stdout),
+    );
+    assert_eq!(driven.stdout, driven.out_file);
+    let repeated = drive_trace_capture(&crate::events::record_bytes(&record));
+    assert_eq!(driven.stdout, repeated.stdout, "fresh canary drives agree");
+}
+
 /// R1+R2, EVENTS-tail layout: the scanner covers every needle form, and
 /// every planted control flags on every public surface.
 #[test]
@@ -2803,7 +3153,7 @@ fn instance_continuity_tail_never_reaches_any_renderer() {
     let continuity = canary_continuity();
     let canary = ContinuityCanary::from_continuity(&continuity);
     let record = p11scope_ebpf_common::EventRecord {
-        event: open_event(11),
+        event: canary_event(),
         continuity,
     };
     let bytes = crate::events::record_bytes(&record);

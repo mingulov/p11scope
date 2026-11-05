@@ -78,6 +78,33 @@ class DiscoveryFlow(unittest.TestCase):
                 with self.subTest(variant=variant, contract=contract):
                     self.assertTrue(C.check_decoded(elf, disassembly, contract))
 
+    def test_narrow_word_load_disassembler_spelling(self):
+        # LLVM 18 prints the same u32 LDX destination as rN; LLVM 21 uses wN.
+        # The instruction width, source slot and all downstream guards must hold.
+        for variant, elf, disassembly in self.objects:
+            self.assertTrue(C.check_decoded(elf, disassembly, 'interface-name'))
+            sections = C.sections(disassembly)
+            for function, register, offset, section in (
+                ('interface_list_return', '1', '58', 'uretprobe'),
+                ('classify_direct_interface', '6', '38', '.text'),
+            ):
+                _, lines = C.function(sections[section], function, 'fixture')
+                loads = [(pc, op) for pc, op in C.D.instructions(lines)
+                         if re.fullmatch(rf'[rw]{register} = \*\(u32 \*\)\(r10 - 0x{offset}\)', op)]
+                self.assertEqual(len(loads), 1)
+                site, = loads
+                alternate = ('w' if site[1].startswith('r') else 'r') + site[1][1:]
+                old, new = instruction_change(lines, site, alternate)
+                equivalent = change_function(disassembly, function, old, new)
+                with self.subTest(variant=variant, function=function, control='register spelling'):
+                    self.assertTrue(C.check_decoded(elf, equivalent, 'interface-name'))
+                wider = f'r{register} = *(u64 *)(r10 - 0x{offset})'
+                old, new = instruction_change(lines, site, wider)
+                changed_width = change_function(disassembly, function, old, new)
+                with self.subTest(variant=variant, function=function, mutation='full-width read'):
+                    self.reject(elf, changed_width, 'interface-name',
+                                'tail' if function == 'interface_list_return' else 'flags')
+
     def test_typed_section_metadata(self):
         for variant, elf, disassembly in self.objects:
             for mutation in ('removed', 'renamed', 'nonexec', 'legacy', 'undefined'):
@@ -146,11 +173,14 @@ class DiscoveryFlow(unittest.TestCase):
             ('system-bit-cleared', 'p11_link_fork_allowed', 'r2 &= 0x42', 'r2 &= 0x2', 'scope'),
             ('pid-bit-added', 'p11_link_fork_allowed', 'r2 &= 0x42', 'r2 &= 0x43', 'scope'),
             ('aggregate-bypass', 'p11_link_fork_allowed', 'r1 &= 0x10', 'r1 &= 0x0', 'scope'),
-            ('thread-bypass', 'p11_link_emit_fork', 'r5 &= 0x10000', 'r5 &= 0x0', 'classification'),
-            ('child-zero', 'p11_link_emit_fork', 'if r2 == 0x0 goto -0xc', 'if r2 != 0x0 goto -0xc', 'classification'),
-            ('parent-identity', 'p11_link_emit_fork', 'if r9 == 0x0 goto', 'if r9 != 0x0 goto', 'classification'),
-            ('child-identity', 'p11_link_emit_fork', 'if r7 != 0x0 goto', 'if r7 == 0x0 goto', 'classification'),
-            ('reserve-too-early', 'p11_link_emit_fork', '\tr5 = r2', '\tcall 0x83', 'classification'),
+            ('thread-bypass', 'p11_link_emit_fork', 'r1 &= 0x10000', 'r1 &= 0x0', 'classification'),
+            ('child-zero', 'p11_link_emit_fork', '@pid-zero', 'if r1 != 0x0 goto', 'classification'),
+            ('parent-identity', 'p11_link_emit_fork', 'if r8 == 0x0 goto', 'if r8 != 0x0 goto', 'classification'),
+            ('child-identity', 'p11_link_emit_fork', 'if r5 == 0x0 goto', 'if r5 != 0x0 goto', 'classification'),
+            ('reserve-too-early', 'p11_link_emit_fork', '\tr1 = r2', '\tcall 0x83', 'classification'),
+            ('pid-preservation', 'p11_link_emit_fork', '\tr6 = r1', '\tr6 = r2', 'classification'),
+            ('pid-low-word', 'p11_link_emit_fork', 'r1 >>= 0x20', 'r1 >>= 0x10', 'classification'),
+            ('clone-class', 'p11_link_emit_fork', '\tr0 = 0x2', '\tr0 = 0x1', 'classification'),
         ]
         self.mutations(cases, 'typed-birth')
 
@@ -169,8 +199,8 @@ class DiscoveryFlow(unittest.TestCase):
             ('unconditional-exact', 'classify_direct_interface', 'if r1 != r2 goto +0x1', 'goto +0x0', 'classification'),
             ('negative-as-other', 'classify_direct_interface', 'if r1 s> r0 goto', 'if r1 s< r0 goto', 'classification'),
             ('null-as-exact', 'classify_direct_interface', 'r9 = 0x30000', 'r9 = 0x10000', 'null'),
-            ('flags-clamp-removed', 'classify_direct_interface', '\tr5 = 0x2', '\tr5 = r5', 'flags'),
-            ('flags-clamp-inverted', 'classify_direct_interface', 'if r1 > r5 goto', 'if r1 < r5 goto', 'flags'),
+            ('flags-clamp-removed', 'classify_direct_interface', '\tr6 = 0x2', '\tr6 = r6', 'flags'),
+            ('flags-clamp-inverted', 'classify_direct_interface', 'if r1 > r6 goto', 'if r1 < r6 goto', 'flags'),
             ('flags-clamp-bound', 'classify_direct_interface', '@flags-bound', 'r1 = -0x1', 'flags'),
             ('other-as-exact', 'classify_direct_interface', 'r9 = 0x20000', 'r9 = 0x10000', 'classification'),
             ('wrong-class-field', 'classify_direct_interface', '*(u64 *)(r10 - 0x40) = r9', '*(u64 *)(r10 - 0x38) = r9', 'metadata'),
@@ -181,6 +211,346 @@ class DiscoveryFlow(unittest.TestCase):
             ('old-class-retained', 'classify_direct_interface', '0xffffff0000ffff ll', '0xffffffffffffffff ll', 'metadata'),
         ]
         self.mutations(cases, 'interface-name')
+
+    def test_returned_flags_reach_payload_only_as_finite_class(self):
+        for variant, elf, disassembly in self.objects:
+            _, lines = C.function(C.sections(disassembly)['.text'], 'classify_direct_interface', 'fixture')
+            site = early_class_site(lines, 2)
+            self.assertEqual(site[1], 'r6 = 0x0')
+            for value in ('0x3', '0x100000000', 'r8'):
+                with self.subTest(variant=variant, value=value):
+                    old, new = instruction_change(lines, site, 'r6 = ' + value)
+                    self.reject_and_restore(elf, disassembly, 'classify_direct_interface', old, new,
+                                            'interface-name', 'flags')
+
+    def test_tail_count_span_and_continuation_mutations(self):
+        # The tuple locates a real dataflow neighborhood; branch targets are
+        # derived from decoded publications, independently of absolute PCs.
+        cases = [
+            ('count-pointer', 'interface_list_return',
+             ('r3 = *(u64 *)(r10 - 0x30)', 'r0 = *(u64 *)(r10 - 0x38)'),
+             0, 'r3 = *(u64 *)(r10 - 0x38)'),
+            ('count32-width', 'interface_list_return',
+             ('r2 = 0x4', '*(u64 *)(r10 - 0x80) = r0', 'call 0x70'), 0, 'r2 = 0x8'),
+            ('count64-width', 'interface_list_return',
+             ('r2 = 0x8', 'call 0x70'), 0, 'r2 = 0x4'),
+            ('count64-result-width', 'interface_list_return',
+             ('r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9'),
+             0, 'w1 = *(u32 *)(r10 - 0x58)'),
+            ('count64-failure-edge', 'interface_list_return',
+             ('r2 = 0x8', 'call 0x70'), 10, '@count-join'),
+            ('count32-failure-edge', 'interface_list_return',
+             ('r2 = 0x4', '*(u64 *)(r10 - 0x80) = r0', 'call 0x70',
+              'r5 = r8', 'r8 = r9', 'r9 = *(u64 *)(r10 - 0x80)'), 6, '@publish'),
+            ('base-null-edge', 'interface_list_return',
+             ('r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9',
+              'r9 = *(u64 *)(r10 - 0x80)'), 4, '@publish'),
+            ('count-zero-edge', 'interface_list_return',
+             ('r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9',
+              'r9 = *(u64 *)(r10 - 0x80)'), 5, '@publish'),
+            ('active-count-limit', 'interface_list_return',
+             ('r3 = 0x10', 'r3 += -0x1', 'r3 *= r2'), 0, 'r3 = 0x11'),
+            ('span-stride', 'interface_list_return', ('r2 = 0xc',), 0, 'r2 = 0x8'),
+            ('span-base', 'interface_list_return', ('r2 += r9',), 0, 'r2 += r8'),
+            ('span-wrap-edge', 'interface_list_return',
+             ('r4 = 0x0', 'r4 &= 0x1'), 2, '@publish'),
+            ('last-word-width', 'interface_list_return', ('r4 = 0x8',), 0, 'r4 = 0x4'),
+            ('last-word-wrap-edge', 'interface_list_return',
+             ('r2 = 0x0', 'r2 &= 0x1'), 2, '@publish'),
+            ('last-word32-end', 'interface_list_return',
+             ('r2 = 0xfffffffd ll',), 0, 'r2 = 0xffffffff ll'),
+            ('publish-base', 'interface_list_return',
+             ('*(u64 *)(r10 - 0x58) = r9', 'r2 = 0xffffffff ll'),
+             0, '*(u64 *)(r10 - 0x58) = r8'),
+            ('publish-count', 'interface_list_return', ('r1 <<= 0x8',), 0, 'r1 <<= 0x10'),
+            ('publish-symbol', 'interface_list_return', ('r5 <<= 0x28',), 0, 'r5 <<= 0x20'),
+            ('worker-packed-source', 'interface_list_worker',
+             ('r4 = *(u64 *)(r0 + 0x8)', 'r9 = r4'), 0, 'r4 = *(u64 *)(r0 + 0x0)'),
+            ('worker-symbol-width', 'interface_list_worker', ('r9 >>= 0x28',), 0, 'r9 >>= 0x20'),
+            ('worker-symbol-store', 'interface_list_worker', ('r9 <<= 0x20',), 0, 'r9 <<= 0x10'),
+            ('worker-symbol-null-edge', 'interface_list_worker',
+             ('r9 = r4', 'r9 >>= 0x28'), 2, '@classifier'),
+            ('worker-count-width', 'interface_list_worker',
+             ('r7 >>= 0x8', 'r2 = r7', 'r2 <<= 0x20', 'r2 >>= 0x20'), 3, 'r2 >>= 0x10'),
+            ('worker-index-mask', 'interface_list_worker', ('r2 &= 0xff',), 0, 'r2 &= 0xffff'),
+            ('worker-index-limit', 'interface_list_worker', ('r2 &= 0xff',), 1, '@classifier'),
+            ('worker-count-limit', 'interface_list_worker',
+             ('r1 = 0x10', 'r2 = r4', 'r2 &= 0xff'), 6, '@classifier'),
+        ]
+        for variant, elf, disassembly in self.objects:
+            split = C.sections(disassembly)
+            text = split['uretprobe'] + split['.text']
+            for label, function, sequence, offset, replacement in cases:
+                with self.subTest(variant=variant, mutation=label):
+                    name, lines = C.function(text, function, 'fixture')
+                    site = instruction_site(lines, sequence, offset)
+                    if replacement == '@publish':
+                        target = instruction_site(lines, ('r2 = r5', 'r2 &= 0xffffff'))[0]
+                        replacement = site[1].split('goto ')[0] + f'goto {target - site[0] - 1:+#x}'
+                    elif replacement == '@count-join':
+                        self.assertTrue(site[1].startswith('goto '))
+                        target = instruction_site(lines, (
+                            'r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9'))[0]
+                        replacement = f'goto {target - site[0] - 1:+#x}'
+                    elif replacement == '@classifier':
+                        links = C.D.internal_call_targets(C.joined(split, 'uretprobe', '.text'))
+                        targets = [pc for caller, _, pc, target in links
+                                   if caller == name and target is not None and target.endswith('classify_direct_interface')]
+                        self.assertEqual(len(targets), 1)
+                        replacement = site[1].split('goto ')[0] + f'goto {targets[0] - site[0] - 1:+#x}'
+                    old, new = instruction_change(lines, site, replacement)
+                    self.reject_and_restore(elf, disassembly, function, old, new, 'interface-name', 'tail')
+                    print(f'verified {variant} interface-name:tail {label}')
+
+    def test_worker_masked_index_survives_spill_and_reload(self):
+        cases = [
+            ('spill-source', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff', '*(u64 *)(r10 - 0x60) = r1'),
+             2, '*(u64 *)(r10 - 0x60) = r4'),
+            ('index-mask-removed', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff'), 1, 'r1 = r1'),
+            ('index-mask-widened', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff'), 1, 'r1 &= 0xffff'),
+            ('index-source', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff'), 0, 'r1 = r7'),
+            ('spill-width', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff', '*(u64 *)(r10 - 0x60) = r1'),
+             2, '*(u32 *)(r10 - 0x60) = w1'),
+            ('later-overlap', 'interface_list_worker',
+             ('*(u64 *)(r10 - 0x80) = r0', '*(u64 *)(r10 - 0x88) = r5'),
+             0, '*(u32 *)(r10 - 0x5c) = w4'),
+            ('later-alias', 'interface_list_worker',
+             ('r1 = r10', 'r1 += -0x28', '*(u64 *)(r10 - 0x78) = r1'),
+             2, '*(u64 *)(r1 - 0x38) = r4'),
+            ('unknown-atomic-writer', 'interface_list_worker',
+             ('*(u64 *)(r10 - 0x80) = r0', '*(u64 *)(r10 - 0x88) = r5'),
+             0, 'r0 = cmpxchg_64(r10 - 0x60, r0, r4)'),
+            ('helper-destination', 'interface_list_worker',
+             ('r1 = r10', 'r1 += -0x28', '*(u64 *)(r10 - 0x78) = r1'),
+             1, 'r1 += -0x60'),
+            ('helper-writer-body', 'memset',
+             ('r5 = r1', 'r5 += r4'), 1, 'r5 += -0x38'),
+            ('first-index-reload', 'interface_list_worker',
+             ('r1 = *(u64 *)(r10 - 0x60)', '*(u64 *)(r10 - 0x80) = r0'),
+             0, 'r1 = *(u64 *)(r10 - 0x68)'),
+            ('metadata-index-reload', 'interface_list_worker',
+             ('r9 <<= 0x20', 'r1 = *(u64 *)(r10 - 0x60)', 'r1 <<= 0x8'),
+             1, 'r1 = *(u64 *)(r10 - 0x68)'),
+        ]
+        for variant, elf, disassembly in self.objects:
+            secs = C.sections(disassembly)
+            text = secs['uretprobe'] + secs['.text']
+            for label, function, sequence, offset, replacement in cases:
+                with self.subTest(variant=variant, mutation=label):
+                    _, lines = C.function(text, function, 'fixture')
+                    old, new = instruction_change(lines, instruction_site(lines, sequence, offset), replacement)
+                    self.reject_and_restore(elf, disassembly, function, old, new, 'interface-name', 'tail')
+                    print(f'verified {variant} interface-name:tail {label}')
+
+    def test_worker_index_slot_uses_current_stack_facts(self):
+        # The real lowering calls memset with a disjoint -0x28 destination.
+        # A direct rN store is understood by call_argument_facts; a partial
+        # wN store to a saved pointer is not and must not leave stale facts.
+        before = (
+            '*(u64 *)(r10 - 0x88) = r5',
+            '*(u64 *)(r10 - 0x68) = r4',
+            'r1 = r10',
+            'r1 += -0x28',
+            '*(u64 *)(r10 - 0x78) = r1',
+            'r2 = 0x0',
+            'r3 = 0x1a',
+        )
+        clobber = (
+            'r3 = 0x1a',
+            'r1 = r10',
+            'r1 += -0x28',
+            '*(u64 *)(r10 - 0x78) = r1',
+            'r1 += -0x38',
+            '*(u32 *)(r10 - 0x78) = w1',
+            'r1 = *(u64 *)(r10 - 0x78)',
+        )
+        for variant, elf, disassembly in self.objects:
+            with self.subTest(variant=variant, control='disjoint-memset'):
+                self.assertTrue(C.check_decoded(elf, disassembly, 'interface-name'))
+            text = C.sections(disassembly)
+            _, lines = C.function(text['uretprobe'] + text['.text'], 'interface_list_worker', 'fixture')
+            site = instruction_site(lines, before)
+            insns = C.D.instructions(lines)
+            start = insns.index(site)
+            direct_site = insns[start + 5]
+            old, new = instruction_change(lines, direct_site, '*(u32 *)(r10 - 0x78) = r1')
+            direct = change_function(disassembly, 'interface_list_worker', old, new)
+            with self.subTest(variant=variant, control='supported-direct-store'):
+                self.assertTrue(C.check_decoded(elf, direct, 'interface-name'))
+            bad = disassembly
+            for old_site, replacement in zip(insns[start:start + len(clobber)], clobber):
+                old, new = instruction_change(lines, old_site, replacement)
+                bad = change_function(bad, 'interface_list_worker', old, new)
+            with self.subTest(variant=variant, mutation='partial-pointer-clobber'):
+                self.reject(elf, bad, 'interface-name', 'tail')
+
+    def test_worker_pre_slice_saved_pointer_lifetime(self):
+        # Save -0x28 before the masked-index slice, then replace its low word
+        # with -0x60 before the later reload used as memset's destination.
+        changes = {
+            493: 'r1 = r10',
+            494: 'r1 += -0x28',
+            495: '*(u64 *)(r10 - 0x78) = r1',
+            496: 'r1 = r10',
+            497: 'r1 += -0x60',
+            498: '*(u32 *)(r10 - 0x78) = w1',
+            622: 'r1 = *(u64 *)(r10 - 0x78)',
+            623: 'r2 = 0x0',
+            624: 'r3 = 0x1a',
+        }
+        for variant, elf, disassembly in self.objects:
+            text = C.sections(disassembly)
+            _, lines = C.function(text['uretprobe'] + text['.text'], 'interface_list_worker', 'fixture')
+            ops = dict(C.D.instructions(lines))
+            self.assertTrue(C.check_decoded(elf, disassembly, 'interface-name'))
+            changed = disassembly
+            for pc, replacement in changes.items():
+                old, new = instruction_change(lines, (pc, ops[pc]), replacement)
+                changed = change_function(changed, 'interface_list_worker', old, new)
+            partial_line = next(line for line in changed.splitlines()
+                                if C.D.line_pc(line) == 498 and '*(u32 *)(r10 - 0x78) = w1' in line)
+            with self.subTest(variant=variant, control='no-overwrite'):
+                no_store = change_function(changed, 'interface_list_worker', partial_line,
+                                           partial_line.replace('*(u32 *)(r10 - 0x78) = w1', 'r1 = r1'))
+                self.assertTrue(C.check_decoded(elf, no_store, 'interface-name'))
+            with self.subTest(variant=variant, control='recognized-direct-store'):
+                direct = change_function(changed, 'interface_list_worker', partial_line,
+                                         partial_line.replace('= w1', '= r1'))
+                self.reject(elf, direct, 'interface-name', 'tail')
+            with self.subTest(variant=variant, mutation='canonical-exchange-write'):
+                exchange = change_function(changed, 'interface_list_worker', partial_line,
+                                           partial_line.replace('*(u32 *)(r10 - 0x78) = w1',
+                                                                'r1 = xchg_64(r10 - 0x78, r1)'))
+                self.reject(elf, exchange, 'interface-name', 'tail')
+            with self.subTest(variant=variant, mutation='pre-slice-partial-write'):
+                self.reject(elf, changed, 'interface-name', 'tail')
+
+    def test_legacy_bound_follows_loaded_field(self):
+        good = C.D._owned_disassembly()
+        self.assertTrue(C.D.interface_tail_contract(good))
+        lines = C.D.function_blocks(good)['interface_list_worker']
+        insns = C.D.instructions(lines)
+        first_pc = insns[0][0]
+        exit_pc = insns[-1][0]
+        first_line, = [line for line in lines if C.D.line_pc(line) == first_pc]
+        pre_get = ''.join(
+            f'{pc:8}:\t{guard} goto +0x{exit_pc - pc - 1:x}\n'
+            for pc, guard in ((first_pc - 2, 'if r8 == 0x0'),
+                              (first_pc - 1, 'if r8 > 0xffffff'))
+        )
+        self.assertEqual(good.count(first_line), 1)
+        with_pre_get = good.replace(first_line, pre_get + first_line, 1)
+        bound = instruction_site(lines, ('r8 = *(u64 *)(r0 + 0x8)',
+                                         'if r8 == 0x0 goto +0x1e',
+                                         'if r1 > r2 goto +0x1d',
+                                         'if r8 > 0xffffff goto +0x1c'), 3)
+        old, new = instruction_change(lines, bound, 'if r8 > 0x1000000 goto +0x1c')
+        bad = change_function(with_pre_get, 'interface_list_worker', old, new)
+        self.assertFalse(C.D.interface_tail_contract(bad))
+        self.assertTrue(C.D.interface_tail_contract(with_pre_get))
+
+    def test_legacy_rhs_saved_constant_lifetime(self):
+        good = C.D._owned_disassembly()
+        self.assertTrue(C.D.interface_tail_contract(good))
+        lines = C.D.function_blocks(good)['interface_list_worker']
+        first, = [line for line in lines if C.D.line_pc(line) == 700]
+        prologue = ''.join(f'{pc:8}:\t{op}\n' for pc, op in (
+            (695, 'r2 = 0xffffff'),
+            (696, '*(u64 *)(r10 - 0x40) = r2'),
+            (697, 'r2 = 0xffffffff'),
+            (698, '*(u32 *)(r10 - 0x40) = w2'),
+            (699, 'r9 = *(u64 *)(r10 - 0x40)'),
+        ))
+        self.assertEqual(good.count(first), 1)
+        bad = good.replace(first, prologue + first, 1)
+        bad = change_function(bad, 'interface_list_worker',
+                              '     716:\tif r8 > 0xffffff goto +0x1c',
+                              '     716:\tif r8 > r9 goto +0x1c')
+        self.assertEqual(bad.count('*(u32 *)(r10 - 0x40) = w2'), 1)
+        with self.subTest(control='no-overwrite'):
+            no_store = bad.replace('*(u32 *)(r10 - 0x40) = w2', 'r2 = r2', 1)
+            self.assertTrue(C.D.interface_tail_contract(no_store))
+        with self.subTest(control='recognized-direct-store'):
+            direct = bad.replace('*(u32 *)(r10 - 0x40) = w2',
+                                 '*(u32 *)(r10 - 0x40) = r2', 1)
+            self.assertFalse(C.D.interface_tail_contract(direct))
+        with self.subTest(mutation='canonical-exchange-write'):
+            exchange = bad.replace('*(u32 *)(r10 - 0x40) = w2',
+                                   'r2 = xchg_64(r10 - 0x40, r2)', 1)
+            self.assertFalse(C.D.interface_tail_contract(exchange))
+        with self.subTest(mutation='partial-rhs-write'):
+            self.assertFalse(C.D.interface_tail_contract(bad))
+
+    def test_tail_consumed_fact_memory_effects(self):
+        _, _, disassembly = self.objects[0]
+        memset = C.D.function_blocks(C.sections(disassembly)['.text'])['memset']
+
+        def facts(destination, writer='call 0x0', target='memset', observed='r9'):
+            lines = [f'{pc:8}:\t{op}' for pc, op in enumerate((
+                'r2 = 0xffffff',
+                '*(u64 *)(r10 - 0x40) = r2',
+                'r1 = r10',
+                f'r1 += {destination}',
+                'r3 = 0x8',
+                'r8 = 0xffffff',
+                writer,
+                'r9 = *(u64 *)(r10 - 0x40)',
+                'exit',
+            ))]
+            calls = [('fixture', 0, 6, target)] if target else []
+            return C.D._tail_trusted_facts(lines, calls, {'memset': memset})[8].get(observed)
+
+        self.assertEqual(facts('-0x20'), ('constant', 0xffffff))
+        self.assertIsNone(facts('-0x40'))
+        self.assertEqual(facts('-0x20', writer='r2 &= 0xff', target=None), ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='r2 = *(u32 *)(r10 - 0x20)', target=None),
+                         ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='if r2 > 0x0 goto +0x0', target=None),
+                         ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='*(u64 *)(r10 - 0x20) = r2', target=None),
+                         ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='*(u64 *)(r10 - 0x40) = r3', target=None),
+                         ('constant', 0x8))
+        self.assertIsNone(facts('-0x20', writer='*(u32 *)(r10 - 0x40) = w2', target=None))
+        self.assertEqual(facts('-0x20', writer='call 0x1', target=None),
+                         ('constant', 0xffffff))
+        self.assertIsNone(facts('-0x20', writer='call 0x7f', target=None))
+        self.assertIsNone(facts('-0x20', writer='*(u32 *)(r7 - 0x0) = w2', target=None))
+        self.assertIsNone(facts('-0x20', writer='r2 = xchg_64(r10 - 0x40, r2)', target=None))
+        self.assertIsNone(facts('-0x20', writer='r2 = opaque_effect(r1)', target=None,
+                                observed='r8'))
+
+    def test_current_tail_cannot_select_legacy_with_unrelated_markers(self):
+        for variant, elf, disassembly in self.objects:
+            marked = change_function(disassembly, 'interface_list_return',
+                                     'r2 = *(u64 *)(r6 + 0x50)', 'r2 = *(u64 *)(r6 + 0x8)')
+            marked = change_function(marked, 'interface_list_worker',
+                                     'r3 = 0xfffffffd ll', 'r3 = 0xffffff ll')
+            secs = C.sections(marked)
+            for function, sequence, offset, replacement in [
+                ('interface_list_return', ('r2 = 0x4', '*(u64 *)(r10 - 0x80) = r0', 'call 0x70'),
+                 0, 'r2 = 0x8'),
+                ('interface_list_worker', ('r1 = r4', 'r1 &= 0xff', '*(u64 *)(r10 - 0x60) = r1'),
+                 2, '*(u64 *)(r10 - 0x60) = r4'),
+            ]:
+                with self.subTest(variant=variant, mutation=function):
+                    _, lines = C.function(secs['uretprobe'] + secs['.text'], function, 'fixture')
+                    old, new = instruction_change(lines, instruction_site(lines, sequence, offset), replacement)
+                    bad = change_function(marked, function, old, new)
+                    with self.assertRaisesRegex(RuntimeError, 'interface-name:tail'):
+                        C.check_decoded(elf, bad, 'all')
+                    restored = change_function(bad, function, new, old)
+                    restored = change_function(restored, 'interface_list_worker',
+                                               'r3 = 0xffffff ll', 'r3 = 0xfffffffd ll')
+                    restored = change_function(restored, 'interface_list_return',
+                                               'r2 = *(u64 *)(r6 + 0x8)', 'r2 = *(u64 *)(r6 + 0x50)')
+                    self.assertEqual(restored, disassembly)
+                    self.assertTrue(C.check_decoded(elf, restored, 'all'))
 
     def test_all_payload_predecessors(self):
         # Single decoded instructions, including the independent BN-R1 control.
@@ -237,7 +607,7 @@ class DiscoveryFlow(unittest.TestCase):
                 with self.subTest(variant=variant, mutation=label):
                     if old == '@propagation-call':
                         secs = C.sections(disassembly)
-                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        links = C.D.internal_call_targets(C.joined(secs, 'tp_btf/task_newtask', '.text'))
                         targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_root_propagate_thread']
                         self.assertEqual(len(targets), 1)
                         hook = C.D.function_blocks(secs['tp_btf/task_newtask'])['task_newtask']
@@ -247,7 +617,7 @@ class DiscoveryFlow(unittest.TestCase):
                         # located by the call, not by a code-size-dependent
                         # branch displacement.
                         secs = C.sections(disassembly)
-                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        links = C.D.internal_call_targets(C.joined(secs, 'tp_btf/task_newtask', '.text'))
                         targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_link_fork_allowed']
                         self.assertEqual(len(targets), 1)
                         _, lines = C.function(secs['tp_btf/task_newtask'], function, 'fixture')
@@ -261,7 +631,7 @@ class DiscoveryFlow(unittest.TestCase):
                             'if r0 == 0x0 goto', new))
                     elif old == '@flags-restore':
                         secs = C.sections(disassembly)
-                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        links = C.D.internal_call_targets(C.joined(secs, 'tp_btf/task_newtask', '.text'))
                         targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_link_emit_fork']
                         self.assertEqual(len(targets), 1)
                         _, lines = C.function(secs['tp_btf/task_newtask'], function, 'fixture')
@@ -275,8 +645,18 @@ class DiscoveryFlow(unittest.TestCase):
                     elif old == '@flags-bound':
                         _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
                         site = instruction_site(lines, ('r1 = 0x2', 'r4 = *(u64 *)(r10 - 0x60)',
-                                                       'if r1 > r5 goto +0x1', 'r5 = 0x2'))
+                                                       'if r1 > r6 goto +0x1', 'r6 = 0x2'))
                         old, new = instruction_change(lines, site, new)
+                    elif old == '@pid-zero':
+                        _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
+                        insns = C.D.instructions(lines)
+                        sites = [insns[i + 3] for i in range(len(insns) - 3)
+                                 if tuple(op for _, op in insns[i:i + 3]) ==
+                                 ('r1 = r6', 'r1 <<= 0x20', 'r1 >>= 0x20')
+                                 and insns[i + 3][1].startswith('if r1 == 0x0 goto ')]
+                        self.assertEqual(len(sites), 1)
+                        old, new = instruction_change(lines, sites[0], sites[0][1].replace(
+                            'if r1 == 0x0 goto', new))
                     elif old == '@name-read-destination':
                         _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
                         site = instruction_site(lines, ('r1 = r9', 'r2 = 0x9',

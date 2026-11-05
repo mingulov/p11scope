@@ -8,7 +8,8 @@ from fixture_common import CONFIG, record, refuse
 
 
 arguments = sys.argv[1:]
-vendor_arguments = arguments[1:] if arguments[:1] == ["+1.98.1"] else arguments
+release = Path(".release-rust-version").read_text(encoding="utf-8").strip()
+vendor_arguments = arguments[1:] if arguments[:1] == ["+" + release] else arguments
 if vendor_arguments[:1] == ["vendor"]:
     if len(vendor_arguments) != 5 or vendor_arguments[1:4] != [
         "--locked", "--offline", "--respect-source-config"

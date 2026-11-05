@@ -3,6 +3,7 @@
 """Answer only the selected rustc version query."""
 
 import sys
+from pathlib import Path
 
 from fixture_common import CONFIG, record, refuse
 
@@ -14,4 +15,5 @@ status = CONFIG.get("rustc_version_status", 0)
 if status:
     print("fixture rustc version refusal", file=sys.stderr)
     raise SystemExit(status)
-print(CONFIG.get("rustc_version", "rustc 1.98.1 (fixture)"))
+release = Path(".release-rust-version").read_text(encoding="utf-8").strip()
+print(CONFIG.get("rustc_version", f"rustc {release} (fixture)"))

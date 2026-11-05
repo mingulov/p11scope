@@ -538,7 +538,10 @@ class BuildOfflineTests(unittest.TestCase):
         clean_git.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
         for command in (["git", "init", "--quiet", "--template="],
                         ["git", "add", "--all"],
-                        ["git", "-c", "user.name=Integration", "-c",
+                        # No auto maintenance: git >= 2.47 runs it detached after a
+                        # commit, and its lock files race the temp-dir cleanup.
+                        ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                         "-c", "user.name=Integration", "-c",
                          "user.email=test.invalid", "commit", "--quiet", "-m", "fixture"]):
             subprocess.run(command, cwd=fixture.root, env=clean_git, check=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)

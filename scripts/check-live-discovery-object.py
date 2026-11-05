@@ -282,6 +282,46 @@ def relative_target(pc, text):
     return pc + 1 + (distance if branch.group("sign") == "+" else -distance)
 
 
+def reservation_branches(lines, reserve, end=None):
+    """Identify the same reserved pointer on both finite null-guard polarities."""
+    insns, graph = instruction_graph(lines)
+    if len(insns) != len(dict(insns)):
+        fail("reservation function has duplicate instruction addresses")
+    facts = call_argument_facts(lines)
+    reserve_pc = line_pc(lines[reserve])
+    texts = dict(insns)
+    internal = {pc for index, pc, text in instruction_entries(lines)
+                if text.startswith("85 10 ") or any(
+                    relocation == index + 1 and kind == "32"
+                    for relocation, kind, _ in relocation_targets(lines))}
+    if (texts.get(reserve_pc) != "call 0x83" or reserve_pc in internal
+            or facts.get(reserve_pc, {}).get("r2") != ("constant", 920)):
+        fail("reservation is not the 920-byte ring-reserve helper")
+    branches = []
+    limit = end if end is not None else min(len(lines), reserve + 8)
+    for index, pc, _ in instruction_entries(lines):
+        if not reserve < index < limit:
+            continue
+        branch = re.fullmatch(r"if (r\d+) (==|!=) 0x0 goto [+-]0x[0-9a-f]+", texts[pc])
+        if branch and facts.get(pc, {}).get(branch.group(1)) == ("result", reserve_pc):
+            target = relative_target(pc, texts[pc])
+            edges = graph[pc]
+            if len(edges) != 2 or edges[0] == edges[1]:
+                fail("reservation guard does not have two distinct finite arms")
+            fallthrough = next(edge for edge in edges if edge != target)
+            success, failure = ((target, fallthrough) if branch.group(2) == "!="
+                                else (fallthrough, target))
+            branches.append((index, success, failure))
+    if len(branches) != 1:
+        fail("reservation must have one finite null guard of its result")
+    # Encoded internal calls with the same immediate are not target-read helpers.
+    reads = {pc for pc, text in insns if pc not in internal
+             and re.fullmatch(r"call 0x(?:70|72)", text)}
+    if reads & reachable(graph, [insns[0][0]], {reserve_pc}):
+        fail("target read can precede ring reservation")
+    return branches[0], facts, insns, graph, reads
+
+
 def initializer_regions(disassembly):
     regions = []
     for function, lines in function_blocks(disassembly).items():
@@ -328,31 +368,31 @@ def initializer_regions(disassembly):
             if candidate is None:
                 fail(f"{function}: missing exact 115-store initializer")
             start, end, base, zero, stores = candidate
-            prefix = "\n".join(lines[:start])
-            if not re.search(rf"r{zero} = 0x0\b", prefix):
-                fail(f"{function}: initializer source register is not proven zero")
-            success_branches = []
-            for line in lines[reserve + 1 : start]:
-                pc = line_pc(line)
-                if pc is None or not re.search(rf"\bif r{base} != 0x0 goto ", line):
-                    continue
-                success_branches.append(relative_target(pc, line))
-            if len(success_branches) != 1 or success_branches[0] is None:
-                fail(
-                    f"{function}: reservation must have one finite success branch"
-                )
-            target = success_branches[0]
+            (branch, target, failure), facts, insns, graph, reads = reservation_branches(lines, reserve, start)
+            result = ("result", line_pc(lines[reserve]))
+            state = facts.get(line_pc(lines[start]), {})
+            if (state.get("r" + base) != result or state.get("r" + zero) != ("constant", 0)
+                    or not state.get(("nonzero", result)) or state.get(("zero", result))):
+                fail(f"{function}: initializer lacks a non-null reserved pointer and known zero")
             target_index = next(
-                (index for index, line in enumerate(lines) if line_pc(line) == target),
+                (index for index, pc, _ in instruction_entries(lines) if pc == target),
                 None,
             )
-            if target_index is None or not (reserve < target_index <= start):
+            if target_index is None or not (branch < target_index <= start):
                 fail(f"{function}: successful reservation does not enter the initializer")
             for line in lines[target_index:start]:
                 if line_pc(line) is not None and not re.search(
                     r"\*\(u(?:8|16|32|64) \*\)\(r10 - 0x[0-9a-f]+\) =", line
                 ):
                     fail(f"{function}: non-stack operation precedes initialization: {line!r}")
+            store_pcs = [line_pc(line) for line in lines[start:end]]
+            for previous, pc in zip(store_pcs, store_pcs[1:]):
+                if {source for source, edges in graph.items() if pc in edges} != {previous}:
+                    fail(f"{function}: a path bypasses part of the initializer")
+            null_paths = reachable(graph, [failure])
+            submits = {pc for pc, text in insns if text == "call 0x84"}
+            if null_paths & (set(store_pcs) | reads | submits):
+                fail(f"{function}: null reservation arm reaches record work")
             before_init = "\n".join(lines[reserve + 1 : start])
             if re.search(rf"= \*\([^)]*\)\(r{base} \+", before_init):
                 fail(f"{function}: record field read precedes initialization")
@@ -600,15 +640,232 @@ def pause_object_contract(disassembly):
 
 
 def table_bounds_object_contract(disassembly):
+    """Certify regular destinations; table words need the checked-index lowering."""
     blocks = function_blocks(disassembly)
-    export = next(
-        ("\n".join(lines) for name, lines in blocks.items() if name.endswith("emit_export")),
-        "",
-    )
-    return bool(export) and all(
-        re.search(rf"\br\d+ = 0x{bound:x}\b", export)
-        for bound in (67, 68, 92, 104)
-    ) and bool(re.search(r"\bif r\d+ > r\d+ goto -0x", export))
+    lines = next((lines for name, lines in blocks.items() if name.endswith("emit_export")), [])
+    export = "\n".join(lines)
+    if not all(re.search(rf"\br\d+ = 0x{bound:x}\b", export) for bound in (68, 92, 104)):
+        return False
+    insns, graph = instruction_graph(lines)
+    if not insns or not (insns[-1][1] == "exit"
+                         or re.fullmatch(r"goto [+-]0x[0-9a-f]+", insns[-1][1])):
+        return False
+    memory_store = re.compile(r"\*\(u(?:8|16|32|64) \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = (?:[rw]\d+|-?0x[0-9a-f]+)")
+    variable_add = re.compile(r"r(\d+) \+= r(\d+)")
+    indexed_stores = set()
+    guarded_stores = set()
+    facts = _table_destination_facts(lines, insns, graph)
+    for store_pc, op in insns:
+        store = memory_store.fullmatch(op)
+        if not store:
+            continue
+        address = facts.get(store_pc, {}).get("r" + store[1])
+        detail = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r\d+ ([+-]) 0x([0-9a-f]+)\) = .*", op)
+        size, sign, offset = detail.groups()
+        offset = int(offset, 16) * (1 if sign == "+" else -1)
+        size = int(size) // 8
+        if address is None:
+            return False
+        kind, starts = address
+        if kind == "indexed":
+            if starts != frozenset({32}) or offset != 0:
+                return False
+            indexed_stores.add(store_pc)
+        elif kind not in ("stack", "record") or not all(
+                (-512 if kind == "stack" else 0) <= start + offset
+                and start + offset + size <= (0 if kind == "stack" else 920)
+                for start in starts):
+            return False
+    # Check the actual indexed store lowering, not just the presence of width
+    # constants or a backwards branch. The same checked index must supply the
+    # eight-byte offset. This supplements, and does not replace, kernel loading.
+    for position, (_, op) in enumerate(insns):
+        scale = re.fullmatch(r"r(\d+) <<= 0x([0-9a-f]+)", op)
+        if not scale or position + 3 >= len(insns):
+            continue
+        index, shift = scale.groups()
+        base = re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)", insns[position + 1][1])
+        add = variable_add.fullmatch(insns[position + 2][1])
+        store_pc, store_op = insns[position + 3]
+        if not memory_store.fullmatch(store_op) or (not base and not add):
+            continue
+        spill = re.fullmatch(r"\*\(u64 \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = r(\d+)", store_op)
+        state = facts.get(store_pc, {})
+        if (spill and state.get("r" + spill[1], (None,))[0] == "stack"
+                and state.get("r" + spill[2], (None,))[0] == "indexed"):
+            continue
+        # A malformed indexed path must not disappear while another ABI path
+        # still supplies a recognized store. Ordinary fixed metadata/stack
+        # stores have no such address calculation and remain outside this set.
+        indexed_stores.add(store_pc)
+        if (not base or insns[position + 2][1] != f"r{base[1]} += r{index}"
+                or not re.fullmatch(rf"\*\(u64 \*\)\(r{base[1]} \+ 0x0\) = r\d+", store_op)):
+            return False
+        if shift != "3" or not _table_index_guard(insns, graph, position, index):
+            return False
+        guarded_stores.add(store_pc)
+    return bool(guarded_stores) and indexed_stores == guarded_stores
+
+
+def _table_destination_facts(lines, insns, graph):
+    """Finite provenance for this emitter's registers and eight-byte spills.
+
+    Unknown destinations cannot certify a bounds-positive. Stack aliases,
+    overlapping writes and probe-read footprints participate in the same flow;
+    a spill never makes an indexed address become ordinary metadata.
+    Sets widen to unknown after eight choices, so loops cannot invent a safe
+    constant bound or keep the analysis growing indefinitely.
+    """
+    def fact(kind, values):
+        values = frozenset(values)
+        return (kind, values) if values and len(values) <= 8 else None
+
+    def merged(left, right):
+        return fact(left[0], left[1] | right[1]) if left and right and left[0] == right[0] else None
+
+    def operand(state, value):
+        if value[0] in "rw":
+            result = state.get("r" + value[1:])
+            if value[0] == "w":
+                return fact("constant", [number & 0xffffffff for number in result[1]]) if result and result[0] == "constant" else None
+            return result
+        return fact("constant", [int(value, 16)])
+
+    def address(state, base, sign, offset):
+        value = state.get("r" + base)
+        if not value or value[0] not in ("stack", "record", "indexed", "other"):
+            return None
+        delta = int(offset, 16) * (1 if sign == "+" else -1)
+        return fact(value[0], [start + delta for start in value[1]])
+
+    def write(state, destination, sizes):
+        if destination and destination[0] in ("record", "indexed", "other"):
+            return
+        if destination and destination[0] != "stack":
+            destination = None
+        for key in list(state):
+            if isinstance(key, int) and (not destination or not sizes or any(
+                    key < start + size and start < key + 8
+                    for start in destination[1] for size in sizes)):
+                state.pop(key)
+
+    raw = dict((pc, text) for _, pc, text in instruction_entries(lines))
+    encoded = any(re.match(r"(?:[0-9a-f]{2}\s+){8}", text) for text in raw.values())
+    texts = dict(insns)
+    incoming = {insns[0][0]: {"r10": fact("stack", [0])}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = texts[pc]
+        store = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = ([rw]\d+|-?0x[0-9a-f]+)", text)
+        load = re.fullmatch(r"([rw]\d+) = \*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)", text)
+        move = re.fullmatch(r"([rw]\d+) (=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)
+        atomic = re.search(r"(?:lock \*\(u64 \*\)\(|cmpxchg_64\()r(\d+) ([+-]) 0x([0-9a-f]+)", text)
+        if store:
+            width, base, sign, offset, source = store.groups()
+            target = address(state, base, sign, offset)
+            value = operand(state, source)
+            write(state, target, [int(width) // 8])
+            if target and target[0] == "stack" and len(target[1]) == 1 and width == "64" and value:
+                state[next(iter(target[1]))] = value
+        elif load:
+            dest, width, base, sign, offset = load.groups()
+            target = address(state, base, sign, offset)
+            value = None
+            if target and target[0] == "stack" and width == "64":
+                values = [state.get(start) for start in target[1]]
+                value = values[0]
+                for other in values[1:]:
+                    value = merged(value, other)
+            state.pop("r" + dest[1:], None)
+            if value and (dest[0] == "r" or value[0] == "constant"):
+                if dest[0] == "w":
+                    value = fact("constant", [number & 0xffffffff for number in value[1]])
+                state["r" + dest[1:]] = value
+        elif text.startswith("call "):
+            helper = not encoded or raw[pc].startswith("85 00 ")
+            if helper and text == "call 0x70":
+                length = state.get("r2")
+                write(state, state.get("r1"), length[1] if length and length[0] == "constant" else None)
+            elif not helper or text not in ("call 0x1", "call 0x5", "call 0xe", "call 0x6d", "call 0x83", "call 0x84"):
+                write(state, None, None)
+            reserve = helper and text == "call 0x83" and state.get("r2") == fact("constant", [920])
+            for register in range(6):
+                state.pop("r" + str(register), None)
+            if reserve:
+                state["r0"] = fact("record", [0])
+            elif helper and text == "call 0x1":
+                state["r0"] = fact("other", [0])
+        elif atomic:
+            write(state, address(state, *atomic.groups()), [8])
+            if text.startswith("r0 = "):
+                state.pop("r0", None)
+        elif move:
+            dest, op, source = move.groups()
+            register = "r" + dest[1:]
+            before, value = state.get(register), operand(state, source)
+            if op != "=":
+                if op == "+=" and before and before[0] == "record" and source[0] in "rw":
+                    value = fact("indexed", before[1])
+                elif op in ("+=", "-=") and before and value and value[0] == "constant" and before[0] in ("stack", "record", "indexed", "other", "constant"):
+                    deltas = [delta - (1 << 64) if delta >= 1 << 63 else delta for delta in value[1]]
+                    value = fact(before[0], [start + delta * (1 if op == "+=" else -1)
+                                             for start in before[1] for delta in deltas])
+                else:
+                    value = None
+            state.pop(register, None)
+            if value and (dest[0] == "r" or value[0] == "constant"):
+                if dest[0] == "w":
+                    value = fact("constant", [number & 0xffffffff for number in value[1]])
+                state[register] = value
+        elif (text.startswith(("if ", "goto ")) or text == "exit"):
+            pass
+        else:
+            # Unmodeled memory effects cannot preserve a spilled destination.
+            write(state, None, None)
+            if dest := re.match(r"([rw]\d+) = ", text):
+                state.pop("r" + dest[1][1:], None)
+        for successor in graph[pc]:
+            joined = state.copy() if successor not in incoming else {
+                key: value for key in state.keys() | incoming[successor].keys()
+                if (value := merged(state.get(key), incoming[successor].get(key))) is not None
+            }
+            if incoming.get(successor) != joined:
+                incoming[successor] = joined
+                pending.append(successor)
+    return incoming
+
+
+def _table_index_guard(insns, graph, scale_position, index):
+    scale_pc = insns[scale_position][0]
+    for position, (guard_pc, op) in enumerate(insns[:scale_position]):
+        if op.startswith(f"if r{index} > 0x67 goto "):
+            allowed, denied = insns[position + 1][0], relative_target(guard_pc, op)
+        elif (position and (match := re.fullmatch(rf"if r(\d+) > r{index} goto [+-]0x[0-9a-f]+", op))
+              and insns[position - 1][1] == f"r{match[1]} = 0x68"):
+            allowed, denied = relative_target(guard_pc, op), insns[position + 1][0]
+        else:
+            continue
+        blocked = {guard_pc}
+        if (scale_pc in reachable(graph, [insns[0][0]], blocked)
+                or scale_pc in reachable(graph, [denied], blocked)):
+            continue
+        # Stop at the next visit to this guard so a later loop iteration does
+        # not count as a clobber of the current iteration's checked index.
+        local = {pc: ([] if pc == guard_pc else successors) for pc, successors in graph.items()}
+        path = nodes_on_paths(local, allowed, scale_pc)
+        if scale_pc not in path:
+            continue
+        clobbered = any(
+            pc != scale_pc and pc in path
+            and (re.match(rf"[rw]{index} (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ", text)
+                 or (int(index) < 6 and text.startswith("call ")))
+            for pc, text in insns
+        )
+        if not clobbered:
+            return True
+    return False
 
 
 def instruction_entries(lines):
@@ -648,10 +905,28 @@ def map_call_sites(lines, map_name, helper=None):
 
 def internal_call_targets(disassembly):
     blocks = function_blocks(disassembly)
-    by_pc = {
-        instruction_entries(lines)[0][1]: name
-        for name, lines in blocks.items() if instruction_entries(lines)
-    }
+    section = None
+    sections = {}
+    for line in disassembly.splitlines():
+        if match := re.fullmatch(r"Disassembly of section (.+):", line):
+            section = match.group(1)
+        elif match := re.fullmatch(r"\s*[0-9a-f]+ <([^>]+)>:\s*", line):
+            name = match.group(1)
+            if name in sections:
+                fail(f"duplicate disassembled function {name}")
+            sections[name] = section
+    starts = {name: instruction_entries(lines)[0][1]
+              for name, lines in blocks.items() if instruction_entries(lines)}
+    by_pc = {}
+    for name, pc in starts.items():
+        by_pc.setdefault((sections[name], pc), []).append(name)
+    sectionless = all(section is None for section in sections.values())
+    known_sections = set(sections.values()) - {None}
+
+    def unique(section, pc):
+        candidates = by_pc.get((section, pc), [])
+        return candidates[0] if len(candidates) == 1 else None
+
     calls = []
     for function, lines in blocks.items():
         for line_index, pc, text in instruction_entries(lines):
@@ -664,16 +939,19 @@ def internal_call_targets(disassembly):
             relocation = next((target for index, kind, target in relocation_targets(lines)
                                if index == line_index + 1 and kind == "32"), None)
             value = int(match.group("value"), 16) * (-1 if match.group("sign") else 1)
-            if relocation == ".text":
-                target = by_pc.get(value + 1)
+            if relocation in known_sections or relocation == ".text":
+                target = unique(None if sectionless else relocation, value + 1)
+            elif relocation in starts:
+                target = unique(sections[relocation], starts[relocation] + value + 1)
             elif relocation:
-                target = relocation if relocation in blocks else None
-            elif re.match(r"85 10 ", text) or match.group("sign"):
-                target = by_pc.get(pc + 1 + value)
-            else:
                 target = None
-            if target:
-                calls.append((function, line_index, pc, target))
+            elif re.match(r"85 10 ", text) or match.group("sign"):
+                target = unique(sections[function], pc + 1 + value)
+            else:
+                continue  # Unencoded, nonrelocated positive calls are helpers.
+            # Keep unresolved internal edges visible to each bounded consumer;
+            # another section or an ambiguous synthetic alias grants no target.
+            calls.append((function, line_index, pc, target))
     return calls
 
 
@@ -821,6 +1099,499 @@ def tail_cleanup_contract(disassembly, function, tail_pc, graph):
                                     for pc in owned_paths)
 
 
+def _tail_lowering(insns, source):
+    """One reviewed contiguous tail lowering, with instruction-local labels."""
+    expected, labels = [], {}
+    for text in source.strip().splitlines():
+        text = text.strip()
+        if text.endswith(":"):
+            labels[text[:-1]] = len(expected)
+        else:
+            expected.append(text)
+    matches = []
+    for begin in range(len(insns) - len(expected) + 1):
+        region = insns[begin:begin + len(expected)]
+        for (pc, actual), wanted in zip(region, expected):
+            if "goto @" in wanted:
+                prefix, label = wanted.split("goto @")
+                if (not actual.startswith(prefix + "goto ")
+                        or relative_target(pc, actual) != region[labels[label]][0]):
+                    break
+            elif wanted.endswith("goto ?"):
+                if (not actual.startswith(wanted[:-1])
+                        or relative_target(pc, actual) is None):
+                    break
+            elif actual != wanted:
+                break
+        else:
+            matches.append(region)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _stack_interface_return_contract(lines, insert_pc):
+    """Bind read_word's two widths, nonzero count/base and checked span to insert.
+
+    The native owner now returns StartState on the caller's stack. The old
+    pointer+8 load is absent; an arbitrary stack load cannot replace that proof.
+    Every accepted insert must cross these actual count/span gates, and their
+    refusal edges must be unable to reach the continuation publication.
+    """
+    insns, graph = instruction_graph(lines)
+    state = _tail_lowering(insns, """
+        r3 = *(u64 *)(r10 - 0x30)
+        r0 = *(u64 *)(r10 - 0x38)
+        r8 = *(u64 *)(r10 - 0x48)
+        r9 = *(u64 *)(r10 - 0x50)
+        r1 = r7
+        r1 &= 0x1
+        if r1 == 0x0 goto ?
+        r1 = 0xfffffffd ll
+        if r1 > r3 goto @read32
+        goto ?
+        read32:
+        r1 = r10
+        r1 += -0x58
+        r2 = 0x4
+        *(u64 *)(r10 - 0x80) = r0
+        call 0x70
+        r5 = r8
+        r8 = r9
+        r9 = *(u64 *)(r10 - 0x80)
+        if r0 != 0x0 goto ?
+        w1 = *(u32 *)(r10 - 0x58)
+        goto ?
+        """)
+    read64 = _tail_lowering(insns, """
+        if r3 > -0x8 goto ?
+        *(u64 *)(r10 - 0x80) = r0
+        r1 = r10
+        r1 += -0x58
+        r2 = 0x8
+        call 0x70
+        if r0 == 0x0 goto ?
+        """)
+    span = _tail_lowering(insns, """
+        r1 = *(u64 *)(r10 - 0x58)
+        r5 = r8
+        r8 = r9
+        r9 = *(u64 *)(r10 - 0x80)
+        if r9 == 0x0 goto ?
+        if r1 == 0x0 goto ?
+        r3 = r7
+        r3 &= 0x1
+        r2 = 0xc
+        if r3 != 0x0 goto @stride
+        r2 = 0x18
+        stride:
+        r4 = 0x10
+        r3 = r1
+        if r4 > r1 goto @active
+        r3 = 0x10
+        active:
+        r3 += -0x1
+        r3 *= r2
+        r2 = r3
+        r2 += r9
+        r4 = 0x1
+        if r3 > r2 goto @added
+        r4 = 0x0
+        added:
+        r4 &= 0x1
+        if r4 != 0x0 goto ?
+        r3 = r7
+        r3 &= 0x1
+        r4 = 0x8
+        if r3 != 0x0 goto @lastword
+        r4 = 0x10
+        lastword:
+        r3 = r4
+        r3 += r2
+        r2 = 0x1
+        if r4 > r3 goto @ended
+        r2 = 0x0
+        ended:
+        r2 &= 0x1
+        if r2 != 0x0 goto ?
+        r7 &= 0x1
+        if r7 == 0x0 goto ?
+        r2 = 0xfffffffd ll
+        if r2 > r3 goto ?
+        """)
+    lp64 = _tail_lowering(insns, """
+        if r3 > -0x8 goto ?
+        r2 = r5
+        r2 &= 0xffffff
+        if r2 == 0x0 goto ?
+        """)
+    publish = _tail_lowering(insns, """
+        r2 = r5
+        r2 &= 0xffffff
+        if r2 == 0x0 goto ?
+        *(u64 *)(r10 - 0x20) = r8
+        r2 = 0x1
+        *(u64 *)(r10 - 0x10) = r2
+        r2 = 0x0
+        *(u64 *)(r10 - 0x18) = r2
+        *(u64 *)(r10 - 0x48) = r2
+        *(u64 *)(r10 - 0x58) = r9
+        r2 = 0xffffffff ll
+        if r2 > r1 goto @count
+        r1 = 0xffffffff ll
+        count:
+        r1 <<= 0x8
+        r5 <<= 0x28
+        r1 |= r5
+        *(u64 *)(r10 - 0x50) = r1
+        r1 = r10
+        r1 += -0x20
+        r2 = r10
+        r2 += -0x58
+        r3 = 0x1
+        """)
+    if not all((state, read64, span, lp64, publish)):
+        return False
+    raw_helpers = {pc for _, pc, text in instruction_entries(lines)
+                   if text.startswith("85 00 ")}
+    reads = {state[14][0], read64[5][0]}
+    if not reads <= raw_helpers:
+        return False
+    if (relative_target(*state[6]) != read64[0][0]
+            or relative_target(*state[-1]) != span[4][0]
+            or relative_target(*read64[-1]) != span[0][0]
+            or relative_target(*span[-3]) != lp64[0][0]
+            or relative_target(*span[-1]) != publish[0][0]
+            or graph[publish[-1][0]] != [insert_pc]):
+        return False
+    start = insns[0][0]
+    # The two ABI alternatives do not individually dominate publication.
+    # The common span gates do; branch-only alternatives are checked below.
+    required = (state[0][0], *(span[i][0] for i in (4, 5, 15, 23, 35, 37)),
+                publish[0][0])
+    if (insert_pc in reachable(graph, [start], reads)
+            or any(insert_pc in reachable(graph, [start], {pc}) for pc in required)):
+        return False
+    denied = [state[9], state[18], read64[0], *[span[i] for i in (4, 5, 23, 35)],
+              lp64[0], publish[2]]
+    return not any(insert_pc in reachable(graph, [relative_target(pc, text)])
+                   for pc, text in denied)
+
+
+def _tail_path_nodes(graph, start, end):
+    """Instructions on a path between two already decoded tail sites."""
+    reverse = {pc: [] for pc in graph}
+    for pc, successors in graph.items():
+        for successor in successors:
+            reverse[successor].append(pc)
+    return reachable(graph, [start]) & reachable(reverse, [end])
+
+
+def _tail_memset_range(lines, state):
+    """Return the exact caller-stack footprint of the reviewed byte loop."""
+    callee = instructions(lines)
+    byte_stores = [op for _, op in callee
+                   if re.fullmatch(r"\*\(u8 \*\)\(r5 \+ 0x0\) = [rw]2", op)]
+    if len(byte_stores) != 1:
+        return None
+    loop = _tail_lowering(callee, f"""
+        if r3 == 0x0 goto @done
+        r4 = 0x0
+        again:
+        r5 = r1
+        r5 += r4
+        {byte_stores[0]}
+        r4 += 0x1
+        if r3 > r4 goto @again
+        done:
+        exit
+        """)
+    pointer, length = state.get("r1"), state.get("r3")
+    if (loop != callee or not pointer or pointer[0] != "stack"
+            or not length or length[0] != "constant"
+            or length[1] < 0 or pointer[1] < -512 or pointer[1] + length[1] > 0):
+        return None
+    return pointer[1], length[1]
+
+
+def _tail_trusted_facts(lines, calls, blocks):
+    """Prove consumed constants/stack pointers through all caller CFG paths.
+
+    Unlike call_argument_facts, every stack write kills overlapping saved u64
+    facts, including wN, immediates and unknown aliases. Callee writes are
+    summarized before a later load can consume the saved value.
+    """
+    insns, graph = instruction_graph(lines)
+    if not insns:
+        return {}
+    texts = dict(insns)
+    targets = {pc: target for _, _, pc, target in calls}
+    incoming = {insns[0][0]: {"r10": ("stack", 0)}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = texts[pc]
+        store = re.fullmatch(
+            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = ([rw]\d+|-?0x[0-9a-f]+)", text)
+        load = re.fullmatch(
+            r"(r\d+) = \*\(u64 \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)", text)
+        move = re.fullmatch(r"([rw]\d+) (=|\+=) (r\d+|-?0x[0-9a-f]+)(?: ll)?", text)
+        if store:
+            width, base, sign, offset, src = store.groups()
+            pointer = state.get("r" + base)
+            if pointer and pointer[0] == "stack":
+                address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
+                size = int(width) // 8
+                for key in list(state):
+                    if isinstance(key, int) and key < address + size and address < key + 8:
+                        state.pop(key)
+                if width == "64" and src.startswith("r") and src in state:
+                    state[address] = state[src]
+            else:
+                for key in list(state):
+                    if isinstance(key, int):
+                        state.pop(key)
+        elif text.startswith("call "):
+            target = targets.get(pc)
+            footprint = _tail_memset_range(blocks.get(target, ()), state) if target == "memset" else None
+            if footprint is not None:
+                address, size = footprint
+                for key in list(state):
+                    if isinstance(key, int) and key < address + size and address < key + 8:
+                        state.pop(key)
+            else:
+                preserves_stack = (pc not in targets
+                                   and text in ("call 0x1", "call 0x3", "call 0xe", "call 0xae"))
+                if not preserves_stack:
+                    for key in list(state):
+                        if isinstance(key, int):
+                            state.pop(key)
+            for register in range(6):
+                state.pop("r" + str(register), None)
+        elif load:
+            dst, base, sign, offset = load.groups()
+            pointer = state.get("r" + base)
+            state.pop(dst, None)
+            if pointer and pointer[0] == "stack":
+                address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
+                if address in state:
+                    state[dst] = state[address]
+        elif move:
+            dst, op, src = move.groups()
+            register = "r" + dst[1:]
+            value = state.get(src) if src.startswith("r") else ("constant", int(src, 16))
+            if op == "+=":
+                previous = state.get(register)
+                value = ((previous[0], previous[1] + value[1])
+                         if previous and previous[0] in ("constant", "stack")
+                         and value and value[0] == "constant" else None)
+            if dst.startswith("w") and value:
+                value = ("constant", value[1] & 0xffffffff) if value[0] == "constant" else None
+            state.pop(register, None)
+            if value is not None:
+                state[register] = value
+        elif (re.fullmatch(
+                r"if [rw]\d+ (?:==|!=|<=|>=|<|>|s<=|s>=|s<|s>|&) "
+                r"(?:[rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+", text)
+              or re.fullmatch(r"goto [+-]0x[0-9a-f]+", text)
+              or text == "exit"):
+            pass
+        elif read := re.fullmatch(
+                r"([rw]\d+) = \*\(u(?:8|16|32|64) \*\)\(r\d+ [+-] 0x[0-9a-f]+\)", text):
+            state.pop("r" + read[1][1:], None)
+        elif arithmetic := re.fullmatch(
+                r"([rw]\d+) (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) "
+                r"(?:[rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            state.pop("r" + arithmetic[1][1:], None)
+        else:
+            # Unrecognized forms may write memory or clobber implicit registers.
+            state.clear()
+        for successor in graph[pc]:
+            merged = (state if successor not in incoming else
+                      {key: value for key, value in incoming[successor].items()
+                       if state.get(key) == value})
+            if incoming.get(successor) != merged:
+                incoming[successor] = merged
+                pending.append(successor)
+    return incoming
+
+
+def _interface_index_slot_preserved(lines, graph, start, end, calls, blocks):
+    """No overlapping or unproved writer may change the u64 index at -0x60."""
+    facts = _tail_trusted_facts(lines, calls, blocks)
+    targets = {pc: target for _, _, pc, target in calls}
+    slot, size = -0x60, 8
+    path = _tail_path_nodes(graph, start, end)
+    for pc, text in instructions(lines):
+        if pc in (start, end) or pc not in path:
+            continue
+        state = facts.get(pc, {})
+        store = re.fullmatch(
+            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = (?:[rw]\d+|-?0x[0-9a-f]+)",
+            text,
+        )
+        if store:
+            width, base, sign, offset = store.groups()
+            pointer = state.get("r" + base)
+            if not pointer or pointer[0] != "stack":
+                return False
+            address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
+            count = int(width) // 8
+        elif text.startswith("call "):
+            footprint = _tail_memset_range(blocks.get(targets.get(pc), ()), state)
+            if footprint is None:
+                return False
+            address, count = footprint
+        elif (text.startswith(("if ", "goto ")) or text == "exit"
+              or re.fullmatch(r"[rw]\d+ = \*\(u(?:8|16|32|64) \*\)\(r\d+ [+-] 0x[0-9a-f]+\)", text)
+              or re.fullmatch(r"[rw]\d+ (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) (?:[rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
+            continue
+        else:
+            # Includes implicit writes such as cmpxchg and lock syntax.
+            return False
+        if (count < 0 or address < -512 or address + count > 0
+                or (count and address < slot + size and slot < address + count)):
+            return False
+    return True
+
+
+def _packed_interface_worker_contract(lines, get_pc, classifier_pc, calls, blocks):
+    """The symbol is packed>>40, count is u32, and the index is below min(count,16)."""
+    insns, graph = instruction_graph(lines)
+    unpack = _tail_lowering(insns, """
+        if r0 == 0x0 goto ?
+        r5 = *(u64 *)(r0 + 0x0)
+        if r5 == 0x0 goto ?
+        r4 = *(u64 *)(r0 + 0x8)
+        r9 = r4
+        r9 >>= 0x28
+        if r9 == 0x0 goto ?
+        r7 = r4
+        r7 >>= 0x8
+        r2 = r7
+        r2 <<= 0x20
+        r2 >>= 0x20
+        r3 = 0x10
+        r1 = r7
+        if r3 > r2 goto @active
+        r1 = 0x10
+        active:
+        r2 = r4
+        r2 &= 0xff
+        if r2 > 0xf goto ?
+        r1 <<= 0x20
+        r1 >>= 0x20
+        if r2 >= r1 goto ?
+        """)
+    metadata = _tail_lowering(insns, """
+        r9 <<= 0x20
+        r1 = *(u64 *)(r10 - 0x60)
+        r1 <<= 0x8
+        r1 |= r9
+        r1 |= 0x2
+        r4 = r10
+        r4 += -0x40
+        r2 = r7
+        r3 = *(u64 *)(r10 - 0x70)
+        r5 = *(u64 *)(r10 - 0x78)
+        """)
+    index = _tail_lowering(insns, """
+        r1 = r4
+        r1 &= 0xff
+        *(u64 *)(r10 - 0x60) = r1
+        """)
+    if (not unpack or not metadata or not index or graph[get_pc] != [unpack[0][0]]
+            or graph[metadata[-1][0]] != [classifier_pc]):
+        return False
+    guards = [unpack[i] for i in (0, 2, 6, 18, 21)]
+    start = insns[0][0]
+    if not all(classifier_pc not in reachable(graph, [start], {pc})
+               and classifier_pc not in reachable(graph, [relative_target(pc, text)])
+               for pc, text in guards):
+        return False
+    symbol_writes = [pc for pc, text in insns if unpack[5][0] < pc < classifier_pc
+                     and re.match(r"[rw]9\b", text)]
+    live = reachable(graph, [start])
+    if (symbol_writes != [metadata[0][0]]
+            or classifier_pc in reachable(graph, [start], {metadata[0][0]})
+            or not all({pc for pc in live if current[0] in graph[pc]} == {previous[0]}
+                       for region in (metadata, index)
+                       for previous, current in zip(region, region[1:]))):
+        return False
+    reloads = [pc for pc, text in insns if text == "r1 = *(u64 *)(r10 - 0x60)"]
+    if (len(reloads) != 2 or reloads[-1] != metadata[1][0]
+            or any(classifier_pc in reachable(graph, [start], {pc})
+                   for pc in (unpack[3][0], index[0][0], index[-1][0], reloads[0]))):
+        return False
+    packed_path = _tail_path_nodes(graph, unpack[3][0], index[0][0]) - {unpack[3][0]}
+    if any(pc in packed_path and (re.match(r"[rw]4\b", text) or text.startswith("call "))
+           for pc, text in insns):
+        return False
+    return _interface_index_slot_preserved(lines, graph, index[-1][0], metadata[1][0], calls, blocks)
+
+
+def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False, calls=(), blocks=None):
+    """Legacy +8 loads and bounds must use the actual direct getter result.
+
+    A context load and an unrelated 24-bit constant cannot opt a current-format
+    object out of the stack/packed proof. Preserve the old direct-get ABI only
+    when its returned field and same-value guards causally protect the sink.
+    """
+    insns, graph = instruction_graph(lines)
+    if not insns or not get_pcs:
+        return False
+    texts = dict(insns)
+    facts = _tail_trusted_facts(lines, calls, blocks) if upper_bound else {}
+    start = insns[0][0]
+    candidates = []
+    for index, (pc, text) in enumerate(insns[:-1]):
+        load = re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r0 \+ 0x8\)", text)
+        if not load:
+            continue
+        register = load.group(1)
+        null_pc, null = insns[index + 1]
+        if not re.fullmatch(rf"if r{register} == 0x0 goto [+-]0x[0-9a-f]+", null):
+            continue
+        getter = []
+        for get_pc in get_pcs:
+            successors = graph[get_pc]
+            if successors == [pc]:
+                getter.append(get_pc)
+            elif len(successors) == 1:
+                result_pc = successors[0]
+                result = texts[result_pc]
+                if (re.fullmatch(r"if r0 == 0x0 goto [+-]0x[0-9a-f]+", result)
+                        and pc in graph[result_pc]
+                        and relative_target(result_pc, result) != pc
+                        and target not in reachable(graph, [relative_target(result_pc, result)])):
+                    getter.append(get_pc)
+        if len(getter) != 1:
+            continue
+        path = _tail_path_nodes(graph, pc, target) - {pc, target}
+        bounds = []
+        if upper_bound:
+            for bound_pc, bound in insns:
+                if bound_pc <= pc or bound_pc not in path:
+                    continue
+                immediate = re.fullmatch(rf"if r{register} > 0xffffff goto [+-]0x[0-9a-f]+", bound)
+                other = re.fullmatch(rf"if r{register} > (r\d+) goto [+-]0x[0-9a-f]+", bound)
+                if (immediate or (other and facts.get(bound_pc, {}).get(other[1]) == ("constant", 0xffffff))):
+                    bounds.append((bound_pc, bound))
+            if len(bounds) != 1:
+                continue
+        guards = [(null_pc, null), *bounds]
+        if (target in reachable(graph, [start], {getter[0]})
+                or target in reachable(graph, [start], {pc})
+                or any(target in reachable(graph, [start], {guard_pc})
+                       or target in reachable(graph, [relative_target(guard_pc, guard)])
+                       for guard_pc, guard in guards)
+                or any(p in path and (re.match(rf"[rw]{register}\b", op)
+                                      or (int(register) < 6 and op.startswith("call ")))
+                       for p, op in insns)):
+            continue
+        candidates.append(pc)
+    return len(candidates) == 1
+
+
 def interface_tail_contract(disassembly):
     blocks = function_blocks(disassembly)
     returns = [name for name in blocks if name.endswith("interface_list_return")]
@@ -886,21 +1657,32 @@ def interface_tail_contract(disassembly):
             return False
     return_block = "\n".join(return_lines)
     worker_block = "\n".join(worker_lines)
-    if not re.search(r"\br\d+ = \*\(u64 \*\)\(r\d+ \+ 0x8\)", return_block):
-        return False
     if not re.search(r"\bif r\d+ == 0x0 goto", return_block):
         return False
     if not re.search(r"\bif r\d+ > r\d+ goto", return_block):
         return False
     if re.search(r"\bcall 0xae\b", worker_block):
         return False
-    if not (
-        re.search(r"\bif r\d+ > 0xffffff goto", worker_block)
-        or (
-            re.search(r"\br\d+ = 0xffffff\b", worker_block)
-            and re.search(r"\bif r\d+ > r\d+ goto", worker_block)
+    insert_pcs = {pc for _, pc in discovery_call_sites(disassembly, return_name, "insert")}
+    if len(insert_pcs) != 1 or len(reads) != 1:
+        return False
+    insert_pc, = insert_pcs
+    get_pc, = reads
+    return_gets = {pc for _, pc in discovery_call_sites(disassembly, return_name, "get")}
+    legacy = (bool(return_gets)
+              and discovery_arguments(disassembly, return_name, "get", 0)
+              and _legacy_owned_tail_value(return_lines, return_gets, insert_pc)
+              and _legacy_owned_tail_value(
+                  worker_lines, reads, worker_classifier_calls[0][2], True,
+                  [call for call in calls if call[0] == worker_name], blocks,
+              ))
+    if not (legacy or (
+        _stack_interface_return_contract(return_lines, insert_pc)
+        and _packed_interface_worker_contract(
+            worker_lines, get_pc, worker_classifier_calls[0][2],
+            [call for call in calls if call[0] == worker_name], blocks,
         )
-    ):
+    )):
         return False
     if not re.search(r"\br\d+ = 0x10\b", worker_block):
         return False
@@ -968,16 +1750,47 @@ def cookie_object_contract(disassembly):
             checked = cookie if domain == 2 else ("cookie_mask", cookie[1], 0xffffff)
             if not state.get(("nonzero", checked)):
                 return False
+    proofs = _outlined_wrapper_proofs(disassembly)
+    routes = (("insert_export_state", "insert", "insert", 1),
+              ("take_export_state", "get", "take_export", 1),
+              ("take_export_state", "remove", "take_export", 1),
+              ("take_selection_state", "get", "take_selection", 2),
+              ("take_selection_state", "remove", "take_selection", 2))
+    for suffix, operation, kind, domain in routes:
+        matches = [name for name in blocks if name.endswith(suffix)]
+        if not matches:
+            continue
+        if len(matches) != 1 or proofs[kind] is None:
+            return False
+        facts = call_argument_facts(blocks[matches[0]])
+        for _, pc in discovery_call_sites(disassembly, matches[0], operation):
+            if not _wrapper_key_site_contract(facts, pc, domain):
+                return False
     return True
 
 
+def _wrapper_key_site_contract(facts, pc, expected_domain):
+    state = facts.get(pc, {})
+    key = state.get("r1")
+    if not key or key[0] != "stack":
+        return False
+    if state.get(key[1] + 16) != ("constant", expected_domain):
+        return False
+    cookie = state.get(key[1] + 8)
+    if not cookie or cookie[0] != "cookie":
+        return False
+    checked = cookie if expected_domain == 2 else ("cookie_mask", cookie[1], 0xffffff)
+    return bool(state.get(("nonzero", checked)))
+
+
 def finite_counter_key(lines, relocation):
+    """Prove the actual lookup's u32 stack key across every incoming path."""
     key_store = re.compile(
-        r"\*\(u32 \*\)\(r10 - 0x[0-9a-f]+\) = [rw](?P<register>\d+)"
+        r"\*\(u32 \*\)\(r10 - 0x(?P<offset>[0-9a-f]+)\) = [rw](?P<register>\d+)"
     )
     stored = next(
         (
-            (index, match.group("register"))
+            (index, -int(match.group("offset"), 16), match.group("register"))
             for index in range(relocation - 1, max(-1, relocation - 12), -1)
             if (match := key_store.search(lines[index]))
         ),
@@ -985,17 +1798,47 @@ def finite_counter_key(lines, relocation):
     )
     if stored is None:
         return None
-    store_index, register = stored
-    assignment = re.compile(
-        rf"\br{register} = (?P<sign>-?)0x(?P<value>[0-9a-f]+)\b"
-    )
-    for index in range(store_index - 1, -1, -1):
-        if match := assignment.search(lines[index]):
-            value = int(match.group("value"), 16)
-            return -value if match.group("sign") else value
-        if re.search(rf"\br{register} =", lines[index]):
-            break
-    return None
+    lookups = [pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+               if index == relocation or ("R_BPF_64_64" in lines[relocation]
+                                           and relocation < index <= relocation + 6)]
+    if len(lookups) != 1:
+        return None
+    lookup = lookups[0]
+    store_index, slot, register = stored
+    store_pc = line_pc(lines[store_index])
+    facts = call_argument_facts(lines)
+    value = facts.get(store_pc, {}).get("r" + register)
+    if (not value or value[0] != "constant" or not 0 <= value[1] <= 0xffffffff
+            or facts.get(lookup, {}).get("r2") != ("stack", slot)):
+        return None
+    insns, graph = instruction_graph(lines)
+    if lookup in reachable(graph, [insns[0][0]], {store_pc}):
+        return None  # A path can reach the lookup without initializing its key.
+    reverse = {pc: [] for pc, _ in insns}
+    for pc, edges in graph.items():
+        for edge in edges:
+            reverse[edge].append(pc)
+    between = (reachable(graph, graph[store_pc], {lookup})
+               & reachable(reverse, [lookup], {store_pc}))
+    for pc, text in insns:
+        if pc not in between:
+            continue
+        # An intervening call or unknown/atomic write can mutate the key via
+        # aliases. Only disjoint, proven stack stores are accepted here.
+        if "call " in text or "lock " in text or "xchg" in text:
+            return None
+        write = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = .+", text)
+        if write:
+            width, base, sign, offset = write.groups()
+            address = facts.get(pc, {}).get("r" + base)
+            if not address or address[0] != "stack":
+                return None
+            offset = address[1] + int(offset, 16) * (1 if sign == "+" else -1)
+            if offset < slot + 4 and slot < offset + int(width) // 8:
+                return None
+        elif text.startswith("*("):
+            return None
+    return value[1]
 
 
 COUNTER_ATOMIC_ADD = re.compile(r"lock \*\(u64 \*\)\(r(\d+) \+ 0x0\) \+= r(\d+)")
@@ -1081,40 +1924,18 @@ def reservation_loss_contract(disassembly):
             )
             if reserve is None:
                 return False
-            branch = next(
-                (
-                    index
-                    for index in range(reserve + 1, min(len(lines), reserve + 8))
-                    if re.search(r"\bif r(?P<base>\d+) != 0x0 goto ", lines[index])
-                ),
-                None,
-            )
-            if branch is None:
+            try:
+                (_, target, failure), _, _, graph, _ = reservation_branches(lines, reserve)
+            except RuntimeError:
                 return False
-            target = relative_target(line_pc(lines[branch]), lines[branch])
-            target_index = next(
-                (index for index, line in enumerate(lines) if line_pc(line) == target),
-                None,
-            )
-            if target_index is None or target_index <= branch:
+            failure_paths = reachable(graph, [failure])
+            lookups = [pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+                       if pc in failure_paths and finite_counter_key(lines, index) == 0]
+            if len(lookups) != 1 or not counter_writeback_contract(lines, lookups[0]):
                 return False
-            failure = lines[branch + 1 : target_index]
-            counters = [
-                index
-                for index, line in enumerate(failure)
-                if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)
-            ]
-            if len(counters) != 1 or finite_counter_key(lines, branch + 1 + counters[0]) != 0:
-                return False
-            lookups = map_call_sites(lines, "COUNTERS", helper=1)
-            lookup = next((pc for index, pc, _ in lookups
-                           if branch < index < target_index), None)
-            if lookup is None or not counter_writeback_contract(lines, lookup):
-                return False
-            _, graph = instruction_graph(lines)
+            lookup = lookups[0]
             # The null reservation arm cannot bypass its COUNTERS lookup.
-            failure_start = line_pc(next(line for line in lines[branch + 1:] if line_pc(line) is not None))
-            unaccounted = reachable(graph, [failure_start], {lookup})
+            unaccounted = reachable(graph, [failure], {lookup})
             if target in unaccounted or any(not graph[pc] for pc in unaccounted):
                 return False
     return len(reservation_functions) == 3 and {
@@ -1124,24 +1945,472 @@ def reservation_loss_contract(disassembly):
     } == reservation_functions
 
 
+_OUTLINED_ENTRY_ROOTS = ("function_list_entry", "interface_list_entry")
+_OUTLINED_TAKE_EXPORT_ROOTS = ("function_list_return", "interface_list_return")
+_OUTLINED_TAKE_SELECTION_ROOTS = ("interface_return",)
+_OUTLINED_RELEVANT_ROOTS = frozenset(
+    _OUTLINED_ENTRY_ROOTS + _OUTLINED_TAKE_EXPORT_ROOTS + _OUTLINED_TAKE_SELECTION_ROOTS
+)
+_OUTLINED_PROGRAM_ROOTS = frozenset(
+    _OUTLINED_RELEVANT_ROOTS | {"interface_entry", "interface_list_worker", "dl_debug_state"}
+)
+_OUTLINED_TAKE_OUTPUT = 56
+
+
+def _register_write(text):
+    match = re.match(r"([rw]\d+) (=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ", text)
+    if not match:
+        return None
+    return "r" + match.group(1)[1:]
+
+
+def _reaching_defs(insns, graph, pc, reg):
+    """PCs with a kill-free path of their reg write to pc (may-analysis).
+
+    Calls kill r0-r5 (callee-clobbered); r6-r9 survive calls. The use at pc
+    reads before pc executes, so pc itself never kills. Extra paths only add
+    definitions, which fails closed against exact-shape requirements.
+    """
+    writes = {q for q, text in insns if _register_write(text) == reg}
+    killers = set(writes)
+    if int(reg[1:]) < 6:
+        killers |= {q for q, text in insns if re.search(r"\bcall ", text)}
+    killers.discard(pc)
+    return sorted(
+        write
+        for write in writes
+        if write != pc and pc in reachable(graph, [write], killers - {write})
+    )
+
+
+def _resolved_callee_closure(calls, root):
+    """All functions reachable from root, or None if any edge is unresolved."""
+    edges = {}
+    for caller, _, _, target in calls:
+        edges.setdefault(caller, []).append(target)
+    seen = set()
+    stack = [root]
+    while stack:
+        for target in edges.get(stack.pop(), []):
+            if target is None:
+                return None
+            if target not in seen:
+                seen.add(target)
+                stack.append(target)
+    return seen
+
+
+def _prove_outlined_insert(disassembly, calls, wrapper):
+    blocks = function_blocks(disassembly)
+    lines = blocks[wrapper]
+    incoming = [(caller, pc) for caller, _, pc, target in calls if target == wrapper]
+    if sorted(caller for caller, _ in incoming) != sorted(_OUTLINED_ENTRY_ROOTS):
+        return None
+    for caller, pc in incoming:
+        facts = call_argument_facts(blocks[caller])
+        if facts.get(pc, {}).get("r2") != ("stack", -32):
+            return None
+    inserts = discovery_call_sites(disassembly, wrapper, "insert")
+    if (len(inserts) != 1 or discovery_call_sites(disassembly, wrapper, "get")
+            or discovery_call_sites(disassembly, wrapper, "remove")):
+        return None
+    insert_pc = inserts[0][1]
+    facts = call_argument_facts(lines)
+    state = facts.get(insert_pc, {})
+    if state.get("r3") != ("constant", 1) or state.get("r1") != ("stack", -40):
+        return None
+    insns, graph = instruction_graph(lines)
+    texts = dict(insns)
+    entry = insns[0][0]
+    retentions = [pc for pc, text in insns if _register_write(text) == "r6"]
+    if len(retentions) != 1 or texts[retentions[0]] != "r6 = r2":
+        return None
+    if insert_pc in reachable(graph, [entry], set(retentions)):
+        return None
+    moves = _reaching_defs(insns, graph, insert_pc, "r2")
+    if len(moves) != 1 or texts[moves[0]] != "r2 = r6":
+        return None
+    if _reaching_defs(insns, graph, moves[0], "r6") != retentions:
+        return None
+    relocs = [index for index, line in enumerate(lines)
+              if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)]
+    if len(relocs) != 1 or finite_counter_key(lines, relocs[0]) != 1:
+        return None
+    sites = [pc for _, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)]
+    if len(sites) != 1 or not counter_writeback_contract(lines, sites[0]):
+        return None
+    atomics = [pc for pc, text in insns
+               if "lock " in text or "atomic" in text
+               or "cmpxchg" in text or "xchg" in text]
+    if len(atomics) != 1:
+        return None
+    direct = [target for caller, _, _, target in calls if caller == wrapper]
+    if any(target is None for target in direct):
+        return None
+    allowed = {"p11_owner_discovery_insert"}
+    scope_auths = [name for name in blocks if name.endswith("scope_auth")]
+    if len(scope_auths) == 1:
+        allowed.add(scope_auths[0])
+    if any(target not in allowed for target in direct):
+        return None
+    closure = _resolved_callee_closure(calls, wrapper)
+    if closure is None or (closure & (_OUTLINED_PROGRAM_ROOTS | {wrapper})):
+        return None
+    return frozenset(caller for caller, _ in incoming)
+
+
+def _prove_outlined_take(disassembly, calls, wrapper, expected_roots):
+    blocks = function_blocks(disassembly)
+    lines = blocks[wrapper]
+    incoming = [(caller, pc) for caller, _, pc, target in calls if target == wrapper]
+    wanted = sorted(root for root in expected_roots for _ in range(2))
+    if sorted(caller for caller, _ in incoming) != wanted:
+        return None
+    scopes = {}
+    for caller, pc in incoming:
+        state = call_argument_facts(blocks[caller]).get(pc, {})
+        slot, scope = state.get("r1"), state.get("r3")
+        if (not slot or slot[0] != "stack" or slot[1] < -512
+                or slot[1] + _OUTLINED_TAKE_OUTPUT > 0
+                or scope not in (("constant", 0), ("constant", 1))):
+            return None
+        scopes.setdefault(caller, []).append(scope[1])
+    if any(sorted(values) != [0, 1] for values in scopes.values()):
+        return None
+    gets = discovery_call_sites(disassembly, wrapper, "get")
+    removes = discovery_call_sites(disassembly, wrapper, "remove")
+    if (len(gets) != 1 or len(removes) != 1
+            or discovery_call_sites(disassembly, wrapper, "insert")):
+        return None
+    if not discovery_arguments(disassembly, wrapper, "get", 0):
+        return None
+    get_pc, remove_pc = gets[0][1], removes[0][1]
+    facts = call_argument_facts(lines)
+    key = facts.get(get_pc, {}).get("r1")
+    if not key or key[0] != "stack":
+        return None
+    slot = key[1]
+    if facts.get(remove_pc, {}).get("r1") != ("stack", slot):
+        return None
+    insns, graph = instruction_graph(lines)
+    texts = dict(insns)
+    entry = insns[0][0]
+    if remove_pc in reachable(graph, [entry], {get_pc}):
+        return None
+    flag_defs = _reaching_defs(insns, graph, remove_pc, "r2")
+    if len(flag_defs) == 1:
+        move = re.fullmatch(r"r2 = r([6789])", texts[flag_defs[0]])
+        if not move:
+            return None
+        flag_reg = "r" + move.group(1)
+        const_defs = _reaching_defs(insns, graph, flag_defs[0], flag_reg)
+    elif len(flag_defs) == 2:
+        flag_reg = "r2"
+        const_defs = flag_defs
+    else:
+        return None
+    consts = sorted((texts[d], d) for d in const_defs)
+    if [text for text, _ in consts] != [f"{flag_reg} = 0x0", f"{flag_reg} = 0x1"]:
+        return None
+    zero_pc = next(d for text, d in consts if text == f"{flag_reg} = 0x0")
+    one_pc = next(d for text, d in consts if text == f"{flag_reg} = 0x1")
+    null_tests = []
+    for pc, text in insns:
+        match = re.fullmatch(r"if (r\d+) != 0x0 goto [+-]0x[0-9a-f]+", text)
+        if not match:
+            continue
+        taken = relative_target(pc, text)
+        edges = graph[pc]
+        if len(edges) != 2:
+            return None
+        fall = next(edge for edge in edges if edge != taken)
+        if fall == zero_pc:
+            null_tests.append((pc, match.group(1), taken))
+    if len(null_tests) != 1:
+        return None
+    test_pc, cell_reg, taken = null_tests[0]
+    if (remove_pc in reachable(graph, [entry], {test_pc})
+            or test_pc in reachable(graph, [entry], {one_pc})
+            or remove_pc not in reachable(graph, [taken])
+            or zero_pc in reachable(graph, [taken])):
+        return None
+    moves = _reaching_defs(insns, graph, test_pc, cell_reg)
+    if len(moves) != 1 or texts[moves[0]] != f"{cell_reg} = r0":
+        return None
+    if moves[0] not in reachable(graph, [get_pc]):
+        return None
+    if any(re.search(r"\bcall ", texts[pc])
+           for pc in nodes_on_paths(graph, get_pc, moves[0]) - {get_pc, moves[0]}):
+        return None
+    for pc, text in insns:
+        if text.startswith("if r7 ") or text.startswith("if w7 "):
+            defs = _reaching_defs(insns, graph, pc, "r7")
+            if len(defs) != 1 or texts[defs[0]] != "r7 = r3":
+                return None
+    outputs = [pc for pc, text in insns if _register_write(text) == "r6"]
+    if len(outputs) != 1 or texts[outputs[0]] != "r6 = r1":
+        return None
+
+    def output_offset(pc, base, rel):
+        if base == "r6":
+            return rel
+        total, current, at = rel, base, pc
+        for _ in range(4):
+            defs = _reaching_defs(insns, graph, at, current)
+            if len(defs) != 1:
+                return None
+            step = texts[defs[0]]
+            if step == f"{current} = r6":
+                if _reaching_defs(insns, graph, defs[0], "r6") != outputs:
+                    return None
+                return total
+            move = re.fullmatch(rf"{current} \+= (-?0x[0-9a-f]+)", step)
+            if not move:
+                return None
+            total += int(move.group(1), 16)
+            at = defs[0]
+        return None
+
+    store_pattern = re.compile(
+        r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = (.+)"
+    )
+    disc_stores, payload_stores = [], []
+    for pc, text in insns:
+        match = store_pattern.fullmatch(text)
+        if not match:
+            continue
+        width, base, sign, offset, src = match.groups()
+        size = int(width) // 8
+        rel = int(offset, 16) * (1 if sign == "+" else -1)
+        base = "r" + base
+        if base != "r6":
+            proven = facts.get(pc, {}).get(base)
+            if proven and proven[0] == "stack":
+                if proven[1] + rel < -512 or proven[1] + rel + size > 0:
+                    return None
+                continue
+            off = output_offset(pc, base, rel)
+            if off is None:
+                return None
+        else:
+            off = rel
+        if off < 0 or off + size > _OUTLINED_TAKE_OUTPUT:
+            return None
+        if off == 0 and size == 8:
+            disc_stores.append((pc, src))
+        else:
+            if pc in reachable(graph, [entry], {remove_pc}):
+                return None
+            payload_stores.append((pc, src, off))
+    for pc, src in disc_stores:
+        if not re.fullmatch(r"r\d+", src):
+            return None
+        defs = _reaching_defs(insns, graph, pc, src)
+        if not defs or any(texts[d] not in (f"{src} = 0x0", f"{src} = 0x1")
+                           for d in defs):
+            return None
+    if not disc_stores:
+        return None
+    if sorted(off for _, _, off in payload_stores) != [8, 16, 24, 32, 40, 48]:
+        return None
+    between = nodes_on_paths(graph, get_pc, remove_pc)
+    snapshot = []
+    for pc, text in insns:
+        if pc not in between:
+            continue
+        match = store_pattern.fullmatch(text)
+        if not match or match.group(1) != "64":
+            continue
+        base = "r" + match.group(2)
+        rel = int(match.group(4), 16) * (1 if match.group(3) == "+" else -1)
+        proven = facts.get(pc, {}).get(base)
+        if not proven or proven[0] != "stack":
+            return None
+        addr = proven[1] + rel
+        if slot <= addr < slot + 24:
+            return None
+        snapshot.append((addr, pc, match.group(5)))
+    if len(snapshot) != 3:
+        return None
+    addrs = sorted(addr for addr, _, _ in snapshot)
+    if addrs[1] != addrs[0] + 8 or addrs[2] != addrs[0] + 16:
+        return None
+    for _, pc, src in snapshot:
+        if not re.fullmatch(r"r\d+", src):
+            return None
+        defs = _reaching_defs(insns, graph, pc, src)
+        if len(defs) != 1:
+            return None
+        load = re.fullmatch(rf"{src} = \*\(u64 \*\)\(r(\d+) \+ 0x([0-9a-f]+)\)",
+                            texts[defs[0]])
+        if not load or int(load.group(2), 16) not in (0, 8, 16):
+            return None
+        cell = "r" + load.group(1)
+        moves = _reaching_defs(insns, graph, defs[0], cell)
+        if len(moves) != 1 or texts[moves[0]] != f"{cell} = r0":
+            return None
+        if moves[0] not in reachable(graph, [get_pc]):
+            return None
+        if any(re.search(r"\bcall ", texts[pc])
+               for pc in nodes_on_paths(graph, get_pc, moves[0]) - {get_pc, moves[0]}):
+            return None
+    before = nodes_on_paths(graph, entry, get_pc)
+    key_writes = set()
+    for pc, text in insns:
+        if pc not in before:
+            continue
+        match = store_pattern.fullmatch(text)
+        if not match or match.group(1) != "64":
+            continue
+        base = "r" + match.group(2)
+        rel = int(match.group(4), 16) * (1 if match.group(3) == "+" else -1)
+        proven = facts.get(pc, {}).get(base)
+        if proven and proven[0] == "stack" and proven[1] + rel in (slot, slot + 8, slot + 16):
+            key_writes.add(proven[1] + rel)
+    if key_writes != {slot, slot + 8, slot + 16}:
+        return None
+    proven_addrs = {slot, slot + 8, slot + 16, addrs[0], addrs[0] + 8, addrs[0] + 16}
+
+    def loads_from_proven(src_reg, at):
+        defs = _reaching_defs(insns, graph, at, src_reg)
+        if not defs:
+            return False
+        for load_pc in defs:
+            load = re.fullmatch(
+                rf"{src_reg} = \*\(u64 \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)",
+                texts[load_pc],
+            )
+            if not load:
+                return False
+            base = facts.get(load_pc, {}).get("r" + load.group(1))
+            if not base or base[0] != "stack":
+                return False
+            delta = int(load.group(3), 16) * (1 if load.group(2) == "+" else -1)
+            if base[1] + delta not in proven_addrs:
+                return False
+        return True
+
+    stack_stores = []
+    for pc, text in insns:
+        match = store_pattern.fullmatch(text)
+        if not match or match.group(1) != "64":
+            continue
+        base = "r" + match.group(2)
+        rel = int(match.group(4), 16) * (1 if match.group(3) == "+" else -1)
+        proven = facts.get(pc, {}).get(base)
+        if proven and proven[0] == "stack":
+            stack_stores.append((pc, proven[1] + rel, match.group(5)))
+    changed = True
+    while changed:
+        changed = False
+        for pc, addr, src in stack_stores:
+            if addr in proven_addrs or not re.fullmatch(r"r\d+", src):
+                continue
+            if loads_from_proven(src, pc):
+                proven_addrs.add(addr)
+                changed = True
+    for pc, src, _ in payload_stores:
+        if not re.fullmatch(r"r\d+", src) or not loads_from_proven(src, pc):
+            return None
+    relocs = [index for index, line in enumerate(lines)
+              if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)]
+    if len(relocs) != 1 or finite_counter_key(lines, relocs[0]) != 1:
+        return None
+    sites = [pc for _, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)]
+    if len(sites) != 1 or not counter_writeback_contract(lines, sites[0]):
+        return None
+    if sites[0] in reachable(graph, [entry], {remove_pc}):
+        return None
+    atomics = [pc for pc, text in insns
+               if "lock " in text or "atomic" in text
+               or "cmpxchg" in text or "xchg" in text]
+    if len(atomics) != 1:
+        return None
+    direct = [target for caller, _, _, target in calls if caller == wrapper]
+    if any(target is None for target in direct):
+        return None
+    allowed = {"p11_owner_discovery_get", "p11_owner_discovery_remove"}
+    if any(target not in allowed for target in direct):
+        return None
+    closure = _resolved_callee_closure(calls, wrapper)
+    if closure is None or (closure & (_OUTLINED_PROGRAM_ROOTS | {wrapper})):
+        return None
+    return frozenset(caller for caller, _ in incoming)
+
+
+def _outlined_wrapper_proofs(disassembly):
+    """Prove exact outlined export-state wrapper custody, if present.
+
+    Returns {"insert", "take_export", "take_selection"} each holding either
+    (wrapper, proven callers) or None. Never raises on mismatch.
+    """
+    blocks = function_blocks(disassembly)
+    calls = internal_call_targets(disassembly)
+    empty = {"insert": None, "take_export": None, "take_selection": None}
+    if any(target is None for caller, _, _, target in calls
+           if caller in _OUTLINED_RELEVANT_ROOTS):
+        return empty
+
+    def unique(suffix):
+        found = [name for name in blocks if name.endswith(suffix)]
+        return found[0] if len(found) == 1 else None
+
+    insert = unique("insert_export_state")
+    take_export = unique("take_export_state")
+    take_selection = unique("take_selection_state")
+    proofs = dict(empty)
+    if insert is not None:
+        callers = _prove_outlined_insert(disassembly, calls, insert)
+        if callers is not None:
+            proofs["insert"] = (insert, callers)
+    if take_export is not None:
+        callers = _prove_outlined_take(
+            disassembly, calls, take_export, _OUTLINED_TAKE_EXPORT_ROOTS)
+        if callers is not None:
+            proofs["take_export"] = (take_export, callers)
+    if take_selection is not None:
+        callers = _prove_outlined_take(
+            disassembly, calls, take_selection, _OUTLINED_TAKE_SELECTION_ROOTS)
+        if callers is not None:
+            proofs["take_selection"] = (take_selection, callers)
+    return proofs
+
+
 def producer_object_contract(disassembly):
     blocks = function_blocks(disassembly)
+    proofs = _outlined_wrapper_proofs(disassembly)
+    insert_callers = proofs["insert"][1] if proofs["insert"] else frozenset()
+    take_export_callers = proofs["take_export"][1] if proofs["take_export"] else frozenset()
+    take_selection_callers = (
+        proofs["take_selection"][1] if proofs["take_selection"] else frozenset()
+    )
     entry_names = ("function_list_entry", "interface_list_entry", "interface_entry")
     return_names = ("function_list_return", "interface_list_return", "interface_return")
     for name in entry_names:
         lines = blocks.get(name, [])
-        if (not discovery_arguments(disassembly, name, "insert", 1)
-                or not discovery_call_sites(disassembly, name, "remove")
-                or not map_call_sites(lines, "COUNTERS", helper=1)):
+        direct = (discovery_arguments(disassembly, name, "insert", 1)
+                  and discovery_call_sites(disassembly, name, "remove")
+                  and map_call_sites(lines, "COUNTERS", helper=1))
+        outlined = (name in insert_callers
+                    and discovery_call_sites(disassembly, name, "remove"))
+        if not direct and not outlined:
             return False
     for name in return_names:
         lines = blocks.get(name, [])
-        if (not discovery_arguments(disassembly, name, "get", 0)
-                # Scope-refused and admitted returns each read their saved state.
-                or len(discovery_call_sites(disassembly, name, "get")) != 2
-                or len(discovery_call_sites(disassembly, name, "remove")) < 2
-                or not map_call_sites(lines, "COUNTERS", helper=1)):
-            return False
+        direct = (discovery_arguments(disassembly, name, "get", 0)
+                  # Scope-refused and admitted returns each read their saved state.
+                  and len(discovery_call_sites(disassembly, name, "get")) == 2
+                  and len(discovery_call_sites(disassembly, name, "remove")) >= 2
+                  and map_call_sites(lines, "COUNTERS", helper=1))
+        if direct:
+            continue
+        outlined = discovery_call_sites(disassembly, name, "remove")
+        if name in ("function_list_return", "interface_list_return") \
+                and name in take_export_callers and outlined:
+            continue
+        if name == "interface_return" and name in take_selection_callers and outlined:
+            continue
+        return False
 
     export = "\n".join(blocks.get("interface_list_return", []))
     if "call 0x70" not in export or not re.search(
@@ -1177,7 +2446,20 @@ def object_counter_uses(disassembly):
             if key is None:
                 fail(f"{function}: COUNTERS lookup has no finite u32 stack key")
             uses.append((function, key))
-    return uses
+    attribution = {}
+    for proof in _outlined_wrapper_proofs(disassembly).values():
+        if proof is not None:
+            wrapper, callers = proof
+            attribution[wrapper] = callers
+    if not attribution:
+        return uses
+    rewritten = []
+    for function, key in uses:
+        if function in attribution and key == 1:
+            rewritten.extend((caller, key) for caller in sorted(attribution[function]))
+        else:
+            rewritten.append((function, key))
+    return rewritten
 
 
 def counter_ownership_contract(uses):
@@ -1314,7 +2596,7 @@ def _source(stores=range(115)):
     )
 
 
-def _initializer_block(function, tail=""):
+def _initializer_block(function, tail="", null_to_failure=False):
     lines = [
         f"0000000000000000 <{function}>:",
         "       0:\tr7 = 0x0",
@@ -1324,32 +2606,51 @@ def _initializer_block(function, tail=""):
         "       4:\tr3 = 0x0",
         "       5:\tcall 0x83",
         "       6:\tr6 = r0",
-        "       7:\tif r6 != 0x0 goto +0x7",
-        "       8:\t*(u32 *)(r10 - 0x4) = r7",
-        "\t\t0000000000000040:  R_BPF_64_64\tCOUNTERS",
-        "       9:\tcall 0x1",
-        "      10:\tif r0 == 0x0 goto +0x74",
-        "      11:\tr1 = 0x1",
-        "      12:\tlock *(u64 *)(r0 + 0x0) += r1",
-        "      13:\tr1 = 0x0",
-        "      14:\tgoto +0x70",
     ]
+    if null_to_failure:
+        lines += ["       7:\tif r6 == 0x0 goto +0x77",
+                  "       8:\t*(u64 *)(r10 - 0x18) = r8"]
+        first = 9
+    else:
+        lines += [
+            "       7:\tif r6 != 0x0 goto +0xa",
+            "       8:\t*(u32 *)(r10 - 0x4) = r7",
+            "       9:\tr2 = r10",
+            "      10:\tr2 += -0x4",
+            "      11:\tr1 = 0x0 ll",
+            "\t\t0000000000000058:  R_BPF_64_64\tCOUNTERS",
+            "      13:\tcall 0x1",
+            "      14:\tif r0 == 0x0 goto +0x77",
+            "      15:\tr1 = 0x1",
+            "      16:\tlock *(u64 *)(r0 + 0x0) += r1",
+            "      17:\tgoto +0x74",
+        ]
+        first = 18
     lines.extend(
-        f"{15 + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
+        f"{first + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
         for index in range(115)
     )
-    lines.append("     127:\tcall 0x84")
+    end = first + 115
+    lines += [f"{end:8}:\tcall 0x84", f"{end + 1:8}:\tr0 = 0x0", f"{end + 2:8}:\texit"]
+    if null_to_failure:
+        lines += ["     127:\t*(u32 *)(r10 - 0x4) = r7",
+                  "     128:\tr2 = r10", "     129:\tr2 += -0x4",
+                  "     130:\tr1 = 0x0 ll",
+                  "\t\t0000000000000410:  R_BPF_64_64\tCOUNTERS",
+                  "     132:\tcall 0x1", "     133:\tif r0 == 0x0 goto +0x3",
+                  "     134:\tr1 = 0x1", "     135:\tlock *(u64 *)(r0 + 0x0) += r1",
+                  "     136:\tr0 = 0x0", "     137:\texit"]
     if tail:
         lines.extend(tail.splitlines())
     return "\n".join(lines)
 
 
-def _initializer_disassembly(loader_tail=""):
+def _initializer_disassembly(loader_tail="", null_to_failure=False):
     return "\n".join(
         [
-            _initializer_block("fixture_emit_export"),
-            _initializer_block("fixture_emit_lifecycle"),
-            _initializer_block("dl_debug_state", loader_tail),
+            _initializer_block("fixture_emit_export", null_to_failure=null_to_failure),
+            _initializer_block("fixture_emit_lifecycle", null_to_failure=null_to_failure),
+            _initializer_block("dl_debug_state", loader_tail, null_to_failure),
         ]
     )
 
@@ -1378,7 +2679,7 @@ def _pause_disassembly():
     return "\n".join(block.format(index=name) for name in ("_emit_export", "_emit_lifecycle", "_dl_debug_state")).replace("pause_dl_debug_state", "dl_debug_state")
 
 
-def _owned_disassembly():
+def _owned_disassembly(indexed_gap=None, metadata_spill=()):
     """Small instruction/relocation fixtures for the native caller ABI."""
     starts = {"p11_owner_discovery_get": 5000, "p11_owner_discovery_insert": 5100,
               "p11_owner_discovery_remove": 5200, "classify_direct_interface": 6000,
@@ -1473,21 +2774,45 @@ def _owned_disassembly():
             parts.append(assemble(name, ["exit"], starts[name]))
     parts.append(assemble("classify_direct_interface", call("fixture_emit_export") + ["exit"], 6000))
     for index, name in enumerate(("fixture_emit_export", "fixture_emit_lifecycle", "dl_debug_state")):
-        tail = ["r1 = 0x43", "r2 = 0x44", "r3 = 0x5c", "r4 = 0x68", "if r1 > r2 goto -0x1"]
+        tail = ["r1 = 0x44", "r2 = 0x5c", "r4 = 0x68", "r8 = 0x0",
+                "if r8 > 0x67 goto @first_done", "r7 = r7", "r8 <<= 0x3",
+                "r9 = *(u64 *)(r10 - 0x8)", "r9 += r8",
+                "*(u64 *)(r9 + 0x0) = r0", "label:first_done",
+                "r5 = 0x0", "if r5 > 0x67 goto @bounded_done", "r5 <<= 0x3",
+                "r9 = *(u64 *)(r10 - 0x8)", "r9 += r5",
+                "*(u64 *)(r9 + 0x0) = r0", "label:bounded_done",
+                "r3 <<= 0x3", "*(u64 *)(r10 - 0x10) = r3",
+                "*(u64 *)(r6 + 0x10) = r3", "r3 += r4",
+                "*(u64 *)(r6 + 0x18) = r3", "*(u64 *)(r6 + 0x18) = 0x0"]
+        tail = ["r9 = r6", "r9 += 0x20", "*(u64 *)(r10 - 0x8) = r9"] + tail
+        tail += list(metadata_spill)
+        if indexed_gap is not None and name == "fixture_emit_export":
+            position = tail.index("r9 += r8") + 1
+            tail[position:position] = [indexed_gap] if isinstance(indexed_gap, str) else list(indexed_gap)
         if name == "dl_debug_state":
             tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
                     "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
                     "if r0 == 0x2 goto +0x0", "if r0 == 0x2 goto +0x0", "r1 = 0x0 ll", "rel64:PAUSE_PIDS"]
-        # Reuse the initializer fixture, fixing its historical duplicate PC at submit.
-        block = _initializer_block(name).replace("     127:\tcall 0x84", "     130:\tcall 0x84")
+        # Keep the bounds fixture's existing submit clobber before its tail,
+        # while making every null-reservation path go to the final exit.
+        block = _initializer_block(name)
         body = []
         for line in block.splitlines()[1:]:
             if "R_BPF" in line:
                 kind, target = re.search(r"R_BPF_64_(32|64)\s+(\S+)", line).groups()
                 body.append(f"rel{kind}:{target}")
             elif (match := re.match(r"\s*\d+:\s+(.*)", line)):
-                body.append(match.group(1))
-        parts.append(assemble(name, body + tail + ["exit"], 7000 + index * 200))
+                text = match.group(1)
+                if text == "if r6 != 0x0 goto +0xa":
+                    text = "if r6 != 0x0 goto @initialize"
+                elif text == "if r0 == 0x0 goto +0x77":
+                    text = "if r0 == 0x0 goto @exit"
+                elif text == "goto +0x74":
+                    text = "goto @exit"
+                if text == "*(u64 *)(r6 + 0x0) = r7":
+                    body.append("label:initialize")
+                body.append(text)
+        parts.append(assemble(name, body[:-2] + tail + ["label:exit", "r0 = 0x0", "exit"], 7000 + index * 200))
     return "\n".join(parts)
 
 
@@ -1652,6 +2977,13 @@ def _owned_self_test():
                           ("if r8 > 0xffffff", "if r8 > 0x1000000")):
         if interface_tail_contract(mutate("interface_list_worker", before, after)):
             raise AssertionError(f"worker mutation accepted: {before}")
+    for name in ("interface_list_return", "interface_list_worker"):
+        if interface_tail_contract(mutate(name, "r8 = *(u64 *)(r0 + 0x8)",
+                                         "r8 = *(u64 *)(r1 + 0x8)")):
+            raise AssertionError(f"legacy field is not bound to the getter result: {name}")
+    if interface_tail_contract(mutate("interface_list_worker", "if r8 > 0xffffff goto",
+                                     "if r7 > 0xffffff goto")):
+        raise AssertionError("legacy bound does not check the loaded field")
     for name in ("function_list_entry", "interface_entry", "interface_list_worker"):
         for before, after in (("*(u64 *)(r1 + 0x10) = r7", "*(u64 *)(r1 + 0x10) = r0"),
                               ("r1 += -0x18", "r1 += -0x20")):
@@ -1684,9 +3016,502 @@ def _owned_self_test():
             raise AssertionError(f"producer edge mutation accepted: {before}")
     if not table_bounds_object_contract(good):
         raise AssertionError("valid table bounds rejected")
-    for bound in ("0x43", "0x44", "0x5c", "0x68"):
+    for bound in ("0x44", "0x5c", "0x68"):
         if table_bounds_object_contract(mutate("fixture_emit_export", " = " + bound, " = 0x42")):
             raise AssertionError(f"table bound mutation accepted: {bound}")
+    for label, before, after in (
+        ("guard removed", "if r8 > 0x67 goto", "if r8 > 0x68 goto"),
+        ("guard inverted", "if r8 > 0x67 goto", "if r8 <= 0x67 goto"),
+        ("guard bypassed", "if r8 > 0x67 goto +0x5", "if r8 > 0x67 goto +0x0"),
+        ("unrelated index", "if r8 > 0x67 goto", "if r7 > 0x67 goto"),
+        ("index clobbered", "r7 = r7", "r8 += 0x1"),
+        ("wrong stride", "r8 <<= 0x3", "r8 <<= 0x4"),
+        ("unsupported scale", "r8 <<= 0x3", "r8 *= 0x8"),
+        ("unsupported base", "r9 = *(u64 *)(r10 - 0x8)", "r9 = r6"),
+        ("wrong address index", "r9 += r8", "r9 += r7"),
+        ("constant address increment", "r9 += r8", "r9 += 0x8"),
+        ("wrong destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r7 + 0x0)"),
+        ("stack destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r10 - 0x8)"),
+        ("narrow destination", "*(u64 *)(r9 + 0x0)", "*(u32 *)(r9 + 0x0)"),
+        ("unsupported immediate value", "*(u64 *)(r9 + 0x0) = r0", "*(u64 *)(r9 + 0x0) = 0x0"),
+        ("terminal call", "\texit", "\tcall 0x5"),
+    ):
+        if table_bounds_object_contract(mutate("fixture_emit_export", before, after)):
+            raise AssertionError(f"table index mutation accepted: {label}")
+    for gap in ("r0 = r0", "r9 = r9", "r9 += 0x0",
+                "r0 = *(u64 *)(r10 - 0x10)", "goto +0x0"):
+        if table_bounds_object_contract(_owned_disassembly(indexed_gap=gap)):
+            raise AssertionError(f"unsupported indexed store skipped across {gap}")
+    spilled_destination = """0000000000000000 <fixture_emit_export>:
+0: r1 = 0x44
+1: r2 = 0x5c
+2: r4 = 0x68
+3: r8 = 0x400
+4: r8 <<= 0x3
+5: r9 = *(u64 *)(r10 - 0x8)
+6: r9 += r8
+7: r0 = r0
+8: *(u64 *)(r10 - 0x18) = r9
+9: r9 = *(u64 *)(r10 - 0x18)
+10: *(u64 *)(r9 + 0x0) = r0
+11: r5 = 0x0
+12: if r5 > 0x67 goto +0x4
+13: r5 <<= 0x3
+14: r9 = *(u64 *)(r10 - 0x8)
+15: r9 += r5
+16: *(u64 *)(r9 + 0x0) = r0
+17: exit
+"""
+    if table_bounds_object_contract(spilled_destination):
+        raise AssertionError("unbounded spilled destination hidden by a healthy indexed store")
+    saved = ["*(u64 *)(r10 - 0x18) = r6"]
+    restored = ["r9 = *(u64 *)(r10 - 0x18)", "*(u64 *)(r9 + 0x18) = 0x0"]
+    probe = ["r1 = r10", "r1 += -0x28", "r2 = 0x8", "call 0x70"]
+    for between in ([], ["*(u64 *)(r10 - 0x28) = 0x0"], ["call 0x5"], probe):
+        if not table_bounds_object_contract(_owned_disassembly(metadata_spill=saved + between + restored)):
+            raise AssertionError(f"healthy fixed metadata spill rejected: {between}")
+    aliased = ["r1 = r10", "r1 += -0x18", "*(u64 *)(r1 + 0x0) = r6",
+               "r2 = r10", "r2 += -0x18", "r9 = *(u64 *)(r2 + 0x0)", "*(u64 *)(r9 + 0x18) = 0x0"]
+    if not table_bounds_object_contract(_owned_disassembly(metadata_spill=aliased)):
+        raise AssertionError("fixed metadata stack alias rejected")
+    for between in (
+        ["*(u32 *)(r10 - 0x18) = 0x0"],
+        ["r1 = r10", "r1 += -0x14", "*(u32 *)(r1 + 0x0) = 0x0"],
+        ["r1 = r10", "r1 += -0x18", "r2 = 0x8", "call 0x70"],
+        ["r1 = r10", "r1 += -0x14", "r2 = 0x4", "call 0x70"],
+        ["*(u64 *)(r10 - 0x18) = r0"], ["call 0x99"],
+    ):
+        if table_bounds_object_contract(_owned_disassembly(metadata_spill=saved + between + restored)):
+            raise AssertionError(f"unknown/overwritten spilled destination accepted: {between}")
+    for gap in (
+        ["r0 = r0", "*(u64 *)(r10 - 0x18) = r9", "r9 = *(u64 *)(r10 - 0x18)"],
+        ["r1 = r10", "r1 += -0x18", "*(u64 *)(r1 + 0x0) = r9", "r9 = *(u64 *)(r10 - 0x18)"],
+    ):
+        # These use a known reservation/base, so rejection exercises indexed
+        # provenance across the spill rather than just an unknown fixture base.
+        # Reuse the fixture assembler to retain exact PCs/branch destinations.
+        if table_bounds_object_contract(_owned_disassembly(indexed_gap=gap)):
+            raise AssertionError(f"indexed pointer spill hidden beside healthy path: {gap}")
+    indexed = ["r8 = 0x400", "r8 <<= 0x3", "r9 = *(u64 *)(r10 - 0x8)",
+               "r9 += r8", "*(u64 *)(r10 - 0x18) = r9"]
+    if not table_bounds_object_contract(_owned_disassembly(metadata_spill=indexed + saved + restored)):
+        raise AssertionError("complete fixed-metadata overwrite did not replace the old spilled value")
+    joined_safe = saved + ["if r0 == 0x0 goto @metadata_join", *saved, "label:metadata_join"] + restored
+    if not table_bounds_object_contract(_owned_disassembly(metadata_spill=joined_safe)):
+        raise AssertionError("matching fixed-metadata branch spills lost provenance")
+    joined_bad = saved + ["if r0 == 0x0 goto @metadata_join", *indexed, "label:metadata_join"] + restored
+    if table_bounds_object_contract(_owned_disassembly(metadata_spill=joined_bad)):
+        raise AssertionError("an indexed branch spill was hidden by a fixed-metadata branch")
+    looped = saved + ["label:metadata_again", "r9 = *(u64 *)(r10 - 0x18)", "r9 += 0x8",
+                      "*(u64 *)(r10 - 0x18) = r9", "if r0 != 0x0 goto @metadata_again"] + restored
+    if table_bounds_object_contract(_owned_disassembly(metadata_spill=looped)):
+        raise AssertionError("loop-carried spilled address acquired a false fixed bound")
+    width_constants_only = """00000000 <fixture_emit_export>:
+0: r1 = 0x43
+1: r2 = 0x44
+2: r3 = 0x5c
+3: r4 = 0x68
+4: if r1 > r2 goto -0x1
+5: exit
+"""
+    if table_bounds_object_contract(width_constants_only):
+        raise AssertionError("width constants and an unrelated loop accepted as an index bound")
+
+
+def _outlined_disassembly():
+    """Outlined export-state wrapper fixture mirroring the actual objects.
+
+    Entries call the insert wrapper once with caller stack-32; returns call
+    their take wrapper twice with r3 0/1 and a caller-stack output. Direct
+    emitter/loader/interface blocks stay byte-identical to _owned_disassembly.
+    """
+    base = _owned_disassembly()
+    blocks = function_blocks(base)
+    INSERT_AT, TAKE_EXPORT_AT, TAKE_SELECTION_AT = 8000, 8300, 8700
+    BREAD_AT, COUNTERX_AT = 9100, 9200
+    GET_AT, INSERT_NATIVE_AT, REMOVE_AT = 5000, 5100, 5200
+
+    def call(target):
+        return [f"call 0x{target - 1:x}", "rel32:.text"]
+
+    def assemble(name, body, start):
+        labels = {}
+        pc = start
+        for text in body:
+            if text.startswith("label:"):
+                labels[text[6:]] = pc
+            elif not text.startswith("rel"):
+                pc += 1
+        pc = start
+        lines = [f"{start * 8:016x} <{name}>:"]
+        for text in body:
+            if text.startswith("label:"):
+                continue
+            if text.startswith("rel"):
+                kind, target = text[3:].split(":")
+                lines.append(f"                {(pc - 1) * 8:016x}:  R_BPF_64_{kind}\t{target}")
+                continue
+            if "@" in text:
+                prefix, label = text.split("@")
+                distance = labels[label] - pc - 1
+                text = prefix + ("+" if distance >= 0 else "-") + f"0x{abs(distance):x}"
+            lines.append(f"{pc:8}:\t{text}")
+            pc += 1
+        return "\n".join(lines)
+
+    def counter_block(key, slot, null_label="exit"):
+        off = f"-0x{-slot:x}"
+        return [
+            f"r7 = 0x{key:x}",
+            f"*(u32 *)(r10 - 0x{-slot:x}) = w7",
+            "r2 = r10",
+            f"r2 += {off}",
+            "r1 = 0x0 ll",
+            "rel64:COUNTERS",
+            "call 0x1",
+            f"if r0 == 0x0 goto @{null_label}",
+            "r5 = 0x1",
+            "lock *(u64 *)(r0 + 0x0) += r5",
+        ]
+
+    def cleanup_key(domain):
+        if domain == 1:
+            head = ["call 0xae", "r6 = r0", "r7 = r6", "r7 &= 0xffffff",
+                    "if r7 == 0x0 goto @exit"]
+        else:
+            head = ["call 0xae", "r6 = r0", "if r6 == 0x0 goto @exit"]
+        return head + ["call 0xe", "r1 = r10", "r1 += -0x18",
+                       "*(u64 *)(r1 + 0x0) = r0", "*(u64 *)(r1 + 0x8) = r6",
+                       f"r7 = 0x{domain:x}", "*(u64 *)(r1 + 0x10) = r7"]
+
+    def cleanup_remove():
+        return ["r1 = r10", "r1 += -0x18", "r2 = 0x0"] + call(REMOVE_AT)
+
+    def entry_body(counter_key):
+        return (["r9 = r1"] + cleanup_key(1) + cleanup_remove()
+                + counter_block(counter_key, -4)
+                + ["r7 = 0x1",
+                   "*(u64 *)(r10 - 0x20) = r7",
+                   "*(u64 *)(r10 - 0x18) = r7",
+                   "*(u64 *)(r10 - 0x10) = r7",
+                   "r1 = r9", "r2 = r10", "r2 += -0x20"]
+                + call(INSERT_AT) + ["label:exit", "exit"])
+
+    def return_body(take_at, domain, counter_key, removes=1, extra=()):
+        body = ["r9 = r1"] + cleanup_key(domain)
+        for _ in range(removes):
+            body += cleanup_remove()
+        if counter_key is not None:
+            body += counter_block(counter_key, -4)
+        body += (["r1 = r10", "r1 += -0x40", "r2 = r9", "r3 = 0x0"]
+                 + call(take_at)
+                 + ["r1 = r10", "r1 += -0x40", "r2 = r9", "r3 = 0x1"]
+                 + call(take_at) + list(extra) + ["label:exit", "exit"])
+        return body
+
+    def take_tail(cell):
+        staging = (["r1 = r10", "r1 += -0x48", "r2 = r10", "r2 += -0x18"]
+                   + [line for off in ("0x0", "0x8", "0x10") for line in
+                      (f"r3 = *(u64 *)(r1 + {off})", f"*(u64 *)(r2 + {off}) = r3")]
+                   + ["r1 = r10", "r1 += -0x60", "r2 = r10", "r2 += -0x30"]
+                   + [line for off in ("0x0", "0x8", "0x10") for line in
+                      (f"r3 = *(u64 *)(r1 + {off})", f"*(u64 *)(r2 + {off}) = r3")]
+                   + ["r1 = r6", "r1 += 0x8"]
+                   + [line for off in ("0x0", "0x8", "0x10", "0x18", "0x20", "0x28")
+                      for line in (f"r3 = *(u64 *)(r2 + {off})",
+                                   f"*(u64 *)(r1 + {off}) = r3")])
+        return ([f"if {cell} == 0x0 goto @failed",
+                 "if r0 != 0x0 goto @failed",
+                 "if r7 != 0x0 goto @success",
+                 "goto @counter",
+                 "label:failed",
+                 "if r7 != 0x0 goto @counter",
+                 "r1 = 0x0",
+                 "*(u64 *)(r6 + 0x0) = r1",
+                 "exit",
+                 "label:counter"]
+                + counter_block(1, -0x30, "none")
+                + ["label:none",
+                   "r1 = 0x0",
+                   "*(u64 *)(r6 + 0x0) = r1",
+                   "exit",
+                   "label:success"]
+                + staging
+                + ["r1 = 0x1",
+                   "*(u64 *)(r6 + 0x0) = r1",
+                   "exit"])
+
+    insert_body = (["r6 = r2", "call 0xae", "r7 = r0", "r1 = r7",
+                    "r1 &= 0xffffff", "if r1 == 0x0 goto @exit", "call 0xe",
+                    "r1 = r10", "r1 += -0x28",
+                    "*(u64 *)(r1 + 0x0) = r0",
+                    "*(u64 *)(r1 + 0x8) = r7",
+                    "r7 = 0x1",
+                    "*(u64 *)(r1 + 0x10) = r7",
+                    "r2 = r6", "r3 = 0x1"]
+                   + call(INSERT_NATIVE_AT)
+                   + ["if r0 == 0x0 goto @exit"]
+                   + counter_block(1, -4)
+                   + ["label:exit", "exit"])
+    take_export_body = (["r7 = r3", "r6 = r1", "r1 = r2", "call 0xae",
+                         "r9 = r0", "r1 = r9", "r1 &= 0xffffff",
+                         "if r1 != 0x0 goto @keyed",
+                         "r1 = 0x0", "*(u64 *)(r6 + 0x0) = r1", "exit",
+                         "label:keyed", "call 0xe", "r8 = 0x1",
+                         "*(u64 *)(r10 - 0x50) = r8",
+                         "*(u64 *)(r10 - 0x58) = r9",
+                         "*(u64 *)(r10 - 0x60) = r0",
+                         "r1 = r10", "r1 += -0x60", "r2 = 0x0"]
+                        + call(GET_AT)
+                        + ["r9 = r0",
+                           "if r9 == 0x0 goto @retest",
+                           "r1 = r10", "r1 += -0x48",
+                           "r2 = *(u64 *)(r9 + 0x0)", "*(u64 *)(r1 + 0x0) = r2",
+                           "r2 = *(u64 *)(r9 + 0x8)", "*(u64 *)(r1 + 0x8) = r2",
+                           "r2 = *(u64 *)(r9 + 0x10)", "*(u64 *)(r1 + 0x10) = r2",
+                           "label:retest",
+                           "if r9 != 0x0 goto @removing",
+                           "r8 = 0x0",
+                           "label:removing",
+                           "r1 = r10", "r1 += -0x60", "r2 = r8"]
+                        + call(REMOVE_AT)
+                        + take_tail("r9"))
+    take_selection_body = (["r7 = r3", "r6 = r1", "r1 = r2", "call 0xae",
+                            "r8 = r0",
+                            "if r8 != 0x0 goto @keyed",
+                            "r1 = 0x0", "*(u64 *)(r6 + 0x0) = r1", "exit",
+                            "label:keyed", "call 0xe",
+                            "r1 = 0x2",
+                            "*(u64 *)(r10 - 0x50) = r1",
+                            "*(u64 *)(r10 - 0x58) = r8",
+                            "*(u64 *)(r10 - 0x60) = r0",
+                            "r1 = r10", "r1 += -0x60", "r2 = 0x0"]
+                           + call(GET_AT)
+                           + ["r8 = r0",
+                              "if r8 == 0x0 goto @retest",
+                              "r1 = r10", "r1 += -0x48",
+                              "r2 = *(u64 *)(r8 + 0x0)", "*(u64 *)(r1 + 0x0) = r2",
+                              "r2 = *(u64 *)(r8 + 0x8)", "*(u64 *)(r1 + 0x8) = r2",
+                              "r2 = *(u64 *)(r8 + 0x10)", "*(u64 *)(r1 + 0x10) = r2",
+                              "label:retest",
+                              "r2 = 0x1",
+                              "if r8 != 0x0 goto @removing",
+                              "r2 = 0x0",
+                              "label:removing",
+                              "r1 = r10", "r1 += -0x60"]
+                           + call(REMOVE_AT)
+                           + take_tail("r8"))
+    ilr_extra = (["r1 = r10", "r1 += -0x40", "r2 = 0x4", "call 0x70"]
+                 + counter_block(2, -4))
+    bread_body = counter_block(2, -4) + ["label:exit", "exit"]
+    counterx_body = (["r7 = 0x3", "*(u32 *)(r10 - 0x4) = w7", "r2 = r10",
+                      "r2 += -0x4", "r1 = 0x0 ll", "rel64:COUNTERS", "call 0x1",
+                      "if r0 == 0x0 goto @second",
+                      "r5 = 0x1", "lock *(u64 *)(r0 + 0x0) += r5",
+                      "label:second",
+                      "r7 = 0x4", "*(u32 *)(r10 - 0x8) = w7", "r2 = r10",
+                      "r2 += -0x8", "r1 = 0x0 ll", "rel64:COUNTERS", "call 0x1",
+                      "if r0 == 0x0 goto @exit",
+                      "r5 = 0x1", "lock *(u64 *)(r0 + 0x0) += r5",
+                      "label:exit", "exit"])
+    roots = {
+        "function_list_entry": (entry_body(2), 100),
+        "interface_list_entry": (entry_body(2), 200),
+        "function_list_return": (return_body(TAKE_EXPORT_AT, 1, 1), 400),
+        "interface_list_return": (
+            return_body(TAKE_EXPORT_AT, 1, None, removes=2, extra=ilr_extra), 500),
+        "interface_return": (return_body(TAKE_SELECTION_AT, 2, None), 600),
+    }
+    out = base
+    for name, (body, start) in roots.items():
+        header = f"{start * 8:016x} <{name}>:"
+        old = header + "\n".join(blocks[name])
+        if out.count(old) != 1:
+            raise AssertionError(f"outlined root anchor not unique: {name}")
+        out = out.replace(old, assemble(name, body, start), 1)
+    extras = [
+        assemble("fixture_insert_export_state", insert_body, INSERT_AT),
+        assemble("fixture_take_export_state", take_export_body, TAKE_EXPORT_AT),
+        assemble("fixture_take_selection_state", take_selection_body, TAKE_SELECTION_AT),
+        assemble("fixture_bread_interface_entry", bread_body, BREAD_AT),
+        assemble("fixture_counter_dl_debug_state", counterx_body, COUNTERX_AT),
+    ]
+    return out + "\n" + "\n".join(extras)
+
+
+def _outlined_wrapper_self_test():
+    good = _outlined_disassembly()
+    if not producer_object_contract(good):
+        raise AssertionError("outlined healthy fixture refused: producer proof")
+    if not counter_ownership_contract(object_counter_uses(good)):
+        raise AssertionError("outlined healthy fixture refused: counter ownership")
+    if not cookie_object_contract(good):
+        raise AssertionError("outlined healthy fixture refused: cookie proof")
+    blocks = function_blocks(good)
+    starts = {name: instruction_entries(lines)[0][1] for name, lines in blocks.items()}
+
+    def mutate(function, before, after, last=False):
+        block = "\n".join(blocks[function])
+        if last:
+            if before not in block:
+                raise AssertionError(f"outlined mutation missing in {function}: {before}")
+            changed = after.join(block.rsplit(before, 1))
+        else:
+            if block.count(before) != 1:
+                raise AssertionError(f"outlined mutation anchor not unique in {function}: {before}")
+            changed = block.replace(before, after, 1)
+        return good.replace(block, changed, 1)
+
+    def append_call(function, wrapper):
+        block = "\n".join(blocks[function])
+        match = re.match(r"\s*(\d+):\s+exit\s*$", block.splitlines()[-1])
+        if not match:
+            raise AssertionError(f"outlined {function} does not end with an exit")
+        pc = int(match.group(1))
+        replacement = (f"{pc:8}:\tcall 0x{starts[wrapper] - 1:x}\n"
+                       f"                0000000000000000:  R_BPF_64_32\t.text\n"
+                       f"{pc + 1:8}:\texit")
+        return good.replace(block, block.replace(block.splitlines()[-1], replacement, 1), 1)
+
+    cycle_call = (f"call 0x{starts['function_list_entry'] - 1:x}\n"
+                  f"                0000000000000000:  R_BPF_64_32\t.text")
+    alias_block = f"0000000000000000 <alias_take>:\n{starts['fixture_take_export_state']}:\texit\n"
+    m3_helper = ("0000000000000000 <m3_helper>:\n"
+                 f"9300:\tcall 0x{starts['function_list_entry'] - 1:x}\n"
+                 "                0000000000000000:  R_BPF_64_32\t.text\n"
+                 "9301:\texit\n")
+    m4_helper = ("0000000000000000 <m4_helper>:\n"
+                 "9400:\t*(u64 *)(r1 + 0x8) = r2\n"
+                 "9401:\texit\n")
+    extended = good + "\n" + m3_helper + m4_helper
+    m3_call = ("call 0x2453\n"
+               "                0000000000000000:  R_BPF_64_32\t.text")
+    poisons = [
+        ("foreign caller into insert",
+         append_call("function_list_return", "fixture_insert_export_state")),
+        ("foreign caller into take",
+         append_call("interface_list_entry", "fixture_take_selection_state")),
+        ("insert call count",
+         append_call("function_list_entry", "fixture_insert_export_state")),
+        ("take export scope",
+         mutate("function_list_return", "r3 = 0x0", "r3 = 0x2")),
+        ("take selection scope",
+         mutate("interface_return", "r3 = 0x0", "r3 = 0x2")),
+        ("alias take target", good + "\n" + alias_block),
+        ("wrapper cycle into root",
+         mutate("fixture_insert_export_state", "r7 = 0x1", cycle_call, last=True)),
+        ("unproved take output write",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x0) = r3", "*(u64 *)(r9 + 0x0) = r3")),
+        ("insert native flag",
+         mutate("fixture_insert_export_state", "r3 = 0x1", "r3 = 0x0")),
+        ("insert key slot",
+         mutate("fixture_insert_export_state", "r1 += -0x28", "r1 += -0x30")),
+        ("insert state retention",
+         mutate("fixture_insert_export_state", "r6 = r2", "r6 = r1")),
+        ("take get flag",
+         mutate("fixture_take_export_state", "r2 = 0x0", "r2 = 0x1")),
+        ("forged take remove flag",
+         mutate("fixture_take_export_state", "r2 = r8", "r2 = 0x1")),
+        ("take snapshot escape",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x0) = r2", "*(u64 *)(r6 + 0x8) = r2")),
+        ("insert counter writeback",
+         mutate("fixture_insert_export_state",
+                "lock *(u64 *)(r0 + 0x0) += r5", "r2 = r5")),
+        ("take payload source",
+         mutate("fixture_take_export_state",
+                "r3 = *(u64 *)(r2 + 0x28)", "r3 = *(u64 *)(r2 + 0x30)")),
+        ("take selection counter writeback",
+         mutate("fixture_take_selection_state",
+                "lock *(u64 *)(r0 + 0x0) += r5", "r2 = r5")),
+        ("unproved selection output write",
+         mutate("fixture_take_selection_state",
+                "*(u64 *)(r1 + 0x0) = r3", "*(u64 *)(r8 + 0x0) = r3")),
+        ("lock payload store",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x0) = r3", "lock *(u64 *)(r1 + 0x0) += r9")),
+        ("lock key-slot store",
+         mutate("fixture_insert_export_state",
+                "*(u64 *)(r1 + 0x0) = r0", "lock *(u64 *)(r1 + 0x0) += r0")),
+        ("deleted payload word",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x28) = r3", "r3 = r3")),
+    ]
+    for label, bad in poisons:
+        if producer_object_contract(bad):
+            raise AssertionError(f"outlined poison accepted by producer: {label}")
+        if counter_ownership_contract(object_counter_uses(bad)):
+            raise AssertionError(f"outlined poison accepted by ownership: {label}")
+    insert_block = "\n".join(blocks["fixture_insert_export_state"])
+    m3_bad = extended.replace(
+        insert_block, m3_call.join(insert_block.rsplit("r7 = 0x1", 1)), 1)
+    if m3_bad == extended:
+        raise AssertionError("cycle-via-helper mutation did not apply")
+    if producer_object_contract(m3_bad):
+        raise AssertionError("outlined poison accepted by producer: cycle via helper")
+    if counter_ownership_contract(object_counter_uses(m3_bad)):
+        raise AssertionError("outlined poison accepted by ownership: cycle via helper")
+    take_block = "\n".join(blocks["fixture_take_export_state"])
+    take_exit = take_block.splitlines()[-1]
+    take_exit_match = re.match(r"\s*(\d+):\s+exit\s*$", take_exit)
+    if not take_exit_match:
+        raise AssertionError("outlined take fixture does not end with an exit")
+    take_pc = int(take_exit_match.group(1))
+    m4_bad = extended.replace(
+        take_block,
+        take_block.replace(
+            take_exit,
+            f"{take_pc:8}:\tcall 0x24b7\n"
+            "                0000000000000000:  R_BPF_64_32\t.text\n"
+            f"{take_pc + 1:8}:\texit",
+            1,
+        ),
+        1,
+    )
+    if producer_object_contract(m4_bad):
+        raise AssertionError("outlined poison accepted by producer: helper writes output")
+    if counter_ownership_contract(object_counter_uses(m4_bad)):
+        raise AssertionError("outlined poison accepted by ownership: helper writes output")
+    if producer_object_contract(mutate("function_list_entry", "call 0x144f", "r0 = r0")):
+        raise AssertionError("outlined poison accepted by producer: root without cleanup")
+    cookie_poisons = [
+        ("selection domain",
+         mutate("fixture_take_selection_state", "r1 = 0x2", "r1 = 0x1")),
+        ("insert cookie source",
+         mutate("fixture_insert_export_state",
+                "*(u64 *)(r1 + 0x8) = r7", "*(u64 *)(r1 + 0x8) = r9")),
+        ("take export domain",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r10 - 0x50) = r8", "*(u64 *)(r10 - 0x50) = r0")),
+        ("insert domain",
+         mutate("fixture_insert_export_state",
+                "*(u64 *)(r1 + 0x10) = r7", "*(u64 *)(r1 + 0x10) = r0")),
+    ]
+    for label, bad in cookie_poisons:
+        if cookie_object_contract(bad):
+            raise AssertionError(f"outlined poison accepted by cookie: {label}")
+    if take_block.count("*(u64 *)(r6 + 0x0) = r1") != 4:
+        raise AssertionError("discriminant anchor count changed")
+    no_disc = good.replace(
+        take_block, take_block.replace("*(u64 *)(r6 + 0x0) = r1", "r1 = r1"), 1)
+    if producer_object_contract(no_disc):
+        raise AssertionError("outlined poison accepted by producer: no discriminant")
+    if counter_ownership_contract(object_counter_uses(no_disc)):
+        raise AssertionError("outlined poison accepted by ownership: no discriminant")
+    renamed_wrapper = good.replace(
+        "<fixture_take_export_state>:", "<fixture_take_other_state>:", 1)
+    if renamed_wrapper == good:
+        raise AssertionError("outlined wrapper rename did not apply")
+    if producer_object_contract(renamed_wrapper):
+        raise AssertionError("outlined poison accepted by producer: wrapper rename")
+    if counter_ownership_contract(object_counter_uses(renamed_wrapper)):
+        raise AssertionError("outlined poison accepted by ownership: wrapper rename")
+    renamed = good.replace("<interface_list_worker>:", "<renamed_worker>:", 1)
+    if renamed == good:
+        raise AssertionError("outlined rename mutation did not apply")
+    if counter_ownership_contract(object_counter_uses(renamed)):
+        raise AssertionError("outlined wrong counter owner accepted")
 
 
 def _reject(action, label):
@@ -1695,6 +3520,167 @@ def _reject(action, label):
     except (RuntimeError, ValueError):
         return
     raise AssertionError(f"mutation accepted: {label}")
+
+
+def _initializer_polarity_self_test():
+    for null_to_failure in (False, True):
+        good = _initializer_disassembly(null_to_failure=null_to_failure)
+        if len(initializer_regions(good)) != 3 or not reservation_loss_contract(good):
+            raise AssertionError(f"valid initializer polarity rejected: {null_to_failure}")
+        branch = "if r6 == 0x0 goto +0x77" if null_to_failure else "if r6 != 0x0 goto +0xa"
+        wrong = "if r6 == 0x0 goto +0x1" if null_to_failure else "if r6 != 0x0 goto +0xb"
+        escape_before = "     136:\tr0 = 0x0" if null_to_failure else "      17:\tgoto +0x74"
+        escape_after = "     136:\tgoto -0x7f" if null_to_failure else "      17:\tgoto +0x1"
+        cases = [
+            ("partial initialization", good.replace("*(u64 *)(r6 + 0x378) = r7", "r1 = r1", 1)),
+            ("wrong null/success target", good.replace(branch, wrong, 1)),
+            ("failure escape into partial initialization", good.replace(escape_before, escape_after, 1)),
+            ("wrong reservation size", good.replace("r2 = 0x398", "r2 = 0x390", 1)),
+            ("wrong reservation result", good.replace("r6 = r0", "r6 = r1", 1)),
+            ("target read before reservation", good.replace("       4:\tr3 = 0x0", "       4:\tcall 0x70", 1)),
+        ]
+        for label, bad in cases:
+            _reject(lambda bad=bad: initializer_regions(bad), f"{label}, polarity={null_to_failure}")
+
+
+def _finite_counter_key_self_test():
+    # The other lexical arm clobbers r7 but cannot reach the key store. A
+    # callee preserves r7, just as the actual worker does before its lookup.
+    good = """0000000000000000 <fixture_counter>:
+       0: r7 = 0x1
+       1: if r0 == 0x0 goto +0x2
+       2: r7 = r0
+       3: exit
+       4: call 0x2962
+       5: *(u32 *)(r10 - 0x28) = w7
+       6: r2 = r10
+       7: r2 += -0x28
+       8: r1 = 0x0 ll
+                0000000000000040: R_BPF_64_64 COUNTERS
+      10: call 0x1
+      11: exit
+"""
+
+    def key(disassembly):
+        lines = function_blocks(disassembly)["fixture_counter"]
+        relocation = next(index for index, line in enumerate(lines) if "R_BPF_64_64" in line)
+        return finite_counter_key(lines, relocation)
+
+    def intervene(text, at=6):
+        lines = []
+        for line in good.splitlines():
+            if "R_BPF_" not in line and (match := re.match(r"(\s*)(\d+):(.*)", line)):
+                pc = int(match.group(2))
+                if pc == at:
+                    lines.append(f"{pc}: {text}")
+                if pc >= at:
+                    line = f"{match.group(1)}{pc + 1}:{match.group(3)}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    same_merge = good.replace("r7 = r0", "r7 = 0x1").replace("3: exit", "3: goto +0x0")
+    for positive in (good, same_merge, intervene("*(u8 *)(r10 - 0x30) = r0")):
+        if key(positive) != 1:
+            raise AssertionError("CFG-proven finite u32 counter key was refused")
+    for label, bad in (
+        ("unknown", good.replace("r7 = 0x1", "r7 = r0")),
+        ("high half", good.replace("r7 = 0x1", "r7 = 0x100000001 ll")),
+        ("uninitialized", good.replace("r7 = 0x1", "r8 = 0x1")),
+        ("unknown merge", good.replace("3: exit", "3: goto +0x0")),
+        ("unequal merge", same_merge.replace("2: r7 = 0x1", "2: r7 = 0x2")),
+        ("wrong width", good.replace("*(u32 *)", "*(u64 *)")),
+        ("wrong slot", good.replace("*(u32 *)(r10 - 0x28)", "*(u32 *)(r10 - 0x24)")),
+        ("wrong pointer", good.replace("r2 = r10", "r2 = r8")),
+        ("different pointer slot", good.replace("r2 += -0x28", "r2 += -0x24")),
+        ("partial overwrite", intervene("*(u16 *)(r10 - 0x26) = r0")),
+        ("aliased partial overwrite", intervene("*(u8 *)(r2 + 0x1) = r0", at=8)),
+        ("unknown write", intervene("*(u8 *)(r8 + 0x0) = r0")),
+        ("call clobber", intervene("call 0x70")),
+        ("uninitialized lookup path", good.replace("if r0 == 0x0 goto +0x2", "if r0 == 0x0 goto +0x8")),
+    ):
+        if key(bad) is not None:
+            raise AssertionError(f"counter key mutation accepted: {label}")
+
+
+def _internal_call_resolution_self_test():
+    collision = """Disassembly of section .text:
+0000000000000000 <scope_auth>:
+0: exit
+0000000000000010 <native_helper>:
+2: exit
+0000000000000050 <local_caller>:
+10: 85 10 00 00 f5 ff ff ff call -0xb
+11: 85 00 00 00 01 00 00 00 call 0x1
+12: exit
+Disassembly of section uprobe:
+00000000000000a0 <root>:
+20: 85 10 00 00 ff ff ff ff call -0x1
+                 00000000000000a0: R_BPF_64_32 .text
+21: 85 10 00 00 ff ff ff ff call -0x1
+                 00000000000000a8: R_BPF_64_32 native_helper
+22: exit
+Disassembly of section fentry/foreign:
+0000000000000000 <foreign_program>:
+0: exit
+0000000000000010 <foreign_helper>:
+2: exit
+"""
+    wanted = [("local_caller", 10, "scope_auth"),
+              ("root", 20, "scope_auth"), ("root", 21, "native_helper")]
+
+    def targets(disassembly):
+        return [(caller, pc, target) for caller, _, pc, target in internal_call_targets(disassembly)]
+
+    if targets(collision) != wanted:
+        raise AssertionError("colliding program PCs replaced a .text call target")
+    no_text_target = collision.replace("<scope_auth>:\n0: exit", "<scope_auth>:\n1: exit")
+    if ("root", 20, None) not in targets(no_text_target):
+        raise AssertionError("foreign section supplied a missing .text target")
+    offset = collision.replace("21: 85 10 00 00 ff ff ff ff call -0x1",
+                               "21: 85 10 00 00 00 00 00 00 call 0x0")
+    if ("root", 21, None) not in targets(offset):
+        raise AssertionError("named relocation ignored its call addend")
+    alias = collision.replace("0000000000000010 <native_helper>:",
+                              "0000000000000000 <scope_alias>:\n0: exit\n0000000000000010 <native_helper>:")
+    if ("root", 20, None) not in targets(alias):
+        raise AssertionError("ambiguous .text alias supplied a call target")
+    sectionless = """0000000000000000 <one>:
+0: exit
+0000000000000050 <caller>:
+10: call -0x1
+                 0000000000000050: R_BPF_64_32 .text
+11: exit
+"""
+    if targets(sectionless) != [("caller", 10, "one")]:
+        raise AssertionError("unambiguous sectionless fixture was refused")
+    relative = sectionless.replace("call -0x1", "call -0xb").replace(
+        "                 0000000000000050: R_BPF_64_32 .text\n", "")
+    if targets(relative) != [("caller", 10, "one")]:
+        raise AssertionError("sectionless relative call used a relocation addend")
+    ambiguous = sectionless + "\n0000000000000000 <two>:\n0: exit\n"
+    if targets(ambiguous) != [("caller", 10, None)]:
+        raise AssertionError("ambiguous sectionless fixture was resolved")
+
+
+def _tail_trusted_facts_miss_self_test():
+    disassembly = (
+        "0000000000000000 <worker>:\n"
+        "0: r1 = 0x5\n"
+        "1: *(u64 *)(r10 - 0x60) = r1\n"
+        "2: call 0xe\n"
+        "                0000000000000010:  R_BPF_64_32\tsome_helper\n"
+        "4: r2 = *(u64 *)(r10 - 0x60)\n"
+        "5: exit\n"
+        "0000000000000000 <some_helper>:\n"
+        "100: exit\n"
+    )
+    calls = internal_call_targets(disassembly)
+    if [target for _, _, pc, target in calls if pc == 2] != [None]:
+        raise AssertionError("named-relocation miss fixture resolved unexpectedly")
+    blocks = function_blocks(disassembly)
+    facts = _tail_trusted_facts(blocks["worker"], calls, blocks)
+    if facts.get(4, {}).get(-0x60) is not None:
+        raise AssertionError("unresolved internal call preserved trusted stack facts")
 
 
 def self_test():
@@ -1817,10 +3803,14 @@ interface_continuation_pack(count, 0, symbol_id)
         raise AssertionError("valid initializer disassembly fixture was rejected")
     if not reservation_loss_contract(initializer):
         raise AssertionError("valid reservation-loss disassembly fixture was rejected")
+    _initializer_polarity_self_test()
+    _finite_counter_key_self_test()
+    _internal_call_resolution_self_test()
+    _tail_trusted_facts_miss_self_test()
     initializer_mutations = [
         (
             "initializer success branch retarget",
-            initializer.replace("if r6 != 0x0 goto +0x7", "if r6 != 0x0 goto +0x6", 1),
+            initializer.replace("if r6 != 0x0 goto +0xa", "if r6 != 0x0 goto +0x9", 1),
         ),
         (
             "114 object stores",
@@ -1829,8 +3819,8 @@ interface_continuation_pack(count, 0, symbol_id)
         (
             "116 object stores",
             initializer.replace(
-                "     127:\tcall 0x84",
-                "     127:\t*(u64 *)(r6 + 0x398) = r7\n     128:\tcall 0x84",
+                "     133:\tcall 0x84\n     134:\tr0 = 0x0",
+                "     133:\t*(u64 *)(r6 + 0x398) = r7\n     134:\tcall 0x84",
                 1,
             ),
         ),
@@ -1959,6 +3949,7 @@ interface_continuation_pack(count, 0, symbol_id)
         ),
         "manifest output overwrites canonical source",
     )
+    _outlined_wrapper_self_test()
     print("live discovery source mutations rejected: OK")
     print("live discovery object mutations rejected: OK")
     print("unrelated memset positive control: OK")

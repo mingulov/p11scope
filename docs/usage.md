@@ -6,28 +6,57 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.3.0.** This guide describes the v0.3.0 release: `doctor`,
-> `inspect` (now `--system`), `profile` (including `--mode metrics`),
-> `trace`, `run` and `inventory`, with memory-scan discovery,
+> **Status: v0.6.0.** This source provides `doctor`,
+> `inspect`, `profile` (including `--mode metrics`),
+> `trace`, `run` and `inventory` (with PID, cgroup and system scopes, offline `diff`
+> comparison and diagnostics, and opt-in live key operations), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
-> per-edge entry counts, and schema v3. Its
-> [known limitations](../CHANGELOG.md#known-limitations) apply throughout;
-> `--system` is a preview. The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
-> record final tagged-artifact qualification and hosted CI;
-> [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) preserves
-> revision-specific pre-release evidence. To install the binaries or build
-> from source, see [Install](../README.md#install).
-> The [privacy allowlist](privacy/allowlist-v1.md) defines the capture
-> boundary, and the [profile schema](schema/observed-profile-v3.md) defines
-> public evidence and its authority.
+> per-edge entry counts, FULL object-attribute capture in release builds
+> (P0 stays an explicit option), repeatable `--exclude-module`, and schema v3; its
+> [known limitations](../CHANGELOG.md#known-limitations) apply throughout,
+> [Install](../README.md#install) distinguishes the source build from the
+> older v0.3.0 binary downloads, and
+> [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) records what
+> this release was qualified on. The [privacy boundary](#what-it-does-not-intentionally-decode)
+> combines unchanged allowlists v1/v2 with the approved FULL sections of v3; the
+> [profile schema](schema/observed-profile-v3.md) defines public profile evidence.
+
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+`--counter-mode counts|timestamps|latency` selects kernel aggregation for
+`profile` or `run` with `--mode metrics` on eligible LP64 hosts, subject to
+mode-specific load and memory limits. Latency banks grow with the host possible-CPU count
+and refuse with `counter-memory-limit` past the per-capture kernel-map
+memory cap on hosts with many CPUs. Omit `--counter-mode` to keep
+existing metrics behavior. `--select-endpoint <FUNCTION>` beside
+`--mode metrics` with `--counter-mode` names one endpoint for full
+detail while aggregate counters continue; the name must resolve to
+exactly one broad slot, otherwise the selection refuses by name and
+the capture continues aggregate-only. The detail is the function's
+own broad-counter cells between selection and close; if the watched
+process replaces itself (exec) in between, the detail is withheld
+with a named reason while aggregate counts continue. The attempt is
+recorded in the report's additive `selected_detail` ledger; aggregate
+and detail counts are never summed.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
 - [Quickstart](#quickstart)
+- [Inventory diagnostics](#inventory-diagnostics)
+- [Offline inventory comparison](#offline-inventory-comparison)
 - [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
 - [Privileges, per environment](#privileges-per-environment)
 - [PID namespaces](#pid-namespaces)
-- [Kernel floor and unsupported environments](#kernel-floor-and-unsupported-environments)
+- [Live host capability and unsupported environments](#live-host-capability-and-unsupported-environments)
 - [Overhead (measured)](#overhead-measured)
 - [The evidence/completeness model](#the-evidencecompleteness-model)
 - [Honest claims](#honest-claims)
@@ -51,34 +80,63 @@ There is no decoder or dump flag for PINs, key material, `CKA_VALUE`, labels,
 operation-state blobs, raw mechanism byte arrays, raw session handles, or
 ordinary buffers.
 
-The privacy-first 1.0 product boundary is function, registered-mechanism,
-return-code, latency, and lifecycle evidence. The default release does not
-correlate object handles and does not promise symbolic `CKA_CLASS` or
-`CKA_KEY_TYPE` output. The unsafe diagnostic build described below does not
-enlarge the default allowlist.
+Public profile evidence covers functions, mechanisms, return
+codes, latency and admitted lifecycle observations. Key creation, derivation
+and destruction are shown the same way: calls such as `C_CreateObject`,
+`C_GenerateKey`, `C_GenerateKeyPair`, `C_DeriveKey`, `C_UnwrapKey`,
+`C_CopyObject` and `C_DestroyObject` appear as function rows with their
+mechanism id and call count, including named vendor key-generation
+mechanisms (for example NSS `CKM_NSS_*` ids); parameters and key material
+are never decoded. Mechanism ids outside the registry are shown as bare
+hex numbers with their call/error counts, marked unregistered
+(`registered: false` in JSON), instead of only a total. Ids above
+`0xFFFFFFFF` count in the total only. Profile, trace
+and metrics publish no object handles
+or object attribute facts. `evidence.object_capture`
+reports build availability, not an observed attribute. The unsafe diagnostic
+build described below does not enlarge the default allowlist.
 
-The default capture policy is `allowlisted`. Under it, pointer-derived bytes
-reach output only by exact membership in a finite published set — a mechanism
-id in the registry, or one of the 104 published function names — so a caller
-that aliases a metadata pointer into unrelated readable memory produces no
-decoded value rather than an arbitrary read. `metrics` mode uses
-`aggregate-only`, which reads no call arguments in the kernel at all.
+The default capture policy is `allowlisted`. For function metadata,
+pointer-derived bytes reach output only by exact membership in a
+finite published set — one of the 104 published function names. Other
+values in that field are dropped even when
+a caller aliases a metadata pointer into unrelated readable memory.
+Mechanism ids are public constants: registered ids resolve by registry
+membership, and unregistered ids publish as numeric id plus counts
+only, never decoded into parameters. Ids above `0xFFFFFFFF` count in
+the total only. `metrics`
+mode uses `aggregate-only`, which reads no call arguments in the kernel at all.
+
+Release builds default to FULL. For attested object calls under `allowlisted`,
+FULL performs the approved bounded reads of `CKA_CLASS`, `CKA_KEY_TYPE`,
+`CKA_TOKEN`, `CKA_VALUE_LEN`, `CKA_MODULUS_BITS` and finite `CKA_EC_PARAMS`
+values, behind descriptor, ABI, span and result checks. These reads stay enabled
+in `profile`, `trace` and `run` with `--manifest`, although those commands
+publish no object facts. The explicit P0 build option
+(`--no-default-features --features stub-object-attributes`) skips these six
+attribute-value reads; it retains the separately approved handle and lifecycle
+reads. FULL availability is not a claim that public object delivery is enabled.
 
 The older unvalidated fixed-offset decoders still exist as a diagnostic, but
 only in a build compiled with the off-by-default `unsafe-unvalidated-metadata`
 Cargo feature *and* run with `--unsafe-unvalidated-metadata`. The flag alone
 cannot enable code absent from the shipped eBPF object, `metrics` refuses the
 flag, and the observer prints a warning naming the exposure when it is active.
-The official release artifact is built `--no-default-features`, and packaging
-fails if the unsafe path is reachable. See
+The official builder selects `--no-default-features --features
+stub-object-attributes` for P0, and packaging fails if the unsafe path is
+reachable. See
 [docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) with its
-[v2 extension](privacy/allowlist-v2.md) for the field-by-field
-enforcement (what is captured, why, and how each read is gated — structural
-where a leak is impossible by construction, runtime-gated where a length/
-null check stands in front of the read, each gate named with the test that
-exercises it). The canary matrix includes secret, unterminated, and hostile-
-alias `C_GetInterface` names and scans every artifact and observer-owned map
-for their bytes.
+[v2 extension](privacy/allowlist-v2.md) and the explicitly approved
+[v3 H7-E4 sections](privacy/allowlist-v3.md#h7-e4-attribute-capture-2026-10-20)
+for the field-by-field enforcement (what is captured, why, and how each read
+is gated — structural where a leak is impossible by construction, runtime-gated
+where a length/null check stands in front of the read, each gate named with
+the test that exercises it). The canary matrix includes secret, unterminated,
+and hostile-alias `C_GetInterface` names and scans every artifact and observer-owned map
+for their bytes. The [v3 header](privacy/allowlist-v3.md) identifies the approved
+read, finite-vocabulary, result and retention rules and separately reviewed
+presentation/caller metadata sections. Its remaining proposals grant no
+capture authority or public object projection.
 
 A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see
@@ -86,31 +144,33 @@ window. It is never proof of what the application *cannot* do — see
 
 ## PKCS #11 versions and interface names
 
-Support is cumulative: legacy 2.00 (67 slots), 2.01 through 2.40 (68), 3.0
-and 3.1 interfaces (92), and the final 3.2 interface (104 published slots).
-Newer support does not replace 2.x support.
+Version values are reported metadata, not proof of a table's allocated extent
+or a provider acceptance gate. An observed `C_GetFunctionList` return is bounded
+to the known 68 legacy entries, including a table labelled 3.2. Interface
+acquisition can retain available known extensions, up to 104 entries, when
+supported by its source and bounded reads. A longer allocation alone does not
+justify naming extra words as newer API fields.
 
-One versioning rule governs every path. The live memory scan, the
-live-export path, and the offline `p11scope-discover` helper all walk the
-same layouts: any minor of a known major (2.x, 3.x), with a newer minor
-decoded as its known prefix — 68 slots for 2.x past 2.40, 104 for 3.x
-past 3.2 — and only a new major refused. A walked prefix is a
-`known_prefix` surface, so the report stays `PARTIAL` with a named
-"surface gaps" cause: the unhooked appended tail is disclosed, never
-silent. The `unsupported function-table version` skip reason remains in
-the report vocabulary only so older captures still validate.
+Short or sparse acquired tables retain their usable targets and actual
+ordinals, including around NULL or unusable entries. An acquired all-NULL table
+is a valid empty observation. Unread words remain unavailable, never invented
+NULLs. Actual missing or unusable portions of an established extent are
+disclosed as incomplete coverage; a complete bounded legacy table is not
+incomplete solely because its version label suggests a larger interface.
 
-The standard name `"PKCS 11"` is common but not universal. Discovery also
-handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables
-only when standard export anchors—or an independently acquired legacy 2.40
-table—corroborate the expected layout. Such a walk is a known prefix and keeps
-the report `PARTIAL`; uncorroborated entries remain present as vendor evidence
-and are not decoded. The observer and `p11scope inspect` make zero PKCS #11
-calls. Only the explicit offline `p11scope-discover` helper enumerates
-`C_GetInterfaceList`, then makes exactly ten bounded `C_GetInterface`
-compatibility calls (the fixed selector/version/flag matrix) before
-`C_Initialize`; these helper calls are separate from live target observation
-and never initialize the provider.
+The standard name `"PKCS 11"` is common but not universal. Alternate, null,
+unreadable and non-UTF-8 names do not by themselves discard observed targets.
+Standard API names require layout evidence from a typed getter, an exact-standard
+interface, an accepted manifest or exact agreement with the provider's own
+exports. Other valid targets stay unknown and count-only; arbitrary memory is
+not established as an API table by its size or header alone. Naming does not
+grant mechanism, object or interface-selection semantics.
+
+The observer and `p11scope inspect` make zero PKCS #11 calls. The explicit
+offline `p11scope-discover` helper calls the available getter and enumeration
+exports and makes ten bounded `C_GetInterface` compatibility calls when that
+export is available (the fixed selector/version/flag matrix). These calls are
+separate from live target observation; the helper never calls `C_Initialize`.
 
 Interface-name discovery reads at most 64 bytes and never crosses the readable
 VMA containing the pointer. A name without an in-VMA NUL is unreadable. Text
@@ -121,19 +181,43 @@ classification consequences, never the name bytes.
 
 Start with `inspect`: it shows every provider-shaped module the target maps.
 An optional `--module` only narrows that set. On the measured p11-kit stack,
-p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
-whole, while the later-fitting SoftHSM2 backend attaches; the report is
-explicitly `PARTIAL`, not a claim that the proxy layer was captured.
+the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
+it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
+attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
+layer was captured. A live Detailed capture admits a late-start closure (one
+mapped before the capture's first plan beside a non-closure provider) as a
+reserve-capped leading-templates prefix with a named partial gap when no
+provider was refused or omitted; a closure alone in the first plan, or first
+mapped mid-capture, admits only its published tables, unless its opened file
+matches an operator-named `--module` path, which admits the reserve-capped
+prefix after the named non-closure modules admitted in the same discovery
+pass (a prefix held from an earlier pass can still crowd a later-named
+provider). The terminal report names each refused or partially covered module
+with its reason: `run` and `profile` print a `Module gaps` section with the
+first five and an "and K more" line, and `inventory` prints the admission
+reason under each refused module. A capture whose only mapped provider is
+the proxy layer (a process that has not loaded the providers below it yet)
+starts with the proxy layer named as a `PARTIAL` gap — with no provider beside
+it in the first plan there is no prefix, and nothing of it is published yet —
+and attaches each provider below it whole as the process loads it. Naming the
+proxy layer with `--module` admits its reserve-capped prefix but narrows
+discovery to the named modules, so a provider below it is captured only when
+also named. A prefix leaves at least the reserve (128 of 512 slots) free, so
+one later standard function list (at most 104 entries) always fits; a second
+later provider may be refused by name.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
-return values and latency. They still carry standard names when the provider's
-own `.dynsym` exports every standard name exactly where its function table
-points (`discovery[].tables[].linkage: "exports"`, as SoftHSM2 does); a table
-with no such evidence stays unnamed, and its rows read `unknown#<ordinal>` in
-the live table and trace (`functions[].ordinals` and `functions[].target` in
-JSON), never a guessed name. Missing mechanism or session evidence does not mean
-the application used none. For those semantics, use the separate
+return values and latency. Standard names require a typed legacy return, an
+exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
+the provider's own `.dynsym` and every retained non-NULL target
+(`discovery[].tables[].linkage: "exports"`). `inspect` reports each table's
+raw decoder walk, so a 3.x-labelled prefix that `run` proves `full` still reads
+`known_prefix` in `inspect` output. Without name evidence, rows read
+`unknown#<ordinal>` in the live table and trace (`functions[].ordinals` and
+`functions[].target` in JSON), never a guessed name. Missing mechanism or
+session evidence does not mean the application used none. For those
+semantics, use the separate
 [attested capture workflow](#attested-semantic-capture).
 
 ```bash
@@ -155,6 +239,17 @@ sudo p11scope profile --system --duration 60 -o system-profile.json
 sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
+
+Trace rows show an executable label when p11scope can establish which process
+image made that call. Otherwise they say `Unknown executable` and retain the
+PID/TID. The label comes from the observed executable path: an interpreter may
+therefore appear as `python` or `sh`, rather than the script or service name.
+For cgroup traces, naming needs calls on both sides of a validated executable
+sample. Early calls and short-lived or infrequent callers can stay unknown;
+their count and admission rules are unchanged. Previously printed rows are
+not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
+for the sampling and retention limits. Installed cgroup naming checks for v0.4
+are still in progress.
 
 > **`run` safety boundary:** `sudo p11scope run` requires valid non-root
 > `SUDO_UID` and `SUDO_GID` values naming one existing non-root account and
@@ -282,7 +377,13 @@ and `--manifest` remains the explicit-attestation path for that case.
 Attach takes time to land (seconds for hundreds of probes), and the first
 calls after a `dlopen` can fire before their probes exist — a workload that
 exits in milliseconds can be gone before attach completes, even with
-`--pause auto`. Keep the workload alive past attach (a sleep/hold phase,
+`--pause auto`. Measured FULL-default startup to the `capturing:` line on
+4 vCPUs is ~4–7 s on 6.6+ (6.6.157 4.5–4.9 s, 7.0 6.25–6.6 s) but
+~15–22 s on 5.15/6.1 (6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s,
+0-probe 14.8–21.5 s under host load). These are historical measurements;
+stock non-Multi hosts are outside current live support, and none of these
+numbers is a product cold-start SLA. The kernel verifies BPF loads; plan the
+hold phase accordingly. Keep the workload alive past attach (a sleep/hold phase,
 `LD_PRELOAD=<provider.so>` so the initial scan sees it, or long-lived
 daemons via `profile --pid`). Without `run --pause auto`, expect the
 earliest post-load calls to be absent from the counts; with it, the child
@@ -316,6 +417,28 @@ profile, trace, run, and inspect.
 unsupported instead of accepting and ignoring operator input; use
 `inspect --pid <pid> --module <provider.so>` for module-specific discovery.
 
+### Pre-arming providers with `--prearm-module`
+
+Repeatable `--prearm-module <provider.so>` (profile, trace, run, inventory)
+names a provider file to pin before any mapping and pre-arm its proved
+offsets, so a provider that loads mid-capture is already held. It inherits
+the command's scope: it never narrows the memory scan (that is `--module`)
+and carries no function-name/offset claims (that is `--manifest`). One bad
+path fails startup before any capture work. Pre-mapping attach still needs
+proved offsets — an accompanying `--manifest` claim for the same pinned
+file, or the file's own standard PKCS#11 exports proved executable in held
+bytes; unproved functions attach only after ordinary scan corroboration,
+with the gap disclosed. Records seen only through pre-arm stay
+`Uncorroborated` and force `PARTIAL` until scan or manifest corroboration.
+
+Under inventory, `--prearm-module` requires `--capture auto` or `native`
+and is refused by name under `scan`. Inventory pins and retains the inputs
+at startup, attaches their proved offsets through the inventory lane, and
+reports one interval row per input in the top-level `prearm[]` section
+(path, file identity, `mapped`, `watch`, `attached_at_ns`,
+`unobserved_windows`); a never-mapped input carries a bounded watch that
+ends at scope end. See the [inventory v1 schema](schema/inventory-v1.md).
+
 ### Attaching to an existing Kubernetes pod
 
 `scripts/attach-pod.sh` resolves a pod/container to its host cgroup and runs the
@@ -333,7 +456,11 @@ ELF object identity plus file offset, and uprobes attach to that object/offset
 in the selected PID or cgroup. Virtual addresses never have to match.
 
 The default scan reads the target's mapped table; it does not call into the
-provider. The optional helper reconstructs a table in its own unprivileged
+provider. File-data scans can miss tables held only in runtime allocation.
+An observed getter return can supply such a table; when that evidence is
+unavailable, use a manifest from `p11scope-discover` (see
+[known limitations](known-limitations.md#runtime-built-function-tables-need-publication-evidence-or-a-manifest)).
+The optional helper reconstructs a table in its own unprivileged
 process and does not read or inject into the target. Its manifest is suitable
 only when that independently reconstructed table describes the same hash-pinned
 provider. Anonymous or JIT-generated targets and process-specific tables remain
@@ -341,13 +468,17 @@ outside this release's completeness guarantee. The kernel keys each accepted
 uprobe to the pinned inode and offset, and the BPF scope guard runs before any
 argument read.
 
-The optional helper always drops supplementary groups, UID/GID, and active, permitted,
-inheritable, and ambient capabilities before loading provider code, even when
-invoked from an elevated observer. The module and output directory must
-therefore be readable/writable by the invoking unprivileged identity (or the
-`nobody` fallback for a direct root invocation). After an ID change, the helper
-restores Linux dumpability only to perform bounded reads through
-`/proc/self/mem`; it does not restore groups, IDs, or capabilities.
+Before loading provider code, the optional helper clears capabilities, uses
+an unprivileged UID/GID and sets `no_new_privs`. An elevated invocation clears
+supplementary groups when dropping to that identity (the invoking user, or
+the `nobody` fallback for direct root); an ordinary non-root invocation can
+retain its existing non-root groups. The module and output directory must be
+accessible to that resulting identity. The helper preopens its own
+`/proc/self/mem` for bounded reads and keeps Linux dumpability disabled while
+provider code runs; it does not restore dumpability after changing IDs.
+This is not a seccomp or Landlock sandbox. Library constructors and discovery
+exports execute with that user's access, so use the helper only with code
+you trust to run as that user. The observer never launches it automatically.
 
 Both `profile` and `trace` require exactly one of `--pid`, `--cgroup`, or
 `--system`; `--module` and `--manifest` are repeatable optional discovery
@@ -361,9 +492,9 @@ included, is refused with `not a cgroup v2 directory` before discovery, by
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
 discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
-rarest providers first). `--system` is a preview (see the
-[known limitations](../CHANGELOG.md#known-limitations)): scope admission does
-not promise that every process or call is captured, and the whole-machine
+rarest providers first). Scope admission does not promise that every process
+or call is captured (see the
+[known limitations](../CHANGELOG.md#known-limitations)), and the whole-machine
 scope shares the 512 attach slots with every ambient provider. Without
 `--module`, a `--cgroup` or `--system` capture admits each provider whole or
 not at all, by value: `--manifest` providers, then providers with a
@@ -378,6 +509,20 @@ in the JSON report reads `"system"`. Fork children are admitted without a
 destination check, and short-lived processes that exit between refreshes
 count `pid_descendant_gaps` through the same bounded unmatched-exit ledger
 as cgroup scope (overflow latches one lower-bound increment and `PARTIAL`).
+With `--track-short-lived`, each novel unmatched exit also gains an
+exit-time mapping verdict (`gap_exit_mappings` beside the gap count):
+whether the kernel recorded a localized mapping of a watched provider
+file by the process at some point while watched (`mapped`) or cannot
+tell (`unknown`); the cells persist across unmap and exec, so `mapped`
+never means the file was still mapped at the exit instant.
+Multi-threaded exits and late watches read `unknown`; nothing here
+proves a process did not map a watched provider.
+Any admission after the initial sweep, and any unmatched leader exit, keeps
+the observation lossy by design: the process could have used an unattached
+provider before admission left no trace (see the
+[known limitations](known-limitations.md)). A forking workload,
+or a `--system` capture with ambient process churn, therefore reports exact
+counts with `PARTIAL` observation; only a quiescent scope can be exact.
 `p11scope doctor` needs no scope flags for a system capture: its host
 program preflight already covers the whole-machine lane.
 `--duration` (bare
@@ -388,7 +533,11 @@ at the stop gate's quiescence point, before any probe link is closed. Closing
 the links then runs in the background with a progress line on stderr about
 once a second (`p11scope: cleanup 1200/4227 links released, 38 s`) and a final
 `p11scope: cleanup completed, …` line (`cleanup incomplete, … uncertain` when
-a close failed); with many attached functions this can take seconds. A second
+a close failed); with many attached functions this can take seconds. On kernels
+without batched uprobe detach, when closing the links is expected to take at
+least two seconds, one estimate line prints first (`p11scope: closing 4227 probe
+links one at a time (no batched uprobe detach on this kernel); about 212 s,
+progress follows`). A second
 Ctrl-C while the links are closing stops waiting: p11scope prints the
 progress and `p11scope: cleanup incomplete`, exits with status 130, and the
 kernel finishes the remaining closes as the process exits — the report is
@@ -447,6 +596,9 @@ Views without an executable (kernel threads) and static executables are not
 loader-arming candidates and no longer count as `unavailable`: arming returns
 a silent NotArmable outcome, retried next tick like any unarmed view, while
 genuine arm failures still mark and record as before.
+Memory scans treat the same shape the same way: a process whose maps read
+0 bytes and whose stat flags carry PF_KTHREAD scans as verified absence (no
+modules, no skip), so kernel threads no longer force system captures PARTIAL.
 
 For cgroup event captures, `task/task_newtask` records ordinary non-thread
 creation as a semantic hint and may preserve the parent's proven state while
@@ -458,7 +610,15 @@ admitted generation, with each generation or unmatched exit counted once.
 When the bounded unmatched-exit ledger is full, a novel unmatched exit latches
 one lower-bound overflow increment. If admission already counted the gap,
 coalescing overflow marks `PARTIAL` without another increment. Replayed or
-further unremembered exits do not increment again.
+further unremembered exits do not increment again. With
+`--track-short-lived`, each novel unmatched exit also gains an exit-time
+mapping verdict (`gap_exit_mappings` beside `pid_descendant_gaps`):
+whether the kernel recorded a localized mapping of a watched provider
+file by the process at some point while watched (`mapped`) or cannot
+tell (`unknown`); the cells persist across unmap and exec, so `mapped`
+never means the file was still mapped at the exit instant.
+Multi-threaded exits and late watches read `unknown`; nothing here
+proves a process did not map a watched provider.
 Arbitrary enter-then-migrate-out before refresh or exit remains outside the
 `COMPLETE` and runtime-qualified claims; no migration subsystem is provided.
 PID scope remains exact and does not attach process-creation tracking.
@@ -668,9 +828,14 @@ Limits that matter in pods:
   its own process (`nsenter -m` without `-p`) is refused before attaching.
   To keep no report file, leave out `-o`.
   `-o -` means stdout for trace (including `run --trace`), whose lines
-  already stream to stdout when `-o` is omitted; profile (including `run`
-  without `--trace`) refuses `-o -` because its report requires a file —
-  omit `-o` for display frames on stdout. No command ever creates a file
+  already stream to stdout when `-o` is omitted. When stdout is a slow
+  pipe, trace output that cannot be delivered within the bounded wait is
+  dropped and counted as dropped bytes
+  (`scheduling.sink_dropped_bytes` in the JSON evidence), which can cut
+  the last stdout line; the `-o` file is always complete. Profile
+  (including `run` without `--trace`) refuses `-o -` because its report
+  requires a file — omit `-o` for display frames on stdout. No command
+  ever creates a file
   literally named `-`. Every
   directory on the way to the file must be a real directory (no symlinks)
   owned by root, you, or the user who ran `sudo`, and not group- or
@@ -682,6 +847,100 @@ Limits that matter in pods:
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
   aggregate document.
+- `--exclude-module <path-or-name>` — repeatable, for `inspect`, `run`,
+  `profile`, `trace` and `inventory` in every scope: the opposite of
+  `--module`. Discovery stays automatic, except that excluded files get no
+  probes and use no slots. A full path (contains `/`) excludes exactly that
+  file: it is resolved like `--module` (following symlinks) and matched by
+  file identity (device + inode), so a different file at the same path in
+  another mount namespace, container or snap is NOT excluded; a path that
+  does not exist is a usage error at start. A bare name (no `/`) excludes
+  every copy, in every process and namespace, whose file name or ELF soname
+  (`DT_SONAME`) equals the name — for example `libp11-kit.so.0` matches
+  `libp11-kit.so.0.4.8`, a snap's `.0.4.5` and Fedora's `.0.4.11`, while an
+  exact file name such as `libp11-kit.so.0.4.8` matches that version only.
+  Every excluded file is listed in the report (text and JSON) as "excluded
+  by you" with its path, identity and the number of processes that mapped
+  it, and an exclusion that matched nothing is reported as such.
+  `--module X` together with an `--exclude-module` that matches X is
+  refused with a named error, and so is a `--prearm-module` or `--manifest`
+  attesting an excluded module. Excluded modules are a declared choice, not
+  a loss: the rest of the capture can still be `exact`, and the report
+  says plainly that calls into excluded files were not observed. To leave
+  the proxy layer out entirely and spend its slots on the backends, pass
+  `--exclude-module libp11-kit.so.0`.
+- `--select-endpoint <FUNCTION>` — `profile` or `run` with `--mode metrics`
+  and `--counter-mode` only: name one endpoint function (for example
+  `C_Sign`) for full detail while aggregate counters continue. The name
+  resolves against the live broad plan: zero matches refuse as unknown,
+  two or more refuse as ambiguous (narrow providers with `--module`),
+  never first-match. Only `--pid` and owned-`run` scopes resolve to one
+  original; `--cgroup` and `--system` refuse by name. The name
+  resolves once at start against the plan then live; a provider loaded
+  after start needs `--prearm-module <provider.so>` to be selected
+  (`--module` only narrows the scan). With `run` it is usually
+  required, because the owned child maps its provider after the
+  observer attaches. The detail
+  is the function's own broad-counter cells between a selection-time
+  read and the close read, in the measurement's own mode (counts,
+  timestamps or latency cells). With `run` the selection-time read
+  happens after the owned child is released, so the window may start
+  after the child has started and early calls can fall outside the
+  detail. If the watched process replaces
+  itself (exec) between the two reads, the slot retires, or the close
+  boundary cannot be proven clean, the detail is withheld with a named
+  reason; a leader exit that is the last lifecycle record ends the
+  window cleanly and the detail renders the counts up to the exit.
+  Loader scans left unfinished by the exit itself, and loader rejects
+  the exiting process explains (a hook address that no longer maps, a
+  late record bound to the ended process, a zero-state scan that never
+  completed), do not void it: they are counted apart as exit-only, and
+  other truncation still counts, including loader rejects the observer
+  cannot tie to the exit. Those withhold the detail
+  as `broad_stopping`, so a `run` child that loads and exits at once may
+  still void intermittently, about 1 in 10 runs in local testing; a child
+  that runs on for a few seconds after loading is unaffected. Each
+  bracketing read samples the return-value table before the slot
+  counters, so a call that completes between the two passes leaves a
+  torn window and the detail is withheld as `broad_plan_topology`;
+  against a busy `--pid` target this can withhold most windows. With
+  `run`, the window must
+  tell the child's own startup exec apart from the window by kernel
+  and userspace monotonic time; where the two clocks cannot be
+  compared (a time namespace offset, or a kernel without the time
+  namespace files) the selection refuses as
+  `promotion_scope_unsupported`. A
+  window with no calls still renders explicit zero rows. The selection
+  attempt — resolved slot or named refusal — is recorded in the
+  report's additive `selected_detail` evidence object; unrelated
+  endpoints stay aggregate-only, and aggregate and detail counts are
+  never summed.
+- `--track-short-lived` — profile and `run` (default off): extensive
+  mode. The kernel records the exec-time executable identity (device +
+  inode, no path, argv, or environment) in EXEC records, and each novel
+  unmatched exit gains a bounded static-linkage hint (`gap_exe_hints`
+  beside `pid_descendant_gaps`): does the dead process's executable
+  name a pinned watched provider, or the PKCS#11 loader, within two
+  `DT_NEEDED` steps. A hint is labelled `STATIC HINT`, never a call
+  or verdict, and never moves call/attribution shares. Each novel
+  unmatched exit also gains an exit-time mapping verdict
+  (`gap_exit_mappings` beside `pid_descendant_gaps`): at exit the
+  kernel reports the watched-provider slots it had recorded for the
+  leader — `mapped` if one names a watched provider file with no
+  disqualifying refusal, else `unknown` (no record, shared mm,
+  refused hooks, late watch, local fault, or empty slots). The
+  split is a kernel observation: never a call, caller, share, or
+  conformance input, and never a negative. Multi-threaded exits
+  and late watches read `unknown`, and nothing here proves a
+  process did not map a watched provider.
+  Beside `--trace`, `--mode metrics`, exact `--pid` scope, or an owned
+  `run` the flag is accepted but arms nothing: no exe identity is
+  recorded there, because nothing there classifies gaps (614b P1
+  narrow authorization — the read arms only where hints publish).
+  Beside `--counter-mode` the flag is refused:
+  extensive mode arms Detailed captures only, never a counter
+  object. Privacy row: `docs/privacy/allowlist-v3.md`
+  (extensive-mode executable dependency hints).
 - `run --trace` — stream one line per completed call (trace semantics) for an
   owned command instead of aggregating a profile.
 - `run --kill-on-timeout` — when `--duration` expires, terminate and reap the
@@ -697,10 +956,58 @@ Limits that matter in pods:
 - `inventory [--pid <n> | --system]` — answer "which module is used by
   whom": one snapshot pass, or a `--duration` observation window of
   rescanning passes, reporting callers (per process incarnation), modules
-  (per physical object, with scan-only admission verdicts), and the
-  caller/module edges between them with usage coverage, lifecycle, and
+  (per physical object, with admission verdicts for the validated count union),
+  and the caller/module edges between them with usage coverage, lifecycle, and
   explicit gaps; the native lane counts entries per edge (see
-  `entries.coverage` below). A process is a caller of a module only when
+  `entries.coverage` below). Text snapshots begin with an application/module
+  overview, followed by detailed retained paths, identities, states and
+  coverage. The application label is the observed executable's basename,
+  not a desktop or package identity: an interpreter remains `python3`,
+  `java`, etc. Caller/module IDs and PID/incarnation are secondary detail;
+  equal basenames remain separate rows for their existing identities.
+  Under `--capture auto` or `native`, repeatable `--manifest <m.json>` inputs
+  that match a provider mapped in the selected scope and pass identity/ABI
+  checks join the ordinary count union before shared admission. Count admission
+  grants no semantic, object or interface-selection authority. Eligible attested
+  inputs separately prepare a Detailed subset. `scan` plus a manifest is an
+  argument error before output files open. Subset preparation preserves broad
+  physical counting; this
+  preparation gate alone does not activate positive Inventory instance delivery.
+  `--key-operations` (default off) opts in to per-key tracking through a linked
+  journal session; it requires `--capture auto` or `native` and a build with
+  the journal object. A refused journal start keeps the S1 capture with a
+  finite reason.
+  Missing retained names read `Unknown executable` or `Unknown module`;
+  an observed ` (deleted)` path marker stays on the executable label.
+  Retired images say `Application executed a new image`, and exited
+  callers say `Process exited`; these labels describe retained observations.
+  For example, a scan of an owned fixture with
+  `p11scope inventory --pid "$fixture_pid" --capture scan` can show:
+
+  ```text
+  application app-first-driver [c0 pid 4242 incarnation 0] -> module app-p1.so [m0]: Module mapped; activity not captured; coverage unknown (scan only)
+  ```
+
+  The header also carries a key-operation summary line. Once key
+  operations populate (opt in with `--key-operations`), it counts
+  completions per operation category, e.g.
+  `key operations: rev 1 populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active operations`.
+  In v0.6.0 key-operation rows name only registered mechanisms: the
+  journal lane keeps withholding unregistered ids, which appear with
+  counts in the profile and trace mechanism tables instead.
+  A linked capture whose key-operation tracking never starts reads
+  `key operations: unavailable (bootstrap_unavailable)`. Without the
+  opt-in, or on a build without the journal object, the line reads
+  `key operations: not reported (per-key tracking is off)`.
+  The line shows counts per operation category from the
+  `object_observations` section of the JSON report; `--json` has the
+  full rows.
+
+  The fixture PID and IDs vary by run. Mapping alone does not prove use;
+  `At least N entries observed` counts entries, a lower bound, rather than
+  completed operations. Capture loss, unknown counts and no-use intervals
+  remain explicit in the overview and details. A process is a caller of a
+  module only when
   its maps show an executable (`x`) mapping of the module file that
   passes the identity proof; a process that maps the file only without
   `x` (a scanner reading it) is not a caller, and is no gap (see
@@ -709,10 +1016,23 @@ Limits that matter in pods:
   document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
-  report requires a file). `--dashboard` runs the live read-only
-  dashboard on stdout when it is a terminal (scrollable edge table with
+  report requires a file). `--quiet` prints only the summary head
+  (totals plus application/module edges) and silences scan progress;
+  `--json`, `-o`, and logs are unchanged. `--dashboard` runs the live dashboard on
+  stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
-  `q` quits, `--duration` bounds the run); on a pipe it degrades
+  `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and
+  `--duration` bounds the run). `d` requests Detailed capture for the
+  selected caller/provider pair (it needs a fully drawn frame) and `x`
+  cancels outstanding promotion work; both keys are ignored on the gaps
+  page and refuse honestly (stale view, busy, unsupported scope or
+  scan-only run) without disturbing the capture. At 40x10, the compact
+  summary keeps an
+  executable/module pair, their IDs and observation meaning visible;
+  scrolling reaches later associations while totals still cover the whole
+  capture. Enlarge the terminal to see the fuller state and evidence view.
+  Below the useful compact size, the view asks for enlargement. On a pipe
+  it degrades
   honestly to snapshots (or JSON under `--json`), never ANSI. The
   dashboard runs the same loop as the classic path (passes, native
   service ticks, witness reads, stop) and only draws inside its service
@@ -731,8 +1051,9 @@ Limits that matter in pods:
   shed so far` once frames are drawn again. On exit the screen is
   restored (waiting at most 1 s for the terminal; a restore the
   terminal did not take, e.g. after Ctrl-S then `q`, is tried once
-  more for up to 5 s after the report is written, and a second signal
-  ends that wait), and stderr ends with
+  more for up to 5 s after final output attempts; deliberate stdout
+  cancellation gives that retry zero wait budget, and a further delivered
+  signal after output attempts ends the process), and stderr ends with
   `p11scope: dashboard terminal: W frames written, S shed by a terminal
   that did not keep up (C cut short, B bytes, T ms waited); screen
   restored; service ticks N, longest gap G ms (P ms across a pass)` and
@@ -752,16 +1073,65 @@ Limits that matter in pods:
   `-o`'s hardening (a new file is 0600, a symlink or other non-regular
   target is refused and left as it was, the parent directory must be
   trusted) and is truncated when the stream opens; a rotation rename
-  never replaces an entry planted at its target. Entry columns read unknown
+  never replaces an entry planted at its target. After `started`, a returned
+  event write, rotation, flush or sync error disables that writer while
+  observation continues to its ordinary stop. Final event completion,
+  atomic `-o` commit and stdout are attempted independently; any returned
+  sink error gives exit 1 with sink-specific diagnostics. The event file
+  may contain a partial line, and `ended` is never fabricated or retried.
+  A readable `ended` alone does not confirm successful sync. A failed
+  `-o` commit preserves the destination under the atomic-file policy;
+  failed stdout may contain only a prefix. Final JSON and text stdout keep
+  writing while bytes are accepted, with no total-document deadline. On
+  ordinary Linux pipes/FIFOs and TTYs/PTYs, five seconds without a positive
+  write fails stdout with exit 1. A reader pausing at least five seconds can
+  lose the remaining suffix; a truncated JSON prefix is not a usable report.
+  A signal already used to stop capture permits healthy final output; a
+  later delivered SIGINT, SIGTERM or SIGHUP cancels it, including a first
+  delivery after a duration/key stop starts finalization. The bounded
+  diagnostic names the reason and exact local accepted/total/remaining
+  bytes; a stopped stderr may shed it. Accepted bytes do not prove that a
+  reader parsed them or a screen displayed them. `-o` and event completion
+  remain independent and their failures remain explicit. Saved termios is
+  restored before dashboard JSON, but a permanently stopped screen may
+  still need `reset` after output resumes. These bounds cover eligible
+  stdout backpressure waits: filesystem publication/sync, regular-file or
+  arbitrary device writes already in the kernel, scheduling and unsettled
+  native detach retain their separate limits.
+  Entry columns read unknown
   unless a usage feed observed them, mappings are never reported as
   observed calls, and every coverage loss is an explicit gap.
+  `--caller-metadata=cgroup` opts in to finite sampled caller context from
+  the original retained process's cgroup membership. The default `none` opens
+  no metadata files. PID, system and cgroup Inventory scopes all accept it;
+  `--cgroup` still selects scope independently. Recognized Docker/containerd/
+  CRI-O and Kubernetes cgroup patterns can yield canonical container IDs and
+  pod UIDs, labeled as lexical hints. They do not prove orchestrator ownership.
+  Kubernetes systemd patterns include the exact `kubepods.slice` and
+  `kubelet.slice/kubelet-kubepods.slice` stems, with matching QoS/pod units.
+  No runtime/Kubernetes API, network, credentials, environment or command line
+  is queried; complete paths and arbitrary names are never published.
+  A genuine native caller-use binding after coverage starts and full-image
+  proof are required; scan-only captures and unbound callers report unknown.
+  The display proof never upgrades caller admission authority.
+  Numeric cgroup directory identity remains unavailable without proved mount
+  coordinates. Sampling targets1s within fixed budgets; a sample older than10s
+  becomes stale, and failures clear current hints. Text/dashboard detail shows
+  sampled-at/age and endpoint-only validity; equal endpoints do not exclude an
+  intervening migration. Required installed multi-container/pod qualification
+  remains open.
+
   `--capture auto|scan|native` selects the usage lane. `scan` reads
-  `/proc` only (no BPF): every edge's usage coverage
+  `/proc` without loading usage BPF: every edge's usage coverage
   (`entries.coverage`) reads `unknown` with the reason `scan_only` (or
   `not_admitted`), never a zero as fact; the dashboard shows such counts
   as `entries ?`, such edges as `capture scan only` and `activity not
   covered` — never armed, never quiet — and the full coverage on its
-  evidence page. `native` also loads the Inventory BPF object, attaches
+  evidence page. System inventory selects its identity backend separately;
+  `--identity-backend auto` may load identity BPF even with `--capture scan`.
+  Use `p11scope inventory --system --capture scan --identity-backend userspace`
+  for system inventory that loads no BPF.
+  `native` also loads the Inventory BPF object, attaches
   every admitted provider entry, and binds each positive use to the exact
   caller image with its entry count (`counted`: a saturating lower bound
   since the pair's first record, at pass resolution) or reports it as
@@ -774,12 +1144,11 @@ Limits that matter in pods:
   protocol, so a call in flight at stop may still be unrecorded), and
   `observation.retirement` (`closed`, or `unsettled` when the probes did
   not detach within the stop budget — that also records a gap). The stop
-  waits at most 10 s for the probes before it writes the report (so a
-  supervisor's grace, such as Kubernetes' 30 s, always sees it); a
-  detach still running then finishes after the report, between the
-  stderr lines `p11scope: report written; detaching the remaining native
+  waits at most 10 s for the probes before attempting final outputs; a
+  detach still running then finishes after those attempts, between the
+  stderr lines `p11scope: output attempts finished; detaching the remaining native
   probes …` and `p11scope: native probes detached`, and a second
-  SIGINT, SIGTERM or SIGHUP once the report is written exits at once
+  SIGINT, SIGTERM or SIGHUP after output attempts return exits at once
   (status 128 + signal; the kernel releases the remaining probes).
   Every exec and process exit in scope sends a 920-byte record through
   the native lane's 2 MiB lifecycle ring (about 2,260 records). The lane
@@ -799,6 +1168,12 @@ Limits that matter in pods:
   stop line reports the run's final maximum including the terminal
   sweep. It measures headroom, never loss; it is timings output only
   and adds no schema key.
+  With `P11SCOPE_K0_DEBUG=1`, a `--select-endpoint` capture also
+  prints one `k0-debug` stderr line at close: selection-time
+  comparable losses plus close-time truncation, exit-only total and
+  per-route exit-only counts (`scan_end`, `reject`, `zero_state`),
+  and comparable losses. It is test scaffolding for the K0 live
+  cells, never part of the JSON report.
   `--attach-backend auto|multi|singles` (default `auto`) selects how the
   native lane attaches the provider entries. `auto` decides by a
   functional probe once per run, never by the kernel version: where the
@@ -806,8 +1181,9 @@ Limits that matter in pods:
   one immutable uprobe-multi link per provider object (one file
   descriptor instead of one per entry, and a stop that closes hundreds
   of entries in well under a second on 6.12 and 7.x, against 35-95 ms
-  per entry for per-offset links); otherwise (5.15) every entry gets its
-  own per-offset link. Under `--pid` the probe must also prove that the
+  per entry for per-offset links). General Multi host eligibility is required
+  before any live backend selection; a missing host capability never falls
+  through to scan, including empty plans and explicit Singles. Under `--pid` the probe must also prove that the
   kernel's uprobe-multi pid filter covers every thread of the named
   process: the links then name the target, so no other process — not one
   that later reuses the PID — traps or runs the probe, and the in-BPF PID
@@ -815,7 +1191,8 @@ Limits that matter in pods:
   6.6 to 6.9.11 shipped a thread-exact filter; the probe also requires
   that a forked child process does not fire) `auto` keeps per-offset
   links bound to the target. `multi` forces uprobe-multi: where it is
-  unavailable the native lane does not start, naming why — under
+  unavailable for the scope on an eligible host the native lane does not
+  start, naming why — under
   `--capture native` that is an error, and under `--capture auto` (the
   default) the run continues on the scan lane with the gap `native usage
   feed unavailable: --attach-backend multi: …`. `singles` forces
@@ -833,11 +1210,23 @@ Limits that matter in pods:
   runs exactly as on the classic path; the dashboard gives the terminal
   back before the native stop, so its stderr notices are readable.
   Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the
-  stream's `ended`, the `-o` document and stdout are still written. Admission
+  stream's `ended`, the `-o` document and stdout are still attempted
+  independently, with returned sink failures reported as exit 1. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in
-  `gaps_suppressed`, never silently. A target no scan inventoried is a
+  `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
+  selects the capture-lifetime physical endpoint budget (1..=8192; 4096
+  when absent), before output files or native maps are opened. The same
+  limit applies to scan, native and auto fallback, including the dashboard.
+  IDs are append-only: unloading a provider does not refund capacity, and
+  whole-module growth that does not fit is refused while retained endpoints
+  and historical observations remain. The JSON row `budgets.inventory_endpoints`
+  reports this physical limit; `budgets.endpoints` is the separate summed
+  per-module census limit. Pair and discovery-work limits stay independent.
+  The 8192 upper bound is a candidate policy limit, not a measured native
+  release envelope; see [known limitations](known-limitations.md).
+  A target no scan inventoried is a
   hard error (one stderr line, exit 1), never an empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
@@ -859,7 +1248,8 @@ Limits that matter in pods:
 - `--attach-backend auto|multi|singles` — the static probe backend. The
   decision comes from a functional probe, never from the kernel version.
   - `auto` (the default) uses one multi-uprobe link per attach group wherever
-    the probe links one, and per-offset links elsewhere. It also falls back to
+    the scoped probe links one, with safe scoped per-offset fallback on an
+    eligible host. It also falls back to
     per-offset links if the kernel then refuses multi.
   - Under `--pid`, `auto` uses multi only where the probe also proves that the
     kernel's uprobe-multi pid filter covers every thread of the named process
@@ -868,9 +1258,10 @@ Limits that matter in pods:
     breakpoint. The in-BPF PID guard stays as a second check. Where the filter
     is not proven, `--pid` uses per-offset links bound to the target and never
     a process-wide link.
-  - `multi` forces multi. It needs 6.6+, and under `--pid` it also needs a
+  - `multi` forces multi. It needs a capable host and attachment scope
+    (including working backports), and under `--pid` it also needs a
     proven pid filter; without one it is refused.
-  - `singles` forces per-offset links everywhere.
+  - `singles` forces per-offset links after general host admission.
 
   Dynamic loader and export probes always use per-offset links. Each profile
   report discloses the backend that owned each link
@@ -885,6 +1276,18 @@ Limits that matter in pods:
   the effective cap and names `--max-events` only when the operator passed it.
   A truncated trace is always `PARTIAL` (observation cause `trace_truncated`),
   even when its stop drain was proven.
+- `--identity-backend auto|userspace|kernel` — the system sweep identity
+  proof backend for `inventory --system` only (D3d). `auto` (the default)
+  defers any identity load until the first nonempty proof plan, then uses
+  kernel proof when eligible; `userspace` never loads identity BPF;
+  `kernel` validates numbering/BTF, strict load and functional probe
+  before capture starts, or refuses with
+  `--identity-backend kernel: kernel identity is unavailable: <reason>`
+  (exit 1, before any capture output is created). An explicit value under
+  `--pid` or `--cgroup` is a usage error; the implicit default there
+  loads nothing and emits no `observation.identity` field. The document
+  discloses the choice in `observation.identity` (`backend`
+  `userspace` or `kernel`, plus a finite `fallback` reason or null).
 
 ### Environment (`P11SCOPE_*`)
 
@@ -950,12 +1353,166 @@ changing capture behavior, it joins the table above and the `--help` list.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead. `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure
-  in any assessed lane instead); `inspect` exits 1 when the target cannot
-  be read.
+  in any assessed lane instead); `inspect --pid` exits 1 when the target
+  cannot be read, while `inspect --system` renders a partial catalog
+  (exit 0) unless the `/proc` listing itself fails.
 - `2` — a CLI usage error (unknown flag, missing value, mutually exclusive
   options, removed subcommand).
 
+## Inventory diagnostics
+
+In v0.4 development builds, `inventory --diagnostics <f.jsonl>` requests a
+separate JSONL file explaining native count reads, ownership changes, allocations
+and withheld growth. Use `--capture native` or `auto`; explicit `scan` is refused. If `auto`
+falls back to scanning, the file reports `native_unavailable` without inventing
+native decisions.
+
+```sh
+p11scope inventory --system --capture native --duration 30s \
+  --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
+```
+
+4242 is an example PID. Optional `--diagnostics-pid <n>` selects that numeric
+PID's admitted process incarnations without changing capture scope, admission
+or attribution. Global health and lifecycle-loss records remain included;
+records whose PID is unknown may be filtered out, with counters. The filter
+requires a diagnostics destination and a positive PID. Diagnostics also work
+with `inventory --pid` and `--dashboard`.
+
+The file contains recent history, rather than a replay of the whole capture:
+two rolling buffers retain up to 24,576 ordinary records and 8,192 transition,
+exceptional-decision and health records. Older records can be evicted; the footer
+reports retained spans, eviction, filtering, omission, capture outcome and
+settlement independently. Missing predecessors make `history_complete` false.
+A complete file can contain incomplete history, and neither establishes exact
+whole-workload counts. Sequences and opaque decision/read identifiers belong
+to this capture; timestamps use its monotonic clock. Application/module labels
+come from retained inventory identities, with unknown names left explicit.
+
+The recorder storage and export-index budget is 16 MiB, with at most 32,768
+data records, 1,800 bytes per data line and a 64 MiB file limit. Fixed diagnostic
+metadata in the inventory coordinator is separate: at the default inventory
+limits it can add up to 11 MiB on x86-64, including when recording is disabled.
+These payload budgets exclude allocator overhead and are not process RSS limits.
+Diagnostic omissions do not become BPF loss or change public coverage. The
+[diagnostics schema](schema/inventory-diagnostics-v1.md) defines the fields,
+limits and privacy projection; diagnostics capture no arguments, PINs,
+payloads or additional target memory.
+
+Use a separate regular file: publication is atomic and private (0600).
+Stdout (`-`), pipes, devices, symlinks and aliases of `-o` or the event-log
+file/rotation namespace are refused. Export happens after capture stops and
+the primary report is attempted, including normal duration, signal and dashboard
+quit paths; available records are also attempted on ordinary capture errors.
+There is no periodic persistence, so abrupt kill or panic need not produce a
+file or footer. Regular-file writes and sync can block in the kernel; export
+has no hard wall-clock deadline. A second signal cancels export between records.
+
+Checking an existing destination for hardlinks to event-log rotations examines
+at most 4,096 directory entries. If that check cannot finish, diagnostics are
+disabled with a warning; capture can continue. Keeping event logs in a dedicated
+directory avoids spending this limit on unrelated files.
+
+Diagnostics-only setup failures warn and let capture continue. Delivery is
+attempted independently of other final sinks; a diagnostic write, serialization
+or publication failure preserves an existing destination and is reported by
+name. Requested diagnostic delivery failure gives exit 1 after normal report
+attempts; an existing capture failure keeps precedence. Ring eviction and
+filtering alone do not fail capture. A normal stderr/dashboard-log summary
+names the destination, records retained, older records evicted and settlement.
+
+`P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1` (exactly `1`; unset records
+nothing) enables a diagnostic-only per-call settlement measurement on
+inventory runs: each applied call's delay from its record ENTRY
+timestamp to registry application is histogrammed in 1 ms buckets to
+10 s, and the cumulative `p11scope: settlement latency:` line (samples,
+p50/p99/max, overflow, unknown timestamps) prints beside the stop line.
+ENTRY precedes END by the call's own microseconds, so the line
+overstates END-based settlement by that negligible amount; percentiles
+are exact to 1 ms. Counts only, never a contract. A clean stop prints
+the line once. When calls are still applied after the stop counts are
+disclosed (a lane held for exit applies its last commit then), a
+second, cumulative line follows; the last `settlement latency` line is
+the final one. The throughput harness passes it through sudo with
+`SETTLEMENT_LAT=1`.
+
+## Offline inventory comparison
+
+`inventory diff` compares saved [inventory v1](schema/inventory-v1.md)
+snapshots as an ordinary user. It performs no live process lookup, loads no
+provider, and requires no capture privileges. It accepts neither profile
+reports nor inventory-event JSONL.
+
+```bash
+p11scope inventory diff before.json after.json
+p11scope inventory diff before.json after.json --json
+p11scope inventory diff before.json after.json -o comparison.json
+# Options precede -- when the input names begin with a dash.
+p11scope inventory diff --json -- -before.json -after.json
+```
+
+Default stdout is readable text, with application names, full recorded paths,
+module content digests, and separate before/after evidence. `--json` emits one
+`p11scope/inventory-diff/v1` document plus newline. `-o` atomically saves that
+JSON regardless of stdout mode, before writing stdout. Output aliases of
+either input, including hardlinks and symlinks, are refused; the existing
+trusted-directory/final-name protections apply. The final check and rename
+are not a lock against replacement by a writer in that trusted directory.
+Stdin (`-`) and `-o -` are unsupported; use `--json` for JSON stdout and
+prefix a dash-leading output name with `./`.
+
+For an illustrative application upgrade, suppose `/opt/service/bin/worker`
+has an edge to `/opt/vendor/lib/pkcs11.so` with digest A before and digest B
+after. A and B here stand for different valid 64-digit SHA-256 values, not
+literal input values. The report names one changed application group, two
+content-presence rows, and different module content observed at that path.
+If counts are 128 before and 24 after, they remain separate window
+observations; no -104 delta or throughput change is inferred. Equal digests
+mean equal module bytes, while different inodes remain separate physical
+records in each snapshot. Exact executable paths group application
+observations; equal basenames at different paths remain separate groups.
+
+Read coverage alongside those observations: witnessed use may have no entry
+count; watched no-use applies only to its recorded coverage; absent, unknown,
+lossy, saturated, and in-flight evidence remain explicit. A missing module
+digest or executable path remains unresolved. Each side's scope completeness
+is unknown even with no gaps. Host/boot, process and physical continuity
+remain unknown. Not observed after does not prove removal. An unchanged
+supported projection does not prove equal instance populations or detailed
+semantics: instance and detailed semantic changes are not compared.
+
+Differences and unknown evidence exit 0; input, schema or output failures
+exit 1; usage errors exit 2. A broken stdout pipe exits 0 after any requested
+file succeeds. Another stdout error can exit 1 after that file was published.
+Malformed inputs and exceeded limits fail without a partial successful parse.
+Per input, limits are 64 MiB actually read, 250,000 combined caller/module/
+edge/gap rows, 16,384 decoded UTF-8 bytes per string or key, nesting depth 64,
+and 2,000,000 JSON values plus object keys. All apply together. Legacy
+additive omissions retain unknown states; unknown additive data is bounded
+and ignored rather than copied through. Unknown clock units retain raw values.
+See the [diff schema](schema/inventory-diff-v1.md) for exact fields,
+side-local evidence references, population multiplicity and interpretation.
+
 ## Privileges, per environment
+
+Root UID is not an unconditional requirement: the observer can run under an
+ordinary UID with file capabilities. The capture permissions have separate
+roles, and the exact set depends on the target, attach backend and host policy:
+
+| Capability | Capture operation |
+| --- | --- |
+| `CAP_BPF` + `CAP_PERFMON` | Load BPF and attach probes where host policy permits this narrower set. |
+| `CAP_SYS_PTRACE` | Read a target's memory when ptrace/Yama or cross-UID checks require it. |
+| `CAP_DAC_READ_SEARCH` | Open provider files or traverse target paths otherwise unreadable to the observer. |
+| `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` | Follow target `map_files` for Inventory's past-scan-cap identity proof. |
+| `CAP_SYS_ADMIN` | Current self-probe/live-discovery perf-event paths on restrictive `perf_event_paranoid >= 3` hosts; also covers the BPF/perf checks. |
+
+This is a conditional roles list, not one portable minimum or a reason to grant
+all listed capabilities. Offline processing needs no BPF privileges. Capabilities
+only inside a child user namespace do not satisfy host BPF/perf checks; seccomp,
+LSM and lockdown policy can still refuse a privileged observer. Run
+`p11scope doctor --pid <pid>` as the intended observer identity against the actual
+target. The measured matrices and command-specific limitations follow below.
 
 `doctor` reports one finite availability tier for the requested host and
 target. The tier is preflight evidence, not capture authority or a completeness
@@ -963,12 +1520,16 @@ promise. With no `--pid`, target readability is explicitly `unassessed`.
 `doctor --extra-strict` is the qualification gate: it refuses (exit 1, with
 an `extra-strict refusal:` line naming every violating row) when any assessed
 lane warns or fails, and states `extra-strict: no qualification violations`
-when the host is fully clean. Three rows are limits of this build, the same
-on every host, and are listed on an `extra-strict: not counted` line instead
-of refusing: the two `loader timing` rows (`unproven`/`none`: the loader
-timing catalog is empty) and `run initial-set capture: none` (an owned `run`
-cannot prove it captured its child's initial provider set, so its reports
-stay `PARTIAL`; `run` itself works, and the verdict line says so). A
+when the host is fully clean. Five rows are limits of this build, the same
+on every host, and when they warn with their by-design values they are listed
+on an `extra-strict: not counted` line instead of refusing: the two `loader
+timing` rows (`unproven`/`none`: the loader timing catalog is empty), `run
+initial-set capture: none` (an owned `run` cannot prove it captured its
+child's initial provider set, so its reports stay `PARTIAL`; `run` itself
+works, and the verdict line says so), `object-attribute capture: not enabled
+in this P0 build` (P0 builds only; FULL builds read `ok`), and `journal pair
+preflight: unavailable-in-build` (builds that omit the production journal
+object only; other `unavailable` reasons still refuse). A
 `kernel.yama.ptrace_scope` restriction is `ok` when doctor holds the
 capability that lifts it (`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
 A `kernel.perf_event_paranoid` restriction is `ok` when doctor holds
@@ -980,18 +1541,34 @@ live-discovery loader/export probes are per-probe `perf_event` uprobes
 everywhere. Below 3, `CAP_BPF`+`CAP_PERFMON` suffice. The `PID namespace` row
 is described under [PID namespaces](#pid-namespaces).
 
+The `journal pair preflight` row preflights this build's production journal
+object: it reads `available` only when both journal roots are present and the
+object flavor is clean, and warns otherwise. `unavailable-in-build` is the
+expected reading on builds that omit the production journal object, and
+`--extra-strict` lists exactly that value without counting it. The row loads
+nothing, seals nothing, and never enables linked mode.
+
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |
-| T0 offline | host attach failed | Offline helper, inspect, and report work only; no live-call evidence. |
-| T1 host attach | supported kernel, real embedded BPF object/maps/program load, and an actual self-uprobe | Live observation works on this host; target readability is failed or unassessed. |
+| T0 offline | host load/link preflight failed | Offline helper, inspect, and report work only; no live-call evidence. |
+| T1 host attach | eligible host, real embedded BPF object/maps/program load, and an actual self-uprobe link | Host load/link preflight passed; target readability failed or is unassessed, and workload event delivery is unmeasured. |
 | T2 target readable | T1 plus one stable target generation, readable `maps`, `mem`, and `root`, and exact executable/provider identity opens through that root | The target can be planned; lifecycle changes may be missed, so an attempted capture can be `PARTIAL`. |
-| T3 lifecycle | T2 plus successful real exec and exit lifecycle links | Base lifecycle coverage works; a requested scope-specific lane is unavailable or degraded. |
-| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and process-creation tracing when required | Current mechanisms preflighted; this is neither leased/hardened authority nor a `COMPLETE` promise. |
+| T3 lifecycle | T2 plus successful real exec and exit lifecycle links | Lifecycle links preflighted; a requested scope-specific lane is unavailable or degraded. Event delivery remains unmeasured. |
+| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and process-creation tracing when required | Requested load/link and scope operations preflighted; workload delivery, leased or hardened authority and `COMPLETE` coverage are not established. |
 
 The doctor runs the real embedded BPF object/map/program inventory and drops a
 temporary session after preflighting exec/exit lifecycle links and every
 requested PID/cgroup scope. T3/T4 come only from those observed operations;
 they are never inferred from uid, seccomp mode, sysctls, or capabilities.
+On a kernel that itself lacks `uprobe_multi` (the probe row fails with a known
+pre-Multi shape, for example Linux 6.1 refusing the scratch self-link), live
+capture refuses before loading any capture program, so doctor skips those
+loads: `BPF map create`, `uprobe attach (self)`,
+`uretprobe vs seccomp`, `host program preflight`, `inventory program preflight`,
+`lifecycle preflight` and a requested `scope preflight` read `n/a` with
+`skipped: uprobe-multi-required`, and the verdict stays `capture unavailable`.
+A permission or policy refusal of the probe, a resource error, or an `ENOSYS`
+answer (possibly a seccomp mask) still runs them, so their rows name the cause.
 `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`,
 `CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows
 for the tier. One inventory proof does depend on them: `inventory --system`
@@ -1002,11 +1579,23 @@ callers are counted as `map_files_unavailable` losses and discovery stays
 incomplete rather than guessed.
 There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 
-The attach floor is backend-dependent. In `auto` mode the product attempts
-one uprobe-multi link per attach group on kernels ≥ 6.9 and falls back to
-per-probe `perf_event` uprobes if multi is unsupported; below 6.9 it uses
-per-probe links (`src/attach.rs`: `kernel_supports_multi`, floor 6.9). Both
-matrices below were measured by
+Ring memory: BPF ring buffers are locked kernel memory, charged to the
+capturing process's memory cgroup. An `inventory` capture holds an 8 MiB
+lifecycle ring. A capture whose Joint key-operations lane is active loads a
+16 MiB EVENTS ring (12 MiB more than the 4 MiB default every other capture
+keeps); `--ring-bytes` still names an explicit size. While a pass collects
+or the semantic lane starts, the lifecycle lane may also hold up to 32,768
+drained records in user memory (about 29 MiB, allocated only as records
+arrive) plus up to 65,536 empty batch shells (about 6.6 MiB).
+
+The attach backend is probe-decided after the host passes the Multi load and
+self-link eligibility gate. On such a host, `auto` selects Multi when its
+scope requirements pass, including process-wide PID filtering for PID scopes.
+If that PID filter is unavailable, `auto` can use safe target-bound Singles;
+a safe scoped startup retry can also select per-probe `perf_event` uprobes
+(`src/attach.rs`: `select_session_backend`). Other required permissions and
+scope features still apply. A host that fails Multi eligibility exits nonzero
+with `uprobe-multi-required`. Both historical matrices below were measured by
 `scripts/matrix/verify-fork-scope.sh` against a same-UID non-descendant
 with SoftHSM2 already mapped, at `kernel.perf_event_paranoid=4`,
 `kernel.yama.ptrace_scope=1`.
@@ -1146,18 +1735,27 @@ cgroup. `scripts/matrix/verify-pidns.sh` reproduces all of this without kind:
 `unshare --pid --fork --mount-proc` for a nested observer, and
 `unshare --mount` with a foreign `/proc` for the stale-`/proc` case.
 
-## Kernel floor and unsupported environments
+<a id="kernel-floor-and-unsupported-environments"></a>
 
-Kernel floor: **≥ 5.15**, required by the attach-cookie design and validated
-by the supported cgroup-scoped BPF path. This tool does not runtime-check
-the kernel version; on an unsupported kernel or configuration it relies on
-the same clear-failure path described below. Caveat, stated plainly: the
-5.15 number itself was not re-derived against a live sub-5.15 kernel in
-this repo — no such kernel was available to test against
-(`docs/notes/phase5-unsupported.md`, case 5). It is inherited from the
-Phase 4 plan, not independently measured here.
+## Live host capability and unsupported environments
 
-What actually happens today, measured on a real host
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+The following permission measurements are historical diagnostics. Their old
+5.15 floor hints and exit-0 partial-capture behavior predate current host
+admission. A live attempt on a host without usable Multi now exits nonzero with
+`uprobe-multi-required` before capture or workload side effects.
+
+These earlier measurements came from a real host
 (`docs/notes/phase5-unsupported.md`; two real bugs — a swallowed OS error,
 and the historical 136 identical unexplained lines — were found while reproducing these
 and fixed, not just described):
@@ -1184,10 +1782,10 @@ attach failed (slot 0): p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `
 p11scope: 68/68 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `perf_event_open` failed: Permission denied (os error 13)
 ```
 
-The tool keeps running with `attached_probes: 0`,
-`evidence.completeness: "PARTIAL"` — a real, reported partial capture,
-never a silent zero-count report that reads as healthy. Exit code 0
-(unchanged; `scripts/matrix/verify-fork-scope.sh` depends on this).
+The historical tool kept running with `attached_probes: 0` and
+`evidence.completeness: "PARTIAL"`, returning exit code 0. That measured
+behavior is retained here for diagnosis; live attempts on hosts without usable
+Multi now refuse early and nonzero as described above.
 
 **Missing BTF, kernel lockdown, kernel < 5.15** — not inducible on the
 host this was measured on (BTF is present, no lockdown LSM loaded, kernel

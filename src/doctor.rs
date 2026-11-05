@@ -13,7 +13,6 @@ use anyhow::{Context as _, Result};
 use aya::programs::ProgramError;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,8 +112,16 @@ pub fn classify_eperm_origin(evidence: EpermEvidence) -> EpermOrigin {
     }
 }
 
+#[cfg(test)]
 fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     const MAX_BYTES: usize = 4096;
+    bounded_verifier_diagnostic_with_budget(verifier_text, MAX_BYTES)
+}
+
+/// The verifier excerpt within a caller-supplied byte budget: the errno
+/// or refusal prefix keeps its own text while the excerpt shrinks, so the
+/// whole diagnostic stays within 4096 bytes however the refusal is named.
+fn bounded_verifier_diagnostic_with_budget(verifier_text: &str, max_bytes: usize) -> String {
     const PREFIX: &str = "verifier: ";
     const MIDDLE_OMITTED: &str = " [middle omitted] ";
 
@@ -122,10 +129,10 @@ fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     if escaped.is_empty() {
         return "verifier rejected the embedded program".to_string();
     }
-    if PREFIX.len() + escaped.len() <= MAX_BYTES {
+    if PREFIX.len() + escaped.len() <= max_bytes {
         return format!("{PREFIX}{escaped}");
     }
-    let excerpt_bytes = MAX_BYTES - PREFIX.len() - MIDDLE_OMITTED.len();
+    let excerpt_bytes = max_bytes.saturating_sub(PREFIX.len() + MIDDLE_OMITTED.len());
     let mut head_end = excerpt_bytes / 4;
     while !escaped.is_char_boundary(head_end) {
         head_end -= 1;
@@ -142,7 +149,6 @@ fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     )
 }
 
-const KERNEL_FLOOR: (u32, u32) = (5, 15);
 const CAP_SYS_PTRACE_BIT: u32 = 19;
 const CAP_SYS_ADMIN_BIT: u32 = 21;
 
@@ -160,15 +166,20 @@ const CAP_BITS: [(u32, &str); 6] = [
 /// `verdict`) so the table layout and exit code are testable without any of
 /// these probes running.
 pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
+    probe_with_host(pid, cgroup, crate::attach::require_multi_capable_host())
+}
+
+fn probe_with_host(
+    pid: Option<u32>,
+    cgroup: Option<&Path>,
+    host: crate::attach::MultiHostVerdict,
+) -> Vec<Check> {
     let held = |bit: u32| read_cap_eff().is_ok_and(|mask| mask & (1u64 << bit) != 0);
     let mut checks = vec![
         kernel_release_check(),
         btf_check(),
         lockdown_check(),
-        paranoid_check(
-            held(CAP_SYS_ADMIN_BIT),
-            crate::attach::kernel_supports_multi(),
-        ),
+        paranoid_check(held(CAP_SYS_ADMIN_BIT), host.is_ok()),
         sysctl_check(
             "kernel.yama.ptrace_scope",
             "/proc/sys/kernel/yama/ptrace_scope",
@@ -183,9 +194,22 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         ),
         capabilities_check(),
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
+        object_capture_check(),
     ];
-    checks.extend(bpf_checks());
-    let attach_preflight = attach_preflight_checks(pid, cgroup);
+    let loads_capture = capture_loads_assessed(host);
+    checks.extend(if loads_capture {
+        bpf_checks(host)
+    } else {
+        premulti_bpf_checks(host)
+    });
+    let attach_preflight = if loads_capture {
+        attach_preflight_checks(pid, cgroup)
+    } else {
+        premulti_preflight_checks(
+            pid.is_some() || cgroup.is_some(),
+            journal_pair_check(crate::attach::journal_pair_preflight()),
+        )
+    };
     let capture_lane = !checks
         .iter()
         .chain(attach_preflight.iter())
@@ -213,6 +237,139 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
     });
     checks.extend(attach_preflight);
     checks
+}
+
+/// The required uprobe-multi self-link row.
+const UPROBE_MULTI_ROW: &str = "uprobe-multi attach (own libc)";
+
+/// Detail of every capture-object check that doctor skips on a host
+/// without uprobe-multi. Live capture refuses there before loading any
+/// capture program, so test-loading them would only cost verifier time
+/// (minutes on 6.1) and could not change the verdict.
+const SKIPPED_WITHOUT_MULTI: &str = "skipped: uprobe-multi-required (live capture needs uprobe-multi; this check loads capture programs)";
+
+/// Whether doctor test-loads the capture objects. A proven Multi host
+/// loads them, and so does any refused probe except a known pre-Multi
+/// kernel shape (V61-5): permission, resource and ENOSYS states fail
+/// fast and keep their guidance, while only a kernel that itself lacks
+/// Multi skips them; its uprobe-multi row still fails, so the verdict
+/// stays "capture unavailable".
+fn capture_loads_assessed(host: crate::attach::MultiHostVerdict) -> bool {
+    match host {
+        Ok(_) => true,
+        Err(refusal) => !refusal.is_premulti_kernel(),
+    }
+}
+
+fn skipped_without_multi(name: &str) -> Check {
+    Check {
+        name: name.into(),
+        status: Status::NotApplicable(SKIPPED_WITHOUT_MULTI.into()),
+    }
+}
+
+/// The `bpf_checks` rows on a host without uprobe-multi: the same rows,
+/// with the capture-object loads skipped and the failing Multi row kept.
+fn premulti_bpf_checks(host: crate::attach::MultiHostVerdict) -> Vec<Check> {
+    vec![
+        skipped_without_multi("BPF map create"),
+        skipped_without_multi(UPROBE_ATTACH_SELF_ROW),
+        skipped_without_multi("uretprobe vs seccomp"),
+        uprobe_multi_check(host),
+    ]
+}
+
+/// The `attach_preflight_checks` rows on a host without uprobe-multi. The
+/// journal row only parses the embedded object, so it is still reported.
+fn premulti_preflight_checks(scope_requested: bool, journal: Check) -> Vec<Check> {
+    vec![
+        skipped_without_multi("host program preflight"),
+        skipped_without_multi(INVENTORY_PREFLIGHT_ROW),
+        journal,
+        skipped_without_multi("lifecycle preflight"),
+        if scope_requested {
+            skipped_without_multi("scope preflight")
+        } else {
+            not_applicable("scope preflight", "no requested scope")
+        },
+    ]
+}
+
+/// Name of the inventory-object load row: load-and-release through the
+/// real preparation path, never attached.
+const INVENTORY_PREFLIGHT_ROW: &str = "inventory program preflight";
+
+/// Name of the journal-pair availability row: preflight only. It
+/// reports whether this build's production journal object carries a
+/// clean pair; it loads nothing, seals nothing, and its result never
+/// enables linked mode (the seal derives linkage from the actually
+/// loaded pair, not from doctor).
+const JOURNAL_PAIR_ROW: &str = "journal pair preflight";
+
+/// The one build-limit detail for the journal row: a build that omits
+/// the production journal object reports exactly this token on every
+/// host, so extra-strict qualification lists it without counting it.
+const JOURNAL_UNAVAILABLE_IN_BUILD: &str = "unavailable-in-build";
+
+/// Render the attach-derived pair fact as one doctor row. Only a
+/// present, flavor-clean pair reads "available"; every other shape
+/// reads "unavailable" with its finite reason and warns, because the
+/// journal lane is opt-in and its absence must never fail a verdict.
+fn journal_pair_check(preflight: crate::attach::JournalPairPreflight) -> Check {
+    use crate::attach::JournalPairPreflight;
+    let status = match preflight {
+        JournalPairPreflight::Available => Status::Ok("available".into()),
+        JournalPairPreflight::UnavailableInBuild => {
+            Status::Warn(JOURNAL_UNAVAILABLE_IN_BUILD.into())
+        }
+        JournalPairPreflight::PairMissing(reason) => {
+            Status::Warn(format!("unavailable: pair missing ({reason})"))
+        }
+        JournalPairPreflight::LoadError(reason) => {
+            Status::Warn(format!("unavailable: load error ({reason})"))
+        }
+        JournalPairPreflight::WrongDomain(reason) => {
+            Status::Warn(format!("unavailable: wrong domain ({reason})"))
+        }
+    };
+    Check {
+        name: JOURNAL_PAIR_ROW.into(),
+        status,
+    }
+}
+
+/// Load-and-release preflight of the embedded Inventory object:
+/// `inventory --system` needs it, and doctor once reported OK on kernels
+/// where it failed to load. The prepared object drops before return, so
+/// no program, link, or map survives the probe.
+fn inventory_preflight_check() -> Check {
+    let name = INVENTORY_PREFLIGHT_ROW.to_string();
+    let budget = match crate::capacity::inventory_endpoint_budget(None) {
+        Ok(budget) => budget,
+        Err(reason) => {
+            return Check {
+                name,
+                status: Status::Fail(reason),
+            };
+        }
+    };
+    match crate::attach::PreparedInventory::prepare(
+        crate::attach::Scope::Pid(std::process::id()),
+        budget,
+        crate::attach::AttachBackend::Singles,
+    ) {
+        Ok(prepared) => {
+            drop(prepared);
+            Check {
+                name,
+                status: Status::Ok("available".into()),
+            }
+        }
+        Err(error) => Check {
+            name,
+            status: Status::Fail(format_preflight_error(error.as_ref())),
+        },
+    }
 }
 
 fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
@@ -261,6 +418,8 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
     };
     vec![
         host_check,
+        inventory_preflight_check(),
+        journal_pair_check(crate::attach::journal_pair_preflight()),
         Check {
             name: "lifecycle preflight".into(),
             status: status(lifecycle),
@@ -340,6 +499,7 @@ fn not_applicable(name: &str, reason: &str) -> Check {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_major_minor(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(|c: char| !c.is_ascii_digit());
     let major = parts.next()?.parse().ok()?;
@@ -352,17 +512,9 @@ fn kernel_release_check() -> Check {
     let status = match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
         Ok(raw) => {
             let release = raw.trim().to_string();
-            match parse_major_minor(&release) {
-                Some(version) if version >= KERNEL_FLOOR => Status::Ok(format!(
-                    "{release} (floor {}.{})",
-                    KERNEL_FLOOR.0, KERNEL_FLOOR.1
-                )),
-                Some(_) => Status::Warn(format!(
-                    "{release} is below the documented floor {}.{}",
-                    KERNEL_FLOOR.0, KERNEL_FLOOR.1
-                )),
-                None => Status::Warn(format!("{release}: could not parse a kernel version")),
-            }
+            Status::Ok(format!(
+                "{release} (informational; live support is capability-tested)"
+            ))
         }
         Err(e) => Status::Warn(format!("/proc/sys/kernel/osrelease: {e}")),
     };
@@ -459,17 +611,15 @@ fn sysctl_status(
 }
 
 /// The `kernel.perf_event_paranoid` row, backend-aware. Static uprobe-multi
-/// links (kernels ≥ 6.9, the backend `Auto` picks there) never call
+/// links on an eligible host never call
 /// `perf_event_open`, so a restrictive paranoid does not limit them
 /// (measured 136/136 at paranoid=4 with `CAP_BPF`+`CAP_PERFMON`,
 /// `scripts/matrix/verify-fork-scope.sh` Part 2). But the uretprobe
 /// self-probe and live-discovery loader/export probes are per-probe
 /// `perf_event` uprobes on every kernel, and at paranoid ≥ 3 those need
 /// `CAP_SYS_ADMIN` (DR-K8S-3), so the row warns there unless it is held.
-/// Below 6.9 every probe is per-probe and the same rule applies.
-/// The multi hint is the release floor (`kernel_supports_multi()`), not the
-/// capture's functional-probe decision (which needs privilege the doctor
-/// may lack), injected as a bool so both branches are unit-testable.
+/// The Multi fact comes from the functional load/self-link, never a release
+/// number. A failed fact does not promise the per-offset fallback is eligible.
 fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
     Check {
         name: "kernel.perf_event_paranoid".to_string(),
@@ -485,8 +635,8 @@ fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
 /// Pure over the sysctl read and the backend decision, mirroring
 /// `sysctl_status` outcomes: on a multi-capable kernel a value below 3 is
 /// `Ok` and 3 or above warns unless CAP_SYS_ADMIN is held (the per-probe
-/// self-probe and live-discovery probes); below the multi floor the
-/// restrictive range warns exactly as before.
+/// self-probe and live-discovery probes); without a proven Multi fact the
+/// restrictive perf-event rule stays visible as a separate diagnostic.
 fn paranoid_status(
     read: std::io::Result<String>,
     path: &str,
@@ -585,20 +735,61 @@ fn bounded_error_text(message: &str) -> String {
     escaped[..end].to_string()
 }
 
+/// Pushes a chain fragment unless its text is already present: wrappers
+/// such as aya's `map error: {0}` repeat their source's Display, and
+/// joining the whole chain would print it twice. Only verbatim-present
+/// text is skipped, so no information is lost.
+fn push_chain_fragment(context: &mut Vec<String>, fragment: String) {
+    if fragment.is_empty() || context.join(": ").ends_with(&fragment) {
+        return;
+    }
+    context.push(fragment);
+}
+
 fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> String {
     let mut context = Vec::new();
     let detail = loop {
-        if let Some(ProgramError::LoadError { verifier_log, .. }) =
-            error.downcast_ref::<ProgramError>()
+        if let Some(
+            program @ ProgramError::LoadError {
+                verifier_log,
+                io_error,
+                ..
+            },
+        ) = error.downcast_ref::<ProgramError>()
         {
             // Never format LoadError itself: its Display includes the complete
-            // verifier log. Keep the independently bounded excerpt instead.
-            break bounded_verifier_diagnostic(&verifier_log.to_string());
+            // verifier log. Keep the independently bounded excerpt instead,
+            // naming a budget refusal for what it is — and, for any other
+            // refusal, the errno the log alone does not name.
+            let prefix = match crate::attach::verifier_budget_refusal_errno_name(program) {
+                // ENOSPC proves only that the verifier log filled during a
+                // very long check, not what the verifier concluded.
+                Some("ENOSPC") => "verifier log filled during a very long check (ENOSPC); \
+                 usually the complexity limit; "
+                    .to_string(),
+                Some(errno_name) => {
+                    format!("verifier budget refused the program ({errno_name}); ")
+                }
+                None => {
+                    let errno_text = match io_error.raw_os_error() {
+                        Some(errno) => match crate::attach::load_refusal_errno_name(errno) {
+                            Some(name) => format!("{name} (os error {errno})"),
+                            None => format!("os error {errno}"),
+                        },
+                        None => "unknown errno".to_string(),
+                    };
+                    format!("BPF_PROG_LOAD failed with {errno_text}; ")
+                }
+            };
+            let budget = 4096usize.saturating_sub(prefix.len());
+            let excerpt =
+                bounded_verifier_diagnostic_with_budget(&verifier_log.to_string(), budget);
+            break format!("{prefix}{excerpt}");
         }
         let Some(source) = error.source() else {
             break format_operation_error(error);
         };
-        context.push(bounded_error_detail(error));
+        push_chain_fragment(&mut context, bounded_error_detail(error));
         error = source;
     };
     if context.is_empty() {
@@ -607,7 +798,12 @@ fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> Stri
         // Bound the whole stage prefix as well as each individual fragment.
         // The errno or verifier excerpt retains its own budget and cannot be
         // crowded out by a long outer context.
-        format!("{}: {detail}", bounded_error_text(&context.join(": ")))
+        let stages = context.join(": ");
+        if stages.ends_with(&detail) {
+            bounded_error_text(&stages)
+        } else {
+            format!("{}: {detail}", bounded_error_text(&stages))
+        }
     }
 }
 
@@ -635,6 +831,34 @@ fn format_operation_error(error: &(dyn std::error::Error + 'static)) -> String {
     format_operation_error_with(error, None, false, false)
 }
 
+/// The object-capture row's by-design warning in P0 (stub) builds.
+const OBJECT_CAPTURE_P0: &str = "not enabled in this P0 build";
+
+/// Byte scope, identical on every host, read from the embedded object:
+/// FULL bytes wire capture, P0 (stub) bytes warn by design (a
+/// [`BUILD_LIMIT_ROWS`] member). A stale or mismatched object fails the
+/// row with the same reason capture setup refuses with.
+/// OD33/R-50: v0.5.0 reads attributes but reports key operations only
+/// from 0.6.0, and the OK detail says so.
+fn object_capture_check() -> Check {
+    match crate::attach::checked_embedded_flavor() {
+        Err(error) => Check {
+            name: "object-attribute capture".into(),
+            status: Status::Fail(format!("{error:#}")),
+        },
+        Ok(flavor) if !flavor.stubbed => Check {
+            name: "object-attribute capture".into(),
+            status: Status::Ok(
+                "enabled (read only; key operations are reported from 0.6.0)".into(),
+            ),
+        },
+        Ok(_) => Check {
+            name: "object-attribute capture".into(),
+            status: Status::Warn(OBJECT_CAPTURE_P0.into()),
+        },
+    }
+}
+
 fn capabilities_check() -> Check {
     // A read/parse failure is reported, never coerced into "(none)" — an
     // unmeasured mask must not read the same as a genuinely empty one.
@@ -657,12 +881,12 @@ fn capabilities_check() -> Check {
 
 /// Uses capture's complete preparation and mandatory lifecycle ownership. The
 /// diagnostic link shares Session teardown ordering.
-fn bpf_checks() -> Vec<Check> {
+fn bpf_checks(host: crate::attach::MultiHostVerdict) -> Vec<Check> {
     bpf_checks_with_seccomp(
         crate::attach::Session::diagnostic(),
         attach_self_probe,
         uretprobe_seccomp_check,
-        uprobe_multi_check,
+        || uprobe_multi_check(host),
     )
 }
 
@@ -682,14 +906,8 @@ fn bpf_checks_with_seccomp<T>(
             "unavailable: shared capture setup refused; active probe skipped",
         )
     });
-    checks.push(if setup_succeeded {
-        multi()
-    } else {
-        not_applicable(
-            "uprobe-multi attach (own libc)",
-            "unavailable: shared capture setup refused; active probe skipped",
-        )
-    });
+    // The independent scratch proof is needed even if full capture setup fails.
+    checks.push(multi());
     checks
 }
 
@@ -767,6 +985,9 @@ fn uretprobe_seccomp_check() -> Check {
                 crate::uretprobe_hazard::PrivilegeFacts::current(),
             )
         )),
+        // A broken observer build was never assessed: fail with the plain
+        // gate message, not an unknown-kernel warning.
+        crate::uretprobe_hazard::KernelVerdict::FlavorMismatch(why) => Status::Fail(why),
     };
     Check {
         name: "uretprobe vs seccomp".to_string(),
@@ -777,83 +998,25 @@ fn uretprobe_seccomp_check() -> Check {
 /// Resolve the anchor (own libc, else own entry point), then give the
 /// concrete link to Session.
 fn attach_self_probe(session: &mut crate::attach::Session) -> Result<(), String> {
-    let (anchor_path, offset) = self_probe_anchor()?;
+    let (anchor_path, offset) = self_probe_anchor().map_err(|error| format!("{error:#}"))?;
     session
         .attach_diagnostic_probe(&anchor_path, offset)
         .map_err(|e| format!("{e:#}"))?;
     session.detach_producers().map_err(|e| format!("{e:#}"))
 }
 
-/// Functional uprobe-multi probe: loads the mapless scratch program and
-/// self-links it at the anchor the singles row uses, then drops the link
-/// (drop = detach; the no-op program is safe even if it fired). Never
-/// `Fail`: multi is optional with a singles fallback, so the row reports
-/// Ok / Warn / NotApplicable only, stays out of the capability tier, and
-/// its name deliberately avoids the `uprobe attach` capture-row prefix.
-fn uprobe_multi_check() -> Check {
-    let status = match uprobe_multi_self_link() {
-        Ok(linked) => linked,
-        Err(unavailable) => Status::NotApplicable(unavailable),
-    };
+/// The required host fact is the same bounded load/self-link used by capture.
+/// It does not measure entry or return delivery.
+fn uprobe_multi_check(host: crate::attach::MultiHostVerdict) -> Check {
     Check {
-        name: "uprobe-multi attach (own libc)".to_string(),
-        status,
-    }
-}
-
-/// Runs the scratch self-link: the anchor plus a scratch-program load
-/// plus one single-offset link to this process. Returns the row status,
-/// or the reason the probe itself could not run.
-fn uprobe_multi_self_link() -> Result<Status, String> {
-    let (path, offset) =
-        self_probe_anchor().map_err(|error| format!("self-probe anchor unavailable: {error}"))?;
-    let prog = match p11scope_bpf_multi::prog_load_scratch_multi() {
-        Ok(prog) => prog,
-        Err(error) => {
-            return Ok(Status::Warn(format!(
-                "scratch program load failed ({error}); multi availability unproven"
-            )));
-        }
-    };
-    let link = p11scope_bpf_multi::attach_group(
-        prog.as_raw_fd(),
-        std::process::id(),
-        &path,
-        &[offset],
-        &[1],
-        false,
-    );
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|release| release.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    // The link fd drops here: detach before the row returns.
-    Ok(multi_self_link_status(link.map(|_| ()), &release))
-}
-
-/// Classifies the scratch self-link outcome. Pure over the link result
-/// and the kernel release so the EINVAL rule is unit-testable: link
-/// errors that prove an incapable kernel are NotApplicable (the auto
-/// backend stays on singles); anything unexpected is Warn, never Fail.
-fn multi_self_link_status(link: Result<(), std::io::Error>, release: &str) -> Status {
-    match link {
-        Ok(()) => Status::Ok("self-link attached and detached".to_string()),
-        Err(error) => {
-            let errno = error.raw_os_error();
-            if errno.is_some_and(p11scope_bpf_multi::is_unsupported_kernel_errno) {
-                Status::NotApplicable(format!(
-                    "kernel lacks uprobe-multi ({error}); static probes use per-offset links"
-                ))
-            } else if errno == Some(libc::EINVAL) && !crate::attach::multi_allowed_on(release) {
-                Status::NotApplicable(format!(
-                    "kernel {release} predates the 6.9 multi floor ({error}); \
-                     static probes use per-offset links"
-                ))
-            } else {
-                Status::Warn(format!(
-                    "self-link failed ({error}); the auto backend tries multi and falls back per run"
-                ))
-            }
-        }
+        name: UPROBE_MULTI_ROW.to_string(),
+        status: match host {
+            Ok(_) => Status::Ok(
+                "scratch program loaded; self-link attached and detached (delivery unmeasured)"
+                    .into(),
+            ),
+            Err(refusal) => Status::Fail(refusal.to_string()),
+        },
     }
 }
 
@@ -995,18 +1158,19 @@ fn libc_path_in_maps(bytes: &[u8]) -> Option<PathBuf> {
 /// at `getpid`, else the observer's own entry point (static builds, which
 /// map no libc). Either site only proves attach works — the probe is dropped
 /// immediately without ever firing.
-pub(crate) fn self_probe_anchor() -> Result<(PathBuf, u64), String> {
+pub(crate) fn self_probe_anchor() -> Result<(PathBuf, u64)> {
     if let Ok(libc) = own_libc_path() {
         let file =
-            std::fs::File::open(&libc).map_err(|e| format!("open {}: {e}", libc.display()))?;
-        let offset = p11scope_manifest::elf::symbol_file_offset(&file, "getpid")?
-            .ok_or_else(|| format!("getpid not exported by {}", libc.display()))?;
+            std::fs::File::open(&libc).with_context(|| format!("open {}", libc.display()))?;
+        let offset = p11scope_manifest::elf::symbol_file_offset(&file, "getpid")
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("getpid not exported by {}", libc.display()))?;
         return Ok((libc, offset));
     }
-    let exe = std::fs::read_link("/proc/self/exe").map_err(|e| format!("/proc/self/exe: {e}"))?;
-    let file = std::fs::File::open(&exe).map_err(|e| format!("open {}: {e}", exe.display()))?;
-    let offset = p11scope_manifest::elf::entry_file_offset(&file)?.ok_or_else(|| {
-        format!(
+    let exe = std::fs::read_link("/proc/self/exe").context("/proc/self/exe")?;
+    let file = std::fs::File::open(&exe).with_context(|| format!("open {}", exe.display()))?;
+    let offset = p11scope_manifest::elf::entry_file_offset(&file).map_err(anyhow::Error::msg)?.ok_or_else(|| {
+        anyhow::anyhow!(
             "entry point outside every loaded segment of {}; a stripped static build has no anchor",
             exe.display()
         )
@@ -1259,6 +1423,13 @@ fn status_detail(status: &Status) -> &str {
 fn is_capture_row(name: &str) -> bool {
     name == "BPF map create"
         || name == "host program preflight"
+        // `inventory --system` needs the Inventory object: its load row
+        // gates the exit code with the other capture rows.
+        || name == INVENTORY_PREFLIGHT_ROW
+        // A flavor mismatch fails the object row, and no capture lane can
+        // work then, so it gates the exit code with the other capture rows.
+        || name == "object-attribute capture"
+        || name == UPROBE_MULTI_ROW
         || name.starts_with("uprobe attach")
 }
 
@@ -1307,7 +1478,7 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
     classify_capability_tier(CapabilityTierInput {
         // Deliberately not `row_ok("kernel release")`. That row compares
         // `uname` against a floor, and a version number is a proxy for the
-        // capability, while the three rows below are the capability itself:
+        // capability; the required functional rows below test the operations:
         // they create a map, load every program, and attach a real uprobe.
         // RHEL 9 reports 5.14 with the cookie and perf-link support
         // backported, and was measured attaching 136/136 probes while this
@@ -1316,7 +1487,8 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
         // rows, so nothing is lost by trusting them instead.
         host_attach: row_ok("BPF map create")
             && row_ok(UPROBE_ATTACH_SELF_ROW)
-            && row_ok("host program preflight"),
+            && row_ok("host program preflight")
+            && row_ok(UPROBE_MULTI_ROW),
         target_readable,
         lifecycle: row_ok("lifecycle preflight"),
         // A requested --pid lane refused for its PID namespace is not a
@@ -1340,10 +1512,48 @@ fn capability_tier_line(capability: CapabilityTierResult) -> String {
     )
 }
 
+/// The inventory part of the verdict line names the failure's reason, not
+/// the BPF map the loader happened to attempt first: aya drains its map
+/// table (a per-process `HashMap`) in an unspecified order, so two runs
+/// on one host fail on different maps for the same refusal. Backticked
+/// spans carry those unstable map names; the per-row diagnostic keeps
+/// them, while the verdict drops them and stays categorical. The output
+/// is always shorter than the input, so the row's bound still holds.
+fn verdict_inventory_reason(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(open) = rest.find('`') {
+        let (head, tail) = rest.split_at(open);
+        let Some(close) = tail[1..].find('`') else {
+            // Unbalanced backtick: keep the remainder verbatim.
+            out.push_str(rest);
+            rest = "";
+            break;
+        };
+        let after = &tail[1 + close + 1..];
+        // Drop a space left dangling before ':' or the end, so
+        // "create map `X`:" reads "create map:".
+        let head = head
+            .strip_suffix(' ')
+            .filter(|_| after.starts_with(':') || after.is_empty())
+            .unwrap_or(head);
+        out.push_str(head);
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn verdict_line(checks: &[Check]) -> String {
-    let capture_ok = !checks
-        .iter()
-        .any(|c| is_capture_row(&c.name) && matches!(c.status, Status::Fail(_)));
+    // The inventory lane gets its own part below: an inventory-only
+    // failure must not read as "capture unavailable" when the Detailed
+    // lanes work. Exit gating is unchanged (`verdict` still counts the
+    // inventory row as a requested lane).
+    let capture_ok = !checks.iter().any(|c| {
+        is_capture_row(&c.name)
+            && c.name != INVENTORY_PREFLIGHT_ROW
+            && matches!(c.status, Status::Fail(_))
+    });
     let mut parts = vec![format!(
         "capture {}",
         if capture_ok {
@@ -1352,6 +1562,14 @@ fn verdict_line(checks: &[Check]) -> String {
             "unavailable"
         }
     )];
+    if let Some(check) = checks.iter().find(|c| c.name == INVENTORY_PREFLIGHT_ROW)
+        && let Status::Fail(detail) = &check.status
+    {
+        parts.push(format!(
+            "inventory capture unavailable ({})",
+            verdict_inventory_reason(detail)
+        ));
+    }
 
     if let Some(check) = checks.iter().find(|c| is_scan_row(&c.name)) {
         match &check.status {
@@ -1400,12 +1618,174 @@ fn verdict_line(checks: &[Check]) -> String {
     format!("verdict: {}", parts.join("; "))
 }
 
-/// Pads `name` to 34 columns with dots and prints `ok` / `warn` / `FAIL` /
-/// `n/a` followed by the detail (when there is one), then a final
-/// `verdict:` line naming what is available. Pure: takes the probe result,
-/// returns the text, so the layout is testable without any probe running.
+fn is_requested_lane(name: &str) -> bool {
+    is_capture_row(name)
+        || is_target_row(name)
+        || is_scan_row(name)
+        || is_cgroup_row(name)
+        || is_run_capture_row(name)
+        || is_pid_namespace_row(name)
+}
+
+/// Explain the existing requested-lane verdict and capability tier before the
+/// diagnostic rows. This is pure over probe results; missing rows cannot prove
+/// a target or scope ready, and copy does not change qualification or exits.
+pub fn summary(checks: &[Check], extra_strict: bool) -> String {
+    summary_with_host(checks, extra_strict, None)
+}
+
+/// The summary with the typed host verdict: the Next step for the
+/// uprobe-multi row comes from the typed probe refusal, never from
+/// re-parsing the rendered row text. Without a typed verdict (callers
+/// with synthetic checks) no kernel-age claim is made.
+fn summary_with_host(
+    checks: &[Check],
+    extra_strict: bool,
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
+    let assessed = checks.iter().any(|check| {
+        is_requested_lane(&check.name) && !matches!(check.status, Status::NotApplicable(_))
+    });
+    let conclusion = if extra_strict && verdict_extra_strict(checks) != 0 {
+        "extra-strict qualification refused"
+    } else if !assessed {
+        "no requested lanes assessed"
+    } else if extra_strict {
+        "extra-strict qualification passed"
+    } else if verdict(checks) == 0 {
+        "requested-lane checks passed"
+    } else {
+        "requested lane unavailable"
+    };
+    let mut out = format!("Doctor: {conclusion}.\n");
+    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
+    let assessment = |name: &str| match checks
+        .iter()
+        .find(|check| check.name == name)
+        .map(|check| &check.status)
+    {
+        Some(Status::Ok(_)) => "available",
+        Some(Status::Warn(_) | Status::Fail(_)) => "unavailable",
+        Some(Status::NotApplicable(_)) | None => "unassessed",
+    };
+    let target = assessment("target readability");
+    let scope = if checks
+        .iter()
+        .any(|check| is_pid_namespace_row(&check.name) && matches!(check.status, Status::Fail(_)))
+    {
+        "unavailable"
+    } else {
+        match assessment("cgroup path") {
+            "unavailable" => "unavailable",
+            _ => assessment("scope preflight"),
+        }
+    };
+    let _ = writeln!(out, "Target: {target}.\nScope: {scope}.");
+    let problem = if extra_strict {
+        extra_strict_violations(checks).first().copied()
+    } else {
+        checks
+            .iter()
+            .find(|check| is_requested_lane(&check.name) && matches!(check.status, Status::Fail(_)))
+            .or_else(|| {
+                checks
+                    .iter()
+                    .find(|check| matches!(check.status, Status::Warn(_)) && !is_build_limit(check))
+            })
+    };
+    let next = match problem {
+        Some(check) => next_step_with_host(check, host),
+        None if scope == "unassessed" =>
+            "choose --pid <PID> or --cgroup <PATH> to assess a target scope".into(),
+        None => "choose a capture mode with p11scope profile --help; these checks do not prove provider activity".into(),
+    };
+    let _ = writeln!(out, "Next: {}.", crate::render::escape_controls(&next));
+    out
+}
+
+/// The Next step with the typed host verdict. Only a probe refusal that
+/// proves the kernel itself lacks Multi names a Multi host; every other
+/// Multi refusal falls through to the generic guidance below, and the
+/// loads that ran ahead of it keep their own rows.
+fn next_step_with_host(check: &Check, host: Option<crate::attach::MultiHostVerdict>) -> String {
+    if check.name == UPROBE_MULTI_ROW
+        && matches!(host, Some(Err(refusal)) if refusal.is_premulti_kernel())
+    {
+        return "use a host with uprobe-multi (normally Linux 6.6+) for live capture; \
+                p11scope inspect --pid <PID> works here without live capture"
+            .into();
+    }
+    next_step(check)
+}
+
+fn next_step(check: &Check) -> String {
+    let detail = status_detail(&check.status);
+    // These suffixes come from the existing independent EPERM classifier.
+    // Seccomp mode or CapEff alone must never select a causal recommendation.
+    if detail.ends_with("(origin: controlled seccomp denial)") {
+        return "review the specific denied operation in the launcher seccomp policy".into();
+    }
+    if detail.ends_with("(origin: missing required capability)") {
+        return "review the required capabilities for the failed operation".into();
+    }
+    if is_pid_namespace_row(&check.name) {
+        return "use an observer in the initial PID namespace with a matching /proc view".into();
+    }
+    if is_cgroup_row(&check.name) || check.name == "cgroup version" {
+        return "choose a cgroup v2 directory with cgroup.procs and check access to it".into();
+    }
+    if is_target_row(&check.name) || is_scan_row(&check.name) {
+        if detail == "generation unavailable" {
+            return "verify the target is live and readable, then rerun p11scope doctor --pid <PID>".into();
+        }
+        if ["generation changed", "ESRCH", "ENOENT"]
+            .iter()
+            .any(|cause| detail.contains(cause))
+        {
+            return "select a live target and rerun p11scope doctor --pid <PID>".into();
+        }
+        return "check access to the target's maps, memory, root and provider files; rerun p11scope doctor --pid <PID>".into();
+    }
+    if detail.contains("EPERM") || detail.contains("Operation not permitted") {
+        return "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges".into();
+    }
+    if is_capture_row(&check.name)
+        && ["unsupported", "not supported", "ENOSYS", "EOPNOTSUPP"]
+            .iter()
+            .any(|cause| detail.contains(cause))
+    {
+        return "use a host with the required BPF/uprobe support; check the failed feature below"
+            .into();
+    }
+    if detail.contains("verifier:") {
+        return "review the verifier diagnostic and use a build supported by this kernel".into();
+    }
+    format!(
+        "review {} in the checks below before retrying qualification or capture",
+        check.name
+    )
+}
+
+/// Summary first, then every diagnostic row and the unchanged lane verdict.
+/// Pure: no probe or lookup runs while formatting.
 pub fn render(checks: &[Check]) -> String {
-    let mut out = String::new();
+    render_with_mode(checks, false)
+}
+
+fn render_with_host(checks: &[Check], host: crate::attach::MultiHostVerdict) -> String {
+    render_with_mode_and_host(checks, false, Some(host))
+}
+
+fn render_with_mode(checks: &[Check], extra_strict: bool) -> String {
+    render_with_mode_and_host(checks, extra_strict, None)
+}
+
+fn render_with_mode_and_host(
+    checks: &[Check],
+    extra_strict: bool,
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
+    let mut out = summary_with_host(checks, extra_strict, host);
     for check in checks {
         let dots = NAME_WIDTH.saturating_sub(check.name.chars().count());
         let word = status_word(&check.status);
@@ -1422,7 +1802,6 @@ pub fn render(checks: &[Check]) -> String {
         }
         out.push('\n');
     }
-    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
     let _ = writeln!(out, "{}", verdict_line(checks));
     out
 }
@@ -1453,10 +1832,15 @@ pub fn verdict(checks: &[Check]) -> i32 {
 /// No host can clear them, so `--extra-strict` — a host qualification —
 /// lists them without counting them (HIGH-5). Only these exact by-design
 /// values are exempt: any other value (a future catalog) counts as usual.
-const BUILD_LIMIT_ROWS: [(&str, &[&str]); 3] = [
+const BUILD_LIMIT_ROWS: [(&str, &[&str]); 5] = [
     ("loader timing (initial_set)", &["unproven", "none"]),
     ("loader timing (dlopen)", &["unproven", "none"]),
     ("run initial-set capture", &["none"]),
+    ("object-attribute capture", &[OBJECT_CAPTURE_P0]),
+    // A build that omits the production journal object (`P11SCOPE_JOURNAL=0`,
+    // or a SMALL, WIDE or unsafe build) reports this one token on every
+    // host; only this exact value is exempt.
+    (JOURNAL_PAIR_ROW, &[JOURNAL_UNAVAILABLE_IN_BUILD]),
 ];
 
 fn is_build_limit(check: &Check) -> bool {
@@ -1494,7 +1878,14 @@ pub fn verdict_extra_strict(checks: &[Check]) -> i32 {
 /// labels, never target-controlled bytes, so the refusal line cannot be
 /// forged the way a detail could (F-59).
 pub fn render_extra_strict(checks: &[Check]) -> String {
-    let mut out = render(checks);
+    render_extra_strict_with_host(checks, None)
+}
+
+fn render_extra_strict_with_host(
+    checks: &[Check],
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
+    let mut out = render_with_mode_and_host(checks, true, host);
     let violations = extra_strict_violations(checks);
     let exempt: Vec<&str> = checks
         .iter()
@@ -1527,21 +1918,119 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
     out
 }
 
+/// Counter-mode capability footer for `p11scope doctor`: one line naming
+/// bpf_loop (helper 181) support. A footer, not a table row: the probed-row
+/// contract (pinned count, tier inputs, verdict gates) stays unchanged
+/// because this capability gates only counter preparation, never ordinary
+/// capture. The old-kernel refusal names the same token the footer carries.
+pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> String {
+    match verdict {
+        crate::attach::BpfLoopVerdict::Available => {
+            if cfg!(p11scope_counter_objects) {
+                "counter modes: available (counts, timestamps, latency; subject to the kernel verifier accepting the counter programs; the kernel provides bpf_loop (helper 181))\n"
+                    .to_string()
+            } else {
+                "counter modes: not enabled in this build (the kernel provides bpf_loop (helper 181))\n"
+                    .to_string()
+            }
+        }
+        crate::attach::BpfLoopVerdict::Unavailable(reason) => {
+            format!("counter modes: counter-mode-unavailable-on-kernel ({reason})\n")
+        }
+        crate::attach::BpfLoopVerdict::Unknown(reason) => {
+            format!("counter modes: {reason}\n")
+        }
+    }
+}
+
+/// Counter-mode line with load-preflight verdicts (one per mode,
+/// `Ok(())` when the object loads and releases). A proven named
+/// refusal (the old-kernel token or the memory-limit preflight)
+/// replaces the availability sentence, as does any other load failure
+/// with its mode and text: only a clean all-modes load keeps an
+/// availability sentence.
+pub(crate) fn counter_modes_footer_with_preflight(
+    verdict: &crate::attach::BpfLoopVerdict,
+    preflight: Option<&[(p11scope_ebpf_common::CounterMode, Result<(), String>)]>,
+) -> String {
+    if let (crate::attach::BpfLoopVerdict::Available, Some(loads)) = (verdict, preflight)
+        && cfg!(p11scope_counter_objects)
+    {
+        if let Some((_, Err(refusal))) = loads.iter().find(|(_, result)| {
+            result.as_ref().is_err_and(|s| {
+                s.starts_with("counter-mode-") || s.starts_with("counter-memory-limit")
+            })
+        }) {
+            return format!("counter modes: {refusal}\n");
+        }
+        // A failed load that is not a proven refusal still names its
+        // mode and failure: falling back to the "available" sentence here
+        // hid a real gate-1 load error behind "subject to the kernel
+        // verifier".
+        if let Some((mode, Err(failure))) = loads.iter().find(|(_, result)| result.is_err()) {
+            return format!("counter modes: {}: {failure}\n", mode.name());
+        }
+        if loads.iter().all(|(_, result)| result.is_ok()) {
+            return "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181); counter objects load on this kernel)\n"
+                .to_string();
+        }
+    }
+    counter_modes_footer(verdict)
+}
+
+fn counter_modes_for_host(
+    host: crate::attach::MultiHostVerdict,
+    loop_probe: impl FnOnce() -> crate::attach::BpfLoopVerdict,
+    mut object_preflight: impl FnMut(p11scope_ebpf_common::CounterMode) -> Result<(), String>,
+) -> String {
+    if let Err(refusal) = host {
+        return format!("counter modes: {refusal}\n");
+    }
+    let loop_probe = loop_probe();
+    let loads;
+    let preflight = if matches!(loop_probe, crate::attach::BpfLoopVerdict::Available)
+        && cfg!(p11scope_counter_objects)
+    {
+        loads = [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ]
+        .map(|mode| (mode, object_preflight(mode)));
+        Some(loads.as_slice())
+    } else {
+        None
+    };
+    counter_modes_footer_with_preflight(&loop_probe, preflight)
+}
+
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
 /// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
 /// render names every violating row; otherwise the default gated verdict
-/// applies and the render is unchanged.
+/// applies. Both modes put the matching conclusion before the checks.
 ///
 /// The table is written without `print!`: a reader that went away
 /// (`p11scope doctor | head`, EPIPE) must not turn the verdict into a panic
 /// (HIGH-4), so a broken pipe still exits with the verdict code.
 pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Result<i32> {
-    let checks = probe(pid, cgroup);
-    let (text, code) = if extra_strict {
-        (render_extra_strict(&checks), verdict_extra_strict(&checks))
+    let host = crate::attach::require_multi_capable_host();
+    let checks = probe_with_host(pid, cgroup, host);
+    let (mut text, code) = if extra_strict {
+        (
+            render_extra_strict_with_host(&checks, Some(host)),
+            verdict_extra_strict(&checks),
+        )
     } else {
-        (render(&checks), verdict(&checks))
+        (render_with_host(&checks, host), verdict(&checks))
     };
+    // The preflight loads each counter object and releases it without
+    // attaching; only a proven bpf_loop host can answer, and omitted
+    // builds refuse at the probe sentence.
+    text.push_str(&counter_modes_for_host(
+        host,
+        crate::attach::kernel_bpf_loop_probe,
+        crate::attach::counter_banks::counter_object_preflight,
+    ));
     write_report(&mut std::io::stdout().lock(), &text)?;
     Ok(code)
 }
@@ -1579,7 +2068,7 @@ mod tests {
             },
         );
         assert_eq!(active_calls, 0);
-        assert_eq!(multi_calls, 0);
+        assert_eq!(multi_calls, 1);
         assert_eq!(verdict(&checks), 1);
         let seccomp = checks
             .iter()
@@ -1589,8 +2078,7 @@ mod tests {
         assert!(status_detail(&seccomp.status).contains("shared capture setup refused"));
         let multi = checks.last().unwrap();
         assert_eq!(multi.name, "uprobe-multi attach (own libc)");
-        assert!(matches!(multi.status, Status::NotApplicable(_)));
-        assert!(status_detail(&multi.status).contains("shared capture setup refused"));
+        assert!(matches!(multi.status, Status::Ok(_)));
     }
 
     #[test]
@@ -1641,52 +2129,375 @@ mod tests {
     }
 
     #[test]
-    fn multi_self_link_classification_proves_or_defers_never_fails() {
-        assert_eq!(
-            multi_self_link_status(Ok(()), "7.0.0"),
-            Status::Ok("self-link attached and detached".into())
-        );
-        for errno in [libc::ENOTSUP, libc::EOPNOTSUPP] {
-            let status =
-                multi_self_link_status(Err(std::io::Error::from_raw_os_error(errno)), "7.0.0");
-            assert!(
-                matches!(status, Status::NotApplicable(_)),
-                "errno {errno} proves an incapable kernel"
-            );
-            assert!(status_detail(&status).contains("per-offset links"));
-        }
-        // EINVAL on an old kernel is the unknown attach type: incapable.
-        let status = multi_self_link_status(
-            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-            "5.15.0",
-        );
-        assert!(matches!(status, Status::NotApplicable(_)));
-        assert!(status_detail(&status).contains("predates the 6.9 multi floor"));
-        // EINVAL past the floor is unexpected: warn, the runtime falls back.
-        let status = multi_self_link_status(
-            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-            "6.9.0",
-        );
-        assert!(matches!(status, Status::Warn(_)));
-        assert!(status_detail(&status).contains("falls back per run"));
-        // Anything else (EPERM, EMFILE, ...) warns too, never fails.
-        for errno in [libc::EPERM, libc::EACCES, libc::EMFILE] {
-            let status =
-                multi_self_link_status(Err(std::io::Error::from_raw_os_error(errno)), "7.0.0");
-            assert!(matches!(status, Status::Warn(_)), "errno {errno}");
+    fn required_multi_row_preserves_typed_refusals_and_limited_positive() {
+        use crate::attach::{MultiCapableHost, MultiHostRefusal, MultiHostStage};
+        let check = uprobe_multi_check(Ok(MultiCapableHost::for_test()));
+        let Status::Ok(detail) = check.status else {
+            panic!("positive fact must be reported")
+        };
+        assert!(detail.contains("self-link attached and detached"));
+        assert!(detail.contains("delivery unmeasured"));
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, libc::EACCES),
+            (MultiHostStage::SelfLink, libc::EPERM),
+            (MultiHostStage::SelfLink, libc::EOPNOTSUPP),
+            (MultiHostStage::SelfLink, libc::EINVAL),
+        ] {
+            let refusal = MultiHostRefusal::for_test(stage, Some(errno));
+            let check = uprobe_multi_check(Err(refusal));
+            assert_eq!(check.status, Status::Fail(refusal.to_string()));
+            assert_eq!(verdict(&[check]), 1);
         }
     }
 
     #[test]
-    fn multi_row_is_neither_capture_nor_tier() {
-        assert!(!is_capture_row("uprobe-multi attach (own libc)"));
-        assert_eq!(
-            verdict(&[Check {
-                name: "uprobe-multi attach (own libc)".into(),
-                status: Status::Warn("controlled".into()),
-            }]),
-            0
+    fn counter_footer_requires_host_before_helper_or_mode_preflights() {
+        use crate::attach::{BpfLoopVerdict, MultiCapableHost, MultiHostRefusal, MultiHostStage};
+        for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+            let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+            let line = counter_modes_for_host(
+                Err(refusal),
+                || panic!("helper probe after refused host"),
+                |_| panic!("counter object load after refused host"),
+            );
+            assert_eq!(line, format!("counter modes: {refusal}\n"));
+        }
+        let line = counter_modes_for_host(
+            Ok(MultiCapableHost::for_test()),
+            || BpfLoopVerdict::Unavailable("helper control refused".into()),
+            |_| panic!("mode preflight without its helper"),
         );
+        assert!(line.contains("counter-mode-unavailable-on-kernel"));
+        assert!(!line.contains("uprobe-multi-required"));
+    }
+
+    /// Twin of `doctor_runs_capture_loads_unless_the_kernel_itself_lacks_multi`:
+    /// a probe shape that proves the kernel itself lacks Multi (the
+    /// observed 6.1 scratch-link refusal, an explicit unsupported answer,
+    /// or a load refusal for the unknown attach type) skips every
+    /// capture-object load with the named token, keeps the same rows,
+    /// and never reads as ready.
+    #[test]
+    fn doctor_skips_capture_loads_on_known_premulti_shapes_and_stays_not_ready() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        for (stage, errno, cause) in [
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EINVAL),
+                "Multi capability unproven",
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EINVAL),
+                "Multi capability unproven",
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EOPNOTSUPP),
+                "Multi capability unavailable",
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EOPNOTSUPP),
+                "Multi capability unavailable",
+            ),
+        ] {
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            assert!(refusal.is_premulti_kernel(), "{refusal}");
+            assert!(!capture_loads_assessed(Err(refusal)), "{refusal}");
+            let stage_word = match stage {
+                MultiHostStage::Anchor => "self-probe anchor",
+                MultiHostStage::ProgramLoad => "scratch program load",
+                MultiHostStage::SelfLink => "scratch self-link",
+            };
+            let multi_detail = expected_multi_detail(stage_word, cause, errno, None);
+            let bpf = premulti_bpf_checks(Err(refusal));
+            let healthy = bpf_checks_with_seccomp(
+                Ok(()),
+                |_| Ok(()),
+                || not_applicable("uretprobe vs seccomp", "controlled"),
+                || uprobe_multi_check(Err(refusal)),
+            );
+            let names = |rows: &[Check]| rows.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+            assert_eq!(
+                names(&bpf),
+                names(&healthy),
+                "same rows as the loading path"
+            );
+            let preflight = premulti_preflight_checks(
+                true,
+                journal_pair_check(crate::attach::JournalPairPreflight::Available),
+            );
+            assert_eq!(
+                names(&preflight),
+                [
+                    "host program preflight",
+                    INVENTORY_PREFLIGHT_ROW,
+                    JOURNAL_PAIR_ROW,
+                    "lifecycle preflight",
+                    "scope preflight",
+                ]
+            );
+            for check in bpf.iter().chain(&preflight) {
+                match check.name.as_str() {
+                    UPROBE_MULTI_ROW => {
+                        assert_eq!(check.status, Status::Fail(multi_detail.clone()));
+                    }
+                    JOURNAL_PAIR_ROW => {
+                        assert_eq!(check.status, Status::Ok("available".into()));
+                    }
+                    _ => {
+                        let Status::NotApplicable(detail) = &check.status else {
+                            panic!("{} must be skipped: {:?}", check.name, check.status)
+                        };
+                        assert!(detail.contains("uprobe-multi-required"), "{detail}");
+                    }
+                }
+            }
+            let unscoped = premulti_preflight_checks(
+                false,
+                journal_pair_check(crate::attach::JournalPairPreflight::Available),
+            );
+            assert_eq!(
+                unscoped.last().unwrap().status,
+                Status::NotApplicable("no requested scope".into())
+            );
+            let mut checks = vec![Check {
+                name: "kernel release".into(),
+                status: Status::Ok("6.1.188".into()),
+            }];
+            checks.extend(bpf);
+            checks.extend(preflight);
+            assert_eq!(verdict(&checks), 1, "{refusal}");
+            assert_eq!(capability_tier(&checks).tier, CapabilityTier::T0);
+            // The typed render names a Multi host, in both modes; the
+            // untyped render of the same rows must not invent that claim
+            // from the row text alone.
+            let text = render_with_host(&checks, Err(refusal));
+            assert_eq!(
+                text.lines().next(),
+                Some("Doctor: requested lane unavailable."),
+                "{text}"
+            );
+            assert!(
+                verdict_line(&checks).contains("capture unavailable"),
+                "{text}"
+            );
+            let next = text
+                .lines()
+                .find(|line| line.starts_with("Next: "))
+                .unwrap();
+            assert_eq!(next, format!("Next: {PREMULTI_KERNEL_NEXT}."), "{text}");
+            let strict = render_extra_strict_with_host(&checks, Some(Err(refusal)));
+            let next = strict
+                .lines()
+                .find(|line| line.starts_with("Next: "))
+                .unwrap();
+            assert_eq!(next, format!("Next: {PREMULTI_KERNEL_NEXT}."), "{strict}");
+            let untyped = render(&checks);
+            assert!(
+                !untyped.contains("Linux 6.6"),
+                "untyped render must not claim a kernel age: {untyped}"
+            );
+        }
+    }
+
+    /// The exact Multi-row detail for one probe shape: cause and stage
+    /// words plus the libc errno text, the Denied operation sentence when
+    /// present, and the shared offline-pointer tail.
+    fn expected_multi_detail(
+        stage: &str,
+        cause: &str,
+        errno: Option<i32>,
+        operation: Option<&str>,
+    ) -> String {
+        let mut detail = format!("uprobe-multi-required: {cause} at {stage}");
+        if let Some(errno) = errno {
+            detail.push_str(&format!(
+                " (errno {errno}: {})",
+                std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        if let Some(operation) = operation {
+            detail.push_str(&format!("; cannot {operation}; live capture requires root or appropriate capabilities and a permitting host policy (for example, sudo)"));
+        }
+        detail.push_str("; run `p11scope doctor` for host readiness or `p11scope doctor --pid <n>` for target readiness; `p11scope inspect --pid <n>` lists readable mapped providers without live capture");
+        detail
+    }
+
+    /// The Next step for a Multi row that carries no kernel-age claim.
+    const GENERIC_MULTI_NEXT: &str = "review uprobe-multi attach (own libc) in the checks below before retrying qualification or capture";
+    /// The Next step for a Multi row whose errno names a permission failure.
+    const UNCLASSIFIED_DENIAL_NEXT: &str = "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges";
+    /// The Next step for a probe refusal that proves a pre-Multi kernel.
+    const PREMULTI_KERNEL_NEXT: &str = "use a host with uprobe-multi (normally Linux 6.6+) for live capture; p11scope inspect --pid <PID> works here without live capture";
+
+    /// Twin of the skip test: permission, resource and ENOSYS probe states
+    /// (at any stage) run the capture-object loads as before, and the Next
+    /// step for the Multi row never claims a newer kernel.
+    #[test]
+    fn doctor_runs_capture_loads_unless_the_kernel_itself_lacks_multi() {
+        use crate::attach::{MultiCapableHost, MultiHostRefusal, MultiHostStage};
+        assert!(capture_loads_assessed(Ok(MultiCapableHost::for_test())));
+        for (stage, errno, cause, operation, next) in [
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EACCES),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::Anchor,
+                Some(libc::EPERM),
+                "Multi capability unproven",
+                None,
+                UNCLASSIFIED_DENIAL_NEXT,
+            ),
+            (
+                MultiHostStage::Anchor,
+                Some(libc::EACCES),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EPERM),
+                "Multi probe denied by permission or policy",
+                Some("load p11scope's BPF programs"),
+                UNCLASSIFIED_DENIAL_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EPERM),
+                "Multi probe denied by permission or policy",
+                Some("attach p11scope's required Multi probe"),
+                UNCLASSIFIED_DENIAL_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EACCES),
+                "Multi probe denied by permission or policy",
+                Some("attach p11scope's required Multi probe"),
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EMFILE),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::ENOMEM),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::ENOSYS),
+                "Multi capability unavailable",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::ENOSYS),
+                "Multi capability unavailable",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::Anchor,
+                None,
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+        ] {
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            assert!(!refusal.is_premulti_kernel(), "{refusal}");
+            assert!(capture_loads_assessed(Err(refusal)), "{refusal}");
+            let multi = uprobe_multi_check(Err(refusal));
+            assert_eq!(multi.name, UPROBE_MULTI_ROW);
+            let stage_word = match stage {
+                MultiHostStage::Anchor => "self-probe anchor",
+                MultiHostStage::ProgramLoad => "scratch program load",
+                MultiHostStage::SelfLink => "scratch self-link",
+            };
+            assert_eq!(
+                multi.status,
+                Status::Fail(expected_multi_detail(stage_word, cause, errno, operation)),
+                "{refusal}"
+            );
+            assert_eq!(
+                next_step_with_host(&multi, Some(Err(refusal))),
+                next,
+                "{refusal}"
+            );
+            assert!(
+                !next_step(&multi).contains("Linux 6.6"),
+                "untyped Next must not claim a kernel age: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_host_refusal_gates_live_tier_and_exit_without_a_version_gate() {
+        let mut checks = vec![
+            Check {
+                name: "kernel release".into(),
+                status: Status::Warn("5.14 with a working backport".into()),
+            },
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: UPROBE_ATTACH_SELF_ROW.into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "host program preflight".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "target readability".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "lifecycle preflight".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "scope preflight".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "uprobe-multi attach (own libc)".into(),
+                status: Status::Ok("self-link only".into()),
+            },
+        ];
+        assert_eq!(capability_tier(&checks).tier, CapabilityTier::T4);
+        assert_eq!(verdict(&checks), 0);
+        for reason in [
+            "unavailable",
+            "permission or policy denied",
+            "unproven probe",
+        ] {
+            checks.last_mut().unwrap().status =
+                Status::Fail(format!("uprobe-multi-required: {reason}"));
+            assert_eq!(verdict(&checks), 1, "{reason}");
+            assert_eq!(
+                capability_tier(&checks).tier,
+                CapabilityTier::T0,
+                "{reason}"
+            );
+            assert!(verdict_line(&checks).contains("capture unavailable"));
+        }
     }
 
     #[test]
@@ -1803,6 +2614,10 @@ mod tests {
             name: "host program preflight".into(),
             status: Status::Ok("available".into()),
         });
+        checks.push(Check {
+            name: "uprobe-multi attach (own libc)".into(),
+            status: Status::Ok("self-link proven".into()),
+        });
         // Host attach works, target unassessed: T1, not T0 offline.
         assert_eq!(capability_tier(&checks).tier, CapabilityTier::T1);
 
@@ -1895,11 +2710,8 @@ mod tests {
 
     #[test]
     fn a_backported_kernel_below_the_floor_is_not_forced_offline() {
-        // RHEL 9 and its rebuilds report 5.14 with cookies and the perf link
-        // backported. Measured on CentOS Stream 9 (5.14.0-741.el9): every
-        // capability probe passes and a real capture attaches 136/136 probes,
-        // while the "kernel release" row warns about the 5.15 floor. Letting
-        // that row veto the tier reported T0 offline for a host that works.
+        // A synthetic working Multi backport qualifies independently of its
+        // low release label; this is not a claim about a stock old kernel.
         let row = |name: &str, status: Status| Check {
             name: name.to_string(),
             status,
@@ -1907,7 +2719,7 @@ mod tests {
         let checks = vec![
             row(
                 "kernel release",
-                Status::Warn("5.14.0-741.el9.x86_64 is below the documented floor 5.15".into()),
+                Status::Ok("5.14.0 with a working Multi backport; informational".into()),
             ),
             row("BPF map create", Status::Ok("created".into())),
             row(
@@ -1915,6 +2727,10 @@ mod tests {
                 Status::Ok("attached and detached".into()),
             ),
             row("host program preflight", Status::Ok("available".into())),
+            row(
+                "uprobe-multi attach (own libc)",
+                Status::Ok("self-link proven".into()),
+            ),
             row("lifecycle preflight", Status::Ok("available".into())),
             row("scope preflight", Status::NotApplicable("no scope".into())),
         ];
@@ -2002,6 +2818,10 @@ mod tests {
 
         let mut operational = vec![
             Check {
+                name: "uprobe-multi attach (own libc)".into(),
+                status: Status::Ok("self-link proven".into()),
+            },
+            Check {
                 name: "kernel release".into(),
                 status: Status::Ok(String::new()),
             },
@@ -2050,6 +2870,10 @@ mod tests {
     #[test]
     fn host_lifecycle_survives_requested_scope_failure() {
         let checks = vec![
+            Check {
+                name: "uprobe-multi attach (own libc)".into(),
+                status: Status::Ok("self-link proven".into()),
+            },
             Check {
                 name: "kernel release".into(),
                 status: Status::Ok(String::new()),
@@ -2186,6 +3010,163 @@ mod tests {
         assert!(!diagnostic.contains('\u{fffd}'));
     }
 
+    /// The doctor names the build's object-capture scope: enabled in
+    /// FULL builds, a by-design warning in P0 (stub) builds that
+    /// extra-strict qualification excuses (no host can clear it).
+    /// OD33/R-50: v0.5.0 reads attributes but reports key operations
+    /// only from 0.6.0, so the OK detail says so.
+    #[test]
+    fn object_capture_check_matches_build() {
+        let check = object_capture_check();
+        assert_eq!(check.name, "object-attribute capture");
+        // The session reports the bytes it was set up with; the row must
+        // agree with those same bytes.
+        let available = !crate::attach::embedded_object_is_stubbed();
+        match available {
+            true => assert_eq!(
+                check.status,
+                Status::Ok("enabled (read only; key operations are reported from 0.6.0)".into()),
+                "{check:?}"
+            ),
+            false => {
+                assert!(matches!(check.status, Status::Warn(_)), "{check:?}");
+                assert!(is_build_limit(&check), "{check:?}");
+                let checks = vec![check];
+                assert!(extra_strict_violations(&checks).is_empty());
+            }
+        }
+    }
+
+    /// A planted flavor mismatch fails the object-capture row with the
+    /// same reason capture setup refuses with, and extra-strict counts
+    /// it. Fails while the row derives the flavor from the feature.
+    #[test]
+    fn object_capture_check_fails_on_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let check = object_capture_check();
+        assert_eq!(check.name, "object-attribute capture");
+        let Status::Fail(detail) = &check.status else {
+            panic!(
+                "mismatched flavor must Fail the row, got {:?}",
+                check.status
+            );
+        };
+        assert!(detail.contains("stale or mismatched"), "{detail}");
+        assert!(detail.contains("FULL"), "{detail}");
+        assert!(detail.contains("P0"), "{detail}");
+        assert!(!extra_strict_violations(&[check]).is_empty());
+    }
+
+    /// Twin of the stub-direction row test: a planted unsafe-decoder
+    /// disagreement fails the object-capture row with the same reason
+    /// capture setup refuses with, naming the unsafe feature. Fails while
+    /// the row derives the flavor from the feature, or maps only the
+    /// stub direction to `Fail`.
+    #[test]
+    fn object_capture_check_fails_on_unsafe_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let check = object_capture_check();
+        assert_eq!(check.name, "object-attribute capture");
+        let Status::Fail(detail) = &check.status else {
+            panic!(
+                "mismatched unsafe decoders must Fail the row, got {:?}",
+                check.status
+            );
+        };
+        assert!(detail.contains("stale or mismatched"), "{detail}");
+        assert!(detail.contains("unsafe-unvalidated-metadata"), "{detail}");
+        assert!(!extra_strict_violations(&[check]).is_empty());
+    }
+
+    /// A flavor mismatch exits nonzero through the object-attribute capture
+    /// row itself: the row's `Fail` gates the verdict without needing a
+    /// preflight row beside it. Fails while the row is not a capture row.
+    #[test]
+    fn object_capture_mismatch_alone_exits_nonzero() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        {
+            let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+            let check = object_capture_check();
+            assert!(matches!(check.status, Status::Fail(_)), "{check:?}");
+            assert_eq!(verdict(&[check]), 1);
+        }
+        let check = object_capture_check();
+        assert!(
+            matches!(check.status, Status::Ok(_) | Status::Warn(_)),
+            "{check:?}"
+        );
+        assert_eq!(verdict(&[check]), 0);
+    }
+
+    /// The uretprobe row fails (not warns) on a flavor mismatch with the
+    /// plain gate message: the build is broken, so the kernel was never
+    /// assessed. Fails while the mismatch classifies as an unknown kernel.
+    #[test]
+    fn uretprobe_row_fails_on_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let check = uretprobe_seccomp_check();
+        assert_eq!(check.name, "uretprobe vs seccomp");
+        let Status::Fail(detail) = &check.status else {
+            panic!(
+                "a flavor mismatch must Fail the row, got {:?}",
+                check.status
+            );
+        };
+        assert!(detail.contains("stale or mismatched"), "{detail}");
+    }
+
+    /// A budget refusal names its cause: E2BIG through preflight formats
+    /// as a verifier-budget refusal with the bounded log excerpt.
+    #[test]
+    fn preflight_budget_refusal_names_cause() {
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new("BPF program is too large".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("loading p11_entry");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert!(rendered.contains("verifier budget refused"), "{rendered}");
+        assert!(rendered.contains("E2BIG"), "{rendered}");
+        assert!(rendered.contains("BPF program is too large"), "{rendered}");
+    }
+
+    /// Log-exhaustion twin at the doctor seam: an ENOSPC budget refusal
+    /// routes to the budget row and names ENOSPC, never E2BIG.
+    #[test]
+    fn preflight_budget_refusal_names_log_exhaustion() {
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+            verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("loading p11_entry");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert!(
+            rendered.contains(
+                "verifier log filled during a very long check (ENOSPC); usually the complexity limit"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("verifier budget refused"), "{rendered}");
+        assert!(rendered.contains("ENOSPC"), "{rendered}");
+        assert!(!rendered.contains("(E2BIG)"), "{rendered}");
+        assert!(rendered.contains("truncated verifier dump"), "{rendered}");
+    }
+
     #[test]
     fn wrapped_program_load_error_keeps_named_context_and_bounded_verifier_log() {
         let error = ProgramError::LoadError {
@@ -2196,7 +3177,7 @@ mod tests {
         let rendered = format_preflight_error(wrapped.as_ref());
         assert_eq!(
             rendered,
-            r"loading required typed task_newtask: verifier: denied\u{1b}[2J"
+            r"loading required typed task_newtask: BPF_PROG_LOAD failed with EPERM (os error 1); verifier: denied\u{1b}[2J"
         );
         assert!(!rendered.contains("Operation not permitted"));
 
@@ -2209,6 +3190,58 @@ mod tests {
         assert!(rendered.contains(" [middle omitted] "));
         assert!(rendered.ends_with('é'));
         assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn preflight_names_errno_for_non_budget_load_refusals() {
+        // The budget arm names its errno; any other load refusal must name
+        // its errno too, not just the verifier excerpt.
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EACCES),
+            verifier_log: aya_obj::VerifierLog::new("R1 invalid mem access".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("loading p11_entry");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert!(
+            rendered.contains("BPF_PROG_LOAD failed with EACCES (os error 13); "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("R1 invalid mem access"), "{rendered}");
+    }
+
+    /// A nested map-creation refusal renders once: aya's outer
+    /// `EbpfError::MapError` Display (`map error: {0}`) already contains
+    /// the inner `MapError` Display, so joining the whole chain must not
+    /// print the `failed to create map` phrase twice. The row keeps
+    /// the map name; only the repeat goes.
+    #[test]
+    fn preflight_skips_chain_fragments_already_present() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EPERM))
+            .context("failed to create map `DISCOVERY`")
+            .context("map error: failed to create map `DISCOVERY`")
+            .context("loading fresh Inventory object with exact capacity")
+            .context("preparing Inventory: LoadObject");
+        let rendered = format_preflight_error(error.as_ref());
+        assert_eq!(
+            rendered,
+            "preparing Inventory: LoadObject: loading fresh Inventory object with exact capacity: \
+             map error: failed to create map `DISCOVERY`: Operation not permitted (os error 1)"
+        );
+    }
+
+    #[test]
+    fn preflight_names_numeric_errno_when_name_unknown() {
+        // Errnos outside the short-name table stay numeric rather than
+        // losing the failure's identity.
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EIO),
+            verifier_log: aya_obj::VerifierLog::new("i/o hiccup".to_string()),
+        };
+        let rendered = format_preflight_error(anyhow::Error::new(error).as_ref());
+        assert!(
+            rendered.contains("BPF_PROG_LOAD failed with os error 5; "),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2227,10 +3260,11 @@ mod tests {
             &checks.iter().find(|c| c.name == name).unwrap().status
         }
         let checks = probe(None, None);
-        // 13 host/target rows, eight §10.1 rows, three finite preflight rows,
-        // the cgroup version row, the uprobe-multi self-link row, and the
-        // PID namespace row.
-        assert_eq!(checks.len(), 27, "{checks:?}");
+        // 13 host/target rows, eight §10.1 rows, five finite preflight rows
+        // (host, inventory, journal pair, lifecycle, scope), the cgroup
+        // version row, the uprobe-multi self-link row, the PID namespace
+        // row, and the object-attribute capture build row.
+        assert_eq!(checks.len(), 30, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),
@@ -2262,6 +3296,279 @@ mod tests {
                 "{name} was not requested and must not Fail"
             );
         }
+    }
+
+    #[test]
+    fn probe_reports_the_inventory_object_load_row() {
+        let checks = probe(None, None);
+        let row = checks
+            .iter()
+            .find(|c| c.name == "inventory program preflight")
+            .unwrap_or_else(|| panic!("inventory preflight row is missing: {checks:?}"));
+        // Host state decides Ok vs Fail (unprivileged CI legitimately
+        // fails the BPF rows); what's invariant is the host row is
+        // assessed, never NotApplicable.
+        assert!(
+            matches!(row.status, Status::Ok(_) | Status::Fail(_)),
+            "unexpected status: {row:?}"
+        );
+    }
+
+    /// Journal-pair honesty: every non-loaded shape of the pair fact
+    /// reports "unavailable" with a finite reason, never "available".
+    /// Only an actually present, flavor-clean pair reports available.
+    #[test]
+    fn journal_pair_unavailable_shapes_never_report_available() {
+        use crate::attach::JournalPairPreflight;
+        for (shape, needle) in [
+            (
+                JournalPairPreflight::PairMissing("p11_entry_journal, p11_return_journal".into()),
+                "pair missing",
+            ),
+            (
+                JournalPairPreflight::LoadError("journal object unparseable".into()),
+                "load error",
+            ),
+            (
+                JournalPairPreflight::WrongDomain("ordinary roots present".into()),
+                "wrong domain",
+            ),
+        ] {
+            let check = journal_pair_check(shape);
+            assert_eq!(check.name, JOURNAL_PAIR_ROW);
+            let detail = status_detail(&check.status);
+            assert!(
+                detail.starts_with("unavailable"),
+                "must report unavailable, got {detail:?}"
+            );
+            assert_ne!(detail, "available");
+            assert!(
+                detail.contains(needle),
+                "finite reason names its shape: {detail:?}"
+            );
+            assert!(
+                matches!(check.status, Status::Warn(_)),
+                "an opt-in lane warns, never fails the verdict: {check:?}"
+            );
+        }
+        let check = journal_pair_check(JournalPairPreflight::Available);
+        assert_eq!(check.status, Status::Ok("available".into()));
+        // A build that omits the production journal object reports the
+        // one build-limit token: identical on every host, so it never
+        // becomes an extra-strict qualification violation.
+        let check = journal_pair_check(JournalPairPreflight::UnavailableInBuild);
+        assert_eq!(check.status, Status::Warn("unavailable-in-build".into()));
+        assert!(
+            extra_strict_violations(std::slice::from_ref(&check)).is_empty(),
+            "the omitted-build row is a build limit, not a host defect"
+        );
+    }
+
+    /// The journal row is preflight only: present in every probe, but
+    /// never a requested/capture lane, so neither its Ok nor its Warn
+    /// can move the verdict or the exit code.
+    #[test]
+    fn journal_pair_row_is_preflight_only_and_never_gates() {
+        let checks = probe(None, None);
+        let row = checks
+            .iter()
+            .find(|c| c.name == JOURNAL_PAIR_ROW)
+            .unwrap_or_else(|| panic!("journal pair row is missing: {checks:?}"));
+        assert!(
+            matches!(row.status, Status::Ok(_) | Status::Warn(_)),
+            "assessed on every host, never Fail or NotApplicable: {row:?}"
+        );
+        assert!(!is_capture_row(JOURNAL_PAIR_ROW));
+        assert!(!is_requested_lane(JOURNAL_PAIR_ROW));
+        // Doctor success alone changes no verdict: an available journal
+        // row beside a failed capture row still exits 1, and an
+        // unavailable journal row beside healthy rows still exits 0.
+        let healthy = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("available".into()),
+            },
+            Check {
+                name: JOURNAL_PAIR_ROW.into(),
+                status: Status::Warn("unavailable-in-build".into()),
+            },
+        ];
+        assert_eq!(verdict(&healthy), 0);
+        let refused = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Fail("denied".into()),
+            },
+            Check {
+                name: JOURNAL_PAIR_ROW.into(),
+                status: Status::Ok("available".into()),
+            },
+        ];
+        assert_eq!(verdict(&refused), 1);
+    }
+
+    /// The reported fact comes from the actual load inputs, not a
+    /// build flag: ordinary embedded bytes miss the pair by name,
+    /// garbage bytes refuse as a load error, and this build's live
+    /// preflight agrees with its embedded journal selection.
+    #[test]
+    fn journal_pair_preflight_derives_from_actual_object_bytes() {
+        use crate::attach::JournalPairPreflight;
+        for bytes in [b"not an ELF object".as_slice(), b""] {
+            assert!(
+                matches!(
+                    crate::attach::journal_pair_preflight_from_bytes(bytes),
+                    JournalPairPreflight::LoadError(_)
+                ),
+                "unparseable bytes are a load error"
+            );
+        }
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        match crate::attach::journal_pair_preflight_from_parsed(&ordinary) {
+            JournalPairPreflight::PairMissing(names) => {
+                assert!(names.contains("p11_entry_journal"), "{names}");
+                assert!(names.contains("p11_return_journal"), "{names}");
+            }
+            other => panic!("ordinary bytes must miss the pair, got {other:?}"),
+        }
+        if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+            assert!(matches!(
+                crate::attach::journal_pair_preflight(),
+                JournalPairPreflight::Available
+            ));
+            // A planted ordinary root is the wrong program domain even
+            // though both journal roots are present.
+            let mut mixed = aya_obj::Object::parse(crate::attach::journal::journal_object())
+                .expect("journal bytes parse");
+            let program = mixed
+                .programs
+                .values()
+                .next()
+                .expect("journal bytes carry programs")
+                .clone();
+            mixed.programs.insert("p11_entry".to_string(), program);
+            assert!(matches!(
+                crate::attach::journal_pair_preflight_from_parsed(&mixed),
+                JournalPairPreflight::WrongDomain(_)
+            ));
+        } else {
+            assert!(matches!(
+                crate::attach::journal_pair_preflight(),
+                JournalPairPreflight::UnavailableInBuild
+            ));
+        }
+    }
+
+    #[test]
+    fn inventory_preflight_failure_fails_the_requested_lane_verdict() {
+        let row = |name: &str, status: Status| Check {
+            name: name.into(),
+            status,
+        };
+        let mut checks = vec![
+            row("BPF map create", Status::Ok("available".into())),
+            row("host program preflight", Status::Ok("available".into())),
+            row(
+                "inventory program preflight",
+                Status::Fail(
+                    "verifier budget refused the program (E2BIG); verifier: denied".into(),
+                ),
+            ),
+        ];
+        assert_eq!(verdict(&checks), 1);
+        assert_eq!(
+            verdict_line(&checks),
+            "verdict: capture available; inventory capture unavailable \
+             (verifier budget refused the program (E2BIG); verifier: denied)"
+        );
+        assert_eq!(
+            render(&checks).lines().next(),
+            Some("Doctor: requested lane unavailable.")
+        );
+        checks[2].status = Status::Ok("available".into());
+        assert_eq!(verdict(&checks), 0);
+        assert!(
+            !verdict_line(&checks).contains("inventory capture"),
+            "{}",
+            verdict_line(&checks)
+        );
+    }
+
+    #[test]
+    fn verdict_names_inventory_failure_beside_host_failure() {
+        // Twin: when the host lanes fail too, the verdict names both the
+        // capture failure and the inventory lane's own reason. The exit
+        // gating is unchanged: any failed requested lane exits 1.
+        let row = |name: &str, status: Status| Check {
+            name: name.into(),
+            status,
+        };
+        let checks = vec![
+            row("BPF map create", Status::Ok("available".into())),
+            row(
+                "host program preflight",
+                Status::Fail(
+                    "BPF_PROG_LOAD failed with EPERM (os error 1); verifier: denied".into(),
+                ),
+            ),
+            row(
+                "inventory program preflight",
+                Status::Fail(
+                    "verifier budget refused the program (E2BIG); verifier: denied".into(),
+                ),
+            ),
+        ];
+        assert_eq!(verdict(&checks), 1);
+        assert_eq!(
+            verdict_line(&checks),
+            "verdict: capture unavailable; inventory capture unavailable \
+             (verifier budget refused the program (E2BIG); verifier: denied)"
+        );
+    }
+
+    /// The verdict's inventory part stays categorical across loader runs:
+    /// aya drains its map table (a per-process `HashMap`) in an
+    /// unspecified order, so the same EPERM names `DISCOVERY` in one run
+    /// and `STACK_GUARD` in the next. The verdict drops the backticked
+    /// map name; the per-row diagnostic keeps it.
+    #[test]
+    fn verdict_inventory_part_drops_unstable_map_names() {
+        let row = |name: &str, status: Status| Check {
+            name: name.into(),
+            status,
+        };
+        let detail = |map: &str| {
+            format!(
+                "preparing Inventory: LoadObject: loading fresh Inventory object with exact capacity: \
+                 map error: failed to create map `{map}`: Operation not permitted (os error 1)"
+            )
+        };
+        let line = |map: &str| {
+            verdict_line(&[
+                row("BPF map create", Status::Ok("available".into())),
+                row("host program preflight", Status::Ok("available".into())),
+                row("inventory program preflight", Status::Fail(detail(map))),
+            ])
+        };
+        assert_eq!(line("DISCOVERY"), line("STACK_GUARD"));
+        assert!(
+            line("DISCOVERY").contains(
+                "inventory capture unavailable (preparing Inventory: LoadObject: \
+                 loading fresh Inventory object with exact capacity: map error: \
+                 failed to create map: Operation not permitted (os error 1))"
+            ),
+            "{}",
+            line("DISCOVERY")
+        );
+        // Details without a map name pass through untouched.
+        assert_eq!(
+            verdict_inventory_reason(
+                "verifier budget refused the program (E2BIG); verifier: denied"
+            ),
+            "verifier budget refused the program (E2BIG); verifier: denied"
+        );
+        // An unbalanced backtick keeps the remainder verbatim.
+        assert_eq!(verdict_inventory_reason("broken `map"), "broken `map");
     }
 
     // ---- Slice 1b-2 doctor contract (design §10.1) ------------------------
@@ -2507,8 +3814,20 @@ mod tests {
     /// still names them, so nothing is hidden.
     #[test]
     fn extra_strict_passes_a_capable_host_whatever_this_build_cannot_prove() {
+        use crate::fixture_guard::DieWithParent as _;
+
+        // Probe a small owned child, not this test binary: the live checks
+        // snapshot the target executable, and instrumented builds exceed
+        // the object limit. The host loader is the same either way.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let mut checks = capable_host_environment_rows();
-        checks.extend(live_discovery_checks(Some(std::process::id()), true));
+        checks.extend(live_discovery_checks(Some(child.id()), true));
+        child.kill().unwrap();
+        child.wait().unwrap();
         let names = |checks: &[Check]| {
             extra_strict_violations(checks)
                 .iter()
@@ -2690,7 +4009,7 @@ mod tests {
         // DR-RETRO-PIDNS-2: a /proc with no entry for this observer fails
         // the row for every scope, saying every capture except inventory
         // --system is refused (inventory --system warns and carries the
-        // pid namespace gap instead: inventory.rs lets that scope
+        // pid namespace gap instead: inventory/mod.rs lets that scope
         // through, run.rs refuses every classic scope by name).
         let unserved = PidNumbering {
             observer: ObserverPidNs::Unknown("gone".into()),
@@ -2738,6 +4057,7 @@ mod tests {
             ok_row("lifecycle preflight"),
             ok_row("scope preflight"),
             pid_namespace_check(&PidNumbering::agreeing(), true),
+            ok_row("uprobe-multi attach (own libc)"),
         ];
         assert_eq!(verdict(&checks), 0);
         assert_eq!(capability_tier(&checks).tier, CapabilityTier::T4);
@@ -2909,8 +4229,172 @@ mod tests {
             "detail must survive escaped on its own row: {out:?}"
         );
         assert!(
-            out.lines().count() == 3,
-            "one check must render exactly one row + tier + verdict: {out:?}"
+            out.lines().count() == 7,
+            "one check must render five summary lines + one row + verdict: {out:?}"
+        );
+    }
+
+    #[test]
+    fn counter_modes_footer_names_availability_per_verdict() {
+        use crate::attach::BpfLoopVerdict;
+        // Builds without embedded counter objects (WIDE, SMALL) keep the
+        // not-enabled line; the ordinary build names the modes available.
+        let available_marker = if cfg!(p11scope_counter_objects) {
+            "counter modes: available"
+        } else {
+            "not enabled in this build"
+        };
+        for (verdict, marker) in [
+            (BpfLoopVerdict::Available, available_marker),
+            (
+                BpfLoopVerdict::Unavailable("test old kernel".into()),
+                "counter-mode-unavailable-on-kernel",
+            ),
+            (
+                BpfLoopVerdict::Unknown("test no privilege".into()),
+                "test no privilege",
+            ),
+        ] {
+            let line = counter_modes_footer(&verdict);
+            assert!(line.starts_with("counter modes: "), "{line:?}");
+            assert!(line.ends_with('\n'), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+            assert!(line.contains(marker), "{line:?}");
+        }
+        // The Available line states the kernel fact behind the verdict.
+        assert!(
+            counter_modes_footer(&BpfLoopVerdict::Available)
+                .contains("the kernel provides bpf_loop (helper 181)")
+        );
+
+        // The refusal token appears only on proven absence.
+        assert!(
+            !counter_modes_footer(&BpfLoopVerdict::Available)
+                .contains("counter-mode-unavailable-on-kernel")
+        );
+        assert!(
+            !counter_modes_footer(&BpfLoopVerdict::Unknown("x".into()))
+                .contains("counter-mode-unavailable-on-kernel")
+        );
+        // The ordinary build names every available mode.
+        if cfg!(p11scope_counter_objects) {
+            let line = counter_modes_footer(&BpfLoopVerdict::Available);
+            for mode in ["counts", "timestamps", "latency"] {
+                assert!(line.contains(mode), "{line:?}");
+            }
+            // The Available line scopes the claim: the kernel verifier
+            // still has to accept the counter programs (6.1 rejects them).
+            assert!(
+                line.contains("subject to the kernel verifier accepting the counter programs"),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_modes_footer_with_preflight_reports_load_verdicts() {
+        use crate::attach::BpfLoopVerdict;
+        use p11scope_ebpf_common::CounterMode;
+        let loads = |results: [Result<(), String>; 3]| {
+            [
+                CounterMode::Counts,
+                CounterMode::Timestamps,
+                CounterMode::Latency,
+            ]
+            .into_iter()
+            .zip(results)
+            .collect::<Vec<_>>()
+        };
+        let oks = loads([Ok(()), Ok(()), Ok(())]);
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&oks));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.contains("counter objects load on this kernel"),
+                "{line:?}"
+            );
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        // A proven old-kernel token replaces the availability sentence.
+        let refused = loads([
+            Err("counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)".to_string()),
+            Ok(()),
+            Ok(()),
+        ]);
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&refused));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: counter-mode-unavailable-on-kernel:"),
+                "{line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // A proven memory-limit refusal replaces the sentence too.
+        let capped = loads([
+            Err("counter-memory-limit: mode latency P 256 fixed 1 bytes per-bank 2 bytes affordable ceiling 3 endpoints (requested 4)".to_string()),
+            Ok(()),
+            Ok(()),
+        ]);
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&capped));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: counter-memory-limit:"),
+                "{line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // An unproven load failure names its mode and itself instead of
+        // falling back to the "available" sentence (C1: the fallback hid
+        // a real gate-1 load error behind the probe sentence).
+        let unproven = loads([
+            Err("counter object load failed (Operation not permitted (os error 1))".to_string()),
+            Ok(()),
+            Ok(()),
+        ]);
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: counts: counter object load failed ("),
+                "{line:?}"
+            );
+            assert!(!line.contains("available"), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // The named mode is the failed one, not always the first.
+        let unproven_late = loads([
+            Ok(()),
+            Err("counter object load failed (broken)".to_string()),
+            Ok(()),
+        ]);
+        let line =
+            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven_late));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: timestamps: counter object load failed ("),
+                "{line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // Other verdicts ignore the preflight.
+        assert_eq!(
+            counter_modes_footer_with_preflight(
+                &BpfLoopVerdict::Unavailable("test old kernel".into()),
+                Some(&oks)
+            ),
+            counter_modes_footer(&BpfLoopVerdict::Unavailable("test old kernel".into()))
+        );
+        assert_eq!(
+            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, None),
+            counter_modes_footer(&BpfLoopVerdict::Available)
         );
     }
 }

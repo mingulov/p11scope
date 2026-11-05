@@ -4,6 +4,7 @@
 pub mod attribution;
 pub(crate) mod caller_registry;
 pub(crate) mod confirm_shards;
+pub(crate) mod elf_needed;
 pub mod engine;
 pub mod hooks;
 pub mod identity;
@@ -13,11 +14,28 @@ pub mod identity;
 pub(crate) mod instances;
 pub(crate) mod inventory_attach_set;
 pub mod inventory_workload;
+// D3b custody substrate; production backend selection follows in D3c/D3d.
+#[allow(dead_code)]
+pub(crate) mod kernel_identity;
 pub(crate) mod loader;
+// L1 staged loader-lifetime token/generation model (G16). Production
+// allocation stays on loader.rs's refusal path until L2/L3 land atomically;
+// L3's Engine acknowledgement wires the retirement/fence API.
+#[allow(dead_code)]
+pub(crate) mod loader_lifetime;
+// T-L3 staged Engine acknowledgement endpoints (6.09b). No production
+// callers until activation; the driver is exercised by its own RED suite.
+#[allow(dead_code)]
+pub(crate) mod loader_ack;
 pub(crate) mod native_binding;
 pub mod noise;
+pub(crate) mod overlay_witness;
 pub(crate) mod pause;
 pub(crate) mod proof_stats;
+// Z2 retained-member custody substrate; the Task 3 N1 confirm-path routing
+// is its first consumer (remove once it consumes the whole surface).
+#[allow(dead_code)]
+pub(crate) mod retained_member;
 pub mod scan;
 pub(crate) mod scheduler;
 pub(crate) mod sweep_attribution;

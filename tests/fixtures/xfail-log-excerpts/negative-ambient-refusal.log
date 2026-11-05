@@ -1,0 +1,13 @@
+# verbatim excerpt of the real REFUSED log (loaded host; must match no signature)
+
+running 1 test
+test discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head ... t8: fixtures built (head linkage: static)
+  [...]
+thread 'discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head' (3639334) panicked at src/discovery/pressure_native_tests.rs:3351:5:
+t8-live256: REFUSED: ambient EXECs in the burst batch ([3639524, 3639525, 3639594, 3639596]); rerun in a quiet window
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 20.53s

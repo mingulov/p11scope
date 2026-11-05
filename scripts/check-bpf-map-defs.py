@@ -255,10 +255,10 @@ class Btf:
                        fields.get("max_entries", 0), fields.get("map_flags", 0)), size
 
 
-def decode_btf_maps(elf):
+def decode_btf_maps(elf, *, decoder_class=Btf):
     if ".BTF" not in elf.sections:
         raise RuntimeError("native .maps missing .BTF")
-    btf = Btf(elf.sections[".BTF"][1])
+    btf = decoder_class(elf.sections[".BTF"][1])
     sections = [n for n in btf.types[1:] if n[0] == 15 and n[1] == ".maps"]
     if len(sections) != 1:
         raise RuntimeError("missing/duplicate .maps BTF DATASEC")
@@ -356,6 +356,63 @@ def decode_btf_maps(elf):
     return maps
 
 
+def decode_journal_native_maps(elf):
+    """Journal-only `.maps` decode matched by symbol name.
+
+    The journal link leaves the trailing native DATASEC entries at
+    offset zero (the ELF symbols carry the true offsets), so the
+    DATASEC-offset cross-check in decode_btf_maps cannot apply. This
+    decoder instead requires a one-to-one name match between BTF VARs
+    and `.maps` symbols, contiguous symbol coverage of the section,
+    and a valid map definition per VAR; the DATASEC must name exactly
+    the same set.
+    """
+    if ".BTF" not in elf.sections:
+        raise RuntimeError("native .maps missing .BTF")
+    btf = Btf(elf.sections[".BTF"][1])
+    row, raw = elf.sections[".maps"]
+    if row[1] != 1 or not raw or any(raw):
+        raise RuntimeError("unsupported native map section size/content")
+    objects = {}
+    for name, info, other, section, offset, size in elf.symbols:
+        if section != elf.indices[".maps"] or info & 15 == 3:
+            continue
+        if info not in (1, 0x11) or other != 0 or not name or name in objects:
+            raise RuntimeError("duplicate/unsupported native map symbol")
+        objects[name] = (offset, size)
+    by_name = {}
+    for node in btf.types[1:]:
+        if node[0] != 14 or node[1] not in objects:
+            continue
+        if node[1] in by_name or node[5][0] not in (0, 1):
+            raise RuntimeError("invalid/duplicate journal BTF VAR")
+        by_name[node[1]] = node
+    if set(by_name) != set(objects):
+        raise RuntimeError("journal VAR/symbol name mismatch")
+    sections = [node for node in btf.types[1:] if node[0] == 15 and node[1] == ".maps"]
+    if len(sections) != 1:
+        raise RuntimeError("missing/duplicate journal .maps BTF DATASEC")
+    declared = set()
+    for i in range(sections[0][3]):
+        var = btf.resolve(sections[0][5][i * 3])
+        if var[0] != 14:
+            raise RuntimeError("journal DATASEC entry is not VAR")
+        declared.add(var[1])
+    if declared != set(objects):
+        raise RuntimeError("journal DATASEC names differ from map symbols")
+    maps = {}
+    cursor = 0
+    for name, (offset, size) in sorted(objects.items(), key=lambda item: item[1][0]):
+        definition, struct_size = btf.map_definition(by_name[name][2])
+        if offset != cursor or offset % 8 or size != struct_size or size > len(raw) - offset:
+            raise RuntimeError("journal map bounds/coverage mismatch")
+        cursor += size
+        maps[name] = definition
+    if cursor != len(raw):
+        raise RuntimeError("journal map incomplete coverage/extra symbol")
+    return maps
+
+
 def decode_map_definitions(records, section, data):
     objects = sorted(
         (offset, size, name)
@@ -391,15 +448,42 @@ REQUIRED_GLOBAL_HELPERS = frozenset({
 })
 REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_lease", "p11_owner_refund"})
 REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
+OBJECT_CAPTURE_GLOBAL_HELPERS = frozenset({
+    "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell",
+})
+REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
+# 6.14 Option B: exec-time exe-file identity. Outside the no-argument
+# p11_exec_ global namespace: this helper needs two out-word pointers.
+REQUIRED_GLOBAL_EXE_HELPERS = frozenset({"p11_exe_identity"})
+REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS = frozenset({"p11_link_current_cookie"})
+# H8-D post-attach birth marker (Detailed and journal): the exec half
+# publishes READY after closure, the gap half dirties on refused calls.
+# Counter and inventory objects carry neither these globals nor the
+# control map.
+REQUIRED_GLOBAL_MARKER_HELPERS = frozenset({
+    "p11_instance_exec_birth", "p11_instance_scope_gap",
+})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
-    "p11_owner_start_insert", "p11_owner_start_remove", "p11_owner_discovery_get",
+    "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove", "p11_owner_discovery_get",
     "p11_owner_discovery_insert", "p11_owner_discovery_remove",
 })
 REQUIRED_LOCAL_ROOT_HELPERS = frozenset({
     "p11_root_propagate_thread", "p11_root_current_tag", "p11_root_current_exit",
 })
 OPTIONAL_LOCAL_OWNER_HELPERS = frozenset({"p11_owner_healthy"})
+# The journal object swaps the plain START removal for the reason-bearing
+# one (exported, so the journal roots can settle with a cause) and keeps
+# the current-owner lookup its transaction core calls.
+JOURNAL_LOCAL_OWNER_HELPERS = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_remove"}
+                                | {"p11_owner_current"})
+JOURNAL_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_start_remove_reason"})
+# The journal transaction boundary: the four exported native producers.
+# Only the journal object defines them.
+JOURNAL_GLOBAL_PRODUCERS = frozenset({
+    "p11_journal_begin", "p11_journal_returning",
+    "p11_journal_settle_prepare", "p11_journal_settle_finish",
+})
 EXACT_PROGRAM_SECTIONS = {
     "task_newtask": "tp_btf/task_newtask",
     "sched_process_exec": "raw_tp/sched_process_exec",
@@ -407,7 +491,30 @@ EXACT_PROGRAM_SECTIONS = {
     "p11_inst_vma_map": "fentry/uprobe_mmap",
     "p11_inst_vma_unmap": "fentry/uprobe_munmap",
     "p11_inst_vma_copy": "fexit/copy_vma",
+    "p11_inst_vma_retcopy": "fexit/copy_vma",
+    "p11_image_exec_release": "fentry/exec_mm_release",
+    "p11_image_mmap_release": "fexit/exec_mmap",
+    "p11_image_query": "iter/task",
+    "p11_selected_bootstrap": "iter/task",
+    "p11_selected_cgroup_migrate": "fentry/cgroup_migrate",
 }
+
+SELECTED_GLOBAL_HELPERS = frozenset({"p11_selected_current_allowed"})
+CALLER_PROGRAM_SECTIONS = {"p11_inventory_image_baseline": "iter/task"}
+SELECTED_PROGRAMS = {"p11_selected_bootstrap", "p11_selected_cgroup_migrate"}
+SELECTED_MAPS = frozenset({"SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL"})
+
+
+def has_selected(names):
+    """True when an object participates in the selected contract.
+
+    Decoder fixtures predate the selected gate and carry neither its
+    code nor its maps; shipped Detailed objects always carry both
+    (still pinned by the frozen inventory). Presence selects enforcement,
+    the same way owner/exec/ia32 validators skip objects that lack
+    their subsystem.
+    """
+    return any(name.startswith("p11_selected_") or name in SELECTED_MAPS for name in names)
 
 DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
     "p11_decode_params",
@@ -417,12 +524,19 @@ DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
 
 
 def validate_private_helpers(elf, prefix, required, optional, label,
-                             global_helpers=frozenset(), required_map=None, inventory=False):
+                             global_helpers=frozenset(), required_map=None, inventory=False,
+                             global_result_bytes=4, global_param_kinds=(),
+                             global_proto_overrides=None):
     """Verify exact native helper linkage, metadata, calls and map boundaries.
 
     Pointer-taking owner APIs stay LOCAL/STATIC; only the supplied scalar owner
     boundaries may be GLOBAL. Healthy alone may disappear after inlining. Do
     not retain dummy bodies or admit arbitrary clones/attachment targets.
+    A nonempty global_param_kinds tuple replaces the no-argument global
+    rule with an exact parameter-kind list (BTF kind per parameter).
+    global_proto_overrides maps one global name to its own
+    (result_bytes, param_kinds) pair, for boundaries whose arity differs
+    from the uniform rule.
     """
     owners = [s for s in elf.symbols if s[0].startswith(prefix)]
     production = any(s[0] in EXACT_PROGRAM_SECTIONS or s[0] in REQUIRED_GLOBAL_HELPERS
@@ -447,10 +561,19 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
             raise RuntimeError(f"{label} helper {name} has invalid/empty body")
     # Stage A hooks link into Detailed objects only; inventory flavors keep
-    # file-level semantics without them (as task_newtask).
+    # file-level semantics without them (as task_newtask). Selected programs
+    # are required only of objects that participate in the selected contract;
+    # decoder fixtures predate that gate.
+    selected = has_selected(symbol[0] for symbol in elf.symbols)
     for name, location in EXACT_PROGRAM_SECTIONS.items():
+        if name in SELECTED_PROGRAMS and not selected:
+            continue
         if inventory and name in ("task_newtask", "p11_inst_vma_map",
-                                  "p11_inst_vma_unmap", "p11_inst_vma_copy"):
+                                  "p11_inst_vma_unmap", "p11_inst_vma_copy",
+                                  "p11_inst_vma_retcopy",
+                                  "p11_image_exec_release", "p11_image_mmap_release",
+                                  "p11_image_query",
+                                  "p11_selected_bootstrap", "p11_selected_cgroup_migrate"):
             continue
         matches = [s for s in elf.symbols if s[0] == name]
         if (len(matches) != 1 or matches[0][1] != 0x12 or matches[0][2] != 0
@@ -478,7 +601,32 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if name in global_helpers:
             proto = btf.types[node[2]]
             scalar = btf.resolve(proto[2])
-            if proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != 4:
+            override = (global_proto_overrides or {}).get(name)
+            if override is not None:
+                result_bytes, kinds = override
+                params = proto[5]
+                if (proto[3] != len(kinds)
+                        or len(params) != 2 * len(kinds)
+                        or scalar[0] != 1 or scalar[2] != result_bytes
+                        or any(btf.resolve(params[2 * i + 1])[0] != kind
+                               for i, kind in enumerate(kinds))):
+                    raise RuntimeError(
+                        f"{label} helper {name} requires the exact documented FUNC_PROTO"
+                    )
+            elif global_param_kinds:
+                params = proto[5]
+                # Lengths first: resolving runs only when the arity
+                # already matches, so a short proto fails, never
+                # indexes out of range.
+                if (proto[3] != len(global_param_kinds)
+                        or len(params) != 2 * len(global_param_kinds)
+                        or scalar[0] != 1 or scalar[2] != global_result_bytes
+                        or any(btf.resolve(params[2 * i + 1])[0] != kind
+                               for i, kind in enumerate(global_param_kinds))):
+                    raise RuntimeError(
+                        f"{label} helper {name} requires the exact documented FUNC_PROTO"
+                    )
+            elif proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != global_result_bytes:
                 raise RuntimeError(
                     f"{label} helper {name} requires a no-argument scalar FUNC_PROTO"
                 )
@@ -602,14 +750,274 @@ def validate_private_helpers(elf, prefix, required, optional, label,
                 )
 
 
-def validate_owner_helpers(elf, inventory=False):
+def validate_owner_helpers(elf, inventory=False, *, journal=False):
     exported = (REQUIRED_GLOBAL_OWNER_HELPERS
                 if any(symbol[0] == "OWNER_CTL" for symbol in elf.symbols)
                 else frozenset())
-    required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_insert", "p11_owner_start_remove"}
-                if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
+    overrides = None
+    if journal:
+        required = JOURNAL_LOCAL_OWNER_HELPERS
+        exported |= JOURNAL_GLOBAL_OWNER_HELPERS
+        overrides = {"p11_owner_start_remove_reason": (8, (2, 1, 1))}
+    else:
+        required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove"}
+                    if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
     validate_private_helpers(elf, "p11_owner_", required,
-                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory)
+                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory,
+                             global_proto_overrides=overrides)
+
+
+def validate_exec_helpers(elf, inventory=False):
+    """Keep EXEC candidacy behind one no-argument, no-map kernel predicate."""
+    validate_private_helpers(elf, "p11_exec_", frozenset(), frozenset(), "EXEC",
+                             REQUIRED_GLOBAL_EXEC_HELPERS, inventory=inventory)
+    selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_exec_dumpability"]
+    if not selected:
+        return  # Generic fixtures have no lifecycle producer.
+    helper = selected[0]
+    btf = Btf(elf.sections[".BTF"][1])
+    function = next(node for node in btf.types[1:] if node[:2] == (12, helper[0]))
+    scalar = btf.resolve(btf.types[function[2]][2])
+    if scalar[5] != (32,):
+        raise RuntimeError("EXEC predicate requires an unsigned u32 return")
+    body = checked_slice(elf.sections[".text"][1], helper[4], helper[5], "EXEC body")
+    calls = set()
+    for pos in range(0, len(body), 8):
+        op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+        if op == 0x18:
+            raise RuntimeError("EXEC predicate cannot carry map/global-data relocations")
+        if op == 0x85:
+            if reg >> 4 or imm not in {113, 158}:
+                raise RuntimeError("EXEC predicate permits only current-task and kernel-read helpers")
+            calls.add(imm)
+    if calls != {113, 158}:
+        raise RuntimeError("EXEC predicate requires both checked kernel helper boundaries")
+
+
+def validate_exe_helpers(elf, inventory=False):
+    """6.14 Option B exe-file identity: one global with two out-word
+    pointer arguments and a u32 success result. It lives outside the
+    no-argument p11_exec_ global namespace; the body boundary (exactly
+    current-task plus checked-read helpers, no maps or relocations)
+    mirrors the predicate it sits beside."""
+    validate_private_helpers(elf, "p11_exe_", frozenset(), frozenset(), "EXE identity",
+                             REQUIRED_GLOBAL_EXE_HELPERS, inventory=inventory,
+                             global_param_kinds=(2, 2))
+    selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_exe_identity"]
+    if not selected:
+        return  # Generic fixtures have no lifecycle producer.
+    helper = selected[0]
+    btf = Btf(elf.sections[".BTF"][1])
+    function = next(node for node in btf.types[1:] if node[:2] == (12, helper[0]))
+    scalar = btf.resolve(btf.types[function[2]][2])
+    if scalar[5] != (32,):
+        raise RuntimeError("EXE identity helper requires an unsigned u32 return")
+    body = checked_slice(elf.sections[".text"][1], helper[4], helper[5], "EXE identity body")
+    calls = set()
+    for pos in range(0, len(body), 8):
+        op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+        if op == 0x18:
+            raise RuntimeError("EXE identity helper cannot carry map/global-data relocations")
+        if op == 0x85:
+            if reg >> 4 or imm not in {113, 158}:
+                raise RuntimeError("EXE identity helper permits only current-task and kernel-read helpers")
+            calls.add(imm)
+    if calls != {113, 158}:
+        raise RuntimeError("EXE identity helper requires both checked kernel helper boundaries")
+
+
+def validate_exec_cookie_helper(elf, inventory=False, callers=False):
+    """One exact cookie-only EXEC ABI, confined to existing identity flavors.
+
+    Generic decoder fixtures carry neither identity maps nor this helper;
+    real identity objects must carry both maps and the complete boundary.
+    Existing u32 private helpers retain their unchanged default ABI check.
+    """
+    name = "p11_link_current_cookie"
+    symbols = {symbol[0] for symbol in elf.symbols}
+    identity_maps = {"TASK_COOKIE", "COOKIE_CTL"}
+    present = symbols & identity_maps
+    btf = Btf(elf.sections[".BTF"][1]) if ".BTF" in elf.sections else None
+    named = [node for node in btf.types[1:] if node[0] == 12 and node[1].startswith(name)] if btf else []
+    if not present and not named and not any(symbol.startswith(name) for symbol in symbols):
+        return
+    if inventory and not callers:
+        raise RuntimeError("InventoryGlobal cannot carry an EXEC cookie helper or identity maps")
+    if present != identity_maps:
+        raise RuntimeError("EXEC cookie helper requires both existing identity maps")
+    validate_private_helpers(elf, name, frozenset(), frozenset(), "EXEC cookie",
+                             frozenset({name}), inventory=inventory, global_result_bytes=8)
+    function = next(node for node in named if node[1] == name)
+    result = btf.resolve(btf.types[function[2]][2])
+    if result[5] != (64,):
+        raise RuntimeError("EXEC cookie helper requires an unsigned u64 result")
+
+
+def validate_marker_helpers(elf, inventory=False):
+    """Keep the H8-D birth marker behind its two Detailed-only globals.
+
+    Generic fixtures carry no marker and skip this check, the same way
+    owner/exec validators skip objects that lack their subsystem. A
+    Detailed object that defines one global must define both, as GLOBAL
+    DEFAULT FUNCs in .text whose bodies only look up maps (1), fetch
+    task storage (156) and read the current task (158): the marker paths
+    read no user memory, argument, path or name. Inventory objects must
+    not define either global.
+    """
+    selected = [symbol for symbol in elf.symbols
+                if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS]
+    if not selected:
+        return
+    if inventory:
+        raise RuntimeError("Inventory contains birth marker globals")
+    if {symbol[0] for symbol in selected} != REQUIRED_GLOBAL_MARKER_HELPERS:
+        raise RuntimeError("birth marker requires the complete unique set of globals")
+    for symbol in selected:
+        check_marker_body(elf, symbol)
+
+
+def check_marker_body(elf, symbol):
+    """One marker body: GLOBAL DEFAULT FUNC in .text reading only maps,
+    task storage and the current task. Shared by the Detailed pair and
+    the journal gap writer."""
+    name, info, other, section, value, size = symbol
+    text = elf.indices.get(".text")
+    if info != 0x12 or other != 0 or section != text:
+        raise RuntimeError(f"birth marker {name} must be GLOBAL DEFAULT FUNC in .text")
+    if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+        raise RuntimeError(f"birth marker {name} has invalid/empty body")
+    body = checked_slice(elf.sections[".text"][1], value, size, "marker body")
+    helpers = set()
+    for pos in range(0, len(body), 8):
+        op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+        # A BPF-to-BPF pseudo-call (source register 1) is a local
+        # leaf call, not a kernel helper boundary.
+        if op == 0x85 and reg >> 4 == 0:
+            helpers.add(imm)
+    if helpers != {1, 156, 158}:
+        raise RuntimeError(
+            f"birth marker {name} permits only map lookup, task storage and "
+            f"current-task helpers, saw {sorted(helpers)}"
+        )
+
+
+def validate_journal_marker_helpers(elf):
+    """The journal object carries both marker bodies and the control
+    map: the READY publish body births post-closure execs in opted-in
+    sessions, and the DIRTY gap writer dirties refused calls.
+    """
+    for name in ("p11_instance_exec_birth", "p11_instance_scope_gap"):
+        bodies = [symbol for symbol in elf.symbols if symbol[0] == name]
+        if len(bodies) != 1:
+            raise RuntimeError(f"journal object requires one {name} body")
+        check_marker_body(elf, bodies[0])
+
+
+def validate_journal_producers(elf):
+    """The journal transaction boundary: all four producers present as
+    GLOBAL DEFAULT FUNCs in .text with real bodies. Arity and pointer
+    ABIs are pinned by the native linkage test.
+    """
+    selected = [symbol for symbol in elf.symbols
+                if symbol[0] in JOURNAL_GLOBAL_PRODUCERS]
+    if {symbol[0] for symbol in selected} != JOURNAL_GLOBAL_PRODUCERS:
+        raise RuntimeError("journal object requires the complete producer set")
+    text = elf.indices.get(".text")
+    for name, info, other, section, value, size in selected:
+        if info != 0x12 or other != 0 or section != text:
+            raise RuntimeError(f"journal producer {name} must be GLOBAL DEFAULT FUNC in .text")
+        if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+            raise RuntimeError(f"journal producer {name} has invalid/empty body")
+
+
+def validate_marker_call_sites(elf, *, journal=False):
+    """Keep the birth marker wired: every defined Detailed root that can
+    birth or gap must call its marker global.
+
+    Objects without both globals skip this check (fixtures without a
+    marker, counter and inventory objects). Core roots (p11_entry,
+    p11_return, sched_process_exec, sched_process_exit) must exist;
+    unsafe-only roots (p11_entry_ia32, the template entries and the
+    template continuation) must call when defined. Each call must
+    resolve to the GLOBAL .text definition, never a same-named local.
+    The journal object wires its two journal roots to the gap writer
+    and its exec root to the birth writer.
+    """
+    markers = {symbol[0] for symbol in elf.symbols
+               if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS}
+    if markers != REQUIRED_GLOBAL_MARKER_HELPERS:
+        return
+    text = elf.indices.get(".text")
+    relocs = {}
+    for row, raw in elf.sections.values():
+        if row[1] != 9:
+            continue
+        if row[9] != 16 or len(raw) % 16:
+            raise RuntimeError("invalid marker call relocation table")
+        for at in range(0, len(raw), 16):
+            address, info = struct.unpack_from("<QQ", raw, at)
+            if info >> 32 >= len(elf.symbols) or (row[7], address) in relocs:
+                raise RuntimeError("invalid/duplicate marker call relocation")
+            relocs[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+    bodies = [symbol for symbol in elf.symbols
+              if symbol[1] & 15 == 2 and symbol[1] >> 4 == 1 and symbol[3] and symbol[5]]
+    by_name = {}
+    for symbol in bodies:
+        by_name.setdefault(symbol[0], []).append(symbol)
+    if journal:
+        label = "journal"
+        required = {
+            "p11_entry_journal": "p11_instance_scope_gap",
+            "p11_return_journal": "p11_instance_scope_gap",
+            "sched_process_exec": "p11_instance_exec_birth",
+        }
+        optional = {}
+    else:
+        label = "Detailed"
+        required = {
+            "p11_entry": "p11_instance_scope_gap",
+            "p11_return": "p11_instance_scope_gap",
+            "sched_process_exec": "p11_instance_exec_birth",
+            "sched_process_exit": "p11_instance_scope_gap",
+        }
+        optional = {
+            "p11_entry_ia32": "p11_instance_scope_gap",
+            "p11_entry_template": "p11_instance_scope_gap",
+            "p11_entry_template_types": "p11_instance_scope_gap",
+            "p11_entry_template_pair": "p11_instance_scope_gap",
+            "p11_entry_template_second": "p11_instance_scope_gap",
+        }
+    for root in required:
+        if root not in by_name:
+            raise RuntimeError(f"{label} {root} program is missing")
+    for root, marker in list(required.items()) + list(optional.items()):
+        for _, _, _, section, start, size in by_name.get(root, []):
+            body = checked_slice(sections.get(section, b""), start, size,
+                                 "marker caller body")
+            wired = False
+            for pos in range(0, len(body), 8):
+                op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+                if op != 0x85 or reg != 0x10:
+                    continue
+                relocation = relocs.get((section, start + pos))
+                if relocation:
+                    kind, target = relocation
+                    if kind != 10:
+                        raise RuntimeError(
+                            f"invalid marker call relocation kind in {root}")
+                    if (target[0] == marker and target[1] == 0x12
+                            and target[3] == text):
+                        wired = True
+                        break
+                else:
+                    dest = (section, start + pos + (imm + 1) * 8)
+                    if any(symbol[0] == marker and symbol[1] == 0x12
+                           and (symbol[3], symbol[4]) == dest for symbol in bodies):
+                        wired = True
+                        break
+            if not wired:
+                raise RuntimeError(f"{label} {root} must call {marker}")
 
 
 def validate_diagnostic_helper_linkage(elf):
@@ -641,12 +1049,186 @@ def validate_diagnostic_helper_linkage(elf):
                 f"diagnostic helper {name} lacks GLOBAL BTF FUNC linkage")
 
 
-def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits):
+def validate_object_capture_globals(elf, inventory=False):
+    """Recognize only the complete scalar Detailed boundary, never Inventory."""
+    selected = [symbol for symbol in elf.symbols if symbol[0] in OBJECT_CAPTURE_GLOBAL_HELPERS]
+    if inventory and selected:
+        raise RuntimeError("Inventory contains object capture globals")
+    if not selected:
+        return
+    if (len(selected) != len(OBJECT_CAPTURE_GLOBAL_HELPERS)
+            or {symbol[0] for symbol in selected} != OBJECT_CAPTURE_GLOBAL_HELPERS):
+        raise RuntimeError("object capture requires the complete unique set of globals")
+    if ".BTF" not in elf.sections or ".BTF.ext" not in elf.sections:
+        raise RuntimeError("object capture globals require BTF and BTF.ext")
+    btf = Btf(elf.sections[".BTF"][1])
+    ext = elf.sections[".BTF.ext"][1]
+    magic, version, flags, hlen, off, length = struct.unpack(
+        "<HBBIII", checked_slice(ext, 0, 16, "BTF.ext function info header"))
+    if (magic, version, flags, hlen) != (0xeb9f, 1, 0, 32):
+        raise RuntimeError("unsupported BTF.ext function info header")
+    raw = checked_slice(ext, hlen + off, length, "BTF.ext function info")
+    stride, = struct.unpack("<I", checked_slice(raw, 0, 4, "function info stride"))
+    if stride != 8:
+        raise RuntimeError("unsupported function info stride")
+    info_relocations = {}
+    for row, relocations in elf.sections.values():
+        if row[1] == 9 and row[7] == elf.indices[".BTF.ext"]:
+            for pos in range(0, len(relocations), 16):
+                address, info = struct.unpack_from("<QQ", relocations, pos)
+                if address in info_relocations or info >> 32 >= len(elf.symbols):
+                    raise RuntimeError("invalid object capture function info relocation")
+                info_relocations[address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    pos, records = 4, {}
+    while pos < len(raw):
+        section_name, count = struct.unpack("<II", checked_slice(raw, pos, 8, "function info section"))
+        section = string_at(btf.strings, section_name)
+        pos += 8
+        for _ in range(count):
+            address, ident = struct.unpack("<II", checked_slice(raw, pos, stride, "function info record"))
+            records.setdefault(ident, []).append((section, address, info_relocations.get(hlen + off + pos)))
+            pos += stride
+
+    def unsigned_u64(ref):
+        node = btf.resolve(ref)
+        return node[0] == 1 and node[2] == 8 and node[5] == (64,)
+
+    for name, info, other, section, value, size in selected:
+        if info != 0x12 or other != 0 or section != elf.indices.get(".text"):
+            raise RuntimeError(f"object capture {name} must be GLOBAL DEFAULT FUNC in .text")
+        if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+            raise RuntimeError(f"object capture {name} has invalid/empty body")
+        functions = [(ident, node) for ident, node in enumerate(btf.types)
+                     if node and node[:2] == (12, name)]
+        if len(functions) != 1 or functions[0][1][3] != 1:
+            raise RuntimeError(f"object capture {name} requires one GLOBAL BTF FUNC")
+        ident, function = functions[0]
+        proto = btf.resolve(function[2])
+        if proto[0] != 13 or proto[3] != 5 or len(proto[5]) != 10:
+            raise RuntimeError(f"object capture {name} requires exactly five scalar arguments")
+        if not unsigned_u64(proto[2]):
+            raise RuntimeError(f"object capture {name} return must be unsigned u64")
+        for argument in proto[5][1::2]:
+            if not unsigned_u64(argument):
+                raise RuntimeError(f"object capture {name} argument must be unsigned u64")
+        entries = records.get(ident, [])
+        if len(entries) != 1:
+            raise RuntimeError(f"object capture {name} function info missing/duplicate")
+        info_section, address, relocation = entries[0]
+        if (info_section != ".text" or address != value or not relocation
+                or relocation[0] != 4 or relocation[1][1] != 3
+                or relocation[1][3] != section or relocation[1][4] != 0):
+            raise RuntimeError(f"object capture {name} function info relocation mismatch")
+
+
+def bpf_call_graph(elf):
+    """Resolve emitted pseudo-calls and retain exact call instruction offsets."""
+    bodies = {(symbol[3], symbol[4]): symbol for symbol in elf.symbols
+              if symbol[1] & 15 == 2 and symbol[5] and symbol[3]}
+    sections = {elf.indices[name]: (row, raw) for name, (row, raw) in elf.sections.items()}
+    relocations = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9 and row[7] in sections:
+            for at in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, at)
+                if info >> 32 >= len(elf.symbols) or (row[7], address) in relocations:
+                    raise RuntimeError("invalid BPF call relocation")
+                relocations[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    edges, calls = {key: set() for key in bodies}, []
+    for key, symbol in bodies.items():
+        row, raw = sections[key[0]]
+        code = checked_slice(raw, key[1], symbol[5], "BPF call body")
+        for at in range(0, len(code), 8):
+            op, reg, _, immediate = struct.unpack_from("<BBhi", code, at)
+            if (op, reg) != (0x85, 0x10):
+                continue
+            relocation = relocations.get((key[0], key[1] + at))
+            if relocation and relocation[0] == 10:
+                destination = (relocation[1][3], relocation[1][4] + (immediate + 1) * 8)
+            elif relocation:
+                raise RuntimeError("unknown BPF pseudo-call relocation")
+            else:
+                destination = (key[0], key[1] + at + (immediate + 1) * 8)
+            if destination not in bodies:
+                raise RuntimeError("unresolved BPF pseudo-call")
+            edges[key].add(destination)
+            calls.append((key, destination, row[4] + key[1] + at))
+    return bodies, edges, calls
+
+
+def validate_object_capture_reachability(elf, *, full, journal=False):
+    """FULL reaches scalar readers; P0 never reaches them. Neither publishes.
+
+    The journal ELF runs the same rule with journal roots: its entry and
+    return roots reach exactly the globals the Detailed roots reach.
+    """
+    validate_object_capture_globals(elf)
+    bodies, edges, _ = bpf_call_graph(elf)
+
+    def reachable(root):
+        seen, pending = set(), [root]
+        while pending:
+            key = pending.pop()
+            if key not in seen:
+                seen.add(key)
+                pending.extend(edges[key])
+        return seen
+
+    globals_by_name = {symbol[0]: key for key, symbol in bodies.items()
+                       if symbol[0] in OBJECT_CAPTURE_GLOBAL_HELPERS}
+    if globals_by_name.keys() != OBJECT_CAPTURE_GLOBAL_HELPERS:
+        raise RuntimeError("missing compiled object capture globals")
+    if journal:
+        entry_prefix, return_name = "p11_entry_journal", "p11_return_journal"
+    else:
+        entry_prefix, return_name = "p11_entry", "p11_return"
+    roots = {symbol[0]: key for key, symbol in bodies.items()
+             if symbol[0] == return_name or symbol[0].startswith(entry_prefix)}
+    if journal:
+        if not {"p11_entry_journal", "p11_return_journal"} <= roots.keys():
+            raise RuntimeError("object capture globals require actual journal entry/return roots")
+    elif not {"p11_entry", "p11_return"} <= roots.keys():
+        raise RuntimeError("object capture globals require actual entry/return roots")
+    for name, root in roots.items():
+        symbol = bodies[root]
+        section = "uretprobe" if name == return_name else "uprobe"
+        if symbol[1] != 0x12 or symbol[2] != 0 or symbol[3] != elf.indices.get(section):
+            raise RuntimeError(f"object capture requires {name} GLOBAL DEFAULT {section} root")
+        required = ({"p11_stable_cell", "p11_alias_capacity"} if name == return_name
+                    else {"p11_stable_cell", "p11_alias_scan", "p11_request_cell"})
+        found = {helper for helper, key in globals_by_name.items() if key in reachable(root)}
+        # This diagnostic tail continuation walks the second template in an
+        # existing START. Its parent already captured the object attributes;
+        # the continuation must not gain a second scalar-capture path.
+        captures = full and name != "p11_entry_template_second"
+        if (captures and required != found) or (not captures and found):
+            raise RuntimeError(f"object capture globals not correctly reachable from {name}: {sorted(found)}")
+    for name, root in globals_by_name.items():
+        allowed = {112} if name != "p11_alias_capacity" else set()
+        for section, start in reachable(root):
+            symbol = bodies[section, start]
+            raw = next(raw for label, (_, raw) in elf.sections.items() if elf.indices[label] == section)
+            code = checked_slice(raw, start, symbol[5], "scalar capture body")
+            for at in range(0, len(code), 8):
+                op, reg, _, helper = struct.unpack_from("<BBhi", code, at)
+                if op == 0x85 and reg != 0x10 and (reg != 0 or helper not in allowed):
+                    raise RuntimeError(f"object capture {name} has a non-read helper")
+            for row, relocations in elf.sections.values():
+                if row[1] == 9 and row[7] == section:
+                    for at in range(0, len(relocations), 16):
+                        address, info = struct.unpack_from("<QQ", relocations, at)
+                        if start <= address < start + symbol[5] and info & 0xffffffff == 1:
+                            raise RuntimeError(f"object capture {name} references map/state")
+
+
+def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits,
+                           *, register_transfer=None):
     """Prove guard dominance and sentinel return on every rejected path.
 
-    Both raw-ELF and disassembly callers supply their own decoded CFG and r0
-    writes. An omitted update preserves r0; None is an unknown value. This
-    deliberately does not infer success from a comparison's mere presence.
+    Disassembly callers supply r0 writes; an omitted update preserves r0 and
+    None is unknown. Raw ELF can track all registers through register_transfer
+    so an optimizer's saved sentinel remains proven across calls and copies.
+    Keep path states separate: one safe predecessor cannot excuse another.
     """
     guard_values = set()
 
@@ -665,9 +1247,11 @@ def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits
             if (pc, result) in visited:
                 continue
             visited.add((pc, result))
-            result = updates.get(pc, result)
+            result = (register_transfer(pc, result) if register_transfer
+                      else updates.get(pc, result))
             if pc in exits:
-                if rejection and result != 1 << 32:
+                returned_value = result[0] if register_transfer else result
+                if rejection and returned_value != 1 << 32:
                     raise RuntimeError("ia32 reader span rejection must return failure sentinel")
                 returned = True
                 continue
@@ -676,7 +1260,8 @@ def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits
             pending.extend((target, result, ancestors | {pc}) for target in graph[pc])
         return returned
 
-    walk([(entry, None, frozenset())], False)
+    initial = (None,) * 11 if register_transfer else None
+    walk([(entry, initial, frozenset())], False)
     if not guard_values:
         raise RuntimeError("ia32 reader span guard is unreachable")
     if not walk([(rejected, value, frozenset()) for value in guard_values], True):
@@ -689,7 +1274,7 @@ def validate_ia32_raw_span(insns, read):
               if (op, reg) == (0x2d, 0x13)]
     if len(guards) != 1:
         raise RuntimeError("ia32 reader requires one full-width address span guard")
-    graph, updates, exits = {}, {}, set()
+    graph, exits = {}, set()
     pc = 0
     while pc < len(insns):
         op, reg, offset, imm = insns[pc]
@@ -705,21 +1290,44 @@ def validate_ia32_raw_span(insns, read):
             graph[pc] = [pc + 1, pc + 1 + offset]
         else:
             graph[pc] = [pc + size]
-        if op == 0x85:
-            updates[pc] = None
-        elif reg & 15 == 0 and op & 7 in (0, 1, 4, 7):
-            if op == 0x18:
-                updates[pc] = (imm & 0xffffffff) | ((insns[pc + 1][3] & 0xffffffff) << 32)
-            elif op in (0xb4, 0xb7):
-                updates[pc] = imm & ((1 << (32 if op == 0xb4 else 64)) - 1)
-            else:
-                updates[pc] = None
         pc += size
+
+    def transfer(pc, state):
+        op, reg, offset, imm = insns[pc]
+        values = list(state)
+        dst, src = reg & 15, reg >> 4
+        if op == 0x85:
+            # The BPF call ABI preserves r6-r9, but destroys r0-r5 facts.
+            values[:6] = [None] * 6
+        elif op & 7 == 3 and op & 0xe0 == 0xc0:
+            # Atomic fetch operations have implicit register writes. Do not
+            # carry a constant through an unmodeled atomic operation.
+            values = [None] * 11
+        elif op & 7 in (0, 1, 4, 7):
+            if dst > 10:
+                raise RuntimeError("ia32 reader span has invalid destination register")
+            value = None
+            if op == 0x18 and src == 0:
+                value = (imm & 0xffffffff) | ((insns[pc + 1][3] & 0xffffffff) << 32)
+            elif op in (0xb4, 0xb7) and offset == 0:
+                value = imm & ((1 << (32 if op == 0xb4 else 64)) - 1)
+            elif op in (0xbc, 0xbf) and offset == 0:
+                if src > 10:
+                    raise RuntimeError("ia32 reader span has invalid source register")
+                value = state[src]
+                if value is not None and op == 0xbc:
+                    value &= 0xffffffff
+            # Nonzero-offset MOVSX shares MOV opcodes; do not preserve its
+            # source fact. Loads and unmodeled arithmetic also invalidate it.
+            values[dst] = value
+        return tuple(values)
+
     guard = guards[0]
-    validate_ia32_span_paths(graph, 0, guard, guard + 1 + insns[guard][2], read, updates, exits)
+    validate_ia32_span_paths(graph, 0, guard, guard + 1 + insns[guard][2], read, {}, exits,
+                            register_transfer=transfer)
 
 
-def validate_ia32_reader(elf, inventory=False):
+def validate_ia32_reader(elf, inventory=False, *, journal=False):
     """Verify the scalar-only ia32 user-read boundary and one reachable call."""
     selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_read_ia32_arg"]
     production = any(symbol[0] == "p11_entry" for symbol in elf.symbols)
@@ -893,9 +1501,14 @@ def validate_ia32_reader(elf, inventory=False):
                     destination = (section_index, start + pos + (imm + 1) * 8)
                 if destination in bodies:
                     edges[section_index, start].add(destination)
-    root_name = ("function_list_entry" if inventory else "p11_entry_ia32"
-                 if any(candidate[0] == "p11_entry_ia32" for candidate in elf.symbols)
-                 else "p11_entry")
+    if journal:
+        root_name = "p11_entry_journal"
+    elif inventory:
+        root_name = "function_list_entry"
+    elif any(candidate[0] == "p11_entry_ia32" for candidate in elf.symbols):
+        root_name = "p11_entry_ia32"
+    else:
+        root_name = "p11_entry"
     roots = [candidate for candidate in elf.symbols if candidate[0] == root_name]
     if len(roots) != 1:
         raise RuntimeError(f"ia32 reader requires exact {root_name} entry root")
@@ -926,40 +1539,53 @@ def validate_inventory_usage_transition(elf, root, relocations):
     at = atomic[0]
     usage = relocations.get((root[3], root[4] + (at - 10) * 8))
     if (not usage or usage[0] != 1 or usage[1][0] != "USAGE"
-            or instructions[at - 10][0] != 0x18
-            or instructions[at - 8] != (0x85, 0, 0, 1)
-            or instructions[at - 7][0:2] != (0x15, 0)
-            or instructions[at - 7][3] != 0):
+            or instructions[at - 10:at - 8] != [(0x18, 1, 0, 0), (0, 0, 0, 0)]
+            or instructions[at - 8] != (0x85, 0, 0, 1)):
         raise RuntimeError("usage CAS requires the exact checked USAGE lookup")
-    load, positive, zero = instructions[at - 6:at - 3]
+    # O3 copies the lookup pointer just before CAS; opt-s hoists that same
+    # copy before the null guard. Admit only these two complete placements.
+    early_pointer = instructions[at - 7][0] == 0xbf
+    pointer_at, null_at = ((at - 7, at - 6) if early_pointer else (at - 2, at - 7))
+    load_at, positive_at, zero_at = null_at + 1, null_at + 2, null_at + 3
+    replacement_at = at - 2 if early_pointer else at - 3
+    pointer = instructions[pointer_at]
+    pointer_register = pointer[1] & 15
+    if pointer != (0xbf, pointer_register, 0, 0) or not 1 <= pointer_register <= 9:
+        raise RuntimeError("usage CAS must preserve the exact lookup pointer")
+    live_pointer = pointer_register if early_pointer else 0
+    null = instructions[null_at]
+    if (null[:2] != (0x15, live_pointer) or null[3] != 0
+            or not at < null_at + 1 + null[2] < len(instructions)):
+        raise RuntimeError("usage CAS requires the checked lookup null guard")
+    load, positive, zero = (instructions[index] for index in (load_at, positive_at, zero_at))
     register = load[1] & 15
-    # R0 must retain the lookup pointer until the later pointer copy.
-    if (not 1 <= register <= 9 or load != (0x79, register, 0, 0)
+    # The load/guards must not overwrite whichever register owns the pointer.
+    if (not 1 <= register <= 9 or register == live_pointer
+            or load != (0x79, live_pointer << 4 | register, 0, 0)
             or positive[0:2] != (0x15, register)
             or positive[3] != 1 or zero[0:2] != (0x55, register) or zero[3] != 0
-            or at - 4 + 1 + zero[2] <= at):
+            or not at < zero_at + 1 + zero[2] < len(instructions)):
         raise RuntimeError("usage needs aligned u64 load and exact one/zero guards")
-    replacement, pointer, expected = instructions[at - 3:at]
-    replacement_register, pointer_register = replacement[1], pointer[1]
-    # Replacement must preserve R0; its pointer copy must preserve replacement.
-    # Neither operand may alias R0, which is then overwritten with expected zero.
+    replacement, expected = instructions[replacement_at], instructions[at - 1]
+    replacement_register = replacement[1] & 15
+    # Replacement and the preserved pointer stay distinct and neither may
+    # alias R0, which is overwritten with the expected zero before the CAS.
     if (replacement != (0xb7, replacement_register, 0, 1)
             or not 1 <= replacement_register <= 9
-            or pointer != (0xbf, pointer_register, 0, 0)
-            or not 1 <= pointer_register <= 9
             or replacement_register == pointer_register
             or expected != (0xb7, 0, 0, 0)
             or instructions[at] != (0xdb, replacement_register << 4 | pointer_register, 0, 0xf1)):
         raise RuntimeError("usage atomic operation must compare zero and write one to the same cell")
     # The already-positive path must reach exit without any map write, helper,
     # or CAS. Only a zero return and forward jumps may remain in this lowering.
-    cursor, visited = at - 5 + 1 + positive[2], set()
+    cursor, zeroed, visited = positive_at + 1 + positive[2], False, set()
     while 0 <= cursor < len(instructions) and cursor not in visited:
         visited.add(cursor)
         instruction = instructions[cursor]
-        if instruction == (0x95, 0, 0, 0):
+        if instruction == (0x95, 0, 0, 0) and zeroed:
             return
         if instruction == (0xb7, 0, 0, 0):
+            zeroed = True
             cursor += 1
         elif instruction[0:2] == (0x05, 0) and instruction[2] > 0 and instruction[3] == 0:
             cursor += instruction[2] + 1
@@ -991,6 +1617,15 @@ MULTI_LOADED_PROGRAMS = frozenset({
     "p11_entry", "p11_entry_ia32", "p11_entry_template", "p11_entry_template_types",
     "p11_entry_template_pair", "p11_entry_template_second", "p11_return",
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+})
+# The journal twins load with the multi flag exactly like the ordinary
+# static endpoint twins they replace (pinned by
+# journal_pair_takes_the_multi_load_flag in src/attach.rs), so they
+# reference STACK_GUARD, never TAIL_CALLS. Kept beside the ordinary set
+# above, which the object-checker cross-pin derives from the
+# ordinary/inventory loaders alone.
+JOURNAL_MULTI_LOADED_PROGRAMS = frozenset({
+    "p11_entry_journal", "p11_return_journal",
 })
 
 
@@ -1182,7 +1817,7 @@ def program_array_relocations(elf):
     return found
 
 
-def validate_classic_uprobe_kernel_stack(elf):
+def validate_classic_uprobe_kernel_stack(elf, *, journal=False):
     """Every uprobe/uretprobe program keeps the task's kernel stack.
 
     From Linux 6.13 the x86 JIT gives a KPROBE-type program with a >= 64-byte
@@ -1250,7 +1885,7 @@ def validate_classic_uprobe_kernel_stack(elf):
         used = {array for _, array in references.get(name, ())}
         if name == "p11_entry_template_pair":
             allowed = {"PAIR_CALLS"}
-        elif name in MULTI_LOADED_PROGRAMS:
+        elif name in MULTI_LOADED_PROGRAMS or (journal and name in JOURNAL_MULTI_LOADED_PROGRAMS):
             allowed = {"STACK_GUARD"}
         else:
             allowed = {"TAIL_CALLS"}
@@ -1379,7 +2014,74 @@ def validate_inventory_caller_entry_reachability(elf):
             raise RuntimeError(f"caller inventory missing real scope/use/identity/pair dependencies: {name}")
         reports[name] = {"functions": len(seen), "maps": sorted(maps),
                          "helpers": sorted(helpers), "compare_exchanges": atomic}
+    roots = [s for s in elf.symbols if s[0] == "p11_inventory_image_baseline"]
+    if (len(roots) != 1 or roots[0][1:3] != (0x12, 0)
+            or roots[0][3] != elf.indices.get("iter/task")):
+        raise RuntimeError("caller inventory requires exact GLOBAL DEFAULT baseline iterator")
+    seen, maps, helpers, _ = walk(roots[0][3:5],
+        {"INV_BASELINE_RQ", "INV_BASELINE_CT", "TASK_COOKIE", "COOKIE_CTL"},
+        {1, 5, 127, 156})
+    if (maps != {"INV_BASELINE_RQ", "INV_BASELINE_CT", "TASK_COOKIE", "COOKIE_CTL"}
+            or helpers != {1, 5, 127, 156}):
+        raise RuntimeError("caller baseline iterator requires exact identity-only dependency footprint")
+    reports["p11_inventory_image_baseline"] = {
+        "functions": len(seen), "maps": sorted(maps), "helpers": sorted(helpers)}
     return reports
+
+
+def validate_selected_leaf(elf):
+    """Check the actual hot native gate's bounded, lookup-only call boundary.
+
+    This is own-frame/footprint evidence, not a kernel verifier or proof that
+    every parent-scope branch calls it. Root reachability is checked separately.
+    Objects without any selected symbol predate the gate and skip it.
+    """
+    if not has_selected(symbol[0] for symbol in elf.symbols):
+        return None
+    names = [symbol for symbol in elf.symbols if symbol[0] == "p11_selected_current_allowed"]
+    if len(names) != 1:
+        raise RuntimeError("selected gate requires one actual native helper")
+    symbol = names[0]
+    if symbol[1:3] != (0x12, 0) or symbol[3] != elf.indices.get(".text") or not symbol[5] or symbol[5] % 8:
+        raise RuntimeError("selected gate must be GLOBAL DEFAULT bounded .text function")
+    section = elf.sections[".text"][1]
+    body = checked_slice(section, symbol[4], symbol[5], "selected native gate")
+    relocations = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9 and row[7] == symbol[3]:
+            for at in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, at)
+                relocations[address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    maps, helpers, frame = set(), set(), 0
+    allowed_maps = {"SELECTED_DETAIL", "SELECTED_DSTATE", "INSTANCE_GEN", "TASK_COOKIE"}
+    for at in range(0, len(body), 8):
+        op, registers, offset, immediate = struct.unpack_from("<BBhi", body, at)
+        if op & 7 in (1, 2, 3) and offset < 0:
+            stack_register = registers >> 4 if op & 7 == 1 else registers & 15
+            if stack_register == 10:
+                frame = max(frame, -offset)
+        if op == 0x85:
+            if registers != 0:
+                raise RuntimeError("selected hot gate cannot nest BPF calls")
+            if immediate not in {1, 156, 158}:
+                raise RuntimeError(f"selected hot gate reaches forbidden helper {immediate}")
+            helpers.add(immediate)
+        relocation = relocations.get(symbol[4] + at)
+        if op == 0x18 and relocation:
+            kind, target = relocation
+            map_name = target[0]
+            if target[1] & 15 == 3:
+                high = struct.unpack_from("<I", body, at + 12)[0]
+                address = target[4] + (immediate & 0xffffffff) + (high << 32)
+                matches = [candidate[0] for candidate in elf.symbols
+                           if candidate[1] & 15 == 1 and candidate[3] == target[3] and candidate[4] == address]
+                map_name = matches[0] if len(matches) == 1 else ""
+            if kind != 1 or map_name not in allowed_maps:
+                raise RuntimeError(f"selected hot gate reaches forbidden map/global {map_name!r}")
+            maps.add(map_name)
+    if not frame or frame > 32 or maps != allowed_maps or helpers != {1, 156, 158}:
+        raise RuntimeError(f"selected gate frame/actual dependency footprint differs: frame={frame} maps={sorted(maps)} helpers={sorted(helpers)}")
+    return {"frame": frame, "rounded_frame": (frame + 31) // 32 * 32, "maps": sorted(maps), "helpers": sorted(helpers)}
 
 
 def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
@@ -1405,7 +2107,10 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
             raise RuntimeError("LLVM/raw legacy section mismatch")
         maps = decode_map_definitions(records, sections["maps"], data)
     if ".maps" in sections:
-        native = decode_btf_maps(elf)
+        if variant == "journal":
+            native = decode_journal_native_maps(elf)
+        else:
+            native = decode_btf_maps(elf)
         if maps.keys() & native.keys():
             raise RuntimeError("cross-section duplicate map names")
         maps.update(native)
@@ -1413,26 +2118,43 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         btf = Btf(elf.sections[".BTF"][1])
         if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
-    validate_ia32_reader(elf, inventory)
-    validate_owner_helpers(elf, inventory)
+    validate_ia32_reader(elf, inventory, journal=(variant == "journal"))
+    validate_object_capture_globals(elf, inventory)
+    validate_owner_helpers(elf, inventory, journal=(variant == "journal"))
+    validate_exec_helpers(elf, inventory)
+    validate_exe_helpers(elf, inventory)
+    validate_exec_cookie_helper(elf, inventory, callers)
+    if variant == "journal":
+        validate_journal_marker_helpers(elf)
+        validate_marker_call_sites(elf, journal=True)
+        validate_journal_producers(elf)
+    else:
+        validate_marker_helpers(elf, inventory)
+        validate_marker_call_sites(elf)
     if not inventory:
+        validate_selected_leaf(elf)
         validate_root_helpers(elf)
         validate_diagnostic_helper_linkage(elf)
     elif callers:
         validate_inventory_caller_entry_reachability(elf)
     else:
         validate_inventory_entry_reachability(elf)
-    validate_classic_uprobe_kernel_stack(elf)
+    validate_classic_uprobe_kernel_stack(elf, journal=(variant == "journal"))
     # A literal pool or static (.rodata*/.data*/.bss*) becomes one more loaded
     # map: it breaks the exact owned-map inventory and the live map counts.
     global_data = sorted(name for name in elf.sections
                          if name.startswith((".rodata", ".data", ".bss")))
     if global_data:
         raise RuntimeError(f"object carries global-data sections {global_data}")
-    image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
-                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS)
+    image_helpers = (frozenset({"p11_link_current_identity", "p11_link_current_cookie"}) if callers else
+                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | SELECTED_GLOBAL_HELPERS
+                     | REQUIRED_GLOBAL_MARKER_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
-                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS,
+                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
+                          | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS
+                          | (frozenset() if inventory else OBJECT_CAPTURE_GLOBAL_HELPERS)
+                          | (JOURNAL_GLOBAL_OWNER_HELPERS | JOURNAL_GLOBAL_PRODUCERS
+                             if variant == "journal" else frozenset()),
                           inventory=inventory), {
         record[-1] for record in records
     }
@@ -1468,10 +2190,18 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
                 and name in {"memcpy", "memset", "memmove", "memcmp", "bcmp"}):
             continue
         exact = EXACT_PROGRAM_SECTIONS.get(name)
+        if inventory:
+            exact = CALLER_PROGRAM_SECTIONS.get(name, exact)
         if bind != "GLOBAL" or visibility != "DEFAULT":
             raise RuntimeError(f"unclassified global function {name} in {location}")
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
-                    | REQUIRED_GLOBAL_SCALAR_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS):
+                    | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
+                    | REQUIRED_GLOBAL_EXE_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+                    | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
+                    | REQUIRED_GLOBAL_MARKER_HELPERS
+                    | JOURNAL_GLOBAL_OWNER_HELPERS
+                    | JOURNAL_GLOBAL_PRODUCERS
+                    | OBJECT_CAPTURE_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
                 continue
@@ -1486,7 +2216,10 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
     # Generic fixtures need no production helpers. A production hook or helper
     # selects the complete exact export contract, independent of program counts.
     if not inventory and (programs & EXACT_PROGRAM_SECTIONS.keys() or helpers & REQUIRED_GLOBAL_HELPERS):
-        missing = REQUIRED_GLOBAL_HELPERS - helpers
+        required = set(REQUIRED_GLOBAL_HELPERS)
+        if programs & SELECTED_PROGRAMS:
+            required |= SELECTED_GLOBAL_HELPERS
+        missing = required - helpers
         if missing:
             raise RuntimeError(f"missing required .text helpers: {sorted(missing)}")
     return programs
@@ -1500,7 +2233,7 @@ def map_def(map_type, key, value, maximum, flags=0):
     return dict(zip(MAP_FIELDS, (map_type, key, value, maximum, flags, 0, 0)))
 
 
-SAFE_MAPS = {
+_DETAILED_BASE_MAPS = {
     name: map_def(*values)
     for name, values in {
         "ASYNC_FUNCTIONS": (1, 32, 4, 128, 128),
@@ -1520,9 +2253,16 @@ SAFE_MAPS = {
         "RV_COUNTS": (5, 16, 8, 4_096),
         "DESCRIPTORS": (2, 4, 18, 105, 128),
         "START": (1, 16, 288, 16_384),
+        # H7 slice B subordinate custody: one side row per START entry, the
+        # frozen descriptor table, and the verified zero template.
+        "OBJECT_START": (1, 16, 432, 16_384),
+        "OBJECT_DESCRIPTORS": (2, 4, 16, 105, 128),
+        "OBJECT_ZERO": (2, 4, 432, 1, 128),
         "TASK_COOKIE": (29, 4, 8, 0, 1),
         "COOKIE_CTL": (2, 4, 40, 1),
-        "THREAD_OWNER": (29, 4, 544, 0, 1),
+        # H8 slice A: Detailed rows carry two trailing lifetime words
+        # (560 B); Inventory-only objects stay 544 B (overridden below).
+        "THREAD_OWNER": (29, 4, 560, 0, 1),
         "OWNER_CTL": (2, 4, 56, 1),
         "ROOT_AFFILIATION": (29, 4, 8, 0, 1),
         "ROOT_CTL": (2, 4, 64, 1),
@@ -1533,19 +2273,44 @@ SAFE_MAPS = {
         # Task 3 Stage A continuity witness (native instance_epoch.c).
         "WATCHED_FILES": (1, 16, 4, 1_024, 128),
         "SLOT_FILE": (2, 4, 4, 512, 128),
-        "PROC_EPOCH": (29, 4, 144, 0, 1),
+        "PROC_EPOCH": (29, 4, 152, 0, 1),
         "G_EPOCH": (2, 4, 8, 1_024),
-        "INSTANCE_GEN": (2, 4, 8, 3, 1024),
+        "INSTANCE_GEN": (2, 4, 8, 4, 1024),
+        "IMAGE_CONTINUITY": (1, 8, 24, 16_384, 17),
+        "IMAGE_TGID_INDEX": (1, 8, 8, 16_384, 17),
+        "IMAGE_QUERY_REQUESTS": (1, 8, 24, 1_024, 129),
+        "IMAGE_QUERY_CTL": (2, 4, 56, 1),
+        "SELECTED_DETAIL": (2, 4, 32, 1, 128),
+        "SELECTED_DSTATE": (2, 4, 8, 1, 1024),
+        "SELECTED_BCTL": (2, 4, 48, 1),
         "INSTANCE_CALIB": (2, 4, 40, 1),
         "INSTANCE_COUNT": (2, 4, 80, 1),
         "INSTANCE_START": (9, 16, 24, 16_384),
     }.items()
 }
-UNSAFE_MAPS = SAFE_MAPS | {
+# The birth-marker control row and the PID-scope birth witness ship in
+# default FULL/P0 objects. Builds that cannot carry the journal (unsafe,
+# wide) omit them, so only the default variant requires them.
+SAFE_MAPS = _DETAILED_BASE_MAPS | {
+    "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+    "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
+}
+UNSAFE_MAPS = _DETAILED_BASE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
     "PAIR_CALLS": map_def(3, 4, 4, 1),
 }
-WIDE_MAPS = SAFE_MAPS | {
+# The loader-gate Detailed object: the default maps plus the bank-B
+# identity maps, the bank-select word and the gate rows/control. Gate
+# builds add no programs and no global helpers, so the program and
+# symbol contracts stay the default ones.
+GATE_MAPS = SAFE_MAPS | {
+    "TASK_COOKIE_B": map_def(29, 4, 8, 0, 1),
+    "COOKIE_CTL_B": map_def(2, 4, 40, 1),
+    "IMAGE_BANK_SELECT": map_def(2, 4, 96, 1),
+    "LOADER_GATE": map_def(2, 4, 32, 256),
+    "LOADER_GATE_CTL": map_def(2, 4, 72, 1),
+}
+WIDE_MAPS = _DETAILED_BASE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
     "RV_COUNTS": map_def(5, 16, 8, 8_192),
     "SLOT_FILE": map_def(2, 4, 4, 2_112, 128),
@@ -1571,12 +2336,35 @@ SAFE_PROGRAMS = {
     "p11_inst_vma_map",
     "p11_inst_vma_unmap",
     "p11_inst_vma_copy",
+    "p11_inst_vma_retcopy",
+    "p11_image_exec_release",
+    "p11_image_mmap_release",
+    "p11_image_query",
+    "p11_selected_bootstrap",
+    "p11_selected_cgroup_migrate",
 }
-INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
+INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
+                     "p11_inst_vma_retcopy",
+                     "p11_image_exec_release", "p11_image_mmap_release", "p11_image_query"}
 UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_ia32",
     "p11_entry_template", "p11_entry_template_pair",
     "p11_entry_template_second", "p11_entry_template_types",
+}
+# The production journal object: Detailed maps plus the four journal maps
+# (its own marker control row included) and the PID-scope birth witness,
+# with the entry/return pair replaced by the journal roots. Built only at
+# FULL capacities, with the build's own attribute-capture selection (P0
+# stubs it, like Detailed).
+JOURNAL_MAPS = _DETAILED_BASE_MAPS | {
+    "JOURNAL_START": map_def(1, 16, 24, 16_384, 0),
+    "JOURNAL_CTL": map_def(2, 4, 24, 1, 0),
+    "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+    "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
+    "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
+}
+JOURNAL_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {
+    "p11_entry_journal", "p11_return_journal",
 }
 
 
@@ -1584,15 +2372,17 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "STACK_GUARD", "EVIDENCE",
     "COUNTERS", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
 )} | {
-    # The Inventory lifecycle ring is 2 MiB (Detailed keeps 64 KiB in
+    # Inventory-only objects carry no journal words: 544 B, not 560 B.
+    "THREAD_OWNER": map_def(29, 4, 544, 0, 1),
+    # The Inventory lifecycle ring is 8 MiB (Detailed keeps 64 KiB in
     # SAFE_MAPS); tracks ebpf-common INVENTORY_DISCOVERY_BYTES.
-    "DISCOVERY": map_def(27, 0, 0, 2 * 1024 * 1024),
+    "DISCOVERY": map_def(27, 0, 0, 8 * 1024 * 1024),
     "USAGE": map_def(2, 4, 8, 1),
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),
 }
 INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}
-                      - INSTANCE_PROGRAMS) | {
+                      - INSTANCE_PROGRAMS - SELECTED_PROGRAMS) | {
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
 }
 INVENTORY_FORBIDDEN_MAPS = {
@@ -1600,6 +2390,11 @@ INVENTORY_FORBIDDEN_MAPS = {
     "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
     "ROOT_AFFILIATION", "ROOT_CTL", "WATCHED_FILES", "SLOT_FILE", "PROC_EPOCH", "G_EPOCH",
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
+    "JOURNAL_MARKER_CTL", "PID_START_TICK",
+    "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
+    "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
+    "SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL",
+    "INV_BASELINE_RQ", "INV_BASELINE_CT",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -1607,17 +2402,23 @@ INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "CALLER_EVIDENCE": map_def(6, 4, 8, 4),
     "TASK_COOKIE": SAFE_MAPS["TASK_COOKIE"],
     "COOKIE_CTL": SAFE_MAPS["COOKIE_CTL"],
+    "INV_BASELINE_RQ": map_def(1, 4, 16, 1024, 129),
+    "INV_BASELINE_CT": map_def(2, 4, 56, 1),
 }
+INVENTORY_CALLER_PROGRAMS = INVENTORY_PROGRAMS | {"p11_inventory_image_baseline"}
 
 FROZEN_INVENTORY = {
     "inventory": (INVENTORY_MAPS, INVENTORY_PROGRAMS),
     "inventory-small-discovery": (INVENTORY_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
-    "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_PROGRAMS),
-    "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
+    "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_CALLER_PROGRAMS),
+    "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_CALLER_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
+    "default-gate": (GATE_MAPS, SAFE_PROGRAMS),
+    "default-no-marker": (_DETAILED_BASE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide-default": (WIDE_MAPS, SAFE_PROGRAMS),
     "wide-diagnostic": (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS),
+    "journal": (JOURNAL_MAPS, JOURNAL_PROGRAMS),
 }
 
 
@@ -1632,9 +2433,12 @@ FROZEN_SYMBOLS = {
     "inventory-callers": (False, False, False, 0, 0, 0),
     "inventory-callers-small-discovery": (False, False, False, 0, 0, 0),
     "default": (False, False, False, 0, 0, 0),
+    "default-gate": (False, False, False, 0, 0, 0),
+    "default-no-marker": (False, False, False, 0, 0, 0),
     "diagnostic": (True, True, True, 2, 2, 2),
     "wide-default": (False, False, False, 0, 0, 0),
     "wide-diagnostic": (True, True, True, 2, 2, 2),
+    "journal": (False, False, False, 0, 0, 0),
 }
 
 
@@ -1664,18 +2468,39 @@ def validate_inventory(variant, maps, programs, symbols):
         raise RuntimeError(f"{variant} program inventory differs")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
+    journal = variant == "journal"
+    if journal:
+        # The exact map comparison above already excludes every map the
+        # journal must not carry, including inventory-only maps; here
+        # the marker wiring needs its own rule: the control map plus
+        # both marker bodies, birth and gap.
+        missing = (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}) - symbols
+        if missing:
+            raise RuntimeError(f"journal object lacks required marker symbols: {sorted(missing)}")
+    elif not inventory:
+        markers = symbols & (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"})
+        if variant in ("default", "default-gate"):
+            missing = (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}) - symbols
+            if missing:
+                raise RuntimeError(f"{variant} object lacks required birth marker symbols: {sorted(missing)}")
+        elif markers:
+            raise RuntimeError(f"release object contains forbidden birth marker symbols: {sorted(markers)}")
     if inventory:
-        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity"} if callers else set()
+        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity", "p11_link_current_cookie",
+                   "INV_BASELINE_RQ", "INV_BASELINE_CT",
+                   "p11_inventory_image_baseline"} if callers else set()
         forbidden = {name for name in symbols if name not in allowed and
-                     (name in INVENTORY_FORBIDDEN_MAPS
+                     (name in INVENTORY_FORBIDDEN_MAPS or name in OBJECT_CAPTURE_GLOBAL_HELPERS
                       or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_",
-                                          "p11_inst")))}
+                                          "p11_inst", "p11_image_", "p11_object", "p11_selected_")))}
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                        if inventory else REQUIRED_GLOBAL_HELPERS)
+                        if inventory else REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | SELECTED_GLOBAL_HELPERS)
+    required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
+    required_helpers |= REQUIRED_GLOBAL_EXE_HELPERS
     if callers:
-        required_helpers |= {"p11_link_current_identity"}
+        required_helpers |= {"p11_link_current_identity", "p11_link_current_cookie"}
     missing_helpers = required_helpers - symbols
     if missing_helpers:
         raise RuntimeError(f"missing required .text helpers: {sorted(missing_helpers)}")
@@ -1714,19 +2539,42 @@ def self_test():
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
+    assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
+    assert SAFE_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
+    assert "JOURNAL_MARKER_CTL" not in _DETAILED_BASE_MAPS
+    assert "JOURNAL_MARKER_CTL" not in UNSAFE_MAPS
+    assert "JOURNAL_MARKER_CTL" not in WIDE_MAPS
+    assert "JOURNAL_MARKER_CTL" in INVENTORY_FORBIDDEN_MAPS
+    for variant_maps in (SAFE_MAPS, JOURNAL_MAPS):
+        assert variant_maps["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
+    for variant_maps in (_DETAILED_BASE_MAPS, UNSAFE_MAPS, WIDE_MAPS):
+        assert "PID_START_TICK" not in variant_maps
+    assert "PID_START_TICK" in INVENTORY_FORBIDDEN_MAPS
+    assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
+    assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)
     assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
     assert UNSAFE_MAPS["PAIR_CALLS"] == map_def(3, 4, 4, 1)
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 32
-    assert len(UNSAFE_MAPS) == 34
-    assert len(WIDE_MAPS) == 32
-    assert len(WIDE_UNSAFE_MAPS) == 34
-    assert len(SAFE_PROGRAMS) == 16
-    assert len(UNSAFE_PROGRAMS) == 21
+    assert JOURNAL_MAPS["JOURNAL_START"] == map_def(1, 16, 24, 16_384, 0)
+    assert JOURNAL_MAPS["JOURNAL_CTL"] == map_def(2, 4, 24, 1, 0)
+    assert JOURNAL_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
+    assert JOURNAL_MAPS["JOURNAL_CLASSES"] == map_def(2, 4, 4, 105, 128)
+    assert len(SAFE_MAPS) == 44
+    assert len(UNSAFE_MAPS) == 44
+    assert len(WIDE_MAPS) == 42
+    assert len(WIDE_UNSAFE_MAPS) == 44
+    assert len(JOURNAL_MAPS) == 47
+    assert len(SAFE_PROGRAMS) == 22
+    assert len(UNSAFE_PROGRAMS) == 27
+    assert len(JOURNAL_PROGRAMS) == 22
+    assert JOURNAL_PROGRAMS == (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {"p11_entry_journal", "p11_return_journal"}
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
-    good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
+    base_helpers = (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+                    | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
+    marked_helpers = base_helpers | REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
+    good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | marked_helpers)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -1740,33 +2588,53 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
-    validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
+    validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
     validate_inventory("wide-diagnostic", WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
+    validate_inventory("default-no-marker", _DETAILED_BASE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
+    validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                       {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
+                                                               "p11_instance_exec_birth",
+                                                               "p11_instance_scope_gap"})
 
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS)
+            extra = base_helpers
+            if prefix[0] == "default":
+                extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
+            elif prefix[0] == "journal":
+                extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
+            arguments = (*prefix, symbols | extra)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):
                 check(*arguments)
-        except RuntimeError:
-            return errors.getvalue().splitlines()
+        except RuntimeError as error:
+            lines = errors.getvalue().splitlines()
+            return lines if lines else [str(error)]
         raise AssertionError(f"{check.__name__} accepted {arguments!r}")
 
     assert rejected(
         validate_policy_inventory, (UNSAFE_MAPS, SAFE_PROGRAMS, {"decode_params"}), diagnostic
-    ) == ["map added: ATTR_BOOL_BITS", "map added: PAIR_CALLS"]
+    ) == [
+        "map added: ATTR_BOOL_BITS",
+        "map added: PAIR_CALLS",
+        "map removed: JOURNAL_MARKER_CTL",
+        "map removed: PID_START_TICK",
+    ]
     # Each variant is compared against ITS OWN freeze, not the other one's.
     assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "map added: JOURNAL_MARKER_CTL",
+        "map added: PID_START_TICK",
         "map removed: ATTR_BOOL_BITS",
         "map removed: PAIR_CALLS",
     ]
     assert rejected(validate_inventory, "wide-default", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "map added: JOURNAL_MARKER_CTL",
+        "map added: PID_START_TICK",
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
@@ -1774,6 +2642,53 @@ def self_test():
     assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
         "map added: ATTR_BOOL_BITS",
         "map added: PAIR_CALLS",
+        "map removed: JOURNAL_MARKER_CTL",
+        "map removed: PID_START_TICK",
+    ]
+    # The default object requires the marker set; the other Detailed
+    # variants forbid any of it; the journal requires the same marker set
+    # (control map plus birth and gap bodies).
+    for extra, missing in [
+        (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
+        ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
+    ]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                validate_inventory("default", SAFE_MAPS, SAFE_PROGRAMS,
+                                   {"p11_entry"} | base_helpers | extra)
+        except RuntimeError as error:
+            assert str(error) == f"default object lacks required birth marker symbols: {missing}", error
+        else:
+            raise AssertionError(f"default accepted a markerless object with {sorted(extra)}")
+    assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS,
+                    {"p11_entry", "JOURNAL_MARKER_CTL"}) == [
+        "release object contains forbidden birth marker symbols: ['JOURNAL_MARKER_CTL']"
+    ]
+    assert rejected(validate_inventory, "default-no-marker", _DETAILED_BASE_MAPS, SAFE_PROGRAMS,
+                    {"p11_entry", "p11_instance_scope_gap"}) == [
+        "release object contains forbidden birth marker symbols: ['p11_instance_scope_gap']"
+    ]
+    for extra, missing in [
+        (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
+        ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
+        ({"JOURNAL_MARKER_CTL", "p11_instance_exec_birth"}, "['p11_instance_scope_gap']"),
+    ]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                                   {"p11_entry_journal"} | base_helpers | extra)
+        except RuntimeError as error:
+            assert str(error) == f"journal object lacks required marker symbols: {missing}", error
+        else:
+            raise AssertionError(f"journal accepted a markerless object with {sorted(extra)}")
+    assert rejected(validate_inventory, "journal", JOURNAL_MAPS | {"USAGE": INVENTORY_MAPS["USAGE"]},
+                    JOURNAL_PROGRAMS, {"p11_entry_journal"}) == [
+        "map added: USAGE"
+    ]
+    drifted_journal = JOURNAL_MAPS | {"JOURNAL_CTL": JOURNAL_MAPS["JOURNAL_CTL"] | {"value_size": 25}}
+    assert rejected(validate_inventory, "journal", drifted_journal, JOURNAL_PROGRAMS,
+                    {"p11_entry_journal"}) == [
+        "JOURNAL_CTL.value_size: object=25 frozen=24"
     ]
     # A one-field drift names exactly that field, nothing else (the W3 CONFIG
     # shape: same maps, one max_entries apart).
@@ -1843,6 +2758,33 @@ def self_test():
                 pass
             else:
                 raise AssertionError(f"non-diagnostic or inexact global helper {name} accepted")
+    assert classify([func(1, "p11_selected_current_allowed")], sections,
+                    SELECTED_GLOBAL_HELPERS) == set()
+    for name, location, allowed in [
+        ("p11_selected_current_allowed", 1, frozenset()),
+        ("p11_selected_current_allowed_extra", 1, SELECTED_GLOBAL_HELPERS),
+        ("p11_selected_current_allowed", 3, SELECTED_GLOBAL_HELPERS),
+    ]:
+        try:
+            classify([func(location, name)], sections, allowed)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("inexact selected helper admitted")
+    iterator_sections = sections | {"iter/task": 4}
+    assert classify([func(4, "p11_inventory_image_baseline")], iterator_sections,
+                    inventory=True) == {"p11_inventory_image_baseline"}
+    for name, location, inventory in [
+        ("p11_inventory_image_baseline", 4, False),
+        ("p11_inventory_image_baseline_extra", 4, True),
+        ("p11_inventory_image_baseline", 1, True),
+    ]:
+        try:
+            classify([func(location, name)], iterator_sections, inventory=inventory)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("inexact caller baseline root admitted")
     # mem* helpers are GLOBAL HIDDEN, so the visibility filter already excludes
     # them; the name carries no exemption of its own.
     assert classify([(0, 0, "FUNC", "GLOBAL", "HIDDEN", "1", "memcpy")], sections) == set()
@@ -1878,8 +2820,9 @@ def self_test():
 def usage():
     return (
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
-        "--inventory VARIANT BPF_ELF (default, diagnostic, inventory[-small-discovery], "
-        "inventory-callers[-small-discovery], wide-default, wide-diagnostic) | "
+        "--inventory VARIANT BPF_ELF (default, default-no-marker, diagnostic, "
+        "inventory[-small-discovery], inventory-callers[-small-discovery], "
+        "wide-default, wide-diagnostic, journal) | "
         "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 

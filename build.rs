@@ -19,16 +19,150 @@
 //! Task 3 used and copy the artifact into OUT_DIR ourselves.
 //!
 use sha2::{Digest, Sha256};
-use std::{env, ffi::OsString, path::PathBuf, process::Command};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+    process::Command,
+};
 
 #[path = "build_support/bpf_tools.rs"]
 mod bpf_tools;
+#[path = "build_support/clang_resolve.rs"]
+mod clang_resolve;
+#[path = "build_support/semantic_rustc.rs"]
+mod semantic_rustc;
+
+// The birth-marker paths stay behind P11SCOPE_BIRTH_MARKER. Unset follows
+// the journal decision (a marker with no journal object can never arm, so
+// it would add hook code and a map for nothing); 0 is off; 1 keeps its
+// meaning on any Detailed build. One derived decision controls host
+// expectations and every native/Rust BPF build site.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BirthMarkerRequest {
+    Unset,
+    Enabled,
+    Disabled,
+}
+
+fn birth_marker_requested() -> BirthMarkerRequest {
+    match env::var("P11SCOPE_BIRTH_MARKER").as_deref() {
+        Err(env::VarError::NotPresent) => BirthMarkerRequest::Unset,
+        Ok("1") => BirthMarkerRequest::Enabled,
+        Ok("0") => BirthMarkerRequest::Disabled,
+        _ => panic!("P11SCOPE_BIRTH_MARKER must be unset, 0 or 1"),
+    }
+}
 
 #[derive(Clone, Copy)]
 enum BpfFlavor {
     Detailed,
     InventoryGlobal,
     InventoryCallers,
+    CounterCounts,
+    CounterTimestamps,
+    CounterLatency,
+}
+
+/// Private proof kind beside the ordinary object flavor. Counter geometry
+/// remains selected by its current counts/timestamps/latency flavor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BankProof {
+    None,
+    Counter,
+    Image,
+    /// Journal-roots Detailed content: the private proof, or with the
+    /// production flag the production journal object. BPF content is
+    /// identical; only output names and host selection differ.
+    Journal,
+}
+
+impl BpfFlavor {
+    fn counters(self) -> bool {
+        matches!(
+            self,
+            Self::CounterCounts | Self::CounterTimestamps | Self::CounterLatency
+        )
+    }
+}
+
+fn counter_artifacts_requested() -> bool {
+    match env::var("P11SCOPE_COUNTER_ARTIFACTS").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_COUNTER_ARTIFACTS must be unset, 0 or 1"),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CounterObjectsRequest {
+    Unset,
+    Enabled,
+    Disabled,
+}
+
+fn counter_objects_requested() -> CounterObjectsRequest {
+    match env::var("P11SCOPE_COUNTER_OBJECTS").as_deref() {
+        Err(env::VarError::NotPresent) => CounterObjectsRequest::Unset,
+        Ok("1") => CounterObjectsRequest::Enabled,
+        Ok("0") => CounterObjectsRequest::Disabled,
+        _ => panic!("P11SCOPE_COUNTER_OBJECTS must be unset, 0 or 1"),
+    }
+}
+
+fn image_bank_proof_requested() -> bool {
+    match env::var("P11SCOPE_IMAGE_BANK_PROOF").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_IMAGE_BANK_PROOF must be unset, 0 or 1"),
+    }
+}
+
+fn journal_proof_requested() -> bool {
+    match env::var("P11SCOPE_JOURNAL_PROOF").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_JOURNAL_PROOF must be unset, 0 or 1"),
+    }
+}
+
+// The production journal stays behind P11SCOPE_JOURNAL. Unset selects it
+// exactly when the build can carry it (default capacities, no SMALL/WIDE,
+// no unsafe, no private proof or counter-artifact configuration); P0
+// carries it with attribute capture stubbed, like its Detailed object.
+// Other builds omit it silently, like the counter objects below. Explicit
+// =1 with an incompatible build keeps its refusal; =0 is off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JournalRequest {
+    Unset,
+    Enabled,
+    Disabled,
+}
+
+fn journal_requested() -> JournalRequest {
+    match env::var("P11SCOPE_JOURNAL").as_deref() {
+        Err(env::VarError::NotPresent) => JournalRequest::Unset,
+        Ok("1") => JournalRequest::Enabled,
+        Ok("0") => JournalRequest::Disabled,
+        _ => panic!("P11SCOPE_JOURNAL must be unset, 0 or 1"),
+    }
+}
+
+// Staged loader-gate activation: unset/0 compiles the gate out (every
+// object byte-identical to before this flag existed), 1 compiles the
+// gate unit, production define and Rust maps into Detailed flavors.
+// Wiring only: the runtime cutover latch gates the loader hit path
+// alone (old decode before the flip, tokens after). Image-identity
+// bank selection is not latch-gated: the flavor-wide define always
+// compiles the bank-aware allocator, which refuses until the
+// bank-select map is prepared, and nothing publishes it yet. P3 entry
+// precondition: publish the bank select before any =1 load.
+fn loader_gate_requested() -> bool {
+    match env::var("P11SCOPE_LOADER_GATE").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_LOADER_GATE must be unset, 0 or 1"),
+    }
 }
 
 /// Drops host-only coverage instrumentation from rustflags before they are
@@ -76,35 +210,16 @@ fn strip_coverage_flags(encoded: &str) -> String {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=crates/ebpf/src");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_fork.c");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.c");
-    println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.h");
-    println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
-    println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
-    println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
-    println!("cargo:rerun-if-changed=crates/ebpf-common/src");
-    println!("cargo:rerun-if-changed=crates/ebpf-common/Cargo.toml");
-    println!("cargo:rerun-if-changed=build_support/bpf_tools.rs");
-    // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
-    // call rate overflows the ring buffer deliberately. Unset (the default)
-    // leaves the build byte-for-byte identical to before this flag existed.
-    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
-    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
-    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
-    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
-    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
-    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
-    println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
+    // Refuse malformed requests before any compiler or native build work.
+    let counter_artifacts = counter_artifacts_requested();
+    let counter_objects_request = counter_objects_requested();
+    let image_bank_proof = image_bank_proof_requested();
+    let journal_proof = journal_proof_requested();
+    let journal_request = journal_requested();
+    let birth_marker_request = birth_marker_requested();
+    let loader_gate_env = loader_gate_requested();
+    // Capacity reads come before any emission: the journal and marker
+    // selections below depend on them.
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
         Ok("1") | Ok("true")
@@ -117,12 +232,188 @@ fn main() {
         env::var("P11SCOPE_SMALL_DISCOVERY_RING").as_deref(),
         Ok("1") | Ok("true")
     );
+    let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
+    let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
+    let unsafe_unvalidated = env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some();
+    let small_build = small_ring || small_state_maps || small_discovery_ring;
+    // Explicit =1 keeps today's refusals; unset omits silently where the
+    // build cannot carry the production journal.
+    assert!(
+        journal_request != JournalRequest::Enabled
+            || !(small_build || wide_detailed || unsafe_unvalidated),
+        "production journal requires default FULL capacities without SMALL, WIDE or unsafe"
+    );
+    assert!(
+        !(journal_request == JournalRequest::Enabled && (image_bank_proof || counter_artifacts)),
+        "production journal requires a separate configuration from image proof and counter artifacts"
+    );
+    let production_journal = match journal_request {
+        JournalRequest::Enabled => true,
+        JournalRequest::Disabled => false,
+        JournalRequest::Unset => {
+            !(small_build
+                || wide_detailed
+                || unsafe_unvalidated
+                || journal_proof
+                || image_bank_proof
+                || counter_artifacts)
+        }
+    };
+    let birth_marker = match birth_marker_request {
+        BirthMarkerRequest::Enabled => true,
+        BirthMarkerRequest::Disabled => false,
+        BirthMarkerRequest::Unset => production_journal,
+    };
+    println!("cargo:rustc-check-cfg=cfg(p11scope_journal_roots)");
+    if journal_proof {
+        println!("cargo:rustc-cfg=p11scope_journal_roots");
+    }
+    println!("cargo:rustc-check-cfg=cfg(p11scope_journal)");
+    if production_journal {
+        println!("cargo:rustc-cfg=p11scope_journal");
+    }
+    println!("cargo:rustc-check-cfg=cfg(p11scope_birth_marker)");
+    if birth_marker {
+        println!("cargo:rustc-cfg=p11scope_birth_marker");
+    }
+    println!(
+        "cargo:rustc-env=P11SCOPE_BIRTH_MARKER_ENABLED={}",
+        u8::from(birth_marker)
+    );
+    // Both selections are emitted before any compiler work, so the
+    // preflight harness observes them at the tripwire.
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_ENABLED={}",
+        u8::from(production_journal)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_OUTPUTS={}",
+        if production_journal { "journal-v1" } else { "" }
+    );
+    println!("cargo:rerun-if-changed=crates/ebpf/src");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_fork.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed_baseline.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed_baseline.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/loader_gate.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/loader_gate.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/object_journal.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/object_journal.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/journal_marker.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/journal_marker.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/exec_task.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/exec_task.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/vma_identity.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/vma_identity.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/uapi_check.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
+    println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
+    println!("cargo:rerun-if-changed=crates/ebpf-common/src");
+    println!("cargo:rerun-if-changed=crates/ebpf-common/Cargo.toml");
+    println!("cargo:rerun-if-changed=build_support/bpf_tools.rs");
+    println!("cargo:rerun-if-changed=build_support/clang_resolve.rs");
+    // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
+    // call rate overflows the ring buffer deliberately. Unset (the default)
+    // leaves the build byte-for-byte identical to before this flag existed.
+    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_ARTIFACTS");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_OBJECTS");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_IMAGE_BANK_PROOF");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL_PROOF");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_LOADER_GATE");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_BIRTH_MARKER");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
+    // The identity build resolves clang-18 via PATH and records the hit.
+    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+    println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
+    println!("cargo:rustc-check-cfg=cfg(p11scope_image_bank_proof)");
     // The Inventory validator pins the DISCOVERY size this build compiled
-    // (2 MiB, or 4 KiB here), so the small-ring build loads again.
+    // (8 MiB, or 4 KiB here), so the small-ring build loads again.
     if small_discovery_ring {
         println!("cargo:rustc-cfg=p11scope_small_discovery_ring");
     }
-    let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
+    if image_bank_proof {
+        println!("cargo:rustc-cfg=p11scope_image_bank_proof");
+    }
+    assert!(
+        !counter_artifacts
+            || !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
+        "private counter artifacts currently require default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !image_bank_proof
+            || !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
+        "private image bank proof requires default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !(image_bank_proof && counter_artifacts),
+        "private image bank proof and counter artifacts require separate build configurations"
+    );
+    assert!(
+        !journal_proof
+            || !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
+        "private journal proof requires default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !(journal_proof && (image_bank_proof || counter_artifacts)),
+        "private journal proof requires a separate configuration from image proof and counter artifacts"
+    );
+    // The ordinary FULL build embeds the three bank objects. SMALL/WIDE omit
+    // them silently only when unset; an explicit `=1` with SMALL/WIDE fails
+    // here, before any compiler work. P0 and unsafe-compiled builds embed
+    // identical bytes (counter flavors never take those features below).
+    // The fixed-512 artifacts are a separate private control and coexist.
+    if counter_objects_request == CounterObjectsRequest::Enabled && (small_build || wide_detailed) {
+        panic!("P11SCOPE_COUNTER_OBJECTS=1 with SMALL or WIDE refuses: unset omits silently");
+    }
+    let counter_objects = matches!(
+        counter_objects_request,
+        CounterObjectsRequest::Unset | CounterObjectsRequest::Enabled
+    ) && !small_build
+        && !wide_detailed;
+    // Private discovery for the real early-refusal driver. This records the
+    // actual independent selection used below, before any compiler is called.
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_COUNTER_OBJECTS={}",
+        u8::from(counter_objects)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_BUILD_SCRIPT={}",
+        env::current_exe()
+            .expect("build script executable")
+            .display()
+    );
+    semantic_rustc::emit_proof();
 
     for flavor in [
         BpfFlavor::Detailed,
@@ -135,8 +426,160 @@ fn main() {
             small_state_maps,
             small_discovery_ring,
             wide_detailed,
+            stub_object_attributes,
+            birth_marker,
+            loader_gate_env,
         );
     }
+    // The identity flavor is a standalone clang invocation, not a fourth
+    // `build_variant` arm (the `native_units` match text is pinned by the
+    // image-identity contract test): adding or changing it cannot alter the
+    // three objects above.
+    build_identity_object();
+    // Pre-arm witness object (WU-13 P-C phase 2): standalone, like identity.
+    build_prearm_witness_object();
+    if counter_artifacts {
+        for flavor in [
+            BpfFlavor::CounterCounts,
+            BpfFlavor::CounterTimestamps,
+            BpfFlavor::CounterLatency,
+        ] {
+            build_variant(
+                flavor,
+                false,
+                false,
+                false,
+                false,
+                false,
+                birth_marker,
+                loader_gate_env,
+            );
+        }
+    }
+    println!("cargo:rustc-check-cfg=cfg(p11scope_counter_objects)");
+    if counter_objects {
+        println!("cargo:rerun-if-changed=crates/ebpf/native/counter_bank_proof.c");
+        println!("cargo:rerun-if-changed=crates/ebpf/native/counter_bank_timing.c");
+        println!("cargo:rustc-cfg=p11scope_counter_objects");
+        for flavor in [
+            BpfFlavor::CounterCounts,
+            BpfFlavor::CounterTimestamps,
+            BpfFlavor::CounterLatency,
+        ] {
+            build_variant_with_proof(
+                flavor,
+                false,
+                false,
+                false,
+                false,
+                false,
+                BankProof::Counter,
+                false,
+                birth_marker,
+                loader_gate_env,
+            );
+        }
+    }
+    if image_bank_proof {
+        println!("cargo:rerun-if-changed=crates/ebpf/native/image_bank_proof.c");
+        build_variant_with_proof(
+            BpfFlavor::Detailed,
+            false,
+            false,
+            false,
+            false,
+            false,
+            BankProof::Image,
+            false,
+            birth_marker,
+            loader_gate_env,
+        );
+    }
+    if journal_proof {
+        build_variant_with_proof(
+            BpfFlavor::Detailed,
+            false,
+            false,
+            false,
+            false,
+            false,
+            BankProof::Journal,
+            false,
+            birth_marker,
+            loader_gate_env,
+        );
+    }
+    if production_journal {
+        // The journal object takes the build's own attribute-capture
+        // selection: P0 stubs it exactly like its Detailed object.
+        build_variant_with_proof(
+            BpfFlavor::Detailed,
+            false,
+            false,
+            false,
+            false,
+            stub_object_attributes,
+            BankProof::Journal,
+            true,
+            birth_marker,
+            loader_gate_env,
+        );
+    }
+    println!(
+        "cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED={}",
+        u8::from(loader_gate_env)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_ENABLED={}",
+        u8::from(journal_proof)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_OUTPUTS={}",
+        if journal_proof {
+            "journal-proof-v1"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_IMAGE_BANK_PROOF_ENABLED={}",
+        u8::from(image_bank_proof)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_IMAGE_BANK_PROOF_OUTPUTS={}",
+        if image_bank_proof {
+            "image-bank-proof-v1"
+        } else {
+            ""
+        }
+    );
+    // Selection is an emitted contract, never an inference from stale files.
+    println!(
+        "cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_ENABLED={}",
+        u8::from(counter_objects)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_OUTPUTS={}",
+        if counter_objects {
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        } else {
+            ""
+        }
+    );
+    // Consumers use the emitted set, not file presence. Switching back off
+    // cannot expose stale opt-in artifacts and does not delete owning caches.
+    println!(
+        "cargo:rustc-env=P11SCOPE_COUNTER_ARTIFACTS_ENABLED={}",
+        u8::from(counter_artifacts)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_COUNTER_ARTIFACTS_OUTPUTS={}",
+        if counter_artifacts {
+            "counts,timestamps,latency"
+        } else {
+            ""
+        }
+    );
     println!(
         "cargo:rustc-env=P11SCOPE_INVENTORY_VARIANT={}",
         if small_discovery_ring {
@@ -155,17 +598,81 @@ fn main() {
     );
 }
 
+#[allow(clippy::too_many_arguments)] // The staged gate switch joins the existing explicit flavor seam; bundling would churn both ends for no gain.
 fn build_variant(
     flavor: BpfFlavor,
     small_ring: bool,
     small_state_maps: bool,
     small_discovery_ring: bool,
     wide_detailed: bool,
+    stub_object_attributes: bool,
+    birth_marker: bool,
+    loader_gate_env: bool,
 ) {
-    let inventory = !matches!(flavor, BpfFlavor::Detailed);
+    build_variant_with_proof(
+        flavor,
+        small_ring,
+        small_state_maps,
+        small_discovery_ring,
+        wide_detailed,
+        stub_object_attributes,
+        BankProof::None,
+        false,
+        birth_marker,
+        loader_gate_env,
+    );
+}
+
+// The production-journal flag joins the existing explicit flavor and
+// configuration args; bundling would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
+fn build_variant_with_proof(
+    flavor: BpfFlavor,
+    small_ring: bool,
+    small_state_maps: bool,
+    small_discovery_ring: bool,
+    wide_detailed: bool,
+    stub_object_attributes: bool,
+    bank_proof: BankProof,
+    production_journal: bool,
+    birth_marker: bool,
+    loader_gate_env: bool,
+) {
+    let counter_bank_proof = matches!(bank_proof, BankProof::Counter);
+    let image_bank_proof = matches!(bank_proof, BankProof::Image);
+    let journal_roots = matches!(bank_proof, BankProof::Journal);
+    // The gate wires the loader producer, which only Detailed flavors
+    // run. Inventory and counter objects stay byte-identical either way.
+    let loader_gate = loader_gate_env && matches!(flavor, BpfFlavor::Detailed);
+    let inventory = matches!(
+        flavor,
+        BpfFlavor::InventoryGlobal | BpfFlavor::InventoryCallers
+    );
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let mut out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    if journal_roots {
+        out_dir.push(if production_journal {
+            "journal-v1"
+        } else {
+            "journal-proof-v1"
+        });
+        std::fs::create_dir_all(&out_dir).expect(if production_journal {
+            "creating production journal output"
+        } else {
+            "creating private journal proof output"
+        });
+    } else if counter_bank_proof || image_bank_proof {
+        out_dir.push(if image_bank_proof {
+            "image-bank-proof-v1"
+        } else {
+            "counter-bank-growth-v2"
+        });
+        std::fs::create_dir_all(&out_dir).expect("creating private bank proof output");
+    } else if flavor.counters() {
+        out_dir.push("counter-artifacts");
+        std::fs::create_dir_all(&out_dir).expect("creating private counter artifact output");
+    }
 
     let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
         Ok("big") => "bpfeb-unknown-none",
@@ -178,22 +685,80 @@ fn build_variant(
     // Only caller Inventory retains the exact identity core. Neither Inventory
     // flavor has a fork wrapper, root affiliation, or START dependency.
     let native_units: &[&str] = match flavor {
-        BpfFlavor::InventoryGlobal => &["task_owner"],
-        BpfFlavor::InventoryCallers => &["image_identity", "task_owner"],
-        BpfFlavor::Detailed => &[
+        BpfFlavor::InventoryGlobal => &["task_owner", "exec_task"],
+        BpfFlavor::InventoryCallers => &[
+            "image_identity",
+            "selected_detailed_baseline",
+            "task_owner",
+            "exec_task",
+        ],
+        BpfFlavor::Detailed
+        | BpfFlavor::CounterCounts
+        | BpfFlavor::CounterTimestamps
+        | BpfFlavor::CounterLatency => &[
             "image_identity",
             "image_identity_fork",
+            "image_identity_query",
+            "selected_detailed",
             "task_owner",
             "root_affiliation",
             "instance_epoch",
+            "exec_task",
         ],
     };
+    let mut selected_native_units = native_units.to_vec();
+    if counter_bank_proof || image_bank_proof {
+        // Each proof flavor links one bank core. Counter checkers require
+        // exactly the untimed counts pair or the timed timestamps/latency pair.
+        selected_native_units.push(match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "image_bank_proof",
+            BpfFlavor::CounterCounts => "counter_bank_proof",
+            BpfFlavor::CounterTimestamps | BpfFlavor::CounterLatency => "counter_bank_timing",
+            _ => unreachable!("bank proof builds only counter flavors"),
+        });
+    }
+    // H8-D birth marker: the Detailed object alone links the admission
+    // control row; counter and inventory flavors keep no marker state.
+    // One gate for the unit, define and exports below: Image is Detailed
+    // and retains the canonical marker dependencies; Counter excludes them.
+    let journal_marker = birth_marker
+        && matches!(flavor, BpfFlavor::Detailed)
+        && !counter_bank_proof
+        && !journal_roots;
+    if journal_marker {
+        selected_native_units.push("journal_marker");
+    }
+    if journal_roots {
+        selected_native_units.extend(["object_journal", "journal_marker"]);
+    }
+    if loader_gate {
+        selected_native_units.push("loader_gate");
+    }
     let mut native_bitcodes = Vec::new();
-    for unit in native_units {
-        let suffix = match flavor {
-            BpfFlavor::Detailed => "detailed",
-            BpfFlavor::InventoryGlobal => "inventory",
-            BpfFlavor::InventoryCallers => "inventory-callers",
+    for unit in &selected_native_units {
+        let suffix = if journal_roots {
+            if production_journal {
+                "journal-v1"
+            } else {
+                "journal-proof-v1"
+            }
+        } else if counter_bank_proof || image_bank_proof {
+            match flavor {
+                BpfFlavor::Detailed if image_bank_proof => "image-bank-proof-v1",
+                BpfFlavor::CounterCounts => "counts-bank-growth-v2",
+                BpfFlavor::CounterTimestamps => "timestamps-bank-growth-v2",
+                BpfFlavor::CounterLatency => "latency-bank-growth-v2",
+                _ => unreachable!("bank proof builds only counter flavors"),
+            }
+        } else {
+            match flavor {
+                BpfFlavor::Detailed => "detailed",
+                BpfFlavor::InventoryGlobal => "inventory",
+                BpfFlavor::InventoryCallers => "inventory-callers",
+                BpfFlavor::CounterCounts => "counter-counts",
+                BpfFlavor::CounterTimestamps => "counter-timestamps",
+                BpfFlavor::CounterLatency => "counter-latency",
+            }
         };
         let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
         // The embedded object keeps DWARF/BTF line info. Name the native
@@ -236,8 +801,51 @@ fn build_variant(
         if !inventory && wide_detailed && *unit == "task_owner" {
             compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
         }
+        if flavor.counters() && *unit == "task_owner" {
+            if counter_bank_proof {
+                compile.args([
+                    "-DP11SCOPE_COUNTER_BANK_PROOF",
+                    "-DP11SCOPE_OWNER_SLOT_BOUND=8192U",
+                ]);
+            } else {
+                compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=512U");
+            }
+        }
         if !inventory && wide_detailed && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U");
+        }
+        if counter_bank_proof && *unit == "instance_epoch" {
+            compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=8192U");
+        }
+        // H8-D wires the exec-birth and scope-gap globals into the
+        // Detailed instance witness; the journal instance witness carries
+        // the same READY writer beside its gap, so opted-in sessions can
+        // birth on exec. Counter bitcode stays identical.
+        if journal_marker && *unit == "instance_epoch" {
+            compile.arg("-DP11SCOPE_JOURNAL_MARKER");
+        }
+        if journal_roots {
+            if matches!(*unit, "task_owner" | "object_journal") {
+                compile.arg("-DP11SCOPE_OBJECT_JOURNAL");
+            }
+            if *unit == "instance_epoch" {
+                compile.arg("-DP11SCOPE_JOURNAL_GAP");
+                compile.arg("-DP11SCOPE_JOURNAL_MARKER");
+            }
+        }
+        // Flavor-wide, like INVENTORY_ONLY: every unit in a gated
+        // Detailed build sees the same gate selection, so guarded map
+        // definitions and their externs can never disagree.
+        if loader_gate {
+            compile.arg("-DP11SCOPE_LOADER_GATE");
+        }
+        if counter_bank_proof && *unit == "counter_bank_timing" {
+            compile.arg("-DP11SCOPE_COUNTER_BANK_PROOF");
+            compile.arg(match flavor {
+                BpfFlavor::CounterTimestamps => "-DP11SCOPE_BANK_MODE_TIMESTAMPS",
+                BpfFlavor::CounterLatency => "-DP11SCOPE_BANK_MODE_LATENCY",
+                _ => unreachable!("the timing bank unit needs its mode"),
+            });
         }
         let status = compile
             .status()
@@ -260,10 +868,29 @@ fn build_variant(
     }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
-    let target_dir = out_dir.join(match flavor {
-        BpfFlavor::Detailed => "ebpf-target",
-        BpfFlavor::InventoryGlobal => "ebpf-inventory-target",
-        BpfFlavor::InventoryCallers => "ebpf-inventory-callers-target",
+    let target_dir = out_dir.join(if journal_roots {
+        if production_journal {
+            "ebpf-journal-v1-target"
+        } else {
+            "ebpf-journal-proof-v1-target"
+        }
+    } else if counter_bank_proof || image_bank_proof {
+        match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "ebpf-image-bank-proof-v1-target",
+            BpfFlavor::CounterCounts => "ebpf-counts-bank-growth-v2-target",
+            BpfFlavor::CounterTimestamps => "ebpf-timestamps-bank-growth-v2-target",
+            BpfFlavor::CounterLatency => "ebpf-latency-bank-growth-v2-target",
+            _ => unreachable!("bank proof builds only counter flavors"),
+        }
+    } else {
+        match flavor {
+            BpfFlavor::Detailed => "ebpf-target",
+            BpfFlavor::InventoryGlobal => "ebpf-inventory-target",
+            BpfFlavor::InventoryCallers => "ebpf-inventory-callers-target",
+            BpfFlavor::CounterCounts => "ebpf-counter-counts-target",
+            BpfFlavor::CounterTimestamps => "ebpf-counter-timestamps-target",
+            BpfFlavor::CounterLatency => "ebpf-counter-latency-target",
+        }
     });
     cmd.args([
         "build",
@@ -275,15 +902,43 @@ fn build_variant(
         "build-std=core",
         "--manifest-path",
     ])
-    .arg(&ebpf_manifest)
-    .arg("--target-dir")
-    .arg(&target_dir);
+    .arg(&ebpf_manifest);
+    bpf_tools::isolate_bpf_output(&mut cmd, &target_dir);
     let mut features = Vec::new();
     match flavor {
         BpfFlavor::Detailed if wide_detailed => features.push("wide-detailed-2112"),
         BpfFlavor::Detailed => {}
         BpfFlavor::InventoryGlobal => features.push("inventory-only"),
         BpfFlavor::InventoryCallers => features.push("inventory-callers"),
+        BpfFlavor::CounterCounts => features.push("counter-counts"),
+        // Bank objects share the counts Rust shape so the ordinary maps
+        // stay identical; only the fixed-512 artifacts take their flavor.
+        BpfFlavor::CounterTimestamps => features.push(if counter_bank_proof {
+            "counter-counts"
+        } else {
+            "counter-timestamps"
+        }),
+        BpfFlavor::CounterLatency => features.push(if counter_bank_proof {
+            "counter-counts"
+        } else {
+            "counter-latency"
+        }),
+    }
+    if counter_bank_proof || image_bank_proof {
+        features.push(match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "image-bank-proof",
+            BpfFlavor::CounterCounts => "counts-bank-proof",
+            BpfFlavor::CounterTimestamps => "timestamps-bank-proof",
+            BpfFlavor::CounterLatency => "latency-bank-proof",
+            _ => unreachable!("bank proof builds only counter flavors"),
+        });
+    }
+    // P0-only ship vehicle: the Detailed object alone carries attribute
+    // adapters, so only it takes the stub feature. Inventory flavors
+    // compile the adapters out and are unaffected either way. Counter
+    // flavors never take the stub feature, so bank bytes stay identical.
+    if stub_object_attributes && !flavor.counters() && matches!(flavor, BpfFlavor::Detailed) {
+        features.push("stub-object-attributes");
     }
     if small_ring && !inventory {
         features.push("small-ring");
@@ -304,6 +959,18 @@ fn build_variant(
         }
         flags.push_str(flag);
     };
+    append_flag("--check-cfg=cfg(p11scope_journal_roots)");
+    if journal_roots {
+        append_flag("--cfg=p11scope_journal_roots");
+    }
+    append_flag("--check-cfg=cfg(p11scope_birth_marker)");
+    if journal_marker {
+        append_flag("--cfg=p11scope_birth_marker");
+    }
+    append_flag("--check-cfg=cfg(p11scope_loader_gate)");
+    if loader_gate {
+        append_flag("--cfg=p11scope_loader_gate");
+    }
     // Native task storage and typed tracepoint require BTF/CO-RE in every build.
     for flag in [
         "-C",
@@ -325,6 +992,64 @@ fn build_variant(
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_identity");
     }
+    // The EXEC ticket helper is exported only where the stamp can run:
+    // counter flavors compile the stamp out and must not retain it.
+    if matches!(flavor, BpfFlavor::Detailed | BpfFlavor::InventoryCallers) {
+        append_flag("-C");
+        append_flag("link-arg=--export=p11_link_current_cookie");
+    }
+    if counter_bank_proof || image_bank_proof {
+        let bank_exports: &[&str] = match flavor {
+            BpfFlavor::Detailed if image_bank_proof => &[
+                "p11_bank_select",
+                "p11_bank_gate_release",
+                "p11_bank_enter_a",
+                "p11_bank_enter_b",
+                "p11_bank_complete",
+                "p11_bank_ref",
+            ],
+            BpfFlavor::CounterCounts => &["p11_bank_enter", "p11_bank_complete"],
+            BpfFlavor::CounterTimestamps | BpfFlavor::CounterLatency => {
+                &["p11_bank_enter_timed", "p11_bank_complete_timed"]
+            }
+            _ => unreachable!("bank proof builds only counter flavors"),
+        };
+        for name in bank_exports {
+            append_flag("-C");
+            append_flag(&format!("link-arg=--export={name}"));
+        }
+    }
+    if journal_roots {
+        for name in [
+            "p11_journal_begin",
+            "p11_journal_returning",
+            "p11_journal_settle_prepare",
+            "p11_journal_settle_finish",
+            "p11_owner_start_remove_reason",
+            "p11_instance_exec_birth",
+            "p11_instance_scope_gap",
+            "JOURNAL_START",
+            "JOURNAL_CTL",
+            "JOURNAL_MARKER_CTL",
+            "EVENTS",
+            "DESCRIPTORS",
+            "INSTANCE_START",
+            "EVIDENCE",
+        ] {
+            append_flag("-C");
+            append_flag(&format!("link-arg=--export={name}"));
+        }
+    }
+    if matches!(flavor, BpfFlavor::InventoryCallers) {
+        append_flag("-C");
+        append_flag("link-arg=--export=p11_inventory_image_baseline");
+    }
+    append_flag("-C");
+    append_flag("link-arg=--export=p11_exec_dumpability");
+    // 6.14 Option B: exec-time exe identity, exported in every flavor
+    // like the predicate it sits beside (behavior is runtime-gated).
+    append_flag("-C");
+    append_flag("link-arg=--export=p11_exe_identity");
     if !inventory {
         for flag in [
             "-C",
@@ -341,18 +1066,67 @@ fn build_variant(
             "-C",
             "link-arg=--export=p11_inst_vma_copy",
             "-C",
+            "link-arg=--export=p11_inst_vma_retcopy",
+            "-C",
+            "link-arg=--export=p11_image_exec_release",
+            "-C",
+            "link-arg=--export=p11_image_mmap_release",
+            "-C",
+            "link-arg=--export=p11_image_query",
+            "-C",
+            "link-arg=--export=p11_selected_bootstrap",
+            "-C",
+            "link-arg=--export=p11_selected_cgroup_migrate",
+            "-C",
+            "link-arg=--export=p11_selected_current_allowed",
+            "-C",
             "link-arg=--export=p11_instance_entry",
             "-C",
             "link-arg=--export=p11_instance_return",
             "-C",
             "link-arg=--export=p11_instance_exec",
+            // E1a: Rust stable-cell global (defined in the BPF crate root).
+            "-C",
+            "link-arg=--export=p11_stable_cell",
+            // E1b: Rust alias-scan global (defined in the BPF crate root).
+            "-C",
+            "link-arg=--export=p11_alias_scan",
+            // E1c: Rust alias-capacity global (defined in the BPF crate root).
+            "-C",
+            "link-arg=--export=p11_alias_capacity",
         ] {
             append_flag(flag);
         }
         append_flag("-C");
         append_flag("link-arg=--export=START");
+        if loader_gate {
+            append_flag("-C");
+            append_flag("link-arg=--export=LOADER_GATE");
+            append_flag("-C");
+            append_flag("link-arg=--export=LOADER_GATE_CTL");
+        }
         append_flag("-C");
         append_flag("link-arg=--export=STOP_GATE");
+        // H7 slice B subordinate custody: the native owner resolves these.
+        append_flag("-C");
+        append_flag("link-arg=--export=OBJECT_START");
+        append_flag("-C");
+        append_flag("link-arg=--export=OBJECT_DESCRIPTORS");
+        append_flag("-C");
+        append_flag("link-arg=--export=OBJECT_ZERO");
+    }
+    // H8-D birth marker globals: Detailed exports when the marker is
+    // selected (the journal list above always carries both). Counter and
+    // inventory objects carry neither the map nor the globals.
+    if journal_marker {
+        for flag in [
+            "-C",
+            "link-arg=--export=p11_instance_exec_birth",
+            "-C",
+            "link-arg=--export=p11_instance_scope_gap",
+        ] {
+            append_flag(flag);
+        }
     }
     for bitcode in native_bitcodes {
         append_flag("-C");
@@ -360,7 +1134,12 @@ fn build_variant(
     }
     append_flag("-C");
     append_flag("link-arg=--export=DISCOVERY_STATE");
-    if !inventory && env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
+    // Counter bank objects are identical across FULL, P0 and unsafe builds:
+    // counter flavors never take the stub or unsafe features.
+    if !inventory
+        && !flavor.counters()
+        && env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()
+    {
         features.push("unsafe-unvalidated-metadata");
         // Preserve separately verified diagnostic helpers and their BTF signatures.
         for flag in [
@@ -374,6 +1153,45 @@ fn build_variant(
             append_flag(flag);
         }
     }
+    // The crate release profile optimizes for size, which the Detailed
+    // object needs for its FULL-capture verifier budget; the same shape
+    // doubles the inventory `interface_list_worker` states past the 1M
+    // 5.15/6.1 limit. Both inventory flavors restore level 3, the setting
+    // their worker verified under before the profile change. This stays
+    // the last flag appended: rustc takes the last `-C opt-level`, so a
+    // later opt-level would silently win.
+    if inventory {
+        append_flag("-C");
+        append_flag("opt-level=3");
+    }
+    // Record the effective per-flavor flags for the host contract test:
+    // inventory flavors must end with `-C opt-level=3`, and no other
+    // flavor may carry an opt-level override.
+    println!(
+        "cargo:rustc-env={}={flags}",
+        match flavor {
+            BpfFlavor::Detailed if journal_roots && production_journal => {
+                "P11SCOPE_BPF_RUSTFLAGS_JOURNAL"
+            }
+            BpfFlavor::Detailed if journal_roots => "P11SCOPE_BPF_RUSTFLAGS_JOURNAL_PROOF",
+            BpfFlavor::Detailed if image_bank_proof => "P11SCOPE_BPF_RUSTFLAGS_IMAGE_BANK_PROOF",
+            BpfFlavor::Detailed => "P11SCOPE_BPF_RUSTFLAGS_DETAILED",
+            BpfFlavor::InventoryGlobal => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY",
+            BpfFlavor::InventoryCallers => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY_CALLERS",
+            BpfFlavor::CounterCounts if counter_bank_proof => {
+                "P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS_PROOF"
+            }
+            BpfFlavor::CounterCounts => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS",
+            BpfFlavor::CounterTimestamps if counter_bank_proof => {
+                "P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS_PROOF"
+            }
+            BpfFlavor::CounterTimestamps => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS",
+            BpfFlavor::CounterLatency if counter_bank_proof => {
+                "P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY_PROOF"
+            }
+            BpfFlavor::CounterLatency => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY",
+        }
+    );
     cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
     // Coverage instrumentation is host-only, and it arrives on three
     // channels: plain RUSTFLAGS, the encoded var above, and (for
@@ -406,11 +1224,336 @@ fn build_variant(
     let built = target_dir.join(target).join("release/p11scope-ebpf");
     std::fs::copy(
         &built,
-        out_dir.join(match flavor {
-            BpfFlavor::Detailed => "p11scope-ebpf",
-            BpfFlavor::InventoryGlobal => "p11scope-ebpf-inventory",
-            BpfFlavor::InventoryCallers => "p11scope-ebpf-inventory-callers",
+        out_dir.join(if journal_roots {
+            if production_journal {
+                "p11scope-ebpf-journal-v1"
+            } else {
+                "p11scope-ebpf-journal-proof-v1"
+            }
+        } else if counter_bank_proof || image_bank_proof {
+            match flavor {
+                BpfFlavor::Detailed if image_bank_proof => "p11scope-ebpf-image-bank-proof-v1",
+                BpfFlavor::CounterCounts => "p11scope-ebpf-counts-bank-growth-v2",
+                BpfFlavor::CounterTimestamps => "p11scope-ebpf-timestamps-bank-growth-v2",
+                BpfFlavor::CounterLatency => "p11scope-ebpf-latency-bank-growth-v2",
+                _ => unreachable!("bank proof builds only counter flavors"),
+            }
+        } else {
+            match flavor {
+                BpfFlavor::Detailed => "p11scope-ebpf",
+                BpfFlavor::InventoryGlobal => "p11scope-ebpf-inventory",
+                BpfFlavor::InventoryCallers => "p11scope-ebpf-inventory-callers",
+                BpfFlavor::CounterCounts => "p11scope-ebpf-counter-counts",
+                BpfFlavor::CounterTimestamps => "p11scope-ebpf-counter-timestamps",
+                BpfFlavor::CounterLatency => "p11scope-ebpf-counter-latency",
+            }
         }),
     )
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
+}
+
+/// Resolve `clang-18` like process spawning does: the first `X_OK`
+/// hit on `PATH` (an effective-access probe via an absolute `test`
+/// path, so an unusable-but-bit-set entry is skipped exactly as
+/// `execvp` would skip it), as an absolute path.
+/// The identity build executes this path directly and records its
+/// digest — the receipt names the compiler that actually ran, never a
+/// decoy execution skipped.
+fn resolve_clang18() -> PathBuf {
+    let cwd = env::current_dir().expect("build cwd");
+    clang_resolve::resolve_executable_in("clang-18", &env::var_os("PATH").unwrap_or_default(), &cwd)
+        .expect("an executable clang-18 on PATH")
+}
+
+/// Lossy `OsStr` for the receipt (paths are UTF-8 in practice; a
+/// non-UTF-8 path records lossy, and the pin compares lossy too).
+fn lossy(arg: &OsStr) -> String {
+    arg.to_string_lossy().into_owned()
+}
+
+/// Hex sha256 of a file's bytes.
+fn sha256_file_hex(path: &std::path::Path) -> String {
+    let bytes = std::fs::read(path).expect("reading file for digest");
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Stage 3 Wave D identity object (D2a): `crates/ebpf/native/vma_identity.c`
+/// compiled by clang-18 straight to a BPF ELF. No Rust crate, no nightly,
+/// and no bpf-linker take part, so this object is independent of the B1
+/// blockers by construction. It carries no small-ring or diagnostic variant:
+/// the anchor and scope maps have fixed capacities.
+///
+/// Tool trust, stated plainly: ordinary builds trust their tool
+/// environment — the `PATH` `clang-18` below plus the system headers.
+/// Qualification does not trust it blindly: this function resolves the
+/// first EXECUTABLE `clang-18` on `PATH` to an absolute path ONCE,
+/// executes that path directly for both the compile and the UAPI check,
+/// and records that same path, its realpath, its binary digest, the
+/// full compile and UAPI argv, the explicit CPU baseline, the `PATH`
+/// directories watched, the candidate permission bits, and the object
+/// digest in `p11scope-identity-build-info.txt`; the harness checks the
+/// executed compiler and object against that record. Reviewed source/argv
+/// contracts are independent of compiler-produced object metadata.
+/// Every existing `PATH` directory is watched (a brand-new shadowing
+/// file bumps its directory and re-runs the build), every candidate
+/// file is watched (content changes re-run), and `PATH` itself is
+/// watched (list changes re-run) — so a compiler change shows up as a
+/// changed record (and usually a changed object), never as a silent
+/// identical build. Chmod-only flips change no mtime cargo sees; they
+/// are caught instead by the recorded-vs-live permission comparison
+/// in the harness, which fails loudly on a stale receipt. All of this
+/// acts AT REBUILD TIME: a skipped rebuild leaves a stale-but-
+/// consistent object+receipt pair where receipt checks pass by design — the
+/// record binds the compiler that ran, not custody across invocations.
+/// Remaining envelope (three shapes): concurrent mid-build compiler
+/// replacement (standard build-time trust); nonexistent `PATH`
+/// directories (listed in the receipt, unwatched until they exist);
+/// and executability-only changes — a named-user ACL grant or a
+/// noexec remount flips executability with no mtime/mode change, so
+/// no rebuild fires and receipt checks can pass (the receipt stays true;
+/// any rebuild re-records the executed compiler and current object). No test
+/// re-resolves the winner: the recorded-vs-live
+/// comparison covers `mode & 0o7777` bits only.
+fn build_identity_object() {
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    // Resolve the compiler ONCE, before compiling: this absolute path is
+    // both executed and recorded, so no PATH decoy, relative entry, or
+    // later working directory can split execution from the receipt.
+    let compiler_path = resolve_clang18();
+
+    let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
+        Ok("big") => "bpfeb",
+        _ => "bpfel",
+    };
+    // Same reproducibility rules as the bitcode builds above: fixed source
+    // prefix, fixed compilation directory, no recorded command line, so the
+    // object never records the build host's checkout path. The CPU baseline
+    // is explicit (`v1`, the clang default, verified byte-identical to the
+    // flagless build) so it cannot drift silently with compiler upgrades.
+    let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
+    file_prefix_map.push(manifest_dir.as_os_str());
+    file_prefix_map.push("=/p11scope");
+    let cflags = [
+        "-target",
+        target,
+        "-mcpu=v1",
+        "-O2",
+        "-g",
+        "-gno-record-gcc-switches",
+        "-fdebug-compilation-dir=/p11scope/native",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-c",
+    ];
+    // The compile argv, built once and used for BOTH execution and the
+    // receipt below, so the record cannot drift from what ran.
+    let source = manifest_dir.join("crates/ebpf/native/vma_identity.c");
+    let mut compile_args: Vec<OsString> = cflags.iter().map(OsString::from).collect();
+    compile_args.push(file_prefix_map);
+    compile_args.push(source.into_os_string());
+    compile_args.push(OsString::from("-o"));
+    compile_args.push(OsString::from("p11scope-ebpf-identity"));
+    let status = Command::new(&compiler_path)
+        .current_dir(&out_dir)
+        .args(&compile_args)
+        .status()
+        .expect("failed to spawn clang-18 for the identity object");
+    assert!(
+        status.success(),
+        "building the identity object failed: {status}"
+    );
+    // Reproducible UAPI assertion check (F-uapi): the host <linux/bpf.h>
+    // must agree with the layouts `identity_iter.rs` mirrors. Syntax-only
+    // (the `_Static_assert`s are the product); any mismatch fails the
+    // build here instead of mis-issuing syscalls at runtime. Its argv is
+    // recorded alongside the compile argv.
+    let uapi_source = manifest_dir.join("crates/ebpf/native/uapi_check.c");
+    let uapi_args = [
+        OsString::from("-fsyntax-only"),
+        OsString::from("-Wall"),
+        OsString::from("-Wextra"),
+        OsString::from("-Werror"),
+        uapi_source.into_os_string(),
+    ];
+    let check = Command::new(&compiler_path)
+        .args(&uapi_args)
+        .status()
+        .expect("failed to spawn clang-18 for the UAPI check");
+    assert!(
+        check.success(),
+        "the UAPI header check failed: host <linux/bpf.h> disagrees with identity_iter.rs"
+    );
+    // Qualification record: resolved compiler identity, full argv, CPU
+    // baseline, watch set, candidate bits, and the object digest. A
+    // compiler upgrade re-runs this build (via the rerun lines below)
+    // and re-records. The harness verifies current receipt/object agreement;
+    // it does not compare with an old development-host object digest.
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    let build_cwd = env::current_dir().expect("build cwd");
+    println!("cargo:rerun-if-changed={}", compiler_path.display());
+    for dir in clang_resolve::path_dirs_in(&path_env, &build_cwd) {
+        if dir.is_dir() {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+    }
+    let candidates = clang_resolve::candidate_files_in("clang-18", &path_env, &build_cwd);
+    for candidate in &candidates {
+        if *candidate != compiler_path {
+            println!("cargo:rerun-if-changed={}", candidate.display());
+        }
+    }
+    let compiler_realpath = compiler_path
+        .canonicalize()
+        .unwrap_or_else(|_| compiler_path.clone());
+    let object_path = out_dir.join("p11scope-ebpf-identity");
+    let mut info = format!(
+        "compiler_path={}\ncompiler_realpath={}\ncompiler_sha256={}\ntarget={target}\nmcpu=v1\ncflags={}\ncompile_cwd={}\n",
+        compiler_path.display(),
+        compiler_realpath.display(),
+        sha256_file_hex(&compiler_path),
+        cflags.join(" "),
+        out_dir.display(),
+    );
+    let mut compile_argv = vec![lossy(compiler_path.as_os_str())];
+    compile_argv.extend(compile_args.iter().map(|arg| lossy(arg)));
+    info.push_str(&format!("compile_argc={}\n", compile_argv.len()));
+    for (index, arg) in compile_argv.iter().enumerate() {
+        info.push_str(&format!("compile_arg{index}={arg}\n"));
+    }
+    let mut uapi_argv = vec![lossy(compiler_path.as_os_str())];
+    uapi_argv.extend(uapi_args.iter().map(|arg| lossy(arg)));
+    info.push_str(&format!("uapi_argc={}\n", uapi_argv.len()));
+    for (index, arg) in uapi_argv.iter().enumerate() {
+        info.push_str(&format!("uapi_arg{index}={arg}\n"));
+    }
+    info.push_str(&format!(
+        "path_env={}\nbuild_cwd={}\n",
+        path_env.to_string_lossy(),
+        build_cwd.display(),
+    ));
+    let dirs = clang_resolve::path_dirs_in(&path_env, &build_cwd);
+    info.push_str(&format!("path_dir_count={}\n", dirs.len()));
+    for (index, dir) in dirs.iter().enumerate() {
+        info.push_str(&format!("path_dir{index}={}\n", dir.display()));
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    info.push_str(&format!("candidate_count={}\n", candidates.len()));
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mode = candidate
+            .metadata()
+            .expect("candidate metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        info.push_str(&format!(
+            "candidate{index}_path={}\ncandidate{index}_mode={mode:04o}\n",
+            candidate.display(),
+        ));
+    }
+    info.push_str(&format!(
+        "object_sha256={}\n",
+        sha256_file_hex(&object_path),
+    ));
+    std::fs::write(out_dir.join("p11scope-identity-build-info.txt"), info)
+        .expect("writing identity build info");
+}
+
+/// Pre-arm witness object (WU-13 P-C phase 2): `crates/ebpf/native/prearm_witness.c`
+/// compiled by clang-18 straight to a BPF ELF, like the identity object above.
+/// Uses `-mcpu=v3` (fetch-add and compare-exchange; 6.6 supports v3 atomics).
+/// Self-contained single-writer region: source reruns, compile, compiler/PATH
+/// reruns and receipt all live here; `main` holds the single call. The
+/// controller serializes this function with WU-2b.
+fn build_prearm_witness_object() {
+    println!("cargo:rerun-if-changed=crates/ebpf/native/prearm_witness.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/prearm_witness.h");
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let compiler_path = resolve_clang18();
+
+    let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
+        Ok("big") => "bpfeb",
+        _ => "bpfel",
+    };
+    let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
+    file_prefix_map.push(manifest_dir.as_os_str());
+    file_prefix_map.push("=/p11scope");
+    let cflags = [
+        "-target",
+        target,
+        "-mcpu=v3",
+        "-O2",
+        "-g",
+        "-gno-record-gcc-switches",
+        "-fdebug-compilation-dir=/p11scope/native",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-c",
+    ];
+    let source = manifest_dir.join("crates/ebpf/native/prearm_witness.c");
+    let mut compile_args: Vec<OsString> = cflags.iter().map(OsString::from).collect();
+    compile_args.push(file_prefix_map);
+    compile_args.push(source.into_os_string());
+    compile_args.push(OsString::from("-o"));
+    compile_args.push(OsString::from("p11scope-ebpf-prearm-witness"));
+    let status = Command::new(&compiler_path)
+        .current_dir(&out_dir)
+        .args(&compile_args)
+        .status()
+        .expect("failed to spawn clang-18 for the witness object");
+    assert!(
+        status.success(),
+        "building the witness object failed: {status}"
+    );
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    let build_cwd = env::current_dir().expect("build cwd");
+    println!("cargo:rerun-if-changed={}", compiler_path.display());
+    for dir in clang_resolve::path_dirs_in(&path_env, &build_cwd) {
+        if dir.is_dir() {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+    }
+    let candidates = clang_resolve::candidate_files_in("clang-18", &path_env, &build_cwd);
+    for candidate in &candidates {
+        if *candidate != compiler_path {
+            println!("cargo:rerun-if-changed={}", candidate.display());
+        }
+    }
+    let compiler_realpath = compiler_path
+        .canonicalize()
+        .unwrap_or_else(|_| compiler_path.clone());
+    let object_path = out_dir.join("p11scope-ebpf-prearm-witness");
+    let mut info = format!(
+        "compiler_path={}\ncompiler_realpath={}\ncompiler_sha256={}\ntarget={target}\nmcpu=v3\ncflags={}\ncompile_cwd={}\n",
+        compiler_path.display(),
+        compiler_realpath.display(),
+        sha256_file_hex(&compiler_path),
+        cflags.join(" "),
+        out_dir.display(),
+    );
+    let mut compile_argv = vec![lossy(compiler_path.as_os_str())];
+    compile_argv.extend(compile_args.iter().map(|arg| lossy(arg)));
+    info.push_str(&format!("compile_argc={}\n", compile_argv.len()));
+    for (index, arg) in compile_argv.iter().enumerate() {
+        info.push_str(&format!("compile_arg{index}={arg}\n"));
+    }
+    info.push_str(&format!(
+        "path_env={}\nbuild_cwd={}\n",
+        path_env.to_string_lossy(),
+        build_cwd.display(),
+    ));
+    info.push_str(&format!(
+        "object_sha256={}\n",
+        sha256_file_hex(&object_path),
+    ));
+    std::fs::write(out_dir.join("p11scope-prearm-witness-build-info.txt"), info)
+        .expect("writing witness build info");
 }

@@ -40,7 +40,7 @@ fn interface(manifest: &Manifest, index: usize) -> &SurfaceRecord {
 #[test]
 fn legacy_layout_matrix_covers_200_through_32() {
     let cases = [
-        (2, 0, 67, "full"),
+        (2, 0, 68, "full"),
         (2, 1, 68, "full"),
         (2, 10, 68, "full"),
         (2, 11, 68, "full"),
@@ -48,10 +48,11 @@ fn legacy_layout_matrix_covers_200_through_32() {
         (2, 30, 68, "full"),
         (2, 40, 68, "full"),
         (2, 41, 68, "known_prefix"),
-        (3, 0, 68, "known_prefix"),
-        (3, 1, 68, "known_prefix"),
-        (3, 2, 68, "known_prefix"),
-        (4, 0, 0, "refused"),
+        (3, 0, 68, "full"),
+        (3, 1, 68, "full"),
+        (3, 2, 68, "full"),
+        (4, 0, 68, "known_prefix"),
+        (0, 255, 68, "known_prefix"),
     ];
     for (major, minor, count, expected_walk) in cases {
         let name = format!("legacy-{major}-{minor}");
@@ -80,6 +81,53 @@ fn legacy_layout_matrix_covers_200_through_32() {
                 "{name} boundary"
             );
         }
+    }
+}
+
+/// The shared ABI selection for a legacy table stamped with a published
+/// 3.x: CK_FUNCTION_LIST is the frozen 68-slot 2.40 layout whatever the
+/// stamp says, so the walk is exact. Unpublished minors stay a known
+/// prefix and unknown majors stay refused.
+#[test]
+fn legacy_30_through_32_select_the_exact_base_walk() {
+    fn legacy(major: u8, minor: u8) -> pkcs11_module::TableSet {
+        pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+            version: cryptoki_sys::CK_VERSION { major, minor },
+        })
+    }
+    fn walked_fields(set: pkcs11_module::TableSet) -> usize {
+        match set {
+            pkcs11_module::TableSet::Walk(spans)
+            | pkcs11_module::TableSet::WalkKnownPrefix(spans) => {
+                spans.iter().map(|span| span.fields().len()).sum()
+            }
+            pkcs11_module::TableSet::Refuse => 0,
+        }
+    }
+    for minor in [0u8, 1, 2] {
+        let set = legacy(3, minor);
+        assert!(
+            matches!(set, pkcs11_module::TableSet::Walk(_)),
+            "legacy 3.{minor} must select the exact walk"
+        );
+        assert_eq!(walked_fields(set), 68, "legacy 3.{minor}");
+    }
+    for minor in [3u8, 9, 255] {
+        let set = legacy(3, minor);
+        assert!(
+            matches!(set, pkcs11_module::TableSet::WalkKnownPrefix(_)),
+            "legacy 3.{minor} stays a known prefix"
+        );
+        assert_eq!(walked_fields(set), 68, "legacy 3.{minor}");
+    }
+    let set = legacy(2, 41);
+    assert!(matches!(set, pkcs11_module::TableSet::WalkKnownPrefix(_)));
+    assert_eq!(walked_fields(set), 68);
+    for (major, minor) in [(0u8, 255u8), (1, 0), (4, 0)] {
+        assert!(
+            matches!(legacy(major, minor), pkcs11_module::TableSet::Refuse),
+            "legacy {major}.{minor} stays refused"
+        );
     }
 }
 
@@ -117,8 +165,9 @@ fn standard_and_corroborated_interfaces_cover_every_published_boundary() {
     }
     assert!(matches!(
         &interface(&manifest, 5).walk,
-        WalkOutcome::Refused
+        WalkOutcome::KnownPrefix
     ));
+    assert_eq!(interface(&manifest, 5).functions.len(), 68);
 
     let all_names: Vec<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
         .iter()
@@ -163,7 +212,7 @@ fn standard_and_corroborated_interfaces_cover_every_published_boundary() {
 }
 
 #[test]
-fn page_boundary_short_table_becomes_unreadable_evidence() {
+fn page_boundary_short_table_retains_only_complete_pointer_words() {
     let provider = build(
         "short-table",
         &[
@@ -176,7 +225,144 @@ fn page_boundary_short_table_becomes_unreadable_evidence() {
     let manifest = discover(&provider).unwrap();
     let surface = legacy(&manifest);
     assert!(matches!(&surface.walk, WalkOutcome::Unreadable { .. }));
-    assert!(surface.functions.is_empty());
+    assert_eq!(surface.functions.len(), 67);
+    assert_eq!(surface.functions[66].name, "C_CancelFunction");
+    assert!(
+        surface
+            .functions
+            .iter()
+            .all(|function| matches!(function.resolution, Resolution::Resolved { .. }))
+    );
+}
+
+#[test]
+fn bounded_legacy_tables_preserve_sparse_and_empty_observations() {
+    for ((major, minor, populated), words) in [
+        (2, 40, 67),
+        (3, 0, 67),
+        (3, 1, 67),
+        (3, 2, 67),
+        (4, 19, 27),
+        (0, 255, -1),
+        (2, 0, 67),
+    ]
+    .into_iter()
+    .flat_map(|case| [68, 92, 104].map(|words| (case, words)))
+    {
+        let name = format!("bounded-{major}-{minor}-{populated}-{words}");
+        let major_define = format!("-DLEGACY_MAJOR={major}");
+        let minor_define = format!("-DLEGACY_MINOR={minor}");
+        let sparse_define = format!("-DSPARSE_LEGACY={populated}");
+        let words_define = format!("-DMAPPED_LEGACY_WORDS={words}");
+        let provider = build(
+            &name,
+            &[
+                &major_define,
+                &minor_define,
+                &sparse_define,
+                "-DMATRIX_INTERFACES=0",
+                &words_define,
+                "-DLEGACY_PADDING=1",
+            ],
+        );
+        let manifest = discover(&provider).unwrap();
+        let surface = legacy(&manifest);
+        assert_eq!(surface.version, Some(Version { major, minor }), "{name}");
+        assert_eq!(surface.functions.len(), 68, "{name}");
+        assert!(
+            matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix),
+            "{name}"
+        );
+        assert_eq!(surface.functions[27].name, "C_FindObjects");
+        assert_eq!(surface.functions[67].name, "C_WaitForSlotEvent");
+        for (ordinal, function) in surface.functions.iter().enumerate() {
+            assert_eq!(
+                matches!(function.resolution, Resolution::Resolved { .. }),
+                ordinal as i32 == populated,
+                "{name} slot {ordinal}"
+            );
+            assert_eq!(
+                matches!(function.resolution, Resolution::NullPointer),
+                ordinal as i32 != populated,
+                "{name} slot {ordinal}"
+            );
+        }
+    }
+}
+
+#[test]
+fn interface_version_does_not_erase_observed_common_or_extend_a_shorter_layout() {
+    for ((major, minor, bound), words) in [
+        (2, 40, 68),
+        (3, 0, 92),
+        (3, 1, 92),
+        (3, 2, 104),
+        (4, 19, 68),
+    ]
+    .into_iter()
+    .flat_map(|case| [68, 92, 104].map(|words| (case, words)))
+    {
+        let name = format!("interface-{major}-{minor}-with-{words}");
+        let major_define = format!("-DINTERFACE_MAJOR={major}");
+        let minor_define = format!("-DINTERFACE_MINOR={minor}");
+        let words_define = format!("-DMAPPED_V32_WORDS={words}");
+        let provider = build(&name, &[&major_define, &minor_define, &words_define]);
+        let manifest = discover(&provider).unwrap();
+        let surface = interface(&manifest, 3);
+        assert_eq!(surface.version, Some(Version { major, minor }), "{name}");
+        assert_eq!(
+            matches!(surface.walk, WalkOutcome::Unreadable { .. }),
+            words < bound,
+            "{name}"
+        );
+        assert_eq!(surface.functions.len(), words.min(bound), "{name}");
+        assert_eq!(surface.functions[67].name, "C_WaitForSlotEvent");
+        if words.min(bound) >= 92 {
+            assert_eq!(surface.functions[91].name, "C_MessageVerifyFinal");
+        }
+        assert_eq!(
+            interface(&manifest, 0).functions.len(),
+            68,
+            "a 2.40 label on 104-word storage does not claim extension ordinals"
+        );
+        assert_eq!(interface(&manifest, 1).functions.len(), 92);
+    }
+}
+
+#[test]
+fn legacy_read_failure_distinguishes_unread_words_from_null() {
+    for words in [0, 1, 3, 67] {
+        let name = format!("short-{words}-words");
+        let words_define = format!("-DMAPPED_LEGACY_WORDS={words}");
+        let provider = build(
+            &name,
+            &[
+                "-DLEGACY_MAJOR=2",
+                "-DLEGACY_MINOR=0",
+                "-DMATRIX_INTERFACES=0",
+                "-DSPARSE_LEGACY=0",
+                &words_define,
+            ],
+        );
+        let manifest = discover(&provider).unwrap();
+        let surface = legacy(&manifest);
+        assert!(
+            matches!(&surface.walk, WalkOutcome::Unreadable { detail } if !detail.is_empty()),
+            "{name}"
+        );
+        assert_eq!(surface.functions.len(), words, "{name}");
+        if words > 0 {
+            assert!(matches!(
+                surface.functions[0].resolution,
+                Resolution::Resolved { .. }
+            ));
+            assert!(
+                surface.functions[1..]
+                    .iter()
+                    .all(|function| matches!(function.resolution, Resolution::NullPointer))
+            );
+        }
+    }
 }
 
 #[test]
@@ -200,5 +386,14 @@ fn preloaded_and_non_executable_targets_are_evidence_not_probe_targets() {
             );
         };
         assert!(reason.contains(expected), "slot {index}: {reason}");
+    }
+    for ordinal in [2, 67] {
+        assert!(
+            matches!(
+                surface.functions[ordinal].resolution,
+                Resolution::Resolved { .. }
+            ),
+            "valid slot {ordinal} survives unusable targets"
+        );
     }
 }

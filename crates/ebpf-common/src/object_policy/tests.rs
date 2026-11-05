@@ -16,7 +16,7 @@ const SCALARS: &[(SafeAttributeKind, &[u64])] = &[
     (SafeAttributeKind::Class, &[0, 1, 2, 3, 4]),
     (
         SafeAttributeKind::KeyType,
-        &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x3a, 0x3b],
+        &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41],
     ),
     (SafeAttributeKind::Token, &[0, 1]),
     (SafeAttributeKind::ValueLen, &[16, 24, 32]),
@@ -75,6 +75,28 @@ fn s2s3_safe_attribute_sets_are_closed() {
         for value in [u32::MAX as u64, u64::MAX] {
             assert_eq!(classify_attribute_scalar(kind, value), None);
         }
+    }
+}
+
+// Mutation caught: a key-type vocabulary drifting from the OASIS PKCS #11
+// 3.0 numbers, including the pinned pkcs11-types misnumbering that puts
+// Edwards/Montgomery at 0x3a/0x3b (those are BLAKE2b HMAC and stay refused).
+#[test]
+fn s2s3_key_types_pin_oasis_numbers() {
+    const ACCEPTED: &[u64] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41];
+    for value in ACCEPTED {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, *value),
+            Some(*value as u16),
+            "key type {value:#x}"
+        );
+    }
+    for refused in [0x05u64, 0x11, 0x27, 0x3a, 0x3b] {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, refused),
+            None,
+            "key type {refused:#x} refused"
+        );
     }
 }
 
@@ -250,6 +272,24 @@ const EXPECTED: &[Expected] = &[
         [2, N],
         [7, N],
         [(5, 6), (N, N)],
+        [N, N],
+        NamedFunction,
+    ),
+    Expected(
+        "C_EncapsulateKey",
+        Encapsulate,
+        [2, N],
+        [7, N],
+        [(N, N), (N, N)],
+        [N, N],
+        NamedFunction,
+    ),
+    Expected(
+        "C_DecapsulateKey",
+        Decapsulate,
+        [2, N],
+        [7, N],
+        [(N, N), (N, N)],
         [N, N],
         NamedFunction,
     ),
@@ -450,7 +490,7 @@ fn literal_descriptor(row: &Expected) -> ObjectCaptureDescriptor {
 #[test]
 fn s2s3_object_descriptor_matrix() {
     assert_eq!(pkcs11_module::FUNCTION_NAMES.len(), 104);
-    assert_eq!(EXPECTED.len(), 25);
+    assert_eq!(EXPECTED.len(), 27);
     for (id, name) in pkcs11_module::FUNCTION_NAMES.iter().enumerate() {
         let expected = EXPECTED
             .iter()
@@ -478,9 +518,7 @@ fn s2s3_object_descriptor_matrix() {
     }
     for name in [
         "C_UnwrapKeyAuthenticated",
-        "C_EncapsulateKey",
         "C_FindObjectsInit",
-        "C_DecapsulateKey",
         "C_WrapKeyAuthenticated",
         "C_AsyncComplete",
     ] {
@@ -530,6 +568,18 @@ fn s2s3_argument_seven_is_named_only() {
             .result_pointer_args,
         [7, N]
     );
+    assert_eq!(
+        object_descriptor(function_id("C_EncapsulateKey"))
+            .unwrap()
+            .result_pointer_args,
+        [7, N]
+    );
+    assert_eq!(
+        object_descriptor(function_id("C_DecapsulateKey"))
+            .unwrap()
+            .result_pointer_args,
+        [7, N]
+    );
     for row in EXPECTED {
         let id = function_id(row.0);
         let expected = literal_descriptor(row);
@@ -538,7 +588,9 @@ fn s2s3_argument_seven_is_named_only() {
                 let candidate = replace_argument(expected, position, value);
                 let permitted = value == 7
                     && ((row.0 == "C_GenerateKeyPair" && position == 3)
-                        || (row.0 == "C_UnwrapKey" && position == 2));
+                        || (row.0 == "C_UnwrapKey" && position == 2)
+                        || (row.0 == "C_EncapsulateKey" && position == 2)
+                        || (row.0 == "C_DecapsulateKey" && position == 2));
                 assert_eq!(
                     valid_object_descriptor(id, &candidate),
                     permitted,
@@ -586,6 +638,8 @@ fn s2s3_descriptor_validation_rejects_all_changed_fields() {
             Find,
             GetAttributes,
             SetAttributes,
+            Encapsulate,
+            Decapsulate,
         ] {
             let candidate = ObjectCaptureDescriptor { action, ..expected };
             assert_eq!(valid_object_descriptor(id, &candidate), action == row.1);
@@ -672,4 +726,44 @@ fn s2s3_derive_scalar_phkey_is_authorized() {
         result_protocol_guard: NamedFunction,
     };
     assert!(!valid_object_descriptor(id, &changed));
+}
+
+// Mutation caught: a KEM template-pointee authorization (T0 forbids it),
+// a scalar mechanism guard on the named KEM result, or a moved argument.
+#[test]
+fn s2s3_kem_descriptors_are_named_scalar_result_without_templates() {
+    for (name, action) in [
+        ("C_EncapsulateKey", Encapsulate),
+        ("C_DecapsulateKey", Decapsulate),
+    ] {
+        let id = function_id(name);
+        let descriptor = object_descriptor(id).unwrap_or_else(|| panic!("{name} modeled"));
+        assert_eq!(descriptor.action, action, "{name}");
+        assert_eq!(descriptor.input_args, [2, N], "{name}");
+        assert_eq!(descriptor.result_pointer_args, [7, N], "{name}");
+        assert_eq!(
+            descriptor.template_args,
+            [(N, N), (N, N)],
+            "{name}: T0 keeps template pairs absent"
+        );
+        assert_eq!(descriptor.find_capacity_arg, N, "{name}");
+        assert_eq!(descriptor.find_count_ptr_arg, N, "{name}");
+        assert_eq!(
+            descriptor.result_protocol_guard, NamedFunction,
+            "{name}: no new mechanism read"
+        );
+        // NamedFunction authorizes the nominal result slot for every
+        // mechanism evidence shape, including absent evidence.
+        for mechanism in [None, Some(0), Some(0x17), Some(u64::MAX)] {
+            assert_eq!(
+                authorized_result_pointer_args(id, mechanism),
+                [7, N],
+                "{name}: {mechanism:?}"
+            );
+        }
+        // Any template authorization breaks exact descriptor validation.
+        let mut templated = descriptor;
+        templated.template_args = [(3, 4), (N, N)];
+        assert!(!valid_object_descriptor(id, &templated), "{name}");
+    }
 }

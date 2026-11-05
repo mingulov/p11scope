@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
 use p11scope::{
     capture, capture_startup_signal_dispositions, doctor, failure_already_reported,
-    failure_exit_code, inspect, inventory, pidns, run_owned,
+    failure_exit_code, inspect, inventory, inventory_diff, pidns, run_owned,
 };
 
 fn main() {
@@ -27,7 +27,7 @@ fn main() {
             // progress and "cleanup incomplete", and exits 130 like any
             // shell-interrupted command (SG-I7).
             if !failure_already_reported(&e) {
-                let _ = writeln!(std::io::stderr(), "p11scope: {e:#}");
+                let _ = p11scope::try_stderr_line(&format!("p11scope: {e:#}"));
             }
             std::process::exit(failure_exit_code(&e));
         }
@@ -57,41 +57,96 @@ fn run() -> Result<i32> {
         }
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
-        Ok(Command::Profile(a) | Command::Trace(a)) => capture(&a).map(|()| 0),
+        Ok(Command::Profile(a) | Command::Trace(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
+                .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
+                .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+            {
+                let topic = match a.kind {
+                    cli::Kind::Profile => cli::HelpTopic::Profile,
+                    cli::Kind::Trace => cli::HelpTopic::Trace,
+                };
+                let _ = p11scope::try_stderr_line(&format!("{message}\n{}", topic.hint()));
+                return Ok(2);
+            }
+            capture(&a).map(|()| 0)
+        }
         // `run` owns its child from fork to reap and reports the status a shell
         // would. A child deliberately handed back still running is a success
         // for the observer, so it exits 0.
-        Ok(Command::Run(a)) => run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0)),
+        Ok(Command::Run(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
+                .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
+                .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+            {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Run.hint()
+                ));
+                return Ok(2);
+            }
+            run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0))
+        }
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target
         // that exited while its objects were being pinned — mean "the target could
         // not be read at all": one line here, exit 1, never a panic. A
         // fully-unreadable machine fails the same way under `--system`.
         Ok(Command::Inspect(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Inspect.hint()
+                ));
+                return Ok(2);
+            }
             let scope = match a.scope {
                 cli::InspectScope::Pid(pid) => format!("inspect --pid {pid}"),
                 cli::InspectScope::System => "inspect --system".to_string(),
             };
-            inspect::run(a.scope, &a.modules, &a.hooks, a.json, a.max_scan_pids)
-                .with_context(|| scope)
+            inspect::run(
+                a.scope,
+                &a.modules,
+                &a.exclude_modules,
+                &a.hooks,
+                a.json,
+                a.max_scan_pids,
+            )
+            .with_context(|| scope)
         }
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
+        Ok(Command::InventoryDiff(a)) => inventory_diff::run(&a),
         // `inventory`'s hard failures — an unreadable target, an
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
-            let scope = match a.scope {
-                cli::InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
-                cli::InspectScope::System => "inventory --system".to_string(),
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
+                .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
+                .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+            {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Inventory.hint()
+                ));
+                return Ok(2);
+            }
+            let scope = match &a.scope {
+                cli::ScopeArg::Pid(pid) => format!("inventory --pid {pid}"),
+                cli::ScopeArg::System => "inventory --system".to_string(),
+                cli::ScopeArg::Cgroup(_) => "inventory --cgroup".to_string(),
             };
             // DR-K8S-1: `inventory::run` refuses a mismatched --pid by
             // name before anything runs; that line is already complete.
             inventory::run(
                 a.scope,
                 &a.modules,
+                &a.exclude_modules,
+                &a.manifests,
+                &a.prearm_modules,
                 &a.hooks,
                 a.json,
                 a.max_scan_pids,
                 a.max_gaps,
+                a.max_endpoints,
                 a.duration,
                 a.out.as_deref(),
                 a.dashboard,
@@ -100,6 +155,13 @@ fn run() -> Result<i32> {
                 a.event_max_files,
                 a.capture,
                 a.attach_backend,
+                a.diagnostics.as_deref(),
+                a.diagnostics_pid,
+                a.identity_backend,
+                a.identity_backend_explicit,
+                a.caller_metadata,
+                a.key_operations,
+                a.quiet,
             )
             .map_err(|error| {
                 if error.is::<pidns::NumberingMismatch>() {
@@ -111,8 +173,8 @@ fn run() -> Result<i32> {
         }
         // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
         Err(CliError::Help(topic)) => print_stdout(format_args!("{}\n", topic.text())),
-        Err(CliError::Usage(msg)) => {
-            let _ = writeln!(std::io::stderr(), "{msg}");
+        Err(CliError::Usage { message, topic }) => {
+            let _ = p11scope::try_stderr_line(&format!("{message}\n{}", topic.hint()));
             Ok(2)
         }
     }

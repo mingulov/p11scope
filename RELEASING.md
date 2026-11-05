@@ -1,25 +1,60 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Releasing p11scope
 
-The owner's runbook for tagging a release, written for v0.1.0 and updated for
-v0.2.0. The release
-build uses network access and pins its source dependencies (lockfiles, the
+The owner's runbook for a fully packaged release. The published
+[v0.4.0 tag](https://github.com/mingulov/p11scope/tree/v0.4.0) was an intermediate
+source checkpoint with explicit P0 selection, no new binary assets and open
+installed/package acceptance; it does not claim completion of this runbook.
+The versioned examples below use the `0.5.0` manifest spelling. For a
+new release, choose an unpublished version and fresh output paths; do not
+recreate or move existing tags.
+
+The release build uses network access and pins its source dependencies (lockfiles, the
 `pkcs11-components` Git revision and hash-pinned patched crates), Rust
-toolchains and discover build images. The builder records the effective host
+toolchains and digest-pinned build images. The builder records the effective host
 tools and source tree in its receipt. Binary byte reproducibility has not been
 established by independent builds. A full offline source export is an optional
 capability, described in [docs/build-offline.md](docs/build-offline.md); the
 attached source export uses network access for remaining dependencies.
 
-Run the steps in order. The release receipt binds the tree of `HEAD`. Finish
-every tracked file before the final hosted CI run, qualification and artifact
-build. Any later source or documentation change creates a new candidate and
-requires the affected gates to run again on that new revision.
+Run the steps in order when assembling the final candidate. During development,
+use focused regression checks per fix and affected checks at coherent integration
+checkpoints; complete candidate gates follow convergence. The release receipt
+binds the tree of `HEAD`. Finish tracked edits before final hosted CI and artifact
+publication. Later edits invalidate affected checks and any whole-tree package
+bindings; reconcile those on the final revision. Keep earlier functional results
+labelled with their actual revision rather than restarting unrelated checks or
+describing an old CI run as an exact-new-commit result.
+
+## Version and schema-identifier rules
+
+- The product version lives in two manifests: the root `Cargo.toml` and
+  `crates/discover/Cargo.toml` carry the release version and must agree
+  (`scripts/package-release.py` refuses to package when they differ). Every
+  other crate is internal and stays `0.0.0`.
+- Report schema identifiers are versioned separately from the product. They
+  are opaque, exact dispatch keys: the apparent major/minor spelling grants
+  no compatibility, and a consumer dispatches on the exact string. A release
+  never renames a schema in place; an incompatible change ships under a new
+  identifier with its schema document beside it.
+- The current identifiers are `p11scope/observed-profile/v3` and
+  `p11scope/observed-profile/v3-metrics` (profile lanes),
+  `p11scope-manifest/5` (optional discovery input),
+  `p11scope/inventory/v1` and `p11scope/inventory-events/v1` (inventory),
+  `p11scope/inventory-diff/v1` (offline comparison),
+  `p11scope/inventory-diagnostics/v1` (diagnostics), and
+  `p11scope/inspect/v1` / `p11scope/inspect-system/v1` (inspection). Each is
+  defined under [docs/schema](docs/schema) except `p11scope-manifest/5`,
+  whose contract is code in
+  [crates/manifest/src/manifest.rs](crates/manifest/src/manifest.rs)
+  (the `SCHEMA` constant and its writer); the historical v2 profile
+  documents keep their old shape.
 
 ## 1. Freeze the candidate
 
-- Merge the release work to `main` and check out the exact commit to tag.
-  A release branch can stage and test the candidate first. When `main` is
+- Integrate release work into `main` with cherry-picks or a fast-forward and
+  check out the exact commit to tag. A release branch can stage and test the
+  candidate first. When `main` is
   an ancestor of that branch, use a fast-forward to preserve the candidate
   commit. A merge commit, squash, rebase or history rewrite changes its
   identity; reconcile source-bound receipts and run the affected gates on
@@ -27,9 +62,9 @@ requires the affected gates to run again on that new revision.
   The tree must be clean, including untracked files:
   `git status --porcelain=v1 --untracked-files=all` prints nothing.
 - Confirm the versions: `Cargo.toml` and `crates/discover/Cargo.toml` both
-  say the release version (`0.2.0`). The other crates are internal and stay
+  say the release version (`0.5.0`). The other crates are internal and stay
   `0.0.0`.
-- Set the version heading in `CHANGELOG.md` to `## [0.2.0]` (drop
+- Set the version heading in `CHANGELOG.md` to `## [0.5.0]` (drop
   ` - UNRELEASED`). Put the actual
   publication date in the GitHub release. Every tracked text change must land
   before final CI and artifact builds.
@@ -48,37 +83,34 @@ requires the affected gates to run again on that new revision.
   GPL-3.0-only or Apache-2.0-only code has entered the BPF build
   (`cargo tree -e normal` in `crates/ebpf`).
 
-## 2. Confirm the dependency revision is tagged
+## 2. Confirm the dependency versions are released
 
-The pinned `pkcs11-components` revision must stay fetchable, so it must be
-reachable from a published tag, not only from a branch a later force-push
-could rewrite. The pinned `d0a47c7` is an ancestor of the published tags
-`v0.2.0` and `v0.2.1`:
+The `pkcs11-types`/`pkcs11-module` crates come from crates.io (there is no
+Git dependency left to keep fetchable). The released version in every
+manifest that names them (`Cargo.toml`, `crates/discover/Cargo.toml`,
+`crates/ebpf-common/Cargo.toml`) must match both lockfiles (`Cargo.lock`,
+`crates/ebpf/Cargo.lock`), including the registry checksums:
 
 ```sh
-git ls-remote --tags https://github.com/mingulov/pkcs11-components
-git -C <pkcs11-components checkout> fetch --tags origin
-git -C <pkcs11-components checkout> merge-base --is-ancestor \
-  d0a47c71d34294466bc41100ae6b5a5a329029d2 v0.2.0 && echo reachable
+grep -h 'name = "pkcs11-' -A3 Cargo.lock crates/ebpf/Cargo.lock
 ```
 
-The revision must match the `rev =` in `Cargo.toml` and both lockfiles. The
-crates.io releases of `pkcs11-types` and `pkcs11-module` (0.2.0, 0.2.1) are
-later revisions with source changes, not `d0a47c7`. Moving to them is a
-dependency upgrade that needs the full checks and qualification again.
+Moving to a newer crates.io release is a dependency upgrade that needs the
+full checks and qualification again.
 
 ## 3. Get a green hosted CI run on the exact commit
 
 Push the frozen commit to a branch and let `ci` run. Every job of the push
 run must pass on that exact SHA: `dedupe`; the check jobs `lint`, `audit`,
-`tests`, every `contracts-N` shard and `scripts`; every `coverage` shard and
-`coverage-report`; and `archive-log`. `quarantine` runs only when a check
-job failed, so a green run skips it.
+`tests`, `bpf-noninterference`, the eight `contracts` shards, and `scripts`;
+the seven `coverage` partitions and `coverage-report`; and `archive-log`.
+`quarantine` runs only when a check job failed (`if: failure()`), so a green
+run skips it.
 
 `ci` runs the full matrix once per commit. When the same commit is pushed
 again under another ref (the release branch, then `main`, then the tag),
 the later push run's `dedupe` job finds the earlier push or dispatch run that
-already passed `lint` and `coverage-report` on that SHA, skips its own check
+already passed `lint`, `coverage-report` and `bpf-noninterference` on that SHA, skips its own check
 and coverage jobs, and names the covering run in its summary. If the earlier
 run is still going, `dedupe` waits for it, and runs the full matrix itself
 when that run fails, is cancelled or is still unfinished after 75 minutes.
@@ -86,14 +118,93 @@ Record the URL of the run that executed the matrix, not of a deduplicated
 one; a deduplicated run on the tag is green only because that covering run
 passed. A manual dispatch always runs the full matrix.
 
+`bpf-noninterference` follows `tests`, including when tests fail. It first
+runs the repeat-baseline control on reviewed baseline
+`ad01d1b65bf980403aa652f140ce06088e9d591d` twice, then compares that
+baseline with the exact candidate commit in a fresh integration snapshot.
+Use the reviewed `BASELINE` in `.github/workflows/ci.yml`; earlier baseline
+results retain their actual revisions.
+Advance the baseline only after reviewing intentional BPF changes, not to
+clear an arbitrary comparison failure. All bytes
+of the three default BPF objects must match in the same pinned tool/header environment;
+a proven BTF type-order-only permutation (identical sections, same BTF
+meaning) is accepted with a recorded `btf-order-only` verdict instead of
+failing the gate. Its
+separate artifact retains commands, source and tool receipts, object digests
+and section summaries on success or failure.
+After root/BPF acquisition, it fetches the selected pinned nightly's installed
+`library/sysroot/Cargo.toml` with `--locked` before the offline build. Receipts
+bind that manifest and `library/Cargo.lock` before/after and between snapshots;
+the toolchain source inputs must stay unchanged.
+The checker's command runner applies timeouts; later text parsing rejects stdout
+over 64 MiB. Captured
+stdout/stderr files have no byte cap and can consume disk until a command exits
+or times out, including a failed build whose output is retained without parsing.
+This gate does not qualify the separate identity object on a live kernel.
+
+For a restricted network environment, pass both `--baseline-offline-payload ABS`
+and `--candidate-offline-payload ABS` to the checker. Each snapshot admits its
+payload against its own committed offline recipe using the existing complete
+validator. The checker copies validated inputs into owned scratch, generates
+only the exact source replacement config, and uses locked offline fetches and
+offline nested Cargo in a fresh private home for each build. Receipts bind the
+supplied and copied payloads, config and coordinator helpers before and after
+execution. Use the released payload for both sides of the R/R diagnostic.
+The ordinary acquisition path also fetches nightly sysroot dependencies;
+root/BPF fetches alone do not provide that closure. Payload mode does not
+establish hosted online/network qualification, which still needs real CI
+evidence.
+
 Then dispatch `ci` manually on the same ref (Actions → ci → Run workflow,
-`release_preview` selected). Keep the `release-preview-public-assets` artifact
-and the separately labeled container SBOM. The full release receipt remains
-on the hosted runner only during verification; retain the full local builder
-receipt privately. Actions logs contain a small status, source identity, tree
-and digest-checker summary; record their run URL and result.
-`privileged-e2e` needs a `[self-hosted, bpf]` runner; select it only if one
-exists. Record the run URLs and exact source SHA for the release notes. A job
+`release_preview` selected). The job rebuilds the FULL and P0 musl observers,
+builds the observer/holder container images (the observer image holds the FULL
+binary; hadolint and kubeconform checks cover `deploy/`), runs the official
+builder receipt for each capture mode, and assembles the notices, source export
+and one public candidate per mode. The `release-preview-public-assets` and
+`release-preview-public-assets-p0` artifacts have 30-day retention. The
+separately labeled container SBOM (`sbom-observer-container-preview`) describes
+the preview container image, not the official release bytes. Keep the local
+builder receipt while packaging,
+verification or active debugging needs it; this does not require a permanent
+private archive. The full hosted receipt remains on the runner only during
+verification. Actions logs contain a small status, source identity, tree and
+digest-checker summary; record their run URL and result.
+
+For package-only work after a successful ordinary and coverage run, dispatch
+`package-preview` on the **same commit**, with `accepted_ci_run_id` set to that
+actual `ci.yml` run ID. `capture_mode` selects `full`, `p0` or `both` (default
+`both`); `jobs` selects a canonical integer from 1 through 16 (default `2`).
+The workflow requires the selected run to have completed successfully in this
+repository, on the checkout's exact SHA and tree, with every current ordinary
+job, all eight contracts shards, all seven coverage partitions and the merged
+coverage report successful in that run's current attempt. Missing, skipped,
+duplicate, stale or partial gates, API errors and deduped runs refuse; there
+is no automatic search for a different run. The complete `ci` workflow remains
+the ordinary and coverage entry point.
+
+Each selected package mode gets its own ordinary `ubuntu-26.04` runner,
+official `build-release.sh --capture-mode MODE --jobs N`, successful receipt,
+source export, notices and package validation before its own public upload.
+All final-binary canaries, helper, static and hostile-target checks stay in the
+official builder. FULL and P0 upload independently as
+`release-preview-public-assets` and `release-preview-public-assets-p0` in this
+separate run; a P0 failure does not withhold successful FULL assets. Both
+required mode results still need to pass for a release. No private receipts,
+capture or logs are uploaded. The Docker runtime artifact downloader
+(`scripts/download-runtime-observer.py`, through the `docker-runtime`
+workflow's `preview_run_id`) accepts these run IDs: a completed exact-source
+`package-preview` dispatch whose `validate` and `package-full` gates succeeded
+supplies the FULL `release-preview-public-assets` artifact.
+
+The preview workflow passes a version-neutral `source.tar.gz` from the exporter
+to the packager. The packager validates the archive's recorded revision and
+derives the public source filename from the manifests. Inspect the actual output
+`RELEASE.json` and `SHA256SUMS` for the candidate's version and source identity.
+Select `privileged_e2e` in the manual dispatch for the four actual
+PID/system × metrics/profile capture cells. The `privileged-e2e` job runs on
+ordinary GitHub-hosted `ubuntu-26.04`; no external or self-hosted runner is
+required. Missing capabilities or failed count/window checks fail the job.
+Record the run URLs and exact source SHA for the release notes. A job
 judged environmental (a flaky coverage run, for example) is an explicit,
 written decision, never an ignored red badge.
 
@@ -106,44 +217,87 @@ scratch.
 
 ## 4. Run the privileged qualification
 
-On a quiet BPF-capable host, run the source-level qualification (kernel matrix,
-privacy canaries, container lanes, overhead re-bench) against the frozen
-commit. Record exact commands, source SHA, kernels, lanes, pass and skip counts,
+On a quiet Linux x86-64 host, live capture requires demonstrated
+`uprobe_multi` load and self-link capability under the current credentials,
+normally Linux 6.6+ or a working backport. Kernel version alone does not admit
+a host. Safe scoped Singles remains available on eligible hosts; PID Multi
+also requires its independent kernel PID-filter proof.
+
+Run the planned source-level qualification against the frozen commit: the
+selected release-matrix assertions (`scripts/qualify-release-matrix.sh`;
+see [docs/qualification/release-matrix.md](docs/qualification/release-matrix.md)),
+privacy canaries, container lanes and overhead re-bench. The matrix's six
+default positive lanes are 6.6.157, Ubuntu 6.8.0-142-generic, 6.12.111,
+6.18.58, 7.2.6 and the host. Keep the separate unsupported-host refusal/offline
+control; do not restart stock 5.15/6.1 positive or verifier-headroom campaigns.
+Older registered labels serve explicitly selected backport or historical
+inputs, not a claim of current stock old-kernel live support. Start with a plan.
+For prebuilt execution, set `candidate_sha`, `bin_dir` and `candidate_receipt`
+to the selected commit, binary directory and its actual build-produced receipt;
+guest storage/account prerequisites are described in the matrix guide:
+
+```sh
+scripts/qualify-release-matrix.sh --dry-run
+scripts/qualify-release-matrix.sh --rev "$candidate_sha" --bin-dir "$bin_dir" \
+  --candidate-receipt "$candidate_receipt"
+```
+
+Record exact commands, source SHA, kernels, lanes, pass and skip counts,
 and the binaries actually used. A lane that builds its own binary validates
 that source, not the packaged bytes. After step 5, run every artifact-specific
 qualification claimed in the release notes against the official `work/dist/`
 binaries and record their hashes. Do not promote earlier candidate runs to
 final tagged-artifact qualification. A fix found here invalidates the affected
-results; go back to step 1.
+results. Select the updated candidate, repeat the affected qualification and
+reconcile its build/package bindings before the final candidate gates; do not
+restart unrelated qualification for every fix.
 
 ## 5. Build the release artifacts
 
 `scripts/build-release.sh` is the only path to the official bytes. It builds
-the safe-only static observer (`--no-default-features`, musl, `+crt-static`,
-build-host paths remapped), builds the discover helper for glibc and musl in
-digest-pinned containers, and runs the canary, attach and hostile-target
-smokes against the packaged binaries.
+the FULL static observer (default features, musl, `+crt-static`, build-host
+paths remapped), with `--capture-mode p0` selecting the P0 variant
+(`--no-default-features --features stub-object-attributes`) for the
+verifier-budget lane; it builds the discover helper for
+glibc and musl in digest-pinned containers, and runs the canary, attach and hostile-target
+smokes against the packaged binaries. The helper lane
+(`scripts/verify-discover-containers.sh`) pins `rust:1.99.1-bookworm`,
+`rust:1.99.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
+FULL and P0 official bytes embed the journal object and the birth marker, and the official build strips caller switches.
+Qualify the packaged FULL bytes on the release candidate before publishing.
 
-Requirements: a non-root user with passwordless `sudo`, a working Docker
-daemon, SoftHSM2 at `/usr/lib/softhsm/libsofthsm2.so`, every tool in the
-script's `RECEIPT_TOOL_INVENTORY` on `PATH` (including `bpftool`,
-`llvm-objcopy`, `llvm-readelf`, `setpriv`, `softhsm2-util`, `file`), no
-inherited `RUSTFLAGS`/`CARGO_*`/`RUSTUP_*` build variables, no untracked
-`.cargo/config.toml`, and the pinned toolchains:
+Ordinary source builds default to FULL; `--no-default-features` alone does not
+select P0. The packager records `p11scope_features: []` and a FULL scope with
+object-attribute capture enabled by default, and `["stub-object-attributes"]`
+with a P0 scope (capture disabled) under `--capture-mode p0`, in the top-level
+and bundled `RELEASE.json`. This describes the official builder configuration
+per capture mode; report the runtime object-capture disclosure when qualifying
+packaged binaries. Qualify the packaged FULL bytes on the release candidate before publishing.
+
+Requirements: a non-root user with passwordless `sudo` (`sudo -n true` must
+succeed), a working Docker daemon, SoftHSM2 at
+`/usr/lib/softhsm/libsofthsm2.so`, every tool in the script's
+`RECEIPT_TOOL_INVENTORY` on `PATH` (including `bpftool`,
+`llvm-objcopy`, `llvm-readelf`, `setpriv`, `softhsm2-util`, `file`), none of
+the inherited build inputs in `RECEIPT_BUILD_INPUTS` set (`RUSTFLAGS`,
+`CARGO_*`, `RUSTUP_*`, `RUSTC_WRAPPER`, `CC`, `CFLAGS` and the
+`P11SCOPE_PREPARED_*`/`P11SCOPE_PRODUCT_BUILD_MODE` seams), a safe `TMPDIR`,
+no untracked `.cargo/config.toml`, and the pinned toolchains:
 
 ```sh
-rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
-rustup target add --toolchain 1.98.1 x86_64-unknown-linux-musl
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+rustup target add --toolchain 1.99.1 x86_64-unknown-linux-musl
 rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
+cargo +1.99.1 install bpf-linker --version 0.10.4 --locked
 python3 -I scripts/prepare-dependencies.py
-cargo +1.98.1 fetch --locked
+cargo +1.99.1 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
 The stable version above is the release compiler, single-sourced from
-`.release-rust-version` (currently 1.98.1); the release scripts and CI read
-that file rather than pinning a literal.
+`.release-rust-version` (currently 1.99.1); the release scripts and CI read
+that file rather than pinning a literal. The `bpf-linker` version matches
+`CI_TOOL_BPF_LINKER` in `.github/workflows/ci.yml`.
 
 The driver checks the host tool selection before building:
 
@@ -154,7 +308,7 @@ The driver checks the host tool selection before building:
   `RUSTUP_TOOLCHAIN`, which the release preflight rejects. If these select
   only the standard homes and the pinned toolchain, remove those inherited
   variables when launching the driver, for example
-  `mise exec -- env -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN scripts/build-release.sh /var/tmp/p11scope-release/v0.2.0`.
+  `mise exec -- env -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN scripts/build-release.sh /var/tmp/p11scope-release/v0.5.0`.
   A custom Cargo or rustup home requires a separate build environment.
 
 The discover helper lane creates one dedicated Docker bridge with automatic
@@ -167,29 +321,53 @@ or package access still fails, retain the failed receipt and inspect the
 recorded network and the host's resolver configuration before retrying, or use the
 `release-preview` CI job.
 
-The single argument is an absent evidence root whose parent is a private
-directory outside the checkout:
+The driver accepts an optional `--capture-mode full|p0` before the evidence-root
+argument (default `full`); the single-argument invocation keeps working. The
+evidence root is an absent absolute path whose parent is an existing private
+directory outside the checkout; the receipt records the selected `capture_mode`
+fact:
 
 ```sh
 mkdir -p -m 700 /var/tmp/p11scope-release && chmod 700 /var/tmp/p11scope-release
-scripts/build-release.sh /var/tmp/p11scope-release/v0.2.0
+scripts/build-release.sh /var/tmp/p11scope-release/v0.5.0
+# P0 variant: scripts/build-release.sh --capture-mode p0 /var/tmp/p11scope-release/v0.5.0-p0
 ```
+
+Use `--jobs N` before the evidence-root argument to select a Cargo build budget
+of 1 through 16 jobs, for example `--jobs 2`. Only canonical decimal integers
+are accepted; duplicate, missing and out-of-range values fail before the
+driver creates its receipt or starts work. The selected budget reaches the
+sealed host builds, nested BPF builds and both owned discover-helper build
+containers. The standalone helper driver accepts the same option before
+`--lane14-facts ABSENT_ARTIFACTS_FILE`.
+
+Omitting `--jobs` keeps Cargo's existing scheduler defaults. Inherited
+`CARGO_BUILD_JOBS` is removed by the release seal; select the option explicitly.
+The parent receipt and helper facts record `build_jobs` as the selected integer
+or `cargo-default` when omitted. The upper bound is a policy limit, not a CPU
+or memory reservation: follow the build host's lane and concurrency rules.
+This option does not change target directories or Docker daemon settings.
 
 The body prints `=== build-release: ALL OK ===` before the finalizer runs.
 Accept the build only when the script exits zero, the receipt's `status` file
 contains `0`, and `facts.log` records `terminal_status` and `checker_status`
-as `0`. The marker alone is not a success verdict. Keep the whole evidence
-root: `facts.log`, `stdout.log`, `stderr.log` and `artifacts/` are the receipt.
+as `0`. The marker alone is not a success verdict. `facts.log`, `stdout.log`,
+`stderr.log` and `artifacts/` form the builder receipt; keep it intact through
+packaging and verification. Completed build caches and temporary full logs do
+not require permanent retention once active work no longer needs them.
 The binaries are in `work/dist/`: `p11scope` (static musl observer),
 `p11scope-discover-glibc`, `p11scope-discover-musl`, and `p11scope-discover`
 (a copy of the glibc helper). The duplicate is for the smoke lane; package
-the explicitly named glibc and musl outputs.
+the explicitly named glibc and musl outputs. The builder binds the four files
+to `artifacts/release-artifacts.sha256` with
+`scripts/release-artifacts.py record` and re-verifies the binding before it
+publishes `status`.
 
 Record the build facts for the release notes:
 
 ```sh
-cd /var/tmp/p11scope-release/v0.2.0/work/dist
-rustc +1.98.1 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
+cd /var/tmp/p11scope-release/v0.5.0/work/dist
+rustc +1.99.1 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
 if strings -a p11scope | grep -Fq -- "$HOME"; then
   echo 'release binary embeds build-home path' >&2
   exit 1
@@ -209,9 +387,9 @@ that ran in the final release notes.
 
 `scripts/package-release.py` makes three versioned tarballs from the official
 binaries:
-`p11scope-0.2.0-x86_64-linux-musl.tar.gz`,
-`p11scope-discover-0.2.0-x86_64-linux-gnu.tar.gz`, and
-`p11scope-discover-0.2.0-x86_64-linux-musl.tar.gz`. Each archive has one
+`p11scope-0.5.0-x86_64-linux-musl.tar.gz`,
+`p11scope-discover-0.5.0-x86_64-linux-gnu.tar.gz`, and
+`p11scope-discover-0.5.0-x86_64-linux-musl.tar.gz`. Each archive has one
 same-named top-level directory containing an executable named `p11scope` or
 `p11scope-discover` (mode `0755`), project GPL license texts, `notices/`, and
 `RELEASE.json` with curated build provenance. The glibc and musl helpers
@@ -219,39 +397,45 @@ must remain separately labeled: each is dynamically linked and must match the
 provider's ABI and C library. Generate and verify the notices from the actual
 locked dependency graph, including the statically linked Rust crates and musl
 libc. Retain license texts in the bundle even though the source export also
-contains them. The package directory also contains top-level `RELEASE.json`
-and `SHA256SUMS`; those metadata files accompany the four archives on GitHub.
+contains them. The package directory also contains the versioned source
+archive, top-level `RELEASE.json` and `SHA256SUMS` (which covers the four
+archives plus `RELEASE.json`); those metadata files accompany the four
+archives on GitHub.
 
-Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.98.1 static target
-builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r12). The
-notice generator refuses any other archive. Verify its SHA-256
+Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.99.1 static target
+builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r13). Both pins
+are enforced: the notice generator accepts only `cargo-about 0.9.2` output
+and the recipe-pinned musl SHA-256. Verify its SHA-256
 before running the notice generator. The
 example paths below are absolute; `/var/tmp/p11scope-release` was created with
 mode `0700` in step 5, each output is absent, and their parent remains private:
 
 ```sh
-cargo +1.98.1 install cargo-about --version 0.9.2 --locked --features cli
-mkdir -m 700 /var/tmp/p11scope-release/v0.2.0-package-inputs
+cargo +1.99.1 install cargo-about --version 0.9.2 --locked --features cli
+mkdir -m 700 /var/tmp/p11scope-release/v0.5.0-package-inputs
 curl -fL https://musl.libc.org/releases/musl-1.2.5.tar.gz \
-  -o /var/tmp/p11scope-release/v0.2.0-package-inputs/musl-1.2.5.tar.gz
+  -o /var/tmp/p11scope-release/v0.5.0-package-inputs/musl-1.2.5.tar.gz
 printf '%s  %s\n' \
   a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4 \
-  /var/tmp/p11scope-release/v0.2.0-package-inputs/musl-1.2.5.tar.gz | sha256sum --check
+  /var/tmp/p11scope-release/v0.5.0-package-inputs/musl-1.2.5.tar.gz | sha256sum --check
 python3 -I scripts/release-notices.py \
   --cargo-about "$(command -v cargo-about)" \
-  --musl-archive /var/tmp/p11scope-release/v0.2.0-package-inputs/musl-1.2.5.tar.gz \
-  --output /var/tmp/p11scope-release/v0.2.0-notices
+  --musl-archive /var/tmp/p11scope-release/v0.5.0-package-inputs/musl-1.2.5.tar.gz \
+  --output /var/tmp/p11scope-release/v0.5.0-notices
 python3 -I scripts/export-source.py \
-  --output /var/tmp/p11scope-release/p11scope-0.2.0-source.tar.gz
+  --output /var/tmp/p11scope-release/p11scope-0.5.0-source.tar.gz
 python3 -I scripts/package-release.py \
-  --receipt /var/tmp/p11scope-release/v0.2.0 \
-  --notices /var/tmp/p11scope-release/v0.2.0-notices \
-  --source /var/tmp/p11scope-release/p11scope-0.2.0-source.tar.gz \
-  --output /var/tmp/p11scope-release/v0.2.0-public-assets
+  --receipt /var/tmp/p11scope-release/v0.5.0 \
+  --notices /var/tmp/p11scope-release/v0.5.0-notices \
+  --source /var/tmp/p11scope-release/p11scope-0.5.0-source.tar.gz \
+  --output /var/tmp/p11scope-release/v0.5.0-public-assets
 ```
 
-The attached schema-v1 source export contains the committed source and the two
-exact pinned Aya archives. It still needs network access or a populated Cargo
+The packager defaults to `--capture-mode full`; pass `--capture-mode p0` to
+stamp P0 provenance for a P0 receipt. The attached schema-v1 source export
+contains the committed source and the two
+exact pinned Aya archives (aya 0.14.0 and aya-obj 0.3.0, recipe revision p2).
+It still needs network access or a populated Cargo
 cache for the remaining locked dependencies; do not describe it as a full offline
 export. A separately assembled full offline export is documented in
 [docs/build-offline.md](docs/build-offline.md). GitHub's automatic source
@@ -261,27 +445,48 @@ Verify `SHA256SUMS` against the four versioned `.tar.gz` assets and top-level
 `RELEASE.json`:
 
 ```sh
-(cd /var/tmp/p11scope-release/v0.2.0-public-assets && sha256sum --check SHA256SUMS)
+(cd /var/tmp/p11scope-release/v0.5.0-public-assets && sha256sum --check SHA256SUMS)
 ```
 
 Extract each archive into a fresh private
 directory and inspect its exact member set, modes, executable version,
 license notices and provenance. For the musl dynamic helper, use a compatible
 musl host or container for its executable smoke; inspecting the archive is
-still required on the build host. Test the source archive as a recipient with
+still required on the build host. Then run the recipient journey from the
+extracted bytes, not from `PATH`: the clean-context checklist is
+[tests/fixtures/t11-package-acceptance/package-recipient-checklist.md](tests/fixtures/t11-package-acceptance/package-recipient-checklist.md)
+(ledger and provenance, per-archive extract, executable smoke, installed
+journeys, refusal twins, source recipient). The automated checks pin the same
+journey:
+
+```sh
+python3 -I tests/python/test_release_recipient.py -v
+python3 -I tests/fixtures/u6-installed-drive.py --self-test --journey ledger
+python3 -I tests/fixtures/u6-installed-drive.py --dry-run --journey ledger \
+  --binary <extracted-observer-dir>/p11scope
+```
+
+The first proves the journey executes the selected candidate binary (exact
+path and digest; a decoy earlier in `PATH` stays unexecuted). The U6 driver
+covers the ledger and named-trace installed journeys: `--self-test` runs the
+synthetic twin red-green without capture (named-trace self-test needs
+`--binary` for its offline diff twin), `--dry-run` validates the installed
+wiring for an explicit `--binary` without capturing, and live mode (default)
+runs the cells and fails closed. Test the source archive as a recipient with
 network access and the pinned toolchains; its included Aya archives should
 reconstruct without downloading them. For example, from the repository root:
 
 ```sh
 source_recipient=$(mktemp -d /var/tmp/p11scope-source-recipient.XXXXXX)
 tar --same-permissions --no-same-owner -xzf \
-  /var/tmp/p11scope-release/p11scope-0.2.0-source.tar.gz \
+  /var/tmp/p11scope-release/p11scope-0.5.0-source.tar.gz \
   -C "$source_recipient"
 (
   cd "$source_recipient/p11scope-source"
   python3 -I scripts/prepare-dependencies.py --offline
-  mise exec -- ./scripts/cargo.sh +1.98.1 build --locked --release \
-    --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
+  mise exec -- ./scripts/cargo.sh +1.99.1 build --locked --release \
+    --target x86_64-unknown-linux-musl --bin p11scope
+  # P0 variant: add --no-default-features --features stub-object-attributes
 )
 ```
 
@@ -300,8 +505,8 @@ On the commit that steps 3–6 ran on:
 2. Create an annotated (optionally signed) tag and push `main` and the tag:
 
    ```sh
-   git tag -a v0.2.0 -m 'p11scope v0.2.0'    # or -s to sign
-   git push origin main v0.2.0
+   git tag -a v0.5.0 -m 'p11scope v0.5.0'    # or -s to sign
+   git push origin main v0.5.0
    ```
 
 3. Create the GitHub release with the four versioned `.tar.gz` assets,
@@ -316,6 +521,8 @@ On the commit that steps 3–6 ran on:
 
 ## After the tag
 
-- Keep the evidence root from step 5 with the release records.
+- Record concise source, CI, package and qualification results and unresolved
+  limits. Retain private builder inputs and logs while active work needs them;
+  preserve the licenses, notices and public provenance distributed with assets.
 - Start the next `## [Unreleased]` section in `CHANGELOG.md` only when the
   next change lands.

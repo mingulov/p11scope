@@ -1,0 +1,2353 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Pass-local scanner custody and anchor installation. Runtime proof selection
+//! is a later slice; these owners never change default userspace collection.
+
+use super::confirm_shards::{
+    AcceptedBatch, AcceptedKind, AcceptedRequest, SegmentProof, prove_and_finish_prepared,
+};
+use super::identity::{
+    ExaminedObject, FileIdentity, HeldExaminedObject, PinnedObjectId, PinnedObjects,
+    RetainedInventoryTarget,
+};
+use super::retained_member::ValidatedMemberSelector;
+use super::scan::CaptureWorkBudget;
+use super::sweep_attribution::{
+    ConfirmIo, Confirmation, IoResources, KnownKeyIndex, MappedIdentities, MemberProbe,
+    prepare_confirmation, stat_unpinned_reserved,
+};
+use super::sweep_attribution::{ReservationOwner, SegmentPolicy, Slot};
+use crate::attach::identity_iter::{
+    AnchorArena, Expect, OwnedRunError, ProbeError, RunKind, RunMode, ScopeBitmap, StrictIdentity,
+    consume_owned_run, encode_tid_selector, iter_create, link_create_task_vma_tid_encoded, parse,
+};
+use p11scope_manifest::maps::ObjectKey;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
+
+/// A bounded snapshot of capture-retained files that must not be mapped by
+/// identity acceleration. These keys only exclude work: collisions can lose
+/// acceleration, never establish file identity or admission authority.
+#[derive(Debug, Default)]
+pub(crate) struct KernelAnchorExclusions {
+    keys: BTreeSet<ObjectKey>,
+    files: BTreeMap<FileIdentity, Arc<File>>,
+    unavailable: bool,
+}
+
+impl KernelAnchorExclusions {
+    pub(crate) fn from_targets<'a>(
+        targets: impl IntoIterator<Item = &'a RetainedInventoryTarget>,
+    ) -> Self {
+        let mut result = Self::default();
+        for target in targets {
+            result.keys.insert(target.object_key());
+            let file = target.retirement_lease();
+            match file.metadata() {
+                Ok(metadata) => {
+                    result
+                        .files
+                        .entry(FileIdentity {
+                            dev: metadata.dev(),
+                            ino: metadata.ino(),
+                        })
+                        .or_insert(file);
+                }
+                Err(_) => result.unavailable = true,
+            }
+        }
+        result
+    }
+
+    pub(crate) fn excludes(&self, keys: &BTreeSet<ObjectKey>, file: &File) -> bool {
+        !self.keys.is_empty()
+            && (self.unavailable
+                || keys.iter().any(|key| self.keys.contains(key))
+                || file.metadata().map_or(true, |metadata| {
+                    self.files.contains_key(&FileIdentity {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    })
+                }))
+    }
+}
+
+pub(crate) const EXAMINED_ANCHOR_CAP: usize = 512;
+pub(crate) const TOTAL_ANCHOR_CAP: usize = 1024;
+
+/// An anchor is never taken below this many descriptors of headroom.
+const CUSTODY_TAKE_FLOOR: usize = 3;
+
+/// Descriptors one deep-scan offer can hold beyond the retained custody
+/// anchors and the offered file itself: the member view pin (one pidfd at
+/// most), the /proc mem handle (one at most) and the mount-table cache
+/// file (one at most). Completed members' provider pins are the
+/// cross-member term — they stay open until bind_collection — and the
+/// per-scan census (`begin_scan` invalidates the cache) counts them at
+/// each member's start, so within one scan only transients vary. Deep
+/// scans run serially on one thread while shard and confirmation workers
+/// only exist past the reconcile census, so no other thread grows the
+/// observer's descriptor table between two offers; the remaining slack
+/// absorbs platform and test-double variance.
+const CUSTODY_TRANSIENT_MARGIN: usize = 16;
+
+/// Ledger takes need this much estimated headroom: the unchanged take
+/// floor plus the full transient margin, so a cached census still refuses
+/// before the true headroom can reach the floor. With the pinned term
+/// counted at each scan start, the line tolerates transient_delta ≤ 17
+/// within one scan (take line 19, minus the take floor 3, plus back the
+/// double-counted offered file). Below this line the offer re-takes the
+/// strict census and obeys it exactly, as before.
+const CUSTODY_LEDGER_TAKE_LINE: usize = CUSTODY_TAKE_FLOOR + CUSTODY_TRANSIENT_MARGIN;
+
+/// One shared per-pass count of actual proof target runs: whole-system
+/// segment batches and per-PID promotion packets, including failed runs.
+/// Anchor setup and the one-time eligibility probe are not target attempts.
+pub(crate) const MAX_TARGET_ATTEMPTS_PER_PASS: u32 = 3;
+
+/// Provisional automatic whole-system threshold: proof-needing PIDs inside
+/// one resource-bounded segment. Named and internal, with deterministic
+/// injection for tests, never a public tuning option. Neither this value
+/// nor any latency is a validated production crossover.
+pub(crate) const AUTO_KERNEL_PROOF_PID_THRESHOLD: usize = 2_400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchorDeny {
+    FdHeadroom,
+    AnchorCap,
+    AnchorNotInstalled,
+    CaptureWatched,
+}
+
+/// Cached per-candidate rank: most callers first, then key, then
+/// ordinal. Ranks are immutable (the caller map is fixed at
+/// construction), so the at-cap search compares cached ranks instead of
+/// re-evaluating every candidate per offer.
+type CandidateRank = (Reverse<usize>, ObjectKey, u64);
+
+pub(crate) struct ExaminedCustody {
+    pub(crate) owner: ReservationOwner,
+    candidates: Vec<HeldExaminedObject>,
+    ranks: Vec<CandidateRank>,
+    worst: Option<usize>,
+    callers: BTreeMap<ObjectKey, usize>,
+    missing: BTreeMap<(u64, ObjectKey), AnchorDeny>,
+    next_scan: u64,
+    ordinal: u64,
+    cap: usize,
+    failed: bool,
+    census_headroom: Option<usize>,
+    census_held: usize,
+    #[cfg(test)]
+    rank_evals: std::cell::Cell<usize>,
+}
+
+impl ExaminedCustody {
+    pub(crate) fn new(owner: ReservationOwner, callers: BTreeMap<ObjectKey, usize>) -> Self {
+        let cap = owner.examined_capacity().min(EXAMINED_ANCHOR_CAP);
+        Self {
+            owner,
+            candidates: Vec::new(),
+            ranks: Vec::new(),
+            worst: None,
+            callers,
+            missing: BTreeMap::new(),
+            next_scan: 0,
+            ordinal: 0,
+            cap,
+            failed: false,
+            census_headroom: None,
+            census_held: 0,
+            #[cfg(test)]
+            rank_evals: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(crate) fn begin_scan(&mut self) -> u64 {
+        // A cached census must not cross a scan boundary: completed
+        // members keep their provider pins open until bind_collection,
+        // so each member's first offer re-takes the strict census and
+        // counts all previously completed members' pins. Within one
+        // member the untracked delta stays ~1 (mounts 0→1; view/mem
+        // fixed; pins land after that member's offers), covered 16× by
+        // the margin below.
+        self.census_headroom = None;
+        self.next_scan += 1;
+        self.next_scan
+    }
+
+    pub(crate) fn offer(&mut self, scan: u64, examined: ExaminedObject, file: File) -> bool {
+        self.offer_with_census(scan, examined, file, || SegmentPolicy::try_snapshot(0, 0))
+    }
+
+    fn fail(&mut self) {
+        self.failed = true;
+        for held in self.candidates.drain(..) {
+            self.missing
+                .insert((held.scan, held.examined.key), AnchorDeny::FdHeadroom);
+        }
+        self.ranks.clear();
+        self.worst = None;
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.fail();
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn rank(&self, key: ObjectKey, ordinal: u64) -> CandidateRank {
+        #[cfg(test)]
+        self.rank_evals.set(self.rank_evals.get() + 1);
+        (
+            Reverse(self.callers.get(&key).copied().unwrap_or(0)),
+            key,
+            ordinal,
+        )
+    }
+
+    /// Index of the worst-ranked live candidate, rescanned lazily over
+    /// cached ranks. Ranks are unique (ordinals are), so the argmax
+    /// matches the old linear search exactly.
+    fn worst_index(&mut self) -> Option<usize> {
+        debug_assert_eq!(self.candidates.len(), self.ranks.len());
+        if self.worst.is_none() && !self.ranks.is_empty() {
+            self.worst = self
+                .ranks
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, rank)| *rank)
+                .map(|(index, _)| index);
+        }
+        self.worst
+    }
+
+    fn offer_with_census(
+        &mut self,
+        scan: u64,
+        examined: ExaminedObject,
+        file: File,
+        census: impl FnOnce() -> Result<SegmentPolicy, String>,
+    ) -> bool {
+        if self.failed || self.owner.examined_capacity() == 0 {
+            self.missing
+                .insert((scan, examined.key), AnchorDeny::FdHeadroom);
+            return false;
+        }
+        let ordinal = self.ordinal;
+        self.ordinal = self.ordinal.saturating_add(1);
+        let new_rank = self.rank(examined.key, ordinal);
+        let replace = if self.candidates.len() >= self.cap {
+            self.worst_index()
+                .filter(|index| new_rank < self.ranks[*index])
+        } else {
+            None
+        };
+        if self.candidates.len() >= self.cap && replace.is_none() {
+            self.missing
+                .insert((scan, examined.key), AnchorDeny::AnchorCap);
+            return false;
+        }
+        // One strict census per scan plus a local ledger: within one scan
+        // the only descriptors custody retains between offers are the
+        // held anchors, so the cached headroom minus their growth (and
+        // the still-open offered file) can only overstate consumption
+        // once scan transients are covered by the take line. Completed
+        // members' pins are re-counted by the per-scan census at each
+        // member's first offer. A ledger below the line, or no cached
+        // census yet, re-takes the strict census and obeys it exactly.
+        // Replacements keep the count, discards shrink it (saturating:
+        // freed anchors only make the ledger pessimistic).
+        let ledger_covers = self.census_headroom.is_some_and(|cached| {
+            let grown = self.candidates.len().saturating_sub(self.census_held);
+            let estimate = cached.saturating_sub(grown).saturating_sub(1);
+            estimate >= CUSTODY_LEDGER_TAKE_LINE
+        });
+        if !ledger_covers {
+            match census() {
+                Err(_) => {
+                    self.fail();
+                    self.missing
+                        .insert((scan, examined.key), AnchorDeny::FdHeadroom);
+                    return false;
+                }
+                Ok(policy) => {
+                    self.census_headroom = Some(policy.headroom);
+                    self.census_held = self.candidates.len();
+                    if policy.headroom < CUSTODY_TAKE_FLOOR {
+                        self.missing
+                            .insert((scan, examined.key), AnchorDeny::FdHeadroom);
+                        return false;
+                    }
+                }
+            }
+        }
+        if let Some(index) = replace {
+            let removed = self.candidates.remove(index);
+            self.ranks.remove(index);
+            self.worst = None;
+            self.missing
+                .insert((removed.scan, removed.examined.key), AnchorDeny::AnchorCap);
+            drop(removed); // Actual FD closes before acquiring its replacement lease.
+        }
+        let lease = match self.owner.examined() {
+            Ok(lease) => lease,
+            Err(_) => {
+                self.missing
+                    .insert((scan, examined.key), AnchorDeny::FdHeadroom);
+                return false;
+            }
+        };
+        self.candidates.push(HeldExaminedObject {
+            scan,
+            ordinal,
+            examined,
+            file,
+            _lease: lease,
+        });
+        self.ranks.push(new_rank);
+        self.worst = None;
+        true
+    }
+
+    pub(crate) fn discard_scan(&mut self, scan: u64) {
+        // Paired removal keeps ranks aligned with candidates.
+        for index in (0..self.candidates.len()).rev() {
+            if self.candidates[index].scan == scan {
+                self.candidates.remove(index);
+                self.ranks.remove(index);
+            }
+        }
+        self.worst = None;
+        self.missing
+            .retain(|(missing_scan, _), _| *missing_scan != scan);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rank_evals_for_test(&self) -> usize {
+        self.rank_evals.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_for_test(&self, scan: u64) -> Option<&File> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.scan == scan)
+            .map(|candidate| &candidate.file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offer_for_test(
+        &mut self,
+        scan: u64,
+        examined: ExaminedObject,
+        file: File,
+    ) -> bool {
+        self.offer_with_census(scan, examined, file, || {
+            Ok(SegmentPolicy::from_headroom(16, 0, 0))
+        })
+    }
+
+    pub(crate) fn reconcile(&mut self, policy: SegmentPolicy) -> Result<(), String> {
+        if let Err(error) = self.owner.reconcile(policy) {
+            self.fail();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_census(
+        &mut self,
+        census: Result<SegmentPolicy, String>,
+    ) -> Result<(), String> {
+        match census {
+            Ok(policy) if !self.failed => self.reconcile(policy),
+            _ => {
+                self.fail();
+                Err(super::sweep_attribution::FD_CENSUS_REASON.into())
+            }
+        }
+    }
+}
+
+enum AnchorFile<'p> {
+    Pinned { id: PinnedObjectId, file: &'p File },
+    Examined(HeldExaminedObject),
+}
+
+impl AnchorFile<'_> {
+    fn file(&self) -> &File {
+        match self {
+            Self::Pinned { file, .. } => file,
+            Self::Examined(held) => &held.file,
+        }
+    }
+}
+
+struct Candidate<'p> {
+    keys: BTreeSet<ObjectKey>,
+    slot: Slot,
+    file: AnchorFile<'p>,
+}
+
+/// `read_run` returns completed bytes only: its descriptors close before
+/// this owner can release its arena, then its scanner-opened files.
+pub(crate) struct AnchorPass<'p> {
+    arena: Option<AnchorArena>,
+    #[cfg(test)]
+    after_arena: Option<DropObserver>,
+    candidates: Vec<Candidate<'p>>,
+    #[cfg(test)]
+    after_files: Option<DropObserver>,
+    pub(crate) fallback: BTreeMap<ObjectKey, AnchorDeny>,
+    expected_matches: BTreeMap<(ObjectKey, PinnedObjectId), BTreeSet<Slot>>,
+    expected_examined: BTreeMap<ObjectKey, BTreeSet<Slot>>,
+    #[cfg(test)] // Custody/alias observations only; never proof authority.
+    expected: BTreeMap<ObjectKey, BTreeSet<Slot>>,
+    reservations: ReservationOwner,
+    binding: Option<PassBinding>,
+}
+
+#[derive(Clone)]
+struct PassBinding {
+    session: Arc<()>,
+    generation: u64,
+    arena_base: u64,
+    arena_len: u64,
+}
+
+impl PassBinding {
+    fn same_installation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session, &other.session)
+            && self.generation == other.generation
+            && self.arena_base == other.arena_base
+            && self.arena_len == other.arena_len
+    }
+}
+
+/// Owns the installed arena and files while exclusively borrowing the loaded
+/// object. Scope/configuration cannot be changed through another pass until
+/// this guard has released its mappings and files.
+pub(crate) struct InstalledAnchorPass<'s, 'p> {
+    pass: Option<AnchorPass<'p>>,
+    session: &'s mut IdentitySession,
+    failed_target: Option<RunFailure>,
+    target_attempts: u32,
+}
+
+impl InstalledAnchorPass<'_, '_> {
+    /// A raw target read without a charged batch: custody probing only, not
+    /// a proof attempt, so it never consumes the per-pass attempt budget.
+    pub(crate) fn read_target(
+        &mut self,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, &'static str> {
+        self.read_target_typed(pid, deadline, max_bytes)
+            .map_err(|_| "identity target run is unavailable")
+    }
+
+    fn read_target_typed(
+        &mut self,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        let pass = self.pass.as_mut().expect("installed guard owns its pass");
+        let lease = pass
+            .reservations
+            .immediate()
+            .transient()
+            .map_err(|_| RunFailure::FdHeadroom)?;
+        let result = pass.read_run_typed(self.session, RunKind::Target, pid, deadline, max_bytes);
+        // The concrete read closes iterator/link before this lease or the
+        // enclosing guard can release the arena and examined files.
+        drop(lease);
+        result
+    }
+
+    fn read_member_typed(
+        &mut self,
+        selector: ValidatedMemberSelector<'_>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        let pass = self.pass.as_mut().expect("installed guard owns its pass");
+        let lease = pass
+            .reservations
+            .immediate()
+            .transient()
+            .map_err(|_| RunFailure::FdHeadroom)?;
+        let result = pass.read_run_member(self.session, selector, deadline, max_bytes);
+        // The concrete read closes iterator/link before this lease or the
+        // enclosing guard can release the arena and examined files.
+        drop(lease);
+        result
+    }
+
+    fn replace_target_scope(&mut self, tgids: &[u32]) -> Result<(), RunFailure> {
+        let pass = self.pass.as_ref().expect("installed guard owns its pass");
+        if !pass.owns_installation(self.session) {
+            return Err(RunFailure::Scope);
+        }
+        let result = match &mut self.session.object {
+            SessionObject::Kernel(loaded) => self
+                .session
+                .scope
+                .replace(&mut loaded.ebpf, tgids)
+                .map_err(|_| RunFailure::Scope),
+            #[cfg(test)]
+            SessionObject::Fixture { scope_words, .. } => self
+                .session
+                .scope
+                .fixture_replace_observed(tgids, |word, bits| {
+                    scope_words.borrow_mut().insert(word, bits);
+                })
+                .map_err(|_| RunFailure::Scope),
+        };
+        if result.is_err() {
+            self.session.binding = None;
+            self.session.scope.invalidate();
+        }
+        result
+    }
+
+    /// Write (`Some`) or reset (`None`) the member-run target, keeping
+    /// the installed generation, arena and slot budget. A failed write
+    /// invalidates the binding exactly like [`Self::replace_target_scope`]:
+    /// a stuck target would hijack later ordinary runs, so nothing may
+    /// run on afterwards.
+    fn replace_member_target(&mut self, target: Option<(u32, u32)>) -> Result<(), RunFailure> {
+        let pass = self.pass.as_ref().expect("installed guard owns its pass");
+        if !pass.owns_installation(self.session) {
+            return Err(RunFailure::Scope);
+        }
+        let Some(binding) = self.session.binding.clone() else {
+            return Err(RunFailure::Scope);
+        };
+        let (target_tgid, target_tid) = target.unwrap_or((0, 0));
+        let config = crate::attach::identity_iter::IdentityConfig {
+            generation: binding.generation,
+            arena_base: binding.arena_base,
+            arena_len: binding.arena_len,
+            slots: (binding.arena_len / crate::attach::identity_iter::ANCHOR_STRIDE) as u32,
+            observer_tgid: std::process::id(),
+            target_tgid,
+            target_tid,
+        };
+        let result = self
+            .session
+            .configure(config)
+            .map_err(|_| RunFailure::Scope);
+        if result.is_err() {
+            self.session.binding = None;
+            self.session.scope.invalidate();
+        }
+        result
+    }
+}
+
+/// One member (TID-scoped) target run over the validated selector's
+/// task: a TID-only iterator link plus its reader. The tid derives
+/// privately from retained custody here — callers pass only the
+/// validated selector, never a numeric tid.
+pub(crate) fn attach_and_read_member_run(
+    prog: std::os::fd::BorrowedFd<'_>,
+    member: ValidatedMemberSelector<'_>,
+    deadline: std::time::Instant,
+    max_bytes: usize,
+) -> Result<Vec<u8>, OwnedRunError> {
+    // Encode once, up front: an encode-time refusal (the target exited
+    // before the run) classifies exactly here, and the link below never
+    // re-gates the same death as an attempted run.
+    let (info, len) = encode_tid_selector(member.tgid(), member.tid()).map_err(|error| {
+        OwnedRunError::TargetExited(ProbeError {
+            stage: "encode",
+            detail: error.to_string(),
+        })
+    })?;
+    let link = link_create_task_vma_tid_encoded(prog, &info, len).map_err(|error| {
+        OwnedRunError::Attach(ProbeError {
+            stage: "link",
+            detail: error.to_string(),
+        })
+    })?;
+    let iter = iter_create(link.as_fd()).map_err(|error| {
+        OwnedRunError::Attach(ProbeError {
+            stage: "iter",
+            detail: error.to_string(),
+        })
+    })?;
+    consume_owned_run(iter, link, deadline, max_bytes).map_err(OwnedRunError::Read)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunFailure {
+    Scope,
+    AnchorNotInstalled,
+    FdHeadroom,
+    Deadline,
+    Clock,
+    StreamInvalid,
+    AttachOrRead,
+    BelowThreshold,
+    TargetLimit,
+    /// The member target exited before the run: the pre-syscall gate
+    /// refused, so no syscall ran. A dead selector, never an attempted
+    /// run — the member branch resets without counting or demoting.
+    TargetExited,
+}
+
+/// Finite userspace-fallback cause for one proof request. Labels and details
+/// are fixed strings: they never carry PIDs, paths, verdicts or low-level
+/// error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelFallbackReason {
+    BelowThreshold,
+    FdHeadroom,
+    TargetLimit,
+    AnchorNotInstalled,
+    Scope,
+    Deadline,
+    Clock,
+    StreamInvalid,
+    TargetUnavailable,
+    Unvisited,
+    ConflictingDuplicate,
+    /// A zombie-group member request that cannot run as a single-request
+    /// TID run. Named per request (never a batch verdict); kept in the
+    /// kernel-identity oracle only — it never becomes the surfaced
+    /// first reason until the schema vocabulary allows it.
+    ZombieBatch,
+}
+
+impl KernelFallbackReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::BelowThreshold => "below_threshold",
+            Self::FdHeadroom | Self::TargetLimit => "fd_headroom",
+            Self::AnchorNotInstalled => "anchor_not_installed",
+            Self::Scope => "scope_unavailable",
+            Self::Deadline => "deadline",
+            Self::Clock => "clock_unavailable",
+            Self::StreamInvalid => "stream_invalid",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::Unvisited => "unvisited",
+            Self::ConflictingDuplicate => "conflicting_duplicate",
+            Self::ZombieBatch => "zombie_batch",
+        }
+    }
+
+    pub(crate) fn detail(self) -> Option<&'static str> {
+        match self {
+            Self::TargetLimit => Some("target_run_limit"),
+            _ => None,
+        }
+    }
+}
+
+impl From<RunFailure> for KernelFallbackReason {
+    fn from(reason: RunFailure) -> Self {
+        match reason {
+            RunFailure::Scope => Self::Scope,
+            RunFailure::AnchorNotInstalled => Self::AnchorNotInstalled,
+            RunFailure::FdHeadroom => Self::FdHeadroom,
+            RunFailure::Deadline => Self::Deadline,
+            RunFailure::Clock => Self::Clock,
+            RunFailure::StreamInvalid => Self::StreamInvalid,
+            RunFailure::AttachOrRead => Self::TargetUnavailable,
+            RunFailure::BelowThreshold => Self::BelowThreshold,
+            RunFailure::TargetLimit => Self::TargetLimit,
+            // The member branch intercepts this before any batch
+            // fallback; if it ever leaks, it surfaces exactly what the
+            // same event produced before the interception existed.
+            RunFailure::TargetExited => Self::TargetUnavailable,
+        }
+    }
+}
+
+/// Capture-level fallback disclosure input: a pass counts once if any
+/// requested proof fell back or was refused, distinct affected PIDs/keys
+/// once per pass, summed across the capture, with the first finite reason
+/// preserved. Overlay keys with no kernel route count here as refused
+/// (never a userspace fallback edge). Counting happens when the kernel
+/// answer is recorded, before the sweep witness runs, so a refused key
+/// the witness later proves still counts here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct KernelFallbackTotals {
+    pub(crate) passes: u64,
+    pub(crate) pids: u64,
+    pub(crate) keys: u64,
+    pub(crate) first_reason: Option<KernelFallbackReason>,
+}
+
+#[derive(Debug, Default)]
+struct PassFallback {
+    pids: BTreeSet<u32>,
+    keys: BTreeSet<ObjectKey>,
+    reason: Option<KernelFallbackReason>,
+    /// Every per-request name, including ones the surfaced first reason
+    /// must not carry. Test oracle only; production reads `reason`.
+    #[cfg(test)]
+    per_pid: BTreeMap<u32, KernelFallbackReason>,
+}
+
+/// Session-owned fallback accounting. The current pass opens at anchor
+/// installation and rolls up when its guard drops; a pass with no fallback
+/// requests adds zero at every unit.
+#[derive(Debug, Default)]
+pub(crate) struct KernelFallbackLedger {
+    totals: KernelFallbackTotals,
+    current: Option<PassFallback>,
+}
+
+impl KernelFallbackLedger {
+    pub(crate) fn begin_pass(&mut self) {
+        self.end_pass();
+        self.current = Some(PassFallback::default());
+    }
+
+    pub(crate) fn end_pass(&mut self) {
+        let Some(pass) = self.current.take() else {
+            return;
+        };
+        if pass.pids.is_empty() {
+            return;
+        }
+        self.totals.passes = self.totals.passes.saturating_add(1);
+        self.totals.pids = self.totals.pids.saturating_add(pass.pids.len() as u64);
+        self.totals.keys = self.totals.keys.saturating_add(pass.keys.len() as u64);
+        if self.totals.first_reason.is_none() {
+            self.totals.first_reason = pass.reason;
+        }
+    }
+
+    pub(crate) fn note_fallback(
+        &mut self,
+        pid: u32,
+        keys: impl IntoIterator<Item = ObjectKey>,
+        reason: KernelFallbackReason,
+    ) {
+        let Some(current) = self.current.as_mut() else {
+            return;
+        };
+        current.pids.insert(pid);
+        current.keys.extend(keys);
+        #[cfg(test)]
+        current.per_pid.insert(pid, reason);
+        // `ZombieBatch` counts but never becomes the surfaced first
+        // reason: the schema vocabulary has no such label yet.
+        let surfaced = !matches!(reason, KernelFallbackReason::ZombieBatch);
+        if current.reason.is_none() && surfaced {
+            current.reason = Some(reason);
+        }
+    }
+
+    pub(crate) fn note_batch(&mut self, batch: &AcceptedBatch<'_>, reason: KernelFallbackReason) {
+        for request in batch.requests() {
+            self.note_fallback(request.pid(), request_keys(request), reason);
+        }
+    }
+
+    pub(crate) fn totals(&self) -> KernelFallbackTotals {
+        self.totals.clone()
+    }
+}
+
+fn request_keys(request: &AcceptedRequest<'_>) -> BTreeSet<ObjectKey> {
+    let wanted: BTreeSet<(u64, u64)> = request.ranges().iter().copied().collect();
+    request
+        .entries()
+        .iter()
+        .filter(|entry| wanted.contains(&(entry.start, entry.end)))
+        .map(ObjectKey::of)
+        .collect()
+}
+
+/// The userspace-refusal map for one request whose kernel run is
+/// unavailable: every range under an overlay key — or under no examined
+/// entry, fail closed — carries
+/// [`super::sweep_attribution::RangeProof::OverlayRefused`] instead of a
+/// userspace read. Empty when the request touches no overlay key.
+fn overlay_refused_ranges(
+    request: &AcceptedRequest<'_>,
+    overlay_keys: &BTreeSet<ObjectKey>,
+) -> MappedIdentities {
+    if overlay_keys.is_empty() {
+        return MappedIdentities::new();
+    }
+    let by_range: BTreeMap<(u64, u64), ObjectKey> = request
+        .entries()
+        .iter()
+        .map(|entry| ((entry.start, entry.end), ObjectKey::of(entry)))
+        .collect();
+    request
+        .ranges()
+        .iter()
+        .filter(|range| {
+            by_range
+                .get(*range)
+                .is_none_or(|key| overlay_keys.contains(key))
+        })
+        .map(|range| (*range, super::sweep_attribution::RangeProof::OverlayRefused))
+        .collect()
+}
+
+/// Sweep hook for a pass whose anchors never installed because every
+/// anchor is capture-watched (all providers watched, no unwatched
+/// anchor): no sweep kernel run exists, so every request answers
+/// `UserspaceExceptOverlay` with `AnchorNotInstalled`, refusing exactly
+/// its overlay ranges (no manufactured kernel proofs). The driver reads
+/// the remaining ranges from userspace — identical to the userspace path
+/// for non-overlay keys — and the private witness may prove the refused
+/// overlay keys. Batches with no overlay key answer plain `Userspace`.
+pub(crate) struct AnchorRefusedHook<'i> {
+    index: &'i KnownKeyIndex,
+}
+
+impl<'i> AnchorRefusedHook<'i> {
+    pub(crate) fn new(index: &'i KnownKeyIndex) -> Self {
+        Self { index }
+    }
+}
+
+impl SegmentProof for AnchorRefusedHook<'_> {
+    fn prove<'r>(
+        &'r mut self,
+        batch: &AcceptedBatch<'_>,
+        _budget: &mut CaptureWorkBudget,
+        _resources: &IoResources,
+    ) -> ProofDecision<'r> {
+        let refused: Vec<MappedIdentities> = batch
+            .requests()
+            .iter()
+            .map(|request| overlay_refused_ranges(request, self.index.overlay_keys()))
+            .collect();
+        if refused.iter().all(MappedIdentities::is_empty) {
+            ProofDecision::Userspace(RunFailure::AnchorNotInstalled)
+        } else {
+            ProofDecision::UserspaceExceptOverlay {
+                reason: RunFailure::AnchorNotInstalled,
+                refused,
+            }
+        }
+    }
+}
+
+/// Session-level failure that persists through subsequent passes: an invalid
+/// target stream, or three consecutive attempted overdue runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelSticky {
+    StreamInvalid,
+    Deadlines,
+}
+
+impl KernelSticky {
+    fn reason(self) -> RunFailure {
+        match self {
+            Self::StreamInvalid => RunFailure::StreamInvalid,
+            Self::Deadlines => RunFailure::Deadline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentSelection {
+    Kernel,
+    Userspace(KernelFallbackReason),
+}
+
+/// The automatic cost gate for one resource-bounded segment: `proof_pids`
+/// counts the segment's charged requests, never the whole sweep. `None` is
+/// forced kernel, which bypasses this cost threshold only: resource, guard,
+/// attempt-cap and run-failure policy still apply where the run is attempted.
+/// `overlay_present` forces the kernel run however small the batch: an
+/// overlay key never takes the userspace-identity fallback.
+pub(crate) fn select_proof_run(
+    proof_pids: usize,
+    auto_threshold: Option<usize>,
+    overlay_present: bool,
+) -> SegmentSelection {
+    if overlay_present {
+        return SegmentSelection::Kernel;
+    }
+    match auto_threshold {
+        Some(threshold) if proof_pids < threshold => {
+            SegmentSelection::Userspace(KernelFallbackReason::BelowThreshold)
+        }
+        _ => SegmentSelection::Kernel,
+    }
+}
+
+impl From<crate::attach::identity_iter::ReadError> for RunFailure {
+    fn from(error: crate::attach::identity_iter::ReadError) -> Self {
+        match error {
+            crate::attach::identity_iter::ReadError::Deadline => Self::Deadline,
+            crate::attach::identity_iter::ReadError::TooLarge => Self::StreamInvalid,
+            crate::attach::identity_iter::ReadError::Errno(_) => Self::AttachOrRead,
+        }
+    }
+}
+
+/// Only this module can mint a complete target result. The borrow prevents
+/// reconfiguration/release while the shared driver finishes this batch.
+pub(crate) struct ValidatedTargetSegment<'r> {
+    binding: &'r PassBinding,
+    batch: Arc<()>,
+    answers: Vec<Option<MappedIdentities>>,
+}
+
+pub(crate) enum ProofDecision<'r> {
+    Kernel(ValidatedTargetSegment<'r>),
+    Userspace(RunFailure),
+    /// The kernel run is unavailable for a batch touching overlay keys:
+    /// `refused` holds one per-request map whose overlay ranges carry
+    /// [`super::sweep_attribution::RangeProof::OverlayRefused`] (no
+    /// userspace reads for them); the caller proves the remaining ranges
+    /// from userspace. The ledger already notes `reason`, like
+    /// [`ProofDecision::Userspace`].
+    UserspaceExceptOverlay {
+        reason: RunFailure,
+        refused: Vec<MappedIdentities>,
+    },
+}
+
+impl ProofDecision<'_> {
+    pub(crate) fn answer(
+        &self,
+        batch: &AcceptedBatch<'_>,
+        position: usize,
+    ) -> Option<&MappedIdentities> {
+        match self {
+            Self::Kernel(segment)
+                if Arc::ptr_eq(&segment.batch, batch.token()) && segment.binding.generation > 0 =>
+            {
+                segment.answers.get(position).and_then(Option::as_ref)
+            }
+            Self::UserspaceExceptOverlay { refused, .. } => refused.get(position),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for InstalledAnchorPass<'_, '_> {
+    fn drop(&mut self) {
+        self.session.fallback.end_pass();
+        self.session.binding = None;
+        self.session.scope.invalidate();
+        // Explicit Drop keeps the exclusive session borrow alive through
+        // arena -> examined File destruction, even when the guard is unused.
+        drop(self.pass.take());
+    }
+}
+
+/// Dormant adapter for the shared charged preparation and live finish path.
+/// Target evidence and same-pin fallback share one charged request batch.
+pub(crate) struct KernelMemberProbe<'g, 's, 'p, Io> {
+    proof: KernelPassProof<'g, 's, 'p>,
+    io: Io,
+    resources: IoResources,
+}
+
+struct KernelPassProof<'g, 's, 'p> {
+    installed: &'g mut InstalledAnchorPass<'s, 'p>,
+    deadline: std::time::Instant,
+    eligible_keys: BTreeSet<ObjectKey>,
+    auto_threshold: Option<usize>,
+    /// The pass's match keys that need the kernel proof (overlayfs or an
+    /// unproven filesystem): no userspace-identity fallback for their
+    /// ranges anywhere in this ladder.
+    overlay_keys: BTreeSet<ObjectKey>,
+}
+
+struct TargetWorkDeadline {
+    deadline: std::time::Instant,
+    steps: u32,
+}
+
+impl TargetWorkDeadline {
+    fn check(&self, budget: &mut CaptureWorkBudget) -> Result<(), RunFailure> {
+        if std::time::Instant::now() >= self.deadline || budget.check_deadline_now().is_some() {
+            Err(RunFailure::Deadline)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn step(&mut self, budget: &mut CaptureWorkBudget) -> Result<(), RunFailure> {
+        self.steps += 1;
+        if self.steps == 32 {
+            self.steps = 0;
+            self.check(budget)?;
+        }
+        Ok(())
+    }
+}
+
+/// Resets an installed member-run target unless disarmed. The guard
+/// holds the pass mutably, so every post-write return through `&mut
+/// self` must drop it first — and dropping resets, including future
+/// refusal paths. A failed reset already invalidated the binding
+/// inside `replace_member_target`, so the drop ignores its result
+/// fail-closed.
+struct MemberTargetGuard<'a, 's, 'p> {
+    installed: &'a mut InstalledAnchorPass<'s, 'p>,
+    armed: bool,
+}
+
+impl MemberTargetGuard<'_, '_, '_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MemberTargetGuard<'_, '_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.installed.replace_member_target(None);
+        }
+    }
+}
+
+fn bounded_target_deadline(
+    budget: &mut CaptureWorkBudget,
+    outer: std::time::Instant,
+) -> Result<std::time::Instant, RunFailure> {
+    if budget.check_deadline_now().is_some() {
+        return Err(RunFailure::Deadline);
+    }
+    let now = std::time::Instant::now();
+    let mut deadline = outer.min(now + std::time::Duration::from_millis(500));
+    if let Some(limit) = budget.effective_deadline_ns() {
+        let clock = crate::attach::monotonic_ns().ok_or(RunFailure::Clock)?;
+        let left = limit.checked_sub(clock).ok_or(RunFailure::Deadline)?;
+        deadline = deadline.min(
+            now.checked_add(std::time::Duration::from_nanos(left))
+                .ok_or(RunFailure::Clock)?,
+        );
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(RunFailure::Deadline);
+    }
+    Ok(deadline)
+}
+
+impl KernelPassProof<'_, '_, '_> {
+    fn userspace(&mut self, batch: &AcceptedBatch<'_>, reason: RunFailure) -> ProofDecision<'_> {
+        self.installed
+            .session
+            .fallback
+            .note_batch(batch, reason.into());
+        let refused: Vec<MappedIdentities> = batch
+            .requests()
+            .iter()
+            .map(|request| overlay_refused_ranges(request, &self.overlay_keys))
+            .collect();
+        if refused.iter().all(MappedIdentities::is_empty) {
+            ProofDecision::Userspace(reason)
+        } else {
+            ProofDecision::UserspaceExceptOverlay { reason, refused }
+        }
+    }
+
+    /// The fallback answer for one request the kernel run did not prove:
+    /// `None` (userspace fallback as today) unless the request touches an
+    /// overlay key, whose ranges refuse without userspace reads.
+    fn unproven_answer(&self, request: &AcceptedRequest<'_>) -> Option<MappedIdentities> {
+        let refused = overlay_refused_ranges(request, &self.overlay_keys);
+        (!refused.is_empty()).then_some(refused)
+    }
+
+    /// Session bookkeeping for one attempted target run's terminal outcome.
+    /// An overdue run advances the consecutive streak (sticky at three); an
+    /// invalid stream sticks immediately; any other attempted outcome breaks
+    /// the deadline streak without clearing stickiness. No-attempt refusals
+    /// never reach this function.
+    fn note_attempted_outcome(&mut self, reason: RunFailure) {
+        let session = &mut self.installed.session;
+        match reason {
+            RunFailure::Deadline => {
+                session.consecutive_deadlines = session.consecutive_deadlines.saturating_add(1);
+                if session.consecutive_deadlines >= 3 {
+                    session.sticky = Some(KernelSticky::Deadlines);
+                }
+            }
+            RunFailure::StreamInvalid => {
+                session.sticky = Some(KernelSticky::StreamInvalid);
+                session.consecutive_deadlines = 0;
+            }
+            _ => {
+                session.consecutive_deadlines = 0;
+            }
+        }
+    }
+}
+
+impl SegmentProof for KernelPassProof<'_, '_, '_> {
+    fn prove<'r>(
+        &'r mut self,
+        batch: &AcceptedBatch<'_>,
+        budget: &mut CaptureWorkBudget,
+        resources: &IoResources,
+    ) -> ProofDecision<'r> {
+        let (owns, same_owner, failed_target, sticky, attempts) = {
+            let pass = self
+                .installed
+                .pass
+                .as_ref()
+                .expect("installed guard owns its pass");
+            (
+                pass.owns_installation(self.installed.session),
+                resources.same_owner(&pass.reservations),
+                self.installed.failed_target,
+                self.installed.session.sticky,
+                self.installed.target_attempts,
+            )
+        };
+        if !owns {
+            return self.userspace(batch, RunFailure::Scope);
+        }
+        if !same_owner {
+            return self.userspace(batch, RunFailure::FdHeadroom);
+        }
+        if let Some(sticky) = sticky {
+            return self.userspace(batch, sticky.reason());
+        }
+        if let Some(reason) = failed_target {
+            return self.userspace(batch, reason);
+        }
+        if attempts >= MAX_TARGET_ATTEMPTS_PER_PASS {
+            return self.userspace(batch, RunFailure::TargetLimit);
+        }
+        let overlay_present = batch
+            .requests()
+            .iter()
+            .any(|request| !overlay_refused_ranges(request, &self.overlay_keys).is_empty());
+        if matches!(
+            select_proof_run(batch.requests().len(), self.auto_threshold, overlay_present),
+            SegmentSelection::Userspace(_)
+        ) {
+            return self.userspace(batch, RunFailure::BelowThreshold);
+        }
+        let deadline = match bounded_target_deadline(budget, self.deadline) {
+            Ok(deadline) => deadline,
+            Err(reason) => return self.userspace(batch, reason),
+        };
+        let mut work = TargetWorkDeadline { deadline, steps: 0 };
+        // A zombie-group member request runs only alone, as a TID run
+        // over its survivor; anywhere else it keeps its own name.
+        let singleton_member = matches!(batch.requests(), [only] if only.member().is_some());
+        // Exclude a PID before running if any required whole-key expectation
+        // is absent. A consumed valid NONE from eligible PIDs is never retried.
+        let mut eligible = Vec::with_capacity(batch.requests().len());
+        let mut scope = BTreeSet::new();
+        let mut examined_entries = 0usize;
+        let mut requested_ranges = 0usize;
+        let mut maps = 0usize;
+        for request in batch.requests() {
+            if let Err(reason) = work.check(budget) {
+                return self.userspace(batch, reason);
+            }
+            examined_entries = match examined_entries.checked_add(request.entries().len()) {
+                Some(total) if total <= super::scan::MapsReadLimits::LIVE.max_entries => total,
+                _ => return self.userspace(batch, RunFailure::FdHeadroom),
+            };
+            requested_ranges = match requested_ranges.checked_add(request.ranges().len()) {
+                Some(total) if total <= super::scan::MapsReadLimits::LIVE.max_entries => total,
+                _ => return self.userspace(batch, RunFailure::FdHeadroom),
+            };
+            // Exact-range lookup is built once from the original prepared maps.
+            // Duplicate ranges cannot supply an unambiguous kernel request.
+            let mut by_range = BTreeMap::new();
+            for entry in request.entries() {
+                #[cfg(test)]
+                tests::note_eligibility_visit(budget);
+                if let Err(reason) = work.step(budget) {
+                    return self.userspace(batch, reason);
+                }
+                if by_range.insert((entry.start, entry.end), entry).is_some() {
+                    return self.userspace(batch, RunFailure::StreamInvalid);
+                }
+            }
+            let mut complete = !request.ranges().is_empty();
+            for range in request.ranges() {
+                let entry = by_range.get(range);
+                #[cfg(test)]
+                if entry.is_some() {
+                    tests::note_eligibility_visit(budget);
+                }
+                if let Err(reason) = work.step(budget) {
+                    return self.userspace(batch, reason);
+                }
+                if !entry.is_some_and(|entry| self.eligible_keys.contains(&ObjectKey::of(entry))) {
+                    complete = false;
+                    break;
+                }
+            }
+            // A member request outside a singleton batch cannot run
+            // here: it draws no scope and no bytes; the answers name it.
+            let runnable = request.member().is_none() || singleton_member;
+            if complete && runnable {
+                scope.insert(request.pid());
+                maps += request.entries().len(); // Bounded by examined_entries above.
+            }
+            eligible.push(complete);
+        }
+        if let Err(reason) = work.check(budget) {
+            return self.userspace(batch, reason);
+        }
+        if scope.is_empty() {
+            return self.userspace(batch, RunFailure::AnchorNotInstalled);
+        }
+        let (generation, slots) = {
+            let pass = self
+                .installed
+                .pass
+                .as_ref()
+                .expect("installed guard owns its pass");
+            let binding = pass
+                .binding
+                .as_ref()
+                .expect("owned installation has a binding");
+            (
+                binding.generation,
+                (binding.arena_len / crate::attach::identity_iter::ANCHOR_STRIDE) as u32,
+            )
+        };
+        let max_bytes = maps
+            .checked_add(slots as usize + 1)
+            .and_then(|records| records.checked_mul(crate::attach::identity_iter::RECORD_LEN));
+        let Some(max_bytes) = max_bytes else {
+            return self.userspace(batch, RunFailure::FdHeadroom);
+        };
+        // A singleton member batch proves by TID run over a freshly
+        // derived selector; a dead selector skips the run entirely (not
+        // an attempt) and the answers name it. Anything else takes the
+        // ordinary scope-and-promotion path.
+        let selector = if singleton_member {
+            batch
+                .requests()
+                .first()
+                .and_then(AcceptedRequest::member)
+                .and_then(|member| member.selector().ok())
+        } else {
+            None
+        };
+        let mut ran_as_member = false;
+        let run = if singleton_member {
+            match selector {
+                Some(selector) => {
+                    if let Err(reason) = self
+                        .installed
+                        .replace_member_target(Some((selector.tgid(), selector.tid())))
+                    {
+                        return self.userspace(batch, reason);
+                    }
+                    // From here every refusal resets the installed
+                    // target: the guard holds the pass, so returning
+                    // through `&mut self` must drop it first, and
+                    // dropping resets.
+                    let guard = MemberTargetGuard {
+                        installed: self.installed,
+                        armed: true,
+                    };
+                    #[cfg(test)]
+                    tests::maybe_expire_pre_member_check(&mut work);
+                    if let Err(reason) = work.check(budget) {
+                        drop(guard);
+                        return self.userspace(batch, reason);
+                    }
+                    match guard
+                        .installed
+                        .read_member_typed(selector, deadline, max_bytes)
+                    {
+                        // The target exited between validation and the
+                        // run: the pre-syscall gate refused, so no
+                        // syscall ran. A dead selector, not an attempted
+                        // run: reset the target without counting an
+                        // attempt or demoting later segments; the
+                        // answers below name it per request, like no
+                        // selector at all.
+                        Err(RunFailure::TargetExited) => {
+                            drop(guard);
+                            crate::attach::identity_iter::Run::default()
+                        }
+                        read => {
+                            let bytes = match read {
+                                Ok(bytes) => {
+                                    guard.installed.target_attempts =
+                                        guard.installed.target_attempts.saturating_add(1);
+                                    bytes
+                                }
+                                Err(reason) => {
+                                    // Same attempt policy as ordinary runs:
+                                    // only an attempted run's failure demotes
+                                    // later segments.
+                                    if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope)
+                                    {
+                                        drop(guard);
+                                        return self.userspace(batch, reason);
+                                    }
+                                    guard.installed.target_attempts =
+                                        guard.installed.target_attempts.saturating_add(1);
+                                    drop(guard);
+                                    self.note_attempted_outcome(reason);
+                                    self.installed.failed_target = Some(reason);
+                                    return self.userspace(batch, reason);
+                                }
+                            };
+                            // Reset before consuming: a stuck target would hijack
+                            // later ordinary runs. Fail closed on a stuck reset.
+                            let reset = guard.installed.replace_member_target(None);
+                            guard.disarm();
+                            if let Err(reason) = reset {
+                                return self.userspace(batch, reason);
+                            }
+                            ran_as_member = true;
+                            let only_pid = batch
+                                .requests()
+                                .first()
+                                .expect("singleton member batch")
+                                .pid();
+                            match parse(
+                                &bytes,
+                                &Expect {
+                                    generation,
+                                    slots,
+                                    scope: &BTreeSet::from([only_pid]),
+                                    mode: RunMode::PerPid,
+                                    run: RunKind::Target,
+                                },
+                            ) {
+                                Ok(run) => run,
+                                Err(_) => {
+                                    self.note_attempted_outcome(RunFailure::StreamInvalid);
+                                    self.installed.failed_target = Some(RunFailure::StreamInvalid);
+                                    return self.userspace(batch, RunFailure::StreamInvalid);
+                                }
+                            }
+                        }
+                    }
+                }
+                // A dead selector skips the run entirely (not an
+                // attempt); the answers below name it.
+                None => crate::attach::identity_iter::Run::default(),
+            }
+        } else {
+            if let Err(reason) = self
+                .installed
+                .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
+            {
+                return self.userspace(batch, reason);
+            }
+            if let Err(reason) = work.check(budget) {
+                return self.userspace(batch, reason);
+            }
+            // One confirmed request on its original retained pidfd is a per-PID
+            // promotion walk; anything else runs whole-system without a pidfd.
+            // The fd is only ever borrowed from the charged preparation: a
+            // missing pidfd runs whole-system, never a numeric reopen.
+            let promotion = match batch.requests() {
+                [only] => matches!(only.kind(), AcceptedKind::Confirm)
+                    .then(|| only.pidfd())
+                    .flatten(),
+                _ => None,
+            };
+            let (mode, pid) = match promotion {
+                Some(pidfd) => (RunMode::PerPid, Some(pidfd)),
+                None => (RunMode::WholeSystem, None),
+            };
+            let bytes = match self.installed.read_target_typed(pid, deadline, max_bytes) {
+                Ok(bytes) => {
+                    self.installed.target_attempts =
+                        self.installed.target_attempts.saturating_add(1);
+                    bytes
+                }
+                Err(reason) => {
+                    // Reservation/installation refusals precede target I/O and
+                    // are not attempts. Only an attempted run's failure demotes
+                    // later segments and moves the session streak.
+                    if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
+                        return self.userspace(batch, reason);
+                    }
+                    self.installed.target_attempts =
+                        self.installed.target_attempts.saturating_add(1);
+                    self.note_attempted_outcome(reason);
+                    self.installed.failed_target = Some(reason);
+                    return self.userspace(batch, reason);
+                }
+            };
+            match parse(
+                &bytes,
+                &Expect {
+                    generation,
+                    slots,
+                    scope: &scope,
+                    mode,
+                    run: RunKind::Target,
+                },
+            ) {
+                Ok(run) => run,
+                Err(_) => {
+                    self.note_attempted_outcome(RunFailure::StreamInvalid);
+                    self.installed.failed_target = Some(RunFailure::StreamInvalid);
+                    return self.userspace(batch, RunFailure::StreamInvalid);
+                }
+            }
+        };
+        #[cfg(test)]
+        tests::maybe_cross_work_deadline(&mut work);
+        if let Err(reason) = work.check(budget) {
+            self.note_attempted_outcome(reason);
+            self.installed.failed_target = Some(reason);
+            return self.userspace(batch, reason);
+        }
+        let mut answers = Vec::with_capacity(batch.requests().len());
+        for (request, eligible) in batch.requests().iter().zip(eligible) {
+            if let Err(reason) = work.step(budget) {
+                self.note_attempted_outcome(reason);
+                self.installed.failed_target = Some(reason);
+                return self.userspace(batch, reason);
+            }
+            // A member request answers from its own TID run only; anywhere
+            // else (a shared batch, a dead selector) it keeps its own
+            // name and falls back per request, never per batch.
+            if request.member().is_some() && !ran_as_member {
+                self.installed.session.fallback.note_fallback(
+                    request.pid(),
+                    request_keys(request),
+                    KernelFallbackReason::ZombieBatch,
+                );
+                answers.push(self.unproven_answer(request));
+                continue;
+            }
+            let demoted = run.demoted_pids.contains(&request.pid());
+            let records = eligible
+                .then(|| run.by_pid.get(&request.pid()))
+                .flatten()
+                .filter(|_| !demoted);
+            let Some(records) = records else {
+                let reason = if !eligible {
+                    KernelFallbackReason::AnchorNotInstalled
+                } else if demoted {
+                    KernelFallbackReason::ConflictingDuplicate
+                } else {
+                    KernelFallbackReason::Unvisited
+                };
+                self.installed.session.fallback.note_fallback(
+                    request.pid(),
+                    request_keys(request),
+                    reason,
+                );
+                answers.push(self.unproven_answer(request));
+                continue;
+            };
+            let mut mapped = MappedIdentities::new();
+            for &range in request.ranges() {
+                if let Err(reason) = work.step(budget) {
+                    self.note_attempted_outcome(reason);
+                    self.installed.failed_target = Some(reason);
+                    return self.userspace(batch, reason);
+                }
+                let proof = match records.get(&range) {
+                    Some(crate::attach::identity_iter::TargetVerdict::Slot(slot)) => {
+                        super::sweep_attribution::RangeProof::Kernel(Slot(*slot))
+                    }
+                    Some(crate::attach::identity_iter::TargetVerdict::Unmatched) => {
+                        super::sweep_attribution::RangeProof::KernelNone
+                    }
+                    None => super::sweep_attribution::RangeProof::NotMapped,
+                };
+                mapped.insert(range, proof);
+            }
+            answers.push(Some(mapped));
+        }
+        if let Err(reason) = work.check(budget) {
+            self.note_attempted_outcome(reason);
+            self.installed.failed_target = Some(reason);
+            return self.userspace(batch, reason);
+        }
+        // A completed run breaks any deadline streak; stickiness never clears.
+        self.installed.session.consecutive_deadlines = 0;
+        let binding = self
+            .installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass")
+            .binding
+            .as_ref()
+            .expect("owned installation has a binding");
+        ProofDecision::Kernel(ValidatedTargetSegment {
+            binding,
+            batch: batch.token().clone(),
+            answers,
+        })
+    }
+}
+
+impl<'g, 's, 'p, Io: ConfirmIo> KernelMemberProbe<'g, 's, 'p, Io> {
+    pub(crate) fn segment_proof(&mut self) -> &mut impl SegmentProof {
+        &mut self.proof
+    }
+
+    pub(crate) fn new(
+        installed: &'g mut InstalledAnchorPass<'s, 'p>,
+        io: Io,
+        deadline: std::time::Instant,
+    ) -> Self {
+        let resources = installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass")
+            .reservations
+            .immediate();
+        Self {
+            proof: KernelPassProof {
+                installed,
+                deadline,
+                eligible_keys: BTreeSet::new(),
+                auto_threshold: None,
+                overlay_keys: BTreeSet::new(),
+            },
+            io,
+            resources,
+        }
+    }
+
+    /// The automatic cost gate for this probe's segments: batches with fewer
+    /// charged requests fall back with `below_threshold` and never attempt a
+    /// target run. Absent, the probe runs every accepted batch (forced shape).
+    pub(crate) fn with_auto_threshold(mut self, threshold: usize) -> Self {
+        self.proof.auto_threshold = Some(threshold);
+        self
+    }
+
+    pub(crate) fn install_expectations(
+        &mut self,
+        index: &mut KnownKeyIndex,
+    ) -> Result<(), &'static str> {
+        let pass = self
+            .proof
+            .installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass");
+        index.clear_kernel_slots();
+        self.proof.eligible_keys.clear();
+        // The overlay refusal follows the pass's match keys whether or not
+        // they hold validated slots: an overlay key without a kernel proof
+        // still never takes the userspace fallback.
+        self.proof.overlay_keys = index.overlay_keys().clone();
+        // The held object's role is part of the expectation. An examined
+        // file under a colliding key must never become its admitted provider.
+        for (&(key, id), slots) in &pass.expected_matches {
+            if index.classify(key) == super::sweep_attribution::KeyClass::Match(id) {
+                index.set_kernel_slots(key, slots.clone())?;
+                self.proof.eligible_keys.insert(key);
+            }
+        }
+        for (&key, slots) in &pass.expected_examined {
+            if index.classify(key) == super::sweep_attribution::KeyClass::Examined {
+                index.set_kernel_slots(key, slots.clone())?;
+                self.proof.eligible_keys.insert(key);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<Io: ConfirmIo> MemberProbe for KernelMemberProbe<'_, '_, '_, Io> {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        // Scoped collection keeps its established per-read cancellation and
+        // charging boundary; this opt-in substrate does not activate there.
+        if budget.has_collection_work() {
+            return super::sweep_attribution::confirm_with_resources(
+                &mut self.io,
+                pid,
+                prove,
+                budget,
+                Some(&self.resources),
+            );
+        }
+        let prepared =
+            match prepare_confirmation(&mut self.io, pid, prove, budget, Some(&self.resources)) {
+                Ok(prepared) => prepared,
+                Err(confirmation) => return confirmation,
+            };
+        prove_and_finish_prepared(
+            &mut self.io,
+            pid,
+            prepared,
+            &mut self.proof,
+            &self.resources,
+            budget,
+        )
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned_reserved(&mut self.io, pid, ranges, budget, &self.resources)
+    }
+}
+
+#[cfg(test)]
+struct DropObserver(Option<Box<dyn FnOnce()>>);
+#[cfg(test)]
+impl Drop for DropObserver {
+    fn drop(&mut self) {
+        if let Some(observe) = self.0.take() {
+            observe();
+        }
+    }
+}
+
+impl<'p> AnchorPass<'p> {
+    pub(crate) fn only_capture_excluded(&self) -> bool {
+        self.arena.is_none()
+            && !self.fallback.is_empty()
+            && self
+                .fallback
+                .values()
+                .all(|reason| *reason == AnchorDeny::CaptureWatched)
+    }
+
+    pub(crate) fn prepare_excluding(
+        pins: &'p PinnedObjects,
+        admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,
+        custody: ExaminedCustody,
+        exclusions: &KernelAnchorExclusions,
+    ) -> Self {
+        Self::prepare_limits(
+            pins,
+            admitted,
+            custody,
+            EXAMINED_ANCHOR_CAP,
+            TOTAL_ANCHOR_CAP,
+            exclusions,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare(
+        pins: &'p PinnedObjects,
+        admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,
+        custody: ExaminedCustody,
+    ) -> Self {
+        Self::prepare_limits(
+            pins,
+            admitted,
+            custody,
+            EXAMINED_ANCHOR_CAP,
+            TOTAL_ANCHOR_CAP,
+            &KernelAnchorExclusions::default(),
+        )
+    }
+
+    fn prepare_limits(
+        pins: &'p PinnedObjects,
+        admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,
+        mut custody: ExaminedCustody,
+        examined_cap: usize,
+        total_cap: usize,
+        exclusions: &KernelAnchorExclusions,
+    ) -> Self {
+        let mut pass = Self {
+            arena: None,
+            #[cfg(test)]
+            after_arena: None,
+            candidates: Vec::new(),
+            #[cfg(test)]
+            after_files: None,
+            fallback: custody
+                .missing
+                .into_iter()
+                .map(|((_, key), reason)| (key, reason))
+                .collect(),
+            expected_matches: BTreeMap::new(),
+            expected_examined: BTreeMap::new(),
+            #[cfg(test)]
+            expected: BTreeMap::new(),
+            reservations: custody.owner.clone(),
+            binding: None,
+        };
+        let mut admitted_by_id: BTreeMap<PinnedObjectId, BTreeSet<ObjectKey>> = BTreeMap::new();
+        for (key, id) in admitted {
+            admitted_by_id.entry(id).or_default().insert(key);
+        }
+        for (id, keys) in admitted_by_id {
+            let Some(file) = pins.file_for(id) else {
+                for key in keys {
+                    pass.fallback.insert(key, AnchorDeny::AnchorNotInstalled);
+                }
+                continue;
+            };
+            // One retained ID may have several mapped aliases. Exclude the
+            // entire file before allocating or mapping any anchor slot.
+            if exclusions.excludes(&keys, file) {
+                for key in keys {
+                    pass.fallback.insert(key, AnchorDeny::CaptureWatched);
+                }
+                continue;
+            }
+            if pass.candidates.len() >= total_cap.min(TOTAL_ANCHOR_CAP) {
+                for key in keys {
+                    pass.fallback.insert(key, AnchorDeny::AnchorCap);
+                }
+                continue;
+            }
+            pass.candidates.push(Candidate {
+                keys,
+                slot: Slot(pass.candidates.len() as u32),
+                file: AnchorFile::Pinned { id, file },
+            });
+        }
+        let callers = &custody.callers;
+        custody.candidates.sort_by_key(|held| {
+            (
+                Reverse(callers.get(&held.examined.key).copied().unwrap_or(0)),
+                held.examined.key,
+                held.ordinal,
+            )
+        });
+        let mut examined_anchors = 0;
+        for held in custody.candidates {
+            let keys = BTreeSet::from([held.examined.key]);
+            if exclusions.excludes(&keys, &held.file) {
+                pass.fallback
+                    .insert(held.examined.key, AnchorDeny::CaptureWatched);
+                continue;
+            }
+            if examined_anchors >= examined_cap.min(EXAMINED_ANCHOR_CAP)
+                || pass.candidates.len() >= total_cap.min(TOTAL_ANCHOR_CAP)
+            {
+                pass.fallback
+                    .insert(held.examined.key, AnchorDeny::AnchorCap);
+                continue;
+            }
+            pass.candidates.push(Candidate {
+                keys,
+                slot: Slot(pass.candidates.len() as u32),
+                file: AnchorFile::Examined(held),
+            });
+            examined_anchors += 1;
+        }
+        if pass.candidates.is_empty() {
+            return pass;
+        }
+        let arena = match AnchorArena::reserve(pass.candidates.len() as u32) {
+            Ok(arena) => arena,
+            Err(_) => {
+                for candidate in &pass.candidates {
+                    for key in &candidate.keys {
+                        pass.fallback.insert(*key, AnchorDeny::AnchorNotInstalled);
+                    }
+                }
+                pass.candidates.clear();
+                return pass;
+            }
+        };
+        pass.candidates.retain(|candidate| {
+            let file = candidate.file.file();
+            let mapped = file.metadata().is_ok_and(|meta| meta.len() > 0)
+                && arena.map_slot(candidate.slot.0, file.as_fd()).is_ok();
+            if !mapped {
+                for key in &candidate.keys {
+                    pass.fallback.insert(*key, AnchorDeny::AnchorNotInstalled);
+                }
+            }
+            mapped
+        });
+        pass.arena = Some(arena);
+        pass
+    }
+
+    fn accept_anchor_run(&mut self, bytes: &[u8], generation: u64) -> Result<(), String> {
+        self.expected_matches.clear();
+        self.expected_examined.clear();
+        #[cfg(test)]
+        self.expected.clear();
+        let run = parse(
+            bytes,
+            &Expect {
+                generation,
+                slots: self.arena.as_ref().map_or(0, |arena| {
+                    (arena.len() / crate::attach::identity_iter::ANCHOR_STRIDE) as u32
+                }),
+                scope: &BTreeSet::from([std::process::id()]),
+                mode: RunMode::PerPid,
+                run: RunKind::Anchor,
+            },
+        )
+        .map_err(|_| "anchor installation stream is invalid".to_string())?;
+        for candidate in &self.candidates {
+            let root = match run.anchors.get(&candidate.slot.0) {
+                Some(crate::attach::identity_iter::AnchorOutcome::Ok) => candidate.slot,
+                Some(crate::attach::identity_iter::AnchorOutcome::Dup(root)) => Slot(*root),
+                _ => {
+                    for key in &candidate.keys {
+                        self.fallback.insert(*key, AnchorDeny::AnchorNotInstalled);
+                    }
+                    continue;
+                }
+            };
+            // Parser aliases are valid only relative to installed OK records.
+            // A failed userspace mapping may leave a reserved slot gap: it
+            // cannot supply an alias root even if an injected stream says OK.
+            if !self
+                .candidates
+                .iter()
+                .any(|installed| installed.slot == root)
+            {
+                for key in &candidate.keys {
+                    self.fallback.insert(*key, AnchorDeny::AnchorNotInstalled);
+                }
+                continue;
+            }
+            for key in &candidate.keys {
+                match &candidate.file {
+                    AnchorFile::Pinned { id, .. } => {
+                        self.expected_matches
+                            .entry((*key, *id))
+                            .or_default()
+                            .insert(root);
+                    }
+                    AnchorFile::Examined(_) => {
+                        self.expected_examined.entry(*key).or_default().insert(root);
+                    }
+                }
+                #[cfg(test)]
+                self.expected.entry(*key).or_default().insert(root);
+            }
+        }
+        self.expected_matches
+            .retain(|(key, _), _| !self.fallback.contains_key(key));
+        self.expected_examined
+            .retain(|key, _| !self.fallback.contains_key(key));
+        #[cfg(test)]
+        self.expected
+            .retain(|key, _| !self.fallback.contains_key(key));
+        Ok(())
+    }
+
+    fn read_run(
+        &mut self,
+        session: &IdentitySession,
+        run: RunKind,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, &'static str> {
+        self.read_run_typed(session, run, pid, deadline, max_bytes)
+            .map_err(|_| "identity pass installation is unavailable")
+    }
+
+    fn owns_installation(&self, session: &IdentitySession) -> bool {
+        let Some(binding) = &self.binding else {
+            return false;
+        };
+        session.binding.as_ref().is_some_and(|installed| {
+            binding.same_installation(installed)
+                && Arc::ptr_eq(&binding.session, &session.token)
+                && binding.generation == session.generation
+                && self.arena.as_ref().is_some_and(|arena| {
+                    arena.base() == binding.arena_base && arena.len() == binding.arena_len
+                })
+        })
+    }
+
+    fn read_run_typed(
+        &mut self,
+        session: &IdentitySession,
+        run: RunKind,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        if !self.owns_installation(session) || !session.scope.ready() {
+            return Err(RunFailure::Scope);
+        }
+        session.read(run, pid, deadline, max_bytes)
+    }
+
+    fn read_run_member(
+        &mut self,
+        session: &IdentitySession,
+        selector: ValidatedMemberSelector<'_>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        if !self.owns_installation(session) || !session.scope.ready() {
+            return Err(RunFailure::Scope);
+        }
+        session.read_member(selector, deadline, max_bytes)
+    }
+
+    #[cfg(test)]
+    fn read_fixture_run(
+        &mut self,
+        iter: std::os::fd::OwnedFd,
+        link: std::os::fd::OwnedFd,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, crate::attach::identity_iter::ReadError> {
+        crate::attach::identity_iter::consume_owned_run(iter, link, deadline, max_bytes)
+    }
+}
+
+/// The scope tracker belongs to this one fresh object; a failed replacement
+/// cannot be bypassed by calling its iterator with an unrelated ready tracker.
+pub(crate) struct IdentitySession {
+    object: SessionObject,
+    scope: ScopeBitmap,
+    generation: u64,
+    token: Arc<()>,
+    binding: Option<PassBinding>,
+    sticky: Option<KernelSticky>,
+    consecutive_deadlines: u32,
+    fallback: KernelFallbackLedger,
+}
+
+enum SessionObject {
+    Kernel(StrictIdentity),
+    #[cfg(test)]
+    Fixture {
+        _object: File,
+        anchor: Vec<u8>,
+        target: Vec<u8>,
+        config: Option<crate::attach::identity_iter::IdentityConfig>,
+        fail_config: bool,
+        /// Writes allowed before `fail_config` starts failing.
+        fail_config_after: usize,
+        reads: std::cell::Cell<usize>,
+        target_steps: std::cell::RefCell<std::collections::VecDeque<FixtureTarget>>,
+        target_trace: Arc<std::sync::Mutex<FixtureRunTrace>>,
+        scope_words: std::cell::RefCell<BTreeMap<u32, u64>>,
+    },
+}
+
+#[cfg(test)]
+enum FixtureTarget {
+    Bytes(Vec<u8>),
+    Deadline(Vec<u8>),
+    Failure(RunFailure),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FixtureRunTrace {
+    scopes: Vec<BTreeSet<u32>>,
+    concrete_runs: usize,
+    closed: Vec<(tests::ClosedFdEvidence, tests::ClosedFdEvidence)>,
+    outcomes: Vec<Result<(), RunFailure>>,
+    pidfds: Vec<Option<i32>>,
+    /// The member target per target run (`Some` exactly for TID runs),
+    /// aligned with `scopes`/`pidfds`/`outcomes`.
+    tids: Vec<Option<(u32, u32)>>,
+    /// Every config write attempt, in order (install, member target,
+    /// reset): the exact bytes each call carried.
+    config_writes: Vec<crate::attach::identity_iter::IdentityConfig>,
+}
+
+#[cfg(test)]
+impl FixtureRunTrace {
+    fn all_concrete_runs_closed(&self) -> bool {
+        self.concrete_runs == self.closed.len()
+            && self
+                .closed
+                .iter()
+                .all(|(iterator, link)| iterator.was_closed() && link.was_closed())
+    }
+}
+
+fn probe_succeeded(report: &crate::attach::identity_iter::FunctionalProbeReport) -> bool {
+    use crate::attach::identity_iter::{AnchorOutcome, TargetVerdict};
+    report.anchor_outcomes == [(0, AnchorOutcome::Ok), (1, AnchorOutcome::Ok)]
+        && report.hardlink_verdict == TargetVerdict::Slot(0)
+        && report.second_verdict == TargetVerdict::Slot(1)
+        && report.copy_verdict == TargetVerdict::Unmatched
+        && report.pids_seen == [report.child_pid]
+        && report.demoted_pids.is_empty()
+        && report.stale_unmatched
+}
+
+impl IdentitySession {
+    #[cfg(test)]
+    fn install_unowned_for_test<'p>(
+        &mut self,
+        pass: AnchorPass<'p>,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<AnchorPass<'p>, &'static str> {
+        self.install_pass(pass, generation, deadline)
+    }
+
+    pub(crate) fn probe_and_load(
+        btf: &aya::Btf,
+        dir: &std::path::Path,
+    ) -> Result<Self, &'static str> {
+        let loaded = probe_then_fresh(
+            || {
+                crate::attach::identity_iter::load_identity_object_strict(btf)
+                    .map_err(|_| "identity object load failed")
+            },
+            |loaded| {
+                let report = crate::attach::identity_iter::run_functional_probe(dir, loaded, 1)
+                    .map_err(|_| "identity functional probe failed")?;
+                if probe_succeeded(&report) {
+                    Ok(())
+                } else {
+                    Err("identity functional probe failed")
+                }
+            },
+        )?;
+        Ok(Self {
+            object: SessionObject::Kernel(loaded),
+            scope: ScopeBitmap::default(),
+            generation: 0,
+            token: Arc::new(()),
+            binding: None,
+            sticky: None,
+            consecutive_deadlines: 0,
+            fallback: KernelFallbackLedger::default(),
+        })
+    }
+
+    pub(crate) fn replace_scope(&mut self, tgids: &[u32]) -> Result<(), &'static str> {
+        self.binding = None;
+        match &mut self.object {
+            SessionObject::Kernel(loaded) => self
+                .scope
+                .replace(&mut loaded.ebpf, tgids)
+                .map_err(|_| "identity scope is unavailable"),
+            #[cfg(test)]
+            SessionObject::Fixture { scope_words, .. } => {
+                self.scope.fixture_replace_observed(tgids, |word, bits| {
+                    scope_words.borrow_mut().insert(word, bits);
+                })
+            }
+        }
+    }
+
+    fn configure(
+        &mut self,
+        config: crate::attach::identity_iter::IdentityConfig,
+    ) -> Result<(), &'static str> {
+        match &mut self.object {
+            SessionObject::Kernel(loaded) => {
+                crate::attach::identity_iter::write_identity_config(&mut loaded.ebpf, &config)
+                    .map_err(|_| "identity anchor configuration failed")
+            }
+            #[cfg(test)]
+            SessionObject::Fixture {
+                config: installed,
+                fail_config,
+                fail_config_after,
+                target_trace,
+                ..
+            } => {
+                // Attempts record before the gate, so a failed write
+                // still shows the bytes it carried.
+                target_trace.lock().unwrap().config_writes.push(config);
+                if *fail_config {
+                    if *fail_config_after > 0 {
+                        *fail_config_after -= 1;
+                    } else {
+                        return Err("injected configuration failure");
+                    }
+                }
+                *installed = Some(config);
+                Ok(())
+            }
+        }
+    }
+
+    fn read(
+        &self,
+        run: RunKind,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        match &self.object {
+            SessionObject::Kernel(loaded) => {
+                let program = match run {
+                    RunKind::Anchor => &loaded.anchor_fd,
+                    RunKind::Target => &loaded.target_fd,
+                };
+                crate::attach::identity_iter::attach_and_read_run_typed(
+                    program.as_fd(),
+                    pid,
+                    deadline,
+                    max_bytes,
+                )
+                .map_err(|error| match error {
+                    crate::attach::identity_iter::OwnedRunError::Attach(_) => {
+                        RunFailure::AttachOrRead
+                    }
+                    // Unreachable on the ordinary path (its attach never
+                    // pre-screens a member target); fail closed as any
+                    // other attach error if it ever arrives.
+                    crate::attach::identity_iter::OwnedRunError::TargetExited(_) => {
+                        RunFailure::AttachOrRead
+                    }
+                    crate::attach::identity_iter::OwnedRunError::Read(error) => error.into(),
+                })
+            }
+            #[cfg(test)]
+            SessionObject::Fixture { .. } => Self::run_fixture_target(
+                &self.object,
+                run,
+                pid.map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd)),
+                None,
+                deadline,
+                max_bytes,
+            ),
+        }
+    }
+
+    /// One member (TID-scoped) target run over the validated selector's
+    /// task. The tid selects the task only at attach; generation proof
+    /// stays the confirm path's job.
+    fn read_member(
+        &self,
+        selector: ValidatedMemberSelector<'_>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        match &self.object {
+            SessionObject::Kernel(loaded) => {
+                attach_and_read_member_run(loaded.target_fd.as_fd(), selector, deadline, max_bytes)
+                    .map_err(|error| match error {
+                        OwnedRunError::Attach(_) => RunFailure::AttachOrRead,
+                        OwnedRunError::TargetExited(_) => RunFailure::TargetExited,
+                        OwnedRunError::Read(error) => error.into(),
+                    })
+            }
+            #[cfg(test)]
+            SessionObject::Fixture { .. } => Self::run_fixture_target(
+                &self.object,
+                RunKind::Target,
+                None,
+                Some((selector.tgid(), selector.tid())),
+                deadline,
+                max_bytes,
+            ),
+        }
+    }
+
+    /// Scripted target/anchor consumption shared by ordinary and member
+    /// runs: identical bytes, accounting and evidence, with the pidfd
+    /// and member-target recordings supplied per run kind.
+    #[cfg(test)]
+    fn run_fixture_target(
+        object: &SessionObject,
+        run: RunKind,
+        pid_record: Option<i32>,
+        member: Option<(u32, u32)>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        let SessionObject::Fixture {
+            anchor,
+            target,
+            reads,
+            target_steps,
+            target_trace,
+            scope_words,
+            ..
+        } = object
+        else {
+            unreachable!("fixture runs need the fixture object")
+        };
+        use std::os::unix::fs::FileExt;
+        reads.set(reads.get() + 1);
+        let step = (run == RunKind::Target)
+            .then(|| target_steps.borrow_mut().pop_front())
+            .flatten();
+        let scope: BTreeSet<_> = scope_words
+            .borrow()
+            .iter()
+            .flat_map(|(&word, &bits)| {
+                (0..64)
+                    .filter_map(move |bit| (bits & (1u64 << bit) != 0).then_some(word * 64 + bit))
+            })
+            .collect();
+        if run == RunKind::Target {
+            let mut trace = target_trace.lock().unwrap();
+            trace.scopes.push(scope);
+            trace.pidfds.push(pid_record);
+            trace.tids.push(member);
+        }
+        if let Some(FixtureTarget::Failure(reason)) = step {
+            target_trace.lock().unwrap().outcomes.push(Err(reason));
+            return Err(reason);
+        }
+        let bytes = match &step {
+            Some(FixtureTarget::Bytes(bytes) | FixtureTarget::Deadline(bytes)) => bytes,
+            _ => match run {
+                RunKind::Anchor => anchor,
+                RunKind::Target => target,
+            },
+        };
+        let (file, file_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+        file.write_at(bytes, 0).unwrap();
+        let (link, link_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+        let tokens = (tests::FdToken::of(&file), tests::FdToken::of(&link));
+        if run == RunKind::Target {
+            target_trace.lock().unwrap().concrete_runs += 1;
+        }
+        let read_deadline = if matches!(step, Some(FixtureTarget::Deadline(_))) {
+            std::time::Instant::now() - std::time::Duration::from_millis(1)
+        } else {
+            deadline
+        };
+        let result = crate::attach::identity_iter::consume_owned_run(
+            file.into(),
+            link.into(),
+            read_deadline,
+            max_bytes,
+        )
+        .map_err(RunFailure::from);
+        let closed = (
+            tests::ClosedFdEvidence::capture(tokens.0, file_path),
+            tests::ClosedFdEvidence::capture(tokens.1, link_path),
+        );
+        if run == RunKind::Target {
+            let mut trace = target_trace.lock().unwrap();
+            trace.closed.push(closed);
+            trace
+                .outcomes
+                .push(result.as_ref().map(|_| ()).map_err(|reason| *reason));
+        }
+        result
+    }
+
+    /// D3d capture disclosure input: the session-owned fallback totals
+    /// (affected passes/PIDs/keys with the first finite reason). Read-only:
+    /// the ledger, sticky status and counters stay session-owned.
+    pub(crate) fn fallback_totals(&self) -> KernelFallbackTotals {
+        self.fallback.totals()
+    }
+
+    /// Install only this pass's observer anchors. Target-range proof belongs
+    /// to D3c. A generation is spent before I/O so a failed pass cannot reuse it.
+    pub(crate) fn install_anchors<'s, 'p>(
+        &'s mut self,
+        pass: AnchorPass<'p>,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<InstalledAnchorPass<'s, 'p>, &'static str> {
+        let pass = self.install_pass(pass, generation, deadline)?;
+        Ok(InstalledAnchorPass {
+            pass: Some(pass),
+            session: self,
+            failed_target: None,
+            target_attempts: 0,
+        })
+    }
+
+    fn install_pass<'p>(
+        &mut self,
+        pass: AnchorPass<'p>,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<AnchorPass<'p>, &'static str> {
+        self.binding = None;
+        self.scope.invalidate();
+        self.fallback.begin_pass();
+        let result = self.install_pass_inner(pass, generation, deadline);
+        if result.is_err() {
+            self.binding = None;
+            self.scope.invalidate();
+        }
+        result
+    }
+
+    fn install_pass_inner<'p>(
+        &mut self,
+        mut pass: AnchorPass<'p>,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<AnchorPass<'p>, &'static str> {
+        pass.expected_matches.clear();
+        pass.expected_examined.clear();
+        #[cfg(test)]
+        pass.expected.clear();
+        if generation <= self.generation || generation >= u64::from(u32::MAX) {
+            return Err("identity generation is unavailable");
+        }
+        self.generation = generation;
+        let Some(arena) = pass.arena.as_ref() else {
+            return Err("identity anchor arena is unavailable");
+        };
+        let slots = (arena.len() / crate::attach::identity_iter::ANCHOR_STRIDE) as u32;
+        let config = arena.config(generation, slots, std::process::id());
+        self.replace_scope(&[std::process::id()])?;
+        self.configure(config)?;
+        let binding = PassBinding {
+            session: self.token.clone(),
+            generation,
+            arena_base: arena.base(),
+            arena_len: arena.len(),
+        };
+        pass.binding = Some(binding.clone());
+        self.binding = Some(binding);
+        let pid_lease = pass
+            .reservations
+            .immediate()
+            .pin()
+            .map_err(|_| "identity anchor FD headroom is unavailable")?;
+        let pid = crate::attach::identity_iter::open_pidfd(std::process::id())
+            .map_err(|_| "identity anchor observer is unavailable")?;
+        let run_lease = pass
+            .reservations
+            .immediate()
+            .transient()
+            .map_err(|_| "identity anchor FD headroom is unavailable")?;
+        let result = pass.read_run(
+            self,
+            RunKind::Anchor,
+            Some(pid.as_fd()),
+            deadline,
+            (slots as usize + 1) * crate::attach::identity_iter::RECORD_LEN,
+        );
+        drop(run_lease);
+        drop(pid);
+        drop(pid_lease);
+        let bytes = result?;
+        pass.accept_anchor_run(&bytes, generation)
+            .map_err(|_| "identity anchor installation failed")?;
+        Ok(pass)
+    }
+}
+
+/// The probe mutates scope/config/generation. Production requires a distinct
+/// fresh strict-loaded object after the complete probe owner has been dropped.
+fn probe_then_fresh<L, E>(
+    mut load: impl FnMut() -> Result<L, E>,
+    probe: impl FnOnce(&mut L) -> Result<(), E>,
+) -> Result<L, E> {
+    let mut loaded = load()?;
+    probe(&mut loaded)?;
+    drop(loaded);
+    load()
+}
+
+#[cfg(test)]
+#[path = "kernel_identity_tests.rs"]
+mod tests;

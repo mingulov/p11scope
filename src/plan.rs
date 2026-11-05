@@ -14,7 +14,12 @@
 //! admission the complete validated union — refuses the module whole when it
 //! exceeds the remaining budget. That holds for a module new to the capture
 //! and for one whose sources no longer list any endpoint the capture attached
-//! for it (its old endpoints retire; capture history still names it). A
+//! for it (its old endpoints retire; capture history still names it), except
+//! that a shared-scope Detailed ordinary provider refused whole retries as
+//! its leading-tables prefix with a named partial gap (JK-22a) — whole
+//! refusal stays only when not even the strongest table fits within its
+//! reserve-aware budget, or when its corroborated (published) tables
+//! together do not fit. A
 //! module whose sources still list such endpoints is never refused whole
 //! (G-03): when what it needs next does not fit, it keeps those endpoints, no
 //! prefix of the rest is attached, and the omission is reported, so it is
@@ -24,12 +29,19 @@
 //! and go through the same `merge`, so there is exactly one implementation of the
 //! merge rules rather than two that can drift.
 
-use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
+use crate::discovery::identity::{
+    GraphRefusal, GraphStep, PinnedObjectId, PinnedObjects, ReconciledModule,
+};
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
-    ObjectExports, ScannedInterface, ScannedTable, TableEvidenceScore, export_agreement,
-    order_tables_by_evidence, standard_ordinal, table_evidence_score, table_linkage,
-    table_name_authorized,
+    ObjectExports, ScannedEntry, ScannedInterface, ScannedTable, TableEvidenceScore,
+    export_agreement, order_tables_by_evidence, published_walk, standard_ordinal,
+    table_evidence_score, table_linkage, table_name_authorized, table_observation_authorized,
+};
+use crate::inventory_semantics::SemanticRefusal;
+use crate::kinds::AliasAgreement;
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
 };
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
@@ -38,6 +50,11 @@ use p11scope_manifest::manifest::{
 };
 use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+#[path = "plan_selection_recovery_tests.rs"]
+mod selection_recovery_tests;
 
 /// Immutable admission contract carried by one planner for its whole capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +66,10 @@ pub enum AdmissionPolicy {
     /// count-only and the complete union is admitted atomically within this
     /// endpoint/payload budget.
     Inventory(crate::capacity::InventoryBudget),
+    /// Planner preparation for metrics counters: the complete validated union
+    /// is count-only within a lifetime endpoint envelope. This policy grants
+    /// no native map capacity or runtime activation.
+    Counters(crate::capacity::CounterBudget),
 }
 
 impl AdmissionPolicy {
@@ -60,19 +81,39 @@ impl AdmissionPolicy {
         Self::Inventory(budget)
     }
 
+    pub const fn counters(budget: crate::capacity::CounterBudget) -> Self {
+        Self::Counters(budget)
+    }
+
     fn endpoint_limit(self) -> usize {
         match self {
             Self::Detailed => MAX_SLOTS as usize,
             Self::Inventory(budget) => budget.endpoint_limit() as usize,
+            Self::Counters(budget) => budget.endpoint_limit() as usize,
         }
     }
 
     fn admits_complete_validated_union(self) -> bool {
-        matches!(self, Self::Inventory(_))
+        matches!(self, Self::Inventory(_) | Self::Counters(_))
     }
 
     fn forces_count_only(self) -> bool {
-        matches!(self, Self::Inventory(_))
+        matches!(self, Self::Inventory(_) | Self::Counters(_))
+    }
+
+    fn count_only_subject(self) -> &'static str {
+        match self {
+            Self::Detailed => "detailed",
+            Self::Inventory(_) => "inventory",
+            Self::Counters(_) => "counter",
+        }
+    }
+
+    fn capacity_subject(self) -> &'static str {
+        match self {
+            Self::Detailed | Self::Inventory(_) => "attach slots",
+            Self::Counters(_) => "counter endpoints",
+        }
     }
 
     fn validate_count(self, endpoints: usize) -> Result<(), String> {
@@ -82,13 +123,18 @@ impl AdmissionPolicy {
                 "attach plan requires {endpoints} allocated slots but only {MAX_SLOTS} are available"
             )),
             Self::Inventory(budget) => budget.validate_count(endpoints),
+            Self::Counters(budget) => budget.validate_count(endpoints),
         }
     }
 
     fn checked_required(self, current: usize, additions: usize) -> Result<usize, String> {
-        let required = current
-            .checked_add(additions)
-            .ok_or_else(|| "attach slot requirement overflowed".to_string())?;
+        let required = current.checked_add(additions).ok_or_else(|| {
+            match self {
+                Self::Counters(_) => "counter endpoint requirement overflowed",
+                Self::Detailed | Self::Inventory(_) => "attach slot requirement overflowed",
+            }
+            .to_string()
+        })?;
         self.validate_count(required)?;
         Ok(required)
     }
@@ -153,6 +199,21 @@ pub struct Slot {
     pub fork_safe: bool,
     /// Every module claiming this exact {object, offset}. Length >= 2 ⇒ ambiguous.
     pub module_ids: Vec<ModuleId>,
+}
+
+/// Per-slot object authority computed from the sealed plan: either the
+/// frozen cookie stays eligible, or the claim is refused with its reason
+/// and fresh alias verdict. Inactive in slice A.
+#[cfg_attr(not(test), allow(dead_code))] // Slices B/C admit markers from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectSlotEligibility {
+    Eligible {
+        descriptor_index: u32,
+    },
+    Refused {
+        reason: SemanticRefusal,
+        agreement: AliasAgreement,
+    },
 }
 
 /// The presented name for a slot no authorized source named: an unlinked
@@ -231,6 +292,52 @@ pub(crate) fn is_growth_omission(reason: &str) -> bool {
     reason.starts_with(GROWTH_OMISSION)
 }
 
+/// Whether a `modules_skipped` reason records a refused proxy closure
+/// array (whole or growth): the terminal report names where its forwarded
+/// calls are counted instead of suggesting `--module` for it.
+pub(crate) fn is_closure_array_refusal(reason: &str) -> bool {
+    reason.contains(CLOSURE_ARRAY_MARKER)
+}
+
+/// The stable head of [`CLOSURE_ARRAY_NOTE`] that classifies a closure
+/// refusal, unchanged by later rewording of the rule after it.
+const CLOSURE_ARRAY_MARKER: &str = "(a proxy closure array is admitted whole";
+
+/// The admission rule every closure-array refusal states.
+const CLOSURE_ARRAY_NOTE: &str = "(a proxy closure array is admitted whole, as a prefix when \
+     mapped before the capture's first plan beside a provider or named by the operator, or \
+     as published tables)";
+
+/// What an unpublished closure-array gap says instead of a demand: nothing
+/// it holds may attach yet, whatever the free capacity.
+const CLOSURE_UNPUBLISHED: &str = "is published yet";
+
+/// Whether a `modules_skipped` reason records a proxy closure array that
+/// admits only published tables (alone in the capture's first plan, or
+/// mapped during the capture) and has none yet. Not a capacity refusal: a
+/// named capture with nothing else to attach still starts on it, PARTIAL,
+/// and admits the providers below it as they load.
+pub(crate) fn is_closure_awaiting_publication(reason: &str) -> bool {
+    is_closure_array_refusal(reason) && reason.contains(CLOSURE_UNPUBLISHED)
+}
+
+/// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
+/// proxy closure array: some leading templates attached, the rest not
+/// counted. Partially covered, never a whole refusal.
+pub(crate) fn is_closure_array_prefix(reason: &str) -> bool {
+    reason.contains("template tables attached; calls through the others are not counted")
+}
+
+/// Whether a `modules_skipped` reason records a JK-22a prefix-admitted
+/// ordinary provider: some leading endpoints attached, the rest not
+/// counted. Partially covered, never a whole refusal. The counted phrase
+/// is required beside the tag: whole refusals interpolate holder paths
+/// verbatim, and a path may name the tag.
+pub(crate) fn is_provider_prefix(reason: &str) -> bool {
+    reason.contains("endpoints attached; calls through the others are not counted")
+        && reason.contains("(provider_prefix)")
+}
+
 /// The omitted count a growth omission states — the `N` of
 /// `admitted module needs N more;` — or `None` for any other reason.
 pub(crate) fn growth_omitted_count(reason: &str) -> Option<usize> {
@@ -256,33 +363,57 @@ pub(crate) fn whole_refusal_needed_count(reason: &str) -> Option<usize> {
 
 /// The omitted endpoints are not called new: an endpoint deactivated earlier
 /// in the capture and listed again needs a fresh slot just the same.
-fn growth_omission_reason(
+/// Like a whole refusal, an omission names what holds the room the growth
+/// needed; a provider omission also names the remedies, so a provider that
+/// arrives after a prefix and still does not fit fails visibly.
+/// Inputs to [`growth_omission_reason`], grouped past clippy's arity cap.
+struct GrowthOmission<'a> {
     omitted: usize,
     capacity: usize,
     in_use: usize,
     retired: usize,
     kept: usize,
-) -> String {
-    let endpoints = |count: usize| if count == 1 { "endpoint" } else { "endpoints" };
-    format!(
-        "{GROWTH_OMISSION} {omitted} more; only {capacity} attach slots are available; \
-         {} — {omitted} {} not attached; kept its {kept} attached {}",
-        slot_use(in_use, retired, &[]),
-        endpoints(omitted),
-        endpoints(kept),
-    )
+    policy: AdmissionPolicy,
+    holders: &'a [(&'a str, usize)],
+    provider_remedies: bool,
+    counter_hint: bool,
 }
 
-/// A module's admission class in a shared scope, in admission order.
+fn growth_omission_reason(details: &GrowthOmission) -> String {
+    let endpoints = |count: usize| if count == 1 { "endpoint" } else { "endpoints" };
+    let mut reason = format!(
+        "{GROWTH_OMISSION} {omitted} more; only {capacity} {} are available; \
+         {} — {omitted} {} not attached; kept its {kept} attached {}",
+        details.policy.capacity_subject(),
+        slot_use(details.in_use, details.retired, details.holders),
+        endpoints(details.omitted),
+        endpoints(details.kept),
+        omitted = details.omitted,
+        capacity = details.capacity,
+        kept = details.kept,
+    );
+    if details.provider_remedies {
+        reason.push_str("; to capture one provider, name it with --module <path>");
+        reason.push_str("; to free slots, exclude an unneeded module with --exclude-module <name>");
+        if details.counter_hint {
+            reason.push_str(
+                "; to count every endpoint in this metrics capture, re-run with \
+                 --counter-mode counts",
+            );
+        }
+    }
+    reason
+}
+
+/// A module's admission class, in admission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AdmissionClass {
     /// Named by the operator's `--manifest`: attested, admitted first and
     /// under the named-scope rule.
     Operator,
     /// At least one table with publication evidence, and no closure-array
-    /// excess of unresolved lookalikes: the single [`table_name_authorized`]
-    /// predicate, so any linkage the scan learns counts here too. Evidence
-    /// beats count — a corroborated table is never a lookalike.
+    /// excess of unresolved lookalikes. Observation authorization is independent
+    /// of the permission to present ordinal names as API names.
     Corroborated,
     /// Only unresolved heuristic tables, at most [`MAX_TABLES_PER_OBJECT`].
     Heuristic,
@@ -290,7 +421,13 @@ enum AdmissionClass {
     /// one object: a proxy's closure array (p11-kit decodes 64). A call
     /// through the proxy is seen at the real provider's own functions once
     /// that provider is attached, and the whole array (~6,656 endpoints)
-    /// never fits, so it is admitted last and only whole.
+    /// never fits, so it is admitted last in every scope: whole when it
+    /// fits (late-start, reserve-capped), otherwise a reserve-capped
+    /// leading-templates prefix in every scope when the capture's first
+    /// plan held it beside a non-closure provider, or when its opened file
+    /// matched an operator-named `--module` input, and its published tables
+    /// only when unnamed (mapped mid-capture, or alone in the first plan) —
+    /// refused whole when none of those admit.
     ClosureArray,
 }
 
@@ -309,37 +446,44 @@ impl AdmissionClass {
 /// shared-scope within-class order and the closure-array refusal message,
 /// both of which are about lookalikes.
 fn admission_class(group: &[Discovered<'_>]) -> (AdmissionClass, usize) {
-    let mut unresolved = BTreeSet::new();
-    let mut corroborated = false;
+    let mut observations = BTreeMap::<TableKey, bool>::new();
     for (piece, module) in group.iter().enumerate() {
         let Some(evidence) = &module.scan_evidence else {
             continue;
         };
         for (index, table) in evidence.tables.iter().enumerate() {
-            let authorized = table_name_authorized(&table_evidence_score(
-                index,
-                evidence.tables,
-                evidence.interfaces,
-                &[],
-                &[],
-                &evidence.exports,
-            ));
-            corroborated |= authorized;
-            if !authorized {
-                unresolved.insert(table_key(piece, index, table));
-            }
+            let authorized = table_observation_authorized(
+                table,
+                &table_evidence_score(
+                    index,
+                    evidence.tables,
+                    evidence.interfaces,
+                    &[],
+                    &[],
+                    &evidence.exports,
+                ),
+            );
+            observations
+                .entry(table_key(piece, index, table))
+                .and_modify(|known| *known |= authorized)
+                .or_insert(authorized);
         }
     }
+    let unresolved = observations
+        .values()
+        .filter(|authorized| !**authorized)
+        .count();
+    let corroborated = observations.values().any(|authorized| *authorized);
     let class = if group.iter().any(|module| module.scan_evidence.is_none()) {
         AdmissionClass::Operator
-    } else if unresolved.len() > MAX_TABLES_PER_OBJECT {
+    } else if unresolved > MAX_TABLES_PER_OBJECT {
         AdmissionClass::ClosureArray
     } else if corroborated {
         AdmissionClass::Corroborated
     } else {
         AdmissionClass::Heuristic
     };
-    (class, unresolved.len())
+    (class, unresolved)
 }
 
 impl AdmissionClass {
@@ -399,6 +543,13 @@ enum AdmissionDecision {
         kept: BTreeSet<AttachKey>,
         /// Allocated slots once this module was admitted.
         allocated_slots: usize,
+        /// Part 0: a closure array admitted as a leading-templates prefix
+        /// (not whole) names its covered tables for the report.
+        closure_prefix: Option<(usize, usize)>,
+        /// JK-22a: an ordinary provider admitted as a leading-tables
+        /// prefix (not whole) names its attached endpoints beside its
+        /// needed endpoints for the report.
+        provider_prefix: Option<(usize, usize)>,
     },
     Refused(Skipped),
 }
@@ -446,7 +597,11 @@ fn slot_holders<'a>(
 
 /// A whole-module capacity refusal: the demand, the budget, what holds it,
 /// and — in a shared scope — the reserve and how to aim the capture.
+/// Provider refusals name every remedy valid in this command and scope;
+/// closure-array refusals keep their specialized text (the gap line already
+/// says where forwarded calls are counted).
 struct CapacityRefusal<'a> {
+    policy: AdmissionPolicy,
     needed: usize,
     capacity: usize,
     in_use: usize,
@@ -455,14 +610,38 @@ struct CapacityRefusal<'a> {
     reserve: Option<usize>,
     closure_tables: Option<usize>,
     aim_hint: bool,
+    naming_hint: bool,
+    counter_hint: bool,
+    /// A Detailed closure array limited to its published tables, with none
+    /// published: not refused for capacity, so no demand is stated.
+    unpublished: bool,
 }
 
 impl CapacityRefusal<'_> {
     fn reason(&self) -> String {
+        if self.unpublished {
+            let mut reason = format!(
+                "a proxy closure array alone in the capture's first plan, or mapped during \
+                 the capture, attaches only its published tables, and none of its {} lookalike \
+                 function tables {CLOSURE_UNPUBLISHED}, so calls through it are not counted \
+                 {CLOSURE_ARRAY_NOTE}; the providers it forwards to attach when they load",
+                self.closure_tables.unwrap_or_default()
+            );
+            // Unnamed only: an operator-named closure was already named.
+            if self.naming_hint {
+                reason.push_str(
+                    "; naming it with --module <path> attaches its leading-templates prefix \
+                     but narrows discovery to the named modules, so a provider it forwards to \
+                     is captured only when also named",
+                );
+            }
+            return reason;
+        }
         let mut reason = format!(
-            "module needs {} more; only {} attach slots are available; {}",
+            "module needs {} more; only {} {} are available; {}",
             self.needed,
             self.capacity,
+            self.policy.capacity_subject(),
             slot_use(self.in_use, self.retired, &self.holders)
         );
         if let Some(reserve) = self.reserve {
@@ -473,12 +652,26 @@ impl CapacityRefusal<'_> {
         reason.push_str(" — refusing to attach a prefix");
         if let Some(tables) = self.closure_tables {
             reason.push_str(&format!(
-                " of its {tables} lookalike function tables (a proxy closure array is \
-                 admitted whole or not at all)"
+                " of its {tables} lookalike function tables {CLOSURE_ARRAY_NOTE}"
             ));
         }
-        if self.aim_hint {
+        if self.closure_tables.is_none() {
             reason.push_str("; to capture one provider, name it with --module <path>");
+            reason.push_str(
+                "; to free slots, exclude an unneeded module with --exclude-module <name>",
+            );
+            if self.counter_hint {
+                reason.push_str(
+                    "; to count every endpoint in this metrics capture, re-run with \
+                     --counter-mode counts",
+                );
+            }
+        } else if self.aim_hint {
+            reason.push_str("; to capture one provider, name it with --module <path>");
+        } else if self.naming_hint {
+            reason.push_str(
+                "; to capture its leading-templates prefix, name it with --module <path>",
+            );
         }
         reason
     }
@@ -490,9 +683,19 @@ impl CapacityRefusal<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AdmissionScope {
     /// One named process (`--pid`, `run`), or a capture the operator aimed
-    /// with `--module`: modules are admitted first-come in discovery order,
+    /// with `--module`: providers are admitted first-come in discovery order,
     /// and an unresolved heuristic object admits its strongest
-    /// [`MAX_TABLES_PER_OBJECT`] tables (K4).
+    /// [`MAX_TABLES_PER_OBJECT`] tables (K4). A recognized proxy closure
+    /// array is decided after every provider: whole when it fits
+    /// (late-start, reserve-capped), otherwise a reserve-capped
+    /// leading-templates prefix only when the capture's first plan held it
+    /// beside a non-closure provider, or when operator-named — the prefix
+    /// never takes the [`shared_scope_reserve`] slots, so at least the
+    /// reserve (128 of 512 slots) stays free and one later standard function
+    /// list (at most 104 entries) always fits — and its published tables
+    /// only when unnamed (mapped mid-capture, or without an admitted
+    /// provider in the first plan). A second later provider may not fit; it
+    /// is refused by name with the `--exclude-module` remedy.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -504,8 +707,16 @@ pub enum AdmissionScope {
     /// providers with a corroborated table, then heuristic providers with the
     /// fewest tables, and proxy closure arrays last, each class ordered by
     /// `(dev, inode)` so the admitted set never depends on discovery order.
-    /// Every module but an operator-attested one is admitted whole or not at
-    /// all, and uncorroborated ones leave [`shared_scope_reserve`] slots free.
+    /// Operator-attested modules are admitted whole or not at all, as are
+    /// Inventory/Counters/broad modules under their complete-union rule; a
+    /// Detailed closure array takes the same reserve-capped
+    /// leading-templates prefix a named scope admits (JK-22a) before its
+    /// published tables, and any other Detailed provider refused whole
+    /// retries as its leading-tables prefix with a named partial gap
+    /// (JK-22a) — whole refusal stays only when not even the strongest
+    /// table fits within its reserve-aware budget, or when its
+    /// corroborated (published) tables together do not fit.
+    /// Uncorroborated modules leave [`shared_scope_reserve`] slots free.
     Shared,
 }
 
@@ -551,13 +762,16 @@ pub struct TableSummary {
     /// an interface triple), "live_return" (returned by a live provider
     /// export), "manifest" (operator-authoritative), "exports" (every
     /// standard name the object itself exports sits exactly at its ordinal's
-    /// target), or "heuristic" (bare decode with no linkage — its names are
-    /// presented as `unknown`). Every non-heuristic linkage names the table;
-    /// none of them gives a scan target semantic authority.
+    /// target, except an interposed `C_GetFunctionList` bootstrap the
+    /// linker resolved by name), or "heuristic" (bare decode with no
+    /// linkage — its names are presented as `unknown`). Every
+    /// non-heuristic linkage names the table; none of them gives a scan
+    /// target semantic authority.
     pub linkage: &'static str,
     /// Ordinals whose target is exactly the same-named `.dynsym` definition
-    /// in the table's own object. `None` for manifest tables, which are not
-    /// compared.
+    /// in the table's own object, plus an interposed `C_GetFunctionList`
+    /// bootstrap the linker resolved by name. `None` for manifest tables,
+    /// which are not compared.
     pub exports_agreeing: Option<usize>,
 }
 
@@ -572,7 +786,8 @@ pub struct ModuleSummary {
     /// The most interfaces any one source saw, never the sum across sources —
     /// two sources describing one provider both count its interfaces.
     pub interfaces: usize,
-    /// "scan" | "manifest".
+    /// `"scan"`, `"manifest"`, `"prearm"`, or a canonical `+`-joined
+    /// combination (`join_source`).
     pub source: &'static str,
     /// Whether a second discovery source agreed with this one (spec §4.12).
     pub corroborated: bool,
@@ -619,16 +834,6 @@ pub(crate) fn source_label(s: &SurfaceSource) -> String {
                     "corroborated_standard_prefix",
             }
         ),
-    }
-}
-
-fn walk_label(w: &WalkOutcome) -> String {
-    match w {
-        WalkOutcome::Full => "full".into(),
-        WalkOutcome::KnownPrefix => "known_prefix".into(),
-        WalkOutcome::Refused => "refused".into(),
-        WalkOutcome::NotWalked => "not_walked".into(),
-        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
     }
 }
 
@@ -705,8 +910,101 @@ pub struct AttachPlan {
     // Capture-lifetime ownership for every allocated aggregate cell. Active
     // topology remains in `slot_by_key` and each slot's current `module_ids`.
     aggregate_owners: Vec<AggregateOwner>,
+    // Counter staging consumed these original positions, including inactive
+    // published rows and never-published rollback holes. Retention only:
+    // the counter directory, not this floor, records publication.
+    counter_consumed_end: u32,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    // Objects present in the capture's first plan input (PA-5 C1): a proxy
+    // closure array gets its heuristic prefix only when here (the late-start
+    // case); a closure first mapped during the capture admits only its
+    // publication-authorized tables. Carried through rebuilds, never grown.
+    // Generic object identity only — no provider names, offsets or symbols.
+    first_plan_objects: BTreeSet<PinnedObjectId>,
+    // Whether the capture's first plan admitted at least one non-closure
+    // provider onto a slot (PA-9/C1). A closure without one in the first
+    // plan takes no late-start prefix — it is treated like a mid-capture
+    // one — so a backend decoded later still fits. Set by an initial build
+    // as providers are admitted, carried through rebuilds like
+    // `first_plan_objects`.
+    first_plan_had_provider: bool,
+    // Plan fence for the conservative rebuild cursor: every `&mut self`
+    // method bumps `mutations` first, and `token` is minted fresh per plan
+    // value (`Clone` mints, so whole-plan replacement changes the token).
+    // Both are transparent to `PartialEq`.
+    mutations: MutationCount,
+    token: PlanToken,
+}
+
+/// Mutation generation of one [`AttachPlan`] value. Bumped first by every
+/// `&mut self` method so the conservative cursor's fence notices in-place
+/// writes. Transparent to plan equality.
+#[derive(Clone, Copy, Debug, Default)]
+struct MutationCount(u64);
+
+impl PartialEq for MutationCount {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl MutationCount {
+    fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+/// Identity of one [`AttachPlan`] value. Minted from a process-wide counter
+/// the way `mint_pin_copy_cache_id` mints pin generations; the counter never
+/// wraps, and exhaustion (or contention loss) yields [`PLAN_TOKEN_POISON`],
+/// which the fence always refuses. `Clone` mints a fresh token, so no
+/// whole-plan replacement can replay an old fence. Transparent to plan
+/// equality; prints nothing.
+// consumed by T4: read only by the plan fence until the graph polls it.
+#[allow(dead_code)]
+struct PlanToken(u64);
+
+/// Token value the plan fence always refuses: minted only when the token
+/// counter is exhausted.
+const PLAN_TOKEN_POISON: u64 = u64::MAX;
+
+static NEXT_PLAN_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+impl PlanToken {
+    fn mint() -> Self {
+        Self(
+            NEXT_PLAN_TOKEN
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    old.checked_add(1)
+                })
+                .unwrap_or(PLAN_TOKEN_POISON),
+        )
+    }
+}
+
+impl Clone for PlanToken {
+    fn clone(&self) -> Self {
+        Self::mint()
+    }
+}
+
+impl Default for PlanToken {
+    fn default() -> Self {
+        Self::mint()
+    }
+}
+
+impl PartialEq for PlanToken {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for PlanToken {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
 }
 
 /// The one physical attachment identity. A pathname is diagnostic data, not
@@ -718,7 +1016,7 @@ pub struct AttachKey {
 }
 
 impl AttachKey {
-    fn of(slot: &Slot) -> Self {
+    pub(crate) fn of(slot: &Slot) -> Self {
         Self {
             object: slot.object,
             file_offset: slot.file_offset,
@@ -740,6 +1038,48 @@ pub(crate) struct SelectionTableTarget {
     pub(crate) object_path: String,
     pub(crate) file_offset: u64,
     pub(crate) name: &'static str,
+    pub(crate) ordinal: Option<u16>,
+    // Foreign targets can acquire this binding only through comparable pins.
+    provider: PinnedObjectId,
+}
+
+impl SelectionTableTarget {
+    pub(crate) fn provider_local(
+        object: PinnedObjectId,
+        object_path: String,
+        file_offset: u64,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            object,
+            object_path,
+            file_offset,
+            name,
+            ordinal: standard_ordinal(name),
+            provider: object,
+        }
+    }
+
+    pub(crate) fn from_pinned(
+        provider: PinnedObjectId,
+        object: PinnedObjectId,
+        object_path: String,
+        file_offset: u64,
+        name: &'static str,
+        ordinal: u16,
+        pinned: &PinnedObjects,
+    ) -> Option<Self> {
+        matches!((pinned.abi_for(provider), pinned.abi_for(object)),
+            (Some(provider), Some(target)) if provider == target)
+        .then_some(Self {
+            object,
+            object_path,
+            file_offset,
+            name,
+            ordinal: Some(ordinal),
+            provider,
+        })
+    }
 }
 
 /// The finite link work induced by one complete rebuilt-plan snapshot.
@@ -750,7 +1090,175 @@ pub struct AttachDelta {
     pub retire: Vec<Slot>,
 }
 
+/// Refusal before counter history is consumed; no native authority is implied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
+pub(crate) enum CounterHistoryError {
+    Policy,
+    Extent,
+    Frontier,
+    Topology,
+}
+
 impl AttachPlan {
+    /// Whether two plans agree on everything the rebuild derives. The
+    /// recorded skip list is excluded: every commit's publication
+    /// re-derives it from capture-facts history on both paths, and the
+    /// unchanged-tick path reproduces the build-time merge exactly. The
+    /// remaining exclusions are rebuild outputs that are pure functions of
+    /// the verified build inputs (module refusals, refused surfaces,
+    /// decoded-occurrence counts) or carried constants (vendor scalars):
+    /// they agree on every rebuild-vs-rebuild steady tick, and the
+    /// exclusion bridges only walk-vs-rebuild constructor differences
+    /// while reuse state converges. (Token and mutation generations are
+    /// transparent to equality by their own impls.)
+    pub(crate) fn matches_for_stability(&self, other: &Self) -> bool {
+        let mut ours = self.clone();
+        let mut theirs = other.clone();
+        for plan in [&mut ours, &mut theirs] {
+            plan.skipped.clear();
+            plan.modules_skipped.clear();
+            plan.surfaces.clear();
+            plan.entries_seen = 0;
+            plan.vendor_interfaces = 0;
+            plan.interface_list.clear();
+        }
+        ours == theirs
+    }
+
+    /// Object authority for one slot of the sealed plan: the slot must be
+    /// current, single-owned, authorized, unambiguous and S1-consistent,
+    /// its names must freshly agree, and its frozen cookie must name a
+    /// canonical non-NONE object protocol whose function remains among the
+    /// slot's names. The frozen cookie is preserved, never reselected.
+    #[cfg_attr(not(test), allow(dead_code))] // Slices B/C admit markers from this.
+    pub(crate) fn object_slot_eligibility(&self, slot: u32) -> ObjectSlotEligibility {
+        let Some(entry) = self.slots.get(slot as usize) else {
+            let (_, agreement) = crate::kinds::descriptor_index_with_object_agreement(&[]);
+            return ObjectSlotEligibility::Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                agreement,
+            };
+        };
+        let (_, agreement) = crate::kinds::descriptor_index_with_object_agreement(&entry.names);
+        let refused = |reason| ObjectSlotEligibility::Refused { reason, agreement };
+        if entry.index != slot {
+            return refused(SemanticRefusal::IncompleteProvider);
+        }
+        if entry.module_ids.is_empty() {
+            return refused(SemanticRefusal::IncompleteProvider);
+        }
+        if entry.module_ids.len() >= 2 {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if !entry.semantic_authorized {
+            return refused(SemanticRefusal::Unattested);
+        }
+        if entry.semantic_ambiguous {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if entry.descriptor_index == 0
+            || entry.descriptor_index >= p11scope_ebpf_common::MAX_DESCRIPTORS
+        {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if entry.semantics != crate::kinds::DESCRIPTORS[entry.descriptor_index as usize] {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if agreement != AliasAgreement::Agree {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        // The frozen cookie is preserved, never reselected: its function
+        // must remain among the slot's names with a canonical non-NONE
+        // object protocol. Extensions can only narrow, never upgrade.
+        let function = entry.descriptor_index - 1;
+        if !entry
+            .names
+            .iter()
+            .any(|name| crate::kinds::function_id(name) == Some(function))
+        {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if p11scope_ebpf_common::object_wire::canonical_object_wire(function)
+            == p11scope_ebpf_common::object_wire::none_object_wire()
+        {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        ObjectSlotEligibility::Eligible {
+            descriptor_index: entry.descriptor_index,
+        }
+    }
+
+    /// Initial subset only: retain descriptor decisions made with every rival
+    /// claim still present, then allocate a fresh dense slot space.
+    pub(crate) fn attested_subset(
+        &self,
+        providers: &BTreeSet<PinnedObjectId>,
+        degraded: &BTreeSet<AttachKey>,
+    ) -> Result<Self, String> {
+        if self.counter_consumed_end != 0
+            || !self.retired_slots.is_empty()
+            || !self.provisional_get_function_list.is_empty()
+        {
+            return Err("semantic subsets require a fresh initial plan".into());
+        }
+        let selected: BTreeSet<_> = self
+            .modules
+            .iter()
+            .filter(|module| providers.contains(&module.object))
+            .map(|module| module.id)
+            .collect();
+        let mut slots: Vec<_> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.module_ids.iter().any(|id| selected.contains(id)))
+            .cloned()
+            .collect();
+        let referenced: BTreeSet<_> = slots
+            .iter()
+            .flat_map(|slot| slot.module_ids.iter().copied())
+            .collect();
+        let ids: BTreeMap<_, _> = self
+            .modules
+            .iter()
+            .filter(|module| referenced.contains(&module.id))
+            .enumerate()
+            .map(|(index, module)| (module.id, ModuleId(index as u32)))
+            .collect();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            slot.index = index as u32;
+            if degraded.contains(&AttachKey::of(slot)) {
+                slot.descriptor_index = 0;
+                slot.semantics = SlotSemantics::COUNT_ONLY;
+                slot.semantic_authorized = false;
+                slot.semantic_ambiguous = true;
+            }
+            for id in &mut slot.module_ids {
+                *id = ids[id];
+            }
+        }
+        let mut subset = Self::from_slots_with_policy(slots, AdmissionPolicy::Detailed)?;
+        subset.modules = self
+            .modules
+            .iter()
+            .filter(|module| referenced.contains(&module.id))
+            .cloned()
+            .map(|mut module| {
+                module.id = ids[&module.id];
+                module
+            })
+            .collect();
+        subset.slot_ordinals = self
+            .slot_ordinals
+            .iter()
+            .filter(|(key, _)| subset.slot_by_key.contains_key(key))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
+        subset.object_identities = self.object_identities.clone();
+        subset.validate_slot_index()?;
+        Ok(subset)
+    }
+
     pub fn from_slots(slots: Vec<Slot>) -> Self {
         Self::from_indexed_slots(slots, AdmissionPolicy::detailed())
             .expect("slots must have dense indices and unique exact targets")
@@ -805,10 +1313,15 @@ impl AttachPlan {
             provisional_get_function_list: BTreeMap::new(),
             retired_slots: BTreeSet::new(),
             aggregate_owners,
+            counter_consumed_end: 0,
             admission_policy,
             admission_scope: AdmissionScope::Named,
             slot_ordinals: BTreeMap::new(),
             object_identities: BTreeMap::new(),
+            first_plan_objects: BTreeSet::new(),
+            first_plan_had_provider: false,
+            mutations: MutationCount::default(),
+            token: PlanToken::default(),
         })
     }
 
@@ -820,10 +1333,31 @@ impl AttachPlan {
             .unwrap_or_default()
     }
 
+    /// Borrow presentation metadata before reserving its eventual owned copy.
+    pub(crate) fn borrowed_ordinals_of(
+        &self,
+        slot: &Slot,
+    ) -> impl Iterator<Item = SlotOrdinal> + '_ {
+        self.slot_ordinals
+            .get(&AttachKey::of(slot))
+            .into_iter()
+            .flat_map(|ordinals| ordinals.iter().copied())
+    }
+
+    pub(crate) fn ordinal_count(&self, slot: &Slot) -> usize {
+        self.slot_ordinals
+            .get(&AttachKey::of(slot))
+            .map_or(0, BTreeSet::len)
+    }
+
     /// The pinned identity of the object this slot attaches into, when the
     /// plan was built with the pins in hand.
     pub(crate) fn target_object_of(&self, slot: &Slot) -> Option<TargetObject> {
         self.object_identities.get(&slot.object).cloned()
+    }
+
+    pub(crate) fn borrowed_target_object_of(&self, slot: &Slot) -> Option<&TargetObject> {
+        self.object_identities.get(&slot.object)
     }
 
     /// The one display label for `slot` ([`presented_label`]).
@@ -835,6 +1369,7 @@ impl AttachPlan {
     /// plan uses. Called wherever a plan is built from pins, so a later
     /// report can identify a target even after its pin retires.
     fn note_object_identities(&mut self, pinned: &PinnedObjects) {
+        self.mutations.bump();
         let objects: BTreeSet<PinnedObjectId> = self
             .slots
             .iter()
@@ -863,6 +1398,76 @@ impl AttachPlan {
         self.admission_scope
     }
 
+    /// Re-admit this plan's exact slots under a counter budget, preserving
+    /// slots, activity, modules and evidence. Rebuilds do not preserve the
+    /// policy: `rebuild_discovered` always lowers a Detailed plan, so Engine
+    /// callers that need Counters must re-admit the retained plan afterwards
+    /// (counter starts do this via `restore_counters_policy_after_retain`).
+    pub(crate) fn with_counters_policy(
+        &self,
+        budget: crate::capacity::CounterBudget,
+    ) -> Result<Self, String> {
+        budget.validate_count(self.slots.len())?;
+        let mut next = self.clone();
+        next.admission_policy = AdmissionPolicy::Counters(budget);
+        Ok(next)
+    }
+
+    /// Restore the staged counter prefix on a freshly rebuilt plan, which
+    /// always starts unconsumed. The caller passes the committed staged
+    /// length (the directory high-water); lengths past the slots refuse.
+    pub(crate) fn adopt_counter_consumed(&mut self, consumed: u32) -> Result<(), String> {
+        if consumed as usize > self.slots.len() {
+            return Err(format!(
+                "counter staged prefix {consumed} exceeds {} plan slots",
+                self.slots.len()
+            ));
+        }
+        self.counter_consumed_end = consumed;
+        Ok(())
+    }
+
+    /// Exclusive end of consumed counter history, independent of publication.
+    #[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
+    pub(crate) const fn counter_consumed_end(&self) -> u32 {
+        self.counter_consumed_end
+    }
+
+    /// Consume the complete fresh tail of this same historical plan exactly
+    /// once. The caller must finish charged topology/provider/commit-absence
+    /// preflight first and acquire this floor before directory/native mutation.
+    /// This allocation-free port grants no map, link or publication authority.
+    /// Rollback deactivates failed cells without refunding their positions;
+    /// previously published cells likewise survive later inactivity.
+    #[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
+    pub(crate) fn consume_counter_extent(
+        &mut self,
+        first: u32,
+        end: u32,
+    ) -> Result<(), CounterHistoryError> {
+        self.mutations.bump();
+        let AdmissionPolicy::Counters(budget) = self.admission_policy else {
+            return Err(CounterHistoryError::Policy);
+        };
+        if first >= end
+            || end as usize != self.slots.len()
+            || u64::from(end) > budget.endpoint_limit()
+        {
+            return Err(CounterHistoryError::Extent);
+        }
+        if first != self.counter_consumed_end {
+            return Err(CounterHistoryError::Frontier);
+        }
+        if self.slots.iter().enumerate().any(|(position, slot)| {
+            slot.index as usize != position
+                || (position >= first as usize && !self.is_active(slot.index))
+        }) {
+            return Err(CounterHistoryError::Topology);
+        }
+        self.counter_consumed_end = end;
+        Ok(())
+    }
+
     /// Rebuilds the one complete, capacity-aware snapshot a live caller passes
     /// unchanged to [`Self::extend_exact`]. Historical allocations remain
     /// reserved; active exact keys consume no additional slot.
@@ -885,46 +1490,73 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         broad_admit: bool,
     ) -> AttachPlan {
+        self.rebuild_from_sources_broad_with_prearm(
+            scanned,
+            manifests,
+            &[],
+            pinned,
+            broad_admit,
+            false,
+        )
+    }
+
+    /// [`rebuild_from_sources_broad`] plus resolved `--prearm-module` pieces
+    /// (packet 6.13), so live rebuilds keep pre-armed modules. An empty
+    /// slice rebuilds exactly the old plan.
+    pub fn rebuild_from_sources_broad_with_prearm(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        prearm: &[PrearmPlanPiece],
+        pinned: &PinnedObjects,
+        broad_admit: bool,
+        counter_hint: bool,
+    ) -> AttachPlan {
+        let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
         let mut rebuilt = self.rebuild_from_sources_with(
             scanned,
             manifests,
-            |key, path| pinned.id_for_manifest(key, path),
-            |provider, target| {
-                matches!(
-                    (pinned.abi_for(provider), pinned.abi_for(target)),
-                    (Some(provider), Some(target)) if provider == target
-                )
-            },
+            prearm,
+            pinned_id,
+            compatible,
             broad_admit,
             self.admission_policy,
+            counter_hint,
         );
         rebuilt.note_object_identities(pinned);
         rebuilt
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_from_sources_with(
         &self,
         scanned: &[ReconciledModule],
         manifests: &[Manifest],
+        prearm: &[PrearmPlanPiece],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
         broad_admit: bool,
         admission_policy: AdmissionPolicy,
+        counter_hint: bool,
     ) -> AttachPlan {
         let owned = self.active_keys_by_owner();
         let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
+            prearm,
             pinned_id,
             compatible,
             ExistingAllocation {
                 slots: self.slots.len(),
                 active: &self.slot_by_key,
                 owned: &owned,
+                first_plan: Some(&self.first_plan_objects),
+                first_plan_had_provider: self.first_plan_had_provider,
             },
             broad_admit,
             admission_policy,
             self.admission_scope,
+            counter_hint,
         );
         for (key, object) in &self.provisional_get_function_list {
             if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
@@ -968,6 +1600,7 @@ impl AttachPlan {
         &mut self,
         provisional: ProvisionalGetFunctionList,
     ) -> Result<Option<Slot>, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         let Some(module) = self
             .modules
@@ -1029,6 +1662,7 @@ impl AttachPlan {
         module: ModuleId,
         targets: impl IntoIterator<Item = SelectionTableTarget>,
     ) -> Result<(), String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         allocated.validate_slot_index()?;
         if self.admission_policy != allocated.admission_policy {
@@ -1037,24 +1671,26 @@ impl AttachPlan {
         let Some(provider) = self.modules.iter().find(|known| known.id == module) else {
             return Err(format!("selection table names missing module {}", module.0));
         };
-        let mut grouped: BTreeMap<AttachKey, (String, BTreeSet<&'static str>)> = BTreeMap::new();
+        let mut grouped: BTreeMap<AttachKey, (String, BTreeSet<&'static str>, BTreeSet<u16>)> =
+            BTreeMap::new();
         for target in targets {
-            if target.object != provider.object {
+            if target.provider != provider.object {
                 return Err(format!(
                     "selection table module {} names object {:?}, got {:?}",
                     module.0, provider.object, target.object
                 ));
             }
-            let (path, names) = grouped
+            let (path, names, ordinals) = grouped
                 .entry(AttachKey {
                     object: target.object,
                     file_offset: target.file_offset,
                 })
-                .or_insert_with(|| (target.object_path.clone(), BTreeSet::new()));
+                .or_insert_with(|| (target.object_path.clone(), BTreeSet::new(), BTreeSet::new()));
             if target.object_path < *path {
                 *path = target.object_path;
             }
             names.insert(target.name);
+            ordinals.extend(target.ordinal);
         }
 
         let candidate_additions = self
@@ -1077,35 +1713,49 @@ impl AttachPlan {
             .is_err()
         {
             let capacity = self.admission_policy.endpoint_limit();
+            let resource = self.admission_policy.capacity_subject();
             return Err(format!(
-                "selection table needs {table_additions} more of the {capacity} attach slots; \
+                "selection table needs {table_additions} more of the {capacity} {resource}; \
                  {pending} are allocated or pending — refusing to attach a prefix"
             ));
         }
 
-        for (key, (object_path, names)) in grouped {
+        for (key, (object_path, names, ordinals)) in grouped {
             // Selection tables carry no table location, only positions.
-            self.slot_ordinals.entry(key).or_default().extend(
-                names
-                    .iter()
-                    .filter_map(|name| standard_ordinal(name))
-                    .map(|ordinal| SlotOrdinal {
-                        table_file_offset: None,
-                        ordinal,
-                    }),
-            );
+            self.slot_ordinals
+                .entry(key)
+                .or_default()
+                .extend(ordinals.into_iter().map(|ordinal| SlotOrdinal {
+                    table_file_offset: None,
+                    ordinal,
+                }));
             if let Some(position) = self.slot_by_key.get(&key).copied() {
                 let slot = &mut self.slots[position];
                 slot.names.extend(names.into_iter().map(str::to_string));
                 slot.names.sort();
                 slot.names.dedup();
-                // Selection names are interface-selected and authorized: they
-                // displace a prior `unknown`, never alias with it.
+                // An available naming witness displaces a prior `unknown`.
                 drop_transparent_unknown(&mut slot.names);
                 slot.aliased |= slot.names.len() >= 2;
+                if !slot.module_ids.contains(&module) {
+                    slot.module_ids.push(module);
+                    slot.module_ids.sort();
+                    let previous = self.aggregate_owners[position];
+                    let merged = previous.merge(AggregateOwner::Sole(module));
+                    self.aggregate_owners[position] = merged;
+                    self.module_ambiguous += usize::from(
+                        previous != AggregateOwner::Ambiguous
+                            && merged == AggregateOwner::Ambiguous,
+                    );
+                    slot.descriptor_index = 0;
+                    slot.semantics = SlotSemantics::COUNT_ONLY;
+                    slot.semantic_authorized = false;
+                    slot.semantic_ambiguous = true;
+                }
                 continue;
             }
-            let names: Vec<_> = names.into_iter().map(str::to_string).collect();
+            let mut names: Vec<_> = names.into_iter().map(str::to_string).collect();
+            drop_transparent_unknown(&mut names);
             let slot = Slot {
                 index: self.slots.len() as u32,
                 descriptor_index: 0,
@@ -1132,6 +1782,15 @@ impl AttachPlan {
     pub fn is_active(&self, slot: u32) -> bool {
         let position = slot as usize;
         position < self.slots.len() && !self.retired_slots.contains(&position)
+    }
+
+    /// The slot index for one exact attach target, if this plan holds it
+    /// (packet 6.13: the pre-arm arm check maps declared keys to session
+    /// links and their stamps).
+    pub(crate) fn slot_index_for_key(&self, key: AttachKey) -> Option<u32> {
+        self.slot_by_key
+            .get(&key)
+            .and_then(|position| u32::try_from(*position).ok())
     }
 
     /// How many allocated slots are still active right now (U-14): the plan's
@@ -1224,6 +1883,7 @@ impl AttachPlan {
         slots: Vec<Slot>,
         remap: &BTreeMap<ModuleId, ModuleId>,
     ) {
+        self.mutations.bump();
         for owner in &mut self.aggregate_owners {
             if let AggregateOwner::Sole(id) = owner
                 && let Some(stable) = remap.get(id)
@@ -1238,6 +1898,7 @@ impl AttachPlan {
     /// proved about already-active exact targets. Candidate identities and
     /// topology remain local until their transaction commits.
     pub(crate) fn latch_ambiguity_from(&mut self, candidate: &Self) -> bool {
+        self.mutations.bump();
         let mut changed = false;
         for (key, candidate_position) in &candidate.slot_by_key {
             if candidate.aggregate_owners.get(*candidate_position)
@@ -1264,6 +1925,7 @@ impl AttachPlan {
     /// replace an existing exact target; descriptors are frozen before any
     /// attachment and can never be upgraded or otherwise mutated live.
     pub fn extend_exact(&mut self, mut rebuilt: AttachPlan) -> Result<AttachDelta, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.validate_matching_policy(&rebuilt)?;
@@ -1277,6 +1939,7 @@ impl AttachPlan {
         &mut self,
         rebuilt: AttachPlan,
     ) -> Result<AttachDelta, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.validate_matching_policy(&rebuilt)?;
@@ -1285,6 +1948,7 @@ impl AttachPlan {
     }
 
     fn extend_exact_prepared(&mut self, rebuilt: AttachPlan) -> Result<AttachDelta, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.validate_extension_capacity(&rebuilt)?;
@@ -1466,6 +2130,7 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         accepted_slots: usize,
     ) -> Vec<Slot> {
+        self.mutations.bump();
         self.modules
             .retain(|module| pinned.summary(module.object).is_some());
         self.refused_module_objects
@@ -1492,6 +2157,7 @@ impl AttachPlan {
     /// cookie. It remains a visible, inactive aggregate slot with finite
     /// attachment evidence owned by the caller.
     pub(crate) fn deactivate(&mut self, slot: u32) {
+        self.mutations.bump();
         let position = slot as usize;
         if position >= self.slots.len() {
             return;
@@ -1517,8 +2183,12 @@ impl AttachPlan {
     /// no such cell, and keeping them burned the lifetime budget whenever the
     /// same listed-but-inactive endpoints were planned again with additions
     /// closed. Only a wholly inactive tail is withdrawn: an active cell means
-    /// a link exists, and then nothing is given back.
+    /// a link exists, and then nothing is given back. Counter staging also
+    /// consumes positions before links/publication: its history is retained
+    /// even when clean rollback left those cells inactive and never published.
     pub(crate) fn withdraw_unlinked_additions(&mut self, accepted: usize) {
+        self.mutations.bump();
+        let accepted = accepted.max(self.counter_consumed_end as usize);
         if self.slots.len() <= accepted
             || (accepted..self.slots.len()).any(|position| self.is_active(position as u32))
         {
@@ -1538,7 +2208,101 @@ impl AttachPlan {
             .count();
     }
 
+    /// Excises never-linked tail cells this candidate allocated past
+    /// `accepted` — the partial-withhold companion to
+    /// [`withdraw_unlinked_additions`](Self::withdraw_unlinked_additions),
+    /// which only takes back a wholly inactive tail. A withheld retry's
+    /// cell was allocated by this candidate and deactivated before any
+    /// link, so giving it back cannot strand a count; keeping it would
+    /// burn the capture-lifetime budget on every deferral tick. Only
+    /// cells at `accepted..` that are inactive are removed — active cells
+    /// and cells below `accepted` or the consumed counter floor are never
+    /// touched. Surviving unconsumed tail cells
+    /// shift down with their indices, owners, and key/retirement
+    /// positions remapped. Returns the old-index → new-index map
+    /// (`u32::MAX` for excised cells) so the caller can remap detached
+    /// slot clones (delta entries).
+    pub(crate) fn excise_unlinked_tail_cells(
+        &mut self,
+        accepted: usize,
+        cells: &BTreeSet<u32>,
+    ) -> Vec<u32> {
+        self.mutations.bump();
+        let accepted = accepted.max(self.counter_consumed_end as usize);
+        let old_len = self.slots.len();
+        debug_assert_eq!(self.aggregate_owners.len(), old_len);
+        let remove: BTreeSet<usize> = cells
+            .iter()
+            .map(|cell| *cell as usize)
+            .filter(|position| {
+                *position >= accepted && *position < old_len && !self.is_active(*position as u32)
+            })
+            .collect();
+        let mut old_to_new = vec![u32::MAX; old_len];
+        if remove.is_empty() {
+            for (position, new) in old_to_new.iter_mut().enumerate() {
+                *new = position as u32;
+            }
+            return old_to_new;
+        }
+        let mut slots = Vec::with_capacity(old_len - remove.len());
+        for (position, mut slot) in self.slots.drain(..).enumerate() {
+            if remove.contains(&position) {
+                continue;
+            }
+            slot.index = slots.len() as u32;
+            old_to_new[position] = slot.index;
+            slots.push(slot);
+        }
+        let mut owners = Vec::with_capacity(old_len - remove.len());
+        for (position, owner) in self.aggregate_owners.drain(..).enumerate() {
+            if !remove.contains(&position) {
+                owners.push(owner);
+            }
+        }
+        debug_assert_eq!(slots.len(), owners.len());
+        self.slots = slots;
+        self.aggregate_owners = owners;
+        self.retired_slots = self
+            .retired_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new as usize)
+            })
+            .collect();
+        for position in self.slot_by_key.values_mut() {
+            let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+            debug_assert!(
+                new != u32::MAX,
+                "an excised cell must already have left the key index"
+            );
+            if new != u32::MAX {
+                *position = new as usize;
+            }
+        }
+        self.slot_by_key
+            .retain(|_, position| *position < self.slots.len());
+        let slot_by_key = &self.slot_by_key;
+        self.provisional_get_function_list
+            .retain(|key, _| slot_by_key.contains_key(key));
+        self.module_ambiguous = self
+            .aggregate_owners
+            .iter()
+            .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
+            .count();
+        old_to_new
+    }
+
     pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
+        if self.counter_consumed_end as usize > self.slots.len() {
+            return Err("consumed counter history extends past allocated slots".into());
+        }
+        if self.counter_consumed_end != 0
+            && !matches!(self.admission_policy, AdmissionPolicy::Counters(_))
+        {
+            return Err("consumed counter history requires counter admission policy".into());
+        }
         if self.aggregate_owners.len() != self.slots.len() {
             return Err("aggregate-owner state does not match allocated slots".into());
         }
@@ -1569,7 +2333,11 @@ impl AttachPlan {
                     || slot.semantics != SlotSemantics::COUNT_ONLY
                     || slot.semantic_authorized)
             {
-                return Err(format!("inventory slot {} is not count-only", slot.index));
+                return Err(format!(
+                    "{} slot {} is not count-only",
+                    self.admission_policy.count_only_subject(),
+                    slot.index
+                ));
             }
             if slot.descriptor_index != 0
                 && (!slot.semantic_authorized
@@ -1799,11 +2567,36 @@ fn table_key(piece: usize, index: usize, table: &ScannedTable) -> TableKey {
     }
 }
 
+/// One `--prearm-module` input lowered for `merge` (packet 6.13, R2-D1-1/2).
+/// A pre-arm input selects a physical file; it carries no function claims.
+/// Only offsets proved by an accompanying manifest (lowered separately) or
+/// by defined ELF exports proved executable in held bytes (`proved`) lower
+/// pre-mapping. Resolved fresh against the current pin set before each
+/// build, like manifest resolution — never a stale id.
+#[derive(Debug, Clone)]
+pub struct PrearmPlanPiece {
+    pub(crate) object: PinnedObjectId,
+    pub(crate) key: ObjectKey,
+    /// Operator spelling: messages and the module path only, never identity.
+    pub(crate) path: String,
+    /// Standard-name `.dynsym` definitions proved executable in held bytes.
+    pub(crate) proved: Vec<(String, u64)>,
+    /// Standard-name exports not proved executable: disclosed as skipped,
+    /// never attached pre-mapping.
+    pub(crate) non_executable: Vec<(String, u64)>,
+}
+
 /// One module lowered for `merge`.
 struct Discovered<'a> {
     object: PinnedObjectId,
     key: ObjectKey,
     path: &'a str,
+    /// The scanned piece's opened file matched an operator-named `--module`
+    /// input (scan-time match, carried from
+    /// [`crate::discovery::scan::ScannedModule::module_hint`]). The
+    /// operator-named closure exception reads it; manifest and prearm
+    /// pieces carry `false`.
+    module_named: bool,
     source: &'static str,
     tables: Vec<TableSummary>,
     interfaces: usize,
@@ -1825,9 +2618,60 @@ struct Building {
     module_ids: Vec<ModuleId>,
 }
 
+/// Occurrence-deduped decoded counts for one merge group: a manifest
+/// corroborating a scanned entry names the same occurrence and is counted
+/// once. Generic over borrowed (`&str`, for [`decoded_occurrence_count`]) and
+/// owned (`String`, for the conservative cursor's strided recount) names.
+#[derive(Debug, Default)]
+struct OccurrenceCounter<N, S> {
+    targets: BTreeSet<(N, PinnedObjectId, u64, usize)>,
+    skips: BTreeSet<(&'static str, S, S, usize)>,
+}
+
+impl<N: Ord + Clone, S: Ord + Clone> OccurrenceCounter<N, S> {
+    fn feed_target(
+        &mut self,
+        within: &mut BTreeMap<(N, PinnedObjectId, u64), usize>,
+        name: N,
+        object: PinnedObjectId,
+        file_offset: u64,
+    ) {
+        let occurrence = within
+            .entry((name.clone(), object, file_offset))
+            .or_insert(0usize);
+        self.targets
+            .insert((name, object, file_offset, *occurrence));
+        *occurrence += 1;
+    }
+
+    fn feed_skip(
+        &mut self,
+        within: &mut BTreeMap<(S, S), usize>,
+        source: &'static str,
+        subject: S,
+        reason: S,
+    ) {
+        let occurrence = within
+            .entry((subject.clone(), reason.clone()))
+            .or_insert(0usize);
+        self.skips.insert((source, subject, reason, *occurrence));
+        *occurrence += 1;
+    }
+
+    fn count(&self) -> usize {
+        self.targets.len() + self.skips.len()
+    }
+
+    // consumed by T4: the cursor clears the counter per group; merge never does.
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.targets.clear();
+        self.skips.clear();
+    }
+}
+
 fn decoded_occurrence_count(group: &[Discovered<'_>]) -> usize {
-    let mut targets = BTreeSet::new();
-    let mut skips = BTreeSet::new();
+    let mut counter: OccurrenceCounter<&str, &str> = OccurrenceCounter::default();
     for module in group {
         debug_assert_eq!(
             module.entries_seen,
@@ -1835,22 +2679,53 @@ fn decoded_occurrence_count(group: &[Discovered<'_>]) -> usize {
         );
         let mut target_occurrences = BTreeMap::new();
         for target in &module.targets {
-            let record = (target.name, target.object, target.file_offset);
-            let occurrence = target_occurrences.entry(record).or_insert(0usize);
-            targets.insert((record.0, record.1, record.2, *occurrence));
-            *occurrence += 1;
+            counter.feed_target(
+                &mut target_occurrences,
+                target.name,
+                target.object,
+                target.file_offset,
+            );
         }
         let mut skip_occurrences = BTreeMap::new();
         for skip in &module.skipped {
-            let record = (skip.subject.as_str(), skip.reason.as_str());
-            let occurrence = skip_occurrences.entry(record).or_insert(0usize);
-            skips.insert((module.source, record.0, record.1, *occurrence));
-            *occurrence += 1;
+            counter.feed_skip(
+                &mut skip_occurrences,
+                module.source,
+                skip.subject.as_str(),
+                skip.reason.as_str(),
+            );
         }
     }
-    targets.len() + skips.len()
+    counter.count()
 }
 
+/// Canonical `+`-join over scan/manifest/prearm piece sources. Order is
+/// fixed (scan, manifest, prearm) so every combination renders exactly one
+/// way on the module record. Piece sources are closed — `lower_scanned`
+/// says `"scan"`, `lower_manifest` says `"manifest"`, `lower_prearm` says
+/// `"prearm"` — so an unrecognized side falls back to the other side rather
+/// than inventing a label.
+fn join_source(left: &'static str, right: &'static str) -> &'static str {
+    if left == right {
+        return left;
+    }
+    let has = |source: &'static str, part: &str| source.split('+').any(|piece| piece == part);
+    let scan = has(left, "scan") || has(right, "scan");
+    let manifest = has(left, "manifest") || has(right, "manifest");
+    let prearm = has(left, "prearm") || has(right, "prearm");
+    match (scan, manifest, prearm) {
+        (true, true, true) => "scan+manifest+prearm",
+        (true, true, false) => "scan+manifest",
+        (true, false, true) => "scan+prearm",
+        (false, true, true) => "manifest+prearm",
+        (true, false, false) => "scan",
+        (false, true, false) => "manifest",
+        (false, false, true) => "prearm",
+        (false, false, false) => left,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn merge(
     discovered: Vec<Discovered<'_>>,
     vendor_interfaces: usize,
@@ -1859,6 +2734,7 @@ fn merge(
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     let capacity = admission_policy.endpoint_limit();
     let existing_slots = allocated.active;
@@ -1883,8 +2759,36 @@ fn merge(
     let mut order: Vec<usize> = (0..groups.len()).collect();
     if shared {
         order.sort_by_key(|&position| (classes[position], groups[position][0].key, position));
+    } else {
+        // Named scope keeps first-come discovery order for providers, but a
+        // recognized proxy closure array is decided last in every scope, so
+        // providers claim the room first; the first-plan rule plus the
+        // reserve cap below keep an early prefix from crowding out a
+        // provider decoded later. Stable, so discovery order holds within
+        // each partition.
+        order.sort_by_key(|&position| classes[position].0 == AdmissionClass::ClosureArray);
     }
     let reserve = shared_scope_reserve(capacity);
+    // PA-9/C1: the late-start prefix is granted only when the capture's
+    // first plan also admitted a non-closure provider onto at least one
+    // slot. An initial build IS the first plan: closures decide after every
+    // provider in each scope, so this is known when a closure decides, and
+    // it is set below as providers are admitted. A provider refused whole,
+    // or one with nothing attachable, does not count. A rebuild carries
+    // what its first plan held. A closure without such a provider in the
+    // first plan is treated like a mid-capture one below (published tables
+    // only, or the named exception), so a backend decoded later still fits.
+    let mut first_plan_had_provider = match allocated.first_plan {
+        Some(_) => allocated.first_plan_had_provider,
+        None => false,
+    };
+    // PA-5 C1 plus the operator-named exception: the heuristic closure
+    // prefix is allowed only for a closure object already mapped when the
+    // capture's first plan was built (the late-start case), or whose
+    // opened file matched an operator-named `--module` input. Any other
+    // closure first mapped during the capture never gets the prefix; it
+    // admits only its publication-authorized tables below. Generic object
+    // identity only — no provider names, offsets or symbols.
     // Retired slots stay allocated for the capture lifetime and are never
     // reused; refusals say so apart from the active endpoints.
     let retired = allocated.slots.saturating_sub(existing_slots.len());
@@ -1904,17 +2808,79 @@ fn merge(
     let mut decisions: Vec<Option<AdmissionDecision>> = (0..groups.len()).map(|_| None).collect();
     let mut uncorroborated_candidates = 0u64;
     let mut allocated_slots = allocated.slots;
+    // PA-5 C1+M3: a closure array takes heuristic room only when no real
+    // provider was refused whole or omitted its growth ahead of it. Closures
+    // decide last, so this is known. A prefix never hides a loss.
+    let mut provider_refused = false;
+    let mut provider_omitted = false;
     for position in order {
         let group = &groups[position];
         let object = group[0].object;
         let path = group[0].path;
         let (class, table_count) = classes[position];
-        // Shared scope: every module but an operator-attested one is admitted
-        // whole or not at all, and uncorroborated ones leave the reserve free.
-        let whole = broad_admit
+        let is_detailed_closure = class == AdmissionClass::ClosureArray
+            && matches!(admission_policy, AdmissionPolicy::Detailed)
+            && !broad_admit;
+        // Late-start when the object was in the capture's first plan input
+        // and that plan also held a non-closure provider (PA-9/C1). An
+        // initial build's input IS its first plan; a rebuild compares
+        // against the carried set and the carried provider flag. A closure
+        // alone in the first plan reads as mid-capture everywhere below.
+        let closure_late_start = match allocated.first_plan {
+            None => true,
+            Some(first) => first.contains(&object),
+        } && first_plan_had_provider;
+        // Operator-named exception: any scan piece of this object matched an
+        // operator-named `--module` input at scan time. Generic object
+        // identity only — no provider names, offsets or symbols.
+        let closure_named = group.iter().any(|module| module.module_named);
+        // PA-5 C1+M3 plus the operator-named exception, extended to every
+        // scope by JK-22a: a Detailed closure array, late-start (PA-9/C1:
+        // beside a provider in the first plan) or operator-named, with no
+        // provider refused or omitted ahead of it, falls back to its
+        // leading-templates prefix when whole does not fit — outside the
+        // reserve, so at least the reserve (128 of 512 slots) stays free and
+        // one later standard function list (at most 104 entries) always
+        // fits; a second later provider may be refused by name. Closures
+        // decide last in every scope, so backends claim room first and keep
+        // attaching exactly; an unnamed mid-capture closure admits only its
+        // published tables below.
+        let closure_prefix_allowed = is_detailed_closure
+            && (closure_late_start || closure_named)
+            && !provider_refused
+            && !provider_omitted;
+        // PA-5 C2+M4 as amended by JK-22a: shared scope admits every
+        // non-operator, non-closure module whole or not at all; a Detailed
+        // closure admitted whole respects the reserve cap and the first-plan
+        // rule — mid-capture closures skip whole entirely, for published-only
+        // below (or the prefix attempt when operator-named) — and a
+        // prefix-allowed closure retries as its reserve-capped prefix before
+        // published-only, like a named scope.
+        // Inventory/Counters and broad admit keep their complete-union whole.
+        let whole_original = broad_admit
             || admission_policy.admits_complete_validated_union()
+            || (class == AdmissionClass::ClosureArray
+                && (!is_detailed_closure || closure_late_start))
             || (shared && class != AdmissionClass::Operator);
-        let reserved = shared && class.leaves_reserve();
+        // A Detailed closure's whole and prefix budgets leave the reserve
+        // free (M4); its published-only retry below uses the full budget, as
+        // do corroborated tables. Shared uncorroborated modules keep the
+        // reserve as before.
+        let reserved = if is_detailed_closure {
+            // Late-start starts whole (reserve-capped, M4); mid-capture
+            // starts published-only (full budget, corroborated tables) or
+            // at the reserve-capped prefix attempt when operator-named.
+            // The passes below re-cap accordingly.
+            closure_late_start
+        } else {
+            shared && class.leaves_reserve()
+        };
+        // Mid-capture Detailed closures admit published tables only, never
+        // whole and never a heuristic prefix — unless operator-named with
+        // the prefix allowed, in which case the first pass below is the
+        // prefix attempt itself. The exception never grants whole.
+        let closure_published_only_first =
+            is_detailed_closure && !closure_late_start && !closure_prefix_allowed;
         let budget = GroupBudget {
             policy: admission_policy,
             ceiling: if reserved {
@@ -1945,7 +2911,8 @@ fn merge(
         // endpoints to keep. Admission then runs once more over `kept` alone:
         // the module keeps every endpoint it has, no prefix of its growth is
         // attached, and the growth is reported as omitted below. A module
-        // with nothing to keep is refused whole, as before.
+        // with nothing to keep is refused whole, as before — unless Part 0
+        // prefix fallback retries it as a leading-templates prefix below.
         let mut refused_growth: Option<BTreeSet<AttachKey>> = None;
         // The refused table — the strongest one, or a non-leading one that
         // holds kept endpoints: its endpoints are all in the omission
@@ -1957,8 +2924,63 @@ fn merge(
         // first pass spilled before the refusal would be counted again on
         // the retry — a double spill alongside the omission.
         let spill_baseline = uncorroborated_candidates;
+        // PA-5 C1 plus the operator-named exception: late-start whole
+        // first; on whole failure a prefix-allowed closure retries as a K4
+        // prefix, then (or directly, when the prefix is blocked or admits
+        // nothing) as published-tables-only. An operator-named mid-capture
+        // closure starts at the prefix attempt and retries published-only;
+        // other mid-capture closures start published-only and never retry.
+        let mut use_prefix_fallback =
+            is_detailed_closure && !closure_late_start && closure_prefix_allowed;
+        let mut use_published_fallback = false;
+        // JK-22a: a shared-scope Detailed ordinary provider refused whole
+        // retries as its leading-tables prefix (the same strongest-first
+        // per-table path a named scope admits by) under its unchanged
+        // reserve-aware budget. Operator (manifest) modules stay whole —
+        // operator-attested targets are admitted whole or refused whole —
+        // and Inventory/Counters/broad keep their complete-union whole.
+        let provider_prefix_allowed = matches!(admission_policy, AdmissionPolicy::Detailed)
+            && shared
+            && !broad_admit
+            && matches!(
+                class,
+                AdmissionClass::Corroborated | AdmissionClass::Heuristic
+            );
+        let mut use_provider_prefix_fallback = false;
+        // Set when this pass refuses an unpublished closure limited to its
+        // published tables: no capacity check failed, so the refusal states
+        // no demand and leaves a named capture free to start.
+        let mut awaiting_publication;
         let outcome = 'admission: loop {
+            awaiting_publication = false;
+            let published_only = closure_published_only_first || use_published_fallback;
+            let whole = if published_only
+                || (closure_prefix_allowed && use_prefix_fallback)
+                || use_provider_prefix_fallback
+            {
+                false
+            } else {
+                whole_original
+            };
             let kept_only = refused_growth.is_some();
+            // A closure prefix never takes the reserve's slots, so at least
+            // the reserve stays free and one later standard function list
+            // (at most 104 entries) always fits (M4: whole respects the cap
+            // too); a second later provider may be refused by name. The published-only retry uses the full
+            // budget: corroborated tables are not held out of the reserve.
+            let budget = if published_only {
+                GroupBudget {
+                    policy: admission_policy,
+                    ceiling: capacity,
+                }
+            } else if closure_prefix_allowed && use_prefix_fallback {
+                GroupBudget {
+                    policy: admission_policy,
+                    ceiling: budget.ceiling.min(capacity.saturating_sub(reserve)),
+                }
+            } else {
+                budget
+            };
             let admissible = |key: &AttachKey| !kept_only || kept.contains(key);
             let refused: BTreeSet<AttachKey> = 'refused: {
                 // Manifest targets are operator-authoritative: admitted whole, and the
@@ -1993,8 +3015,10 @@ fn merge(
                 // scan-only capture of never-called legacy providers keeps working.
                 // One object seen from several views decodes the same tables
                 // repeatedly: distinct tables admit once, scored by the strongest
-                // instance, so linkage observed from any view counts.
-                let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize)> = BTreeMap::new();
+                // instance. Publication is retained independently: a weaker
+                // opaque observation must survive a stronger unobserved view.
+                let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize, bool)> =
+                    BTreeMap::new();
                 let mut sequence = 0usize;
                 for (piece, module) in group.iter().enumerate() {
                     let Some(evidence) = &module.scan_evidence else {
@@ -2016,24 +3040,34 @@ fn merge(
                             &evidence.exports,
                         );
                         let key = table_key(piece, index, &evidence.tables[index]);
+                        let observed =
+                            table_observation_authorized(&evidence.tables[index], &score);
                         distinct
                             .entry(key)
-                            .and_modify(|slot| slot.0 = slot.0.max(score))
+                            .and_modify(|slot| {
+                                slot.0 = slot.0.max(score);
+                                slot.2 |= observed;
+                            })
                             .or_insert_with(|| {
-                                let slot = (score, sequence);
+                                let slot = (score, sequence, observed);
                                 sequence += 1;
                                 slot
                             });
                     }
                 }
-                let mut ordered: Vec<(TableKey, TableEvidenceScore, usize)> = distinct
+                let mut ordered: Vec<(TableKey, TableEvidenceScore, usize, bool)> = distinct
                     .into_iter()
-                    .map(|(key, (score, sequence))| (key, score, sequence))
+                    .map(|(key, (score, sequence, observed))| (key, score, sequence, observed))
                     .collect();
-                // Strongest evidence first; ties keep first-seen order, so scoring
-                // never reorders what it cannot distinguish.
-                ordered
-                    .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+                // Actual observations precede heuristics even when their API
+                // names are uncertain. Remaining ties retain evidence order.
+                ordered.sort_by(|left, right| {
+                    right
+                        .3
+                        .cmp(&left.3)
+                        .then_with(|| right.1.cmp(&left.1))
+                        .then_with(|| left.2.cmp(&right.2))
+                });
                 // Every scan target of this group, by distinct table, for marginal
                 // budget accounting across views of one object.
                 let mut keys_of: BTreeMap<TableKey, BTreeSet<AttachKey>> = BTreeMap::new();
@@ -2075,13 +3109,12 @@ fn merge(
                                 .collect()
                         })
                 };
-                let is_published = table_name_authorized;
                 // All-or-nothing refusal survives only here: when even the strongest
                 // table exceeds the remaining global budget, the module — scan and
                 // manifest parts alike — is refused whole (or, with endpoints to keep,
                 // kept on them alone, above). A manifest subset must not reattach an
                 // oversized scan as a prefix.
-                if let Some((top, _, _)) = ordered.first() {
+                if let Some((top, _, _, _)) = ordered.first() {
                     let top_fresh: BTreeSet<AttachKey> = keys_of
                         .get(top)
                         .map(|keys| keys.iter().filter(|key| is_fresh(key)).copied().collect())
@@ -2103,8 +3136,8 @@ fn merge(
                 let mut admitted: BTreeSet<TableKey> = BTreeSet::new();
                 let published: Vec<TableKey> = ordered
                     .iter()
-                    .filter(|(_, score, _)| is_published(score))
-                    .map(|(key, _, _)| *key)
+                    .filter(|(_, _, _, observed)| *observed)
+                    .map(|(key, _, _, _)| *key)
                     .collect();
                 let mut published_union = fresh.clone();
                 for key in &published {
@@ -2133,9 +3166,15 @@ fn merge(
                 // promise (spill is informational, never PARTIAL), so broad never
                 // spills — it refuses, loudly, with the same shape. Empty tables cost
                 // nothing either way and admit, never spilling.
+                // Part 0: prefix fallback reports its covered templates; whole
+                // admission and provider K4 spill report nothing here. The
+                // JK-22a provider fallback reports its attached endpoints
+                // beside its needed endpoints instead.
+                let mut closure_prefix: Option<(usize, usize)> = None;
+                let mut provider_prefix: Option<(usize, usize)> = None;
                 if whole {
                     let mut scan_union = fresh.clone();
-                    for (key, _, _) in &ordered {
+                    for (key, _, _, _) in &ordered {
                         if let Some(keys) = keys_of.get(key) {
                             scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
                         }
@@ -2147,12 +3186,12 @@ fn merge(
                         break 'refused scan_union;
                     }
                     fresh = scan_union;
-                    admitted.extend(ordered.iter().map(|(key, _, _)| *key));
+                    admitted.extend(ordered.iter().map(|(key, _, _, _)| *key));
                 } else {
                     let mut heuristic_admitted = 0usize;
                     let mut spent = false;
-                    for (key, score, _) in &ordered {
-                        if is_published(score) {
+                    for (key, _, _, observed) in &ordered {
+                        if *observed {
                             continue;
                         }
                         // A heuristic table with no attachable target costs nothing either
@@ -2160,6 +3199,23 @@ fn merge(
                         // the refused strongest table of a growth, whose endpoints the
                         // omission record already reports.
                         if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
+                            if refused_top != Some(*key) {
+                                uncorroborated_candidates += 1;
+                            }
+                            continue;
+                        }
+                        // Published-only admits no new heuristic table: every
+                        // template spills as uncorroborated evidence, never
+                        // slots — except a table holding kept endpoints,
+                        // which routes to the kept-only retry (G-03) like any
+                        // other kept table. Kept-only retries skip this block
+                        // and preserve kept tables through the normal logic
+                        // below.
+                        if published_only && !kept_only {
+                            if let Some(demand) = kept_demand(key) {
+                                refused_top = Some(*key);
+                                break 'refused demand;
+                            }
                             if refused_top != Some(*key) {
                                 uncorroborated_candidates += 1;
                             }
@@ -2227,34 +3283,154 @@ fn merge(
                         admitted.insert(*key);
                         heuristic_admitted += 1;
                     }
+                    // PA-5 I4+M1: a prefix fallback that attaches nothing falls
+                    // through to the whole refusal below, never a "0 of M"
+                    // partial and never a panic. M counts every distinct
+                    // table, published and heuristic alike.
+                    if use_prefix_fallback && !published_only {
+                        if admitted.is_empty() {
+                            let full_union: BTreeSet<AttachKey> = keys_of
+                                .values()
+                                .flat_map(|keys| keys.iter().filter(|key| is_fresh(key)).copied())
+                                .collect();
+                            break 'refused full_union;
+                        }
+                        closure_prefix = Some((admitted.len(), ordered.len()));
+                    }
+                    // JK-22a: a provider fallback that attaches nothing falls
+                    // through to the whole refusal below — the strongest
+                    // table did not fit — never a "0 of N" partial. Tables
+                    // vary in size, so the record counts endpoints.
+                    if use_provider_prefix_fallback {
+                        if fresh.is_empty() {
+                            let full_union: BTreeSet<AttachKey> = keys_of
+                                .values()
+                                .flat_map(|keys| keys.iter().filter(|key| is_fresh(key)).copied())
+                                .collect();
+                            break 'refused full_union;
+                        }
+                        let mut needed = fresh.clone();
+                        for keys in keys_of.values() {
+                            needed.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                        }
+                        provider_prefix = Some((fresh.len(), needed.len()));
+                    }
+                    // A published-only pass that admits nothing (no published
+                    // tables) is a whole refusal, never an empty admission:
+                    // the heuristic set stays refused whole with its demand.
+                    if published_only && admitted.is_empty() {
+                        // Published-only from the start (never a fallback
+                        // after a failed whole or prefix) and unnamed: every
+                        // capacity check above passed, so nothing published
+                        // is the only reason. A named closure lands here
+                        // only when a loss ahead blocked its prefix, which
+                        // keeps the refusal it had.
+                        awaiting_publication = closure_published_only_first && !closure_named;
+                        let full_union: BTreeSet<AttachKey> = keys_of
+                            .values()
+                            .flat_map(|keys| keys.iter().filter(|key| is_fresh(key)).copied())
+                            .collect();
+                        break 'refused full_union;
+                    }
                 }
-                break 'admission Ok((fresh, admitted));
+                break 'admission Ok((fresh, admitted, closure_prefix, provider_prefix));
             };
             // Over `kept` alone nothing is fresh, so only the first pass
             // refuses; were that ever broken, the module is refused whole
             // rather than retried.
             debug_assert!(!kept_only, "kept endpoints alone need no new slot");
+            // A whole-union policy refuses the group's complete fresh demand,
+            // even when its manifest or strongest table failed first. Scan
+            // targets without a valid table never enter that admission union.
+            // A provider-prefix pass that refuses falls through to the whole
+            // refusal below, so it reports the same complete demand.
+            let refused = if whole || use_provider_prefix_fallback {
+                group
+                    .iter()
+                    .flat_map(|module| {
+                        module.targets.iter().filter(move |target| {
+                            module.scan_evidence.as_ref().is_none_or(|evidence| {
+                                target
+                                    .table
+                                    .is_some_and(|index| evidence.tables.get(index).is_some())
+                            })
+                        })
+                    })
+                    .map(|target| AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    })
+                    .filter(|key| !claimed.contains(key) && !existing_slots.contains_key(key))
+                    .collect()
+            } else {
+                refused
+            };
             if !kept_only && !kept.is_empty() {
                 refused_growth = Some(refused);
                 uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
+            // PA-5 C1 plus the operator-named exception, in every scope
+            // since JK-22a: a late-start Detailed closure with nothing to
+            // keep retries whole, then prefix (when allowed), then
+            // published-only; an operator-named mid-capture closure retries
+            // its prefix as published-only. Prefix and whole never spill, so
+            // the baseline resets are exact. Prefix-blocked and unnamed
+            // mid-capture closures never retry.
+            if is_detailed_closure && kept.is_empty() && (closure_late_start || use_prefix_fallback)
+            {
+                if closure_prefix_allowed && !use_prefix_fallback && !use_published_fallback {
+                    use_prefix_fallback = true;
+                    uncorroborated_candidates = spill_baseline;
+                    refused_top = None;
+                    continue 'admission;
+                }
+                if !use_published_fallback {
+                    use_published_fallback = true;
+                    uncorroborated_candidates = spill_baseline;
+                    refused_top = None;
+                    continue 'admission;
+                }
+            }
+            // JK-22a: a shared-scope ordinary provider with nothing to keep
+            // retries whole, then its leading-tables prefix; a prefix that
+            // attaches nothing falls through to the whole refusal below, so
+            // whole refusal stays exactly for a provider whose strongest
+            // table does not fit within its reserve-aware budget, or whose
+            // corroborated (published) tables together do not fit (the
+            // published-union check above runs in both passes). Prefix and
+            // whole never spill, so the baseline reset is exact.
+            if provider_prefix_allowed && kept.is_empty() && !use_provider_prefix_fallback {
+                use_provider_prefix_fallback = true;
+                uncorroborated_candidates = spill_baseline;
+                refused_top = None;
+                continue 'admission;
+            }
             break 'admission Err(refused);
         };
-        let (fresh, admitted) = match outcome {
+        let (fresh, admitted, closure_prefix, provider_prefix) = match outcome {
             Ok(admission) => admission,
             Err(refused) => {
+                if class != AdmissionClass::ClosureArray {
+                    provider_refused = true;
+                }
                 holding.remove(&object);
                 let refusal = CapacityRefusal {
+                    policy: admission_policy,
                     needed: refused.len(),
                     capacity,
                     in_use: allocated_slots,
                     retired,
                     holders: slot_holders(&holding, &paths),
                     reserve: reserved.then_some(reserve),
-                    closure_tables: (shared && class == AdmissionClass::ClosureArray)
-                        .then_some(table_count),
+                    closure_tables: (class == AdmissionClass::ClosureArray).then_some(table_count),
                     aim_hint: shared,
+                    naming_hint: is_detailed_closure
+                        && !shared
+                        && !closure_late_start
+                        && !closure_named,
+                    counter_hint,
+                    unpublished: awaiting_publication,
                 };
                 decisions[position] = Some(AdmissionDecision::Refused(Skipped {
                     subject: path.to_string(),
@@ -2263,6 +3439,24 @@ fn merge(
                 continue;
             }
         };
+        // PA-5 M3: a provider growth omission blocks the closure prefix
+        // below — a prefix never hides a loss. Zero-demand preservation
+        // (no record) does not block. A JK-22a provider prefix does not
+        // block either: its remainder is a named partial gap beside the
+        // closure's, and closures decide last, so providers already claimed
+        // room first.
+        if class != AdmissionClass::ClosureArray
+            && let Some(demand) = &refused_growth
+            && !demand.is_empty()
+        {
+            provider_omitted = true;
+        }
+        if allocated.first_plan.is_none()
+            && class != AdmissionClass::ClosureArray
+            && kept.len() + fresh.len() > 0
+        {
+            first_plan_had_provider = true;
+        }
         allocated_slots = admission_policy
             .checked_required(allocated_slots, fresh.len())
             .expect("admitted target union was checked before allocation");
@@ -2273,6 +3467,8 @@ fn merge(
             refused_growth,
             kept,
             allocated_slots,
+            closure_prefix,
+            provider_prefix,
         });
     }
 
@@ -2285,13 +3481,14 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
-    for (group, decision) in groups.into_iter().zip(decisions) {
+    for (position, (group, decision)) in groups.into_iter().zip(decisions).enumerate() {
         let key = group[0].key;
         let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
+        let (class, _) = classes[position];
         entries_seen += decoded_occurrence_count(&group);
-        let (admitted, refused_growth, kept, allocated_slots) =
+        let (admitted, refused_growth, kept, allocated_slots, closure_prefix, provider_prefix) =
             match decision.expect("merge decides every module before building it") {
                 AdmissionDecision::Refused(refusal) => {
                     refused_module_objects.push((object, refusal.clone()));
@@ -2303,8 +3500,56 @@ fn merge(
                     refused_growth,
                     kept,
                     allocated_slots,
-                } => (admitted, refused_growth, kept, allocated_slots),
+                    closure_prefix,
+                    provider_prefix,
+                } => (
+                    admitted,
+                    refused_growth,
+                    kept,
+                    allocated_slots,
+                    closure_prefix,
+                    provider_prefix,
+                ),
             };
+        // Part 0: a prefix-admitted closure names its covered templates.
+        // The module is admitted (its prefix counts), but calls through the
+        // other templates are not observed — a partial gap, never silent.
+        // The `closure_prefix` name travels in the reason so JSON carries it;
+        // it is appended, so start-anchored `N of M` readers still match.
+        if let Some((covered, total)) = closure_prefix {
+            let prefix = Skipped {
+                subject: path.to_string(),
+                reason: format!(
+                    "{covered} of {total} template tables attached; calls through the others are not counted (closure_prefix)"
+                ),
+            };
+            refused_module_objects.push((object, prefix.clone()));
+            modules_skipped.push(prefix);
+        }
+        // JK-22a: a prefix-admitted provider names its attached endpoints
+        // beside its needed endpoints. The module is admitted (its prefix
+        // counts), but calls through the other endpoints are not observed —
+        // a partial gap, never silent. The reserve clause travels with the
+        // record when the module was held out of the reserve, as in a whole
+        // refusal; the `provider_prefix` name is appended, like
+        // `closure_prefix` above.
+        if let Some((attached, needed)) = provider_prefix {
+            let mut reason = format!(
+                "{attached} of {needed} endpoints attached; calls through the others are not counted"
+            );
+            if shared && class.leaves_reserve() {
+                reason.push_str(&format!(
+                    "; {reserve} are reserved for providers with a corroborated function table"
+                ));
+            }
+            reason.push_str(" (provider_prefix)");
+            let prefix = Skipped {
+                subject: path.to_string(),
+                reason,
+            };
+            refused_module_objects.push((object, prefix.clone()));
+            modules_skipped.push(prefix);
+        }
         // Per scan piece, per table index: admitted above. Manifest pieces
         // carry `None` and admit every target.
         let admitted_instance: Vec<Option<Vec<bool>>> = group
@@ -2421,7 +3666,7 @@ fn merge(
             }
             let summary = &mut modules[id.0 as usize];
             if summary.source != module.source {
-                summary.source = "scan+manifest";
+                summary.source = join_source(summary.source, module.source);
             }
             let mut module_tables = Vec::new();
             for table in module.tables {
@@ -2482,15 +3727,24 @@ fn merge(
             // snapshot stays COMPLETE. Non-empty demand always leaves the
             // total non-empty, so explicit refusals are unchanged.
             if !omitted.is_empty() {
+                // PA-5 M5: the holder list names what holds the room the
+                // growth needed — never the omitted module's own kept
+                // endpoints.
+                let mut holders_map = holding.clone();
+                holders_map.remove(&object);
                 let omission = Skipped {
                     subject: path.to_string(),
-                    reason: growth_omission_reason(
-                        omitted.len(),
+                    reason: growth_omission_reason(&GrowthOmission {
+                        omitted: omitted.len(),
                         capacity,
-                        allocated_slots,
+                        in_use: allocated_slots,
                         retired,
-                        kept_attached.len(),
-                    ),
+                        kept: kept_attached.len(),
+                        policy: admission_policy,
+                        holders: &slot_holders(&holders_map, &paths),
+                        provider_remedies: class != AdmissionClass::ClosureArray,
+                        counter_hint,
+                    }),
                 };
                 refused_module_objects.push((object, omission.clone()));
                 modules_skipped.push(omission);
@@ -2554,6 +3808,11 @@ fn merge(
     plan.vendor_interfaces = vendor_interfaces;
     plan.interface_list = interface_list;
     plan.admission_scope = admission_scope;
+    plan.first_plan_objects = match allocated.first_plan {
+        Some(first) => first.clone(),
+        None => paths.keys().copied().collect(),
+    };
+    plan.first_plan_had_provider = first_plan_had_provider;
     plan
 }
 
@@ -2567,10 +3826,13 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
+            first_plan: None,
+            first_plan_had_provider: false,
         },
         false,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     )
 }
 
@@ -2598,30 +3860,60 @@ pub fn build_from_sources_broad(
     build_from_sources_with_policy(
         scanned,
         manifests,
+        &[],
         pinned,
         broad_admit,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     )
 }
 
 /// Builds the initial detailed plan of a capture under `admission_scope`,
 /// which every live rebuild of it keeps. `broad_admit` is the Task 1.6
-/// experiment, as for [`build_from_sources_broad`].
+/// experiment, as for [`build_from_sources_broad`]. `counter_hint` names
+/// `--counter-mode counts` in provider-refusal reasons; only the engine's
+/// metrics-capture pass sets this, every other caller keeps `false`.
 pub fn build_from_sources_scoped(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     pinned: &PinnedObjects,
     broad_admit: bool,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
+) -> AttachPlan {
+    build_from_sources_scoped_with_prearm(
+        scanned,
+        manifests,
+        &[],
+        pinned,
+        broad_admit,
+        admission_scope,
+        counter_hint,
+    )
+}
+
+/// [`build_from_sources_scoped`] plus resolved `--prearm-module` pieces
+/// (packet 6.13). Pre-arm pieces lower like manifest pieces under the
+/// unchanged admission caps; an empty slice builds exactly the old plan.
+pub fn build_from_sources_scoped_with_prearm(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+    broad_admit: bool,
+    admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     build_from_sources_with_policy(
         scanned,
         manifests,
+        prearm,
         pinned,
         broad_admit,
         AdmissionPolicy::detailed(),
         admission_scope,
+        counter_hint,
     )
 }
 
@@ -2636,10 +3928,12 @@ pub fn build_from_sources_for_policy(
     build_from_sources_with_policy(
         scanned,
         manifests,
+        &[],
         pinned,
         false,
         admission_policy,
         AdmissionScope::Named,
+        false,
     )
 }
 
@@ -2657,39 +3951,237 @@ pub fn build_from_sources_for_policy_scoped(
     build_from_sources_with_policy(
         scanned,
         manifests,
+        &[],
         pinned,
         false,
         admission_policy,
         admission_scope,
+        false,
     )
 }
 
+/// [`build_from_sources_for_policy_scoped`] plus resolved `--prearm-module`
+/// pieces: the inventory lane lowers proved pre-arm offsets under its own
+/// policy through the same merge, so admission caps and the
+/// count-only-unless-manifest-authorized rule are unchanged. An empty slice
+/// builds exactly the old plan.
+pub fn build_from_sources_for_policy_scoped_with_prearm(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+    admission_policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
+) -> AttachPlan {
+    build_from_sources_with_policy(
+        scanned,
+        manifests,
+        prearm,
+        pinned,
+        false,
+        admission_policy,
+        admission_scope,
+        false,
+    )
+}
+
+/// Complete target requirements before table/slot admission. These are negative
+/// completeness and ambiguity facts, never permission to read arguments.
+pub(crate) struct SemanticSourceClaims {
+    pub(crate) providers: BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
+    pub(crate) degraded: BTreeSet<AttachKey>,
+    pub(crate) incomplete: BTreeSet<PinnedObjectId>,
+}
+
+pub(crate) fn semantic_source_claims(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+) -> SemanticSourceClaims {
+    let affecting = |name: &str| {
+        crate::kinds::descriptor(name)
+            .is_none_or(|descriptor| descriptor != SlotSemantics::COUNT_ONLY)
+    };
+    let mut incomplete: BTreeSet<_> = scanned
+        .iter()
+        .filter(|module| {
+            // The same witness `lower_scanned` publishes by, so semantic
+            // completeness and the reported walk never disagree about one
+            // table.
+            let exports = ObjectExports {
+                object: module.scanned.key,
+                symbols: &module.exports,
+                getter_present: module.getter_present,
+                witness_fault: module.witness_fault,
+            };
+            module
+                .scanned
+                .tables
+                .iter()
+                .enumerate()
+                .any(|(index, table)| {
+                    let walk = published_walk(
+                        index,
+                        &module.scanned.tables,
+                        &module.scanned.interfaces,
+                        &exports,
+                    );
+                    walk != "full" || table.unpinned.iter().any(|entry| affecting(&entry.subject))
+                })
+        })
+        .map(|module| module.object)
+        .collect();
+    let mut pieces: Vec<_> = scanned.iter().map(lower_scanned).collect();
+    let mut selection_claims = Vec::new();
+    for manifest in manifests {
+        let (piece, _) = lower_manifest(
+            manifest,
+            |key, path| pinned.id_for_manifest(key, path),
+            // A retained target rejected by ordinary ABI admission still
+            // belongs to the complete demand; omitting it cannot certify a prefix.
+            |_, _| true,
+        );
+        if let Some(piece) = &piece {
+            if manifest.surfaces.iter().any(|surface| {
+                (matches!(surface.acquisition, Acquisition::Ok)
+                    && !crate::manifest_input::surface_function_inventory_complete(surface))
+                    || surface.functions.iter().any(|function| {
+                        affecting(&function.name)
+                            && !matches!(
+                                function.resolution,
+                                Resolution::Resolved { .. } | Resolution::NullPointer
+                            )
+                    })
+            }) {
+                // Only typed null/absent entries prove optional absence.
+                // A successfully acquired undecoded table is incomplete;
+                // diagnostic strings cannot stand in for either fact.
+                incomplete.insert(piece.object);
+            }
+            if manifest.selection_evidence.tables.iter().any(|table| {
+                crate::manifest_input::selection_table_inventory_incomplete(
+                    &manifest.selection_evidence,
+                    table,
+                )
+            }) {
+                incomplete.insert(piece.object);
+            }
+            for (table_id, targets) in
+                crate::discovery::engine::manifest_selection_targets(manifest, pinned)
+            {
+                if manifest
+                    .selection_evidence
+                    .tables
+                    .iter()
+                    .find(|table| table.id == table_id)
+                    .is_some_and(|table| {
+                        table
+                            .functions
+                            .iter()
+                            .filter(|function| {
+                                matches!(function.resolution, Resolution::Resolved { .. })
+                            })
+                            .count()
+                            != targets.len()
+                    })
+                {
+                    incomplete.insert(piece.object);
+                }
+                selection_claims.extend(targets.into_iter().map(|target| (piece.object, target)));
+            }
+        }
+        pieces.extend(piece);
+    }
+    let mut providers = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut owners = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut names = BTreeMap::<_, BTreeMap<String, bool>>::new();
+    for piece in pieces {
+        for target in piece.targets {
+            let key = AttachKey {
+                object: target.object,
+                file_offset: target.file_offset,
+            };
+            providers.entry(piece.object).or_default().insert(key);
+            owners.entry(key).or_default().insert(piece.object);
+            let claims = names.entry(key).or_default();
+            for name in std::iter::once(presented_name(target.name_authorized, target.name))
+                .chain(target.aliases)
+            {
+                claims
+                    .entry(name.to_owned())
+                    .and_modify(|attested| *attested |= target.semantic_authorized)
+                    .or_insert(target.semantic_authorized);
+            }
+        }
+    }
+    let mut selection_keys = BTreeSet::new();
+    for (provider, target) in selection_claims {
+        let key = AttachKey {
+            object: target.object,
+            file_offset: target.file_offset,
+        };
+        providers.entry(provider).or_default().insert(key);
+        owners.entry(key).or_default().insert(provider);
+        names
+            .entry(key)
+            .or_default()
+            .entry(target.name.to_owned())
+            .or_insert(false);
+        // Selection-only input grants no semantic authority, even when a
+        // target also has a trusted name. Keep that negative claim before
+        // provider selection/admission can hide it.
+        selection_keys.insert(key);
+    }
+    let degraded = names
+        .into_iter()
+        .filter_map(|(key, mut names)| {
+            if names.len() > 1 {
+                names.remove(UNKNOWN_FUNCTION_NAME);
+            }
+            let labels = names.keys().cloned().collect::<Vec<_>>();
+            (selection_keys.contains(&key)
+                || owners[&key].len() > 1
+                || names.values().any(|attested| !attested)
+                || crate::kinds::descriptor_index(&labels).1)
+                .then_some(key)
+        })
+        .collect();
+    SemanticSourceClaims {
+        providers,
+        degraded,
+        incomplete,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_from_sources_with_policy(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
     pinned: &PinnedObjects,
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
+    let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
     let mut plan = build_from_sources_with(
         scanned,
         manifests,
-        |key, path| pinned.id_for_manifest(key, path),
-        |provider, target| {
-            matches!(
-                (pinned.abi_for(provider), pinned.abi_for(target)),
-                (Some(provider), Some(target)) if provider == target
-            )
-        },
+        prearm,
+        pinned_id,
+        compatible,
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
+            first_plan: None,
+            first_plan_had_provider: false,
         },
         broad_admit,
         admission_policy,
         admission_scope,
+        counter_hint,
     );
     plan.note_object_identities(pinned);
     plan
@@ -2704,18 +4196,49 @@ struct ExistingAllocation<'a> {
     /// `active`, under the object of each module that currently owns a
     /// target: a module listed here is already admitted (G-03).
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
+    /// Objects in the capture's first plan input (`None` for an initial
+    /// build, whose input IS the first plan). A closure array gets its
+    /// heuristic prefix only when its object is here (PA-5 C1).
+    first_plan: Option<&'a BTreeSet<PinnedObjectId>>,
+    /// Whether the capture's first plan admitted a non-closure provider
+    /// onto a slot (PA-9/C1). Read only when `first_plan` is `Some`; an
+    /// initial build sets it as its providers are admitted instead.
+    first_plan_had_provider: bool,
+}
+
+/// The standard manifest lookups over live pins: manifest keys resolve to
+/// pinned objects, and a retained target is admitted only under the
+/// provider's own ABI. Shared by the build paths and the conservative plan
+/// cursor so manifest keys cannot resolve differently between them.
+fn pinned_manifest_lookups(
+    pinned: &PinnedObjects,
+) -> (
+    impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId> + '_,
+    impl FnMut(PinnedObjectId, PinnedObjectId) -> bool + '_,
+) {
+    (
+        |key, path| pinned.id_for_manifest(key, path),
+        |provider, target| {
+            matches!(
+                (pinned.abi_for(provider), pinned.abi_for(target)),
+                (Some(provider), Some(target)) if provider == target
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_from_sources_with(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
     allocated: ExistingAllocation<'_>,
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
@@ -2724,6 +4247,10 @@ fn build_from_sources_with(
         discovered.extend(module);
         orphaned.extend(skipped);
     }
+    // Pre-arm pieces arrive resolved against the current pin set (the
+    // engine resolves fresh before each build, so a retired object simply
+    // has no piece here).
+    discovered.extend(prearm.iter().map(lower_prearm));
     // The scan never calls the provider, so it contributes no C_GetInterfaceList
     // enumeration and leaves nothing present-but-undecoded: every interface it
     // records names a table it decoded. Only a manifest can report either.
@@ -2738,6 +4265,7 @@ fn build_from_sources_with(
         broad_admit,
         admission_policy,
         admission_scope,
+        counter_hint,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -2757,16 +4285,20 @@ fn build_from_test_sources_with_policy(
     build_from_sources_with(
         scanned,
         manifests,
+        &[],
         |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
         |_, _| true,
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
+            first_plan: None,
+            first_plan_had_provider: false,
         },
         false,
         admission_policy,
         AdmissionScope::Named,
+        false,
     )
 }
 
@@ -2782,6 +4314,20 @@ fn presented_name(authorized: bool, name: &str) -> &str {
     }
 }
 
+/// The lowered target rows of one scanned table: each decoded entry with the
+/// object it attaches into. Shared by [`lower_scanned`] and the conservative
+/// plan cursor, so the cursor's live-key set is enumerated by the same row
+/// function merge uses and cannot drift from it.
+fn scanned_table_rows(
+    module: &ReconciledModule,
+    table: usize,
+) -> impl Iterator<Item = (&ScannedEntry, PinnedObjectId)> + '_ {
+    module.scanned.tables[table]
+        .entries
+        .iter()
+        .zip(module.entry_objects[table].iter().copied())
+}
+
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
@@ -2789,6 +4335,8 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let exports = ObjectExports {
         object: scanned.key,
         symbols: &module.exports,
+        getter_present: module.getter_present,
+        witness_fault: module.witness_fault,
     };
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
@@ -2827,12 +4375,19 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
             linkage: table_linkage(&score),
             exports_agreeing: Some(export_agreement(table, &exports).agreeing),
         });
+        // A 68-slot prefix proven to be the complete reachable surface
+        // reports a full walk: every function a conforming caller can
+        // reach was walked. The source still names the declared 3.x
+        // version, so the mislabelling quirk stays visible. A table an
+        // interface record links keeps the raw decoder walk: one table
+        // never publishes both `full` and `known_prefix`.
+        let walk = published_walk(index, &scanned.tables, &scanned.interfaces, &exports);
         surfaces.push(SurfaceSummary {
             source: format!(
                 "{} table {}.{}",
                 scanned.path, table.version.0, table.version.1
             ),
-            walk: table.walk.to_string(),
+            walk: walk.to_string(),
             // The bytes were read straight out of the target's mapping.
             acquisition: "ok".into(),
             functions: published,
@@ -2849,10 +4404,10 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                     functions: published,
                 }),
         );
-        targets.extend(table.entries.iter().zip(&module.entry_objects[index]).map(
-            |(entry, object)| Target {
+        targets.extend(
+            scanned_table_rows(module, index).map(|(entry, object)| Target {
                 name: entry.name,
-                object: *object,
+                object,
                 object_path: &entry.object_path,
                 file_offset: entry.file_offset,
                 fork_safe,
@@ -2868,8 +4423,8 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 } else {
                     Vec::new()
                 },
-            },
-        ));
+            }),
+        );
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
             subject: presented_name(authorized, name).to_string(),
             reason: "null pointer".into(),
@@ -2885,6 +4440,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         object: module.object,
         key: scanned.key,
         path: &scanned.path,
+        module_named: module.scanned.module_hint.is_some(),
         source: "scan",
         tables,
         interfaces: scanned.interfaces.len(),
@@ -2959,10 +4515,13 @@ fn build(m: &Manifest) -> AttachPlan {
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
+            first_plan: None,
+            first_plan_had_provider: false,
         },
         false,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -2982,7 +4541,7 @@ fn lower_manifest(
     for surface in &m.surfaces {
         surfaces.push(SurfaceSummary {
             source: source_label(&surface.source),
-            walk: walk_label(&surface.walk),
+            walk: crate::manifest_input::effective_surface_walk(surface),
             acquisition: acquisition_label(&surface.acquisition),
             functions: surface.functions.len(),
         });
@@ -3084,6 +4643,52 @@ fn lower_manifest(
         return (None, skipped);
     };
 
+    // Selection activation remains a separate count-only path. Keep its
+    // observation and target-admission gaps visible in the ordinary summary.
+    let mut selection_gaps = Vec::new();
+    for table in &m.selection_evidence.tables {
+        if crate::manifest_input::selection_table_inventory_incomplete(&m.selection_evidence, table)
+        {
+            selection_gaps.push(Skipped {
+                subject: format!("selection table {}", table.id),
+                reason: format!(
+                    "partial function inventory; {} words observed",
+                    table.functions.len()
+                ),
+            });
+        }
+        for (ordinal, function) in table.functions.iter().enumerate() {
+            let reason = match &function.resolution {
+                Resolution::Resolved { object, .. } => {
+                    match m.objects.iter().find(|record| record.id == *object) {
+                        None => Some(format!("object id {object} missing from manifest")),
+                        Some(record) => match object_key(m, record)
+                            .and_then(|key| pinned_id(key, &record.path))
+                        {
+                            None => Some(format!(
+                                "object id {object} has no comparable pinned identity"
+                            )),
+                            Some(target) if !compatible(module_object, target) => Some(format!(
+                                "object id {object} has a different target ABI from the provider"
+                            )),
+                            Some(_) => None,
+                        },
+                    }
+                }
+                Resolution::NullPointer => None,
+                Resolution::NonFileBacked => Some("non-file-backed".into()),
+                Resolution::Unmapped => Some("unmapped".into()),
+                Resolution::UnusableFile { reason, .. } => Some(reason.clone()),
+            };
+            if let Some(reason) = reason {
+                selection_gaps.push(Skipped {
+                    subject: format!("selection table {} ordinal {ordinal}", table.id),
+                    reason,
+                });
+            }
+        }
+    }
+
     (
         Some(Discovered {
             object: module_object,
@@ -3091,6 +4696,7 @@ fn lower_manifest(
             // resolved into, which for a forwarded entry is a dependency, not this.
             key,
             path: &m.module_path,
+            module_named: false,
             source: "manifest",
             tables,
             interfaces: m
@@ -3104,7 +4710,2066 @@ fn lower_manifest(
             skipped,
             scan_evidence: None,
         }),
-        Vec::new(),
+        selection_gaps,
+    )
+}
+
+/// Lowers one resolved `--prearm-module` piece (packet 6.13, R2-D1-1/2).
+/// Operator-side like a manifest piece (`scan_evidence: None`: admitted
+/// whole under the unchanged caps), but with no tables, no interfaces and
+/// no surfaces — a pre-arm input proves offsets, never tables. Targets
+/// carry file-derived names, so they read operator-side like manifest
+/// names; file selection is not attestation, so they stay count-only
+/// unless an independently accepted manifest authorizes the same slot.
+/// `fork_safe` stays false because no standard interface exposes them.
+fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, file_offset) in &piece.proved {
+        targets.push(Target {
+            name,
+            object: piece.object,
+            object_path: &piece.path,
+            file_offset: *file_offset,
+            fork_safe: false,
+            semantic_authorized: false,
+            name_authorized: true,
+            table: None,
+            ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
+                table_file_offset: None,
+                ordinal,
+            }),
+            aliases: Vec::new(),
+        });
+    }
+    for (name, file_offset) in &piece.non_executable {
+        skipped.push(Skipped {
+            subject: name.clone(),
+            reason: format!(
+                "{name}+{file_offset:#x} is outside every executable ELF segment; \
+                 pre-arm attaches it only after ordinary scan corroboration"
+            ),
+        });
+    }
+    Discovered {
+        object: piece.object,
+        key: piece.key,
+        path: &piece.path,
+        module_named: false,
+        source: "prearm",
+        tables: Vec::new(),
+        interfaces: 0,
+        surfaces: Vec::new(),
+        entries_seen: targets.len() + skipped.len(),
+        targets,
+        skipped,
+        scan_evidence: None,
+    }
+}
+
+/// Operator-declared attach keys per module object (packet 6.13, R2-D1-2/4):
+/// manifest-claimed targets plus pre-arm export-proved targets, grouped by
+/// the publishing module's object. Scan-decoded targets are never declared:
+/// unproved functions attach only after ordinary scan corroboration. The
+/// engine freezes this map's pre-arm entries as each watch's declared
+/// endpoint set; an empty set means `unavailable`, never armed.
+pub(crate) fn operator_target_keys(
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+) -> BTreeMap<PinnedObjectId, BTreeSet<AttachKey>> {
+    let (mut pinned_id, mut compatible) = pinned_manifest_lookups(pinned);
+    let mut declared: BTreeMap<PinnedObjectId, BTreeSet<AttachKey>> = BTreeMap::new();
+    for manifest in manifests {
+        let (piece, _) = lower_manifest(manifest, &mut pinned_id, &mut compatible);
+        if let Some(piece) = &piece {
+            declared
+                .entry(piece.object)
+                .or_default()
+                .extend(piece.targets.iter().map(|target| AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                }));
+        }
+    }
+    for piece in prearm {
+        declared
+            .entry(piece.object)
+            .or_default()
+            .extend(piece.proved.iter().map(|(_, file_offset)| AttachKey {
+                object: piece.object,
+                file_offset: *file_offset,
+            }));
+    }
+    declared
+}
+
+/// Conservative plan cursor: removal-only rebuild of an [`AttachPlan`] from
+/// surviving sources, one bounded step per credit.
+///
+/// The cursor never grows: output slots are a subset of the old plan's, and
+/// output modules are the already-admitted groups rebuilt from the surviving
+/// sources. A slot survives exactly when a surviving source row still yields
+/// its exact key (through the shared [`lower_scanned`]/[`lower_manifest`]
+/// lowering), or when it is a provisional seed whose object still has an
+/// admitted group (the rebuilt carry loop's module check). Everything else
+/// retires in place. Growth in the sources (new keys, new groups) is ignored:
+/// the delta's `new`/`replace` stay empty and historical refusals are kept.
+///
+/// Output assembly mirrors [`AttachPlan::extend_exact_prepared`]'s removal
+/// path (retired slots stay in place with unchanged content, aggregate owners
+/// merge the same way, retire rows leave in key order), and module summaries,
+/// skips and surfaces replicate merge's per-group build (same dedup rules)
+/// over the surviving groups, so a removal-only derivation equals the
+/// rebuild-then-extend reference field for field. Admission is deliberately
+/// not replicated: surviving groups were admitted under a tighter budget, so
+/// they stay admitted; capacity refusals, spill counts and the broad-admit
+/// flag affect only evidence the cursor carries over (see `assemble`). The
+/// known divergences from a full rebuild are all growth-shaped (new slots,
+/// resurrected retired keys, shared-target name narrowing, re-refusal reason
+/// strings) and resolve to no-growth by design.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PlanFence {
+    token: u64,
+    mutations: u64,
+    slots: usize,
+    modules: usize,
+    skipped: usize,
+}
+
+// consumed by T4: the fence runs only inside the cursor poll.
+#[allow(dead_code)]
+impl PlanFence {
+    /// Snapshots the fenced members. A poisoned token refuses at once, before
+    /// any derivation step runs.
+    fn snapshot(plan: &AttachPlan) -> Result<Self, GraphRefusal> {
+        if plan.token.0 == PLAN_TOKEN_POISON {
+            return Err(GraphRefusal::SourceChanged);
+        }
+        Ok(Self {
+            token: plan.token.0,
+            mutations: plan.mutations.0,
+            slots: plan.slots.len(),
+            modules: plan.modules.len(),
+            skipped: plan.skipped.len(),
+        })
+    }
+
+    fn check(&self, plan: &AttachPlan) -> Result<(), GraphRefusal> {
+        if Self::snapshot(plan)? == *self {
+            Ok(())
+        } else {
+            Err(GraphRefusal::SourceChanged)
+        }
+    }
+}
+
+/// Byte accounting mirrors `discovery::identity`'s conservative-copy
+/// accounting, which is private to that module: every owned allocation below
+/// is covered by the one measured reservation before it happens.
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
+fn plan_bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+        .ok_or(GraphRefusal::Overflow)
+}
+
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
+fn plan_byte_len(len: usize) -> Result<usize, GraphRefusal> {
+    len.checked_add(OWNED_ALLOCATION_PADDING)
+        .ok_or(GraphRefusal::Overflow)
+}
+
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
+fn plan_text_bytes(text: &str) -> Result<usize, GraphRefusal> {
+    plan_byte_len(text.len())
+}
+
+// consumed by T4: used only by the cursor measure phase.
+// Rust 1.99.1 B=6 BTree keeps every non-root node at >=5 keys, so n entries
+// need at most 1+(n-1)/5 nodes; empty maps allocate nothing. Node size is the
+// full internal size applied to every node.
+#[allow(dead_code)]
+fn plan_tree_bytes<K, V>(entries: usize) -> Result<usize, GraphRefusal> {
+    fn align8(bytes: usize) -> Option<usize> {
+        bytes.checked_add(7).map(|value| value & !7)
+    }
+    if std::mem::align_of::<K>() > 8 || std::mem::align_of::<V>() > 8 {
+        return Err(GraphRefusal::Overflow);
+    }
+    let keys = std::mem::size_of::<K>()
+        .checked_mul(11)
+        .and_then(align8)
+        .ok_or(GraphRefusal::Overflow)?;
+    let values = std::mem::size_of::<V>()
+        .checked_mul(11)
+        .and_then(align8)
+        .ok_or(GraphRefusal::Overflow)?;
+    let node = 16usize
+        .checked_add(keys)
+        .and_then(|bytes| bytes.checked_add(values))
+        .and_then(|bytes| bytes.checked_add(12 * 8))
+        .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+        .ok_or(GraphRefusal::Overflow)?;
+    let nodes = if entries == 0 {
+        0
+    } else {
+        1 + (entries - 1) / 5
+    };
+    nodes.checked_mul(node).ok_or(GraphRefusal::Overflow)
+}
+
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
+fn plan_add(total: &mut usize, bytes: usize) -> Result<(), GraphRefusal> {
+    *total = total.checked_add(bytes).ok_or(GraphRefusal::Overflow)?;
+    Ok(())
+}
+
+// consumed by T4: used only by the cursor copy/retire phases.
+#[allow(dead_code)]
+fn next_after<K: Ord + Clone, V: Clone>(map: &BTreeMap<K, V>, after: &Option<K>) -> Option<(K, V)> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    match after {
+        Some(key) => map.range((Excluded(key), Unbounded)).next(),
+        None => map.first_key_value(),
+    }
+    .map(|(key, value)| (key.clone(), value.clone()))
+}
+
+// consumed by T4: constructed only by graph callers and cursor tests.
+#[allow(dead_code)]
+pub(crate) struct ConservativePlanSources<'a> {
+    modules: &'a [ReconciledModule],
+    manifests: &'a [Manifest],
+    pins: &'a PinnedObjects,
+    broad_admit: bool,
+}
+
+// consumed by T4: constructed only by graph callers and cursor tests.
+#[allow(dead_code)]
+impl<'a> ConservativePlanSources<'a> {
+    pub(crate) fn new(
+        modules: &'a [ReconciledModule],
+        manifests: &'a [Manifest],
+        pins: &'a PinnedObjects,
+        broad_admit: bool,
+    ) -> Self {
+        Self {
+            modules,
+            manifests,
+            pins,
+            broad_admit,
+        }
+    }
+}
+
+// consumed by T4: stored in the graph backing until the old canonical is reclaimed.
+#[allow(dead_code)]
+pub(crate) struct InstalledPlanBacking {
+    output: Option<ResourceLease>,
+    header: Option<ResourceLease>,
+}
+
+/// One lowered source piece, fully owned so the cursor can suspend and
+/// resume across credits without retaining source borrows. Targets are kept
+/// only as occurrence-count triples plus their keys: names feed the
+/// occurrence recount, keys feed the live set.
+// consumed by T4: read only inside the cursor derivation.
+#[allow(dead_code)]
+struct OwnedPiece {
+    object: PinnedObjectId,
+    key: ObjectKey,
+    path: String,
+    /// The scanned piece's opened file matched an operator-named `--module`
+    /// input, carried from [`Discovered::module_named`]. Kept for copy
+    /// fidelity; the removal-only cursor never re-admits, so no admission
+    /// pass reads it back.
+    module_named: bool,
+    source: &'static str,
+    tables: Vec<TableSummary>,
+    interfaces: usize,
+    surfaces: Vec<SurfaceSummary>,
+    count_targets: Vec<(String, PinnedObjectId, u64)>,
+    skipped: Vec<Skipped>,
+}
+
+// consumed by T4: called only by the cursor lowering phase.
+#[allow(dead_code)]
+fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
+    OwnedPiece {
+        object: piece.object,
+        key: piece.key,
+        path: piece.path.to_owned(),
+        module_named: piece.module_named,
+        source: piece.source,
+        tables: piece.tables,
+        interfaces: piece.interfaces,
+        surfaces: piece.surfaces,
+        count_targets: piece
+            .targets
+            .iter()
+            .map(|target| (target.name.to_owned(), target.object, target.file_offset))
+            .collect(),
+        skipped: piece.skipped,
+    }
+}
+
+/// One old plan module, cached for the slot remap and refusal attribution.
+// consumed by T4: read only inside the cursor derivation.
+#[allow(dead_code)]
+struct OldModuleInfo {
+    id: ModuleId,
+    object: PinnedObjectId,
+    path: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// consumed by T4: transitioned only inside the cursor derivation.
+#[allow(dead_code)]
+enum ConservativePlanPhase {
+    New,
+    Measure,
+    Measured,
+    Lower,
+    DrainKeys,
+    RecordModules,
+    Replicate,
+    Derive,
+    CopyMaps,
+    Retire,
+    Ready,
+    Installed,
+    Cancelled,
+    Refused,
+    Reclaim,
+    Reclaimed,
+}
+
+// consumed by T4: driven only by graph callers and cursor tests.
+#[allow(dead_code)]
+pub(crate) struct ConservativePlanCursor {
+    phase: ConservativePlanPhase,
+    fence: Option<PlanFence>,
+    refusal: Option<GraphRefusal>,
+    broad_admit: bool,
+    // Measure (allocation-free lens only).
+    measured: usize,
+    measured_slots: usize,
+    required: Option<usize>,
+    measure_stage: u8,
+    measure_slot: usize,
+    measure_module: usize,
+    measure_source: usize,
+    measure_table: usize,
+    measure_manifest: usize,
+    measure_surface: usize,
+    measure_ordinals_after: Option<AttachKey>,
+    measure_identities_after: Option<PinnedObjectId>,
+    measure_provisional_after: Option<AttachKey>,
+    measure_refused: usize,
+    measure_skipped: usize,
+    // Owned derivation state (allocated after the reservation).
+    storage: Option<ResourceLease>,
+    live: BTreeSet<AttachKey>,
+    pieces: Vec<OwnedPiece>,
+    groups: BTreeMap<PinnedObjectId, Vec<usize>>,
+    group_order: Vec<PinnedObjectId>,
+    manifest_orphaned: Vec<Skipped>,
+    orphan_idx: usize,
+    old_modules: Vec<OldModuleInfo>,
+    old_id_objects: BTreeMap<ModuleId, PinnedObjectId>,
+    old_objects: BTreeSet<PinnedObjectId>,
+    old_paths: BTreeSet<String>,
+    surviving_paths: BTreeSet<String>,
+    stable_ids: BTreeMap<PinnedObjectId, ModuleId>,
+    lower_source: usize,
+    lower_manifest: usize,
+    drain_piece: usize,
+    drain_target: usize,
+    record_module: usize,
+    replicate_group: usize,
+    replicate_step: u8,
+    replicate_piece: usize,
+    replicate_item: usize,
+    replicate_count_only: bool,
+    in_summary: Option<ModuleSummary>,
+    piece_tables: Vec<TableSummary>,
+    piece_surfaces: Vec<SurfaceSummary>,
+    piece_skip_occurrences: BTreeMap<(String, String), usize>,
+    seen_tables: Vec<(&'static str, TableSummary, usize)>,
+    seen_surfaces: Vec<(&'static str, SurfaceSummary, usize)>,
+    seen_skips: BTreeSet<(&'static str, String, String, usize)>,
+    counter: OccurrenceCounter<String, String>,
+    within_targets: BTreeMap<(String, PinnedObjectId, u64), usize>,
+    within_skips: BTreeMap<(String, String), usize>,
+    entries_seen: usize,
+    derive_slot: usize,
+    output_slots: Vec<Slot>,
+    output_slot_by_key: BTreeMap<AttachKey, usize>,
+    output_retired: BTreeSet<usize>,
+    output_owners: Vec<AggregateOwner>,
+    retired_by_cursor: BTreeSet<usize>,
+    ambiguous_count: usize,
+    output_modules: Vec<ModuleSummary>,
+    output_skipped: Vec<Skipped>,
+    output_surfaces: Vec<SurfaceSummary>,
+    copy_stage: u8,
+    copy_key: Option<AttachKey>,
+    copy_object: Option<PinnedObjectId>,
+    copy_provisional: Option<AttachKey>,
+    copy_index: usize,
+    output_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
+    output_identities: BTreeMap<PinnedObjectId, TargetObject>,
+    output_provisional: BTreeMap<AttachKey, PinnedObjectId>,
+    output_refused: Vec<(PinnedObjectId, Skipped)>,
+    output_modules_skipped: Vec<Skipped>,
+    retire_slot: usize,
+    retire_key: Option<AttachKey>,
+    output_removed: Vec<u32>,
+    output_retire: Vec<Slot>,
+    output: Option<AttachPlan>,
+    delta: Option<AttachDelta>,
+    old: Option<AttachPlan>,
+    reclaim_step: u8,
+}
+
+// consumed by T4: driven only by graph callers and cursor tests.
+#[allow(dead_code)]
+impl ConservativePlanCursor {
+    pub(crate) fn new() -> Self {
+        Self {
+            phase: ConservativePlanPhase::New,
+            fence: None,
+            refusal: None,
+            broad_admit: false,
+            measured: 0,
+            measured_slots: 0,
+            required: None,
+            measure_stage: 0,
+            measure_slot: 0,
+            measure_module: 0,
+            measure_source: 0,
+            measure_table: 0,
+            measure_manifest: 0,
+            measure_surface: 0,
+            measure_ordinals_after: None,
+            measure_identities_after: None,
+            measure_provisional_after: None,
+            measure_refused: 0,
+            measure_skipped: 0,
+            storage: None,
+            live: BTreeSet::new(),
+            pieces: Vec::new(),
+            groups: BTreeMap::new(),
+            group_order: Vec::new(),
+            manifest_orphaned: Vec::new(),
+            orphan_idx: 0,
+            old_modules: Vec::new(),
+            old_id_objects: BTreeMap::new(),
+            old_objects: BTreeSet::new(),
+            old_paths: BTreeSet::new(),
+            surviving_paths: BTreeSet::new(),
+            stable_ids: BTreeMap::new(),
+            lower_source: 0,
+            lower_manifest: 0,
+            drain_piece: 0,
+            drain_target: 0,
+            record_module: 0,
+            replicate_group: 0,
+            replicate_step: 0,
+            replicate_piece: 0,
+            replicate_item: 0,
+            replicate_count_only: false,
+            in_summary: None,
+            piece_tables: Vec::new(),
+            piece_surfaces: Vec::new(),
+            piece_skip_occurrences: BTreeMap::new(),
+            seen_tables: Vec::new(),
+            seen_surfaces: Vec::new(),
+            seen_skips: BTreeSet::new(),
+            counter: OccurrenceCounter::default(),
+            within_targets: BTreeMap::new(),
+            within_skips: BTreeMap::new(),
+            entries_seen: 0,
+            derive_slot: 0,
+            output_slots: Vec::new(),
+            output_slot_by_key: BTreeMap::new(),
+            output_retired: BTreeSet::new(),
+            output_owners: Vec::new(),
+            retired_by_cursor: BTreeSet::new(),
+            ambiguous_count: 0,
+            output_modules: Vec::new(),
+            output_skipped: Vec::new(),
+            output_surfaces: Vec::new(),
+            copy_stage: 0,
+            copy_key: None,
+            copy_object: None,
+            copy_provisional: None,
+            copy_index: 0,
+            output_ordinals: BTreeMap::new(),
+            output_identities: BTreeMap::new(),
+            output_provisional: BTreeMap::new(),
+            output_refused: Vec::new(),
+            output_modules_skipped: Vec::new(),
+            retire_slot: 0,
+            retire_key: None,
+            output_removed: Vec::new(),
+            output_retire: Vec::new(),
+            output: None,
+            delta: None,
+            old: None,
+            reclaim_step: 0,
+        }
+    }
+
+    pub(crate) fn required_bytes(&self) -> Option<usize> {
+        self.required
+    }
+
+    pub(crate) fn plan(&self) -> Option<&AttachPlan> {
+        self.output.as_ref()
+    }
+
+    pub(crate) fn delta(&self) -> Option<&AttachDelta> {
+        self.delta.as_ref()
+    }
+
+    pub(crate) fn removed(&self) -> Option<&[u32]> {
+        if self.phase == ConservativePlanPhase::Ready
+            || self.phase == ConservativePlanPhase::Installed
+        {
+            Some(&self.output_removed)
+        } else {
+            None
+        }
+    }
+}
+
+// consumed by T4: polled only by graph callers and cursor tests.
+#[allow(dead_code)]
+impl AttachPlan {
+    /// Removal-only rebuild of this plan from surviving sources, one bounded
+    /// step per credit. See the [`ConservativePlanCursor`] docs for the
+    /// derivation rules.
+    pub(crate) fn poll_conservative_rebuild(
+        &self,
+        source: ConservativePlanSources<'_>,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+        cursor: &mut ConservativePlanCursor,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<GraphStep, GraphRefusal> {
+        if work == 0 {
+            return Ok(GraphStep::Yielded);
+        }
+        match cursor.fence {
+            Some(fence) => fence.check(self)?,
+            None => cursor.fence = Some(PlanFence::snapshot(self)?),
+        }
+        if cursor.phase == ConservativePlanPhase::Cancelled {
+            return Err(GraphRefusal::Cancelled);
+        }
+        if cursor.phase == ConservativePlanPhase::Refused {
+            return Err(cursor.refusal.expect("a refused cursor keeps its refusal"));
+        }
+        if cursor.phase == ConservativePlanPhase::Ready
+            || cursor.phase == ConservativePlanPhase::Installed
+        {
+            return Ok(GraphStep::Ready);
+        }
+        if cursor.phase == ConservativePlanPhase::Reclaim
+            || cursor.phase == ConservativePlanPhase::Reclaimed
+        {
+            return Err(GraphRefusal::Cancelled);
+        }
+        for _ in 0..work {
+            if cursor.advance(self, &source, stable_id, reserve)? {
+                return Ok(GraphStep::Ready);
+            }
+        }
+        Ok(GraphStep::Advanced)
+    }
+
+    /// An empty plan shell under the given policy/scope for the conservative
+    /// cursor to fill in strided. O(1): no slots, no tables.
+    fn empty_like(admission_policy: AdmissionPolicy, admission_scope: AdmissionScope) -> Self {
+        let mut out = Self::from_indexed_slots(Vec::new(), admission_policy)
+            .expect("an empty slot vec is always a valid plan");
+        out.admission_scope = admission_scope;
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_token_for_test(&mut self) {
+        self.token = PlanToken(PLAN_TOKEN_POISON);
+    }
+}
+
+// consumed by T4: stepped only inside the cursor derivation.
+#[allow(dead_code)]
+impl ConservativePlanCursor {
+    /// One bounded derivation step. Returns `true` exactly when the step
+    /// reached `Ready`.
+    fn advance(
+        &mut self,
+        old: &AttachPlan,
+        source: &ConservativePlanSources<'_>,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<bool, GraphRefusal> {
+        match self.step(old, source, stable_id, reserve) {
+            Ok(ready) => Ok(ready),
+            Err(refusal) => {
+                // A short pool is retryable: the measured derivation stays in
+                // place and the next credit re-attempts the reservation.
+                // Every other refusal is terminal for this derivation.
+                if !matches!(refusal, GraphRefusal::Storage(_)) {
+                    self.phase = ConservativePlanPhase::Refused;
+                    self.refusal = Some(refusal);
+                }
+                Err(refusal)
+            }
+        }
+    }
+
+    fn step(
+        &mut self,
+        old: &AttachPlan,
+        source: &ConservativePlanSources<'_>,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<bool, GraphRefusal> {
+        match self.phase {
+            ConservativePlanPhase::New => {
+                self.broad_admit = source.broad_admit;
+                self.measured_slots = old.slots.len();
+                self.phase = ConservativePlanPhase::Measure;
+                self.measure_one(old, source)
+            }
+            ConservativePlanPhase::Measure => self.measure_one(old, source),
+            ConservativePlanPhase::Measured => self.reserve_one(reserve),
+            ConservativePlanPhase::Lower => self.lower_one(source),
+            ConservativePlanPhase::DrainKeys => self.drain_one_key(),
+            ConservativePlanPhase::RecordModules => self.record_one_module(old),
+            ConservativePlanPhase::Replicate => self.replicate_one(stable_id),
+            ConservativePlanPhase::Derive => self.derive_one_slot(old),
+            ConservativePlanPhase::CopyMaps => self.copy_one_map_entry(old),
+            ConservativePlanPhase::Retire => self.retire_one(old),
+            ConservativePlanPhase::Ready
+            | ConservativePlanPhase::Installed
+            | ConservativePlanPhase::Reclaim
+            | ConservativePlanPhase::Reclaimed
+            | ConservativePlanPhase::Cancelled
+            | ConservativePlanPhase::Refused => Err(GraphRefusal::Cancelled),
+        }
+    }
+
+    /// One measure unit: O(1) lens only, no allocation, no queries. Stage
+    /// order is old slots, old modules, source modules (header plus one table
+    /// each), manifests (header plus one surface each), the carried maps, then
+    /// the fixed tail that publishes the requirement.
+    fn measure_one(
+        &mut self,
+        old: &AttachPlan,
+        source: &ConservativePlanSources<'_>,
+    ) -> Result<bool, GraphRefusal> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match self.measure_stage {
+            0 => {
+                let Some(slot) = old.slots.get(self.measure_slot) else {
+                    self.measure_stage = 1;
+                    return Ok(false);
+                };
+                // The output slot clone plus every per-slot structure it may
+                // fill: key index, retirement set, aggregate owner, and the
+                // removal-only delta rows.
+                plan_add(&mut self.measured, plan_bytes_for::<Slot>(1)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&slot.object_path)?)?;
+                for name in &slot.names {
+                    plan_add(&mut self.measured, plan_text_bytes(name)?)?;
+                }
+                plan_add(
+                    &mut self.measured,
+                    plan_bytes_for::<ModuleId>(slot.module_ids.len())?,
+                )?;
+                plan_add(&mut self.measured, plan_bytes_for::<AggregateOwner>(1)?)?;
+                plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, usize>(1)?)?;
+                plan_add(&mut self.measured, plan_tree_bytes::<usize, ()>(1)?)?;
+                plan_add(&mut self.measured, plan_bytes_for::<u32>(1)?)?;
+                self.measure_slot += 1;
+                Ok(false)
+            }
+            1 => {
+                let Some(module) = old.modules.get(self.measure_module) else {
+                    self.measure_stage = 2;
+                    return Ok(false);
+                };
+                // The remap cache entry plus its index and attribution sets.
+                plan_add(&mut self.measured, plan_bytes_for::<OldModuleInfo>(1)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&module.path)?)?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<ModuleId, PinnedObjectId>(1)?,
+                )?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<PinnedObjectId, ()>(1)?,
+                )?;
+                plan_add(&mut self.measured, plan_text_bytes(&module.path)?)?;
+                self.measure_module += 1;
+                Ok(false)
+            }
+            2 => {
+                let Some(module) = source.modules.get(self.measure_source) else {
+                    self.measure_stage = 3;
+                    return Ok(false);
+                };
+                if self.measure_table == 0 {
+                    // The owned-piece shell plus one upper-bound entry per
+                    // group-level structure this piece may open.
+                    plan_add(&mut self.measured, plan_bytes_for::<OwnedPiece>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&module.scanned.path)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<TableSummary>(module.scanned.tables.len())?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<PinnedObjectId, Vec<usize>>(1)?,
+                    )?;
+                    plan_add(&mut self.measured, plan_bytes_for::<PinnedObjectId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleSummary>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&module.scanned.path)?)?;
+                }
+                let Some(table) = module.scanned.tables.get(self.measure_table) else {
+                    self.measure_source += 1;
+                    self.measure_table = 0;
+                    return Ok(false);
+                };
+                // Owned count triples plus the two occurrence structures that
+                // clone each name again, the transient lowered targets, and
+                // the live-set entry.
+                for entry in &table.entries {
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<(String, PinnedObjectId, u64)>(1)?,
+                    )?;
+                    for _ in 0..3 {
+                        plan_add(&mut self.measured, plan_text_bytes(entry.name)?)?;
+                    }
+                    plan_add(&mut self.measured, plan_bytes_for::<Target<'_>>(1)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<&str>(module.exports.len())?,
+                    )?;
+                    plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, ()>(1)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64, usize), ()>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64), usize>(1)?,
+                    )?;
+                }
+                for skip in &table.unpinned {
+                    self.measure_skip_texts(&skip.subject, &skip.reason)?;
+                }
+                for null in &table.null_entries {
+                    self.measure_skip_texts(null, "null pointer")?;
+                    // The subject may instead present as `unknown`.
+                    for _ in 0..5 {
+                        plan_add(&mut self.measured, plan_text_bytes("unknown")?)?;
+                    }
+                }
+                // One table summary plus its surfaces (the table surface and,
+                // upper bound, one per interface), each held three times
+                // (piece, dedup seen-set, output clone).
+                for _ in 0..3 {
+                    plan_add(&mut self.measured, plan_bytes_for::<TableSummary>(1)?)?;
+                }
+                let surfaces = module
+                    .scanned
+                    .interfaces
+                    .len()
+                    .checked_add(1)
+                    .ok_or(GraphRefusal::Overflow)?;
+                for _ in 0..surfaces {
+                    for _ in 0..3 {
+                        plan_add(&mut self.measured, plan_bytes_for::<SurfaceSummary>(1)?)?;
+                        plan_add(&mut self.measured, plan_text_bytes(&module.scanned.path)?)?;
+                        plan_add(&mut self.measured, plan_byte_len(32)?)?;
+                        plan_add(&mut self.measured, plan_text_bytes(table.walk)?)?;
+                        plan_add(&mut self.measured, plan_text_bytes("ok")?)?;
+                    }
+                }
+                self.measure_table += 1;
+                Ok(false)
+            }
+            3 => {
+                let Some(manifest) = source.manifests.get(self.measure_manifest) else {
+                    self.measure_stage = 4;
+                    return Ok(false);
+                };
+                if self.measure_surface == 0 {
+                    plan_add(&mut self.measured, plan_bytes_for::<OwnedPiece>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&manifest.module_path)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<TableSummary>(manifest.surfaces.len())?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<SurfaceSummary>(manifest.surfaces.len())?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<PinnedObjectId, Vec<usize>>(1)?,
+                    )?;
+                    plan_add(&mut self.measured, plan_bytes_for::<PinnedObjectId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleSummary>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&manifest.module_path)?)?;
+                }
+                let Some(surface) = manifest.surfaces.get(self.measure_surface) else {
+                    self.measure_manifest += 1;
+                    self.measure_surface = 0;
+                    return Ok(false);
+                };
+                for function in &surface.functions {
+                    // Upper bound: every function leaves both a count triple
+                    // and a skip (it leaves exactly one of the two).
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<(String, PinnedObjectId, u64)>(1)?,
+                    )?;
+                    for _ in 0..3 {
+                        plan_add(&mut self.measured, plan_text_bytes(&function.name)?)?;
+                    }
+                    plan_add(&mut self.measured, plan_bytes_for::<Target<'_>>(1)?)?;
+                    plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, ()>(1)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64, usize), ()>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64), usize>(1)?,
+                    )?;
+                    let mut reason = function
+                        .name
+                        .len()
+                        .checked_add(manifest.module_path.len())
+                        .and_then(|bytes| bytes.checked_add(128))
+                        .ok_or(GraphRefusal::Overflow)?;
+                    if let Resolution::UnusableFile { reason: cause, .. } = &function.resolution {
+                        reason = reason
+                            .checked_add(cause.len())
+                            .ok_or(GraphRefusal::Overflow)?;
+                    }
+                    let reason = plan_byte_len(reason)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<Skipped>(5)?)?;
+                    for _ in 0..5 {
+                        plan_add(&mut self.measured, plan_text_bytes(&function.name)?)?;
+                        plan_add(&mut self.measured, reason)?;
+                    }
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, String), usize>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+                    )?;
+                }
+                // The surface summary, three lives; label bytes from the
+                // source records (walk/acquisition details are read, never
+                // copied here).
+                let (source_len, walk_len, acquisition_len) = manifest_surface_label_bytes(surface);
+                for _ in 0..3 {
+                    plan_add(&mut self.measured, plan_bytes_for::<SurfaceSummary>(1)?)?;
+                    plan_add(&mut self.measured, plan_byte_len(source_len)?)?;
+                    plan_add(&mut self.measured, plan_byte_len(walk_len)?)?;
+                    plan_add(&mut self.measured, plan_byte_len(acquisition_len)?)?;
+                }
+                self.measure_surface += 1;
+                Ok(false)
+            }
+            4 => {
+                let next = match &self.measure_ordinals_after {
+                    Some(after) => old.slot_ordinals.range((Excluded(after), Unbounded)).next(),
+                    None => old.slot_ordinals.first_key_value(),
+                };
+                let Some((key, ordinals)) = next else {
+                    self.measure_stage = 5;
+                    self.measure_ordinals_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<AttachKey, BTreeSet<SlotOrdinal>>(1)?,
+                )?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<SlotOrdinal, ()>(ordinals.len())?,
+                )?;
+                self.measure_ordinals_after = Some(*key);
+                Ok(false)
+            }
+            5 => {
+                let next = match &self.measure_identities_after {
+                    Some(after) => old
+                        .object_identities
+                        .range((Excluded(after), Unbounded))
+                        .next(),
+                    None => old.object_identities.first_key_value(),
+                };
+                let Some((object, identity)) = next else {
+                    self.measure_stage = 6;
+                    self.measure_identities_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<PinnedObjectId, TargetObject>(1)?,
+                )?;
+                if let Some(sha) = &identity.sha256 {
+                    plan_add(&mut self.measured, plan_text_bytes(sha)?)?;
+                }
+                self.measure_identities_after = Some(*object);
+                Ok(false)
+            }
+            6 => {
+                let next = match &self.measure_provisional_after {
+                    Some(after) => old
+                        .provisional_get_function_list
+                        .range((Excluded(after), Unbounded))
+                        .next(),
+                    None => old.provisional_get_function_list.first_key_value(),
+                };
+                let Some((key, _)) = next else {
+                    self.measure_stage = 7;
+                    self.measure_provisional_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<AttachKey, PinnedObjectId>(1)?,
+                )?;
+                self.measure_provisional_after = Some(*key);
+                Ok(false)
+            }
+            7 => {
+                let Some((_, skip)) = old.refused_module_objects.get(self.measure_refused) else {
+                    self.measure_stage = 8;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_bytes_for::<(PinnedObjectId, Skipped)>(1)?,
+                )?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.subject)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.reason)?)?;
+                self.measure_refused += 1;
+                Ok(false)
+            }
+            8 => {
+                let Some(skip) = old.modules_skipped.get(self.measure_skipped) else {
+                    self.measure_stage = 9;
+                    return Ok(false);
+                };
+                plan_add(&mut self.measured, plan_bytes_for::<Skipped>(1)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.subject)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.reason)?)?;
+                self.measure_skipped += 1;
+                Ok(false)
+            }
+            _ => {
+                // Fixed tail: stack-resident shells need no charge; every heap
+                // byte is covered per element above.
+                self.required = Some(self.measured);
+                self.phase = ConservativePlanPhase::Measured;
+                Ok(false)
+            }
+        }
+    }
+
+    /// One skip's five lives: owned piece, dedup seen-set, occurrence
+    /// within-map, module summary, and plan-level output.
+    fn measure_skip_texts(&mut self, subject: &str, reason: &str) -> Result<(), GraphRefusal> {
+        plan_add(&mut self.measured, plan_bytes_for::<Skipped>(5)?)?;
+        for _ in 0..5 {
+            plan_add(&mut self.measured, plan_text_bytes(subject)?)?;
+            plan_add(&mut self.measured, plan_text_bytes(reason)?)?;
+        }
+        plan_add(
+            &mut self.measured,
+            plan_tree_bytes::<(String, String), usize>(1)?,
+        )?;
+        plan_add(
+            &mut self.measured,
+            plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+        )?;
+        plan_add(
+            &mut self.measured,
+            plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+        )?;
+        Ok(())
+    }
+
+    fn reserve_one(&mut self, reserve: &SemanticResourceReserver) -> Result<bool, GraphRefusal> {
+        let required = self.required.expect("measured before reserve");
+        match reserve.reserve(required) {
+            Ok(lease) => {
+                self.storage = Some(lease);
+                // The removal index, preallocated from the measure (upper
+                // bound: every old slot).
+                self.output_removed = Vec::with_capacity(self.measured_slots);
+                self.phase = ConservativePlanPhase::Lower;
+                Ok(false)
+            }
+            Err(refusal) => Err(GraphRefusal::Storage(refusal)),
+        }
+    }
+
+    /// One lowering unit: one source piece through the shared lowering,
+    /// converted to owned form. Piece lowering is O(piece) per unit (one
+    /// view's single-object decode); every per-row step downstream is
+    /// strided.
+    fn lower_one(&mut self, source: &ConservativePlanSources<'_>) -> Result<bool, GraphRefusal> {
+        if let Some(module) = source.modules.get(self.lower_source) {
+            self.push_piece(own_piece(lower_scanned(module)));
+            self.lower_source += 1;
+            return Ok(false);
+        }
+        if let Some(manifest) = source.manifests.get(self.lower_manifest) {
+            let (pinned_id, compatible) = pinned_manifest_lookups(source.pins);
+            let (piece, orphaned) = lower_manifest(manifest, pinned_id, compatible);
+            if let Some(piece) = piece {
+                self.push_piece(own_piece(piece));
+            }
+            // Orphaned manifest skips are rare resolution failures; they move
+            // to the plan tail after the group skips, in manifest order.
+            self.manifest_orphaned.extend(orphaned);
+            self.lower_manifest += 1;
+            return Ok(false);
+        }
+        self.phase = ConservativePlanPhase::DrainKeys;
+        Ok(false)
+    }
+
+    fn push_piece(&mut self, piece: OwnedPiece) {
+        let index = self.pieces.len();
+        let object = piece.object;
+        self.groups
+            .entry(object)
+            .or_insert_with(|| {
+                self.group_order.push(object);
+                Vec::new()
+            })
+            .push(index);
+        self.pieces.push(piece);
+    }
+
+    /// One live-key unit: one lowered row into the live set.
+    fn drain_one_key(&mut self) -> Result<bool, GraphRefusal> {
+        while let Some(piece) = self.pieces.get(self.drain_piece) {
+            let next =
+                piece
+                    .count_targets
+                    .get(self.drain_target)
+                    .map(|(_, object, file_offset)| AttachKey {
+                        object: *object,
+                        file_offset: *file_offset,
+                    });
+            match next {
+                Some(key) => {
+                    self.live.insert(key);
+                    self.drain_target += 1;
+                    return Ok(false);
+                }
+                None => {
+                    self.drain_piece += 1;
+                    self.drain_target = 0;
+                }
+            }
+        }
+        self.phase = ConservativePlanPhase::RecordModules;
+        Ok(false)
+    }
+
+    /// One remap-cache unit: one old module's identity triple plus its index
+    /// and attribution entries.
+    fn record_one_module(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        let Some(module) = old.modules.get(self.record_module) else {
+            self.phase = ConservativePlanPhase::Replicate;
+            return Ok(false);
+        };
+        self.old_modules.push(OldModuleInfo {
+            id: module.id,
+            object: module.object,
+            path: module.path.clone(),
+        });
+        self.old_id_objects.insert(module.id, module.object);
+        self.old_objects.insert(module.object);
+        self.old_paths.insert(module.path.clone());
+        self.record_module += 1;
+        Ok(false)
+    }
+
+    /// One replication unit within the current group. Groups replicate in
+    /// first-seen order; only already-admitted groups produce summaries (no
+    /// growth at Q), while every group feeds the occurrence recount.
+    fn replicate_one(
+        &mut self,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+    ) -> Result<bool, GraphRefusal> {
+        let Some(object) = self.group_order.get(self.replicate_group).copied() else {
+            // All groups done: orphaned manifest skips tail the plan skips.
+            if self.orphan_idx < self.manifest_orphaned.len() {
+                let skip = self.manifest_orphaned[self.orphan_idx].clone();
+                self.output_skipped.push(skip);
+                self.orphan_idx += 1;
+                return Ok(false);
+            }
+            self.phase = ConservativePlanPhase::Derive;
+            return Ok(false);
+        };
+        match self.replicate_step {
+            0 => {
+                self.counter.clear();
+                self.piece_tables.clear();
+                self.piece_surfaces.clear();
+                self.piece_skip_occurrences.clear();
+                if !self.old_objects.contains(&object) {
+                    // Growth refused: the group feeds only the recount.
+                    self.replicate_count_only = true;
+                    self.replicate_step = 5;
+                    self.replicate_piece = 0;
+                    self.replicate_item = 0;
+                    return Ok(false);
+                }
+                let Some(stable) = stable_id(object) else {
+                    return Err(GraphRefusal::Identity);
+                };
+                self.stable_ids.insert(object, stable);
+                let first = self
+                    .groups
+                    .get(&object)
+                    .and_then(|pieces| pieces.first().copied())
+                    .ok_or(GraphRefusal::Identity)?;
+                let piece = self.pieces.get(first).ok_or(GraphRefusal::Identity)?;
+                self.in_summary = Some(ModuleSummary {
+                    id: stable,
+                    object,
+                    key: piece.key,
+                    path: piece.path.clone(),
+                    tables: Vec::new(),
+                    interfaces: 0,
+                    source: piece.source,
+                    corroborated: false,
+                    skipped: Vec::new(),
+                });
+                self.surviving_paths.insert(piece.path.clone());
+                self.replicate_count_only = false;
+                self.replicate_step = 1;
+                self.replicate_piece = 0;
+                self.replicate_item = 0;
+                Ok(false)
+            }
+            1 => self.replicate_tables(object),
+            2 => self.replicate_surfaces(object),
+            3 => self.replicate_skips(object),
+            4 => self.replicate_interfaces(object),
+            5 => self.replicate_counts(object),
+            _ => {
+                self.entries_seen = self
+                    .entries_seen
+                    .checked_add(self.counter.count())
+                    .ok_or(GraphRefusal::Overflow)?;
+                if !self.replicate_count_only {
+                    let summary = self.in_summary.take().ok_or(GraphRefusal::Identity)?;
+                    self.output_modules.push(summary);
+                }
+                self.in_summary = None;
+                self.seen_tables.clear();
+                self.seen_surfaces.clear();
+                self.seen_skips.clear();
+                self.replicate_count_only = false;
+                self.replicate_group += 1;
+                self.replicate_step = 0;
+                self.replicate_piece = 0;
+                self.replicate_item = 0;
+                Ok(false)
+            }
+        }
+    }
+
+    /// The current group's piece at position, or `None` once exhausted.
+    fn group_piece(
+        &self,
+        object: PinnedObjectId,
+        position: usize,
+    ) -> Result<Option<usize>, GraphRefusal> {
+        self.groups
+            .get(&object)
+            .ok_or(GraphRefusal::Identity)
+            .map(|pieces| pieces.get(position).copied())
+    }
+
+    /// One table unit: merge's per-piece table dedup, verbatim.
+    fn replicate_tables(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 2;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        let Some(table) = piece.tables.get(self.replicate_item) else {
+            self.piece_tables.clear();
+            self.replicate_piece += 1;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let (source, table) = (piece.source, table.clone());
+        let occurrence = self
+            .piece_tables
+            .iter()
+            .filter(|known| *known == &table)
+            .count();
+        self.piece_tables.push(table.clone());
+        if !self
+            .seen_tables
+            .iter()
+            .any(|(known_source, known, known_occurrence)| {
+                *known_source == source && known == &table && *known_occurrence == occurrence
+            })
+        {
+            self.seen_tables.push((source, table.clone(), occurrence));
+            self.in_summary
+                .as_mut()
+                .ok_or(GraphRefusal::Identity)?
+                .tables
+                .push(table);
+        }
+        self.replicate_item += 1;
+        Ok(false)
+    }
+
+    /// One surface unit: merge's per-piece surface dedup, verbatim; accepted
+    /// surfaces also tail the plan surfaces.
+    fn replicate_surfaces(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 3;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        let Some(surface) = piece.surfaces.get(self.replicate_item) else {
+            self.piece_surfaces.clear();
+            self.replicate_piece += 1;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let (source, surface) = (piece.source, surface.clone());
+        let occurrence = self
+            .piece_surfaces
+            .iter()
+            .filter(|known| *known == &surface)
+            .count();
+        self.piece_surfaces.push(surface.clone());
+        if !self
+            .seen_surfaces
+            .iter()
+            .any(|(known_source, known, known_occurrence)| {
+                *known_source == source && known == &surface && *known_occurrence == occurrence
+            })
+        {
+            self.seen_surfaces
+                .push((source, surface.clone(), occurrence));
+            self.output_surfaces.push(surface);
+        }
+        self.replicate_item += 1;
+        Ok(false)
+    }
+
+    /// One skip unit: merge's per-piece skip dedup, verbatim; accepted skips
+    /// land both in the module summary and at the plan tail.
+    fn replicate_skips(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 4;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        let Some(skip) = piece.skipped.get(self.replicate_item) else {
+            self.piece_skip_occurrences.clear();
+            self.replicate_piece += 1;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let (source, skip) = (piece.source, skip.clone());
+        let record = (skip.subject.clone(), skip.reason.clone());
+        let occurrence = *self
+            .piece_skip_occurrences
+            .entry(record.clone())
+            .or_insert(0usize);
+        if self
+            .seen_skips
+            .insert((source, record.0.clone(), record.1.clone(), occurrence))
+        {
+            self.in_summary
+                .as_mut()
+                .ok_or(GraphRefusal::Identity)?
+                .skipped
+                .push(skip.clone());
+            self.output_skipped.push(skip);
+        }
+        *self.piece_skip_occurrences.entry(record).or_insert(0usize) += 1;
+        self.replicate_item += 1;
+        Ok(false)
+    }
+
+    /// One interface unit: the summary keeps the most any one source saw,
+    /// never the sum across sources.
+    fn replicate_interfaces(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 5;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let interfaces = self
+            .pieces
+            .get(piece_idx)
+            .ok_or(GraphRefusal::Identity)?
+            .interfaces;
+        let summary = self.in_summary.as_mut().ok_or(GraphRefusal::Identity)?;
+        summary.interfaces = summary.interfaces.max(interfaces);
+        self.replicate_piece += 1;
+        Ok(false)
+    }
+
+    /// One recount unit: occurrence-deduped decoded counts for the group,
+    /// fed through the shared counter.
+    fn replicate_counts(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 6;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        if let Some((name, target_object, file_offset)) =
+            piece.count_targets.get(self.replicate_item)
+        {
+            let (name, target_object, file_offset) = (name.clone(), *target_object, *file_offset);
+            self.counter
+                .feed_target(&mut self.within_targets, name, target_object, file_offset);
+            self.replicate_item += 1;
+            return Ok(false);
+        }
+        let skip_idx = self.replicate_item - piece.count_targets.len();
+        if let Some(skip) = piece.skipped.get(skip_idx) {
+            let (source, subject, reason) =
+                (piece.source, skip.subject.clone(), skip.reason.clone());
+            self.counter
+                .feed_skip(&mut self.within_skips, source, subject, reason);
+            self.replicate_item += 1;
+            return Ok(false);
+        }
+        self.within_targets.clear();
+        self.within_skips.clear();
+        self.replicate_piece += 1;
+        self.replicate_item = 0;
+        Ok(false)
+    }
+
+    /// One derive unit: one old slot. A slot survives exactly when its key
+    /// is still yielded by the surviving sources and it was not already
+    /// retired, or when it is a retained provisional seed. Surviving slots
+    /// keep their content and index with retired claimers remapped away;
+    /// retired slots stay in place with unchanged content, exactly like the
+    /// reference extend.
+    fn derive_one_slot(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        let Some(old_slot) = old.slots.get(self.derive_slot) else {
+            self.phase = ConservativePlanPhase::CopyMaps;
+            return Ok(false);
+        };
+        let index = self.derive_slot;
+        let key = AttachKey::of(old_slot);
+        let was_retired = old.retired_slots.contains(&index);
+        let retained_provisional = !was_retired
+            && old
+                .provisional_get_function_list
+                .get(&key)
+                .is_some_and(|object| self.stable_ids.contains_key(object));
+        let live = self.live.contains(&key);
+        let owner = old
+            .aggregate_owners
+            .get(index)
+            .copied()
+            .ok_or(GraphRefusal::Identity)?;
+        if (live || retained_provisional) && !was_retired {
+            let mut slot = old_slot.clone();
+            let mut ids = Vec::with_capacity(old_slot.module_ids.len());
+            for id in &old_slot.module_ids {
+                match self
+                    .old_id_objects
+                    .get(id)
+                    .and_then(|object| self.stable_ids.get(object))
+                {
+                    Some(stable) => ids.push(*stable),
+                    None if self.old_id_objects.contains_key(id) => {
+                        // Retired claimer: the rebuilt plan lacks it.
+                    }
+                    None => ids.push(*id),
+                }
+            }
+            slot.module_ids = ids;
+            // Extend's two owner merges, verbatim.
+            let owner = owner
+                .merge(AggregateOwner::from_module_ids(&old_slot.module_ids))
+                .merge(AggregateOwner::from_module_ids(&slot.module_ids));
+            self.ambiguous_count += usize::from(owner == AggregateOwner::Ambiguous);
+            self.output_slot_by_key.insert(key, index);
+            self.output_owners.push(owner);
+            self.output_slots.push(slot);
+        } else {
+            let owner = owner.merge(AggregateOwner::from_module_ids(&old_slot.module_ids));
+            self.ambiguous_count += usize::from(owner == AggregateOwner::Ambiguous);
+            self.output_owners.push(owner);
+            self.output_slots.push(old_slot.clone());
+            self.output_retired.insert(index);
+            if !was_retired {
+                self.retired_by_cursor.insert(index);
+            }
+        }
+        self.derive_slot += 1;
+        Ok(false)
+    }
+
+    /// One carried-map unit. Ordinals and object identities only grow, so the
+    /// old maps carry over whole; provisionals and refusals survive exactly
+    /// when their object does; historical module skips drop only entries
+    /// provably tied to retired modules.
+    fn copy_one_map_entry(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        match self.copy_stage {
+            0 => {
+                let next = next_after(&old.slot_ordinals, &self.copy_key);
+                let Some((key, ordinals)) = next else {
+                    self.copy_stage = 1;
+                    self.copy_key = None;
+                    return Ok(false);
+                };
+                self.copy_key = Some(key);
+                self.output_ordinals.insert(key, ordinals);
+                Ok(false)
+            }
+            1 => {
+                let next = next_after(&old.object_identities, &self.copy_object);
+                let Some((object, identity)) = next else {
+                    self.copy_stage = 2;
+                    self.copy_object = None;
+                    return Ok(false);
+                };
+                self.copy_object = Some(object);
+                self.output_identities.insert(object, identity);
+                Ok(false)
+            }
+            2 => {
+                let next = next_after(&old.provisional_get_function_list, &self.copy_provisional);
+                let Some((key, object)) = next else {
+                    self.copy_stage = 3;
+                    self.copy_provisional = None;
+                    return Ok(false);
+                };
+                self.copy_provisional = Some(key);
+                if self.stable_ids.contains_key(&object) {
+                    self.output_provisional.insert(key, object);
+                }
+                Ok(false)
+            }
+            3 => {
+                let Some((object, skip)) = old.refused_module_objects.get(self.copy_index) else {
+                    self.copy_stage = 4;
+                    self.copy_index = 0;
+                    return Ok(false);
+                };
+                if self.stable_ids.contains_key(object) {
+                    self.output_refused.push((*object, skip.clone()));
+                }
+                self.copy_index += 1;
+                Ok(false)
+            }
+            _ => {
+                let Some(skip) = old.modules_skipped.get(self.copy_index) else {
+                    self.phase = ConservativePlanPhase::Retire;
+                    self.copy_index = 0;
+                    return Ok(false);
+                };
+                // Only refusals attributable to a retired module drop;
+                // unattributed entries are evidence and stay.
+                let retired_module = self.old_paths.contains(&skip.subject)
+                    && !self.surviving_paths.contains(&skip.subject);
+                if !retired_module {
+                    self.output_modules_skipped.push(skip.clone());
+                }
+                self.copy_index += 1;
+                Ok(false)
+            }
+        }
+    }
+
+    /// One retire unit: removed indices leave in ascending slot order, delta
+    /// retire rows in rebuilt key order.
+    fn retire_one(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        if self.retire_slot < old.slots.len() {
+            if self.retired_by_cursor.contains(&self.retire_slot) {
+                self.output_removed.push(self.retire_slot as u32);
+            }
+            self.retire_slot += 1;
+            return Ok(false);
+        }
+        let next = next_after(&old.slot_by_key, &self.retire_key);
+        match next {
+            Some((key, position)) => {
+                self.retire_key = Some(key);
+                if self.retired_by_cursor.contains(&position) {
+                    let slot = old
+                        .slots
+                        .get(position)
+                        .ok_or(GraphRefusal::Identity)?
+                        .clone();
+                    self.output_retire.push(slot);
+                }
+                Ok(false)
+            }
+            None => {
+                self.assemble(old);
+                self.phase = ConservativePlanPhase::Ready;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Moves the derived pieces into the output plan. All moves are O(1);
+    /// scalars come from the old plan or the derivation. Uncorroborated
+    /// spill is exact under broad admit (broad never spills, so the rebuilt
+    /// count is zero) and carried otherwise; the capture-concurrency
+    /// counters, policy and scope are the old plan's, exactly as the
+    /// reference extend leaves them.
+    fn assemble(&mut self, old: &AttachPlan) {
+        let mut out = AttachPlan::empty_like(old.admission_policy, old.admission_scope);
+        out.slots = std::mem::take(&mut self.output_slots);
+        out.modules = std::mem::take(&mut self.output_modules);
+        out.skipped = std::mem::take(&mut self.output_skipped);
+        out.modules_skipped = std::mem::take(&mut self.output_modules_skipped);
+        out.refused_module_objects = std::mem::take(&mut self.output_refused);
+        out.surfaces = std::mem::take(&mut self.output_surfaces);
+        out.slot_by_key = std::mem::take(&mut self.output_slot_by_key);
+        out.provisional_get_function_list = std::mem::take(&mut self.output_provisional);
+        out.slot_ordinals = std::mem::take(&mut self.output_ordinals);
+        out.object_identities = std::mem::take(&mut self.output_identities);
+        out.retired_slots = std::mem::take(&mut self.output_retired);
+        out.aggregate_owners = std::mem::take(&mut self.output_owners);
+        out.entries_seen = self.entries_seen;
+        out.module_ambiguous = self.ambiguous_count;
+        out.vendor_interfaces = old.vendor_interfaces;
+        out.interface_list = old.interface_list.clone();
+        out.counter_consumed_end = old.counter_consumed_end;
+        out.first_plan_objects = old.first_plan_objects.clone();
+        out.first_plan_had_provider = old.first_plan_had_provider;
+        out.uncorroborated_candidates = if self.broad_admit {
+            0
+        } else {
+            old.uncorroborated_candidates
+        };
+        self.output = Some(out);
+        self.delta = Some(AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: std::mem::take(&mut self.output_retire),
+        });
+    }
+}
+
+impl ConservativePlanCursor {
+    fn drain_vec<T>(vec: &mut Vec<T>) -> bool {
+        vec.pop().is_none()
+    }
+
+    fn drain_map<K: Ord, V>(map: &mut BTreeMap<K, V>) -> bool {
+        map.pop_first().is_none()
+    }
+
+    fn drain_set<T: Ord>(set: &mut BTreeSet<T>) -> bool {
+        set.pop_first().is_none()
+    }
+
+    // consumed by T4: installs the Ready output into the canonical plan.
+    #[allow(dead_code)]
+    pub(crate) fn swap_ready(
+        &mut self,
+        canonical: &mut AttachPlan,
+    ) -> Result<InstalledPlanBacking, GraphRefusal> {
+        if self.phase == ConservativePlanPhase::Cancelled {
+            return Err(GraphRefusal::Cancelled);
+        }
+        if self.phase != ConservativePlanPhase::Ready {
+            return Err(GraphRefusal::Identity);
+        }
+        let mut output = self.output.take().ok_or(GraphRefusal::Identity)?;
+        std::mem::swap(&mut output, canonical);
+        self.old = Some(output);
+        self.phase = ConservativePlanPhase::Installed;
+        Ok(InstalledPlanBacking {
+            output: self.storage.take(),
+            header: None,
+        })
+    }
+
+    // consumed by T4: drops derived leaves one per credit after install or refusal.
+    #[allow(dead_code)]
+    pub(crate) fn reclaim(&mut self, work: usize) -> Result<GraphStep, GraphRefusal> {
+        if work == 0 {
+            return Ok(GraphStep::Yielded);
+        }
+        if self.phase == ConservativePlanPhase::Reclaimed {
+            return Ok(GraphStep::Ready);
+        }
+        self.phase = ConservativePlanPhase::Reclaim;
+        for _ in 0..work {
+            if self.reclaim_one() {
+                self.phase = ConservativePlanPhase::Reclaimed;
+                return Ok(GraphStep::Ready);
+            }
+        }
+        Ok(GraphStep::Advanced)
+    }
+
+    // consumed by T4: abandons the derivation; drops nothing.
+    #[allow(dead_code)]
+    pub(crate) fn cancel(&mut self) {
+        self.phase = ConservativePlanPhase::Cancelled;
+    }
+
+    /// One reclaim leaf. Returns `true` once nothing remains.
+    fn reclaim_one(&mut self) -> bool {
+        match self.reclaim_step {
+            0 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.slots),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            1 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.modules),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            2 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.skipped),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            3 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.modules_skipped),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            4 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.surfaces),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            5 => {
+                if let Some(plan) = self.output.as_mut().or(self.old.as_mut()) {
+                    plan.aggregate_owners = Vec::new();
+                }
+                self.reclaim_step += 1;
+                false
+            }
+            6 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.slot_by_key),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            7 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_set(&mut plan.retired_slots),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            8 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.slot_ordinals),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            9 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.object_identities),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            10 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.provisional_get_function_list),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            11 => {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.refused_module_objects),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            12 => {
+                if let Some(plan) = self.output.as_mut().or(self.old.as_mut()) {
+                    plan.interface_list = String::new();
+                }
+                self.output = None;
+                self.old = None;
+                self.reclaim_step += 1;
+                false
+            }
+            13 => {
+                if Self::drain_vec(&mut self.output_slots) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            14 => {
+                if Self::drain_vec(&mut self.output_modules) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            15 => {
+                if Self::drain_vec(&mut self.output_skipped) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            16 => {
+                if Self::drain_vec(&mut self.output_modules_skipped) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            17 => {
+                if Self::drain_vec(&mut self.output_surfaces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            18 => {
+                self.output_owners = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            19 => {
+                if Self::drain_map(&mut self.output_slot_by_key) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            20 => {
+                if Self::drain_set(&mut self.output_retired) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            21 => {
+                if Self::drain_map(&mut self.output_ordinals) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            22 => {
+                if Self::drain_map(&mut self.output_identities) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            23 => {
+                if Self::drain_map(&mut self.output_provisional) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            24 => {
+                if Self::drain_vec(&mut self.output_refused) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            25 => {
+                match self.delta.as_mut() {
+                    Some(delta) => {
+                        if delta.retire.pop().is_none() {
+                            delta.new = Vec::new();
+                            delta.replace = Vec::new();
+                            self.delta = None;
+                            self.reclaim_step += 1;
+                        }
+                    }
+                    None => self.reclaim_step += 1,
+                }
+                false
+            }
+            26 => {
+                self.output_removed = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            27 => {
+                if Self::drain_vec(&mut self.output_retire) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            28 => {
+                if Self::drain_set(&mut self.live) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            29 => {
+                if Self::drain_vec(&mut self.pieces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            30 => {
+                if Self::drain_map(&mut self.groups) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            31 => {
+                self.group_order = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            32 => {
+                if Self::drain_vec(&mut self.manifest_orphaned) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            33 => {
+                if Self::drain_vec(&mut self.old_modules) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            34 => {
+                if Self::drain_map(&mut self.old_id_objects) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            35 => {
+                if Self::drain_set(&mut self.old_objects) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            36 => {
+                if Self::drain_set(&mut self.old_paths) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            37 => {
+                if Self::drain_set(&mut self.surviving_paths) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            38 => {
+                if Self::drain_map(&mut self.stable_ids) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            39 => {
+                if Self::drain_set(&mut self.retired_by_cursor) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            40 => {
+                let done = match self.in_summary.as_mut() {
+                    Some(summary) => {
+                        if summary.tables.pop().is_none() {
+                            summary.skipped.pop().is_none()
+                        } else {
+                            false
+                        }
+                    }
+                    None => true,
+                };
+                if done {
+                    self.in_summary = None;
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            41 => {
+                if Self::drain_vec(&mut self.piece_surfaces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            42 => {
+                if Self::drain_vec(&mut self.seen_surfaces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            43 => {
+                self.piece_tables = Vec::new();
+                self.seen_tables = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            44 => {
+                if Self::drain_map(&mut self.piece_skip_occurrences) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            45 => {
+                if Self::drain_set(&mut self.seen_skips) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            46 => {
+                if Self::drain_set(&mut self.counter.targets) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            47 => {
+                if Self::drain_set(&mut self.counter.skips) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            48 => {
+                if Self::drain_map(&mut self.within_targets) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            49 => {
+                if Self::drain_map(&mut self.within_skips) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            _ => {
+                self.storage.take();
+                true
+            }
+        }
+    }
+}
+
+/// Upper-bound label bytes for one manifest surface summary, read from the
+/// source records without allocating.
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
+fn manifest_surface_label_bytes(
+    surface: &p11scope_manifest::manifest::SurfaceRecord,
+) -> (usize, usize, usize) {
+    let source = match &surface.source {
+        SurfaceSource::LegacyFunctionList => "legacy_function_list".len(),
+        SurfaceSource::Interface { .. } => 48,
+    };
+    let walk = match &surface.walk {
+        WalkOutcome::Unreadable { detail } => detail.len().checked_add(16),
+        _ => Some(16),
+    };
+    let acquisition = match &surface.acquisition {
+        Acquisition::Error { detail } => detail.len().checked_add(16),
+        _ => Some(16),
+    };
+    (
+        source,
+        walk.unwrap_or(usize::MAX),
+        acquisition.unwrap_or(usize::MAX),
     )
 }
 
@@ -3115,6 +6780,35 @@ mod tests {
     use crate::process::{MountNamespaceId, ProcessViewId};
     use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
     use p11scope_manifest::manifest::*;
+
+    #[test]
+    fn borrowed_projection_metadata_matches_exact_lookups_and_empty_twins() {
+        let mut plan =
+            build_from_reconciled_modules(&[scanned_with(TEST_OBJECT, "/owned.so", [0x10])]);
+        let slot = plan.slots[0].clone();
+        plan.object_identities.insert(
+            slot.object,
+            TargetObject {
+                dev: (8, 1),
+                ino: 42,
+                sha256: Some("11".repeat(32)),
+            },
+        );
+        let ordinals: Vec<_> = plan.borrowed_ordinals_of(&slot).collect();
+        assert_eq!(ordinals, plan.ordinals_of(&slot));
+        assert!(!ordinals.is_empty());
+        assert_eq!(plan.ordinal_count(&slot), ordinals.len());
+        assert!(std::ptr::eq(
+            plan.borrowed_target_object_of(&slot).unwrap(),
+            plan.object_identities.get(&slot.object).unwrap(),
+        ));
+        let mut absent = slot.clone();
+        absent.file_offset += 1;
+        assert_eq!(plan.ordinal_count(&absent), 0);
+        assert_eq!(plan.borrowed_ordinals_of(&absent).count(), 0);
+        absent.object = PinnedObjectId(u32::MAX);
+        assert!(plan.borrowed_target_object_of(&absent).is_none());
+    }
 
     fn manifest_with(functions: Vec<FunctionRecord>) -> Manifest {
         Manifest {
@@ -3194,11 +6888,15 @@ mod tests {
         let object = PinnedObjectId(key.inode as u32);
         ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object,
             entry_objects: vec![vec![object; entries.len()]],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -3218,9 +6916,297 @@ mod tests {
                     file_offset: Some(0),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![],
             },
+        }
+    }
+
+    #[test]
+    fn native_short_prefix_without_bad_targets_remains_semantically_incomplete() {
+        for words in [0, 1, 3, 67] {
+            let mut module = scanned_with(
+                TEST_OBJECT,
+                "/opt/p11.so",
+                if words == 0 { vec![] } else { vec![0x10] },
+            );
+            let table = &mut module.scanned.tables[0];
+            for entry in &mut table.entries {
+                entry.name = "C_Initialize";
+            }
+            table.walk = "known_prefix";
+            table.live_return = true;
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .take(words)
+                .skip(1)
+                .map(|field| field.name)
+                .collect();
+            assert!(table.unpinned.is_empty());
+            let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+            assert_eq!(plan.slots.len(), usize::from(words > 0));
+            assert_eq!(plan.entries_seen, words);
+            assert!(plan.slots.iter().all(|slot| !slot.semantic_authorized));
+            let claims =
+                semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+            assert!(
+                claims.incomplete.contains(&module.object),
+                "{words} observed words cannot prove the missing tail"
+            );
+            if words > 0 {
+                assert_eq!(plan.slots[0].names, ["C_Initialize"]);
+                assert!(claims.providers[&module.object].contains(&AttachKey {
+                    object: module.object,
+                    file_offset: 0x10,
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn native_complete_all_null_inventory_remains_a_complete_empty_observation() {
+        for version in [(2, 40), (3, 0), (3, 1), (3, 2), (4, 19)] {
+            let mut module = scanned_with(TEST_OBJECT, "/opt/p11.so", []);
+            let table = &mut module.scanned.tables[0];
+            table.live_return = true;
+            table.version = version;
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| field.name)
+                .collect();
+            let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+            assert!(plan.slots.is_empty());
+            assert_eq!(plan.entries_seen, 68);
+            let claims = semantic_source_claims(&[module], &[], &PinnedObjects::empty());
+            assert!(claims.incomplete.is_empty());
+        }
+    }
+
+    /// A 3.2-labelled 68-slot prefix the scan proved complete: the full
+    /// declared extent was readable with the first structural failure in
+    /// `68..92`, no 3.x getter is exported, and every retained entry
+    /// agrees with its export. Every surface publisher reports it `full`.
+    fn proven_legacy_module() -> ReconciledModule {
+        use crate::discovery::scan::ScannedEntry;
+
+        let mut module = scanned_with(TEST_OBJECT, "/opt/p11.so", []);
+        module.scanned.tables[0].version = (3, 2);
+        module.scanned.tables[0].walk = "known_prefix";
+        module.scanned.tables[0].entries = (0..68)
+            .map(|ordinal| ScannedEntry {
+                name: pkcs11_module::function_name(ordinal).unwrap(),
+                object: TEST_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x500 + ordinal as u64 * 8,
+            })
+            .collect();
+        module.scanned.tables[0].extension_impossible = true;
+        module.entry_objects = vec![vec![module.object; 68]];
+        module.exports = (0..68)
+            .map(|ordinal| {
+                (
+                    pkcs11_module::function_name(ordinal).unwrap().to_string(),
+                    0x500 + ordinal as u64 * 8,
+                )
+            })
+            .collect();
+        module
+    }
+
+    #[test]
+    fn a_proven_legacy_prefix_is_not_semantically_incomplete() {
+        // The scan proof, the plan surface and semantic completeness agree:
+        // one proven table is `full` everywhere, never refused as an
+        // incomplete provider in one place while reported `full` in another.
+        let module = proven_legacy_module();
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+        assert_eq!(plan.surfaces.len(), 1);
+        assert_eq!(plan.surfaces[0].walk, "full");
+        let claims =
+            semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert!(
+            !claims.incomplete.contains(&module.object),
+            "a proven prefix is semantically complete"
+        );
+    }
+
+    #[test]
+    fn a_proven_legacy_prefix_with_a_getter_or_a_fault_stays_semantically_incomplete() {
+        // The proof's refusals reach semantic completeness too: a getter in
+        // any symbol type, or a faulted exports walk, keeps the module in
+        // `incomplete` exactly as it keeps the surface `known_prefix`.
+        for (getter_present, witness_fault) in [(true, false), (false, true)] {
+            let mut module = proven_legacy_module();
+            module.getter_present = getter_present;
+            module.witness_fault = witness_fault;
+            let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+            assert_eq!(plan.surfaces[0].walk, "known_prefix");
+            let claims =
+                semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+            assert!(
+                claims.incomplete.contains(&module.object),
+                "getter={getter_present} fault={witness_fault} stays incomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proven_prefix_linked_by_an_interface_record_publishes_no_full_walk() {
+        // An interface record linking the table keeps the raw decoder walk
+        // on the table surface too: one table never publishes both `full`
+        // and `known_prefix`.
+        use crate::discovery::scan::ScannedInterface;
+
+        let mut module = proven_legacy_module();
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        });
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+        assert_eq!(plan.surfaces.len(), 2);
+        assert!(
+            plan.surfaces
+                .iter()
+                .all(|surface| surface.walk == "known_prefix"),
+            "no surface publishes full for a linked table: {:?}",
+            plan.surfaces
+                .iter()
+                .map(|surface| &surface.walk)
+                .collect::<Vec<_>>()
+        );
+        let claims =
+            semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert!(
+            claims.incomplete.contains(&module.object),
+            "a linked table stays semantically incomplete"
+        );
+    }
+
+    fn pinnable_null_manifest() -> Manifest {
+        let path = "/bin/true";
+        let file = p11scope_manifest::identity::open_object(std::path::Path::new(path)).unwrap();
+        let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let identity = p11scope_manifest::identity::inspect_file(&file)
+            .unwrap()
+            .identity;
+        let mut manifest = manifest_with(
+            pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| rec(field.name, Resolution::NullPointer))
+                .collect(),
+        );
+        manifest.module_path = path.into();
+        manifest.objects[0].path = path.into();
+        manifest.objects[0].identity = identity.clone();
+        manifest.provenance_objects[0] = ProvenanceObject {
+            path: path.into(),
+            device_major: key.device_major,
+            device_minor: key.device_minor,
+            inode: key.inode,
+            identity,
+        };
+        manifest.surfaces[0].version = Some(Version {
+            major: 2,
+            minor: 40,
+        });
+        manifest
+    }
+
+    #[test]
+    fn normalized_historical_full_prefix_has_partial_walk_and_no_complete_authority() {
+        let mut manifest = pinnable_null_manifest();
+        let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        manifest.surfaces[0].version = Some(Version { major: 2, minor: 0 });
+        manifest.surfaces[0].functions.truncate(67);
+        let plan = build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        assert_eq!(plan.surfaces[0].walk, "known_prefix");
+        assert_eq!(plan.entries_seen, 67);
+        assert!(!crate::manifest_input::selection_surface_usable(
+            &manifest.surfaces[0]
+        ));
+        let claims = semantic_source_claims(&[], &[manifest], &pins);
+        assert_eq!(claims.incomplete.len(), 1);
+    }
+
+    #[test]
+    fn normalized_header_uncertainty_does_not_invent_missing_function_demand() {
+        let mut manifest = pinnable_null_manifest();
+        let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        manifest.surfaces[0].version = None;
+        manifest.surfaces[0].walk = WalkOutcome::Unreadable {
+            detail: "version header unavailable".into(),
+        };
+        let claims = semantic_source_claims(&[], std::slice::from_ref(&manifest), &pins);
+        assert!(
+            claims.incomplete.is_empty(),
+            "all 68 function words are observed"
+        );
+        assert!(!crate::manifest_input::selection_surface_usable(
+            &manifest.surfaces[0]
+        ));
+        manifest.surfaces[0].functions.pop();
+        let claims = semantic_source_claims(&[], &[manifest], &pins);
+        assert_eq!(
+            claims.incomplete.len(),
+            1,
+            "a missing function word remains unknown"
+        );
+    }
+
+    #[test]
+    fn manifest_missing_tail_prevents_provider_completeness_but_metadata_does_not() {
+        let mut manifest = pinnable_null_manifest();
+        manifest.surfaces[0].version = Some(Version {
+            major: 0,
+            minor: 255,
+        });
+        manifest.surfaces[0].walk = WalkOutcome::KnownPrefix;
+        for interface in [false, true] {
+            let mut manifest = manifest.clone();
+            let surface_index = usize::from(interface);
+            if interface {
+                manifest.surfaces[0].source = SurfaceSource::Interface {
+                    index: 0,
+                    raw_name_hex: Some("504b4353203131".into()),
+                    name_lossy: Some("PKCS 11".into()),
+                    name_error: None,
+                    flags: 0,
+                    classification: InterfaceClassification::ExactStandard,
+                };
+                manifest.surfaces.insert(
+                    0,
+                    SurfaceRecord {
+                        source: SurfaceSource::LegacyFunctionList,
+                        acquisition: Acquisition::Absent,
+                        version: None,
+                        walk: WalkOutcome::NotWalked,
+                        functions: vec![],
+                    },
+                );
+                manifest.interface_list = Acquisition::Ok;
+            }
+            let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+            let claims = semantic_source_claims(&[], std::slice::from_ref(&manifest), &pins);
+            assert!(
+                claims.incomplete.is_empty(),
+                "complete common inventory is independent of version metadata"
+            );
+            manifest.surfaces[surface_index].walk = WalkOutcome::Unreadable {
+                detail: "slot 3 unavailable".into(),
+            };
+            manifest.surfaces[surface_index].functions.truncate(3);
+            let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+            let claims = semantic_source_claims(&[], &[manifest], &pins);
+            assert_eq!(
+                claims.incomplete.len(),
+                1,
+                "observed NULLs cannot certify the unavailable tail"
+            );
         }
     }
 
@@ -3245,6 +7231,7 @@ mod tests {
                 file_offset: Some(index as u64 * 0x1000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             })
             .collect();
         scanned.entry_objects = vec![vec![object]; count];
@@ -3271,6 +7258,274 @@ mod tests {
         plan.modules = modules;
         plan.entries_seen = plan.slots.len();
         plan
+    }
+
+    fn object_slot(index: u32, names: &[&str], descriptor_index: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index,
+            object: PinnedObjectId(7),
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x1000 + u64::from(index),
+            names: names.iter().map(|name| name.to_string()).collect(),
+            aliased: names.len() >= 2,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(0)],
+        }
+    }
+
+    fn object_plan(slots: Vec<Slot>) -> AttachPlan {
+        AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::Detailed).unwrap()
+    }
+
+    #[test]
+    fn counter_policy_conversion_preserves_plan() {
+        let mut detailed = object_plan(vec![
+            object_slot(0, &["C_SignInit"], 43),
+            object_slot(1, &["C_Sign"], 43),
+            object_slot(2, &["C_Verify"], 43),
+        ]);
+        detailed.deactivate(1);
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        let converted = detailed.with_counters_policy(budget).unwrap();
+        assert!(matches!(
+            converted.admission_policy(),
+            AdmissionPolicy::Counters(budget) if budget.endpoint_limit() == 8192
+        ));
+        assert_eq!(converted.slots, detailed.slots);
+        assert_eq!(converted.modules, detailed.modules);
+        for index in 0..3 {
+            assert_eq!(
+                converted.is_active(index),
+                detailed.is_active(index),
+                "activity survives conversion"
+            );
+        }
+        assert!(!converted.is_active(1));
+        // Over-budget conversion refuses without mutating the source.
+        let tight = crate::capacity::CounterBudget::new(2).unwrap();
+        assert!(detailed.with_counters_policy(tight).is_err());
+        assert!(matches!(
+            detailed.admission_policy(),
+            AdmissionPolicy::Detailed
+        ));
+    }
+
+    #[test]
+    fn counter_consumed_adoption_restores_staged_prefix() {
+        let rebuilt = object_plan(vec![
+            object_slot(0, &["C_SignInit"], 43),
+            object_slot(1, &["C_Sign"], 43),
+            object_slot(2, &["C_Verify"], 43),
+        ]);
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        let mut rebuilt = rebuilt.with_counters_policy(budget).unwrap();
+        assert_eq!(rebuilt.counter_consumed_end(), 0);
+        rebuilt.adopt_counter_consumed(2).unwrap();
+        assert_eq!(rebuilt.counter_consumed_end(), 2);
+        assert!(rebuilt.adopt_counter_consumed(4).is_err());
+        assert_eq!(rebuilt.counter_consumed_end(), 2);
+    }
+
+    #[test]
+    fn object_producer_plan_eligibility_requires_current_authority() {
+        use ObjectSlotEligibility::{Eligible, Refused};
+        let plan = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible {
+                descriptor_index: 43
+            }
+        );
+        // Missing slots and index/owner bookkeeping refuse without authority.
+        assert!(matches!(
+            plan.object_slot_eligibility(7),
+            Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                ..
+            }
+        ));
+        let mut moved = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        moved.slots[0].index = 5;
+        assert!(matches!(
+            moved.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                ..
+            }
+        ));
+        let mut unowned = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        unowned.slots[0].module_ids.clear();
+        assert!(matches!(
+            unowned.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                ..
+            }
+        ));
+        let mut rival = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        rival.slots[0].module_ids.push(ModuleId(1));
+        assert!(matches!(
+            rival.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+        // Attestation and S1 consistency gate before any protocol reading.
+        let mut unattested = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        unattested.slots[0].semantic_authorized = false;
+        assert!(matches!(
+            unattested.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Unattested,
+                ..
+            }
+        ));
+        let mut vague = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        vague.slots[0].semantic_ambiguous = true;
+        assert!(matches!(
+            vague.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+        let mut drifted = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        drifted.slots[0].semantics = SlotSemantics::COUNT_ONLY;
+        assert!(matches!(
+            drifted.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+        let mut wild = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        wild.slots[0].descriptor_index = 105;
+        assert!(matches!(
+            wild.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn object_producer_plan_eligibility_refuses_count_only_none_and_ambiguous() {
+        use crate::kinds::AliasAgreement;
+        use ObjectSlotEligibility::{Eligible, Refused};
+        // Eligible names never upgrade a frozen count-only slot.
+        let plan = object_plan(vec![object_slot(0, &["C_CreateObject"], 0)]);
+        assert!(matches!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        ));
+        // Ordinary functions carry no object protocol.
+        let plan = object_plan(vec![object_slot(0, &["C_Sign"], 44)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        );
+        // S1 ambiguity, object disagreement and unknown names refuse.
+        let plan = object_plan(vec![object_slot(0, &["C_SignInit", "C_VerifyInit"], 43)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::S1Ambiguous,
+            }
+        );
+        let plan = object_plan(vec![object_slot(
+            0,
+            &["C_DestroyObject", "C_GetObjectSize"],
+            23,
+        )]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::ObjectDisagree,
+            }
+        );
+        let plan = object_plan(vec![object_slot(0, &["C_Nonexistent"], 43)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::S1Ambiguous,
+            }
+        );
+        // Vacuous agreement on empty names grants nothing without a cookie.
+        let plan = object_plan(vec![object_slot(0, &[], 0)]);
+        assert!(matches!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        ));
+        // Control: the agreeing alias pair stays eligible.
+        let plan = object_plan(vec![object_slot(
+            0,
+            &["C_VerifyInit", "C_VerifySignatureInit"],
+            49,
+        )]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible {
+                descriptor_index: 49
+            }
+        );
+    }
+
+    #[test]
+    fn object_producer_plan_eligibility_preserves_frozen_cookie_and_rechecks_extensions() {
+        use crate::kinds::AliasAgreement;
+        use ObjectSlotEligibility::{Eligible, Refused};
+        // An agreeing alias added by extension changes the lowest index,
+        // but eligibility keeps the frozen cookie.
+        let mut plan = object_plan(vec![object_slot(0, &["C_VerifySignatureInit"], 95)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible {
+                descriptor_index: 95
+            }
+        );
+        plan.slots[0].names.push("C_VerifyInit".into());
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible {
+                descriptor_index: 95
+            }
+        );
+        // A disagreeing extension is rechecked and refused.
+        plan.slots[0].names.push("C_SignInit".into());
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::S1Ambiguous,
+            }
+        );
+        // A cookie whose function left the names refuses.
+        let plan = object_plan(vec![object_slot(0, &["C_VerifyInit"], 95)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        );
     }
 
     #[test]
@@ -3433,6 +7688,149 @@ mod tests {
         assert!(plan.slots[0].semantic_ambiguous);
     }
 
+    fn prearm_piece(proved: Vec<(String, u64)>) -> PrearmPlanPiece {
+        PrearmPlanPiece {
+            object: TEST_PINNED_OBJECT,
+            key: TEST_OBJECT,
+            path: "/opt/p11.so".into(),
+            proved,
+            non_executable: Vec::new(),
+        }
+    }
+
+    fn build_with_prearm(
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        prearm: &[PrearmPlanPiece],
+    ) -> AttachPlan {
+        build_from_sources_with(
+            scanned,
+            manifests,
+            prearm,
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+                first_plan: None,
+                first_plan_had_provider: false,
+            },
+            false,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Named,
+            false,
+        )
+    }
+
+    #[test]
+    fn bare_prearm_stays_count_only_without_manifest_authority() {
+        // File selection is not attestation: export-proved targets stay
+        // named but count-only until an accepted manifest supplies authority.
+        let plan = build_with_prearm(&[], &[], &[prearm_piece(vec![("C_SignInit".into(), 0x10)])]);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_SignInit"]);
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!plan.slots[0].semantic_authorized);
+    }
+
+    #[test]
+    fn manifest_backed_prearm_keeps_semantic_authority() {
+        // Positive twin: the same export plus an accepted manifest claim
+        // for the same object authorizes the descriptor.
+        let manifest = manifest_with(vec![resolved("C_SignInit", 0x10)]);
+        let plan = build_with_prearm(
+            &[],
+            std::slice::from_ref(&manifest),
+            &[prearm_piece(vec![("C_SignInit".into(), 0x10)])],
+        );
+        assert_eq!(plan.slots.len(), 1);
+        assert!(plan.slots[0].semantic_authorized);
+        assert_ne!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(
+            plan.slots[0].semantics,
+            crate::kinds::descriptor("C_SignInit").unwrap()
+        );
+    }
+
+    fn inventory_budget_for_prearm_test(endpoints: u64) -> crate::capacity::InventoryBudget {
+        crate::capacity::InventoryBudget::new(endpoints, endpoints * 8).unwrap()
+    }
+
+    #[test]
+    fn inventory_policy_with_prearm_plans_proved_offsets_count_only() {
+        // Proved pre-arm offsets lower into an Inventory-policy plan like
+        // manifest-side operator input: count-only without
+        // independent manifest authority, carrying the Inventory admission
+        // policy the inventory attach set requires.
+        let budget = inventory_budget_for_prearm_test(4096);
+        let plan = build_from_sources_for_policy_scoped_with_prearm(
+            &[],
+            &[],
+            &[prearm_piece(vec![("C_SignInit".into(), 0x10)])],
+            &PinnedObjects::empty(),
+            AdmissionPolicy::Inventory(budget),
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.admission_policy(), AdmissionPolicy::Inventory(budget));
+        assert_eq!(plan.refused_modules().count(), 0);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_SignInit"]);
+        assert_eq!(plan.slots[0].file_offset, 0x10);
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!plan.slots[0].semantic_authorized);
+        assert!(plan.is_active(plan.slots[0].index));
+        plan.validate_slot_index().unwrap();
+    }
+
+    #[test]
+    fn inventory_policy_with_empty_prearm_builds_the_old_plan() {
+        // Additive-only: an empty pre-arm slice builds exactly the plan the
+        // old entry builds — every non-pre-arm capture is untouched.
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let policy = AdmissionPolicy::Inventory(inventory_budget_for_prearm_test(4096));
+        let old = build_from_sources_for_policy_scoped(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+            &PinnedObjects::empty(),
+            policy,
+            AdmissionScope::Shared,
+        );
+        let new = build_from_sources_for_policy_scoped_with_prearm(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+            &[],
+            &PinnedObjects::empty(),
+            policy,
+            AdmissionScope::Shared,
+        );
+        assert_eq!(old, new);
+    }
+
+    #[test]
+    fn inventory_policy_prearm_beyond_budget_is_refused_not_admitted() {
+        // No admission-cap change: proved offsets compete within the
+        // Inventory budget; past it the module is refused whole, never
+        // silently admitted beyond the cap.
+        let budget = inventory_budget_for_prearm_test(4096);
+        let proved: Vec<(String, u64)> = (0..5000u64)
+            .map(|index| (format!("C_Extra{index:04}"), 0x10 + index * 8))
+            .collect();
+        let plan = build_from_sources_for_policy_scoped_with_prearm(
+            &[],
+            &[],
+            &[prearm_piece(proved)],
+            &PinnedObjects::empty(),
+            AdmissionPolicy::Inventory(budget),
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.refused_modules().count(), 1);
+        assert!(plan.slots.is_empty());
+    }
+
     #[test]
     fn raw_key_cannot_authorize_a_distinct_pinned_object() {
         let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
@@ -3445,16 +7843,20 @@ mod tests {
         let plan = build_from_sources_with(
             std::slice::from_ref(&scanned),
             std::slice::from_ref(&manifest),
+            &[],
             |_, _| Some(manifest_object),
             |_, _| true,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
+                first_plan: None,
+                first_plan_had_provider: false,
             },
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
 
         assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
@@ -3487,16 +7889,20 @@ mod tests {
         let plan = build_from_sources_with(
             &[],
             std::slice::from_ref(&manifest),
+            &[],
             |_, _| Some(PinnedObjectId(1)),
             |_, _| false,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
+                first_plan: None,
+                first_plan_had_provider: false,
             },
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
         assert!(plan.slots.is_empty());
         assert_eq!(plan.entries_seen, 1);
@@ -3538,11 +7944,14 @@ mod tests {
 
     #[test]
     fn surface_summaries_are_populated_from_the_manifest() {
-        let m = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let m = manifest_with(vec![resolved("C_Initialize", 0x10)]);
         let p = build(&m);
         assert_eq!(p.surfaces.len(), 1);
         assert_eq!(p.surfaces[0].source, "legacy_function_list");
-        assert_eq!(p.surfaces[0].walk, "full");
+        assert_eq!(
+            p.surfaces[0].walk,
+            "known_prefix; version metadata unavailable"
+        );
         assert_eq!(p.surfaces[0].acquisition, "ok");
         assert_eq!(p.surfaces[0].functions, 1);
         assert_eq!(p.vendor_interfaces, 0);
@@ -3602,7 +8011,10 @@ mod tests {
             func_list_null: true,
         }];
         let p = build(&m);
-        assert_eq!(p.surfaces[0].walk, "known_prefix");
+        assert_eq!(
+            p.surfaces[0].walk,
+            "known_prefix; version metadata unavailable"
+        );
         assert_eq!(p.surfaces[0].acquisition, "error: partial read");
         assert_eq!(p.vendor_interfaces, 1);
         assert_eq!(p.interface_list, "error: boom");
@@ -3905,17 +8317,68 @@ mod tests {
         exact_plan(vec![], vec![exact_module(0, object)])
     }
 
+    #[test]
+    fn interface_only_helper_inventory_reaches_count_only_selection_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture");
+        let helper = dir.path().join("helper.so");
+        let provider = dir.path().join("provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-Wl,-soname,helper.so", "-o"])
+                .arg(&helper)
+                .arg(fixtures.join("helper.c"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-DINTERFACE_ONLY_FIXTURE=1", "-o"])
+                .arg(&provider)
+                .arg(fixtures.join("provider.c"))
+                .arg(&helper)
+                .arg(format!("-Wl,-rpath,{}", dir.path().display()))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let manifest = selection_recovery_tests::acquire_manifest(&provider);
+        assert_eq!(manifest.interface_list, Acquisition::Absent);
+        assert_eq!(manifest.surfaces[0].acquisition, Acquisition::Absent);
+        assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+        let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        let mut plan = build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        assert!(plan.slots.is_empty());
+        assert_eq!(plan.modules.len(), 1);
+        let allocated = plan.clone();
+        for (_, targets) in crate::discovery::engine::manifest_selection_targets(&manifest, &pins) {
+            plan.add_selection_table(&allocated, ModuleId(0), targets)
+                .unwrap();
+        }
+        assert_eq!(plan.slots.len(), 92);
+        assert!(plan.slots.iter().all(|slot| slot.descriptor_index == 0
+            && !slot.semantic_authorized
+            && slot.semantics == SlotSemantics::COUNT_ONLY));
+        assert!(
+            plan.slots
+                .iter()
+                .any(|slot| slot.names == ["C_MessageVerifyFinal"])
+        );
+    }
+
     fn selection_target(
         object: PinnedObjectId,
         file_offset: u64,
         name: &'static str,
     ) -> SelectionTableTarget {
-        SelectionTableTarget {
+        SelectionTableTarget::provider_local(
             object,
-            object_path: format!("/proc/self/fd/{}", object.0),
+            format!("/proc/self/fd/{}", object.0),
             file_offset,
             name,
-        }
+        )
     }
 
     #[test]
@@ -4402,6 +8865,7 @@ mod tests {
                 inode: u64::from(object.0),
             },
             path,
+            module_named: false,
             source: "manifest",
             tables: vec![],
             interfaces: 0,
@@ -4778,22 +9242,60 @@ mod tests {
         assert_eq!(plan.modules_skipped[0].subject, "/opt/crossing.so");
     }
 
+    /// Omission details with no holders and no remedies, for shape tests.
+    fn plain_omission(
+        omitted: usize,
+        capacity: usize,
+        in_use: usize,
+        retired: usize,
+        kept: usize,
+    ) -> GrowthOmission<'static> {
+        GrowthOmission {
+            omitted,
+            capacity,
+            in_use,
+            retired,
+            kept,
+            policy: AdmissionPolicy::Detailed,
+            holders: &[],
+            provider_remedies: false,
+            counter_hint: false,
+        }
+    }
+
     /// The omission record reads right in the singular and the plural, and
     /// keeps the prefix `is_growth_omission` and its consumers key on.
     #[test]
     fn growth_omission_reason_counts_endpoints_in_singular_and_plural() {
         assert_eq!(
-            growth_omission_reason(1, 512, 512, 0, 1),
+            growth_omission_reason(&plain_omission(1, 512, 512, 0, 1)),
             "admitted module needs 1 more; only 512 attach slots are available; 512 are in use \
              (512 active, 0 retired) — 1 endpoint not attached; kept its 1 attached endpoint"
         );
         assert_eq!(
-            growth_omission_reason(2, 512, 511, 11, 500),
+            growth_omission_reason(&plain_omission(2, 512, 511, 11, 500)),
             "admitted module needs 2 more; only 512 attach slots are available; 511 are in use \
              (500 active, 11 retired) — 2 endpoints not attached; kept its 500 attached endpoints"
         );
+        // A provider omission names what holds the room and the remedies.
+        let named = growth_omission_reason(&GrowthOmission {
+            omitted: 104,
+            capacity: 512,
+            in_use: 447,
+            retired: 0,
+            kept: 1,
+            policy: AdmissionPolicy::Detailed,
+            holders: &[("/usr/lib/libp11-kit.so.0", 309)],
+            provider_remedies: true,
+            counter_hint: false,
+        });
+        assert!(
+            named.contains("held by /usr/lib/libp11-kit.so.0 309"),
+            "{named}"
+        );
+        assert!(named.contains("--exclude-module"), "{named}");
         assert!(is_growth_omission(&growth_omission_reason(
-            1, 512, 512, 0, 1
+            &plain_omission(1, 512, 512, 0, 1)
         )));
         let whole = "module needs 2 more; only 512 attach slots are available; 511 are in use — \
                      refusing to attach a prefix";
@@ -4801,14 +9303,16 @@ mod tests {
         // The omitted count round-trips through the record the engine ranks.
         for omitted in [1, 2, 511, 2_113] {
             assert_eq!(
-                growth_omitted_count(&growth_omission_reason(omitted, 512, 511, 3, 7)),
+                growth_omitted_count(&growth_omission_reason(&plain_omission(
+                    omitted, 512, 511, 3, 7
+                ))),
                 Some(omitted)
             );
         }
         assert_eq!(growth_omitted_count(whole), None);
         assert_eq!(whole_refusal_needed_count(whole), Some(2));
         assert_eq!(
-            whole_refusal_needed_count(&growth_omission_reason(2, 512, 511, 3, 7)),
+            whole_refusal_needed_count(&growth_omission_reason(&plain_omission(2, 512, 511, 3, 7))),
             None
         );
         assert_eq!(
@@ -5004,7 +9508,11 @@ mod tests {
                 "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired) — 2 endpoints not \
                  attached; kept its {MAX_SLOTS} attached endpoints"
             )),
-            "{omission:?}"
+            "M5: the holder list excludes the omitted module itself: {omission:?}"
+        );
+        assert!(
+            omission.reason.contains("--exclude-module"),
+            "omissions name the remedy: {omission:?}"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -5099,6 +9607,7 @@ mod tests {
             file_offset: Some(0x9000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         });
         grown.entry_objects.push(vec![existing; 8]);
         let before = plan.clone();
@@ -5164,6 +9673,7 @@ mod tests {
                 file_offset: Some(0x9000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             },
         );
         grown.entry_objects.insert(0, vec![existing; 2]);
@@ -5189,11 +9699,12 @@ mod tests {
         assert_eq!(plan.slots, before.slots);
     }
 
-    /// G-03 against the heuristic cap (whole-branch review finding 1): the
+    /// G-03 for a whole-decided family (whole-branch review finding 1): the
     /// refused growth's new table sorts first and repeats one kept endpoint.
-    /// The kept-only retry must keep every kept endpoint — the newcomer table
-    /// must not consume one of the four cap slots, spill the old fourth
-    /// table, and retire its previously attached endpoint.
+    /// Five heuristic tables are a closure array, so the complete union is
+    /// refused at the ceiling and the kept-only retry must keep every kept
+    /// endpoint — the newcomer must not spill the old fourth table and retire
+    /// its previously attached endpoint.
     #[test]
     fn a_refused_growths_new_table_does_not_spill_a_kept_heuristic_table() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -5242,6 +9753,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -5362,6 +9874,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -5473,6 +9986,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -5576,6 +10090,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -5632,22 +10147,23 @@ mod tests {
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
     }
 
-    /// G-03 spill accounting (#3): a kept-holding table past
-    /// `MAX_TABLES_PER_OBJECT` with budget still available must route to
-    /// the refused-growth retry, not spill silently. The kept endpoint
-    /// stays, the table's fresh endpoint is omitted explicitly, and the
-    /// four genuinely-new tables spill counted exactly once each.
+    /// G-03 spill accounting (#3): a kept-holding table past the remaining
+    /// budget must route to the refused-growth retry, not spill silently. The
+    /// kept endpoint stays, the table's fresh endpoint is omitted explicitly,
+    /// and the three other tables spill counted exactly once each. (A fifth
+    /// heuristic table would make the object a closure array, decided whole;
+    /// the budget, not the cap, is the frontier here.)
     #[test]
-    fn a_kept_table_past_the_heuristic_cap_routes_to_the_refused_growth_retry() {
+    fn a_kept_table_past_the_budget_routes_to_the_refused_growth_retry() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
 
         let existing = PinnedObjectId(10);
         let filler = PinnedObjectId(12);
         let key = scanned_key(existing);
-        // One kept endpoint plus a little filler: every fresh endpoint
-        // would fit by budget, so only the per-object cap can refuse.
+        // One kept endpoint plus filler to two slots short of the ceiling:
+        // the first two new tables fit, the kept-holding third does not.
         let mut slots = vec![exact_slot(0, existing, 0, 0, vec![ModuleId(0)])];
-        slots.extend((0..10u32).map(|index| {
+        slots.extend((0..MAX_SLOTS - 3).map(|index| {
             exact_slot(
                 1 + index,
                 filler,
@@ -5661,9 +10177,9 @@ mod tests {
             vec![exact_module(0, existing), exact_module(1, filler)],
         );
 
-        // Equal heuristic evidence keeps discovery order: four new tables
-        // admit onto the four cap slots, and the fifth table — holding the
-        // kept endpoint — reaches the cap branch with budget to spare.
+        // Equal heuristic evidence keeps discovery order: the first two new
+        // tables admit, and the third — holding the kept endpoint — reaches
+        // the budget branch with nothing left to spend.
         let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -5682,26 +10198,25 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
             table(0x7000, 0x0000, &[0x10000]),
             table(0x7100, 0x1000, &[0x10008]),
-            table(0x7200, 0x2000, &[0x10010]),
-            table(0x7300, 0x3000, &[0x10018]),
-            table(0x7400, 0x4000, &[0, 0x10020]),
+            table(0x7200, 0x2000, &[0, 0x10020]),
+            table(0x7300, 0x3000, &[0x10010]),
         ];
         grown.entry_objects = vec![
             vec![existing],
             vec![existing],
-            vec![existing],
-            vec![existing],
             vec![existing; 2],
+            vec![existing],
         ];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
-            (0..10u32).map(|index| 0x2000 + u64::from(index) * 8),
+            (0..MAX_SLOTS - 3).map(|index| 0x2000 + u64::from(index) * 8),
         );
 
         let rebuilt =
@@ -5727,8 +10242,8 @@ mod tests {
             rebuilt.modules_skipped[0]
         );
         assert_eq!(
-            rebuilt.uncorroborated_candidates, 4,
-            "the four genuinely-new tables spill exactly once each"
+            rebuilt.uncorroborated_candidates, 3,
+            "the three other tables spill exactly once each"
         );
         let kept: Vec<u64> = rebuilt
             .slots
@@ -5747,15 +10262,14 @@ mod tests {
         );
         assert!(delta.new.is_empty());
         assert!(delta.replace.is_empty());
-        assert_eq!(plan.active_slot_count(), 11);
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 2);
     }
 
     /// C1: an unchanged provider whose five heuristic tables share the same
-    /// attached endpoints must not record a growth refusal. The fifth table
-    /// reaches the cap branch with zero fresh demand, so it routes to the
-    /// kept-only retry for preservation — with empty total demand no
-    /// omission is recorded, every endpoint stays attached, and the snapshot
-    /// stays COMPLETE (`modules_skipped` empty).
+    /// attached endpoints must not record a growth refusal. Five tables are
+    /// a closure array, decided whole: with zero fresh demand the union fits,
+    /// no omission is recorded, every endpoint stays attached, and the
+    /// snapshot stays COMPLETE (`modules_skipped` empty).
     #[test]
     fn an_unchanged_provider_past_the_heuristic_cap_records_no_refusal() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -5784,9 +10298,9 @@ mod tests {
             vec![exact_module(0, existing), exact_module(1, filler)],
         );
 
-        // Equal heuristic evidence keeps discovery order: four tables admit
-        // onto the four cap slots, and the fifth — listing the same two
-        // attached endpoints — reaches the cap branch with nothing fresh.
+        // Equal heuristic evidence keeps discovery order; all five tables
+        // list the same two attached endpoints, so the whole union carries
+        // zero fresh demand and admits.
         let table = |address: u64, file_offset: u64| ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -5805,6 +10319,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut unchanged = scanned_with(key, "/proc/self/fd/10", []);
         unchanged.scanned.tables = vec![
@@ -5835,7 +10350,7 @@ mod tests {
         );
         assert_eq!(
             rebuilt.uncorroborated_candidates, 0,
-            "the fifth table routes to the kept-only retry and admits there, it does not spill"
+            "the whole union admits, it does not spill"
         );
         let kept: Vec<u64> = rebuilt
             .slots
@@ -5857,14 +10372,13 @@ mod tests {
         assert_eq!(plan.active_slot_count(), 12);
     }
 
-    /// D1: a zero-demand kept table past the cap must be preserved without
-    /// a refusal. The provider owns four attached endpoints; the refresh
-    /// adds an earlier alias table, so five distinct single-endpoint
-    /// heuristic tables ([0], [0], [8], [16], [24]) overflow the cap. The
-    /// fifth holds kept 24 with zero fresh demand: attached is not
-    /// surviving-in-admitted-tables, so it must route to the kept-only
-    /// retry (where the cap is bypassed) instead of spilling — and with
-    /// empty total demand no omission is recorded (COMPLETE intact).
+    /// D1: a zero-demand kept table in a whole-decided family must be
+    /// preserved without a refusal. The provider owns four attached
+    /// endpoints; the refresh adds an earlier alias table, so five distinct
+    /// single-endpoint heuristic tables ([0], [0], [8], [16], [24]) are a
+    /// closure array, decided whole. The fifth holds kept 24 with zero fresh
+    /// demand: the whole union fits, so nothing spills — and with empty
+    /// total demand no omission is recorded (COMPLETE intact).
     #[test]
     fn a_zero_demand_kept_table_past_the_cap_is_preserved_without_a_refusal() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -5895,10 +10409,9 @@ mod tests {
             vec![exact_module(0, existing), exact_module(1, filler)],
         );
 
-        // Equal heuristic evidence keeps discovery order: the first four
-        // single-endpoint tables admit onto the four cap slots, and the
-        // fifth — holding only kept 24 — reaches the cap branch with
-        // nothing fresh.
+        // Equal heuristic evidence keeps discovery order; every table holds
+        // only kept endpoints, so the whole union carries zero fresh demand
+        // and admits.
         let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -5917,6 +10430,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut refreshed = scanned_with(key, "/proc/self/fd/10", []);
         refreshed.scanned.tables = vec![
@@ -5954,7 +10468,7 @@ mod tests {
         assert_eq!(kept, [0, 8, 16, 24], "every kept endpoint stays slotted");
         assert_eq!(
             rebuilt.uncorroborated_candidates, 0,
-            "the fifth table routes to the kept-only retry, it does not spill"
+            "the whole union admits, nothing spills"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -6052,7 +10566,8 @@ mod tests {
                 reason: format!(
                     "module needs 2 more; only {MAX_SLOTS} attach slots are available; \
                      {admitted} are in use ({admitted} active, 0 retired) — refusing to attach \
-                     a prefix"
+                     a prefix; to capture one provider, name it with --module <path>; to free \
+                     slots, exclude an unneeded module with --exclude-module <name>"
                 ),
             }]
         );
@@ -6118,6 +10633,7 @@ mod tests {
             file_offset: Some(0x9000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         });
         grown.entry_objects.push(vec![existing; 8]);
         // Equal published evidence keeps discovery order: the attached table
@@ -6210,10 +10726,12 @@ mod tests {
         let rebuilt = plan.rebuild_from_sources_with(
             &[],
             std::slice::from_ref(&manifest),
+            &[],
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
             false,
             AdmissionPolicy::detailed(),
+            false,
         );
 
         assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 1);
@@ -6226,11 +10744,17 @@ mod tests {
         );
         // The re-admitted endpoint is not called new.
         assert!(
-            omission.reason.ends_with(&format!(
+            omission.reason.contains(&format!(
                 "— 1 endpoint not attached; kept its {} attached endpoints",
                 MAX_SLOTS - 1
             )),
             "{omission:?}"
+        );
+        assert!(
+            omission
+                .reason
+                .ends_with("exclude an unneeded module with --exclude-module <name>"),
+            "omissions name the remedy: {omission:?}"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -6371,10 +10895,13 @@ mod tests {
                 slots: plan.slots.len(),
                 active: &plan.slot_by_key,
                 owned: &plan.active_keys_by_owner(),
+                first_plan: Some(&plan.first_plan_objects),
+                first_plan_had_provider: plan.first_plan_had_provider,
             },
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
 
         assert_eq!(rebuilt.modules.len(), 1);
@@ -6539,21 +11066,509 @@ mod tests {
         assert!(delta.retire.is_empty());
     }
 
-    #[test]
-    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_stays_k4() {
-        let scanned = scanned_with_heuristic_tables(64);
+    fn counters_policy(endpoints: u64) -> AdmissionPolicy {
+        AdmissionPolicy::counters(crate::capacity::CounterBudget::new(endpoints).unwrap())
+    }
 
-        let detailed = build_from_reconciled_modules(std::slice::from_ref(&scanned));
+    fn counters_plan(slots: Vec<Slot>, modules: Vec<ModuleSummary>, endpoints: u64) -> AttachPlan {
+        let mut plan =
+            AttachPlan::from_slots_with_policy(slots, counters_policy(endpoints)).unwrap();
+        plan.modules = modules;
+        plan.entries_seen = plan.slots.len();
+        plan
+    }
+
+    fn counter_history_plan(count: u32) -> AttachPlan {
+        let object = PinnedObjectId(7);
+        counters_plan(
+            (0..count)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        object,
+                        0x10 + u64::from(index) * 0x10,
+                        0,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .collect(),
+            vec![exact_module(0, object)],
+            8,
+        )
+    }
+
+    #[test]
+    fn counter_consumed_history_prevents_tail_withdrawal() {
+        let mut history = counter_history_plan(2);
+        assert_eq!(history.counter_consumed_end(), 0);
+        history.consume_counter_extent(0, 2).unwrap();
+        history.deactivate(1);
+        let consumed = history.clone();
+
+        // Even a never-published rollback consumed its original ordinal.
+        history.withdraw_unlinked_additions(1);
+        assert_eq!(history, consumed, "consumed rollback holes stay allocated");
+
+        let delta = history.extend_exact(counter_history_plan(2)).unwrap();
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 2, "the retry needs a fresh ordinal");
+        assert_eq!(
+            AttachKey::of(&delta.new[0]),
+            AttachKey::of(&history.slots[1])
+        );
+        assert_eq!(history.slots[..2], consumed.slots);
+        assert_eq!(history.counter_consumed_end(), 2);
+
+        // A later planning-only cell still has the ordinary cleanup behavior.
+        history.deactivate(2);
+        history.withdraw_unlinked_additions(1);
+        assert_eq!(history.slots, consumed.slots);
+        assert_eq!(history.counter_consumed_end(), 2);
+        let delta = history.extend_exact(counter_history_plan(2)).unwrap();
+        assert_eq!(delta.new[0].index, 2);
+        history.consume_counter_extent(2, 3).unwrap();
+        assert_eq!(history.counter_consumed_end(), 3);
+        assert!(!history.is_active(1) && history.is_active(2));
+        assert!(history.validate_slot_index().is_ok());
+    }
+
+    #[test]
+    fn counter_consumed_history_prevents_tail_compaction() {
+        let mut history = counter_history_plan(3);
+        history.consume_counter_extent(0, 3).unwrap();
+        history.extend_exact(counter_history_plan(5)).unwrap();
+        for index in [1, 2, 3] {
+            history.deactivate(index);
+        }
+        let prefix = history.slots[..3].to_vec();
+        let fresh_key = AttachKey::of(&history.slots[4]);
+
+        let mapping = history.excise_unlinked_tail_cells(1, &BTreeSet::from([1, 2, 3, 99]));
+        assert_eq!(mapping, [0, 1, 2, u32::MAX, 3]);
+        assert_eq!(history.slots[..3], prefix);
+        assert_eq!(history.slots.len(), 4);
+        assert_eq!(history.slots[3].index, 3);
+        assert_eq!(AttachKey::of(&history.slots[3]), fresh_key);
+        assert!(history.is_active(0) && history.is_active(3));
+        assert!(!history.is_active(1) && !history.is_active(2));
+        assert_eq!(history.counter_consumed_end(), 3);
+        assert!(history.validate_slot_index().is_ok());
+
+        history.consume_counter_extent(3, 4).unwrap();
+        assert_eq!(history.counter_consumed_end(), 4);
+        assert_eq!(history.slots[..3], prefix);
+    }
+
+    #[test]
+    fn counter_consumption_refuses_invalid_extents_without_mutation() {
+        for policy in [AdmissionPolicy::Detailed, inventory_policy(8)] {
+            let mut plan =
+                AttachPlan::from_slots_with_policy(counter_history_plan(2).slots, policy).unwrap();
+            let before = plan.clone();
+            assert_eq!(
+                plan.consume_counter_extent(0, 2),
+                Err(CounterHistoryError::Policy)
+            );
+            assert_eq!(plan, before);
+        }
+
+        let initial = counter_history_plan(2);
+        for (first, end, expected) in [
+            (0, 0, CounterHistoryError::Extent),
+            (0, 1, CounterHistoryError::Extent),
+            (0, 3, CounterHistoryError::Extent),
+            (1, 2, CounterHistoryError::Frontier),
+            (0, u32::MAX, CounterHistoryError::Extent),
+        ] {
+            let mut plan = initial.clone();
+            assert_eq!(plan.consume_counter_extent(first, end), Err(expected));
+            assert_eq!(
+                plan, initial,
+                "refused extent [{first},{end}) mutates nothing"
+            );
+        }
+        let mut sparse = initial.clone();
+        sparse.slots[1].index = 7;
+        let mut inactive = initial.clone();
+        inactive.deactivate(1);
+        for mut plan in [sparse, inactive] {
+            let before = plan.clone();
+            assert_eq!(
+                plan.consume_counter_extent(0, 2),
+                Err(CounterHistoryError::Topology)
+            );
+            assert_eq!(plan, before);
+        }
+
+        let mut history = initial;
+        history.consume_counter_extent(0, 2).unwrap();
+        let before = history.clone();
+        assert_eq!(
+            history.consume_counter_extent(0, 2),
+            Err(CounterHistoryError::Frontier)
+        );
+        assert_eq!(
+            history, before,
+            "consumption cannot replay or refund an extent"
+        );
+
+        // Make an otherwise consistent short plan: only its consumed floor is wrong.
+        let mut truncated = history.clone();
+        truncated.slots.truncate(1);
+        truncated.aggregate_owners.truncate(1);
+        truncated.slot_by_key.retain(|_, position| *position < 1);
+        assert!(truncated.validate_slot_index().is_err());
+        let mut changed_policy = history;
+        changed_policy.admission_policy = AdmissionPolicy::Detailed;
+        assert!(changed_policy.validate_slot_index().is_err());
+    }
+
+    #[test]
+    fn counter_consumption_preserves_inactive_published_positions() {
+        let mut history = counter_history_plan(2);
+        history.consume_counter_extent(0, 2).unwrap();
+        let consumed = history.clone();
+        assert_eq!(
+            consumed.counter_consumed_end(),
+            2,
+            "clone retains consumption"
+        );
+        let before = history.clone();
+        assert!(
+            history
+                .attested_subset(&BTreeSet::from([PinnedObjectId(7)]), &BTreeSet::new())
+                .is_err(),
+            "a consumed plan cannot become a fresh renumbered subset"
+        );
+        assert_eq!(history, before);
+
+        let delta = history.extend_exact(counter_history_plan(3)).unwrap();
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 2);
+        assert_eq!(history.counter_consumed_end(), 2);
+        assert_eq!(history.slots[..2], consumed.slots);
+        history.consume_counter_extent(2, 3).unwrap();
+
+        // Publication belongs to the directory. A consumed row may already
+        // be published; inactivity cannot erase its original identity/owner.
+        let old = history.slots[1].clone();
+        history.deactivate(1);
+        let mapping = history.excise_unlinked_tail_cells(0, &BTreeSet::from([1]));
+        assert_eq!(mapping, [0, 1, 2]);
+        assert_eq!(history.slots[1], old);
+        assert_eq!(history.module_of_slot(1), Some(ModuleId(0)));
+        assert_eq!(history.active_module_of_slot(1), None);
+        assert!(!history.is_active(1));
+        assert_eq!(history.counter_consumed_end(), 3);
+        assert_eq!(consumed.counter_consumed_end(), 2, "clone is independent");
+        assert!(history.validate_slot_index().is_ok());
+    }
+
+    #[test]
+    fn unconsumed_policies_preserve_tail_cleanup() {
+        for policy in [
+            AdmissionPolicy::Detailed,
+            inventory_policy(8),
+            counters_policy(8),
+        ] {
+            let fixture = counter_history_plan(3);
+            let mut initial = AttachPlan::from_slots_with_policy(fixture.slots, policy).unwrap();
+            initial.modules = fixture.modules;
+            assert_eq!(initial.counter_consumed_end(), 0);
+
+            let mut withdrawn = initial.clone();
+            withdrawn.deactivate(1);
+            withdrawn.deactivate(2);
+            withdrawn.withdraw_unlinked_additions(1);
+            assert_eq!(withdrawn.slots, initial.slots[..1]);
+            assert_eq!(withdrawn.counter_consumed_end(), 0);
+            assert!(withdrawn.validate_slot_index().is_ok());
+
+            let mut compacted = initial.clone();
+            compacted.deactivate(1);
+            assert_eq!(
+                compacted.excise_unlinked_tail_cells(1, &BTreeSet::from([0, 1, 99])),
+                [0, u32::MAX, 1]
+            );
+            assert_eq!(compacted.slots[0], initial.slots[0]);
+            assert_eq!(compacted.slots[1].index, 1);
+            assert_eq!(
+                AttachKey::of(&compacted.slots[1]),
+                AttachKey::of(&initial.slots[2])
+            );
+            assert_eq!(compacted.counter_consumed_end(), 0);
+            assert!(compacted.validate_slot_index().is_ok());
+
+            let mut active_tail = initial.clone();
+            active_tail.deactivate(1);
+            let before = active_tail.clone();
+            active_tail.withdraw_unlinked_additions(1);
+            assert_eq!(
+                active_tail, before,
+                "active tail cells still prevent withdrawal"
+            );
+
+            let subset = initial
+                .attested_subset(&BTreeSet::from([PinnedObjectId(7)]), &BTreeSet::new())
+                .unwrap();
+            assert_eq!(subset.slots, initial.slots);
+            assert_eq!(subset.counter_consumed_end(), 0);
+        }
+        let default = AttachPlan::from_slots(counter_history_plan(1).slots);
+        assert_eq!(default.admission_policy(), AdmissionPolicy::Detailed);
+        assert_eq!(default.counter_consumed_end(), 0);
+    }
+
+    #[test]
+    fn counters_admits_a_complete_union_and_refuses_a_module_whole() {
+        let sources: Vec<_> = (0..3)
+            .map(|index| {
+                scanned_with(
+                    ObjectKey {
+                        device: TEST_OBJECT.device,
+                        inode: TEST_OBJECT.inode + index,
+                    },
+                    &format!("/opt/counter-{index}.so"),
+                    (0..4).map(|n| n * 8),
+                )
+            })
+            .collect();
+        let plan = build_from_test_sources_with_policy(&sources, &[], counters_policy(12));
+        assert_eq!(plan.slots.len(), 12);
+        assert!(plan.modules_skipped.is_empty());
+        assert_eq!(plan.admission_policy(), counters_policy(12));
+        assert!(plan.slots.iter().all(|slot| slot.descriptor_index == 0
+            && slot.semantics == SlotSemantics::COUNT_ONLY
+            && !slot.semantic_authorized));
+        assert!(plan.validate_slot_index().is_ok());
+
+        let refused = build_from_test_sources_with_policy(&sources, &[], counters_policy(4));
+        assert_eq!(refused.slots.len(), 4);
+        assert_eq!(refused.modules_skipped.len(), 2);
+        assert!(
+            refused
+                .slots
+                .iter()
+                .all(|slot| slot.object == refused.slots[0].object)
+        );
+        assert!(
+            refused
+                .modules_skipped
+                .iter()
+                .all(|skip| skip.reason.contains("counter endpoints"))
+        );
+        let none = build_from_test_sources_with_policy(&sources[..1], &[], counters_policy(3));
+        assert!(
+            none.slots.is_empty(),
+            "a refused provider leaves no partial union"
+        );
+        assert!(none.modules.is_empty());
+        assert_eq!(none.modules_skipped.len(), 1);
+
+        let all_tables = build_from_test_sources_with_policy(
+            &[scanned_with_heuristic_tables(64)],
+            &[],
+            counters_policy(64),
+        );
+        assert_eq!(all_tables.slots.len(), 64);
+        assert_eq!(all_tables.uncorroborated_candidates, 0);
+        let past_legacy_slots = build_from_test_sources_with_policy(
+            &[scanned_with(
+                TEST_OBJECT,
+                "/opt/counter-large.so",
+                (0..513).map(|index| index * 8),
+            )],
+            &[],
+            counters_policy(513),
+        );
+        assert_eq!(past_legacy_slots.slots.len(), 513);
+        assert_eq!(past_legacy_slots.slots[512].index, 512);
+        assert!(past_legacy_slots.modules_skipped.is_empty());
+
+        let rebuilt = refused.rebuild_from_sources(&sources, &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.admission_policy(), counters_policy(4));
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let error = AttachPlan::from_slots_with_policy(
+            vec![exact_slot(
+                0,
+                PinnedObjectId(7),
+                0x10,
+                descriptor,
+                vec![ModuleId(0)],
+            )],
+            counters_policy(1),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("counter") && error.contains("count-only"),
+            "{error}"
+        );
+
+        // These are the existing runtime factories. An absent explicit
+        // counter admission request keeps their previous policy selection.
+        let detailed = build_from_reconciled_modules(&sources);
+        assert_eq!(detailed.admission_policy(), AdmissionPolicy::Detailed);
+        let inventory = build_from_test_sources_with_policy(&sources, &[], inventory_policy(12));
+        assert_eq!(inventory.admission_policy(), inventory_policy(12));
+        assert_eq!(inventory.slots.len(), 12);
+    }
+
+    #[test]
+    fn counter_growth_preserves_allocated_positions_and_refuses_whole_module() {
+        let aliased = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Verify", 0x10)]);
+        let mut other_inode = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        assert_eq!(
+            aliased.provenance_objects[0].identity.sha256,
+            other_inode.provenance_objects[0].identity.sha256
+        );
+        other_inode.provenance_objects[0].inode = 99;
+        let initial =
+            build_from_test_sources_with_policy(&[], &[aliased, other_inode], counters_policy(3));
+        assert_eq!(
+            initial.slots.len(),
+            2,
+            "equal bytes do not merge different physical objects"
+        );
+        assert_eq!(
+            initial
+                .slots
+                .iter()
+                .map(AttachKey::of)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                AttachKey {
+                    object: PinnedObjectId(42),
+                    file_offset: 0x10
+                },
+                AttachKey {
+                    object: PinnedObjectId(99),
+                    file_offset: 0x10
+                },
+            ])
+        );
+        let alias = initial
+            .slots
+            .iter()
+            .find(|slot| slot.object == PinnedObjectId(42))
+            .unwrap();
+        assert_eq!(alias.names, ["C_Sign", "C_Verify"]);
+        assert!(alias.aliased);
+        let prefix: Vec<_> = initial
+            .slots
+            .iter()
+            .map(|slot| (slot.index, AttachKey::of(slot)))
+            .collect();
+        let mut plan = initial.clone();
+        let surviving = counters_plan(vec![initial.slots[0].clone()], initial.modules.clone(), 3);
+        let retired = plan.extend_exact(surviving).unwrap();
+        assert_eq!(retired.retire.len(), 1);
+        assert_eq!(retired.retire[0].index, 1);
+        assert!(!plan.is_active(1));
+        let appended = plan.extend_exact(initial.clone()).unwrap();
+        assert_eq!(appended.new.len(), 1);
+        assert_eq!(appended.new[0].index, 2);
+        assert_eq!(AttachKey::of(&appended.new[0]), prefix[1].1);
+        assert!(!plan.is_active(1));
+        assert!(plan.is_active(2));
+        assert_eq!(
+            plan.slots[..2]
+                .iter()
+                .map(|slot| (slot.index, AttachKey::of(slot)))
+                .collect::<Vec<_>>(),
+            prefix
+        );
+
+        let mut one_more = initial.slots.clone();
+        one_more.push(exact_slot(
+            2,
+            initial.slots[0].object,
+            0x1000,
+            0,
+            initial.slots[0].module_ids.clone(),
+        ));
+        let candidate = counters_plan(one_more, initial.modules.clone(), 3);
+        let before = plan.clone();
+        let error = plan.extend_exact(candidate).unwrap_err();
+        assert!(error.contains("counter endpoints"), "{error}");
+        assert_eq!(plan, before, "retired IDs cannot fund a partial extension");
+        for policy in [
+            counters_policy(4),
+            AdmissionPolicy::Detailed,
+            inventory_policy(3),
+        ] {
+            let mut mismatch =
+                AttachPlan::from_slots_with_policy(initial.slots.clone(), policy).unwrap();
+            mismatch.modules = initial.modules.clone();
+            let error = plan.extend_exact(mismatch).unwrap_err();
+            assert!(error.contains("admission policy"), "{error}");
+            assert_eq!(plan, before, "policy/budget mismatch must precede mutation");
+        }
+    }
+
+    #[test]
+    fn selection_table_capacity_refusal_names_the_counters_resource() {
+        let object = PinnedObjectId(7);
+        let allocated = counters_plan(
+            vec![exact_slot(0, object, 0x10, 0, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+            2,
+        );
+        let mut rebuilt = counters_plan(vec![], allocated.modules.clone(), 2);
+        rebuilt
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [selection_target(object, 0x20, "C_Encrypt")],
+            )
+            .unwrap();
+        assert_eq!(rebuilt.slots.len(), 1);
+        assert_eq!(rebuilt.slots[0].descriptor_index, 0);
+        assert_eq!(rebuilt.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!rebuilt.slots[0].semantic_authorized);
+        let before = rebuilt.clone();
+        let error = rebuilt
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [selection_target(object, 0x30, "C_Decrypt")],
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("selection table needs 1 more of the 2 counter endpoints"),
+            "{error}"
+        );
+        assert_eq!(rebuilt, before, "a refused table leaves no prefix");
+    }
+
+    #[test]
+    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_admits_a_prefix() {
+        let scanned = provider_with_tables(92, "/opt/heuristic.so", 64, 103, false);
+        let other = provider_with_tables(93, "/opt/other.so", 1, 68, false);
+
+        // Part 0: Detailed admits the leading-templates prefix with a named
+        // partial gap when no provider is refused; Inventory admits whole.
+        // The prefix stops at the reserve (three templates under 512). A
+        // closure alone in the first plan takes no prefix (PA-9/C1), so the
+        // Detailed shape holds a provider beside the closure.
+        let detailed = build_from_reconciled_modules(&[scanned.clone(), other]);
         assert_eq!(detailed.admission_policy(), AdmissionPolicy::detailed());
-        assert_eq!(detailed.slots.len(), MAX_TABLES_PER_OBJECT);
-        assert_eq!(detailed.uncorroborated_candidates, 60);
+        assert_eq!(slots_of(&detailed, 93), 68, "provider admitted first");
+        assert_eq!(slots_of(&detailed, 92), 3 * 103, "leading-templates prefix");
+        assert_eq!(detailed.modules_skipped.len(), 1);
+        assert!(
+            detailed.modules_skipped[0]
+                .reason
+                .contains("3 of 64 template tables attached"),
+            "{:?}",
+            detailed.modules_skipped[0]
+        );
 
         let inventory = build_from_test_sources_with_policy(
             std::slice::from_ref(&scanned),
             &[],
-            inventory_policy(64),
+            inventory_policy(64 * 103),
         );
-        assert_eq!(inventory.slots.len(), 64);
+        assert_eq!(inventory.slots.len(), 64 * 103);
         assert_eq!(inventory.uncorroborated_candidates, 0);
         assert!(inventory.slots.iter().all(|slot| slot.descriptor_index == 0
             && slot.semantics == SlotSemantics::COUNT_ONLY
@@ -6562,7 +11577,7 @@ mod tests {
             inventory
                 .slots
                 .iter()
-                .any(|slot| slot.file_offset == 63 * 8),
+                .any(|slot| slot.file_offset == (64 * 103 - 1) * 8),
             "the endpoint in the last heuristic table is admitted"
         );
     }
@@ -6761,6 +11776,7 @@ mod tests {
             file_offset: Some(0x1000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         });
         scanned.entry_objects.push(vec![scanned.object]);
 
@@ -6967,6 +11983,7 @@ mod tests {
                 file_offset: Some(table as u64 * 0x1000),
                 live_return,
                 manifest_supported: false,
+                extension_impossible: false,
             })
             .collect();
         module.entry_objects = vec![vec![object; entries]; tables];
@@ -6974,7 +11991,14 @@ mod tests {
     }
 
     fn scoped_plan(modules: &[ReconciledModule], scope: AdmissionScope) -> AttachPlan {
-        build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope)
+        build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope, false)
+    }
+
+    fn scoped_plan_with_counter_hint(
+        modules: &[ReconciledModule],
+        scope: AdmissionScope,
+    ) -> AttachPlan {
+        build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope, true)
     }
 
     fn slots_of(plan: &AttachPlan, inode: u32) -> usize {
@@ -6990,35 +12014,344 @@ mod tests {
             .find(|skipped| skipped.subject == path)
     }
 
+    fn replace_table_targets(
+        module: &mut ReconciledModule,
+        table: usize,
+        targets: &[(&'static str, u32, u64)],
+    ) {
+        module.scanned.tables[table].entries = targets
+            .iter()
+            .map(
+                |&(name, object, file_offset)| crate::discovery::scan::ScannedEntry {
+                    name,
+                    object: scanned_key(PinnedObjectId(object)),
+                    object_path: if PinnedObjectId(object) == module.object {
+                        module.scanned.path.clone()
+                    } else {
+                        format!("/opt/obj{object}.so")
+                    },
+                    file_offset,
+                },
+            )
+            .collect();
+        module.entry_objects[table] = targets
+            .iter()
+            .map(|&(_, object, _)| PinnedObjectId(object))
+            .collect();
+    }
+
+    /// The first table's three fresh keys already fail, but the whole group
+    /// wants five: aliases/views/overlap dedup, equal offsets on distinct
+    /// objects stay distinct, and another admitted module's key costs no slot.
+    #[test]
+    fn whole_module_demand_unions_later_tables_views_aliases_and_shared_targets() {
+        let existing =
+            provider_with_tables(201, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, true);
+        let mut refused = provider_with_tables(202, "/opt/refused.so", 2, 4, true);
+        replace_table_targets(
+            &mut refused,
+            0,
+            &[
+                ("C_Sign", 202, 0x10),
+                ("C_Sign", 202, 0x20),
+                ("C_Sign", 202, 0x30),
+                ("C_Sign", 201, 0),
+            ],
+        );
+        replace_table_targets(
+            &mut refused,
+            1,
+            &[
+                ("C_Sign", 202, 0x30),
+                ("C_Sign", 202, 0x40),
+                ("C_Verify", 202, 0x40),
+                ("C_Sign", 203, 0x40),
+            ],
+        );
+        let mut repeated_view = refused.clone();
+        repeated_view.scanned.view = ProcessViewId(99);
+        let plan = scoped_plan(&[refused, repeated_view, existing], AdmissionScope::Shared);
+
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 2);
+        assert_eq!(plan.modules.len(), 1, "no refused prefix or duplicate view");
+        assert_eq!(plan.modules_skipped.len(), 1);
+        let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 5 more;"),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn whole_module_demand_preserves_the_shared_reserve() {
+        let reserve = shared_scope_reserve(MAX_SLOTS as usize);
+        let open = MAX_SLOTS as usize - reserve;
+        let existing = provider_with_tables(211, "/opt/existing.so", 1, open - 2, false);
+        let refused = provider_with_tables(212, "/opt/refused.so", 2, 3, false);
+        let plan = scoped_plan(&[existing, refused], AdmissionScope::Shared);
+
+        assert_eq!(plan.slots.len(), open - 2);
+        let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 6 more;"),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.reason.contains(&format!("{reserve} are reserved")),
+            "{refusal:?}"
+        );
+    }
+
+    /// Broad admission requires the scan union too, even when a manifest
+    /// subset has already failed before any scan-table demand is considered.
+    #[test]
+    fn whole_module_demand_unions_scan_after_an_early_manifest_refusal() {
+        let mut scan = provider_with_tables(42, "/opt/p11.so", 2, 3, false);
+        replace_table_targets(
+            &mut scan,
+            0,
+            &[
+                ("C_Sign", 42, 0),
+                ("C_Sign", 42, 0x100000),
+                ("C_Verify", 42, 0x100008),
+            ],
+        );
+        replace_table_targets(
+            &mut scan,
+            1,
+            &[
+                ("C_Sign", 42, 0x100008),
+                ("C_Sign", 42, 0x100010),
+                ("C_Verify", 42, 0),
+            ],
+        );
+        let manifest = manifest_with(
+            (0..=MAX_SLOTS)
+                .map(|index| resolved("C_Sign", u64::from(index) * 8))
+                .collect(),
+        );
+        let plan = build_from_sources_with(
+            &[scan],
+            &[manifest],
+            &[],
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+                first_plan: None,
+                first_plan_had_provider: false,
+            },
+            true,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Named,
+            false,
+        );
+
+        assert!(plan.slots.is_empty() && plan.modules.is_empty());
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert!(
+            plan.modules_skipped[0]
+                .reason
+                .starts_with(&format!("module needs {} more;", MAX_SLOTS + 4)),
+            "{:?}",
+            plan.modules_skipped
+        );
+    }
+
+    #[test]
+    fn whole_module_demand_excludes_scan_targets_without_a_valid_table() {
+        let existing =
+            provider_with_tables(221, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, true);
+        let refused = provider_with_tables(222, "/opt/refused.so", 2, 3, true);
+        let mut lowered = lower_scanned(&refused);
+        for (table, offset) in [(None, 0x9000), (Some(2), 0xa000)] {
+            let mut stray = lower_scanned(&refused).targets.remove(0);
+            stray.table = table;
+            stray.file_offset = offset;
+            lowered.targets.push(stray);
+        }
+        lowered.entries_seen = lowered.targets.len();
+        let plan = merge(
+            vec![lower_scanned(&existing), lowered],
+            0,
+            "absent".into(),
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+                first_plan: None,
+                first_plan_had_provider: false,
+            },
+            false,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Shared,
+            false,
+        );
+
+        let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 6 more;"),
+            "{refusal:?}"
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 2);
+    }
+
+    #[test]
+    fn whole_module_demand_keeps_named_heuristic_subset_reporting() {
+        let existing =
+            provider_with_tables(231, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, false);
+        // Four tables stay a heuristic object (five would be a closure array,
+        // decided whole): the K4 prefix and spill below are the heuristic rule.
+        let refused = provider_with_tables(232, "/opt/refused.so", 4, 3, false);
+        let named = scoped_plan(&[existing, refused.clone()], AdmissionScope::Named);
+        let refusal = refusal_of(&named, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 3 more;"),
+            "{refusal:?}"
+        );
+        assert_eq!(named.slots.len(), MAX_SLOTS as usize - 2);
+
+        let prefix = scoped_plan(std::slice::from_ref(&refused), AdmissionScope::Named);
+        assert_eq!(
+            prefix.slots.len(),
+            12,
+            "K4 admits its strongest four tables"
+        );
+        assert_eq!(prefix.uncorroborated_candidates, 0);
+        assert!(prefix.modules_skipped.is_empty());
+
+        // A heuristic object still takes a strongest-prefix subset with spill
+        // when the budget, not the cap, runs out.
+        let cramped =
+            provider_with_tables(233, "/opt/cramped.so", 1, MAX_SLOTS as usize - 4, false);
+        let subset = scoped_plan(&[cramped, refused], AdmissionScope::Named);
+        assert_eq!(subset.slots.len(), MAX_SLOTS as usize - 1);
+        assert_eq!(subset.uncorroborated_candidates, 3);
+        assert!(subset.modules_skipped.is_empty());
+    }
+
+    /// Retired keys cost fresh lifetime slots if they reappear. A failed
+    /// growth keeps all old physical IDs and reports its nine-key union once.
+    #[test]
+    fn whole_module_demand_preserves_growth_and_retired_occupancy() {
+        let existing =
+            provider_with_tables(241, "/opt/existing.so", 1, MAX_SLOTS as usize - 12, true);
+        let owner = provider_with_tables(242, "/opt/grown.so", 2, 2, true);
+        let ended = provider_with_tables(243, "/opt/ended.so", 1, 4, true);
+        let mut plan = scoped_plan(
+            &[existing.clone(), owner.clone(), ended],
+            AdmissionScope::Shared,
+        );
+        let without_ended = plan.rebuild_from_sources(
+            &[existing.clone(), owner.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(plan.extend_exact(without_ended).unwrap().retire.len(), 4);
+        let previous = plan.slots.clone();
+        let mut grown = owner;
+        replace_table_targets(
+            &mut grown,
+            0,
+            &[
+                ("C_Sign", 242, 0),
+                ("C_Sign", 242, 8),
+                ("C_Sign", 242, 0x10000),
+                ("C_Sign", 242, 0x10008),
+                ("C_Sign", 242, 0x10010),
+                ("C_Sign", 242, 0x10018),
+                ("C_Sign", 242, 0x10020),
+            ],
+        );
+        replace_table_targets(
+            &mut grown,
+            1,
+            &[
+                ("C_Sign", 242, 16),
+                ("C_Sign", 242, 24),
+                ("C_Sign", 242, 0x10020),
+                ("C_Sign", 242, 0x20000),
+                ("C_Verify", 242, 0x20000),
+                ("C_Sign", 242, 0x20008),
+                ("C_Sign", 242, 0x20010),
+                ("C_Sign", 241, 0),
+                ("C_Sign", 243, 0),
+            ],
+        );
+
+        for _ in 0..2 {
+            let rebuilt = plan.rebuild_from_sources(
+                &[existing.clone(), grown.clone()],
+                &[],
+                &PinnedObjects::empty(),
+            );
+            assert_eq!(rebuilt.modules_skipped.len(), 1);
+            let omission = refusal_of(&rebuilt, "/opt/grown.so").unwrap();
+            assert!(
+                omission.reason.starts_with("admitted module needs 9 more;"),
+                "{omission:?}"
+            );
+            assert!(omission.reason.contains("4 retired"), "{omission:?}");
+            assert!(
+                omission.reason.contains("kept its 4 attached endpoints"),
+                "{omission:?}"
+            );
+            let delta = plan.extend_exact(rebuilt).unwrap();
+            assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+            assert_eq!(plan.slots, previous, "no old identity or decoder changes");
+            assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 8);
+            assert_eq!(
+                plan.refused_modules().count(),
+                1,
+                "one omission across retries"
+            );
+        }
+    }
+
     const P11_KIT: &str = "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8";
     const TRUST: &str = "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so";
     const SOFTHSM: &str = "/usr/lib/softhsm/libsofthsm2.so";
 
     /// GT-5, the stock-desktop shape: an ambient `libp11-kit` decoding 64
     /// closure tables, ambient `p11-kit-trust`, and the SoftHSM2 the workload
-    /// uses, all heuristic. First-come K4 admission (named scope, unchanged)
-    /// hands p11-kit a 412-endpoint prefix and refuses SoftHSM. A shared scope
-    /// admits both single-table providers in every discovery order, and
-    /// refuses the closure array whole, saying why and how to aim the capture.
+    /// uses, all heuristic. Both scopes admit both single-table providers in
+    /// every discovery order. PA-5 C1, extended to shared scope by JK-22a:
+    /// the late-start closure takes a reserve-capped prefix immediately in
+    /// both scopes.
     #[test]
     fn shared_scope_admits_single_table_providers_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        // 136 in use: default stops 2 tables short of the reserve, wide
+        // stops at the K4 per-object cap.
+        let tables = if cfg!(feature = "wide-detailed-2112") {
+            4
+        } else {
+            2
+        };
 
-        let named = scoped_plan(
-            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
-            AdmissionScope::Named,
-        );
+        let mixed = [p11_kit.clone(), trust.clone(), softhsm.clone()];
+        let named = scoped_plan(&mixed, AdmissionScope::Named);
         assert_eq!(named.admission_scope(), AdmissionScope::Named);
+        assert_eq!(slots_of(&named, 32), 68, "named scope admits p11-kit-trust");
+        assert_eq!(slots_of(&named, 33), 68, "named scope admits SoftHSM");
+        // Late-start prefix immediate.
         assert_eq!(
             slots_of(&named, 31),
-            MAX_TABLES_PER_OBJECT * 103,
-            "named scope keeps the K4 prefix"
+            tables * 103,
+            "late-start prefix after providers"
         );
-        if (MAX_SLOTS as usize) < MAX_TABLES_PER_OBJECT * 103 + 2 * 68 {
-            assert!(refusal_of(&named, SOFTHSM).is_some(), "the GT-5 outcome");
-        }
+        let named_partial = refusal_of(&named, P11_KIT).expect("prefix partial");
+        assert!(
+            named_partial
+                .reason
+                .contains(&format!("{tables} of 64 template tables attached")),
+            "{}",
+            named_partial.reason
+        );
 
         let orders = [
             [&p11_kit, &trust, &softhsm],
@@ -7044,58 +12377,576 @@ mod tests {
                 68,
                 "p11-kit-trust admitted: {label:?}"
             );
-            assert_eq!(slots_of(&shared, 31), 0, "no p11-kit prefix: {label:?}");
+            // JK-22a: shared scope admits the same reserve-capped prefix
+            // named scope admits — never a whole refusal here — in every
+            // discovery order, even after settling.
             assert_eq!(
-                shared.modules_skipped.len(),
-                1,
+                slots_of(&shared, 31),
+                tables * 103,
+                "shared closure takes the prefix: {label:?}"
+            );
+            let partial = refusal_of(&shared, P11_KIT).expect("prefix partial");
+            assert!(
+                is_closure_array_prefix(&partial.reason),
                 "{:?}",
-                shared.modules_skipped
+                partial.reason
             );
-            let refusal = refusal_of(&shared, P11_KIT).expect("p11-kit refused whole");
-            assert!(
-                refusal.reason.starts_with(&format!(
-                    "module needs {} more; only {MAX_SLOTS} attach slots are available; ",
-                    64 * 103
-                )),
-                "{}",
-                refusal.reason
-            );
-            assert!(
-                refusal.reason.contains(
-                    "refusing to attach a prefix of its 64 lookalike function tables \
-                     (a proxy closure array is admitted whole or not at all)"
-                ),
-                "{}",
-                refusal.reason
-            );
-            assert!(
-                refusal.reason.contains(&format!(
-                    "136 are in use (136 active, 0 retired; held by {SOFTHSM} 68, {TRUST} 68)"
-                )),
-                "{}",
-                refusal.reason
-            );
-            assert!(
-                refusal
-                    .reason
-                    .ends_with("; to capture one provider, name it with --module <path>"),
-                "{}",
-                refusal.reason
-            );
+            let settled = shared.rebuild_from_sources(&modules, &[], &PinnedObjects::empty());
             assert_eq!(
-                shared.uncorroborated_candidates, 0,
-                "a whole refusal spills nothing"
+                slots_of(&settled, 31),
+                tables * 103,
+                "shared closure keeps the prefix: {label:?}"
+            );
+            // Settled: the prefix is kept endpoints now, so the growth it
+            // still cannot fit is a G-03 omission, not a fresh prefix.
+            assert!(
+                refusal_of(&settled, P11_KIT)
+                    .is_some_and(|omission| is_growth_omission(&omission.reason)),
+                "kept prefix plus omitted growth: {label:?}"
             );
         }
     }
 
-    /// No module is admitted as a prefix in a shared scope. A corroborated
-    /// provider that also decodes two heuristic lookalikes gets a prefix
-    /// under named-scope K4 (its published table plus one heuristic table,
-    /// the other spilled); in a shared scope the module is admitted whole or,
-    /// as here, refused whole.
+    /// JK-22a: shared scope admits the same reserve-capped leading-templates
+    /// prefix for a late-start closure array that named scope admits, instead
+    /// of refusing the closure whole. Backends attach exactly as before; the
+    /// uncovered templates carry a named `closure_prefix` partial gap.
     #[test]
-    fn shared_scope_never_admits_a_module_prefix() {
+    fn shared_scope_admits_a_late_start_closure_prefix_behind_backends() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let mixed = [p11_kit, trust, softhsm];
+        let shared = scoped_plan(&mixed, AdmissionScope::Shared);
+        // 136 in use: default stops 2 tables short of the reserve, wide
+        // stops at the K4 per-object cap — the same prefix named scope
+        // admits under each profile.
+        let tables = if cfg!(feature = "wide-detailed-2112") {
+            4
+        } else {
+            2
+        };
+
+        assert_eq!(shared.admission_scope(), AdmissionScope::Shared);
+        assert_eq!(slots_of(&shared, 32), 68, "p11-kit-trust admitted whole");
+        assert_eq!(slots_of(&shared, 33), 68, "SoftHSM admitted whole");
+        assert_eq!(
+            slots_of(&shared, 31),
+            tables * 103,
+            "shared closure takes the reserve-capped prefix, never zero"
+        );
+        let partial = refusal_of(&shared, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial
+                .reason
+                .contains(&format!("{tables} of 64 template tables attached")),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            partial.reason.contains("(closure_prefix)"),
+            "the remainder carries the named gap: {}",
+            partial.reason
+        );
+        assert!(
+            is_closure_array_prefix(&partial.reason),
+            "still recognized as a closure prefix: {}",
+            partial.reason
+        );
+    }
+
+    /// Healthy twin: a shared-scope closure array that fits whole beside a
+    /// provider is still admitted whole with no gap — the prefix path only
+    /// runs when whole does not fit.
+    #[test]
+    fn shared_scope_admits_a_small_closure_array_whole_beside_a_provider() {
+        let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
+        let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
+        let shared = scoped_plan(&[family, sidecar], AdmissionScope::Shared);
+
+        assert_eq!(slots_of(&shared, 42), 68, "provider admitted first");
+        assert_eq!(
+            slots_of(&shared, 41),
+            15,
+            "closure admitted whole, not a prefix"
+        );
+        assert_eq!(shared.uncorroborated_candidates, 0);
+        assert!(
+            shared.modules_skipped.is_empty(),
+            "whole admission carries no gap: {:?}",
+            shared.modules_skipped
+        );
+    }
+
+    /// Named scope defers a proxy closure array behind real providers: a
+    /// heuristic backend admitted in every discovery order, and the
+    /// late-start closure takes a reserve-capped leading-templates prefix
+    /// with a named partial gap immediately after them.
+    #[test]
+    fn named_scope_admits_a_heuristic_provider_ahead_of_a_proxy_closure_array() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        for modules in [&[p11_kit.clone(), trust.clone()], &[trust, p11_kit]] {
+            let named = scoped_plan(modules, AdmissionScope::Named);
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(named.admission_scope(), AdmissionScope::Named);
+            assert_eq!(
+                slots_of(&named, 32),
+                68,
+                "the backend is admitted: {label:?}"
+            );
+            // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+            // Late-start prefix immediate (PA-5 C1, no quiescence).
+            assert_eq!(
+                slots_of(&named, 31),
+                3 * 103,
+                "late-start prefix after the backend: {label:?}"
+            );
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial reported");
+            assert!(
+                partial.reason.contains("3 of 64 template tables attached"),
+                "{}",
+                partial.reason
+            );
+            assert!(
+                partial
+                    .reason
+                    .contains("calls through the others are not counted"),
+                "{}",
+                partial.reason
+            );
+            assert_eq!(
+                named.uncorroborated_candidates, 61,
+                "the 61 spilled templates: {label:?}"
+            );
+        }
+    }
+
+    /// The corroborated twin: a backend with publication evidence is admitted
+    /// ahead of the closure array too, in every discovery order; the
+    /// late-start prefix follows immediately after, reserve-capped.
+    #[test]
+    fn named_scope_admits_a_corroborated_provider_ahead_of_a_proxy_closure_array() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, true);
+        for modules in [&[p11_kit.clone(), trust.clone()], &[trust, p11_kit]] {
+            let named = scoped_plan(modules, AdmissionScope::Named);
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(slots_of(&named, 32), 68, "corroborated backend: {label:?}");
+            assert_eq!(
+                slots_of(&named, 31),
+                3 * 103,
+                "late-start prefix after the backend: {label:?}"
+            );
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial: {label:?}");
+            assert!(
+                partial.reason.contains("3 of 64 template tables attached"),
+                "{}",
+                partial.reason
+            );
+        }
+    }
+
+    /// The live `trust list` shape: the closure family, p11-kit-trust and
+    /// SoftHSM, all heuristic. Both backends are admitted in every discovery
+    /// order with the closure refused whole beside them; the family takes
+    /// the leftover room as a reserve-capped prefix (Part 0) one pass later.
+    #[test]
+    fn named_scope_admits_both_backends_ahead_of_a_proxy_closure_array() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let orders = [
+            [&p11_kit, &trust, &softhsm],
+            [&p11_kit, &softhsm, &trust],
+            [&trust, &p11_kit, &softhsm],
+            [&trust, &softhsm, &p11_kit],
+            [&softhsm, &p11_kit, &trust],
+            [&softhsm, &trust, &p11_kit],
+        ];
+        for order in orders {
+            let modules: Vec<_> = order.into_iter().cloned().collect();
+            let named = scoped_plan(&modules, AdmissionScope::Named);
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(slots_of(&named, 32), 68, "p11-kit-trust: {label:?}");
+            assert_eq!(slots_of(&named, 33), 68, "SoftHSM: {label:?}");
+            // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit,
+            // the 3rd would take the reserve. Late-start prefix immediate.
+            assert_eq!(
+                slots_of(&named, 31),
+                2 * 103,
+                "late-start prefix after backends: {label:?}"
+            );
+            assert_eq!(named.modules_skipped.len(), 1, "{label:?}");
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial: {label:?}");
+            assert!(
+                partial.reason.contains("2 of 64 template tables attached"),
+                "{}",
+                partial.reason
+            );
+        }
+    }
+
+    /// A small closure family is still a closure array — five lookalike
+    /// tables never take a strongest-four prefix — but whole admission
+    /// needs a provider beside it in the first plan (PA-9/C1): alone it is
+    /// refused whole even though it would fit, beside a provider it is
+    /// admitted whole.
+    #[test]
+    fn named_scope_admits_a_small_closure_array_whole_only_beside_a_provider() {
+        let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
+        let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
+
+        let alone = scoped_plan(std::slice::from_ref(&family), AdmissionScope::Named);
+        assert_eq!(slots_of(&alone, 41), 0, "alone takes no whole, no prefix");
+        assert!(
+            refusal_of(&alone, "/opt/small-closure.so").is_some(),
+            "alone is refused whole, never silent: {:?}",
+            alone.modules_skipped
+        );
+
+        let beside = scoped_plan(&[family, sidecar], AdmissionScope::Named);
+        assert_eq!(slots_of(&beside, 42), 68, "provider admitted first");
+        assert_eq!(slots_of(&beside, 41), 15, "admitted whole, not a K4 prefix");
+        assert_eq!(beside.uncorroborated_candidates, 0);
+        assert!(beside.modules_skipped.is_empty());
+    }
+
+    /// Part 0: a closure array is refused whole when a real provider was
+    /// refused ahead of it — leftover room goes to providers first, and a
+    /// prefix behind a loss would hide the crowding. (Closure-alone prefix
+    /// is pinned by `named_scope_admits_closure_prefix_when_no_provider_competes`.)
+    #[test]
+    fn named_scope_refuses_closure_whole_when_a_provider_is_refused() {
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let modules = [filler, trust, crowded, p11_kit];
+        let named = scoped_plan(&modules, AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 50), 400);
+        assert_eq!(slots_of(&named, 32), 68);
+        assert_eq!(slots_of(&named, 33), 0, "provider crowded out");
+        assert_eq!(slots_of(&named, 31), 0, "no prefix behind a loss");
+        assert!(refusal_of(&named, SOFTHSM).is_some());
+        let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
+        assert!(
+            refusal
+                .reason
+                .contains("as a prefix when mapped before the capture's first plan"),
+            "closure wording names the first plan: {}",
+            refusal.reason
+        );
+        assert!(
+            !refusal.reason.contains("--module"),
+            "late-start whole refusal names no module remedy: {}",
+            refusal.reason
+        );
+    }
+
+    /// F1 quiescence plus reserve, the reviewer's two-step rebuild: a
+    /// closure-first pass, then `[closure, trust, softhsm]`. Both backends
+    /// are admitted in every provider order; the closure alone in the first
+    /// plan takes no prefix (PA-9/C1), so nothing is held against them.
+    #[test]
+    fn closure_first_rebuild_admits_both_backends_in_every_provider_order() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
+        let orders = [
+            [&p11_kit, &trust, &softhsm],
+            [&p11_kit, &softhsm, &trust],
+            [&trust, &p11_kit, &softhsm],
+            [&trust, &softhsm, &p11_kit],
+            [&softhsm, &p11_kit, &trust],
+            [&softhsm, &trust, &p11_kit],
+        ];
+        for order in orders {
+            let modules: Vec<_> = order.into_iter().cloned().collect();
+            let rebuilt = first.rebuild_from_sources(&modules, &[], &PinnedObjects::empty());
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(slots_of(&rebuilt, 32), 68, "p11-kit-trust: {label:?}");
+            assert_eq!(slots_of(&rebuilt, 33), 68, "SoftHSM: {label:?}");
+            assert_eq!(
+                slots_of(&rebuilt, 31),
+                0,
+                "closure alone in the first plan never prefixes: {label:?}"
+            );
+            assert!(
+                refusal_of(&rebuilt, P11_KIT).is_some(),
+                "closure refused whole, never silent: {label:?}"
+            );
+        }
+    }
+
+    /// F1 reserve: a closure prefix never takes the reserve's slots, in a
+    /// named scope either. With a provider beside it in the first plan the
+    /// closure admits three templates (309 slots), and a provider arriving
+    /// after the prefix fits inside what is left.
+    #[test]
+    fn closure_prefix_leaves_the_reserve_free_for_a_later_provider() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let first = scoped_plan(&[p11_kit.clone(), trust.clone()], AdmissionScope::Named);
+
+        assert_eq!(slots_of(&first, 32), 68, "provider admitted first");
+        assert_eq!(slots_of(&first, 31), 3 * 103, "prefix stops at the reserve");
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+
+        let rebuilt =
+            first.rebuild_from_sources(&[p11_kit, trust, softhsm], &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&rebuilt, 33),
+            68,
+            "later provider fits in the reserve"
+        );
+        assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "prefix kept, not grown");
+    }
+
+    /// PA-5 C1: a mid-capture closure never takes a heuristic prefix, even
+    /// after the set settles. The provider is admitted at once; the closure
+    /// stays refused whole (no published tables here), never silent.
+    #[test]
+    fn closure_waits_one_pass_while_providers_are_still_arriving() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let arriving = empty.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+
+        assert_eq!(slots_of(&arriving, 32), 68, "new provider admitted at once");
+        assert_eq!(
+            slots_of(&arriving, 31),
+            0,
+            "mid-capture closure takes no prefix"
+        );
+        assert!(
+            refusal_of(&arriving, P11_KIT).is_some(),
+            "closure refused whole, never silent"
+        );
+
+        let settled =
+            arriving.rebuild_from_sources(&[p11_kit, trust], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&settled, 32), 68);
+        assert_eq!(
+            slots_of(&settled, 31),
+            0,
+            "mid-capture closure never prefixes, even settled"
+        );
+        assert!(
+            refusal_of(&settled, P11_KIT).is_some(),
+            "whole refusal persists, never a prefix"
+        );
+    }
+
+    /// F1 fail-visible: a provider arriving after the prefix that still does
+    /// not fit is refused by name — the refusal names the prefix holder and
+    /// the `--exclude-module` remedy, never silence.
+    #[test]
+    fn provider_refused_after_the_prefix_names_the_holder_and_remedy() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let small = provider_with_tables(32, "/opt/small.so", 1, 68, false);
+        let big = provider_with_tables(33, "/opt/big.so", 1, 250, false);
+        let first = scoped_plan(&[p11_kit.clone(), small.clone()], AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 32), 68, "provider admitted first");
+        assert_eq!(slots_of(&first, 31), 3 * 103, "late-start prefix immediate");
+        let rebuilt =
+            first.rebuild_from_sources(&[p11_kit, small, big], &[], &PinnedObjects::empty());
+
+        assert_eq!(slots_of(&rebuilt, 33), 0, "oversized late provider refused");
+        let refusal = refusal_of(&rebuilt, "/opt/big.so").expect("named refusal");
+        assert!(
+            refusal.reason.contains("libp11-kit"),
+            "names the prefix holder: {}",
+            refusal.reason
+        );
+        assert!(
+            refusal.reason.contains("--exclude-module"),
+            "names the remedy: {}",
+            refusal.reason
+        );
+    }
+
+    /// F6: the prefix report counts every attached table. A closure with one
+    /// publication-authorized table beside its 64 heuristic templates
+    /// reports the authorized table in N: one heuristic admitted plus the
+    /// authorized one reads "2 of 65" (M1: distinct tables), never "1 of 65".
+    /// Late-start (both in the first plan) so the prefix applies.
+    #[test]
+    fn closure_prefix_counts_authorized_tables_in_its_reported_total() {
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 200, true);
+        let mut closure = provider_with_tables(31, P11_KIT, 65, 68, false);
+        closure.scanned.tables[64].live_return = true;
+        let first = scoped_plan(&[filler, closure], AdmissionScope::Named);
+
+        assert_eq!(slots_of(&first, 50), 200);
+        // 200 in use, authorized 68 (268), then one heuristic (336); the
+        // next would need 404 of the reserve-capped 384.
+        assert_eq!(slots_of(&first, 31), 2 * 68);
+        assert_eq!(
+            first.uncorroborated_candidates, 63,
+            "63 heuristic templates spill"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("2 of 65 template tables attached"),
+            "one heuristic plus the authorized table: {}",
+            partial.reason
+        );
+    }
+
+    /// F6: the prefix report never reads "0 of M" as partial. Authorized
+    /// tables attached while every heuristic template spills report "1 of
+    /// 65" (M1), not a zero partial with slots attached. Late-start so the
+    /// prefix applies.
+    #[test]
+    fn closure_prefix_never_reports_zero_of_m_as_partial() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 250, true);
+        // 64 heuristic templates too big to fit beside the filler under
+        // either ceiling, plus one authorized table that still fits.
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 200, false);
+        let key = scanned_key(PinnedObjectId(31));
+        closure.scanned.tables.push(ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: (0..68)
+                .map(|entry| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: P11_KIT.into(),
+                    file_offset: ((64 * 200 + entry) * 8) as u64,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x10_0000 + 64 * 0x1000,
+            file_offset: Some(64 * 0x1000),
+            live_return: true,
+            manifest_supported: false,
+            extension_impossible: false,
+        });
+        closure.entry_objects.push(vec![closure.object; 68]);
+        let first = scoped_plan(&[filler, closure], AdmissionScope::Named);
+
+        assert_eq!(slots_of(&first, 50), 250);
+        assert_eq!(
+            slots_of(&first, 31),
+            68,
+            "only the authorized table attaches"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("1 of 65 template tables attached"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            !partial.reason.contains("0 of "),
+            "never a zero partial: {}",
+            partial.reason
+        );
+    }
+
+    /// F1 fail-visible, growth edition: a provider admitted beside the
+    /// prefix whose later growth does not fit omits the growth by name —
+    /// the omission names the prefix holder and the `--exclude-module`
+    /// remedy, never bare counts.
+    #[test]
+    fn provider_growth_omitted_after_the_prefix_names_the_holder_and_remedy() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let small = provider_with_tables(32, "/opt/small.so", 1, 68, false);
+        let first = scoped_plan(&[p11_kit.clone(), small.clone()], AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 32), 68);
+        assert_eq!(slots_of(&first, 31), 3 * 103, "late-start prefix immediate");
+        let settled = first.rebuild_from_sources(&[p11_kit, small], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&settled, 31), 3 * 103, "prefix kept");
+        // The provider's table grows past the room the prefix leaves: its
+        // 68 endpoints stay, the 182 new ones are omitted by name.
+        let grown = provider_with_tables(32, "/opt/small.so", 1, 250, false);
+        let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let rebuilt = settled.rebuild_from_sources(&[closure, grown], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 68, "kept endpoints stay");
+        assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "prefix kept");
+        let omission = refusal_of(&rebuilt, "/opt/small.so").expect("growth omission recorded");
+        assert!(
+            omission.reason.contains("libp11-kit"),
+            "names the prefix holder: {}",
+            omission.reason
+        );
+        assert!(
+            omission.reason.contains("--exclude-module"),
+            "names the remedy: {}",
+            omission.reason
+        );
+    }
+
+    /// Part 0: an operator-named closure array alone (no provider
+    /// competing) keeps its leading-templates prefix, not a whole refusal:
+    /// the remote-access client (`p11-kit-client.so`, no local backend)
+    /// counts through its attached templates once named with `--module`.
+    /// The report names the covered templates; the prefix stops at the
+    /// reserve. An unnamed closure alone takes no prefix (PA-9/C1).
+    #[test]
+    fn named_scope_admits_closure_prefix_when_no_provider_competes() {
+        let mut p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        p11_kit.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let named = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 31), 3 * 103, "leading-templates prefix");
+        assert_eq!(named.modules_skipped.len(), 1);
+        let partial = refusal_of(&named, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            partial
+                .reason
+                .contains("calls through the others are not counted"),
+            "{}",
+            partial.reason
+        );
+    }
+
+    /// Healthy control: a named-scope single provider with no closure family
+    /// is admitted exactly as before.
+    #[test]
+    fn named_scope_single_provider_without_a_closure_family_is_unchanged() {
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let named = scoped_plan(std::slice::from_ref(&trust), AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 32), 68);
+        assert_eq!(named.uncorroborated_candidates, 0);
+        assert!(named.modules_skipped.is_empty());
+    }
+
+    /// JK-22a: a corroborated provider that also decodes two heuristic
+    /// lookalikes gets a prefix in both scopes (its published table plus
+    /// one heuristic table, the other spilled). The named-scope K4 prefix
+    /// carries no gap record; the shared-scope prefix carries a named
+    /// `provider_prefix` partial gap with needed versus attached endpoints.
+    /// A corroborated module is not held out of the reserve in either case.
+    #[test]
+    fn shared_scope_admits_a_provider_prefix_with_a_named_gap() {
         let filled = MAX_SLOTS as usize - 112;
         let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
         let mut mixed = provider_with_tables(52, "/opt/mixed.so", 3, 50, false);
@@ -7109,17 +12960,280 @@ mod tests {
 
         let shared = scoped_plan(&modules, AdmissionScope::Shared);
         assert_eq!(slots_of(&shared, 51), filled);
-        assert_eq!(slots_of(&shared, 52), 0, "shared scope: whole or nothing");
-        let refusal = refusal_of(&shared, "/opt/mixed.so").expect("refused whole");
+        assert_eq!(
+            slots_of(&shared, 52),
+            100,
+            "shared scope: the same two-table prefix, never zero"
+        );
+        let partial = refusal_of(&shared, "/opt/mixed.so").expect("prefix partial");
         assert!(
-            refusal.reason.starts_with(&format!(
-                "module needs 150 more; only {MAX_SLOTS} attach slots are available; \
-                 {filled} are in use ({filled} active, 0 retired; held by /opt/filler.so \
-                 {filled}) — refusing to attach a prefix;"
-            )),
+            partial.reason.contains("100 of 150 endpoints attached")
+                && partial.reason.contains("(provider_prefix)"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            !partial.reason.contains("are reserved"),
             "a corroborated module is not held out of the reserve: {}",
+            partial.reason
+        );
+    }
+
+    /// JK-22a: a shared-scope provider whose whole union does not fit but
+    /// whose leading tables do is admitted on that prefix — never refused
+    /// whole — with a named `provider_prefix` partial gap stating needed
+    /// versus attached endpoints. Whole refusal stays only for a provider
+    /// whose strongest table does not fit within its reserve-aware budget,
+    /// or whose corroborated (published) tables together do not fit.
+    #[test]
+    fn shared_scope_admits_a_provider_prefix_when_whole_does_not_fit() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let mut mixed = provider_with_tables(52, "/opt/mixed.so", 3, 50, false);
+        mixed.scanned.tables[0].live_return = true;
+        let shared = scoped_plan(&[filler, mixed], AdmissionScope::Shared);
+
+        assert_eq!(slots_of(&shared, 51), filled, "filler admitted whole");
+        // 112 free: whole (150) does not fit, but the published table plus
+        // one heuristic table (100) does; the third spills.
+        assert_eq!(
+            slots_of(&shared, 52),
+            100,
+            "shared provider takes the prefix that fits, never zero"
+        );
+        let partial = refusal_of(&shared, "/opt/mixed.so").expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("100 of 150 endpoints attached"),
+            "needed versus attached: {}",
+            partial.reason
+        );
+        assert!(
+            partial.reason.contains("(provider_prefix)"),
+            "the remainder carries the named gap: {}",
+            partial.reason
+        );
+        assert!(
+            is_provider_prefix(&partial.reason),
+            "recognized as a provider prefix: {}",
+            partial.reason
+        );
+        assert!(
+            !is_growth_omission(&partial.reason)
+                && whole_refusal_needed_count(&partial.reason).is_none(),
+            "neither a growth omission nor a whole refusal: {}",
+            partial.reason
+        );
+    }
+
+    /// The published-union exception to the strongest-table rule: a fresh
+    /// shared-scope provider whose corroborated (published) tables together
+    /// exceed the remaining budget is refused whole even when its strongest
+    /// single published table fits. Published tables stay atomic.
+    #[test]
+    fn shared_scope_refuses_a_provider_whose_published_union_exceeds_the_budget_whole() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        // Two corroborated tables of 60 endpoints each: the 120-endpoint
+        // union exceeds the 112 free slots, but either table alone fits.
+        let published = provider_with_tables(52, "/opt/published.so", 2, 60, true);
+        let shared = scoped_plan(&[filler, published], AdmissionScope::Shared);
+
+        assert_eq!(slots_of(&shared, 51), filled, "filler admitted whole");
+        assert_eq!(
+            slots_of(&shared, 52),
+            0,
+            "the published union is refused whole"
+        );
+        let refusal = refusal_of(&shared, "/opt/published.so").expect("whole refusal reported");
+        assert_eq!(
+            whole_refusal_needed_count(&refusal.reason),
+            Some(120),
+            "the complete fresh demand: {}",
             refusal.reason
         );
+        assert!(
+            !is_provider_prefix(&refusal.reason),
+            "the remainder is not a named prefix gap: {}",
+            refusal.reason
+        );
+    }
+
+    /// The provider-prefix classifier must not false-positive on a whole
+    /// refusal whose holder path names the tag: holder paths are
+    /// target-controlled labels interpolated verbatim into the refusal.
+    #[test]
+    fn provider_prefix_classifier_ignores_holder_paths_naming_the_tag() {
+        let whole = "module needs 150 more; only 512 attach slots are available; 400 are in use \
+             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+             a prefix; to capture one provider, name it with --module <path>; to free slots, exclude \
+             an unneeded module with --exclude-module <name>";
+        assert!(
+            whole_refusal_needed_count(whole).is_some(),
+            "the pin is a whole refusal: {whole}"
+        );
+        assert!(
+            !is_provider_prefix(whole),
+            "a holder path naming the tag is not a prefix: {whole}"
+        );
+        for prefix in [
+            "100 of 150 endpoints attached; calls through the others are not counted (provider_prefix)",
+            "300 of 600 endpoints attached; calls through the others are not counted; 128 are reserved \
+             for providers with a corroborated function table (provider_prefix)",
+        ] {
+            assert!(
+                is_provider_prefix(prefix),
+                "a planner prefix stays recognized: {prefix}"
+            );
+        }
+    }
+
+    /// Healthy twin: a shared-scope provider that fits whole is still
+    /// admitted whole with no gap — the prefix path only runs when whole
+    /// does not fit.
+    #[test]
+    fn shared_scope_admits_an_exact_fit_provider_whole_without_a_gap() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 300, true);
+        let exact = provider_with_tables(52, "/opt/exact.so", 1, 84, false);
+        let shared = scoped_plan(&[filler, exact], AdmissionScope::Shared);
+
+        assert_eq!(slots_of(&shared, 51), 300, "filler admitted whole");
+        assert_eq!(slots_of(&shared, 52), 84, "exact fit admitted whole");
+        assert!(
+            shared.modules_skipped.is_empty(),
+            "whole admission carries no gap: {:?}",
+            shared.modules_skipped
+        );
+    }
+
+    /// Controller ruling (remedies): a provider refused whole names its
+    /// remedies in the reason itself — terminal text and JSON share it —
+    /// in every scope: `--module` to capture it alone, `--exclude-module`
+    /// to free slots. Every pinned fact stays.
+    #[test]
+    fn provider_refusal_names_module_and_exclude_remedies_in_every_scope() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        let modules = [filler, crowded];
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            let plan = scoped_plan(&modules, scope);
+            assert_eq!(slots_of(&plan, 52), 0, "{scope:?}: refused whole");
+            let refusal = refusal_of(&plan, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                refusal.reason.contains("--module"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains("--exclude-module"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains("module needs 150 more"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains("refusing to attach a prefix"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+        }
+    }
+
+    /// Controller ruling (remedies): `--counter-mode counts` is named only
+    /// for metrics captures without an explicit counter mode. The
+    /// inspect/inventory builders never set the flag, so their reasons never
+    /// name it.
+    #[test]
+    fn provider_refusal_names_counter_mode_only_for_metrics_captures() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        let modules = [filler, crowded];
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            let plain = scoped_plan(&modules, scope);
+            let refusal = refusal_of(&plain, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                !refusal.reason.contains("--counter-mode"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            let metrics = scoped_plan_with_counter_hint(&modules, scope);
+            let refusal = refusal_of(&metrics, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                refusal.reason.contains("--counter-mode counts"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+        }
+        for (label, plan) in [
+            (
+                "for_policy",
+                build_from_sources_for_policy(
+                    &modules,
+                    &[],
+                    &PinnedObjects::empty(),
+                    AdmissionPolicy::detailed(),
+                ),
+            ),
+            (
+                "for_policy_scoped",
+                build_from_sources_for_policy_scoped(
+                    &modules,
+                    &[],
+                    &PinnedObjects::empty(),
+                    AdmissionPolicy::detailed(),
+                    AdmissionScope::Shared,
+                ),
+            ),
+        ] {
+            let refusal = refusal_of(&plan, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                !refusal.reason.contains("--counter-mode"),
+                "{label}: {}",
+                refusal.reason
+            );
+        }
+    }
+
+    /// Controller ruling (remedies): a refused closure array keeps its
+    /// specialized text. The gap line already says where its forwarded calls
+    /// are counted, so the provider remedies are not named there — not even
+    /// under a metrics capture.
+    #[test]
+    fn closure_array_refusal_keeps_its_specialized_text_without_new_remedies() {
+        // A crowded-out provider disables the Part 0 prefix, so the closure
+        // array is refused whole in both scopes.
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let modules = [filler, crowded, closure];
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            for (label, plan) in [
+                ("plain", scoped_plan(&modules, scope)),
+                ("metrics", scoped_plan_with_counter_hint(&modules, scope)),
+            ] {
+                let refusal = refusal_of(&plan, P11_KIT).expect("closure refused whole");
+                assert!(
+                    refusal.reason.contains("lookalike function tables"),
+                    "{scope:?}/{label}: {}",
+                    refusal.reason
+                );
+                assert!(
+                    !refusal.reason.contains("--exclude-module"),
+                    "{scope:?}/{label}: {}",
+                    refusal.reason
+                );
+                assert!(
+                    !refusal.reason.contains("--counter-mode"),
+                    "{scope:?}/{label}: {}",
+                    refusal.reason
+                );
+            }
+        }
     }
 
     /// Uncorroborated modules leave the shared-scope reserve free, and a
@@ -7203,7 +13317,8 @@ mod tests {
             format!(
                 "module needs 20 more; only {capacity} attach slots are available; {} are in \
                  use ({} active, 200 retired; held by /opt/kept.so {}) — refusing to attach \
-                 a prefix",
+                 a prefix; to capture one provider, name it with --module <path>; to free \
+                 slots, exclude an unneeded module with --exclude-module <name>",
                 capacity - 12,
                 capacity - 212,
                 capacity - 212,
@@ -7236,6 +13351,103 @@ mod tests {
         module
     }
 
+    fn opaque_fifth_publication() -> ReconciledModule {
+        let mut module = provider_with_tables(91, "/opt/opaque-published.so", 5, 1, false);
+        for table in &mut module.scanned.tables {
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .filter(|field| field.name != "C_Sign")
+                .map(|field| field.name)
+                .collect();
+        }
+        module.scanned.tables[4].live_return = true;
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "other",
+            name_lossy: None,
+            name_private: Some(b"OTHER".to_vec()),
+            flags: 0,
+            table: Some(4),
+        });
+        module
+    }
+
+    /// An opaque live-return publication admits its table without granting
+    /// semantic permission: the slots stay count-only and unauthorized.
+    /// Without the publication the five lookalikes are a closure array and
+    /// decide whole beside a provider — admitted whole here, since they
+    /// fit — with every name still `unknown` (alone they take no whole
+    /// under PA-9/C1).
+    #[test]
+    fn opaque_publication_admits_without_semantic_permission() {
+        let observed = opaque_fifth_publication();
+        let name_score = TableEvidenceScore {
+            linked: false,
+            live_return: false,
+            manifest: false,
+            exports: false,
+            full_walk: true,
+        };
+        assert!(!table_name_authorized(&name_score));
+        assert!(crate::discovery::scan::table_observation_authorized(
+            &observed.scanned.tables[4],
+            &name_score
+        ));
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&observed));
+        assert_eq!(plan.slots.len(), 5);
+        assert_eq!(plan.uncorroborated_candidates, 0);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| !slot.semantic_authorized && slot.descriptor_index == 0)
+        );
+
+        let mut raw = observed;
+        raw.scanned.tables[4].live_return = false;
+        assert!(!crate::discovery::scan::table_observation_authorized(
+            &raw.scanned.tables[4],
+            &name_score
+        ));
+        // Closure-alone takes no whole under PA-9/C1, so the unobserved
+        // shape decides beside a provider: whole, with unknown names.
+        let sidecar = provider_with_tables(90, "/opt/sidecar.so", 1, 68, false);
+        let plan = build_from_reconciled_modules(&[raw, sidecar]);
+        assert_eq!(slots_of(&plan, 91), 5);
+        assert_eq!(slots_of(&plan, 90), 68);
+        assert_eq!(plan.uncorroborated_candidates, 0);
+        assert!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(91))
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME] && !slot.semantic_authorized)
+        );
+    }
+
+    #[test]
+    fn observed_publication_survives_a_stronger_unobserved_view_of_the_same_table() {
+        let mut observed = opaque_fifth_publication();
+        observed.scanned.tables[4].walk = "known_prefix";
+        observed.scanned.tables[4]
+            .null_entries
+            .retain(|name| *name != "C_GetInfo");
+        observed.scanned.tables[4].unpinned.push(Skipped {
+            subject: "C_GetInfo".into(),
+            reason: "unmapped".into(),
+        });
+        let mut raw = opaque_fifth_publication();
+        raw.scanned.tables[4].live_return = false;
+        raw.scanned.view = ProcessViewId(7);
+        for modules in [[observed.clone(), raw.clone()], [raw, observed]] {
+            let pieces: Vec<_> = modules.iter().map(lower_scanned).collect();
+            let (class, lookalikes) = admission_class(&pieces);
+            assert_eq!(class, AdmissionClass::Corroborated);
+            assert_eq!(lookalikes, 4);
+            let plan = build_from_reconciled_modules(&modules);
+            assert_eq!(plan.slots.len(), 5);
+            assert_eq!(plan.uncorroborated_candidates, 0);
+        }
+    }
+
     /// The multiple-interface/closure-array precedence problem: a provider
     /// whose tables all carry publication evidence is corroborated however
     /// many tables it has. Only *unresolved* lookalikes count toward the
@@ -7260,24 +13472,62 @@ mod tests {
     fn shared_scope_admits_a_corroborated_multi_table_provider_ahead_of_closure_arrays() {
         let open = MAX_SLOTS as usize - shared_scope_reserve(MAX_SLOTS as usize);
         // The closure array fits on its own but not beside the provider.
-        let closure = provider_with_tables(82, P11_KIT, 5, 64, false);
-        assert_eq!(5 * 64 + 6 * 11, 386);
-        assert!((5 * 64..386).contains(&open), "the margin the test needs");
+        // Wide profile: the open pool grows to 1,584, so the closure
+        // carries more entries per table; the table count stays below
+        // the provider's, keeping the within-class order under test.
+        let entries = if cfg!(feature = "wide-detailed-2112") {
+            310
+        } else {
+            64
+        };
+        let closure = provider_with_tables(82, P11_KIT, 5, entries, false);
+        let combined = 5 * entries + 6 * 11;
+        assert_eq!(
+            combined,
+            if cfg!(feature = "wide-detailed-2112") {
+                1616
+            } else {
+                386
+            }
+        );
+        assert!(
+            (5 * entries..combined).contains(&open),
+            "the margin the test needs"
+        );
         let nss = provider_with_linked_tables(83, "/opt/nss-softokn.so", 6, 11);
         for modules in [&[nss.clone(), closure.clone()], &[closure, nss]] {
             let plan = scoped_plan(modules, AdmissionScope::Shared);
             assert_eq!(slots_of(&plan, 83), 66, "the provider admits whole");
-            assert_eq!(slots_of(&plan, 82), 0, "no closure-array prefix");
-            let refusal = refusal_of(&plan, P11_KIT).expect("closure refused whole");
+            // JK-22a: whole (66 + 5 tables) exceeds the reserve-capped
+            // ceiling, so the closure takes a 4-table prefix — never zero,
+            // never whole — even after settling.
+            assert_eq!(
+                slots_of(&plan, 82),
+                4 * entries,
+                "shared closure takes the prefix"
+            );
+            let partial = refusal_of(&plan, P11_KIT).expect("prefix partial");
             assert!(
-                refusal
-                    .reason
-                    .contains("a proxy closure array is admitted whole or not at all"),
+                partial.reason.contains("4 of 5 template tables attached")
+                    && partial.reason.contains("(closure_prefix)"),
                 "{}",
-                refusal.reason
+                partial.reason
+            );
+            let settled = plan.rebuild_from_sources(modules, &[], &PinnedObjects::empty());
+            assert_eq!(
+                slots_of(&settled, 82),
+                4 * entries,
+                "shared closure keeps the prefix"
+            );
+            // Settled: the prefix is kept endpoints now, so the growth it
+            // still cannot fit is a G-03 omission, not a fresh prefix.
+            assert!(
+                refusal_of(&settled, P11_KIT)
+                    .is_some_and(|omission| is_growth_omission(&omission.reason)),
+                "kept prefix plus omitted growth, never a whole refusal"
             );
             assert!(
-                refusal_of(&plan, "/opt/nss-softokn.so").is_none(),
+                refusal_of(&settled, "/opt/nss-softokn.so").is_none(),
                 "the provider is admitted, never refused"
             );
         }
@@ -7310,5 +13560,853 @@ mod tests {
         let (class, lookalikes) = admission_class(&[lower_scanned(&mixed)]);
         assert_eq!(class, AdmissionClass::ClosureArray);
         assert_eq!(lookalikes, 60);
+    }
+
+    const OPENSC: &str = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so";
+
+    /// PA-5 C1 main twin (reviewer's probe): a closure-first pass, then
+    /// trust, softhsm and opensc(104), each in its own rebuild with quiet
+    /// rebuilds in between. All three must be admitted in full in `run`,
+    /// Detailed and named scope; the mid-capture closure takes no prefix.
+    #[test]
+    fn closure_first_then_three_backends_each_in_own_rebuild_admits_all() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&p11_kit),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let quiet = first.rebuild_from_sources(
+            std::slice::from_ref(&p11_kit),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let with_trust = quiet.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let quiet = with_trust.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let with_softhsm = quiet.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let quiet = with_softhsm.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let all = quiet.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&all, 32), 68, "trust admitted in full");
+        assert_eq!(slots_of(&all, 33), 68, "softhsm admitted in full");
+        assert_eq!(
+            slots_of(&all, 34),
+            104,
+            "opensc admitted in full, not starved by the prefix"
+        );
+        assert_eq!(
+            slots_of(&all, 31),
+            0,
+            "mid-capture closure takes no heuristic prefix"
+        );
+    }
+
+    /// PA-9/C1 twin (reviewer's `--pid` probe): the capture attaches to a
+    /// running process with libp11-kit mapped but its backends not yet
+    /// loaded, so the first plan holds the closure alone. The closure takes
+    /// no heuristic prefix — published tables only, like a mid-capture one —
+    /// and every backend arriving later in one rebuild still fits: 68/68/104
+    /// with the closure at 0, never the held 309 that starved the third
+    /// backend ("needs 104 more … 445 in use … held by libp11-kit 309").
+    #[test]
+    fn closure_alone_in_first_plan_leaves_room_for_backends_arriving_together() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        let rebuilt = first.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        // The backends first: starvation is what this twin guards, so it
+        // must be the first failure a regression shows.
+        assert_eq!(slots_of(&rebuilt, 32), 68, "trust fits");
+        assert_eq!(slots_of(&rebuilt, 33), 68, "softhsm fits");
+        assert_eq!(slots_of(&rebuilt, 34), 104, "opensc fits, not starved");
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            0,
+            "closure stays at published-only, never a held prefix"
+        );
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
+        assert!(
+            refusal_of(&first, P11_KIT).is_some(),
+            "closure alone is refused whole, never silent: {:?}",
+            first.modules_skipped
+        );
+    }
+
+    /// PA-9/C1 twin, lazy-start shape: the first plan holds the closure
+    /// alone, and each backend arrives in its own rebuild (one lazy `dlopen`
+    /// at a time). Each is admitted in full; the closure never prefixes.
+    #[test]
+    fn closure_alone_in_first_plan_leaves_room_for_backends_arriving_lazily() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        let with_trust = first.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        // Backends before the closure at every step: starvation is the
+        // first failure a regression shows.
+        assert_eq!(slots_of(&with_trust, 32), 68, "trust admitted in full");
+        assert_eq!(slots_of(&with_trust, 31), 0, "no prefix after trust");
+        let with_softhsm = with_trust.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&with_softhsm, 33), 68, "softhsm admitted in full");
+        assert_eq!(slots_of(&with_softhsm, 32), 68, "trust stays attached");
+        assert_eq!(slots_of(&with_softhsm, 31), 0, "no prefix after softhsm");
+        let all = with_softhsm.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&all, 34), 104, "opensc admitted in full");
+        assert_eq!(slots_of(&all, 33), 68, "softhsm stays attached");
+        assert_eq!(slots_of(&all, 32), 68, "trust stays attached");
+        assert_eq!(slots_of(&all, 31), 0, "no prefix after opensc");
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
+    }
+
+    /// PA-9/C1 guard: the named exception survives the late-start gate. A
+    /// closure alone in the first plan whose opened file matched an
+    /// operator-named `--module` input still takes its reserve-capped prefix.
+    #[test]
+    fn named_closure_alone_in_first_plan_keeps_its_prefix() {
+        let mut p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        p11_kit.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        // Nothing else admitted, reserve-capped ceiling 384: 3 tables (309)
+        // fit, the 4th would take the reserve.
+        assert_eq!(
+            slots_of(&first, 31),
+            3 * 103,
+            "the named closure keeps its prefix"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+    }
+
+    /// PA-9/C1 guard: only a provider the first plan admitted onto a slot
+    /// grants the late-start prefix. A provider refused whole beside the
+    /// closure leaves it as alone as no provider: once that provider is
+    /// gone, the closure still admits only its published tables (none
+    /// here), and the backend arriving after it is admitted in full.
+    #[test]
+    fn refused_provider_in_first_plan_grants_the_closure_no_prefix() {
+        let big = provider_with_tables(50, "/opt/big.so", 1, 600, false);
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let first = scoped_plan(&[big, p11_kit.clone()], AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 50), 0, "oversized provider refused whole");
+        assert_eq!(slots_of(&first, 31), 0, "no prefix behind the loss");
+        let alone = first.rebuild_from_sources(
+            std::slice::from_ref(&p11_kit),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let refusal = refusal_of(&alone, P11_KIT).expect("closure gap stays named");
+        assert!(
+            is_closure_awaiting_publication(&refusal.reason),
+            "published-only, nothing published: {}",
+            refusal.reason
+        );
+        assert_eq!(
+            slots_of(&alone, 31),
+            0,
+            "a refused provider is no provider: no late-start prefix"
+        );
+        let later = alone.rebuild_from_sources(&[p11_kit, trust], &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&later, 32),
+            68,
+            "the later backend is admitted in full"
+        );
+        assert_eq!(slots_of(&later, 31), 0, "the closure stays at zero");
+    }
+
+    /// The unpublished-closure gap states no demand: nothing is refused for
+    /// capacity, so the text never claims slots are short, and `--module`
+    /// appears only with its narrowing effect.
+    #[test]
+    fn unpublished_closure_gap_states_no_capacity_demand() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        let gap = refusal_of(&first, P11_KIT).expect("closure gap named");
+        assert!(
+            is_closure_awaiting_publication(&gap.reason),
+            "{}",
+            gap.reason
+        );
+        assert!(is_closure_array_refusal(&gap.reason), "{}", gap.reason);
+        assert!(
+            !gap.reason.contains("more;") && !gap.reason.contains("are available"),
+            "no capacity demand: {}",
+            gap.reason
+        );
+        assert!(
+            gap.reason.contains(
+                "naming it with --module <path> attaches its leading-templates prefix but \
+                 narrows discovery to the named modules"
+            ),
+            "--module only with its narrowing effect: {}",
+            gap.reason
+        );
+        // A real capacity refusal of a closure stays a capacity refusal.
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let named = scoped_plan(&[filler, trust, crowded, p11_kit], AdmissionScope::Named);
+        let refused = refusal_of(&named, P11_KIT).expect("closure refused whole");
+        assert!(
+            !is_closure_awaiting_publication(&refused.reason),
+            "{}",
+            refused.reason
+        );
+    }
+
+    /// M3: the named ordering holds within one discovery pass only. A named
+    /// closure admitted in an earlier pass (309 held) crowds a named
+    /// two-table provider arriving later: its first table attaches, the
+    /// second spills into the uncorroborated count with no refusal record.
+    #[test]
+    fn named_prefix_from_an_earlier_pass_crowds_a_later_named_provider() {
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let mut later = provider_with_tables(32, "/opt/late.so", 2, 104, false);
+        later.scanned.module_hint = Some(std::path::PathBuf::from("/opt/late.so"));
+        let first = scoped_plan(std::slice::from_ref(&closure), AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 31), 3 * 103, "named prefix immediate");
+        assert_eq!(
+            first.uncorroborated_candidates, 61,
+            "prefix fallback spills its 61 non-admitted tables"
+        );
+        let rebuilt = first.rebuild_from_sources(&[closure, later], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 104, "first table attaches");
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 62,
+            "the second table joins the count: 61 closure plus 1 provider"
+        );
+        assert!(
+            refusal_of(&rebuilt, "/opt/late.so").is_none(),
+            "the spill leaves no refusal record"
+        );
+        assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "held prefix kept");
+    }
+
+    /// PA-5 C1 late-start twin (`--pid` on a running process): the closure
+    /// and providers are all mapped before the first plan. The prefix is
+    /// admitted after the providers, and nothing is starved.
+    #[test]
+    fn late_start_first_plan_admits_prefix_after_providers_without_starvation() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let mixed = [p11_kit, trust, softhsm];
+        let first = scoped_plan(&mixed, AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 32), 68, "trust admitted");
+        assert_eq!(slots_of(&first, 33), 68, "softhsm admitted");
+        // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit.
+        assert_eq!(
+            slots_of(&first, 31),
+            2 * 103,
+            "late-start prefix admitted after providers"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("template tables attached"),
+            "{}",
+            partial.reason
+        );
+    }
+
+    /// JK-22a twin (reviewer's probe): the shared-scope closure prefix
+    /// stays outside the reserve, so a later corroborated provider still
+    /// fits beside it; the prefix is kept (G-03), never regrown or shrunk.
+    #[test]
+    fn shared_scope_closure_prefix_leaves_room_for_later_provider() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, true);
+        let mixed = [p11_kit.clone(), trust.clone(), softhsm.clone()];
+        // Default stops 2 tables short of the reserve, wide stops at K4.
+        let tables = if cfg!(feature = "wide-detailed-2112") {
+            4
+        } else {
+            2
+        };
+        let first = scoped_plan(&mixed, AdmissionScope::Shared);
+        let settled = first.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&settled, 31),
+            tables * 103,
+            "shared closure takes the reserve-capped prefix"
+        );
+        let later = settled.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(
+            slots_of(&later, 34),
+            104,
+            "later corroborated provider fits in shared scope"
+        );
+        assert_eq!(
+            slots_of(&later, 31),
+            tables * 103,
+            "the prefix is kept, not regrown"
+        );
+        let omission = refusal_of(&later, P11_KIT).expect("growth omission");
+        assert!(
+            is_growth_omission(&omission.reason),
+            "kept prefix plus omitted growth: {}",
+            omission.reason
+        );
+    }
+
+    /// PA-5 C1 published-tables-only twin: a mid-capture closure admits only
+    /// its publication-authorized tables, never the heuristic prefix.
+    #[test]
+    fn mid_capture_closure_admits_only_its_published_tables() {
+        let mut closure = provider_with_tables(31, P11_KIT, 65, 68, false);
+        closure.scanned.tables[64].live_return = true;
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&closure),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(
+            slots_of(&first, 31),
+            68,
+            "only the published table attaches, no heuristic prefix"
+        );
+        assert!(
+            refusal_of(&first, P11_KIT).is_none(),
+            "published-only admission carries no prefix record: {:?}",
+            first.modules_skipped
+        );
+        assert_eq!(
+            first.uncorroborated_candidates, 64,
+            "the 64 heuristic templates spill as evidence"
+        );
+    }
+
+    /// M6 twin: an unnamed mid-capture closure refused whole names `--module`
+    /// as the way to get the prefix, and "first seen" reads as mapped
+    /// before the capture's first plan. Still recognized as a closure
+    /// refusal, so the terminal report keeps its forwarding hint.
+    #[test]
+    fn unnamed_mid_capture_closure_refusal_names_module_and_first_plan() {
+        let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&closure),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&first, 31), 0, "no prefix, no published tables");
+        let refusal = refusal_of(&first, P11_KIT).expect("whole refusal recorded");
+        assert!(
+            refusal.reason.contains("--module"),
+            "names the prefix remedy: {}",
+            refusal.reason
+        );
+        assert!(
+            refusal
+                .reason
+                .contains("mapped before the capture's first plan"),
+            "first seen means mapped before the first plan: {}",
+            refusal.reason
+        );
+        assert!(
+            is_closure_array_refusal(&refusal.reason),
+            "still recognized as a closure refusal: {}",
+            refusal.reason
+        );
+    }
+
+    /// M6 guard: a named closure refused whole (its prefix blocked by a
+    /// refused provider ahead of it) carries no `--module` remedy — the
+    /// operator already named it.
+    #[test]
+    fn named_closure_refused_whole_carries_no_module_remedy() {
+        let big = provider_with_tables(32, "/opt/big.so", 1, 600, false);
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let rebuilt = empty.rebuild_from_sources(&[big, closure], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 0, "oversized provider refused");
+        assert_eq!(slots_of(&rebuilt, 31), 0, "prefix blocked behind the loss");
+        let refusal = refusal_of(&rebuilt, P11_KIT).expect("whole refusal recorded");
+        assert!(
+            !refusal.reason.contains("--module"),
+            "no remedy for an already-named closure: {}",
+            refusal.reason
+        );
+        assert!(
+            is_closure_array_refusal(&refusal.reason),
+            "still recognized as a closure refusal: {}",
+            refusal.reason
+        );
+    }
+
+    /// Operator-named exception: a mid-capture closure whose opened file
+    /// matched a `--module` path gets the heuristic prefix (the Part 0
+    /// remote-client shape: `run --module <client>` maps the closure after
+    /// the first plan). Reserve-capped, like the late-start prefix.
+    #[test]
+    fn mid_capture_closure_named_by_module_gets_prefix() {
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&closure),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        // Nothing else admitted, reserve-capped ceiling 384: 3 tables (309)
+        // fit, the 4th would take the reserve.
+        assert_eq!(
+            slots_of(&first, 31),
+            3 * 103,
+            "the named mid-capture closure takes its prefix"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+    }
+
+    /// Operator-named exception with several `--module` paths: the named
+    /// non-closure module is admitted first and in full, and the named
+    /// closure's prefix fits only the remaining budget outside the
+    /// reserve — in either discovery order.
+    #[test]
+    fn two_module_paths_admit_provider_first_then_closure_prefix() {
+        for order in ["closure-first", "provider-first"] {
+            let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+            closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+            let mut provider = provider_with_tables(33, SOFTHSM, 1, 68, false);
+            provider.scanned.module_hint = Some(std::path::PathBuf::from(SOFTHSM));
+            let input = if order == "closure-first" {
+                vec![closure, provider]
+            } else {
+                vec![provider, closure]
+            };
+            let empty = scoped_plan(&[], AdmissionScope::Named);
+            let settled = empty.rebuild_from_sources(&input, &[], &PinnedObjects::empty());
+            assert_eq!(
+                slots_of(&settled, 33),
+                68,
+                "the named provider is admitted in full: {order}"
+            );
+            // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+            assert_eq!(
+                slots_of(&settled, 31),
+                3 * 103,
+                "the named closure prefixes after the provider: {order}"
+            );
+            assert!(
+                refusal_of(&settled, SOFTHSM).is_none(),
+                "the provider carries no refusal: {:?}",
+                settled.modules_skipped
+            );
+            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
+            assert!(
+                partial.reason.contains("3 of 64 template tables attached"),
+                "{}",
+                partial.reason
+            );
+        }
+    }
+
+    /// PA-7 twin: the stop-time owned copy preserves the operator-named
+    /// signal (copy fidelity — the removal-only cursor never re-admits),
+    /// and a later rebuild over settled providers (the first plan is
+    /// carried, the closure arrives in the rebuild input) admits the
+    /// reserve-capped prefix for the operator-named closure and still
+    /// applies C1 published-only to the unnamed one. Generic object
+    /// identity only — no provider names, offsets or symbols.
+    #[test]
+    fn stop_time_copy_preserves_the_signal_that_rebuild_applies() {
+        let provider = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let mut named = provider_with_tables(31, P11_KIT, 64, 103, false);
+        named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let unnamed = provider_with_tables(31, P11_KIT, 64, 103, false);
+        // The stop-time owned copy keeps the scan-time signal.
+        assert!(
+            own_piece(lower_scanned(&named)).module_named,
+            "the stop-time copy keeps the operator-named signal"
+        );
+        assert!(
+            !own_piece(lower_scanned(&unnamed)).module_named,
+            "an unnamed closure stays unnamed through the stop-time copy"
+        );
+        // Providers settled in the first plan; the closure arrives later.
+        let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
+        assert_eq!(slots_of(&settled, 33), 68, "the provider settles whole");
+        // Named: the reserve-capped prefix after the provider.
+        let rebuilt =
+            settled.rebuild_from_sources(&[provider.clone(), named], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 33), 68, "the provider stays whole");
+        // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            3 * 103,
+            "the named closure takes its prefix in the later rebuild"
+        );
+        let partial = refusal_of(&rebuilt, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+        // Unnamed: C1 published-only, never the prefix.
+        let mut lone = provider_with_tables(31, P11_KIT, 65, 68, false);
+        lone.scanned.tables[64].live_return = true;
+        assert!(
+            !own_piece(lower_scanned(&lone)).module_named,
+            "the C1 closure stays unnamed through the stop-time copy"
+        );
+        let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
+        let rebuilt = settled.rebuild_from_sources(&[provider, lone], &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            68,
+            "only the published table attaches, no heuristic prefix"
+        );
+        assert!(
+            refusal_of(&rebuilt, P11_KIT).is_none(),
+            "published-only admission carries no prefix record: {:?}",
+            rebuilt.modules_skipped
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 64,
+            "the 64 heuristic templates spill as evidence"
+        );
+    }
+
+    /// PA-5 I4 twin (reviewer's panic probe): an empty-target leading table
+    /// (all entries unpinned) passes the top-table check, then the next
+    /// table does not fit, so the prefix fallback admits nothing and must
+    /// fall through to the whole refusal instead of panicking or emitting
+    /// a "0 of M" partial.
+    #[test]
+    fn prefix_fallback_with_empty_leading_table_falls_through_to_whole_refusal() {
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 300, true);
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 100, false);
+        let moved: Vec<Skipped> = closure.scanned.tables[0]
+            .entries
+            .iter()
+            .map(|_| Skipped {
+                subject: P11_KIT.to_string(),
+                reason: "entry target not pinned".to_string(),
+            })
+            .collect();
+        closure.scanned.tables[0].entries.clear();
+        closure.scanned.tables[0].unpinned = moved;
+        closure.entry_objects[0].clear();
+        let first = scoped_plan(&[filler.clone(), closure.clone()], AdmissionScope::Named);
+        let settled = first.rebuild_from_sources(&[filler, closure], &[], &PinnedObjects::empty());
+        assert!(
+            !settled
+                .modules_skipped
+                .iter()
+                .any(|s| s.reason.starts_with("0 of ")),
+            "never a zero partial: {:?}",
+            settled.modules_skipped
+        );
+        // Late-start closure (in the first plan) with no admitted tables:
+        // the whole refusal, not a prefix.
+        let refusal = refusal_of(&settled, P11_KIT).expect("whole refusal recorded");
+        assert!(
+            is_closure_array_refusal(&refusal.reason),
+            "falls through to the whole refusal: {}",
+            refusal.reason
+        );
+    }
+
+    /// PA-5 I5 churn twin (reviewer's probe): shared scope, the last process
+    /// mapping the closure exits (empty input) and another starts (mixed
+    /// input again). With the JK-22a prefix the churn holds a stable prefix
+    /// and spends no fresh slots.
+    #[test]
+    fn shared_scope_closure_churn_holds_a_stable_prefix() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, true);
+        let mixed = [p11_kit.clone(), trust.clone()];
+        // Default stops 3 tables short of the reserve, wide stops at K4.
+        let tables = if cfg!(feature = "wide-detailed-2112") {
+            4
+        } else {
+            3
+        };
+        let mut plan = scoped_plan(&mixed, AdmissionScope::Shared);
+        plan = plan.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+        let settled = plan.slots.len();
+        assert_eq!(
+            slots_of(&plan, 31),
+            tables * 103,
+            "settled prefix beside the corroborated backend"
+        );
+        for _ in 1..=3 {
+            plan = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan = plan.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+            plan = plan.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+        }
+        assert_eq!(
+            slots_of(&plan, 31),
+            tables * 103,
+            "churned closure holds its stable prefix in shared scope"
+        );
+        assert_eq!(
+            plan.slots.len(),
+            settled,
+            "churn spends no fresh slots: settled {settled}, now {}",
+            plan.slots.len()
+        );
+    }
+
+    #[test]
+    fn plan_token_poison_is_refused_by_the_fence() {
+        use crate::discovery::identity::{GraphRefusal, GraphStep};
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        let retained = scanned_with(TEST_OBJECT, "/retained.so", [0x10]);
+        let retired_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 43,
+        };
+        let retired = scanned_with(retired_key, "/retired.so", [0x20]);
+        let old = build_from_reconciled_modules(&[retained.clone(), retired]);
+        assert_eq!(old.slots.len(), 2);
+        let surviving = [retained];
+        let pins = PinnedObjects::empty();
+        let mut stable = |object: PinnedObjectId| Some(ModuleId(object.0));
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+
+        // Mid-stream poison trips the fence on the next credit.
+        let mut poisoned = old.clone();
+        let mut cursor = ConservativePlanCursor::new();
+        let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+        let first = poisoned
+            .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 1)
+            .unwrap();
+        assert_eq!(first, GraphStep::Advanced);
+        poisoned.poison_token_for_test();
+        let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+        let err = poisoned
+            .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 1)
+            .unwrap_err();
+        assert!(matches!(err, GraphRefusal::SourceChanged));
+
+        // A pre-poisoned plan is refused at the first credit, before measuring.
+        let mut poisoned = old.clone();
+        poisoned.poison_token_for_test();
+        let mut cursor = ConservativePlanCursor::new();
+        let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+        let err = poisoned
+            .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 1)
+            .unwrap_err();
+        assert!(matches!(err, GraphRefusal::SourceChanged));
+        assert!(cursor.plan().is_none());
+        assert!(cursor.required_bytes().is_none());
+    }
+
+    #[test]
+    fn plan_tree_bound_covers_std_btree_allocations() {
+        fn tight_nodes(entries: usize) -> usize {
+            if entries == 0 {
+                0
+            } else {
+                1 + (entries - 1) / 5
+            }
+        }
+        fn expected_bytes<K, V>(entries: usize) -> usize {
+            fn align8(bytes: usize) -> usize {
+                (bytes + 7) & !7
+            }
+            let node = 16
+                + align8(std::mem::size_of::<K>() * 11)
+                + align8(std::mem::size_of::<V>() * 11)
+                + 12 * 8
+                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+            tight_nodes(entries) * node
+        }
+        fn ascending(n: usize) -> Vec<u64> {
+            (0..n as u64).collect()
+        }
+        fn descending(n: usize) -> Vec<u64> {
+            (0..n as u64).rev().collect()
+        }
+        fn xorshifted(n: usize) -> Vec<u64> {
+            let mut keys: Vec<u64> = (0..n as u64).collect();
+            let mut state = 0x9E3779B97F4A7C15u64;
+            for i in (1..n).rev() {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let j = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as usize % (i + 1);
+                keys.swap(i, j);
+            }
+            keys
+        }
+        fn check_cover<K: Ord, V>(
+            entries: usize,
+            order: &[u64],
+            mut key: impl FnMut(u64) -> K,
+            mut value: impl FnMut(u64) -> V,
+        ) {
+            let bound = plan_tree_bytes::<K, V>(entries).expect("tight bound fits");
+            assert_eq!(
+                bound,
+                expected_bytes::<K, V>(entries),
+                "tight node count for {entries} entries"
+            );
+            let (map, peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut map = std::collections::BTreeMap::new();
+                for k in order {
+                    map.insert(key(*k), value(*k));
+                }
+                map
+            });
+            assert_eq!(map.len(), entries, "all test keys inserted");
+            assert!(!peak.incomplete, "allocation probe stayed complete");
+            assert_eq!(peak.failed_requests, 0, "no failed test allocations");
+            if entries == 0 {
+                assert_eq!(peak.live_blocks, 0, "empty map allocates nothing");
+            } else {
+                assert!(peak.live_blocks > 0, "nonempty map retains nodes");
+                assert!(peak.peak_bytes > 0, "nonempty map requests bytes");
+            }
+            let need = peak
+                .peak_bytes
+                .max(peak.live_bytes)
+                .max(peak.realloc_overlap_bytes);
+            assert!(
+                bound >= need,
+                "bound {bound} covers heap {need} for {entries} entries"
+            );
+            drop(map);
+        }
+        fn check_half_removed<K: Ord, V>(
+            entries: usize,
+            mut key: impl FnMut(u64) -> K,
+            mut value: impl FnMut(u64) -> V,
+        ) {
+            let remaining = entries / 2;
+            let full = plan_tree_bytes::<K, V>(entries).expect("tight bound fits");
+            assert_eq!(
+                full,
+                expected_bytes::<K, V>(entries),
+                "tight node count for {entries} entries"
+            );
+            let rest = plan_tree_bytes::<K, V>(remaining).expect("tight bound fits");
+            assert_eq!(
+                rest,
+                expected_bytes::<K, V>(remaining),
+                "tight node count for {remaining} entries"
+            );
+            let (map, peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut map = std::collections::BTreeMap::new();
+                for k in 0..entries as u64 {
+                    map.insert(key(k), value(k));
+                }
+                for k in (0..entries as u64).filter(|k| k % 2 == 0) {
+                    map.remove(&key(k));
+                }
+                map
+            });
+            assert_eq!(map.len(), remaining, "half the test keys removed");
+            assert!(!peak.incomplete, "allocation probe stayed complete");
+            assert_eq!(peak.failed_requests, 0, "no failed test allocations");
+            assert!(
+                full >= peak.peak_bytes.max(peak.realloc_overlap_bytes),
+                "full bound {full} covers insertion peak {}",
+                peak.peak_bytes.max(peak.realloc_overlap_bytes),
+            );
+            assert!(
+                rest >= peak.live_bytes,
+                "remaining bound {rest} covers live {}",
+                peak.live_bytes,
+            );
+            drop(map);
+        }
+        for entries in [0, 1, 5, 11, 12, 64, 4096] {
+            for order in [ascending(entries), descending(entries), xorshifted(entries)] {
+                check_cover::<u64, u64>(entries, &order, |k| k, |k| k.wrapping_mul(3));
+                check_cover::<u64, ()>(entries, &order, |k| k, |_| ());
+                check_cover::<u64, [u64; 16]>(entries, &order, |k| k, |k| [k; 16]);
+                check_cover::<[u64; 4], [u64; 4]>(entries, &order, |k| [k, 0, 1, 2], |k| [k; 4]);
+            }
+            if entries >= 2 {
+                check_half_removed::<u64, u64>(entries, |k| k, |k| k);
+                check_half_removed::<u64, ()>(entries, |k| k, |_| ());
+                check_half_removed::<u64, [u64; 16]>(entries, |k| k, |k| [k; 16]);
+                check_half_removed::<[u64; 4], [u64; 4]>(entries, |k| [k, 0, 1, 2], |k| [k; 4]);
+            }
+        }
+        #[repr(align(16))]
+        struct OverAligned;
+        assert!(
+            matches!(
+                plan_tree_bytes::<OverAligned, u64>(1),
+                Err(crate::discovery::identity::GraphRefusal::Overflow)
+            ),
+            "over-aligned keys refuse"
+        );
+        assert!(
+            matches!(
+                plan_tree_bytes::<u64, OverAligned>(1),
+                Err(crate::discovery::identity::GraphRefusal::Overflow)
+            ),
+            "over-aligned values refuse"
+        );
+        assert!(
+            plan_tree_bytes::<u64, u64>(usize::MAX).is_err(),
+            "huge maps refuse instead of wrapping"
+        );
     }
 }

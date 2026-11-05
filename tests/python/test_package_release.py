@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Public packages must preserve tested bytes and exclude private evidence."""
 
+import contextlib
 import hashlib
 import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
@@ -51,7 +54,7 @@ class PackageReleaseTests(unittest.TestCase):
             "toolchains": [{
                 "name": name, "rustc_verbose_version": f"fixture {name}",
                 "files": [{"payload": f"licenses/rust-{name}/COPYRIGHT-library.html", "sha256": digest(b"Rust notice")}],
-            } for name in ("1.98.1", "nightly-2026-05-20")],
+            } for name in (RELEASE_RUST, "nightly-2026-05-20")],
         }
         self.inputs["third-party/licenses/sources.json"] = json.dumps(self.recipe).encode()
         self.inputs[".release-rust-version"] = (RELEASE_RUST + "\n").encode()
@@ -83,6 +86,7 @@ class PackageReleaseTests(unittest.TestCase):
             f"head\t{self.head}\ntree\t{self.tree}\n"
             f"release_artifacts_sha256\t{digest(self.ledger.read_bytes())}\n"
             "checker_status\t0\nterminal_status\t0\n"
+            "capture_mode\tfull\n"
             "cwd\t/private/host/path\nsecret\tPRIVATE-CAPTURE-CANARY\n"
         )
         (self.receipt / "facts.log").write_text(self.facts)
@@ -126,7 +130,11 @@ class PackageReleaseTests(unittest.TestCase):
         self.output = self.base / "release"
 
     def git(self, *args):
-        return subprocess.check_output(["git", *args], cwd=self.root, stderr=subprocess.DEVNULL)
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        return subprocess.check_output(
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+            cwd=self.root, stderr=subprocess.DEVNULL)
 
     def write_notice_manifest(self):
         (self.notices / "notices.json").write_text(json.dumps(self.notice_manifest))
@@ -173,6 +181,13 @@ class PackageReleaseTests(unittest.TestCase):
             "p11scope-0.1.0-source.tar.gz", "RELEASE.json", "SHA256SUMS",
         }
         self.assertEqual({p.name for p in self.output.iterdir()}, expected)
+        release_bytes = (self.output / "RELEASE.json").read_bytes()
+        release = json.loads(release_bytes)
+        self.assertEqual(release["p11scope_features"], [])
+        self.assertIn("FULL", release["scope"])
+        self.assertIn("object-attribute capture enabled", release["scope"])
+        self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
+        self.assertIn("Offline/helper commands", release["scope"])
         for path in self.output.iterdir():
             self.assertEqual(path.read_bytes(), (second / path.name).read_bytes())
         checksums = (self.output / "SHA256SUMS").read_text()
@@ -182,6 +197,9 @@ class PackageReleaseTests(unittest.TestCase):
             if not name.endswith(".tar.gz") or name.endswith("-source.tar.gz"):
                 continue
             with tarfile.open(self.output / name) as archive:
+                embedded_release = archive.extractfile(name[:-7] + "/RELEASE.json").read()
+                self.assertEqual(embedded_release, release_bytes)
+                self.assertEqual(json.loads(embedded_release)["p11scope_features"], [])
                 binary_name = "p11scope-discover" if "discover" in name else "p11scope"
                 binary = archive.getmember(name[:-7] + "/" + binary_name)
                 self.assertEqual(binary.mode, 0o755)
@@ -196,6 +214,102 @@ class PackageReleaseTests(unittest.TestCase):
                         self.assertNotIn(b"PRIVATE-CAPTURE-CANARY", data)
                         self.assertNotIn(b"/private/host/path", data)
         self.assertEqual((self.dist / "p11scope").stat().st_mode & 0o777, 0o600)
+
+    def test_default_provenance_is_full_capture(self):
+        result = self.package()
+        self.assertEqual(result["p11scope_features"], [])
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        self.assertEqual(release["p11scope_features"], [])
+        self.assertIn("FULL", release["scope"])
+        self.assertIn("object-attribute capture enabled", release["scope"])
+        self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
+        self.assertIn("Offline/helper commands", release["scope"])
+        self.assertIn("`--system` selects whole-machine scope.", release["scope"])
+        self.assertIn("Consult release notes for qualified lanes and known limitations.",
+                      release["scope"])
+        self.assertNotIn("system-wide tracing remains preview", release["scope"])
+        self.assertNotIn("stub-object-attributes", json.dumps(release))
+        for name in ("p11scope-0.1.0-x86_64-linux-musl.tar.gz",
+                     "p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz",
+                     "p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz"):
+            with tarfile.open(self.output / name) as archive:
+                embedded = json.loads(archive.extractfile(name[:-7] + "/RELEASE.json").read())
+            self.assertEqual(embedded["p11scope_features"], [])
+            self.assertIn("FULL", embedded["scope"])
+
+    def test_p0_option_reproduces_p0_provenance(self):
+        (self.receipt / "facts.log").write_text(
+            self.facts.replace("capture_mode\tfull", "capture_mode\tp0"))
+        result = PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                                 self.output, capture_mode="p0")
+        self.assertEqual(result["p11scope_features"], ["stub-object-attributes"])
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        self.assertEqual(release["p11scope_features"], ["stub-object-attributes"])
+        self.assertIn("P0", release["scope"])
+        self.assertIn("object-attribute capture disabled", release["scope"])
+        self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
+        self.assertIn("`--system` selects whole-machine scope.", release["scope"])
+        self.assertIn("Consult release notes for qualified lanes and known limitations.",
+                      release["scope"])
+        self.assertNotIn("system-wide tracing remains preview", release["scope"])
+
+    def test_receipt_capture_mode_must_match_the_flag(self):
+        cases = (
+            ("full", "full", False),
+            ("p0", "p0", False),
+            ("full", "p0", True),
+            ("p0", "full", True),
+            (None, "full", True),
+            (None, "p0", True),
+        )
+        for fact, flag, refuses in cases:
+            with self.subTest(fact=fact, flag=flag):
+                lines = [line for line in self.facts.splitlines()
+                         if not line.startswith("capture_mode\t")]
+                if fact is not None:
+                    lines.append(f"capture_mode\t{fact}")
+                (self.receipt / "facts.log").write_text("\n".join(lines) + "\n")
+                output = self.base / f"release-{fact or 'missing'}-{flag}"
+                if refuses:
+                    with self.assertRaisesRegex(
+                            ValueError, "receipt capture mode does not match --capture-mode"):
+                        PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                                        output, capture_mode=flag)
+                    self.assertFalse(output.exists())
+                else:
+                    PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                                    output, capture_mode=flag)
+
+    def test_unknown_capture_mode_refuses_without_output(self):
+        with self.assertRaisesRegex(ValueError, "capture"):
+            PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                            self.output, capture_mode="bogus")
+        self.assertFalse(self.output.exists())
+
+    def run_main(self, *arguments):
+        """Run the real CLI parser with the packaging core stubbed out."""
+        with patch.object(PACKAGE, "package", return_value={"version": "0.0.0", "head": "h"}) as packaged:
+            with patch.object(sys, "argv", ["package-release.py", *arguments]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = PACKAGE.main()
+        return code, packaged
+
+    def test_cli_capture_mode_selects_provenance(self):
+        base = ["--receipt", "/r", "--notices", "/n", "--source", "/s", "--output", "/o"]
+        code, packaged = self.run_main(*base)
+        self.assertEqual(code, 0)
+        self.assertEqual(packaged.call_args.kwargs["capture_mode"], "full")
+        code, packaged = self.run_main(*base, "--capture-mode", "p0")
+        self.assertEqual(code, 0)
+        self.assertEqual(packaged.call_args.kwargs["capture_mode"], "p0")
+        with patch.object(PACKAGE, "package", return_value={"version": "0.0.0", "head": "h"}) as packaged:
+            with patch.object(sys, "argv", ["package-release.py", *base, "--capture-mode", "bogus"]):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as refused:
+                        PACKAGE.main()
+        self.assertEqual(refused.exception.code, 2)
+        packaged.assert_not_called()
 
     def test_failed_or_unfinished_receipt_refuses(self):
         for status in ("1\n", "", "0\n0\n"):
@@ -239,7 +353,7 @@ class PackageReleaseTests(unittest.TestCase):
         self.refused("notice.*(graph|recipe|complete)")
 
     def test_missing_required_runtime_notice_refuses(self):
-        name = "licenses/rust-1.98.1/COPYRIGHT-library.html"
+        name = f"licenses/rust-{RELEASE_RUST}/COPYRIGHT-library.html"
         del self.notice_manifest["files"][name]
         (self.notices / name).unlink()
         self.write_notice_manifest()

@@ -6,14 +6,21 @@
 use super::*;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::instances::{
-    CallFacts, EntryIp, InstanceId, InstanceRouter, ObserveOutcome, Route, RouterLimits,
-    UnknownReason, stable_scan,
+    InstanceId, InstanceRouter, ObserveOutcome, RELOAD_NOT_EXCLUDED_LABEL, Route, RouterLimits,
+    UnknownReason,
 };
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::{AttachPlan, Slot};
 use crate::process::{PidPin, ProcessView, ProcessViewId};
+use crate::semantic_capture::{
+    InvalidationScope, SemanticCapture, TickLimits, TickOutcome, TickReport,
+};
 use anyhow::ensure;
-use p11scope_ebpf_common::{EventRecord, SlotSemantics, event_type, instance};
+use p11scope_ebpf_common::{
+    EventRecord, ImageIdentity, InstanceRecord, JournalAdmissionControl, SlotSemantics, event_type,
+    instance, journal_marker,
+};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{mapping_file_key, open_object};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -21,21 +28,46 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::ops::ControlFlow;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SOURCE: &str = include_str!("../../tests/fixtures/instance-continuity.c");
-const SOFTHSM: &str = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so";
+/// SoftHSM2 provider layouts across hosts and guest images (Debian
+/// multiarch, the /usr/lib layout of the vng guests, Fedora /usr/lib64).
+/// The first present one wins; the Debian path is named when none is.
+fn softhsm() -> &'static str {
+    static FOUND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+        ];
+        CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| Path::new(path).is_file())
+            .unwrap_or(CANDIDATES[0])
+    })
+}
 const TAG_MAIN: u64 = 0x7000_0000;
 const TAG_SIBLING: u64 = 0x7100_0000;
 const TAG_RACE: u64 = 0x7200_0000;
 
 fn compile(directory: &Path, provider: bool) -> Result<PathBuf> {
+    compile_for_abi(directory, provider, ElfAbi::Lp64)
+}
+
+fn compile_for_abi(directory: &Path, provider: bool, abi: ElfAbi) -> Result<PathBuf> {
     let source = directory.join("instance-continuity.c");
     std::fs::write(&source, SOURCE)?;
     let output = directory.join(if provider { "provider.so" } else { "driver" });
     let mut cc = Command::new("cc");
     cc.args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]);
+    if abi == ElfAbi::Ilp32 {
+        cc.arg("-m32");
+    }
     if provider {
         cc.args(["-fPIC", "-shared", "-DINSTANCE_PROVIDER"]);
     }
@@ -57,7 +89,7 @@ struct Target {
     child: Child,
     input: ChildStdin,
     lines: mpsc::Receiver<String>,
-    pin: PidPin,
+    pin: Arc<PidPin>,
     ledger: Vec<String>,
 }
 
@@ -71,6 +103,7 @@ impl Target {
         for (key, value) in env {
             command.env(key, value);
         }
+        command.die_with_parent();
         let mut child = command.spawn()?;
         let input = child.stdin.take().context("fixture stdin")?;
         let output = child.stdout.take().context("fixture stdout")?;
@@ -84,7 +117,7 @@ impl Target {
             }
         });
         let pin = match PidPin::open(child.id()) {
-            Ok(pin) => pin,
+            Ok(pin) => Arc::new(pin),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -148,11 +181,20 @@ fn pin_and_plan(
     provider: &Path,
     functions: &[&str],
 ) -> Result<(ProcessView, PinnedObjects, AttachPlan, ObjectKey)> {
+    pin_and_plan_for_abi(pid, provider, functions, ElfAbi::Lp64)
+}
+
+fn pin_and_plan_for_abi(
+    pid: u32,
+    provider: &Path,
+    functions: &[&str],
+    abi: ElfAbi,
+) -> Result<(ProcessView, PinnedObjects, AttachPlan, ObjectKey)> {
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
     let file = open_object(provider).map_err(anyhow::Error::msg)?;
     let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
     let elf = ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
-    ensure!(elf.abi() == ElfAbi::Lp64);
+    ensure!(elf.abi() == abi);
     let key = ObjectKey {
         device: Device {
             major: mapping.device_major,
@@ -161,8 +203,10 @@ fn pin_and_plan(
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
@@ -232,15 +276,18 @@ fn enable_bpf_stats() -> Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
 }
 
-fn hook_runs(harness: &Harness, program: &str) -> Result<u64> {
-    Ok(harness
-        .session
-        .instance_hook_stats()?
-        .iter()
-        .find(|(name, _)| *name == program)
-        .with_context(|| format!("hook {program}"))?
-        .1
-        .run_cnt)
+/// Run count of the resolved `copy_vma` hook: exactly one of the two slots
+/// is active (fixed-slot through the 5-argument shape, `bpf_get_func_ret`
+/// on the 6/7-argument shapes), and the wrong slot must never fire.
+fn copy_hook_runs(harness: &Harness) -> Result<u64> {
+    let mut runs = None;
+    for (name, stats) in harness.session.instance_hook_stats()? {
+        if name == "p11_inst_vma_copy" || name == super::COPY_VMA_RET_PROGRAM {
+            ensure!(runs.is_none(), "both copy_vma hooks are active");
+            runs = Some(stats.run_cnt);
+        }
+    }
+    runs.context("neither copy_vma hook is active")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,14 +310,15 @@ struct ScanStats {
 /// The observer half: one Session, one router, and the scan protocol.
 struct Harness {
     session: Session,
-    router: InstanceRouter,
+    capture: SemanticCapture,
     file_slot: u32,
-    maps_keys: Vec<ObjectKey>,
-    identity: crate::discovery::instances::MappedFileIdentity,
     offsets: BTreeMap<u32, u64>,
-    next_token: u64,
-    awaiting: BTreeMap<u64, (u32, u64)>,
+
     routed: Vec<Routed>,
+    images: Vec<ImageIdentity>,
+    retired_images: Vec<p11scope_ebpf_common::ImageIdentity>,
+    retired_instances: Vec<InstanceId>,
+    retired_tasks: Vec<u64>,
     misses: u64,
     scan: ScanStats,
     events: u64,
@@ -278,15 +326,73 @@ struct Harness {
 
 impl Harness {
     fn start(plan: &AttachPlan, pid: u32, pins: &PinnedObjects) -> Result<Self> {
-        let session = Session::start(
+        Self::start_with_backend(plan, pid, pins, BackendSelection::Singles)
+    }
+
+    fn start_with_backend(
+        plan: &AttachPlan,
+        pid: u32,
+        pins: &PinnedObjects,
+        backend: BackendSelection,
+    ) -> Result<Self> {
+        Self::start_with_scope(plan, &Scope::Pid(pid), pins, backend)
+    }
+
+    /// Cgroup-scoped twin of [`Harness::start`]: the same Session start and
+    /// the same checks, with the caller's cgroup scope instead of a PID.
+    fn start_cgroup(plan: &AttachPlan, scope: &Scope, pins: &PinnedObjects) -> Result<Self> {
+        ensure!(
+            matches!(scope, Scope::Cgroup { .. }),
+            "start_cgroup needs a cgroup scope"
+        );
+        Self::start_with_scope(plan, scope, pins, BackendSelection::Singles)
+    }
+
+    /// Journal-object twin of [`Harness::start`]: the same plan, PID scope
+    /// and checks, but the Session loads the production journal object
+    /// (the `--key-operations` lane) instead of Detailed. Refuses with the
+    /// finite build reason when this build omits the journal. Row reads
+    /// only; the journal roots emit linked records, not Detailed events,
+    /// so call pumping stays with the ordinary harness.
+    fn start_journal(plan: &AttachPlan, pid: u32, pins: &PinnedObjects) -> Result<Self> {
+        Self::start_journal_with_scope(plan, &Scope::Pid(pid), pins)
+    }
+
+    /// Cgroup-scoped twin of [`Harness::start_journal`].
+    fn start_journal_cgroup(
+        plan: &AttachPlan,
+        scope: &Scope,
+        pins: &PinnedObjects,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(scope, Scope::Cgroup { .. }),
+            "start_journal_cgroup needs a cgroup scope"
+        );
+        Self::start_journal_with_scope(plan, scope, pins)
+    }
+
+    fn start_journal_with_scope(
+        plan: &AttachPlan,
+        scope: &Scope,
+        pins: &PinnedObjects,
+    ) -> Result<Self> {
+        let spec = super::journal::JournalSpec;
+        spec.prepare().map_err(anyhow::Error::msg)?;
+        let session = Session::start_with_selected(
             plan,
-            &Scope::Pid(pid),
+            scope,
             pins,
             CapturePolicy::Allowlisted,
             None,
             None,
             None,
             BackendSelection::Singles,
+            None,
+            None,
+            Some(&spec),
+            false,
+            super::require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
         )?;
         ensure!(
             session.attach_failures().is_empty(),
@@ -309,136 +415,161 @@ impl Harness {
             .iter()
             .map(|slot| (slot.index, slot.file_offset))
             .collect();
+        let capture = SemanticCapture::new(&session, TickLimits::default())?;
         Ok(Self {
             session,
-            router: InstanceRouter::new(RouterLimits::default()),
+            capture,
             file_slot: watched.file_slot,
-            maps_keys: watched.maps_keys,
-            identity: watched.identity,
+
             offsets,
-            next_token: 0,
-            awaiting: BTreeMap::new(),
+
             routed: Vec::new(),
+            images: Vec::new(),
+            retired_images: Vec::new(),
+            retired_instances: Vec::new(),
+            retired_tasks: Vec::new(),
             misses: 0,
             scan: ScanStats::default(),
             events: 0,
         })
     }
 
-    fn record(&mut self, token: u64, route: Route) {
-        if let Some((slot, tag)) = self.awaiting.remove(&token) {
-            self.routed.push(Routed { slot, tag, route });
-        }
+    fn start_with_scope(
+        plan: &AttachPlan,
+        scope: &Scope,
+        pins: &PinnedObjects,
+        backend: BackendSelection,
+    ) -> Result<Self> {
+        let session = Session::start(
+            plan,
+            scope,
+            pins,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            backend,
+        )?;
+        ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        let tracking = session.instance_tracking();
+        ensure!(
+            tracking.refused().is_none(),
+            "instance tracking refused: {:?}",
+            tracking.refused()
+        );
+        let object = plan.slots[0].object;
+        let watched = tracking
+            .watched(object)
+            .with_context(|| format!("not watched: {:?}", tracking.watch_refusal(object)))?
+            .clone();
+        let offsets = plan
+            .slots
+            .iter()
+            .map(|slot| (slot.index, slot.file_offset))
+            .collect();
+        let capture = SemanticCapture::new(&session, TickLimits::default())?;
+        Ok(Self {
+            session,
+            capture,
+            file_slot: watched.file_slot,
+
+            offsets,
+
+            routed: Vec::new(),
+            images: Vec::new(),
+            retired_images: Vec::new(),
+            retired_instances: Vec::new(),
+            retired_tasks: Vec::new(),
+            misses: 0,
+            scan: ScanStats::default(),
+            events: 0,
+        })
     }
 
-    /// One stable scan of (pid, provider), observed by the router.
-    fn scan(&mut self, target: &Target, pending: bool) -> Result<Option<ObserveOutcome>> {
-        let started = Instant::now();
-        // The fence is read before the scan starts: a scan cached past a
-        // later fault-era reset must observe as StaleEra, never as New.
-        let fence = self.router.fence();
-        let observation = {
-            let pidfd = target.pin.pidfd()?;
-            let mut reader = LiveScan {
-                maps: self.session.instance_maps(),
-                pidfd,
-                pid: target.pid(),
-                file_slot: self.file_slot,
-                maps_keys: &self.maps_keys,
-                identity: self.identity,
-            };
-            stable_scan(&mut reader, self.file_slot, 8, fence)
-        };
-        let elapsed = started.elapsed().as_nanos();
-        self.scan.scans += 1;
-        self.scan.pending_scans += u64::from(pending);
+    fn record_report(
+        &mut self,
+        report: TickReport,
+        elapsed: u128,
+        pending: bool,
+    ) -> Option<ObserveOutcome> {
+        self.events += report.collected_calls as u64;
+        self.scan.scans += report.scans as u64;
+        if pending {
+            self.scan.pending_scans += report.scans as u64;
+        }
         self.scan.total_ns += elapsed;
         self.scan.max_ns = self.scan.max_ns.max(elapsed);
-        let observation = match observation {
-            Ok(observation) => observation,
-            Err(refusal) => {
-                self.scan.unstable += 1;
-                *self
-                    .scan
-                    .outcomes
-                    .entry(format!("{refusal:?}"))
-                    .or_default() += 1;
-                return Ok(None);
-            }
-        };
-        let (outcome, resolved) = self.router.observe(observation);
-        *self
-            .scan
-            .outcomes
-            .entry(format!("{outcome:?}"))
-            .or_default() += 1;
-        for (token, route) in resolved {
-            self.record(token, route);
+        for refusal in &report.scan_refusals {
+            self.scan.unstable += 1;
+            *self
+                .scan
+                .outcomes
+                .entry(format!("{refusal:?}"))
+                .or_default() += 1;
         }
-        Ok(Some(outcome))
+        for observation in &report.observations {
+            *self
+                .scan
+                .outcomes
+                .entry(format!("{observation:?}"))
+                .or_default() += 1;
+        }
+        let last = report.observations.last().cloned();
+        for outcome in report.into_outcomes() {
+            match outcome {
+                TickOutcome::Call(call) => {
+                    self.images.push(call.image());
+                    self.routed.push(Routed {
+                        slot: call.record().event.slot,
+                        tag: call.record().event.slot_id,
+                        route: call.route(),
+                    });
+                }
+                TickOutcome::Invalidation(change) => match change.scope() {
+                    InvalidationScope::ImageRetired(image) => self.retired_images.push(*image),
+                    InvalidationScope::InstancesRetired { ids, .. } => {
+                        self.retired_instances.extend(ids)
+                    }
+                    InvalidationScope::TaskRetired(cookie) => self.retired_tasks.push(*cookie),
+                    _ => {}
+                },
+                TickOutcome::Other(_) => {}
+            }
+        }
+        last
     }
 
-    /// Drains EVENTS, audits faults/misses, routes every call, and scans
-    /// while any call waits for a stable observation.
+    /// Explicit bounded refresh through the production full-image seal path.
+    fn scan(&mut self, target: &Target, pending: bool) -> Result<Option<ObserveOutcome>> {
+        let started = Instant::now();
+        let report = self
+            .capture
+            .refresh(&mut self.session, target.pin.clone(), 0)?;
+        Ok(self.record_report(report, started.elapsed().as_nanos(), pending))
+    }
+
+    /// The sole production collect/audit/route/scheduler owns EVENTS and all
+    /// pending records. This harness records its opaque outputs only.
     fn pump(&mut self, target: &Target) -> Result<usize> {
-        let mut batch: Vec<EventRecord> = Vec::new();
-        let drain = self.session.event_drain()?;
-        let _ = drain.poll_records(Some(1 << 20), |record| {
-            batch.push(record);
-            ControlFlow::Continue(())
-        });
-        ensure!(drain.malformed() == 0, "malformed EVENTS records");
+        let started = Instant::now();
+        let report = self
+            .capture
+            .tick(&mut self.session, std::slice::from_ref(&target.pin))?;
+        let count = report.collected_calls;
+        self.record_report(report, started.elapsed().as_nanos(), true);
         while self.session.discovery_dequeue()?.is_some() {}
-        // Batch audit before routing: hook-program misses raise the fault
-        // generation, so no call stamped before them can join afterwards.
-        let misses: u64 = self
+        // Diagnostic only; the production tick already audited exact IDs and
+        // each hook miss counter before granting any cached join.
+        self.misses = self
             .session
             .instance_hook_stats()?
             .iter()
             .map(|(_, stats)| stats.recursion_misses)
             .sum();
-        if misses != self.misses {
-            self.misses = misses;
-            self.session.instance_maps().raise_fault()?;
-        }
-        let maps = self.session.instance_maps();
-        let (fault, sticky) = (maps.fault()?, maps.sticky()?);
-        // Seam: the production capture loop (Stage 2+ activation) polls
-        // `instance_hook_stats()` and raises the fault exactly like this
-        // pump does; the router's miss latch then stays a backstop for a
-        // loop that passes misses without raising (DR-T3A-1).
-        for (token, route) in self.router.audit(fault, sticky, misses) {
-            self.record(token, route);
-        }
-        let mut count = 0;
-        for record in batch {
-            let (event, continuity) = (record.event, record.continuity);
-            if event.event_type != event_type::CALL {
-                continue;
-            }
-            count += 1;
-            self.events += 1;
-            let token = self.next_token;
-            self.next_token += 1;
-            self.awaiting.insert(token, (event.slot, event.slot_id));
-            let route = self.router.route(CallFacts {
-                token,
-                cookie: event.image.task_cookie,
-                entry: continuity.entry_stamp,
-                ret: continuity.return_stamp,
-                ip: EntryIp::new(continuity.entry_ip),
-                attached_offset: self.offsets.get(&event.slot).copied(),
-            });
-            if route != Route::Pending {
-                self.record(token, route);
-            }
-        }
-        for _ in 0..4 {
-            if self.router.pending_len() == 0 {
-                break;
-            }
-            self.scan(target, true)?;
-        }
         Ok(count)
     }
 
@@ -481,6 +612,13 @@ impl Harness {
     fn take_routed(&mut self) -> Vec<Routed> {
         std::mem::take(&mut self.routed)
     }
+
+    /// The image identities of the drained calls, index-aligned with the
+    /// [`Harness::take_routed`] vector taken at the same point: every Call
+    /// outcome pushes exactly one of each, in order.
+    fn take_images(&mut self) -> Vec<ImageIdentity> {
+        std::mem::take(&mut self.images)
+    }
 }
 
 fn single_join(routed: &[Routed]) -> Result<InstanceId> {
@@ -497,6 +635,29 @@ fn single_join(routed: &[Routed]) -> Result<InstanceId> {
 
 fn pump_until(harness: &mut Harness, target: &Target, calls: usize) -> Result<Vec<Routed>> {
     let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.routed.len() < calls {
+        harness.pump(target)?;
+        ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for {calls} routed calls ({} so far)",
+            harness.routed.len()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(harness.take_routed())
+}
+
+/// Bounded wait for routed outcomes without demanding joins: returns
+/// whatever the router settled (joined or unknown) once `calls`
+/// outcomes exist, or fails at the budget. For cells where the
+/// expected outcome is an unjoined call that must arrive promptly.
+fn pump_until_routed(
+    harness: &mut Harness,
+    target: &Target,
+    calls: usize,
+    budget: Duration,
+) -> Result<Vec<Routed>> {
+    let deadline = Instant::now() + budget;
     while harness.routed.len() < calls {
         harness.pump(target)?;
         ensure!(
@@ -531,6 +692,881 @@ fn spawn_cmd_target() -> Result<CmdSetup> {
     })
 }
 
+fn held_object_tid(target: &mut Target) -> Result<u32> {
+    let held = target.command(b'o')?;
+    let mut fields = held.split_whitespace();
+    ensure!(
+        fields.next() == Some("OHELD"),
+        "object entry ledger: {held}"
+    );
+    let tid: u32 = fields.next().context("object call worker tid")?.parse()?;
+    ensure!(tid != 0 && tid != target.pid() && fields.next().is_none());
+    Ok(tid)
+}
+
+#[test]
+fn instance_object_call_gate_reports_owned_tid_and_returns() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider: _,
+        mut target,
+    } = spawn_cmd_target()?;
+    held_object_tid(&mut target)?;
+    ensure!(target.command(b'u')? == "UNHELD 0 0");
+    // Existing ordinary held-call commands keep their original protocol.
+    ensure!(target.command(b'b')? == "HELD");
+    ensure!(target.command(b'u')? == "UNHELD 0 3");
+    Ok(())
+}
+
+fn object_call_evidence(session: &Session) -> Result<(u64, u64)> {
+    use p11scope_ebpf_common::{EVIDENCE_RING_LOSS, EVIDENCE_UNMATCHED_RETURNS};
+    let map: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
+    let total = |index| -> Result<u64> { Ok(map.get(&index, 0)?.iter().copied().sum()) };
+    Ok((
+        total(EVIDENCE_RING_LOSS)?,
+        total(EVIDENCE_UNMATCHED_RETURNS)?,
+    ))
+}
+
+/// Default FULL, real Multi/native hooks, with one exact owned continuity
+/// entry removed while its object-arm call is held inside the provider.
+/// Separate sessions keep the refused call's fault out of the healthy twin.
+#[test]
+#[ignore = "privileged: default FULL LP64, Multi and native instance hooks; exact held-call map injection"]
+fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
+    use p11scope_ebpf_common::object_flow::continuity_joins;
+    use p11scope_ebpf_common::{CallStart, InstanceEntry, InstanceStamp, StartKey};
+
+    for missing_entry in [false, true] {
+        let CmdSetup {
+            _directory,
+            provider,
+            mut target,
+        } = spawn_cmd_target()?;
+        let pid = target.pid();
+        let (_view, pins, plan, _) = pin_and_plan(pid, &provider, &["C_SignInit"])?;
+        let mut harness = Harness::start_with_backend(&plan, pid, &pins, BackendSelection::Multi)?;
+        ensure!(harness.session.static_multi_attached());
+        ensure!(harness.session.backend_fallback().is_none());
+        ensure!(!embedded_object_is_stubbed());
+        let Some(Map::LruHashMap(starts)) = harness.session.ebpf.map("INSTANCE_START") else {
+            bail!("expected native INSTANCE_START LRU map");
+        };
+        let info = starts.info()?;
+        ensure!(info.key_size() == 16 && info.value_size() == 24 && info.max_entries() == 16_384);
+        harness.pump(&target)?;
+        ensure!(harness.events == 0 && harness.routed.is_empty());
+        {
+            let (drain, rows) = harness.session.event_drain_with_object_table()?;
+            // Ordinary transport verifies the frozen rows independently;
+            // it does not admit a semantic object tail without attestation.
+            ensure!(rows.is_none(), "ordinary S1 has no attested semantic rows");
+            ensure!(drain.malformed() == 0);
+        }
+        let before = crate::events::event_drain_positions(harness.session.event_drain()?);
+        ensure!(
+            before.capacity == 4 * 1024 * 1024,
+            "requires the default FULL ring"
+        );
+        ensure!(
+            before.consumer == before.producer,
+            "startup ring must be empty"
+        );
+        let evidence_before = object_call_evidence(&harness.session)?;
+        let fault_before = harness.session.instance_maps().fault()?;
+
+        let tid = held_object_tid(&mut target)?;
+        let key = StartKey {
+            pid_tgid: (u64::from(pid) << 32) | u64::from(tid),
+            slot: 0,
+            _pad: 0,
+        };
+        {
+            let starts: HashMap<_, StartKey, CallStart> =
+                HashMap::try_from(harness.session.ebpf.map("START").context("START")?)?;
+            ensure!(
+                starts.get(&key, 0)?.object_required
+                    == u64::from(plan.slots[0].descriptor_index) + 1
+            );
+        }
+        let entry = {
+            let mut starts: HashMap<_, StartKey, InstanceEntry> = HashMap::try_from(
+                harness
+                    .session
+                    .ebpf
+                    .map_mut("INSTANCE_START")
+                    .context("INSTANCE_START")?,
+            )?;
+            let entry = starts.get(&key, 0)?;
+            ensure!(entry.entry_ip != 0);
+            ensure!(entry.entry_stamp.flags == instance::STAMP_VALID);
+            ensure!(u32::from(entry.entry_stamp.file_slot_plus1) == harness.file_slot + 1);
+            if missing_entry {
+                starts.remove(&key)?;
+                ensure!(matches!(starts.get(&key, 0), Err(MapError::KeyNotFound)));
+            }
+            entry
+        }; // Release the map borrow before the call/session runs again.
+        ensure!(target.command(b'u')? == "UNHELD 0 0");
+        let after = crate::events::event_drain_positions(harness.session.event_drain()?);
+        ensure!(
+            after.consumer == before.consumer,
+            "only H0 may advance this cursor"
+        );
+        // Actual producer positions include each eight-byte ring header.
+        // Healthy:608. Refused: discarded608 plus one ordinary368. Combined
+        // with the atomic decoder/outcome checks below this pins wire sizes
+        // without adding a second ring consumer or a test emission flag.
+        let expected_bytes = if missing_entry {
+            608 + 8 + 368 + 8
+        } else {
+            608 + 8
+        };
+        ensure!(after.producer.checked_sub(before.producer) == Some(expected_bytes));
+        let evidence_after = object_call_evidence(&harness.session)?;
+        ensure!(
+            evidence_after.0 == evidence_before.0,
+            "no ring loss in either twin"
+        );
+        ensure!(evidence_after.1 - evidence_before.1 == u64::from(missing_entry));
+        ensure!(
+            harness.session.instance_maps().fault()? - fault_before == u64::from(missing_entry)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut collected = 0;
+        let mut shed = 0u64;
+        let mut calls = Vec::new();
+        loop {
+            let report = harness
+                .capture
+                .tick(&mut harness.session, std::slice::from_ref(&target.pin))?;
+            collected += report.collected_calls;
+            let outcomes = report.into_outcomes();
+            shed += crate::semantic_capture::unjoined_shed_counts(&outcomes)
+                .values()
+                .sum::<u64>();
+            for outcome in outcomes {
+                if let TickOutcome::Call(call) = outcome {
+                    ensure!(call.joint_resource().is_none());
+                    calls.push((*call.record(), call.route(), call.into_object_tail()));
+                }
+            }
+            let positions = crate::events::event_drain_positions(harness.session.event_drain()?);
+            if !calls.is_empty()
+                && positions.consumer == positions.producer
+                && harness.capture.router().pending_len() == 0
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "missing_entry={missing_entry}: collected={collected}, routed={}",
+                calls.len()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ensure!(
+            collected == 1 && calls.len() == 1,
+            "one actual call must conserve one collected/routed outcome"
+        );
+        ensure!(harness.session.event_drain()?.malformed() == 0);
+        let (record, route, object) = calls.pop().unwrap();
+        ensure!(record.event.event_type == event_type::CALL && record.event.slot == 0);
+        ensure!(record.event.pid_tgid == key.pid_tgid && record.event.rv == 0);
+        ensure!(record.continuity.return_stamp == entry.entry_stamp);
+        ensure!(
+            object.is_none(),
+            "ordinary S1 grants no semantic object tail"
+        );
+        if missing_entry {
+            ensure!(record.continuity.entry_ip == 0);
+            ensure!(record.continuity.entry_stamp == InstanceStamp::default());
+            ensure!(!continuity_joins(&record.continuity));
+            ensure!(
+                matches!(route, Route::Unknown(_)),
+                "actual negative route: {route:?}"
+            );
+            ensure!(
+                shed == 1,
+                "count the routed call once, never a receipt repeat"
+            );
+        } else {
+            ensure!(record.continuity.entry_ip == entry.entry_ip);
+            ensure!(record.continuity.entry_stamp == entry.entry_stamp);
+            ensure!(continuity_joins(&record.continuity));
+            ensure!(
+                matches!(route, Route::Joined(_)),
+                "healthy route: {route:?}"
+            );
+            ensure!(shed == 0);
+        }
+        eprintln!(
+            "S1 object twin missing_entry={missing_entry}: collected=1 route={route:?} shed={shed} wire_bytes={expected_bytes}"
+        );
+    }
+    Ok(())
+}
+
+/// Two cmd targets sharing one provider file: the in-scope target and an
+/// out-of-scope sibling whose calls hit the same probed offsets.
+struct PairSetup {
+    _directory: tempfile::TempDir,
+    provider: PathBuf,
+    inner: Target,
+    outer: Target,
+}
+
+fn spawn_pair_targets() -> Result<PairSetup> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let args = ["cmd".as_ref(), provider.as_os_str()];
+    let mut inner = Target::spawn(&driver, &args, &[])?;
+    let ready = inner.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let mut outer = Target::spawn(&driver, &args, &[])?;
+    let ready = outer.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    ensure!(inner.pid() != outer.pid(), "sibling targets share a pid");
+    Ok(PairSetup {
+        _directory: directory,
+        provider,
+        inner,
+        outer,
+    })
+}
+
+/// The target leader's PROC_EPOCH row, if the kernel created one.
+fn proc_record_of(harness: &Harness, target: &Target) -> Result<Option<InstanceRecord>> {
+    harness.session.instance_maps().record(target.pin.pidfd()?)
+}
+
+/// The row's marker word, or 0 when no row exists. `InstanceRecord` has no
+/// Debug impl, so cells format rows through this and [`marker_summary`].
+fn marker_word_of(record: &Option<InstanceRecord>) -> u64 {
+    record.map(|record| record.journal_bootstrap).unwrap_or(0)
+}
+
+fn marker_summary(record: &Option<InstanceRecord>) -> String {
+    match record {
+        None => "no row".to_string(),
+        Some(record) => format!(
+            "word {:#x} gen {}",
+            record.journal_bootstrap, record.exec_attach_gen
+        ),
+    }
+}
+
+/// The session's marker admission row, read directly through the session's
+/// instance maps.
+fn admission_of(harness: &Harness) -> Result<JournalAdmissionControl> {
+    harness.session.instance_maps().journal_admission_control()
+}
+
+/// The READY exec ID of a row that must already be published, or a loud
+/// refusal naming the actual word.
+fn ready_exec_of(record: &Option<InstanceRecord>, what: &str) -> Result<u64> {
+    let word = marker_word_of(record);
+    match journal_marker::read_word(word) {
+        journal_marker::MarkerRead::Ready(exec) => Ok(exec),
+        other => bail!(
+            "{what} must publish READY, got {other:?} ({})",
+            marker_summary(record),
+        ),
+    }
+}
+
+/// 6.05 step 2 R52 retention/live readback wiring (unprivileged): the
+/// same helpers the nine privileged retention/live cells use to read
+/// back marker rows — wired here over fixture rows so the readback
+/// contract stays GREEN without a quiet window. No row infers no flag
+/// (word 0, never DIRTY/READY); READY flips to its exec; every other
+/// shape refuses loudly.
+#[test]
+fn r52_marker_readback_helpers_wire_retention_over_fixture_rows() -> Result<()> {
+    let row = |word: u64, generation: u64| {
+        Some(InstanceRecord {
+            journal_bootstrap: word,
+            exec_attach_gen: generation,
+            ..Default::default()
+        })
+    };
+    // No row: no flag. The empty map reads as word 0 and summarizes
+    // as absent; READY extraction refuses.
+    assert_eq!(marker_word_of(&None), 0);
+    assert_eq!(marker_summary(&None), "no row");
+    assert!(ready_exec_of(&None, "the absent row").is_err());
+    // Unpublished, DIRTY and corrupt shapes refuse with the word named.
+    for (word, generation, what) in [
+        (journal_marker::MARKER_UNPUBLISHED, 7, "unpublished"),
+        (journal_marker::MARKER_DIRTY, 7, "DIRTY"),
+        (3, 7, "low bits 11"),
+        (4, 7, "low bits 00 with high bits"),
+        (7, 7, "low bits 11 with high bit"),
+        (u64::MAX, 7, "all bits"),
+    ] {
+        let record = row(word, generation);
+        assert_eq!(marker_word_of(&record), word);
+        assert_eq!(
+            marker_summary(&record),
+            format!("word {word:#x} gen {generation}")
+        );
+        let refusal = ready_exec_of(&record, what).expect_err("must refuse");
+        let text = format!("{refusal:?}");
+        assert!(text.contains("must publish READY"), "{what}: {text}");
+    }
+    // READY flips to its exec and retains it across rereads.
+    for exec in [0, 1, 7, (1 << 62) - 1] {
+        let record = row(journal_marker::ready_word(exec), 7);
+        assert_eq!(marker_word_of(&record), journal_marker::ready_word(exec));
+        assert_eq!(ready_exec_of(&record, "the READY row")?, exec);
+        assert_eq!(ready_exec_of(&record, "the retained row")?, exec);
+    }
+    Ok(())
+}
+
+/// Pumps `rounds` ticks and returns whatever routed. For pins where the
+/// expected outcome is silence (an out-of-scope return emits no call).
+fn pump_rounds(harness: &mut Harness, target: &Target, rounds: u32) -> Result<Vec<Routed>> {
+    for _ in 0..rounds {
+        harness.pump(target)?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(harness.take_routed())
+}
+
+/// The process's current cgroup v2 directory: parses the `0::` line of
+/// `/proc/<pid>/cgroup` under the v2 mount.
+fn current_cgroup(pid: u32) -> Result<PathBuf> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    for line in text.lines() {
+        if let Some(relative) = line.strip_prefix("0::") {
+            return Ok(PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/')));
+        }
+    }
+    bail!("no cgroup v2 entry for process {pid}: {text:?}")
+}
+
+/// Moves the whole process to `cgroup` and proves the move landed: a
+/// misplaced process would flip every later scope assertion, so a silent
+/// miss must fail here instead.
+fn move_process_to(pid: u32, cgroup: &Path) -> Result<()> {
+    std::fs::write(cgroup.join("cgroup.procs"), pid.to_string())
+        .with_context(|| format!("moving {pid} to {}", cgroup.display()))?;
+    let placed = current_cgroup(pid)?;
+    ensure!(
+        placed == cgroup,
+        "process {pid} did not land in {} (in {})",
+        cgroup.display(),
+        placed.display()
+    );
+    Ok(())
+}
+
+/// One privately owned cgroup v2 child for the marker scope cells. The cell
+/// moves its target back out and removes the directory explicitly; Drop
+/// only best-effort retries the removal.
+struct MarkerCgroup {
+    path: PathBuf,
+}
+
+impl MarkerCgroup {
+    fn create(tag: &str) -> Result<Self> {
+        let path = PathBuf::from(format!(
+            "/sys/fs/cgroup/p11scope-marker-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn move_in(&self, pid: u32) -> Result<()> {
+        move_process_to(pid, &self.path)
+    }
+}
+
+impl Drop for MarkerCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// Timeout-only reads of the owned fixture's actual capture path.
+fn native_image_call_diagnostics(session: &Session, target: &Target) -> Result<String> {
+    use p11scope_ebpf_common::{CallStart, EVIDENCE_CELLS, SlotStats, StartKey};
+
+    let stats: PerCpuArray<_, SlotStats> =
+        PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
+    let (entered, returned, errors) =
+        stats
+            .get(&0, 0)?
+            .iter()
+            .fold((0u64, 0u64, 0u64), |(entered, returned, errors), value| {
+                (
+                    entered.saturating_add(value.entered),
+                    returned.saturating_add(value.returned),
+                    errors.saturating_add(value.errors),
+                )
+            });
+    let evidence: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
+    let evidence = (0..EVIDENCE_CELLS)
+        .map(|index| {
+            Ok(evidence
+                .get(&index, 0)?
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let cookie: Array<_, ImageIdentityControl> =
+        Array::try_from(session.ebpf.map("COOKIE_CTL").context("COOKIE_CTL")?)?;
+    let owner: Array<_, ThreadOwnerControl> =
+        Array::try_from(session.ebpf.map("OWNER_CTL").context("OWNER_CTL")?)?;
+    let pid_filter: HashMap<_, u32, u64> =
+        HashMap::try_from(session.ebpf.map("PID_FILTER").context("PID_FILTER")?)?;
+    let start: HashMap<_, StartKey, CallStart> =
+        HashMap::try_from(session.ebpf.map("START").context("START")?)?;
+    let key = StartKey {
+        pid_tgid: (u64::from(target.pid()) << 32) | u64::from(target.pid()),
+        slot: 0,
+        _pad: 0,
+    };
+    let start_present = match start.get(&key, 0) {
+        Ok(_) => true,
+        Err(MapError::KeyNotFound) => false,
+        Err(error) => return Err(error).context("diagnostic START lookup"),
+    };
+    let array = |name: &str, index: u32| -> Result<u64> {
+        let map: Array<_, u64> =
+            Array::try_from(session.ebpf.map(name).with_context(|| name.to_string())?)?;
+        Ok(map.get(&index, 0)?)
+    };
+    let maps = session.instance_maps();
+    Ok(format!(
+        "slot0 entered={entered} returned={returned} errors={errors} START={start_present}; \
+         EVIDENCE[ring,start,unmatched,rv,cgroup,semantic,template,mechanism,abi]={evidence:?}; \
+         cookie={:?}; owner={:?}; pid_filter={:?}; CONFIG={} STOP_GATE={}; fault={} sticky={}",
+        cookie.get(&0, 0)?,
+        owner.get(&0, 0)?,
+        pid_filter.get(&target.pid(), 0),
+        array("CONFIG", 0)?,
+        array("STOP_GATE", 0)?,
+        maps.fault()?,
+        maps.sticky()?,
+    ))
+}
+
+/// A real endpoint call and its private continuity record, collected without
+/// the legacy cookie-only router harness.
+fn native_image_call(session: &mut Session, target: &mut Target) -> Result<EventRecord> {
+    let reply = target.command(b'c')?;
+    ensure!(reply.starts_with("CALL "), "owned call ledger: {reply}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let drain = session.event_drain()?;
+        let mut calls = Vec::new();
+        let _ = drain.poll_records(Some(1 << 20), |record| {
+            if record.event.event_type == event_type::CALL {
+                calls.push(record);
+            }
+            ControlFlow::Continue(())
+        });
+        ensure!(drain.malformed() == 0, "malformed native call record");
+        if !calls.is_empty() {
+            ensure!(calls.len() == 1, "one owned call must produce one record");
+            let record = calls.pop().unwrap();
+            ensure!(record.event.slot_id == TAG_MAIN);
+            ensure!(record.continuity.entry_stamp.flags == instance::STAMP_VALID);
+            ensure!(record.continuity.return_stamp.flags == instance::STAMP_VALID);
+            return Ok(record);
+        }
+        if Instant::now() >= deadline {
+            let diagnostics = native_image_call_diagnostics(session, target)
+                .unwrap_or_else(|error| format!("diagnostic read failed: {error:#}"));
+            bail!("owned native call record timed out; {diagnostics}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn native_image_retained_kernel_ids(session: &Session) -> Result<BTreeMap<String, u32>> {
+    let mut ids = BTreeMap::new();
+    for (name, map) in session.ebpf.maps() {
+        let data = match map {
+            Map::Array(data)
+            | Map::CgroupArray(data)
+            | Map::HashMap(data)
+            | Map::LruHashMap(data)
+            | Map::PerCpuArray(data)
+            | Map::PerCpuHashMap(data)
+            | Map::ProgramArray(data)
+            | Map::RingBuf(data)
+            | Map::Unsupported(data) => data,
+            _ => bail!("unexpected full-image fixture map {name}"),
+        };
+        let id = data.info()?.id();
+        ensure!(id != 0);
+        ids.insert(format!("map:{name}"), id);
+    }
+    for (name, program) in session.ebpf.programs() {
+        match program.info() {
+            Ok(info) => {
+                ensure!(info.id() != 0);
+                ids.insert(format!("program:{name}"), info.id());
+            }
+            Err(aya::programs::ProgramError::NotLoaded) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(ids)
+}
+
+/// Production tick integration, including explicit endpoint rebind after
+/// de_thread. This qualifies routing within one retained proof domain; it
+/// does not claim automatic recovery of fixed PID-scoped Multi links.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_semantic_capture_multi_reload_and_rebound_successor() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_with_backend(&plan, pid, &pins, BackendSelection::Multi)?;
+    ensure!(
+        harness.session.static_multi_attached() && harness.session.backend_fallback().is_none()
+    );
+    let domain = harness
+        .session
+        .native_domain()
+        .context("retained native domain")?;
+    let ids = native_image_retained_kernel_ids(&harness.session)?;
+    let hooks = harness
+        .session
+        .instance_hook_stats()?
+        .into_iter()
+        .map(|(name, stats)| (name, stats.program_id))
+        .collect::<BTreeMap<_, _>>();
+    let window = || capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(3));
+    ensure!(matches!(
+        harness.session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    target.command(b'c')?;
+    let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(harness.retired_instances.is_empty() && harness.retired_images.is_empty());
+    ensure!(harness.capture.router().ranges_retained() > 0);
+    eprintln!("semantic tick: first nonempty join verified");
+    let reload = target.command(b'r')?;
+    let fields: Vec<_> = reload.split_whitespace().collect();
+    ensure!(
+        fields.len() == 4 && fields[2] == fields[3],
+        "not same-address reload: {reload}"
+    );
+    target.command(b'c')?;
+    let reloaded = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(reloaded != first && harness.retired_instances.contains(&first));
+    target.command(b'e')?;
+    ensure!(matches!(
+        harness.session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    target.command(b'c')?;
+    let leader = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(leader != reloaded && harness.retired_images.len() == 1);
+    eprintln!("semantic tick: same-address reload and leader successor verified");
+    target.command(b'E')?;
+    ensure!(
+        target.pid() == pid
+            && matches!(
+                harness.session.query_images(&[&target.pin], window()?),
+                Err(image_query::ImageQueryRefusal::Unknown)
+            )
+    );
+    harness.session.detach_slots(&plan.slots)?;
+    ensure!(harness.session.detach_failures().is_empty() && !harness.session.has_slot_link(0));
+    let (failed, completed) =
+        harness
+            .session
+            .attach_targets(&plan.slots, &pins, &std::collections::BTreeSet::new())?;
+    ensure!(failed.is_empty() && completed.len() == 1 && completed[0].0 == 0);
+    let owned_sides = harness
+        .session
+        .links
+        .iter()
+        .filter(|link| link.slots().contains(&0))
+        .map(|link| match link {
+            RegisteredLink::MultiUProbe {
+                program,
+                slots,
+                fds,
+                ..
+            } => {
+                ensure!(slots == &[0] && fds.len() == 1);
+                Ok(*program)
+            }
+            _ => bail!("successor endpoint is not owned Multi"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        owned_sides.len() == 2
+            && BTreeSet::from_iter(owned_sides)
+                == BTreeSet::from([
+                    entry_program(
+                        &plan.slots[0].semantics,
+                        CapturePolicy::Allowlisted,
+                        false,
+                        ElfAbi::Lp64
+                    ),
+                    "p11_return"
+                ])
+    );
+    ensure!(
+        harness.session.native_domain() == Some(domain)
+            && harness.session.backend_fallback().is_none()
+    );
+    ensure!(native_image_retained_kernel_ids(&harness.session)? == ids);
+    ensure!(harness.session.instance_tracking().hook_link_count() == 4);
+    ensure!(
+        harness
+            .session
+            .instance_hook_stats()?
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect::<BTreeMap<_, _>>()
+            == hooks
+    );
+    ensure!(matches!(
+        harness.session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    target.command(b'c')?;
+    let successor = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        successor != leader
+            && harness.retired_images.len() == 2
+            && harness.retired_tasks.is_empty()
+    );
+    ensure!(
+        harness.capture.router().ranges_retained() > 0
+            && harness.capture.router().pending_len() == 0
+    );
+    eprintln!("semantic tick: rebound nonleader successor in same proof domain verified");
+    // An actual ordinary fault rejects a collected old-era call; a genuine
+    // later entry and fresh proof recover without restarting the owner.
+    target.command(b'c')?;
+    harness.session.instance_maps().raise_fault()?;
+    let old = pump_until(&mut harness, &target, 1)?;
+    ensure!(old.len() == 1 && old[0].route == Route::Unknown(UnknownReason::FaultEra));
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(harness.false_joins().is_empty());
+    eprintln!("semantic tick: old-fault refusal and fresh-entry recovery verified");
+    Ok(())
+}
+
+// Fixed PID-scoped Multi links retain the original leader task/mm and do not
+// follow de_thread. Rebind only the endpoints for the successor positive;
+// the same Session/domain/maps/four hooks stay retained throughout. Classic
+// Singles' separate detachment/refusal gate remains unchanged.
+fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile_for_abi(directory.path(), true, abi)?;
+    let driver = compile_for_abi(directory.path(), false, abi)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    ensure!(target.line(Duration::from_secs(10))?.starts_with("READY"));
+    let (_view, pins, plan, _key) =
+        pin_and_plan_for_abi(target.pid(), &provider, &["C_GetSlotInfo"], abi)?;
+    let mut session = Session::start(
+        &plan,
+        &Scope::Pid(target.pid()),
+        &pins,
+        CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        BackendSelection::Multi,
+    )?;
+    ensure!(
+        session.static_multi_attached() && session.backend_fallback().is_none(),
+        "full-image successor positive requires attached Multi with no fallback"
+    );
+    ensure!(session.attach_failures().is_empty());
+    ensure!(
+        session.instance_tracking().refused().is_none(),
+        "full-image native startup refused: {:?}",
+        session.instance_tracking().refused()
+    );
+    let window = || capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(3));
+    // Neither a fresh query nor process admission may manufacture Ready.
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    eprintln!("full-image {abi:?}: native startup and initial Unknown query verified");
+    let first = native_image_call(&mut session, &mut target).context("first owned native call")?;
+    let domain = session.native_domain().context("retained native domain")?;
+    let retained_ids = native_image_retained_kernel_ids(&session)?;
+    let hook_ids = session
+        .instance_hook_stats()?
+        .into_iter()
+        .map(|(name, stats)| (name, stats.program_id))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(hook_ids.len() == 4 && session.instance_tracking().hook_link_count() == 4);
+    let router = InstanceRouter::new(
+        session.native_domain().context("native router domain")?,
+        RouterLimits::default(),
+    );
+    let fence = router.fence();
+    let scan = session
+        .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
+            router.fence()
+        })
+        .map_err(|refusal| anyhow::anyhow!("full-image native scan refused: {refusal:?}"))?;
+    ensure!(scan.domain() == domain && scan.image() == first.event.image);
+    ensure!(
+        !scan.ranges().is_empty(),
+        "full-image positive must contain ranges"
+    );
+    ensure!(scan.file_slot() + 1 == u32::from(first.continuity.entry_stamp.file_slot_plus1));
+    ensure!(scan.fence() == router.fence());
+    eprintln!("full-image {abi:?}: first owned call and nonempty full-image scan verified");
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    // Poison is not repaired by a query. The real post-exec entry must renew.
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    let renewed = native_image_call(&mut session, &mut target)
+        .context("owned native call after leader exec")?;
+    ensure!(renewed.event.image.task_cookie == first.event.image.task_cookie);
+    ensure!(renewed.event.image.exec_id > first.event.image.exec_id);
+    let scan = session
+        .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
+            router.fence()
+        })
+        .map_err(|refusal| anyhow::anyhow!("renewed full-image scan refused: {refusal:?}"))?;
+    ensure!(scan.domain() == domain && scan.image() == renewed.event.image);
+    ensure!(!scan.ranges().is_empty());
+    eprintln!("full-image {abi:?}: leader exec, renewed call and nonempty scan verified");
+    let original_birth = target.pin.start_time();
+    let original_pid = target.pid();
+    let ready = target.command(b'E')?;
+    ensure!(ready.starts_with("READY") && target.pid() == original_pid);
+    // de_thread transfers leader birth time/PID custody. It must not be
+    // mistaken for unchanged full image identity by the scan owner.
+    ensure!(crate::process::process_start_time(original_pid).ok() == original_birth);
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    eprintln!("full-image {abi:?}: nonleader exec custody and pre-entry Unknown verified");
+    // The original fixed PID-Multi link cannot install a breakpoint in the
+    // successor mm. This fixture rebinds endpoint links, without restarting
+    // the proof owner or manufacturing continuity through a fresh Session.
+    session
+        .audit_image_continuity()
+        .map_err(|refusal| anyhow::anyhow!("pre-rebind full-image audit refused: {refusal:?}"))?;
+    session.detach_slots(&plan.slots)?;
+    ensure!(session.detach_failures().is_empty() && !session.has_slot_link(plan.slots[0].index));
+    let (failed, completed) =
+        session.attach_targets(&plan.slots, &pins, &std::collections::BTreeSet::new())?;
+    ensure!(failed.is_empty() && session.attach_failures().is_empty());
+    ensure!(completed.len() == 1 && completed[0].0 == plan.slots[0].index);
+    let owned_sides: Vec<_> = session
+        .links
+        .iter()
+        .filter(|link| link.slots().contains(&plan.slots[0].index))
+        .map(|link| match link {
+            RegisteredLink::MultiUProbe {
+                program,
+                slots,
+                fds,
+                ..
+            } => {
+                ensure!(slots == &[plan.slots[0].index] && fds.len() == 1);
+                Ok(*program)
+            }
+            _ => bail!("successor fixture endpoint is not owned Multi"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_entry = entry_program(
+        &plan.slots[0].semantics,
+        CapturePolicy::Allowlisted,
+        false,
+        abi,
+    );
+    ensure!(
+        owned_sides.len() == 2
+            && BTreeSet::from_iter(owned_sides) == BTreeSet::from([expected_entry, "p11_return"])
+    );
+    ensure!(session.backend_fallback().is_none() && session.native_domain() == Some(domain));
+    ensure!(native_image_retained_kernel_ids(&session)? == retained_ids);
+    ensure!(session.instance_tracking().hook_link_count() == 4);
+    ensure!(
+        session
+            .instance_hook_stats()?
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect::<BTreeMap<_, _>>()
+            == hook_ids
+    );
+    session
+        .audit_image_continuity()
+        .map_err(|refusal| anyhow::anyhow!("post-rebind full-image audit refused: {refusal:?}"))?;
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    eprintln!(
+        "full-image {abi:?}: successor endpoints rebound; same domain/maps/programs/hooks and Unknown verified"
+    );
+    let successor = native_image_call(&mut session, &mut target)
+        .context("owned native call after nonleader exec")?;
+    ensure!(successor.event.image.task_cookie != renewed.event.image.task_cookie);
+    let scan = session
+        .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
+            router.fence()
+        })
+        .map_err(|refusal| {
+            anyhow::anyhow!("nonleader successor full-image scan refused: {refusal:?}")
+        })?;
+    ensure!(scan.domain() == domain && scan.image() == successor.event.image);
+    ensure!(!scan.ranges().is_empty());
+    eprintln!("full-image {abi:?}: nonleader successor call and nonempty scan verified");
+    session
+        .audit_image_continuity()
+        .map_err(|refusal| anyhow::anyhow!("final full-image audit refused: {refusal:?}"))?;
+    let retired = target.pin.try_clone().map_err(anyhow::Error::msg)?;
+    drop(target);
+    // Real original-pin retirement control; numeric PID reuse is a separate
+    // kernel fixture, not inferred from this newly exited original.
+    ensure!(matches!(
+        session.query_images(&[&retired], window()?),
+        Err(image_query::ImageQueryRefusal::Custody)
+    ));
+    Ok(())
+}
+
+#[test]
+#[ignore = "privileged: explicit Multi, same-object iterator and nonempty LP64 successor proof"]
+fn privileged_full_image_native_multi_query_and_scan_lp64() -> Result<()> {
+    native_full_image_multi_query_and_scan(ElfAbi::Lp64)
+}
+
+#[test]
+#[ignore = "privileged: explicit Multi, same-object iterator and nonempty ia32 successor proof"]
+fn privileged_full_image_native_multi_query_and_scan_ia32() -> Result<()> {
+    native_full_image_multi_query_and_scan(ElfAbi::Ilp32)
+}
+
 /// Pins one `C_GetSlotInfo` slot per provider, in order; slot 0 is the
 /// scanned and called file, so callers put their file first. Pins match
 /// providers by maps key (distinct files, distinct inodes).
@@ -555,8 +1591,10 @@ fn pin_and_plan_multi(
         };
         keyed.push((key, elf));
         modules.push(ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,
@@ -630,7 +1668,349 @@ fn dir_is_btrfs(dir: &Path) -> Result<bool> {
     );
     // SAFETY: success above initialized it.
     let stat = unsafe { stat.assume_init() };
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     Ok(stat.f_type as u64 == BTRFS_SUPER_MAGIC)
+}
+
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> {
+    use crate::discovery::identity::ExaminedObject;
+    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody, KernelAnchorExclusions};
+    use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let object = plan.slots[0].object;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    target.command(b'c')?;
+    let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
+
+    // A real external shared-mm mutation advances only the per-file
+    // global epoch: the target's mapping and own epoch are unchanged, so
+    // the instance continues. Establish this before the preservation
+    // assertion, including on RED.
+    let mutation_before = harness.session.instance_maps().counters()?;
+    ensure!(target.command(b'v')? == "SHARER");
+    let mutation_after = harness.session.instance_maps().counters()?;
+    target.command(b'c')?;
+    let after_mutation = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        mutation_after.global_bumps > mutation_before.global_bumps
+            && mutation_after.shared > mutation_before.shared
+            && mutation_after.local_bumps == mutation_before.local_bumps
+            && after_mutation == first,
+        "a foreign shared-mm mutation did not continue the watched instance: \
+         {mutation_before:?} -> {mutation_after:?}"
+    );
+
+    // Renewing control: the target's own mapping changes still mint.
+    // Later checks compare against the last own instance.
+    target.command(b'p')?;
+    target.command(b'c')?;
+    let own = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(own != first, "the target's own mapping kept the instance");
+    target.command(b'P')?;
+    target.command(b'c')?;
+    let own2 = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(own2 != own, "the target's own unmap kept the instance");
+
+    // The unexcluded anchor path must also exercise the actual native
+    // witness. Excluding selected files changes no BPF hook semantics.
+    let unexcluded_before = harness.session.instance_maps().complete_epochs(
+        target.pin.pidfd().map_err(anyhow::Error::msg)?,
+        harness.file_slot,
+    )?;
+    let unexcluded_pins = pins.clone();
+    crate::inventory_capture::collect_off_thread(
+        move || {
+            let custody = ExaminedCustody::new(
+                ReservationOwner::for_examined(SegmentPolicy::from_headroom(128, 0, 0), 0),
+                BTreeMap::new(),
+            );
+            drop(AnchorPass::prepare(
+                &unexcluded_pins,
+                [(key, object)],
+                custody,
+            ));
+        },
+        Duration::from_millis(20),
+        &mut || {},
+    );
+    let unexcluded_after = harness.session.instance_maps().complete_epochs(
+        target.pin.pidfd().map_err(anyhow::Error::msg)?,
+        harness.file_slot,
+    )?;
+    target.command(b'c')?;
+    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        unexcluded_after.global > unexcluded_before.global
+            && unexcluded_after.local == unexcluded_before.local
+            && original == own2,
+        "unexcluded System identity anchors did not continue the actual watched instance"
+    );
+
+    let retained = harness
+        .session
+        .instance_tracking()
+        .watched(object)
+        .context("the original provider is still watched")?
+        .retained_target();
+    let unrelated_path = _directory.path().join("unrelated-anchor");
+    std::fs::write(&unrelated_path, [0u8; 4096])?;
+    let unrelated_path = unrelated_path.canonicalize()?;
+    let main_thread = std::thread::current().id();
+    let mut preserved = true;
+    for pass in 0..2 {
+        let before_maps = std::fs::read(format!("/proc/{}/maps", target.pid()))?;
+        let before = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_before = harness.session.instance_maps().counters()?;
+        // Use the production exclusion snapshot of the actual watched
+        // target. An unrelated examined anchor must still be mapped and
+        // released, so the mixed pass cannot pass by disabling all anchors.
+        let worker_pins = pins.clone();
+        let worker_exclusions = KernelAnchorExclusions::from_targets([&retained]);
+        let worker_unrelated = unrelated_path.clone();
+        let worker = crate::inventory_capture::collect_off_thread(
+            move || -> Result<_> {
+                let file = std::fs::File::open(&worker_unrelated)?;
+                let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+                let mapped = crate::discovery::identity::self_mapped_file(&file)
+                    .map_err(anyhow::Error::msg)?;
+                let examined = ExaminedObject {
+                    key: ObjectKey {
+                        device: Device {
+                            major: mapping.device_major,
+                            minor: mapping.device_minor,
+                        },
+                        inode: mapping.inode,
+                    },
+                    identity: mapped.identity,
+                    key_is_identity: false,
+                };
+                let mut custody = ExaminedCustody::new(
+                    ReservationOwner::for_examined(SegmentPolicy::from_headroom(128, 0, 0), 1),
+                    BTreeMap::new(),
+                );
+                let scan = custody.begin_scan();
+                ensure!(
+                    custody.offer(scan, examined, file),
+                    "unrelated custody refused"
+                );
+                let anchors = AnchorPass::prepare_excluding(
+                    &worker_pins,
+                    [(key, object)],
+                    custody,
+                    &worker_exclusions,
+                );
+                let has_unrelated_mapping = || -> Result<bool> {
+                    Ok(std::fs::read_to_string("/proc/self/maps")?
+                        .lines()
+                        .any(|line| line.ends_with(worker_unrelated.to_str().unwrap())))
+                };
+                ensure!(
+                    has_unrelated_mapping()?,
+                    "unrelated identity anchor was not mapped"
+                );
+                drop(anchors);
+                ensure!(
+                    !has_unrelated_mapping()?,
+                    "unrelated identity anchor was not released"
+                );
+                Ok(std::thread::current().id())
+            },
+            Duration::from_millis(20),
+            &mut || {},
+        )?;
+        ensure!(
+            worker != main_thread,
+            "identity anchors did not use the worker"
+        );
+        let after = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_after = harness.session.instance_maps().counters()?;
+        ensure!(
+            before_maps == std::fs::read(format!("/proc/{}/maps", target.pid()))?
+                && target.pin.still_the_same(),
+            "the idle target changed during identity anchor preparation"
+        );
+        let observation = harness.scan(&target, false)?;
+        target.command(b'c')?;
+        let joined = single_join(&pump_until(&mut harness, &target, 1)?)?;
+        let continued = observation == Some(ObserveOutcome::Continued) && joined == original;
+        eprintln!(
+            "H6_SYSTEM_IDENTITY_ANCHOR pass={pass} epochs_equal={} continued={continued} \
+             local_delta={} global_delta={} fault_delta={} \
+             counters_before={counters_before:?} counters_after={counters_after:?}",
+            before == after,
+            after.local.saturating_sub(before.local),
+            after.global.saturating_sub(before.global),
+            after.fault.saturating_sub(before.fault),
+        );
+        preserved &= before == after && continued;
+    }
+    ensure!(
+        preserved,
+        "System identity anchors changed the idle target's watched instance; \
+         inspect actual H6_SYSTEM_IDENTITY_ANCHOR epoch/counter deltas"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::identity::RetainedMappedIdentities;
+
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let retained = pins
+        .retain_inventory_target(pins.pinned().next().context("owned pin")?.id)
+        .map_err(anyhow::Error::msg)?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    target.command(b'c')?;
+    let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
+
+    // Establish the genuine global-mutation control before the regression
+    // assertion, so RED still proves that the real hooks and router respond.
+    // The existing fixture's short-lived CLONE_VM child is reaped by 'v'.
+    // A foreign mutation moves only the global epoch, so it continues.
+    let external_before = harness.session.instance_maps().counters()?;
+    ensure!(target.command(b'v')? == "SHARER");
+    let external_after = harness.session.instance_maps().counters()?;
+    target.command(b'c')?;
+    let after_external = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        external_after.global_bumps > external_before.global_bumps
+            && external_after.shared > external_before.shared
+            && external_after.local_bumps == external_before.local_bumps
+            && after_external == first,
+        "a real external shared-mm mutation did not continue the instance: \
+         {external_before:?} -> {external_after:?}"
+    );
+
+    // Renewing control: the target's own mapping changes still mint.
+    // Later checks compare against the last own instance.
+    target.command(b'p')?;
+    target.command(b'c')?;
+    let own = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        own != after_external,
+        "the target's own mapping kept the instance"
+    );
+    target.command(b'P')?;
+    target.command(b'c')?;
+    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(original != own, "the target's own unmap kept the instance");
+    let pid = target.pid();
+    let pin = target.pin.clone();
+    let cookie = harness
+        .session
+        .instance_maps()
+        .cookie(pin.pidfd().map_err(anyhow::Error::msg)?)?
+        .context("the real target call established its image cookie")?;
+    let current_image = |harness: &mut Harness| -> Result<_> {
+        harness
+            .session
+            .query_images(
+                &[&pin],
+                capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(3))?,
+            )
+            .map_err(|reason| anyhow!("native current image query refused: {reason:?}"))?
+            .image(cookie)
+            .context("the original process still has its current image")
+    };
+    let image = current_image(&mut harness)?;
+    let policy = crate::plan::AdmissionPolicy::inventory(
+        crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
+    );
+    let main_thread = std::thread::current().id();
+    let mut preserved = true;
+    for pass in 0..2 {
+        let before_maps = std::fs::read(format!("/proc/{}/maps", target.pid()))?;
+        let before = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_before = harness.session.instance_maps().counters()?;
+        // The same snapshot constructor used by the coordinator's collector:
+        // the original target/file proof, calibrated before it was watched.
+        let budget = CaptureWorkBudget::default()
+            .with_retained_mapped_identities(RetainedMappedIdentities::from_targets([&retained]));
+        // The same production scan/pinning path used by Inventory's collector,
+        // on its real worker. No target command runs during this collection.
+        let (worker, catalog) = crate::inventory_capture::collect_off_thread(
+            || {
+                (
+                    std::thread::current().id(),
+                    crate::inspect_system::collect_pid_with_budget(
+                        pid,
+                        std::slice::from_ref(&provider),
+                        &HookRegistry::default(),
+                        policy,
+                        budget,
+                    ),
+                )
+            },
+            Duration::from_millis(20),
+            &mut || {},
+        );
+        ensure!(
+            worker != main_thread,
+            "the production scan must run on its worker"
+        );
+        ensure!(
+            catalog?.scanned == 1,
+            "the owned target was not deep-scanned"
+        );
+        let after = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_after = harness.session.instance_maps().counters()?;
+        ensure!(
+            before_maps == std::fs::read(format!("/proc/{}/maps", target.pid()))?
+                && current_image(&mut harness)? == image,
+            "the idle target changed its mapping or image during the observer scan"
+        );
+        let observation = harness.scan(&target, false)?;
+        target.command(b'c')?;
+        let joined = single_join(&pump_until(&mut harness, &target, 1)?)?;
+        let continued = observation == Some(ObserveOutcome::Continued) && joined == original;
+        // Aggregate deltas come from the actual native maps. No epoch values
+        // or image identities are fabricated or emitted as public evidence.
+        eprintln!(
+            "H6_OBSERVER_SCAN pass={pass} epochs_equal={} continued={continued} \
+             local_delta={} global_delta={} fault_delta={} \
+             counters_before={counters_before:?} counters_after={counters_after:?}",
+            before == after,
+            after.local.saturating_sub(before.local),
+            after.global.saturating_sub(before.global),
+            after.fault.saturating_sub(before.fault),
+        );
+        preserved &= before == after && continued;
+    }
+    ensure!(
+        preserved,
+        "Inventory's observer scan changed an idle target's watched instance; \
+         inspect the actual H6_OBSERVER_SCAN epoch/counter deltas"
+    );
+    Ok(())
 }
 
 #[test]
@@ -696,9 +2076,9 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     let c = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(c != b, "extra provider mapping kept the instance");
     // mremap of a provider mapping reaches the copy_vma fexit hook.
-    let copies = hook_runs(&harness, "p11_inst_vma_copy")?;
+    let copies = copy_hook_runs(&harness)?;
     target.command(b'M')?;
-    let copied = hook_runs(&harness, "p11_inst_vma_copy")? - copies;
+    let copied = copy_hook_runs(&harness)? - copies;
     ensure!(copied >= 1, "mremap did not reach the copy_vma hook");
     target.command(b'c')?;
     let moved = single_join(&pump_until(&mut harness, &target, 1)?)?;
@@ -708,19 +2088,23 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     let d = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(d != moved, "provider unmap kept the instance");
     // A CLONE_VM non-thread child mutating the provider in the shared mm:
-    // marked at fork, its mutations go to the file's global epoch, which
-    // ends this process's incarnation too.
+    // marked at fork, its mutations go to the file's global epoch only.
+    // The target's mapping and own epoch are unchanged, so it continues.
     let shared_before = harness.session.instance_maps().counters()?;
     target.command(b'v')?;
     let shared_after = harness.session.instance_maps().counters()?;
     ensure!(
         shared_after.shared >= shared_before.shared + 2
-            && shared_after.global_bumps >= shared_before.global_bumps + 2,
+            && shared_after.global_bumps >= shared_before.global_bumps + 2
+            && shared_after.local_bumps == shared_before.local_bumps,
         "CLONE_VM sharer was not globalized: {shared_before:?} -> {shared_after:?}"
     );
     target.command(b'c')?;
     let after_sharer = single_join(&pump_until(&mut harness, &target, 1)?)?;
-    ensure!(after_sharer != d, "a sharer's mutation kept the instance");
+    ensure!(
+        after_sharer == d,
+        "a sharer's mutation did not continue the instance"
+    );
     // dlmopen sibling: two loads of one file, two instances.
     target.command(b'd')?;
     target.command(b'c')?;
@@ -746,11 +2130,202 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     eprintln!(
         "T3A_ROUTING steps={steps:?} sibling=({e:?},{f:?}) counters={counters:?} hooks={hooks:?} scans={:?} minted={}",
         harness.scan,
-        harness.router.instances_minted()
+        harness.capture.router().instances_minted()
     );
     ensure!(counters.local_bumps > counters_before.local_bumps);
     ensure!(counters.faults == 0 && harness.misses == 0);
     ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Live marker twin: a sharer's global-only churn must taint the router
+/// end-to-end. Zero before the `v` step (negative control), then one
+/// tainted continuation and one tainted join after it. RED live while the
+/// router twins stay green means live epochs diverge from the router
+/// predicate — a finding, never a marker-widening license.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_b17_counters_observe_sharer_churn() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    // Gen 0, three calls: one instance, no churn yet.
+    for _ in 0..3 {
+        target.command(b'c')?;
+    }
+    let a = single_join(&pump_until(&mut harness, &target, 3)?)?;
+    // Negative control: nothing global-only crossed the router yet.
+    let before = harness.capture.router().counters();
+    ensure!(
+        before.continued_across_global == 0 && before.joined_across_global == 0,
+        "marker counters nonzero before sharer churn: {before:?}"
+    );
+    // A CLONE_VM non-thread child mutating the provider in the shared mm:
+    // marked at fork, its mutations go to the file's global epoch only.
+    let shared_before = harness.session.instance_maps().counters()?;
+    let sharer = target.command(b'v')?;
+    ensure!(sharer == "SHARER", "{sharer}");
+    let shared_after = harness.session.instance_maps().counters()?;
+    ensure!(
+        shared_after.shared >= shared_before.shared + 2
+            && shared_after.global_bumps >= shared_before.global_bumps + 2
+            && shared_after.local_bumps == shared_before.local_bumps,
+        "CLONE_VM sharer was not globalized: {shared_before:?} -> {shared_after:?}"
+    );
+    // Continuation + one joined call: the same instance, now tainted.
+    target.command(b'c')?;
+    let after_sharer = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        after_sharer == a,
+        "a sharer's mutation did not continue the instance"
+    );
+    let counters = harness.capture.router().counters();
+    ensure!(
+        counters.continued_across_global >= 1,
+        "live global-only continuation left no marker: {counters:?}"
+    );
+    ensure!(
+        counters.joined_across_global >= 1,
+        "join through the tainted entry left no marker: {counters:?}"
+    );
+    ensure!(
+        counters.continued >= counters.continued_across_global,
+        "continued total below its global-only subset: {counters:?}"
+    );
+    let kernel = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "B17_COUNTERS a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={} sticky={}",
+        harness.scan,
+        harness.capture.router().instances_minted(),
+        harness.session.instance_maps().sticky()?
+    );
+    Ok(())
+}
+
+/// Live drain twin: the post-sharer continuation must disclose the tainted
+/// identity exactly once through the capture report, then stay silent on a
+/// same-triple refresh (sticky, no re-yield). The production drain site
+/// consumes the router queue every scan, so the positive assertion reads
+/// the drained TickReport; the test-only forwarder pins queue-level
+/// negative/terminal emptiness.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_b17_drain_yields_identity_once_live() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    // Gen 0, three calls: one instance, no churn yet.
+    for _ in 0..3 {
+        target.command(b'c')?;
+    }
+    let a = single_join(&pump_until(&mut harness, &target, 3)?)?;
+    let gen0_image = harness
+        .take_images()
+        .first()
+        .copied()
+        .context("gen0 call image")?;
+    // Negative control: nothing queued before the sharer step.
+    ensure!(
+        harness
+            .capture
+            .take_reload_not_excluded_for_test()
+            .is_empty(),
+        "disclosure queued before sharer churn"
+    );
+    // A CLONE_VM non-thread child mutating the provider in the shared mm:
+    // marked at fork, its mutations go to the file's global epoch only.
+    let shared_before = harness.session.instance_maps().counters()?;
+    let sharer = target.command(b'v')?;
+    ensure!(sharer == "SHARER", "{sharer}");
+    let shared_after = harness.session.instance_maps().counters()?;
+    ensure!(
+        shared_after.shared >= shared_before.shared + 2
+            && shared_after.global_bumps >= shared_before.global_bumps + 2
+            && shared_after.local_bumps == shared_before.local_bumps,
+        "CLONE_VM sharer was not globalized: {shared_before:?} -> {shared_after:?}"
+    );
+    // First scan past the churn: a tainted continuation discloses the
+    // identity exactly once, under the frozen label.
+    let started = Instant::now();
+    let report = harness
+        .capture
+        .refresh(&mut harness.session, target.pin.clone(), 0)?;
+    let elapsed = started.elapsed().as_nanos();
+    ensure!(
+        report.observations.contains(&ObserveOutcome::Continued),
+        "post-churn scan observed no continuation: {report:?}"
+    );
+    ensure!(
+        report.reload_not_excluded.len() == 1,
+        "post-churn scan must disclose one identity: {report:?}"
+    );
+    let disclosure = &report.reload_not_excluded[0];
+    ensure!(
+        disclosure.label == RELOAD_NOT_EXCLUDED_LABEL
+            && disclosure.label == "instance_reload_not_excluded",
+        "disclosure must carry the frozen label: {disclosure:?}"
+    );
+    ensure!(
+        disclosure.image == gen0_image,
+        "disclosure must name the joined image: {disclosure:?}"
+    );
+    ensure!(
+        disclosure.file_slot == harness.file_slot,
+        "disclosure must name the watched slot: {disclosure:?}"
+    );
+    ensure!(
+        disclosure.ids == vec![a],
+        "disclosure must name the continued instance: {disclosure:?}"
+    );
+    harness.record_report(report, elapsed, false);
+    // Same-triple refresh: still a continuation, but no re-yield (sticky).
+    let started = Instant::now();
+    let refresh = harness
+        .capture
+        .refresh(&mut harness.session, target.pin.clone(), 0)?;
+    let elapsed = started.elapsed().as_nanos();
+    ensure!(
+        refresh.observations.contains(&ObserveOutcome::Continued),
+        "refresh observed no continuation: {refresh:?}"
+    );
+    ensure!(
+        refresh.reload_not_excluded.is_empty(),
+        "refresh re-yielded the disclosure: {refresh:?}"
+    );
+    harness.record_report(refresh, elapsed, false);
+    // One joined call: the same instance survives the churn.
+    target.command(b'c')?;
+    let after_sharer = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        after_sharer == a,
+        "a sharer's mutation did not continue the instance"
+    );
+    // Terminal: production drained everything; nothing undisclosed pending.
+    ensure!(
+        harness
+            .capture
+            .take_reload_not_excluded_for_test()
+            .is_empty(),
+        "undrained disclosure pending after the sequence"
+    );
+    let counters = harness.capture.router().counters();
+    let kernel = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "B17_DRAIN a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={} sticky={}",
+        harness.scan,
+        harness.capture.router().instances_minted(),
+        harness.session.instance_maps().sticky()?
+    );
     Ok(())
 }
 
@@ -913,7 +2488,7 @@ fn privileged_instance_reload_race_has_zero_false_joins() -> Result<()> {
         harness.events,
         ids.len(),
         false_joins.len(),
-        harness.router.pending_len(),
+        harness.capture.router().pending_len(),
         harness.scan,
         harness.misses
     );
@@ -924,7 +2499,8 @@ fn privileged_instance_reload_race_has_zero_false_joins() -> Result<()> {
         harness.events
     );
     ensure!(
-        harness.routed.len() as u64 == harness.events && harness.router.pending_len() == 0,
+        harness.routed.len() as u64 == harness.events
+            && harness.capture.router().pending_len() == 0,
         "every call must be joined or explicitly unknown"
     );
     ensure!(
@@ -996,7 +2572,7 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
         &driver,
         &[
             "churn".as_ref(),
-            SOFTHSM.as_ref(),
+            softhsm().as_ref(),
             unrelated_file.as_os_str(),
             unrelated_so.as_os_str(),
             seconds_arg.as_ref(),
@@ -1009,7 +2585,7 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
     let key_line = target.line(Duration::from_secs(10))?;
     let (_view, pins, plan, _key) = pin_and_plan(
         target.pid(),
-        Path::new(SOFTHSM),
+        Path::new(softhsm()),
         &["C_GetSlotInfo", "C_EncryptInit", "C_Encrypt"],
     )?;
     let _stats = enable_bpf_stats()?;
@@ -1118,9 +2694,9 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
         counters_end.faults - counters_start.faults,
         hook_ns as f64 / elapsed.as_nanos() as f64 * 100.0,
         harness.scan,
-        harness.router.instances_minted(),
-        harness.router.ranges_retained(),
-        harness.router.pending_len(),
+        harness.capture.router().instances_minted(),
+        harness.capture.router().ranges_retained(),
+        harness.capture.router().pending_len(),
         harness.misses,
     );
     target.send(b'x')?;
@@ -1169,10 +2745,10 @@ fn privileged_instance_mremap_dontunmap_keeps_both_and_renews() -> Result<()> {
     target.command(b'p')?;
     let b = call(&mut harness, &mut target)?;
     ensure!(b != a, "extra provider mapping kept the instance");
-    let copies = hook_runs(&harness, "p11_inst_vma_copy")?;
+    let copies = copy_hook_runs(&harness)?;
     let moved = target.command(b'U')?;
     ensure!(moved == "PUREMOVE", "DONTUNMAP dropped a mapping: {moved}");
-    let copied = hook_runs(&harness, "p11_inst_vma_copy")? - copies;
+    let copied = copy_hook_runs(&harness)? - copies;
     ensure!(
         copied >= 1,
         "DONTUNMAP move did not reach the copy_vma hook"
@@ -1316,8 +2892,9 @@ fn held_sharer_exits_when_parent_dies_before_wake() {
 
 /// P2-2: a CLONE_VM non-thread sharer that predates the attach carries no
 /// SHARED_MM mark (marking happens on forks observed after attachment);
-/// its watched mutations must still globalize — the mm has users beyond
-/// the thread group — ending this process's incarnation.
+/// its watched mutations still globalize — the mm has users beyond the
+/// thread group — but the target's mapping and own epoch are unchanged,
+/// so this process's incarnation continues.
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
@@ -1341,13 +2918,15 @@ fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
     ensure!(woke == "SHARER_WOKE", "{woke}");
     let after = harness.session.instance_maps().counters()?;
     ensure!(
-        after.shared >= before.shared + 2 && after.global_bumps >= before.global_bumps + 2,
+        after.shared >= before.shared + 2
+            && after.global_bumps >= before.global_bumps + 2
+            && after.local_bumps == before.local_bumps,
         "pre-attachment sharer was not globalized: {before:?} -> {after:?}"
     );
     let b = call(&mut harness, &mut target)?;
     ensure!(
-        b != a,
-        "a pre-attachment sharer's mutation kept the instance"
+        b == a,
+        "a pre-attachment sharer's mutation did not continue the instance"
     );
     eprintln!("T3A_PRESHARER counters={after:?} scans={:?}", harness.scan);
     ensure!(harness.false_joins().is_empty());
@@ -1358,10 +2937,11 @@ fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
 
 /// F3 soundness: a zombie group leader still counted in `nr_threads` plus
 /// one live external CLONE_VM sharer — mm_users 2 against nr_threads 2
-/// under the old equality — must still globalize, since the zombie holds
-/// no mm reference. The window predates the attach (no fork marks); the
-/// fixture self-validates it (leader State Z, Threads 2, sharer alive)
-/// and fails loudly when it is not live.
+/// under the old equality — still globalizes, since the zombie holds
+/// no mm reference, but the target's mapping and own epoch are unchanged,
+/// so its incarnation continues. The window predates the attach (no fork
+/// marks); the fixture self-validates it (leader State Z, Threads 2,
+/// sharer alive) and fails loudly when it is not live.
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
@@ -1385,13 +2965,16 @@ fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
     ensure!(woke == "ZOMBIE_WOKE", "{woke}");
     let after = harness.session.instance_maps().counters()?;
     ensure!(
-        after.shared >= before.shared + 2 && after.global_bumps >= before.global_bumps + 2,
+        after.shared >= before.shared + 2
+            && after.global_bumps >= before.global_bumps + 2
+            && after.local_bumps == before.local_bumps
+            && after.storage_null == before.storage_null,
         "zombie-leader sharer was not globalized: {before:?} -> {after:?}"
     );
     let b = call(&mut harness, &mut target)?;
     ensure!(
-        b != a,
-        "a zombie-leader sharer's mutation kept the instance"
+        b == a,
+        "a zombie-leader sharer's mutation did not continue the instance"
     );
     eprintln!("T3A_ZOMBIE counters={after:?} scans={:?}", harness.scan);
     ensure!(harness.false_joins().is_empty());
@@ -1400,15 +2983,21 @@ fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
     Ok(())
 }
 
-/// Decision §3c: a punch-hole on the provider file from another process.
-/// The loaded image keeps executing from untouched text while the header
-/// page's VMAs are zapped through `unmap_mapping_range`, which must reach
-/// the munmap hook — a miss here is a hook-completeness finding, not a
-/// soft control. Static skip: needs punch-hole support under TMPDIR
-/// (btrfs/ext4/xfs; tmpfs refuses); run by hand as root with a suitable
-/// TMPDIR.
+/// Decision §3c: a punch-hole on the provider file from another process,
+/// settled as correct fail-closed behavior (R-39). The hole
+/// changes the file on disk, so the watched provider's `(ino, size,
+/// ctime)` identity pin no longer proves the instance it calibrated:
+/// `LiveImageScan::audit` refuses every later scan with Custody, and
+/// the post-hole call stays unjoined (`Unknown`, never a join to the
+/// old instance or a new one) instead of attributing calls to an
+/// instance that can no longer be proven. The loaded image keeps
+/// executing from untouched text while the header page's VMAs are
+/// zapped through `unmap_mapping_range`, which must still reach the
+/// munmap hook — a miss there stays a hook-completeness finding, not
+/// a soft control. Default campaign cell: needs punch-hole support under
+/// the runner's TMPDIR (btrfs/ext4/xfs; tmpfs refuses).
 #[test]
-#[ignore = "privileged: loads BPF; needs punch-hole-capable TMPDIR, run by hand"]
+#[ignore = "privileged: loads BPF; needs punch-hole-capable runner TMPDIR"]
 fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -1417,24 +3006,148 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     } = spawn_cmd_target()?;
     let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
     let mut harness = Harness::start(&plan, target.pid(), &pins)?;
-    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
-        target.command(b'c')?;
-        single_join(&pump_until(harness, target, 1)?)
+    let object = plan.slots[0].object;
+    let call = |harness: &mut Harness, target: &mut Target, which: &str| -> Result<InstanceId> {
+        target
+            .command(b'c')
+            .with_context(|| format!("punch-hole call {which}: fixture did not answer"))?;
+        let routed = pump_until(&mut *harness, target, 1)?;
+        single_join(&routed).with_context(|| {
+            let counters = harness.session.instance_maps().counters();
+            format!(
+                "punch-hole call {which} did not join \
+                 (routed={routed:?} counters={counters:?} scans={:?})",
+                harness.scan
+            )
+        })
     };
-    let a = call(&mut harness, &mut target)?;
-    let before = harness.session.instance_maps().counters()?.local_bumps;
+    let epochs_of = |harness: &Harness, target: &Target| -> Result<(u64, u64, u64, u64, u64)> {
+        let reading = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        Ok((
+            reading.local,
+            reading.global,
+            reading.fault,
+            reading.sticky,
+            reading.record_flags,
+        ))
+    };
+    // The cause proof: the watched provider's fail-closed state plus
+    // the file's own (ctime, length). Read-only while unchanged.
+    let watched_state = |harness: &Harness| -> Result<(bool, (i64, i64, u64))> {
+        let tracking = harness.session.instance_tracking();
+        let watched = tracking.watched(object).with_context(|| {
+            format!(
+                "not watched after attach: {:?}",
+                tracking.watch_refusal(object)
+            )
+        })?;
+        let unchanged = watched.check_unchanged().map_err(anyhow::Error::msg)?;
+        let metadata = std::fs::metadata(&provider)?;
+        let stamp = (
+            std::os::unix::fs::MetadataExt::ctime(&metadata),
+            std::os::unix::fs::MetadataExt::ctime_nsec(&metadata),
+            metadata.len(),
+        );
+        Ok((unchanged, stamp))
+    };
+    let a = call(&mut harness, &mut target, "a (before the hole)")?;
+    let (unchanged_before, stamp_before) = watched_state(&harness)?;
+    ensure!(
+        unchanged_before,
+        "watched provider already reports changed before the hole (stamp {stamp_before:?})"
+    );
+    let before = harness.session.instance_maps().counters()?;
+    let epochs_before = epochs_of(&harness, &target)?;
+    let scans_before = harness.scan.outcomes.clone();
     let holed = target.command(b'h')?;
     ensure!(holed == "PHOLE", "{holed}");
-    let hole_bumps = harness.session.instance_maps().counters()?.local_bumps - before;
+    let (unchanged_after, stamp_after) = watched_state(&harness)?;
+    ensure!(
+        stamp_after != stamp_before,
+        "punch-hole left the provider file unchanged on disk: {stamp_before:?} vs {stamp_after:?}"
+    );
+    ensure!(
+        !unchanged_after,
+        "watched provider still reports unchanged after the hole \
+         (stamp {stamp_before:?} -> {stamp_after:?})"
+    );
+    let after_hole = harness.session.instance_maps().counters()?;
+    let epochs_after = epochs_of(&harness, &target)?;
+    let hole_bumps = after_hole.local_bumps - before.local_bumps;
+    eprintln!(
+        "T3A_PHOLE_DIAG counters_before={before:?} counters_after={after_hole:?} \
+         target_local={}->{} target_global={}->{} fault={}->{} sticky={}->{} flags={}->{} \
+         unchanged={unchanged_before}->{unchanged_after} stamp={stamp_before:?}->{stamp_after:?} \
+         scans={:?}",
+        epochs_before.0,
+        epochs_after.0,
+        epochs_before.1,
+        epochs_after.1,
+        epochs_before.2,
+        epochs_after.2,
+        epochs_before.3,
+        epochs_after.3,
+        epochs_before.4,
+        epochs_after.4,
+        harness.scan
+    );
     ensure!(
         hole_bumps >= 1,
         "punch-hole did not reach uprobe_munmap (hook gap?)"
     );
-    let b = call(&mut harness, &mut target)?;
-    ensure!(b != a, "punch-hole kept the instance");
+    // Call b is collected but never joined: the changed provider
+    // refuses every scan, so the call expires unjoined instead of
+    // attributing to an unprovable instance. Bounded: the unjoined
+    // outcome must arrive promptly, not after an unbounded wait.
+    target
+        .command(b'c')
+        .with_context(|| "punch-hole call b (after the hole): fixture did not answer")?;
+    let routed = pump_until_routed(&mut harness, &target, 1, Duration::from_secs(10))?;
+    ensure!(
+        routed.len() == 1,
+        "punch-hole call b: expected one routed outcome, got {routed:?}"
+    );
+    ensure!(
+        matches!(routed[0].route, Route::Unknown(_)),
+        "punch-hole call b joined after the provider changed (fail-open): \
+         {:?} (a={a:?} scans={:?})",
+        routed[0].route,
+        harness.scan
+    );
+    // Every scan after the hole refused Custody (at least one ran),
+    // and no New/Continued observation was sealed after the hole:
+    // every other ledger entry is frozen at its pre-hole count.
+    let custody_before = scans_before.get("Custody").copied().unwrap_or(0);
+    let custody_after = harness.scan.outcomes.get("Custody").copied().unwrap_or(0);
+    ensure!(
+        custody_after > custody_before,
+        "no Custody scan refusal after the hole: {scans_before:?} -> {:?}",
+        harness.scan.outcomes
+    );
+    for (outcome, after) in &harness.scan.outcomes {
+        if outcome == "Custody" {
+            continue;
+        }
+        let before_count = scans_before.get(outcome).copied().unwrap_or(0);
+        ensure!(
+            *after == before_count,
+            "post-hole scan ledger entry {outcome:?} moved {before_count}->{after}; \
+             only Custody refusals are allowed after a provider change"
+        );
+    }
     let counters = harness.session.instance_maps().counters()?;
     eprintln!(
-        "T3A_PHOLE hole_bumps={hole_bumps} counters={counters:?} scans={:?}",
+        "T3A_PHOLE hole_bumps={hole_bumps} counters={counters:?} \
+         target_local={}->{} target_global={}->{} custody={custody_before}->{custody_after} \
+         b_route={:?} scans={:?}",
+        epochs_before.0,
+        epochs_after.0,
+        epochs_before.1,
+        epochs_after.1,
+        routed[0].route,
         harness.scan
     );
     ensure!(harness.false_joins().is_empty());
@@ -1551,8 +3264,8 @@ fn privileged_instance_nonleader_exec_detaches_without_misrouting() -> Result<()
         "post-exec scan unexpectedly worked: {outcome:?}"
     );
     ensure!(
-        harness.scan.outcomes.contains_key("NoCookie"),
-        "post-exec scan must refuse on the missing cookie: {:?}",
+        harness.scan.outcomes.contains_key("Unknown"),
+        "post-exec full-image query must remain Unknown: {:?}",
         harness.scan.outcomes
     );
     let counters = harness.session.instance_maps().counters()?;
@@ -1599,6 +3312,1217 @@ fn privileged_instance_fork_without_exec_stays_consistent() -> Result<()> {
     );
     ensure!(harness.false_joins().is_empty());
     ensure!(after.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Off-flavor guard shared by the birth-marker cells: without a
+/// marker-enabled build the Detailed object carries no marker map or
+/// bodies, and the cell asserts that absence instead of running live.
+/// This is a healthy twin, not a skip.
+fn assert_marker_absent_from_detailed() -> Result<()> {
+    let object =
+        aya_obj::Object::parse(crate::EBPF_OBJECT).expect("parse Detailed object for marker");
+    ensure!(
+        !object.maps.contains_key("JOURNAL_MARKER_CTL"),
+        "a markerless build must not allocate the marker control map"
+    );
+    ensure!(
+        !object.maps.contains_key("PID_START_TICK"),
+        "a markerless build must not allocate the PID-scope birth witness"
+    );
+    for global in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
+        ensure!(
+            !object
+                .functions
+                .values()
+                .any(|function| function.name == global),
+            "a markerless build must not retain {global}"
+        );
+    }
+    eprintln!("MARKER_OFF flavor=off");
+    Ok(())
+}
+
+/// Birth marker: an exec before closure publishes nothing; the first exec
+/// after the mint publishes READY with the minted generation and one
+/// admission, and the next call carries the same exec ID.
+#[test]
+#[ignore = "privileged: birth marker exec after closure publishes READY"]
+fn privileged_journal_marker_exec_after_closure_publishes_ready() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "a fresh session must not have minted a closure"
+    );
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let before = harness.take_images();
+    ensure!(before.len() == 1, "one call, one image");
+    // Pre-closure twin: an exec with no minted generation publishes
+    // nothing and spends nothing.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let pre = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&pre) == 0,
+        "a pre-closure exec must leave word 0 or no row: {}",
+        marker_summary(&pre)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "a pre-closure exec must spend nothing: {control:?}"
+    );
+    // Closure, then the exec under test.
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "a post-closure exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one exec, one admission: {control:?}"
+    );
+    // The first call after the exec carries the published exec ID.
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let images = harness.take_images();
+    ensure!(images.len() == 1, "one call, one image");
+    ensure!(
+        images[0].exec_id == exec,
+        "the post-exec call must carry the published exec id: call {} marker {exec}",
+        images[0].exec_id
+    );
+    ensure!(
+        exec > before[0].exec_id,
+        "the exec must advance the exec id: {exec} <= {}",
+        before[0].exec_id
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_EXEC exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker: a non-leader exec gives the fresh leader its own READY
+/// row with one admission and no latch. Post-exec calls stay untraced
+/// (the neighbor detachment gate pins that bound), so this cell reads the
+/// row, never events.
+#[test]
+#[ignore = "privileged: birth marker non-leader exec creates a fresh READY row"]
+fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start(&plan, pid, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "the mint spends nothing: {control:?}"
+    );
+    let ready = target.command(b'E')?;
+    let fields: Vec<_> = ready.split_whitespace().collect();
+    ensure!(
+        fields.len() >= 2 && fields[0] == "READY" && fields[1] == pid.to_string(),
+        "not the same process after nonleader exec: {ready}"
+    );
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the fresh leader")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "the fresh row must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one fresh leader, one admission: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_NONLEADER_EXEC exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker DIRTY-first twin under Scope::Cgroup: after an exec, a
+/// cgroup gap, and re-entry, a non-leader exec gives the fresh leader its
+/// own READY row with a second admission. The old leader's task_struct,
+/// and its DIRTY row, is discarded; in effect the process recovers by
+/// re-execing from a thread. Reads the row after the exec, never events.
+/// The private cgroup is removed at the end.
+#[test]
+#[ignore = "privileged: birth marker dirty non-leader exec publishes fresh READY"]
+fn privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("dirty-exec")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let old = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    // One call outside the cgroup dirties without charging: the row is READY.
+    move_process_to(pid, &home)?;
+    target.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "an out-of-cgroup call must dirty: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "dirtying READY charges nothing: {control:?}"
+    );
+    // Back inside: a call still joins (S1 continues) and keeps DIRTY.
+    group.move_in(pid)?;
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let reentered = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&reentered) == journal_marker::MARKER_DIRTY,
+        "re-entry must not clear DIRTY: {}",
+        marker_summary(&reentered)
+    );
+    // The non-leader exec under test: a fresh READY row, one more admission.
+    let ready = target.command(b'E')?;
+    let fields: Vec<_> = ready.split_whitespace().collect();
+    ensure!(
+        fields.len() >= 2 && fields[0] == "READY" && fields[1] == pid.to_string(),
+        "not the same process after nonleader exec: {ready}"
+    );
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the fresh leader")?;
+    ensure!(
+        exec != old,
+        "the fresh row must name a new exec: {exec} == {old}"
+    );
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "the fresh row must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 2 && control.failed == 0,
+        "two admissions, one per leader: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_DIRTY_NONLEADER_EXEC old={old} exec={exec} minted={minted} \
+         control={control:?} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// Birth marker: a fork without exec publishes nothing. The reaped child
+/// keeps no row (task storage dies with the task), every marker write
+/// charges first, and the parent's row is untouched.
+#[test]
+#[ignore = "privileged: birth marker fork without exec publishes no READY"]
+fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start(&plan, target.pid(), &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    let parent_before = proc_record_of(&harness, &target)?;
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "the mint spends nothing: {control:?}"
+    );
+    let forked = target.command(b'f')?;
+    ensure!(forked == "FORKED", "{forked}");
+    let parent_after = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&parent_after) == marker_word_of(&parent_before)
+            && parent_after.map(|row| row.exec_attach_gen)
+                == parent_before.map(|row| row.exec_attach_gen),
+        "a fork must not touch the parent row: {} -> {}",
+        marker_summary(&parent_before),
+        marker_summary(&parent_after)
+    );
+    ensure!(
+        marker_word_of(&parent_after) == 0,
+        "the parent must have no READY without an exec: {}",
+        marker_summary(&parent_after)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "a fork must charge nothing: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_FORK control={control:?} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker under Scope::Cgroup: an outsider that never enters the
+/// private cgroup dirties its own absent row once no matter how often it
+/// calls, and a later out-of-scope exec keeps DIRTY. The outsider is
+/// spawned before attach, so it has no Stage A row: this is the only live
+/// cell for the gap's reserve-then-create path, and it fails if that path
+/// stops creating (no row), stops charging once (spent moves), or faults.
+/// The in-scope twin joins clean. The private cgroup is removed at the end.
+#[test]
+#[ignore = "privileged: birth marker cgroup-outsider call creates a DIRTY row"]
+fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let PairSetup {
+        _directory,
+        provider,
+        mut inner,
+        mut outer,
+    } = spawn_pair_targets()?;
+    let pid = inner.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("outsider")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    ensure!(
+        current_cgroup(outer.pid())? == home,
+        "the outsider must never enter the private cgroup"
+    );
+    // Twin: the in-scope target joins, spending nothing and dirtying nothing.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    ensure!(
+        proc_record_of(&harness, &outer)?.is_none(),
+        "the outsider must start rowless so the first call drives reserve-then-create"
+    );
+    // Two out-of-scope calls on the absent row: one DIRTY, one admission.
+    outer.command(b'c')?;
+    outer.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &outer)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "out-of-scope calls must dirty the outsider row: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "two calls, one admission: {control:?}"
+    );
+    // A later out-of-scope exec by the same leader keeps DIRTY and spends
+    // nothing: it never reaches the birth path.
+    let ready = outer.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness, &outer)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an out-of-scope exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a DIRTY exec spends nothing: {control:?}"
+    );
+    // The in-scope target still joins with a clean row.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_CGROUP_OUTSIDER minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// Birth marker under Scope::Pid: an outsider sibling is never observed,
+/// so it has no row, spends nothing and routes no call. Perf links bind to
+/// the target and the kernel pid filter drops the rest, on every backend;
+/// no outsider call ever reaches BPF. The in-scope target joins clean.
+/// (No vfork child runs here, so the CLONE_VM-sharer exception is out of
+/// scope for this cell.)
+#[test]
+#[ignore = "privileged: birth marker PID outsider stays unobserved"]
+fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let PairSetup {
+        _directory,
+        provider,
+        mut inner,
+        mut outer,
+    } = spawn_pair_targets()?;
+    let (_view, pins, plan, _key) = pin_and_plan(inner.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, inner.pid(), &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    // Twin: the in-scope target joins, spending nothing and dirtying nothing.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    // Two outsider calls: no row, no admission, no routed call.
+    outer.command(b'c')?;
+    outer.command(b'c')?;
+    let absent = proc_record_of(&harness, &outer)?;
+    ensure!(
+        absent.is_none(),
+        "an unobserved outsider must have no row: {}",
+        marker_summary(&absent)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "unobserved calls spend nothing: {control:?}"
+    );
+    let stray = pump_rounds(&mut harness, &inner, 10)?;
+    ensure!(stray.is_empty(), "the outsider must route no call");
+    // The in-scope target still joins with a clean row.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_PID_OUTSIDER minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker under Scope::Cgroup: READY after closure, then a move out
+/// and one call stick DIRTY across the move back, another call, and a
+/// later in-scope exec. The private cgroup is removed at the end.
+#[test]
+#[ignore = "privileged: birth marker cgroup gap sticks across re-entry and exec"]
+fn privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("gap")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    // One call outside the cgroup dirties without charging: the row is READY.
+    move_process_to(pid, &home)?;
+    target.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "an out-of-cgroup call must dirty: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "dirtying READY charges nothing: {control:?}"
+    );
+    // Back inside: a call still joins (S1 continues) and keeps DIRTY.
+    group.move_in(pid)?;
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let reentered = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&reentered) == journal_marker::MARKER_DIRTY,
+        "re-entry must not clear DIRTY: {}",
+        marker_summary(&reentered)
+    );
+    // A later in-scope exec keeps DIRTY and spends nothing.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an in-scope exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "sticky DIRTY spends nothing more: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_CGROUP_GAP exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// Birth marker return-side twin: one provider call held inside the
+/// provider while the process leaves the cgroup dirties on return, with no
+/// other call in between. The same held call released in scope leaves READY.
+#[test]
+#[ignore = "privileged: birth marker return outside scope dirties"]
+fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("return")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let published = journal_marker::ready_word(exec);
+    // Healthy twin: hold and release inside the scope; the word never moves.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == published,
+        "an in-scope entry must not mark"
+    );
+    let unheld = target.command(b'u')?;
+    ensure!(unheld.starts_with("UNHELD"), "{unheld}");
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == published,
+        "an in-scope return must not mark"
+    );
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let images = harness.take_images();
+    ensure!(
+        images.len() == 1 && images[0].exec_id == exec,
+        "the released call must carry the published exec id"
+    );
+    // The return under test: hold in scope, release outside it.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    move_process_to(pid, &home)?;
+    let unheld = target.command(b'u')?;
+    ensure!(unheld.starts_with("UNHELD"), "{unheld}");
+    let marked = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&marked) == journal_marker::MARKER_DIRTY,
+        "an out-of-scope return must dirty: {}",
+        marker_summary(&marked)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "the return charged nothing: {control:?}"
+    );
+    // The discarded return emitted no call, and the ledger shows the held
+    // call as the only one between the hold and the release: only the
+    // return path can have marked it.
+    let stray = pump_rounds(&mut harness, &target, 10)?;
+    ensure!(
+        stray.is_empty(),
+        "the out-of-scope return must emit no call"
+    );
+    let ledger = &target.ledger;
+    ensure!(
+        ledger.len() >= 2
+            && ledger[ledger.len() - 2] == "HELD"
+            && ledger[ledger.len() - 1].starts_with("UNHELD"),
+        "no other call ran between the hold and the release"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_RETURN_OUTSIDE_SCOPE exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// Birth marker abandoned-call twin: a provider call held inside the
+/// provider while its thread is cancelled dirties at thread exit, with no
+/// other call in between. The same held call released normally leaves
+/// READY. The process keeps running throughout; the private cgroup is
+/// removed at the end.
+#[test]
+#[ignore = "privileged: birth marker abandoned call at thread exit dirties"]
+fn privileged_journal_marker_abandoned_call_at_thread_exit_dirties() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("abandoned")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let published = journal_marker::ready_word(exec);
+    // Healthy twin: hold and release in scope; the word never moves.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    let unheld = target.command(b'u')?;
+    ensure!(unheld.starts_with("UNHELD"), "{unheld}");
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == published,
+        "a returned call must not mark"
+    );
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    // The call under test: hold in scope, then cancel the holding thread.
+    // The process keeps running; thread exit reclaims the live START.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    let cancelled = target.command(b'K')?;
+    ensure!(cancelled.starts_with("CANCELLED"), "{cancelled}");
+    let marked = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&marked) == journal_marker::MARKER_DIRTY,
+        "a call abandoned at thread exit must dirty: {}",
+        marker_summary(&marked)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "the abandoned call charged nothing: {control:?}"
+    );
+    // The abandoned call emitted no completion, and the ledger shows the
+    // held call as the only one between the hold and the cancel: only the
+    // thread-exit path can have marked it.
+    let stray = pump_rounds(&mut harness, &target, 10)?;
+    ensure!(stray.is_empty(), "the abandoned call must emit no call");
+    let ledger = &target.ledger;
+    ensure!(
+        ledger.len() >= 2
+            && ledger[ledger.len() - 2] == "HELD"
+            && ledger[ledger.len() - 1].starts_with("CANCELLED"),
+        "no other call ran between the hold and the cancel"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_ABANDONED_CALL exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// The production live birth-row read's marker word for the target,
+/// or `None` when the kernel holds no row at all. A short row is a
+/// hard error: native rows are always complete.
+fn live_birth_word_of(
+    harness: &Harness,
+    binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+) -> Result<Option<u64>> {
+    use crate::attach::{BirthRowError, BirthRowReader};
+    let maps = harness.session.instance_maps();
+    let mut rows = crate::attach::LiveBirthRows::over(&maps, binding);
+    match rows.read_marker_row() {
+        Ok(record) => Ok(Some(record.journal_bootstrap)),
+        Err(BirthRowError::Unreadable) => Ok(None),
+        Err(BirthRowError::Short) => Err(anyhow!("a live birth row is never short")),
+    }
+}
+
+/// Birth marker, ordinary capture: with no closure minted (the
+/// generation-0 seal of a capture without the per-key-tracking
+/// opt-in), a post-seal exec leaves the target's marker word
+/// unpublished (word 0, generation 0) and spends no admission — and
+/// the birth observation mints a witness only for a READY word
+/// naming the admitted exec, so no birth witness can mint. The
+/// production live birth-row read reports no row before the exec and
+/// the unpublished word after it, then returns the READY row under a
+/// minted closure in the live-read control, proving it reads live
+/// row state rather than a stubbed reader.
+#[test]
+#[ignore = "privileged: birth marker ordinary capture mints no birth"]
+fn privileged_journal_marker_ordinary_capture_mints_no_birth() -> Result<()> {
+    use crate::discovery::caller_registry::{CallerId, ModuleKey};
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "an ordinary capture seals with generation 0"
+    );
+    // One joined call proves the hooks observe before the exec.
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let before = harness.take_images();
+    ensure!(before.len() == 1, "one call, one image");
+    let domain = harness
+        .session
+        .native_domain()
+        .context("the live session owns its native domain")?;
+    // The binding carries the live custody, domain and image; the
+    // production row read uses its pin, nothing else.
+    let binding = SemanticCallerBinding::scripted(
+        CallerId(0),
+        ModuleKey::physical(
+            key.device.major,
+            key.device.minor,
+            key.inode,
+            None,
+            &provider.display().to_string(),
+        ),
+        domain,
+        before[0],
+        target.pin.clone(),
+    );
+    // No row exists before the exec; the exec's hook creates it.
+    let pre = live_birth_word_of(&harness, &binding)?;
+    ensure!(
+        pre.is_none(),
+        "before the exec the kernel holds no row: {pre:?}"
+    );
+    // Post-seal exec on the ordinary lane: the hooks stop at the
+    // gated read and the word stays unpublished.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "the ordinary seal still holds generation 0 after the exec"
+    );
+    let row = proc_record_of(&harness, &target)?;
+    ensure!(
+        row.map(|row| (row.journal_bootstrap, row.exec_attach_gen)) == Some((0, 0)),
+        "an ordinary post-seal exec must publish no READY row: {}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "an ordinary post-seal exec must spend nothing: {control:?}"
+    );
+    let post = live_birth_word_of(&harness, &binding)?;
+    ensure!(
+        post == Some(0),
+        "after the exec the live marker word is still unpublished: {post:?}"
+    );
+    // Live-read control on the same session: mint, re-exec, and run
+    // the same production read. The row publishes READY under the
+    // minted closure, so the read must return it.
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the post-closure control exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one control exec, one admission: {control:?}"
+    );
+    let reread = {
+        let maps = harness.session.instance_maps();
+        crate::attach::LiveBirthRows::over(&maps, &binding).read_marker_row()
+    };
+    let reread =
+        reread.map_err(|error| anyhow!("the control row must read back live: {error:?}"))?;
+    ensure!(
+        journal_marker::read_word(reread.journal_bootstrap)
+            == journal_marker::MarkerRead::Ready(exec)
+            && reread.exec_attach_gen == minted,
+        "the production live read must return the published READY row"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_ORDINARY exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Journal READY writer: in a `--key-operations` (journal-object) session,
+/// an exec before closure publishes nothing (healthy twin: the pre-closure
+/// exec stays unborn with word 0 and no admission); the first exec after
+/// the mint publishes READY with the minted generation and one admission,
+/// so the exec-born candidate is born instead of refusing with
+/// `joint_birth_native_MarkerNotReady`. A DIRTY word stays DIRTY across a
+/// later in-scope exec (failure twin, cgroup phase). On builds that omit
+/// the journal the cell asserts the finite refusal instead.
+#[test]
+#[ignore = "privileged: journal READY exec after closure publishes READY"]
+fn privileged_journal_ready_exec_after_closure_publishes_ready() -> Result<()> {
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        ensure!(
+            crate::EBPF_JOURNAL_OBJECT.is_empty(),
+            "an omitted build must embed no journal bytes"
+        );
+        let spec = super::journal::JournalSpec;
+        let error = spec
+            .prepare()
+            .err()
+            .context("the omitted build refuses journal preparation")?;
+        ensure!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "the omitted build refuses with its finite reason: {error:#}"
+        );
+        eprintln!("JOURNAL_READY journal=inapplicable");
+        return Ok(());
+    }
+    // Phase 1 (PID scope): a pre-closure exec stays unborn; the first
+    // post-closure exec publishes READY with the minted generation.
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start_journal(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "a fresh journal session must not have minted a closure"
+    );
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let pre = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&pre) == 0,
+        "a pre-closure exec must leave word 0 or no row: {}",
+        marker_summary(&pre)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "a pre-closure exec must spend nothing: {control:?}"
+    );
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "a post-closure journal exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one exec, one admission: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "JOURNAL_READY exec={exec} minted={minted} control={control:?} counters={counters:?}"
+    );
+    ensure!(counters.faults == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    drop(harness);
+    // Phase 2 (cgroup scope): DIRTY stays DIRTY across an in-scope exec.
+    let CmdSetup {
+        _directory: _directory2,
+        provider: provider2,
+        target: mut target2,
+    } = spawn_cmd_target()?;
+    let pid2 = target2.pid();
+    let home = current_cgroup(pid2)?;
+    let group = MarkerCgroup::create("journal-ready-dirty")?;
+    group.move_in(pid2)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view2, pins2, plan2, _key2) = pin_and_plan(pid2, &provider2, &["C_GetSlotInfo"])?;
+    let harness2 = Harness::start_journal_cgroup(&plan2, &scope, &pins2)?;
+    let minted2 = harness2.session.instance_maps().mint_attach_generation()?;
+    let ready = target2.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness2, &target2)?;
+    let _exec2 = ready_exec_of(&row, "the in-scope journal exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted2),
+        "READY must name the minted closure: {} minted {minted2}",
+        marker_summary(&row)
+    );
+    move_process_to(pid2, &home)?;
+    target2.command(b'c')?;
+    let dirtied = proc_record_of(&harness2, &target2)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "an out-of-cgroup call must dirty: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness2)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "dirtying READY charges nothing: {control:?}"
+    );
+    group.move_in(pid2)?;
+    let ready = target2.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness2, &target2)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an in-scope exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness2)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a DIRTY exec spends nothing: {control:?}"
+    );
+    let counters = harness2.session.instance_maps().counters()?;
+    eprintln!("JOURNAL_READY_DIRTY minted={minted2} control={control:?} counters={counters:?}");
+    ensure!(counters.faults == 0);
+    ensure!(harness2.session.instance_maps().sticky()? == 0);
+    drop(harness2);
+    move_process_to(pid2, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// A plain process (never maps the watched provider) holding `pid`: the
+/// kernel's next PID is set through `ns_last_pid` (the CRIU technique) and
+/// the spawn retried, since other host processes may take the number first.
+/// Unlike a cmd target, `sleep` maps no watched file, so Stage A creates
+/// no row for its mappings; the spawn fork itself may still leave a plain
+/// Stage A row (a vfork child shares the mm until its exec), which the
+/// marker must never publish on.
+struct ReusedProc {
+    child: Child,
+    pin: Arc<PidPin>,
+}
+
+impl Drop for ReusedProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_plain_with_pid(pid: u32) -> Result<ReusedProc> {
+    for attempt in 0..64 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", pid - 1))
+            .context("writing ns_last_pid (needs CONFIG_CHECKPOINT_RESTORE and root)")?;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawning plain reuse process")?;
+        if child.id() != pid {
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        let pin = match PidPin::open(pid) {
+            Ok(pin) => Arc::new(pin),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
+        };
+        // The spawn exec is the admitted event: the readback must follow the
+        // exec hook. `/proc/PID/exe` alone is not enough: the kernel switches
+        // it in `begin_new_exec`, inside the ELF load, while the
+        // `sched_process_exec` tracepoint fires only after the whole binary
+        // and interpreter load returns, so a readback keyed on the image
+        // alone can see the spawn's unstamped row. Wait until the process
+        // is blocked in its own sleep syscall (`clock_nanosleep` 230, or
+        // `nanosleep` 35): it has returned to user space, after the hook.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|link| link.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let syscall =
+                std::fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap_or_default();
+            let sleeping = matches!(syscall.split_whitespace().next(), Some("230" | "35"));
+            if exe.contains("sleep") && sleeping {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the reused process never exec'd its image and reached its sleep"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("MARKER_PID_REUSE pid={pid} attempt={attempt}");
+        return Ok(ReusedProc { child, pin });
+    }
+    bail!("could not reuse pid {pid} in 64 attempts")
+}
+
+/// Birth marker under Scope::Pid with PID reuse: PID scope admits the exec
+/// hook by number alone, so a process that later reuses the target's number
+/// reaches the hook; the marker births it only by start-time identity. The
+/// marker must never publish there: after the reused process's exec its row
+/// stays UNPUBLISHED (or absent, when the spawn forked no row) and the
+/// admission row is unchanged. The target's own exec first publishes READY
+/// (positive control: PID scope still updates an existing row), spending
+/// exactly one admission.
+#[test]
+#[ignore = "privileged: birth marker PID reuse exec creates no row"]
+fn privileged_journal_marker_pid_reuse_exec_creates_no_row() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start(&plan, pid, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    // Positive control: the admitted target's exec publishes READY.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the target exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one exec, one admission: {control:?}"
+    );
+    // The target exits and is reaped, freeing its number; a plain process
+    // (no watched mapping, so no Stage A row) reuses it and execs.
+    drop(target);
+    let reused = spawn_plain_with_pid(pid)?;
+    let absent = harness
+        .session
+        .instance_maps()
+        .record(reused.pin.pidfd()?)?;
+    ensure!(
+        marker_word_of(&absent) == 0,
+        "a reused PID must gain no marker publication: {}",
+        marker_summary(&absent)
+    );
+    // Liveness, not the birth proof: the plain exec path stamps any
+    // existing row (`p11_instance_exec`), so a matching generation only
+    // proves the hook ran. No birth is proved by the zero marker word
+    // above plus the unchanged admission row below.
+    if let Some(row) = &absent {
+        ensure!(
+            row.exec_attach_gen == minted,
+            "the reused row keeps the minted generation (plain-exec stamp, not a birth): {} minted {minted}",
+            marker_summary(&absent)
+        );
+    }
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a reused-PID exec must spend nothing: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_PID_REUSE_EXEC exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
     ensure!(harness.session.instance_maps().sticky()? == 0);
     Ok(())
 }

@@ -42,9 +42,11 @@ pub fn expected_shapes(reg: &MechanismRegistry) -> std::collections::BTreeMap<u6
         .collect()
 }
 
-/// Every mechanism id safe mode may publish: the complete official 3.2
+/// Every mechanism id safe mode approves: the complete official 3.2
 /// catalog plus configured registered ids. Presence is approval; the value is
-/// only an optional decoder shape.
+/// only an optional decoder shape. When the union exceeds `MECH_SHAPE`
+/// capacity, [`select_publishable`] publishes the official-first prefix and
+/// the unpublished tail keeps counting through the unregistered path.
 pub fn approved_mechanisms(reg: &MechanismRegistry) -> BTreeMap<u64, u32> {
     let mut approved = PKCS11_3_2_OFFICIAL_MECHANISMS
         .iter()
@@ -60,23 +62,63 @@ pub fn approved_mechanisms(reg: &MechanismRegistry) -> BTreeMap<u64, u32> {
     approved
 }
 
-fn ensure_approval_capacity(approved: &BTreeMap<u64, u32>) -> Result<()> {
-    if approved.len() > MAX_MECH_SHAPES as usize {
-        bail!(
-            "mechanism approval union has {} entries but MECH_SHAPE holds only {}; refusing to publish a prefix",
-            approved.len(),
-            MAX_MECH_SHAPES
-        );
+/// The deterministic publishable prefix of an approval union, capped at
+/// `MECH_SHAPE` capacity: the official PKCS#11 3.2 catalog first
+/// (ascending), then the remaining registered ids (ascending). Returns the
+/// subset to publish and how many approved ids stay unpublished.
+pub fn select_publishable(approved: &BTreeMap<u64, u32>) -> (BTreeMap<u64, u32>, u64) {
+    let cap = MAX_MECH_SHAPES as usize;
+    if approved.len() <= cap {
+        return (approved.clone(), 0);
     }
-    Ok(())
+    let official: std::collections::BTreeSet<u64> = PKCS11_3_2_OFFICIAL_MECHANISMS
+        .iter()
+        .map(|mechanism| mechanism.0)
+        .collect();
+    let mut subset = BTreeMap::new();
+    for (id, code) in approved.iter().filter(|(id, _)| official.contains(id)) {
+        if subset.len() >= cap {
+            break;
+        }
+        subset.insert(*id, *code);
+    }
+    for (id, code) in approved.iter().filter(|(id, _)| !official.contains(id)) {
+        if subset.len() >= cap {
+            break;
+        }
+        subset.insert(*id, *code);
+    }
+    let unpublished = approved.len() as u64 - subset.len() as u64;
+    (subset, unpublished)
 }
 
-/// Publishes the complete approved mechanism union, verifies exact readback,
-/// and returns how many entries were published. Capacity is checked before the
-/// first insert, so overflow cannot silently publish a prefix.
-pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
-    let expected = approved_mechanisms(reg);
-    ensure_approval_capacity(&expected)?;
+/// The shaped subset of the publishable prefix: what render may claim a
+/// published shape for (see [`expected_shapes`]). Ids approved but
+/// unpublished have no published shape, so they read "no diagnostic
+/// shape", never "decode failed".
+pub fn published_expected_shapes(reg: &MechanismRegistry) -> BTreeMap<u64, u32> {
+    let approved = approved_mechanisms(reg);
+    let (published, _) = select_publishable(&approved);
+    let mut shaped = expected_shapes(reg);
+    shaped.retain(|id, _| published.contains_key(id));
+    shaped
+}
+
+/// What one `MECH_SHAPE` publication established: how many approved
+/// mechanisms were published and how many stayed unpublished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapePublication {
+    pub published: usize,
+    pub unpublished: u64,
+}
+
+/// Publishes the publishable prefix of the approved mechanism union (see
+/// [`select_publishable`]), verifies exact readback of what was published,
+/// and returns the publication counts. An oversized union no longer
+/// refuses the session: the unpublished tail is gapped by count.
+pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<ShapePublication> {
+    let approved = approved_mechanisms(reg);
+    let (expected, unpublished) = select_publishable(&approved);
     let info = crate::attach::policy_map_data(
         "MECH_SHAPE",
         ebpf.map("MECH_SHAPE").context("MECH_SHAPE map")?,
@@ -100,9 +142,12 @@ pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
         HashMap::try_from(ebpf.map("MECH_SHAPE").context("MECH_SHAPE map")?)?;
     let actual = shapes.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
     if actual != expected {
-        bail!("MECH_SHAPE exact readback differs from the approved mechanism union");
+        bail!("MECH_SHAPE exact readback differs from the published mechanism subset");
     }
-    Ok(expected.len())
+    Ok(ShapePublication {
+        published: expected.len(),
+        unpublished,
+    })
 }
 
 #[cfg(test)]
@@ -191,9 +236,11 @@ mod tests {
 
     #[test]
     fn approvals_are_the_exact_official_and_registered_union() {
-        // This count belongs to the dependency pinned in Cargo.toml at
-        // a2aab6cd67d21d140277a4584942e06c903f165b. A revision change is a
-        // deliberate catalog decision, not a number to update casually.
+        // This count belongs to pkcs11-types 0.2.3 from crates.io (Cargo.toml).
+        // A version change is a deliberate catalog decision, not a number
+        // to update casually. The official 3.2 catalog is unchanged at 463;
+        // the approved union adds the two proposed 3.3 external-mu
+        // registrations (0x403b/0x403c) from the embedded default registry.
         let official = PKCS11_3_2_OFFICIAL_MECHANISMS
             .iter()
             .map(|mechanism| mechanism.0)
@@ -204,7 +251,7 @@ mod tests {
         let approved = approved_mechanisms(&registry);
         assert_eq!(
             approved.len(),
-            463,
+            465,
             "official/registered overlap must deduplicate"
         );
         assert!(official.iter().all(|id| approved.contains_key(id)));
@@ -227,16 +274,90 @@ mod tests {
     }
 
     #[test]
-    fn approval_capacity_refuses_the_whole_oversized_union() {
+    fn approval_overflow_partitions_exactly_into_published_and_count() {
+        // Ruling JK-22a: overflow no longer refuses; the subset and the
+        // unpublished count partition the union exactly — nothing is
+        // invented, dropped silently, or published twice.
         let oversized = (0..=u64::from(MAX_MECH_SHAPES))
             .map(|id| (id, shape::NONE))
             .collect::<BTreeMap<_, _>>();
-        let error = ensure_approval_capacity(&oversized)
-            .unwrap_err()
-            .to_string();
+        assert_eq!(oversized.len(), MAX_MECH_SHAPES as usize + 1);
 
-        assert!(error.contains("1025"), "{error}");
-        assert!(error.contains("1024"), "{error}");
-        assert!(error.contains("refusing"), "{error}");
+        let (subset, unpublished) = select_publishable(&oversized);
+        assert_eq!(subset.len(), MAX_MECH_SHAPES as usize);
+        assert_eq!(unpublished, 1);
+        let tail: Vec<u64> = oversized
+            .keys()
+            .filter(|id| !subset.contains_key(id))
+            .copied()
+            .collect();
+        assert_eq!(tail.len() as u64, unpublished);
+        assert_eq!(subset.len() + tail.len(), oversized.len());
+        assert!(
+            subset.keys().all(|id| oversized.contains_key(id)),
+            "the subset publishes approved ids only"
+        );
+    }
+
+    #[test]
+    fn approval_overflow_publishes_the_official_first_subset() {
+        // Ruling JK-22a: an oversized approval union publishes a
+        // deterministic official-first subset instead of refusing the
+        // session; the rest is gapped by count.
+        let official: BTreeSet<u64> = PKCS11_3_2_OFFICIAL_MECHANISMS
+            .iter()
+            .map(|mechanism| mechanism.0)
+            .collect();
+        let mut approved: BTreeMap<u64, u32> =
+            official.iter().map(|id| (*id, shape::NONE)).collect();
+        // Vendor ids from zero upward, skipping official members: they
+        // interleave below official ids, so naive truncation would drop
+        // official mechanisms while the subset must keep every one.
+        let mut vendor = 0u64;
+        let mut added = 0;
+        while added < 600 {
+            if !official.contains(&vendor) {
+                approved.insert(vendor, shape::NONE);
+                added += 1;
+            }
+            vendor += 1;
+        }
+        assert_eq!(approved.len(), official.len() + 600);
+
+        let (subset, unpublished) = select_publishable(&approved);
+        assert_eq!(subset.len(), MAX_MECH_SHAPES as usize);
+        assert_eq!(
+            unpublished,
+            approved.len() as u64 - u64::from(MAX_MECH_SHAPES)
+        );
+        assert!(
+            official.iter().all(|id| subset.contains_key(id)),
+            "every official id publishes first"
+        );
+        let unpublished_ids: Vec<u64> = approved
+            .keys()
+            .filter(|id| !subset.contains_key(id))
+            .copied()
+            .collect();
+        assert_eq!(unpublished_ids.len() as u64, unpublished);
+        assert!(
+            unpublished_ids.iter().all(|id| !official.contains(id)),
+            "the unpublished tail is vendor-only: {unpublished_ids:?}"
+        );
+        // Deterministic: the same union always selects the same subset.
+        let (again, unpublished_again) = select_publishable(&approved);
+        assert_eq!(subset, again);
+        assert_eq!(unpublished, unpublished_again);
+    }
+
+    #[test]
+    fn approval_within_capacity_publishes_the_whole_union() {
+        let registry = MechanismRegistry::load(None).expect("load embedded registry");
+        let approved = approved_mechanisms(&registry);
+        assert!(approved.len() <= MAX_MECH_SHAPES as usize);
+
+        let (subset, unpublished) = select_publishable(&approved);
+        assert_eq!(unpublished, 0);
+        assert_eq!(subset, approved, "no overflow: everything publishes");
     }
 }

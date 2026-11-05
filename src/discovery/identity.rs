@@ -17,22 +17,26 @@ use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
-    IdentityKind, InspectedObject, MappingFileKey, inspect_file_with_reader_exporting,
-    is_missing_mount_id_error, mapping_file_key, mapping_file_key_in_mountinfo, open_object,
-    open_regular,
+    IdentityKind, InspectedObject, MappingFileKey, SelfMappedFallback,
+    inspect_file_with_reader_exporting, is_missing_mount_id_error, mapping_file_key,
+    mapping_file_key_in_mountinfo, open_object, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
 use crate::discovery::scan::{
-    CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedModule, Skipped, read_mountinfo,
-    standard_function_names,
+    CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
+    read_mountinfo, standard_function_names,
 };
-use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
+use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Pin {
@@ -42,14 +46,70 @@ pub(crate) struct Pin {
 }
 
 pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
+    #[cfg(test)]
+    provider_metadata_read_test::metadata_read();
     let md = file
         .metadata()
         .map_err(|error| format!("fstat failed: {error}"))?;
-    Ok(Pin {
+    Ok(pin_from_metadata(&md))
+}
+
+#[cfg(test)]
+pub(crate) mod provider_metadata_read_test {
+    //! Observer for actual provider metadata reads (held-fd `fstat`
+    //! through `pin_of`/`same_kernel_file`, the primitives behind
+    //! `check_unchanged`, target retention and identity comparison).
+    //! The scoped inventory transaction marks its final membership
+    //! sample; the observer tags each read pre/post-sample so twins
+    //! prove the permit-backed commit performs no provider I/O.
+    use std::cell::{Cell, RefCell};
+
+    type Observer = Box<dyn FnMut(bool)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+        static POST_SAMPLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| *observer.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Run `action` with `observer(post_sample)` notified on every
+    /// provider metadata read. The sample marker starts clear.
+    pub(crate) fn observe<T>(
+        observer: impl FnMut(bool) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        POST_SAMPLE.with(|flag| flag.set(false));
+        let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+        action()
+    }
+
+    pub(super) fn metadata_read() {
+        let post_sample = POST_SAMPLE.with(|flag| flag.get());
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(post_sample);
+            }
+        });
+    }
+
+    /// Mark the final membership sample: later reads in this
+    /// observation are post-sample. Called from `sample_end` only.
+    pub(crate) fn mark_sampled() {
+        POST_SAMPLE.with(|flag| flag.set(true));
+    }
+}
+
+fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
+    Pin {
         ino: md.ino(),
         size: md.len(),
         ctime: (md.ctime(), md.ctime_nsec()),
-    })
+    }
 }
 
 /// Capture-local opened-object identity. It has no stable or serialized meaning.
@@ -61,6 +121,13 @@ struct RawObjectInstance {
     mount_namespace: Option<MountNamespaceId>,
     key: ObjectKey,
     path: String,
+    /// A `--prearm-module` operator alias (packet 6.13). Pre-arm aliases are
+    /// operator inputs like manifest aliases (same lifetime: they survive
+    /// view retirement, they never come from maps), but they file
+    /// separately so `sources` can report the `"prearm"` label. The marker
+    /// never participates in identity merges (`ordinary_identity_equal`
+    /// compares mapping, pin and digest only).
+    prearm: bool,
 }
 
 impl RawObjectInstance {
@@ -69,6 +136,7 @@ impl RawObjectInstance {
             mount_namespace: Some(module.mount_namespace),
             key,
             path: normalize_target_path(path)?,
+            prearm: false,
         })
     }
 
@@ -77,6 +145,16 @@ impl RawObjectInstance {
             mount_namespace: None,
             key,
             path: normalize_target_path(&path)?,
+            prearm: false,
+        })
+    }
+
+    fn prearm(key: ObjectKey, path: String) -> Option<Self> {
+        Some(Self {
+            mount_namespace: None,
+            key,
+            path: normalize_target_path(&path)?,
+            prearm: true,
         })
     }
 }
@@ -115,6 +193,20 @@ struct Entry {
     mapping: MappingFileKey,
     file: Arc<std::fs::File>,
     pin: Pin,
+    /// Last `CLOCK_MONOTONIC` instant a held-fd check proved this object
+    /// unchanged, starting at the pin-time bracket verification. Feeds the
+    /// `pinned_object_changed` bracket's `last_ok_ns` (packet 6.13).
+    last_ok_ns: std::cell::Cell<Option<u64>>,
+    /// Sticky: a per-object check saw this object change. Latches the
+    /// `PinnedObjects` global flag with it, so changed-byte refusal keeps
+    /// precedence whatever checked first.
+    changed: std::cell::Cell<bool>,
+    /// `CLOCK_MONOTONIC` instant of the first detecting check, set once
+    /// with `changed`. Feeds the bracket's `detected_ns`.
+    detected_ns: std::cell::Cell<Option<u64>>,
+    /// Calibrated through this opened file, while its pin was unchanged.
+    /// Keeping the proof avoids mapping a watched file in the observer again.
+    mapped: Option<MappedFile>,
     path: String,
     sha256: String,
     build_id: Option<String>,
@@ -124,6 +216,13 @@ struct Entry {
     /// Export linkage's witness (`scan::export_agreement`); file-derived, so
     /// every entry for one digest carries the same list.
     exports: Arc<[(String, u64)]>,
+    /// A 3.x interface getter name appears among the object's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `exports`. Refuses the legacy-prefix proof.
+    getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    witness_fault: bool,
     /// Whether this object was opened through overlayfs. This narrows the collapse
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
@@ -133,6 +232,19 @@ struct Entry {
     /// entry stands for more than one proven kernel file, so its raw key is
     /// never a sweep-matching key (`sweep_match_keys`).
     collapsed: bool,
+    /// Sticky: the pin-time self-mapping probe could not decide how the
+    /// kernel renders this overlay fd in maps (budget spent, mmap or maps
+    /// read failed). The fd key stays primary and the summary carries
+    /// [`PROBED_MAPS_UNPROVEN_NOTE`], so a caller the rendering would have
+    /// bound never stays unbound silently.
+    probed_maps_unproven: bool,
+    /// How the kernel renders this exact held fd in `/proc` maps when that
+    /// differs from the fd's own key (pre-6.8 overlayfs split), proved by
+    /// the shared self-mapping probe at pin time. `None` whenever the
+    /// rendering agrees or is inconclusive. Carried on the entry — never
+    /// as a second manifest raw — so the one-manifest-raw-per-path
+    /// invariant behind `id_for_path` is preserved.
+    probed_maps_key: Option<ObjectKey>,
 }
 
 /// The exact, bounded pin subset retained by private Inventory activation.
@@ -144,7 +256,70 @@ pub(crate) struct RetainedInventoryTarget {
     changed: std::cell::Cell<bool>,
 }
 
+/// A collection's finite snapshot of already-retained attach targets. Every
+/// proof owns the original file Arc; it neither reopens nor duplicates an fd.
+/// The key is fstat-to-fstat only, never a maps device or pathname.
+#[derive(Debug, Default)]
+pub(crate) struct RetainedMappedIdentities {
+    files: BTreeMap<FileIdentity, RetainedMappedIdentity>,
+}
+
+#[derive(Debug)]
+struct RetainedMappedIdentity {
+    file: Arc<std::fs::File>,
+    pin: Pin,
+    mapped: MappedFile,
+}
+
+impl RetainedMappedIdentities {
+    pub(crate) fn from_targets<'a>(
+        targets: impl IntoIterator<Item = &'a RetainedInventoryTarget>,
+    ) -> Self {
+        let mut result = Self::default();
+        for target in targets {
+            let entry = &target.entry;
+            if target.changed.get() {
+                continue;
+            }
+            let Some(mapped) = entry.reusable_mapped_file() else {
+                continue;
+            };
+            let Ok(metadata) = entry.file.metadata() else {
+                continue;
+            };
+            result
+                .files
+                .entry(FileIdentity::of(&metadata))
+                .or_insert_with(|| RetainedMappedIdentity {
+                    file: Arc::clone(&entry.file),
+                    pin: entry.pin,
+                    mapped,
+                });
+        }
+        result
+    }
+
+    pub(crate) fn identity_for(&self, file: &std::fs::File) -> Option<MappedFile> {
+        let metadata = file.metadata().ok()?;
+        let held = self.files.get(&FileIdentity::of(&metadata))?;
+        // The held fd prevents inode/device reuse; both it and the freshly
+        // opened file must still match the calibrated metadata. Changed or
+        // unmatched files go through the normal probe and hash checks.
+        (pin_from_metadata(&metadata) == held.pin
+            && pin_of(&held.file).is_ok_and(|current| current == held.pin))
+        .then_some(held.mapped)
+    }
+}
+
 impl RetainedInventoryTarget {
+    /// Extra owned allocations made by `share`, without performing the copy
+    /// or exposing identity words. Entry's raw path and display path are two
+    /// independently cloned strings. File/export Arc clones share their
+    /// existing backing; their inline holders are charged by the caller.
+    pub(crate) fn retained_copy_allocation_charge(&self) -> Option<usize> {
+        retained_entry_copy_allocation_charge(&self.entry)
+    }
+
     /// A second owner of this retained object: the same opened file (one
     /// shared `Arc`, no reopen, no new descriptor), the same canonical
     /// identity, and the sticky changed evidence observed so far. The
@@ -181,6 +356,12 @@ impl RetainedInventoryTarget {
             self.changed.set(true);
         }
         Ok(unchanged)
+    }
+
+    /// Borrow the original opened file and canonical digest without copying
+    /// identity or opening another descriptor. Callers retain ABI/pin checks.
+    pub(crate) fn borrowed_file_and_digest(&self) -> (&std::fs::File, &str) {
+        (&self.entry.file, &self.entry.sha256)
     }
 
     /// The raw mapping key this object was first retained under.
@@ -228,6 +409,23 @@ impl RetainedInventoryTarget {
     }
 }
 
+fn retained_entry_copy_allocation_charge(entry: &Entry) -> Option<usize> {
+    [
+        Some(&entry.raw.path),
+        Some(&entry.path),
+        Some(&entry.sha256),
+        entry.build_id.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|text| text.capacity() != 0)
+    .try_fold(0usize, |bytes, text| {
+        bytes
+            .checked_add(text.capacity())?
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+    })
+}
+
 /// The content half of one opened identity — the pin taken at open plus the
 /// whole-file digest. Two openings of one physical file agree on it, so it
 /// narrows a cross-store lookup; it never proves sameness on its own.
@@ -262,6 +460,8 @@ fn on_overlayfs(fd: RawFd) -> Result<bool, String> {
         ));
     }
     // SAFETY: the successful `fstatfs` above initialized `buf`.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     Ok(unsafe {
         buf.assume_init().f_type as u64 == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC
     })
@@ -301,6 +501,7 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
     }
     // SAFETY: the successful `fstatfs` above initialized `buf`. `f_type` is
     // signed on some ABIs; the magic numbers are 32-bit values.
+    #[allow(clippy::unnecessary_cast)]
     let f_type = unsafe { buf.assume_init().f_type } as u64 & 0xffff_ffff;
     Ok(nonunique_inode_kind(f_type))
 }
@@ -319,24 +520,34 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 /// - `fstat` of an opened fd is NOT comparable with maps either (1786658:
 ///   btrfs `st_dev` is the subvolume's anonymous device, 0:37, never the
 ///   maps device). And since 4.19 (stacked file operations) overlayfs
-///   `mmap` installs the BACKING file in the VMA (`ovl_mmap` ->
-///   `backing_file_mmap` -> `vma_set_file(realfile)`); what changed around
-///   6.8 is only what procfs renders for it. Before, maps and `map_files`
-///   show the backing file itself (observed on 6.1 and 6.6, 5498046); from
-///   then on they render the user-visible overlay file (`file_user_inode`
-///   in `show_map_vma`, `file_user_path` in `map_files_get_link`; read in
-///   the 6.17 source). An fd opened through the overlay path `fstat`s as
-///   the overlay file, so comparing `map_files` against `fstat` would
-///   refuse every pre-6.8 container.
-/// - So both sides use the kernel's own `vm_file`: the candidate side
-///   stats the target's `map_files` range; the pinned side mmaps the held
-///   fd itself (one private read-only page, like `KernelSelfMappingProbe`)
-///   and stats `/proc/self/map_files` for that mapping. The same kernel
-///   path installs both VMAs and the same procfs code renders both
+///   `mmap` installs the BACKING file in the VMA (in v6.6 `ovl_mmap`
+///   calls `vma_set_file(vma, realfile)` directly; the
+///   `backing_file_mmap` step appears only in v6.8 `fs/backing-file.c`);
+///   what changed around 6.8 is only what procfs renders for maps
+///   lines. Before, maps shows the backing file itself (observed on
+///   6.1 and 6.6, 5498046); from then on it renders the user-visible
+///   overlay file (`file_user_inode` in `show_map_vma`; read in the
+///   6.17 source). `map_files` stat is the overlay identity on BOTH
+///   sides of 6.8, never the backing file: probed on 6.6.157 and
+///   7.0.14 (upper-only, lower-layer and second-mount files,
+///   xino=off), the `map_files` stat always equals `fstat` of the
+///   same path — when the layers are on different filesystems, with
+///   xino=off both even share the layer's pseudo `st_dev` (upper
+///   `(49, *)`, lower `(50, *)` while the mount itself is `0:48` on
+///   6.6), never the backing device maps shows pre-6.8.
+/// - So both sides compare like-for-like by construction: the candidate
+///   side stats the target's `map_files` range; the pinned side mmaps
+///   the held fd itself (one private read-only page, like
+///   `KernelSelfMappingProbe`) and stats `/proc/self/map_files` for
+///   that mapping. That the `map_files` stat equals `fstat` of the
+///   same path is observed (probed on both sides of 6.8) but not
+///   relied on. The same kernel path installs both VMAs and the same
+///   procfs code renders both
 ///   (overlay or not, before or after 6.8), so equal identities are the
 ///   same kernel file: on btrfs the subvolume's `(anon dev, ino)`, unique;
-///   on pre-6.8 overlay both render the backing file; on 6.8+ overlay both
-///   render the overlay file of the same backing file.
+///   on overlay both render this mount's view of the file, which is also
+///   why a second mount of the same lower file compares unequal (probed
+///   `(66, 11)` vs `(68, 11)` on 6.6).
 /// - Following a `map_files` link needs `CAP_SYS_ADMIN` or
 ///   `CAP_CHECKPOINT_RESTORE` in the initial user namespace (`EPERM`
 ///   otherwise), for `/proc/self` too. Without it nothing is proven and
@@ -345,6 +556,15 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 pub struct FileIdentity {
     pub dev: u64,
     pub ino: u64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
 }
 
 /// A provider-candidate object a complete deep scan opened, identified,
@@ -358,6 +578,16 @@ pub(crate) struct ExaminedObject {
     /// [`MappedFile::key_is_identity`] for `key`: any range under the key
     /// is this file, with no per-range `map_files` stat.
     pub key_is_identity: bool,
+}
+
+/// The actual scanner-opened file; its physical lease returns after the file
+/// closes. Equal metadata never makes two instances of this type one file.
+pub(crate) struct HeldExaminedObject {
+    pub scan: u64,
+    pub ordinal: u64,
+    pub examined: ExaminedObject,
+    pub file: std::fs::File,
+    pub _lease: crate::discovery::sweep_attribution::FdLease,
 }
 
 /// Filesystems on which a maps key is one file: one superblock renders one
@@ -407,6 +637,30 @@ pub struct MappedFile {
 }
 
 impl MappedFile {
+    /// These filesystems preserve the mapping behind a held, unchanged file.
+    /// Btrfs is included here because fstat-to-fstat includes the subvolume
+    /// device; it still requires every target range's map_files proof below.
+    /// Overlay backing switches, wrapping tmpfs inode numbers and unknown
+    /// filesystems keep the ordinary fresh self-mapping probe.
+    fn may_retain(&self) -> bool {
+        self.fs_magic.is_some_and(|magic| {
+            magic == 0x9123_683e
+                || KEY_IS_IDENTITY_FILESYSTEMS
+                    .iter()
+                    .any(|(allowed, _)| *allowed == magic)
+        })
+    }
+
+    /// Whether userspace identity cannot prove this file: it sits on
+    /// overlayfs, where a stale lower mapping keeps the fresh upper
+    /// `(dev, ino)` across a copy-up, or its filesystem is unproven
+    /// (`statfs` unreadable — fail closed). Such keys need the kernel
+    /// proof; the sweep never falls back to userspace identity for them.
+    pub(crate) fn is_overlay_or_unproven(&self) -> bool {
+        self.fs_magic
+            .is_none_or(|magic| magic == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC)
+    }
+
     /// Whether the maps key `key` is this file's identity, so a range
     /// rendered under it in any process is this file: the identity equals
     /// `(makedev(key.device), key.inode)` AND the filesystem is on
@@ -546,22 +800,24 @@ fn map_files_entry_file(entry: &str) -> std::io::Result<MappedFile> {
         (unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) } == 0).then(|| {
             // SAFETY: initialized by the successful `statfs`. `f_type` is
             // signed on some ABIs; the magic numbers are 32-bit values.
-            (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff
+            #[allow(clippy::unnecessary_cast)]
+            let magic = (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff;
+            magic
         })
     });
     Ok(MappedFile { identity, fs_magic })
 }
 
-/// The `vm_file` identity of a held fd: mmap one page (`PROT_READ`,
-/// `MAP_PRIVATE`, never `PROT_EXEC`, unmapped on every path) and stat this
-/// process's own `map_files` entry for it. Like-for-like with
-/// [`map_files_identity`] of a target that maps the same file.
+#[cfg(test)]
 pub(crate) fn self_mapped_identity(file: &std::fs::File) -> Result<FileIdentity, String> {
     self_mapped_file(file).map(|mapped| mapped.identity)
 }
 
-/// [`self_mapped_identity`] plus the filesystem magic of the same
-/// `/proc/self/map_files` entry, read while the self-mapping exists.
+/// The `vm_file` identity of a held fd: mmap one page (`PROT_READ`,
+/// `MAP_PRIVATE`, never `PROT_EXEC`, unmapped on every path) and stat this
+/// process's own `map_files` entry for it. Like-for-like with
+/// [`map_files_identity`] of a target that maps the same file. Includes the
+/// filesystem magic of that same entry, read while the self-mapping exists.
 pub(crate) fn self_mapped_file(file: &std::fs::File) -> Result<MappedFile, String> {
     if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
         return Err("an empty file cannot be mapped".into());
@@ -649,6 +905,16 @@ impl Drop for SelfMapping {
 }
 
 impl Entry {
+    fn reusable_mapped_file(&self) -> Option<MappedFile> {
+        self.mapped.filter(|mapped| {
+            !self.overlay
+                && !self.collapsed
+                && mapped.may_retain()
+                && pin_of(&self.file).is_ok_and(|current| current == self.pin)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         file: std::fs::File,
         pin: Pin,
@@ -656,14 +922,22 @@ impl Entry {
         inspected: &InspectedObject,
         raw: RawObjectInstance,
         mapping: MappingFileKey,
+        mapped: Option<MappedFile>,
+        verified_ns: Option<u64>,
     ) -> Result<Self, String> {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
             collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
             raw,
             mapping,
             file: Arc::new(file),
             pin,
+            last_ok_ns: std::cell::Cell::new(verified_ns),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
+            mapped,
             path,
             // `inspect_file` always records a whole-file digest.
             sha256: inspected.identity.sha256.clone().unwrap_or_default(),
@@ -673,9 +947,18 @@ impl Entry {
             },
             abi: inspected.abi,
             exports: inspected.exports.clone().into(),
+            getter_present: inspected.getter_present,
+            witness_fault: inspected.witness_fault,
         })
     }
 }
+
+/// The pin-time note an overlay provider pin carries when the self-mapping
+/// probe could not decide how the kernel renders its held fd in maps: the
+/// fd key stays primary, and callers the rendering would have bound may
+/// stay unbound. One value, so every such pin discloses identically.
+pub(crate) const PROBED_MAPS_UNPROVEN_NOTE: &str =
+    "provider's maps rendering unproven; callers mapping it may stay unbound";
 
 /// What a pinned object is, for the `discovery[]` report.
 #[derive(Debug, Clone, Copy)]
@@ -734,6 +1017,13 @@ pub struct ReconciledModule {
     /// The module object's own standard-name `.dynsym` definitions, from its
     /// pinned inspection: the export-linkage witness for its tables.
     pub exports: Arc<[(String, u64)]>,
+    /// A 3.x interface getter name appears among the module object's
+    /// dynamic symbols in any symbol type, including non-definitions
+    /// absent from `exports`. Refuses the legacy-prefix proof.
+    pub getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    pub witness_fault: bool,
 }
 
 /// Every object opened, identity-matched, hashed, and pinned by a capture-local ID.
@@ -741,7 +1031,7 @@ pub struct ReconciledModule {
 /// No read leases are held:
 /// `check_unchanged` is a cheap, best-effort check, not a guarantee that the bytes
 /// cannot change between the check and Aya's attach.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
@@ -761,6 +1051,50 @@ pub struct PinnedObjects {
     /// the live display (the frame backstop and the terminal sweep carry
     /// correctness), so bumps are conservative, never exact.
     revision: u64,
+    // Process-local cache fences only, never object/admission/attachment IDs.
+    copy_source: Option<PinCopyCacheId>,
+    copy_version: u64,
+}
+
+impl Clone for PinnedObjects {
+    fn clone(&self) -> Self {
+        Self {
+            by_id: self.by_id.clone(),
+            raw_to_id: self.raw_to_id.clone(),
+            rejected_keys: self.rejected_keys.clone(),
+            ambiguous_keys: self.ambiguous_keys.clone(),
+            ambiguity_published: self.ambiguity_published.clone(),
+            ownership: self.ownership.clone(),
+            raw_ownership: self.raw_ownership.clone(),
+            next_id: self.next_id,
+            overlay_uncertain: self.overlay_uncertain,
+            changed: std::cell::Cell::new(self.changed.get()),
+            revision: self.revision,
+            copy_source: mint_pin_copy_cache_id(&NEXT_PIN_COPY_SOURCE),
+            copy_version: self.copy_version,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PinCopyCacheId(std::num::NonZeroU64);
+
+impl std::fmt::Debug for PinCopyCacheId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinCopyCacheId(<private>)")
+    }
+}
+
+static NEXT_PIN_COPY_SOURCE: AtomicU64 = AtomicU64::new(0);
+static NEXT_PIN_COPY_SELECTION: AtomicU64 = AtomicU64::new(0);
+
+fn mint_pin_copy_cache_id(counter: &AtomicU64) -> Option<PinCopyCacheId> {
+    let previous = counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            old.checked_add(1)
+        })
+        .ok()?;
+    std::num::NonZeroU64::new(previous + 1).map(PinCopyCacheId)
 }
 
 impl PinnedObjects {
@@ -779,6 +1113,8 @@ impl PinnedObjects {
             overlay_uncertain: false,
             changed: std::cell::Cell::new(false),
             revision: 0,
+            copy_source: mint_pin_copy_cache_id(&NEXT_PIN_COPY_SOURCE),
+            copy_version: 0,
         }
     }
 
@@ -789,6 +1125,11 @@ impl PinnedObjects {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
+        self.bump_copy_version();
+    }
+
+    fn bump_copy_version(&mut self) {
+        self.copy_version = self.copy_version.saturating_add(1);
     }
 
     /// Folds another pin set into this capture. Exact comparable identities merge;
@@ -862,6 +1203,102 @@ impl PinnedObjects {
         self.overlay_uncertain
     }
 
+    /// A loader-only absorption may add its pin and scan ownership, but every
+    /// retained provider input must still name the same held File and facts.
+    /// This compares stored state only; attachment keeps its ordinary metadata
+    /// and generation revalidation, rather than replacing them with this proof.
+    pub(crate) fn preserves_provider_inputs_for_loader(
+        &self,
+        candidate: &Self,
+        loader: PinnedObjectId,
+    ) -> bool {
+        if self.changed.get()
+            || candidate.changed.get()
+            || self.overlay_uncertain
+            || candidate.overlay_uncertain
+            || self.rejected_keys != candidate.rejected_keys
+            || self.ambiguous_keys != candidate.ambiguous_keys
+            || self.ambiguity_published != candidate.ambiguity_published
+            || !candidate.by_id.contains_key(&loader)
+            || candidate
+                .by_id
+                .keys()
+                .any(|id| !self.by_id.contains_key(id) && *id != loader)
+        {
+            return false;
+        }
+        for (id, old) in &self.by_id {
+            let Some(new) = candidate.by_id.get(id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&old.file, &new.file)
+                || old.raw != new.raw
+                || old.mapping != new.mapping
+                || old.pin != new.pin
+                || old.path != new.path
+                || old.sha256 != new.sha256
+                || old.build_id != new.build_id
+                || old.abi != new.abi
+                || old.exports != new.exports
+                || old.overlay != new.overlay
+                || old.collapsed != new.collapsed
+            {
+                return false;
+            }
+        }
+        if self
+            .raw_to_id
+            .iter()
+            .any(|(raw, id)| candidate.raw_to_id.get(raw) != Some(id))
+            || candidate.raw_to_id.iter().any(|(raw, id)| {
+                !self.raw_to_id.contains_key(raw)
+                    && (*id != loader || raw.mount_namespace.is_none())
+            })
+            || (self.by_id.contains_key(&loader)
+                && self.sources(loader) != candidate.sources(loader))
+        {
+            return false;
+        }
+        for (view, old) in &self.ownership {
+            let Some(new) = candidate.ownership.get(view) else {
+                return false;
+            };
+            if old.tables != new.tables
+                || old.targets != new.targets
+                || !new.pins.starts_with(&old.pins)
+                || new.pins[old.pins.len()..].iter().any(|id| *id != loader)
+            {
+                return false;
+            }
+        }
+        if candidate.ownership.iter().any(|(view, claims)| {
+            !self.ownership.contains_key(view)
+                && (!claims.tables.is_empty()
+                    || !claims.targets.is_empty()
+                    || claims.pins.iter().any(|id| *id != loader))
+        }) {
+            return false;
+        }
+        for (view, old) in &self.raw_ownership {
+            if candidate
+                .raw_ownership
+                .get(view)
+                .is_none_or(|new| !old.is_subset(new))
+            {
+                return false;
+            }
+        }
+        candidate.raw_ownership.iter().all(|(view, raws)| {
+            raws.iter().all(|raw| {
+                self.raw_ownership
+                    .get(view)
+                    .is_some_and(|old| old.contains(raw))
+                    || (raw.mount_namespace.is_some()
+                        && candidate.raw_to_id.get(raw) == Some(&loader))
+            })
+        })
+    }
+
     pub(crate) fn newly_rejected_keys(&self, committed: &Self) -> BTreeSet<ObjectKey> {
         self.rejected_keys
             .difference(&committed.rejected_keys)
@@ -924,6 +1361,35 @@ impl PinnedObjects {
         keys
     }
 
+    /// Whether a physical `(dev_major, dev_minor, ino)` names this pinned
+    /// object: one of its raw keys, or — on a pre-6.8 overlay split — the
+    /// kernel maps rendering the pin-time probe proved for its exact held
+    /// fd. The single join predicate behind the provider proof and its
+    /// mirrors, so a split-proved binding resolves identically at
+    /// admission, labeling, and selection.
+    ///
+    /// A selector, not file identity: the maps key is not unique (inode
+    /// numbers repeat across btrfs subvolumes and overlay layers), so a
+    /// different file with the same bytes can pass this match. The binding
+    /// authority is the H0 receipt, which keeps only ranges whose
+    /// `map_files` identity matches the observer's own self-mapping of
+    /// the held fd and refuses on zero kept ranges.
+    pub(crate) fn object_matches_key(
+        &self,
+        object: PinnedObjectId,
+        dev_major: u64,
+        dev_minor: u64,
+        ino: u64,
+    ) -> bool {
+        self.raw_keys_for(object).iter().any(|key| {
+            key.device.major == dev_major && key.device.minor == dev_minor && key.inode == ino
+        }) || self.by_id.get(&object).is_some_and(|entry| {
+            entry.probed_maps_key.is_some_and(|key| {
+                key.device.major == dev_major && key.device.minor == dev_minor && key.inode == ino
+            })
+        })
+    }
+
     pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {
         self.by_id.get(&id).map(|entry| entry.abi)
     }
@@ -934,6 +1400,15 @@ impl PinnedObjects {
         self.by_id
             .get(&id)
             .map_or_else(|| Arc::from(Vec::new()), |entry| entry.exports.clone())
+    }
+
+    /// The witness-completeness bits for the pinned object's exports:
+    /// `(getter_present, witness_fault)`. False when the object is not
+    /// pinned here (whose empty exports can never prove anyway).
+    pub(crate) fn export_witness_flags_for(&self, id: PinnedObjectId) -> (bool, bool) {
+        self.by_id.get(&id).map_or((false, false), |entry| {
+            (entry.getter_present, entry.witness_fault)
+        })
     }
 
     /// The content lookup key of a pinned object; `None` when it is not
@@ -966,6 +1441,16 @@ impl PinnedObjects {
             return Err(format!("Inventory object {id:?} changed before retention"));
         }
         Ok(retained)
+    }
+
+    /// Read-only bound before the first retained-target clone. The same
+    /// field/capacity arithmetic also charges later `share` copies; identity
+    /// checks and retention remain the responsibility of their existing path.
+    pub(crate) fn retained_target_copy_allocation_charge(
+        &self,
+        id: PinnedObjectId,
+    ) -> Option<usize> {
+        retained_entry_copy_allocation_charge(self.by_id.get(&id)?)
     }
 
     /// Replaces the raw ownership for one retained process generation while
@@ -1052,6 +1537,7 @@ impl PinnedObjects {
     /// Clears plan-derived table/target claims before the canonical raw module
     /// set is rebound. Opened pin ownership remains intact.
     pub(crate) fn reset_derived_claims(&mut self) {
+        self.bump_copy_version();
         for claims in self.ownership.values_mut() {
             claims.tables.clear();
             claims.targets.clear();
@@ -1065,6 +1551,7 @@ impl PinnedObjects {
     /// aliases resolve to the same physical object. Object IDs, aliases, and
     /// opened-file custody remain unchanged.
     pub(crate) fn reset_scan_pin_claims(&mut self) {
+        self.bump_copy_version();
         for (view, claims) in &mut self.ownership {
             claims.pins = self
                 .raw_ownership
@@ -1145,7 +1632,7 @@ impl PinnedObjects {
         filesystem_without_unique_inodes(entry.file.as_raw_fd())
     }
 
-    /// The held object's `vm_file` identity ([`self_mapped_identity`]):
+    /// The held object's `vm_file` identity ([`self_mapped_file`]):
     /// what another process's `map_files` range must equal before a maps
     /// key may stand for this object there (C1b sweep matching).
     pub(crate) fn object_mapped_identity(&self, id: PinnedObjectId) -> Result<MappedFile, String> {
@@ -1153,7 +1640,10 @@ impl PinnedObjects {
             .by_id
             .get(&id)
             .ok_or_else(|| format!("object {id:?} was not pinned"))?;
-        self_mapped_file(&entry.file)
+        match entry.reusable_mapped_file() {
+            Some(mapped) => Ok(mapped),
+            None => self_mapped_file(&entry.file),
+        }
     }
 
     /// Every pinned object, for `discovery[]`.
@@ -1165,30 +1655,39 @@ impl PinnedObjects {
             sha256: &entry.sha256,
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
-            note: None,
+            note: entry
+                .probed_maps_unproven
+                .then_some(PROBED_MAPS_UNPROVEN_NOTE),
         })
     }
 
     /// Canonical, finite source ownership for one opened capture-local object.
-    /// Raw aliases remain private; output only needs to distinguish scan and
-    /// optional-manifest authority.
+    /// Raw aliases remain private; output only needs to distinguish scan,
+    /// optional-manifest and optional-prearm authority, in that order.
     pub fn sources(&self, id: PinnedObjectId) -> Vec<&'static str> {
         let mut scan = false;
         let mut manifest = false;
+        let mut prearm = false;
         for (raw, observed) in &self.raw_to_id {
             if *observed != id {
                 continue;
             }
             if raw.mount_namespace.is_some() {
                 scan = true;
+            } else if raw.prearm {
+                prearm = true;
             } else {
                 manifest = true;
             }
         }
-        [scan.then_some("scan"), manifest.then_some("manifest")]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            scan.then_some("scan"),
+            manifest.then_some("manifest"),
+            prearm.then_some("prearm"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
@@ -1248,11 +1747,18 @@ impl PinnedObjects {
 
     /// The one pin opened for a manifest object before it is absorbed into the
     /// capture set. Used only to compare that opened object with scan-owned pins.
+    /// Same-id duplicates (a manifest and a pre-arm alias merged onto one
+    /// object) are one answer, not ambiguity.
     pub fn id_for_path(&self, path: &str) -> Option<PinnedObjectId> {
         let path = normalize_target_path(path)?;
-        let mut ids = self.raw_to_id.iter().filter_map(|(raw, id)| {
-            (raw.mount_namespace.is_none() && raw.path == path).then_some(*id)
-        });
+        let mut ids = self
+            .raw_to_id
+            .iter()
+            .filter_map(|(raw, id)| {
+                (raw.mount_namespace.is_none() && raw.path == path).then_some(*id)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter();
         let first = ids.next()?;
         ids.next().is_none().then_some(first)
     }
@@ -1263,6 +1769,32 @@ impl PinnedObjects {
         self.raw_to_id
             .get(&RawObjectInstance::manifest(key, path.to_string())?)
             .copied()
+    }
+
+    /// Resolves a `--prearm-module` record only through the exact pre-arm raw
+    /// instance established when that path was opened (packet 6.13). A bare
+    /// raw key is never enough, and a manifest alias never satisfies a
+    /// pre-arm lookup: sources stay distinct even on one merged object.
+    pub(crate) fn id_for_prearm(&self, key: ObjectKey, path: &str) -> Option<PinnedObjectId> {
+        self.raw_to_id
+            .get(&RawObjectInstance::prearm(key, path.to_string())?)
+            .copied()
+    }
+
+    /// Whether this object carries a pre-arm alias: it was named by
+    /// `--prearm-module`, however many other sources describe it.
+    pub(crate) fn has_prearm(&self, id: PinnedObjectId) -> bool {
+        self.raw_to_id
+            .iter()
+            .any(|(raw, observed)| *observed == id && raw.prearm)
+    }
+
+    /// Total pinned object bytes, saturating: the shared manifest+pre-arm
+    /// byte accounting base (packet 6.13, R2-D1-3).
+    pub(crate) fn pinned_object_bytes(&self) -> u64 {
+        self.by_id
+            .values()
+            .fold(0u64, |total, entry| total.saturating_add(entry.pin.size))
     }
 
     /// Re-files one manifest alias split by pre-6.8 overlayfs onto its scan pin.
@@ -1297,10 +1829,10 @@ impl PinnedObjects {
         };
         // The one manifest pin filed for this path, under its fd key. More
         // than one is a genuine change during discovery, not a split.
-        let mut manifest_aliases = self
-            .raw_to_id
-            .iter()
-            .filter(|(raw, _)| raw.mount_namespace.is_none() && raw.path == normalized);
+        // Pre-arm aliases file separately and never join this count.
+        let mut manifest_aliases = self.raw_to_id.iter().filter(|(raw, _)| {
+            raw.mount_namespace.is_none() && !raw.prearm && raw.path == normalized
+        });
         let Some((manifest_raw, manifest_id)) = manifest_aliases.next() else {
             return;
         };
@@ -1349,6 +1881,7 @@ impl PinnedObjects {
         if !self.by_id.contains_key(&scan_id) {
             return;
         }
+        self.bump_copy_version();
         self.raw_to_id.remove(&manifest_raw);
         let referenced = self.raw_to_id.values().any(|id| *id == manifest_id)
             || self.ownership.values().any(|claims| {
@@ -1365,9 +1898,179 @@ impl PinnedObjects {
                 mount_namespace: None,
                 key: recorded,
                 path: normalized,
+                prearm: false,
             },
             scan_id,
         );
+    }
+
+    /// Re-files one pre-arm alias split by pre-6.8 overlayfs onto its scan pin.
+    ///
+    /// The pre-arm twin of
+    /// [`refile_split_manifest_alias`](Self::refile_split_manifest_alias):
+    /// the scan files the maps/backing key while the pre-arm pin files the
+    /// opened fd's overlay key, so the absorb keeps two objects whose
+    /// complete opened identities agree — and the candidate then bails on
+    /// the same exact provider twice. The join needs no fresh probe: the
+    /// fd-keyed entry carries the pin-time self-mapping proof
+    /// (`Entry::probed_maps_key`) — filed by pre-arm pinning and preserved
+    /// across same-file merges — and the scan pin's own acceptance proved
+    /// its fd renders at its maps key. The alias moves only when exactly
+    /// one scan pin carries the proved maps key with the same complete
+    /// opened-file identity; the scan pin's maps key stays canonical and
+    /// its retained fd stays canonical for attach, exactly as on >= 6.8
+    /// where the absorb merges the two. The pre-arm raw keeps its own fd
+    /// key, so `id_for_prearm` still resolves the operator input after the
+    /// move. Unlike the manifest twin this moves only its own alias and
+    /// never requires owning the entry alone: a manifest alias may share
+    /// the fd-keyed entry, and the engine re-files pre-arm first so the
+    /// manifest twin runs after onto an alone entry. Any ambiguity, any
+    /// missing pin-time proof, or an already-joined alias leaves the pins
+    /// untouched, so a >= 6.8 capture never moves an alias here.
+    pub(crate) fn refile_split_prearm_alias(&mut self, path: &str) {
+        let Some(normalized) = normalize_target_path(path) else {
+            return;
+        };
+        // The one pre-arm alias filed for this path. More than one is a
+        // genuine change during discovery, not a split. Manifest and scan
+        // aliases file separately and never join this count.
+        let mut prearm_aliases = self.raw_to_id.iter().filter(|(raw, _)| {
+            raw.mount_namespace.is_none() && raw.prearm && raw.path == normalized
+        });
+        let Some((prearm_raw, prearm_id)) = prearm_aliases.next() else {
+            return;
+        };
+        if prearm_aliases.next().is_some() {
+            return;
+        }
+        let prearm_raw = prearm_raw.clone();
+        let prearm_id = *prearm_id;
+        // Already joined: the alias shares its object with a scan alias, as
+        // the absorb files it on >= 6.8. Exact captures never reach further.
+        if self
+            .raw_to_id
+            .iter()
+            .any(|(raw, id)| *id == prearm_id && raw.mount_namespace.is_some())
+        {
+            return;
+        }
+        // The split, proved at pin time: this opened fd may stand for the
+        // recorded maps identity only when the kernel rendered it exactly
+        // there. Without that proof there is no split to re-file.
+        let Some(recorded) = self
+            .by_id
+            .get(&prearm_id)
+            .and_then(|entry| entry.probed_maps_key)
+        else {
+            return;
+        };
+        // The scan pin for this file: the recorded key, the same opened
+        // file. Same-key same-file pins merge at absorb, so more than one
+        // match is ambiguity, never identity.
+        let mut scans = BTreeSet::new();
+        for (raw, id) in &self.raw_to_id {
+            if raw.mount_namespace.is_none() || raw.key != recorded {
+                continue;
+            }
+            if self.exactly_matches(*id, self, prearm_id) {
+                scans.insert(*id);
+            }
+        }
+        if scans.len() != 1 {
+            return;
+        }
+        let scan_id = *scans.first().unwrap();
+        if !self.by_id.contains_key(&scan_id) {
+            return;
+        }
+        self.bump_copy_version();
+        self.raw_to_id.remove(&prearm_raw);
+        let referenced = self.raw_to_id.values().any(|id| *id == prearm_id)
+            || self.ownership.values().any(|claims| {
+                claims.tables.contains(&prearm_id)
+                    || claims.pins.contains(&prearm_id)
+                    || claims.targets.iter().any(|(id, _)| *id == prearm_id)
+            });
+        if !referenced {
+            self.by_id.remove(&prearm_id);
+            self.bump_revision();
+        }
+        self.raw_to_id.insert(prearm_raw, scan_id);
+    }
+
+    /// Re-file one manifest raw split by pre-6.8 overlayfs onto its probed
+    /// maps key, at pin time.
+    ///
+    /// The subset pinning path files manifest-only pins with no scan join
+    /// and no refile pass, so on a split the maps-domain raw must be filed
+    /// at pin time or every later exact join misses. This mirrors
+    /// [`refile_split_manifest_alias`](Self::refile_split_manifest_alias)
+    /// onto the manifest's own entry: the fd raw is replaced (not kept
+    /// alongside), because the helper records maps-domain keys and no
+    /// downstream join needs the fd key, while a second manifest raw
+    /// would break path resolution uniqueness. The entry re-keys with
+    /// its raw (retargeting and merges read the entry) but keeps its
+    /// retained fd (attach, unchanged checks and targets are unaffected);
+    /// the reported key becomes maps-canonical exactly as on the scan
+    /// path. Fail-closed: an unnormalizable path, a rejected key, a
+    /// stale id, a path the id never filed, an already-claimed maps key,
+    /// and anything but exactly one owned fd raw all file nothing, and a
+    /// refused re-key leaves the pins (including versions) untouched.
+    ///
+    /// No production caller on this line: the pin-time probe feeds
+    /// `Entry::probed_maps_key` and [`PinnedObjects::object_matches_key`]
+    /// proves both the fd key and the maps key, so the drain keeps the
+    /// fd raw primary. The helper and its tests stay pinned for the
+    /// re-key contract itself.
+    #[cfg(test)]
+    pub(crate) fn refile_manifest_raw_onto_maps_key(
+        &mut self,
+        id: PinnedObjectId,
+        maps_key: ObjectKey,
+        path: &str,
+    ) {
+        if !self.by_id.contains_key(&id) || self.rejected_keys.contains(&maps_key) {
+            return;
+        }
+        let Some(maps_raw) = RawObjectInstance::manifest(maps_key, path.to_string()) else {
+            return;
+        };
+        if let Some(existing) = self.raw_to_id.get(&maps_raw)
+            && *existing != id
+        {
+            return;
+        }
+        // The manifest raws this id already files for this path: the re-key
+        // must replace exactly one fd raw. Zero means an unowned path (or
+        // equal keys, or an idempotent re-call): file nothing. More than
+        // one is ambiguity, not a split. Scan raws are never touched.
+        let owned: Vec<RawObjectInstance> = self
+            .raw_to_id
+            .iter()
+            .filter(|(raw, owner)| {
+                **owner == id
+                    && raw.mount_namespace.is_none()
+                    && !raw.prearm
+                    && raw.path == maps_raw.path
+                    && raw.key != maps_key
+            })
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        if owned.len() != 1 {
+            return;
+        }
+        let Some(entry) = self.by_id.get_mut(&id) else {
+            return;
+        };
+        // The entry re-keys with its raw: retargeting reads the summary
+        // key and merges match entry keys, so a split-brain entry (fd)
+        // with a maps raw refuses the union. Only the key changes (both
+        // raws normalize the same path); the retained fd, mapping, pin
+        // and digest are untouched.
+        entry.raw = maps_raw.clone();
+        self.bump_copy_version();
+        self.raw_to_id.remove(&owned[0]);
+        self.raw_to_id.insert(maps_raw, id);
     }
 
     /// Exact ordinary-file equality between two already opened, hashed pin sets.
@@ -1437,22 +2140,31 @@ impl PinnedObjects {
             sha256: &entry.sha256,
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
-            note: None,
+            note: entry
+                .probed_maps_unproven
+                .then_some(PROBED_MAPS_UNPROVEN_NOTE),
         })
     }
 
     /// `Ok(true)` when every pinned object still has the `(ino, size, ctime)` seen
     /// at pinning; `Ok(false)` when any changed (sticky: once seen, every later
     /// call is `Ok(false)` without re-checking); `Err` only when `fstat` itself fails.
+    /// Success advances every checked object's `last_ok_ns`; the first
+    /// detected change records the same per-object evidence a targeted
+    /// check would, so both paths agree on the bracket.
     pub fn check_unchanged(&self) -> Result<bool, String> {
         if self.changed.get() {
             return Ok(false);
         }
         for entry in self.by_id.values() {
+            let before = crate::attach::monotonic_ns();
             if pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? != entry.pin {
+                entry.changed.set(true);
+                entry.detected_ns.set(crate::attach::monotonic_ns());
                 self.changed.set(true);
                 return Ok(false);
             }
+            entry.last_ok_ns.set(before);
         }
         Ok(true)
     }
@@ -1460,6 +2172,51 @@ impl PinnedObjects {
     /// Whether any `check_unchanged` so far saw a pinned object change.
     pub fn provider_changed(&self) -> bool {
         self.changed.get()
+    }
+
+    /// Per-object held-fd `(ino, size, ctime)` check (packet 6.13, R2-D1-8):
+    /// `Ok(true)` when this one object still matches its pin. Unlike the
+    /// all-objects sticky bool, this attributes a change to one module.
+    /// Success advances that object's `last_ok_ns`; detection latches
+    /// sticky per-object evidence (and the global flag, so changed-byte
+    /// refusal keeps precedence whatever checked first).
+    pub fn check_object_unchanged(&self, id: PinnedObjectId) -> Result<bool, String> {
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| format!("object {id:?} is not pinned"))?;
+        if entry.changed.get() {
+            return Ok(false);
+        }
+        // Clock reads bracket the verification: last-ok can only understate
+        // the proven-ok instant, detection can only overstate the change.
+        let before = crate::attach::monotonic_ns();
+        let unchanged =
+            pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? == entry.pin;
+        if unchanged {
+            entry.last_ok_ns.set(before);
+            return Ok(true);
+        }
+        entry.changed.set(true);
+        entry.detected_ns.set(crate::attach::monotonic_ns());
+        self.changed.set(true);
+        Ok(false)
+    }
+
+    /// The `pinned_object_changed` uncertainty bracket for one object, when a
+    /// per-object (or global) check saw it change (R2-D1-8). `None` when
+    /// unchanged — or when the clock never yielded the bounds, in which case
+    /// the end is still disclosed, only its instants are not.
+    pub fn change_bracket(&self, id: PinnedObjectId) -> Option<crate::render::PrearmObjectChange> {
+        let entry = self.by_id.get(&id)?;
+        if !entry.changed.get() {
+            return None;
+        }
+        Some(crate::render::PrearmObjectChange {
+            last_ok_ns: entry.last_ok_ns.get()?,
+            detected_ns: entry.detected_ns.get()?,
+            previous_ino: entry.pin.ino,
+        })
     }
 
     fn insert_entry(&mut self, entry: Entry, skipped: &mut Vec<Skipped>) -> Option<PinnedObjectId> {
@@ -1473,6 +2230,7 @@ impl PinnedObjects {
         incoming_scan_only: bool,
         skipped: &mut Vec<Skipped>,
     ) -> Option<PinnedObjectId> {
+        self.bump_copy_version();
         let key = entry.raw.key;
         if self.rejected_keys.contains(&key) {
             self.ambiguous_keys.insert(key);
@@ -1492,6 +2250,19 @@ impl PinnedObjects {
                 && let Some(kept) = self.by_id.get_mut(&id)
             {
                 kept.collapsed = true;
+            }
+            // The dropped entry's pin-time maps rendering survives on the
+            // kept entry when both describe one mount: the kernel renders
+            // one file in one mount one way, so the proof stays true for
+            // the kept fd, and the split re-filing reads it there. Gated
+            // on the full mapping — never across the same-open-file arm's
+            // mount-namespace escape, and never into the overlay heuristic
+            // below, which proves no physical identity.
+            if let Some(kept) = self.by_id.get_mut(&id)
+                && kept.mapping == entry.mapping
+                && kept.probed_maps_key.is_none()
+            {
+                kept.probed_maps_key = entry.probed_maps_key;
             }
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
@@ -1571,6 +2342,7 @@ impl PinnedObjects {
     }
 
     fn publish_ambiguities(&mut self, skipped: &mut Vec<Skipped>) {
+        self.bump_copy_version();
         for key in self
             .ambiguous_keys
             .difference(&self.ambiguity_published)
@@ -1583,10 +2355,3896 @@ impl PinnedObjects {
     }
 }
 
+// Inactive collected graph-builder boundary. Ready is structural and borrowed;
+// Engine installation must first supply its own persistent backing-lease sink.
+#[allow(unused_imports)]
+pub(crate) use conservative_copy::{
+    ConservativePinSelection, GraphRefusal, GraphStep, InstalledModulesBacking,
+    InstalledPinsBacking, PinnedConservativeCursor, RetainedScannedInputs, RetiredFileHandoff,
+    ScannedInputMeasure, ScannedRebindCursor,
+};
+#[cfg(test)]
+use conservative_copy::{conservative_pin_tree_bytes, deallocate_drained_unique_arc};
+
+#[allow(dead_code)] // Staged pure builders, not yet selected by the live Engine.
+mod conservative_copy {
+    use super::*;
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    const TEXT_QUANTUM: usize = 4096;
+
+    /// Value construction only: none of these outcomes establish native or
+    /// semantic readiness, retirement, admission, or receipt authority.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum GraphStep {
+        Yielded,
+        Advanced,
+        Ready,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum GraphRefusal {
+        Storage(SemanticResourceRefusal),
+        SourceChanged,
+        Identity,
+        Overflow,
+        Cancelled,
+    }
+
+    /// Immutable original selection and its actual same-pool payment. Neither
+    /// equal cardinalities nor a reused Vec/tree allocation can resume a cursor.
+    #[derive(Debug)]
+    pub(crate) struct ConservativePinSelection {
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+        identity: PinCopyCacheId,
+        storage: ResourceLease,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ConservativePinSelectionRefusal {
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+        storage: ResourceLease,
+    }
+
+    impl ConservativePinSelectionRefusal {
+        /// O(1) owner return; disposal of these original trees remains explicit.
+        pub(crate) fn into_originals(
+            self,
+        ) -> (BTreeSet<ProcessViewId>, BTreeSet<ObjectKey>, ResourceLease) {
+            (self.retired, self.rejected, self.storage)
+        }
+    }
+
+    impl ConservativePinSelection {
+        pub(crate) fn storage_bound(retired: usize, rejected: usize) -> Option<usize> {
+            std::mem::size_of::<Self>()
+                .checked_add(conservative_pin_tree_bytes::<ProcessViewId, ()>(retired)?)?
+                .checked_add(conservative_pin_tree_bytes::<ObjectKey, ()>(rejected)?)
+        }
+
+        pub(crate) fn from_reserved_originals(
+            retired: BTreeSet<ProcessViewId>,
+            rejected: BTreeSet<ObjectKey>,
+            storage: ResourceLease,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<Self, ConservativePinSelectionRefusal> {
+            let required = Self::storage_bound(retired.len(), rejected.len());
+            let identity = required
+                .filter(|bytes| reserve.covers(&storage, *bytes))
+                .and_then(|_| mint_pin_copy_cache_id(&NEXT_PIN_COPY_SELECTION));
+            match identity {
+                Some(identity) => Ok(Self {
+                    retired,
+                    rejected,
+                    identity,
+                    storage,
+                }),
+                None => Err(ConservativePinSelectionRefusal {
+                    retired,
+                    rejected,
+                    storage,
+                }),
+            }
+        }
+
+        fn retires(&self, source: &PinnedObjects, view: ProcessViewId) -> bool {
+            self.retired.contains(&view) && source.ownership.contains_key(&view)
+        }
+
+        pub(crate) fn retired(&self) -> &BTreeSet<ProcessViewId> {
+            &self.retired
+        }
+
+        pub(crate) fn rejected(&self) -> &BTreeSet<ObjectKey> {
+            &self.rejected
+        }
+    }
+
+    /// Rust 1.99.1 alloc::collections::btree::node has B=6: eleven key/value
+    /// slots, twelve edges, and a 16-byte header on Linux x86-64. Every
+    /// non-root node keeps at least five keys after insert, remove, append
+    /// and clone (MIN_LEN), so n entries need at most 1+(n-1)/5 nodes; an
+    /// empty map allocates nothing. The node size is the full internal size,
+    /// applied to every node, so this dominates retained nodes. These actual
+    /// private key/value types have alignment <=8; other layouts refuse.
+    pub(super) fn conservative_pin_tree_bytes<K, V>(entries: usize) -> Option<usize> {
+        fn align8(bytes: usize) -> Option<usize> {
+            bytes.checked_add(7).map(|value| value & !7)
+        }
+        if std::mem::align_of::<K>() > 8 || std::mem::align_of::<V>() > 8 {
+            return None;
+        }
+        let node = 16usize
+            .checked_add(align8(std::mem::size_of::<K>().checked_mul(11)?)?)?
+            .checked_add(align8(std::mem::size_of::<V>().checked_mul(11)?)?)?
+            .checked_add(12 * 8)?
+            .checked_add(OWNED_ALLOCATION_PADDING)?;
+        let nodes = if entries == 0 {
+            0
+        } else {
+            1 + (entries - 1) / 5
+        };
+        nodes.checked_mul(node)
+    }
+
+    fn bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {
+        count
+            .checked_mul(std::mem::size_of::<T>())
+            .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+            .ok_or(GraphRefusal::Overflow)
+    }
+
+    fn tree<K, V>(count: usize) -> Result<usize, GraphRefusal> {
+        conservative_pin_tree_bytes::<K, V>(count).ok_or(GraphRefusal::Overflow)
+    }
+
+    fn add(total: &mut usize, bytes: usize) -> Result<(), GraphRefusal> {
+        *total = total.checked_add(bytes).ok_or(GraphRefusal::Overflow)?;
+        Ok(())
+    }
+
+    fn text_bytes(text: &str) -> Result<usize, GraphRefusal> {
+        text.len()
+            .checked_add(OWNED_ALLOCATION_PADDING)
+            .ok_or(GraphRefusal::Overflow)
+    }
+
+    fn copy_text(target: &mut String, original: &str) -> bool {
+        let start = target.len();
+        let mut end = start.saturating_add(TEXT_QUANTUM).min(original.len());
+        while !original.is_char_boundary(end) {
+            end -= 1;
+        }
+        target.push_str(&original[start..end]);
+        end == original.len()
+    }
+
+    fn next_map<'a, K: Ord, V>(
+        map: &'a BTreeMap<K, V>,
+        after: Option<&K>,
+    ) -> Option<(&'a K, &'a V)> {
+        match after {
+            Some(key) => map.range((Excluded(key), Unbounded)).next(),
+            None => map.first_key_value(),
+        }
+    }
+
+    fn next_set<'a, K: Ord>(set: &'a BTreeSet<K>, after: Option<&K>) -> Option<&'a K> {
+        match after {
+            Some(key) => set.range((Excluded(key), Unbounded)).next(),
+            None => set.first(),
+        }
+    }
+
+    // At most two owned resume keys. During measurement each actual allocation
+    // is paid before its String is allocated. During construction the admitted
+    // whole-envelope lease covers these buffers. Field order refunds only after
+    // the owned String has been freed.
+    struct RawResume {
+        raw: RawObjectInstance,
+        storage: Option<ResourceLease>,
+    }
+
+    #[derive(Default)]
+    struct RawWalker {
+        ended: bool,
+        last: Option<RawResume>,
+        incoming: Option<RawResume>,
+    }
+
+    impl RawWalker {
+        fn after(&self) -> Option<&RawObjectInstance> {
+            self.last.as_ref().map(|key| &key.raw)
+        }
+
+        /// One allocation or <=4096 bytes copied. `next` is borrowed directly
+        /// from the fenced source at the successor of our paid original key.
+        fn advance(
+            &mut self,
+            next: Option<&RawObjectInstance>,
+            reserve: &SemanticResourceReserver,
+            separately_paid: bool,
+        ) -> Result<WalkStep, GraphRefusal> {
+            if self.ended {
+                return Ok(WalkStep::End);
+            }
+            let Some(next) = next else {
+                self.ended = true;
+                return Ok(WalkStep::End);
+            };
+            if self.incoming.is_none() {
+                let storage = if separately_paid {
+                    Some(
+                        reserve
+                            .reserve(text_bytes(&next.path)?)
+                            .map_err(GraphRefusal::Storage)?,
+                    )
+                } else {
+                    None
+                };
+                self.incoming = Some(RawResume {
+                    raw: RawObjectInstance {
+                        mount_namespace: next.mount_namespace,
+                        key: next.key,
+                        path: String::with_capacity(next.path.len()),
+                        prearm: next.prearm,
+                    },
+                    storage,
+                });
+                return Ok(WalkStep::Progress);
+            }
+            let incoming = self.incoming.as_mut().ok_or(GraphRefusal::Identity)?;
+            if copy_text(&mut incoming.raw.path, &next.path) {
+                // One old String leaf and its measurement lease die here.
+                self.last = self.incoming.take();
+                return Ok(WalkStep::Item);
+            }
+            Ok(WalkStep::Progress)
+        }
+
+        fn release_one(&mut self) -> bool {
+            if self.incoming.take().is_some() {
+                return false;
+            }
+            if self.last.take().is_some() {
+                return false;
+            }
+            true
+        }
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum WalkStep {
+        Progress,
+        Item,
+        End,
+    }
+
+    struct EntryCopy {
+        id: PinnedObjectId,
+        entry: Entry,
+        field: u8,
+    }
+
+    impl EntryCopy {
+        fn new(id: PinnedObjectId, old: &Entry) -> Self {
+            Self {
+                id,
+                entry: Entry {
+                    raw: RawObjectInstance {
+                        mount_namespace: old.raw.mount_namespace,
+                        key: old.raw.key,
+                        path: String::with_capacity(old.raw.path.len()),
+                        prearm: old.raw.prearm,
+                    },
+                    mapping: old.mapping,
+                    file: old.file.clone(),
+                    pin: old.pin,
+                    mapped: old.mapped,
+                    path: String::new(),
+                    sha256: String::new(),
+                    build_id: old.build_id.as_ref().map(|_| String::new()),
+                    abi: old.abi,
+                    exports: old.exports.clone(),
+                    getter_present: old.getter_present,
+                    witness_fault: old.witness_fault,
+                    overlay: old.overlay,
+                    collapsed: old.collapsed,
+                    probed_maps_unproven: old.probed_maps_unproven,
+                    probed_maps_key: old.probed_maps_key,
+                    last_ok_ns: std::cell::Cell::new(old.last_ok_ns.get()),
+                    changed: std::cell::Cell::new(old.changed.get()),
+                    detected_ns: std::cell::Cell::new(old.detected_ns.get()),
+                },
+                field: 0,
+            }
+        }
+
+        fn advance(&mut self, old: &Entry) -> bool {
+            let (target, original) = match self.field {
+                0 => (&mut self.entry.raw.path, old.raw.path.as_str()),
+                1 => (&mut self.entry.path, old.path.as_str()),
+                2 => (&mut self.entry.sha256, old.sha256.as_str()),
+                3 => match (&mut self.entry.build_id, &old.build_id) {
+                    (Some(target), Some(original)) => (target, original.as_str()),
+                    _ => {
+                        self.field = 4;
+                        return false;
+                    }
+                },
+                _ => return true,
+            };
+            if target.capacity() < original.len() {
+                // Exactly one known request; no repeated growth or hidden peak.
+                target.reserve_exact(original.len());
+                return false;
+            }
+            if copy_text(target, original) {
+                self.field += 1;
+            }
+            false
+        }
+    }
+
+    struct EntryReclaim {
+        id: PinnedObjectId,
+        raw: String,
+        path: String,
+        digest: String,
+        build: Option<String>,
+        file: Option<Arc<std::fs::File>>,
+        exports: Option<Arc<[(String, u64)]>>,
+        field: u8,
+        drained: usize,
+    }
+
+    impl EntryReclaim {
+        fn new(id: PinnedObjectId, entry: Entry) -> Self {
+            Self {
+                id,
+                raw: entry.raw.path,
+                path: entry.path,
+                digest: entry.sha256,
+                build: entry.build_id,
+                file: Some(entry.file),
+                exports: Some(entry.exports),
+                field: 0,
+                drained: 0,
+            }
+        }
+
+        fn advance(&mut self, source: Option<&PinnedObjects>) -> Result<bool, GraphRefusal> {
+            match self.field {
+                0 => drop(std::mem::take(&mut self.raw)),
+                1 => drop(std::mem::take(&mut self.path)),
+                2 => drop(std::mem::take(&mut self.digest)),
+                3 => drop(self.build.take()),
+                4 => {
+                    let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
+                    if !source
+                        .and_then(|pins| pins.by_id.get(&self.id))
+                        .is_some_and(|held| Arc::ptr_eq(&held.file, file))
+                    {
+                        // Pure reclamation cannot close the last descriptor.
+                        // An inode, independently opened FD, or reference count
+                        // does not prove a LIVE owner of this exact File share.
+                        return Err(GraphRefusal::Identity);
+                    }
+                    drop(self.file.take());
+                }
+                5 => {
+                    let Some(exports) = self.exports.as_mut() else {
+                        return Ok(true);
+                    };
+                    if source
+                        .and_then(|pins| pins.by_id.get(&self.id))
+                        .is_some_and(|held| Arc::ptr_eq(&held.exports, exports))
+                    {
+                        // A borrowed LIVE actual alias proves this release
+                        // cannot run the final payload/slice destructor.
+                        drop(self.exports.take());
+                    } else {
+                        let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                        if self.drained < slice.len() {
+                            drop(std::mem::take(&mut slice[self.drained].0));
+                            self.drained += 1;
+                            return Ok(false);
+                        }
+                        // No callback, exposed Arc/element, or alias-creating
+                        // operation between this exclusive recheck and transfer.
+                        let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                        if self.drained != slice.len() {
+                            return Err(GraphRefusal::Identity);
+                        }
+                        let exports = self.exports.take().ok_or(GraphRefusal::Identity)?;
+                        // SAFETY: each String payload was mem::take+freed once;
+                        // the remaining Strings have zero capacity and are valid.
+                        // drained==len and get_mut just proved no other strong
+                        // or Weak reference. Same allocation and slice metadata
+                        // are consumed once, with no intervening observer.
+                        unsafe {
+                            deallocate_drained_unique_arc(exports);
+                        }
+                    }
+                }
+                _ => return Ok(true),
+            }
+            self.field += 1;
+            Ok(false)
+        }
+
+        /// Installed-mode step: every field behaves as `advance` except the
+        /// file share, which moves into the handoff when no live alias holds
+        /// this exact share, and the exports share, which drops our clone
+        /// when a Session-held clone proves our drop cannot be last. A full
+        /// handoff refuses with the pool's own storage refusal; the file share
+        /// is never dropped here.
+        fn advance_installed(
+            &mut self,
+            source: Option<&PinnedObjects>,
+            handoff: &mut RetiredFileHandoff,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<bool, GraphRefusal> {
+            if self.field != 4 && self.field != 5 {
+                return self.advance(source);
+            }
+            if self.field == 5 {
+                if let Some(exports) = self.exports.as_ref() {
+                    let live_alias = source
+                        .and_then(|pins| pins.by_id.get(&self.id))
+                        .is_some_and(|held| Arc::ptr_eq(&held.exports, exports));
+                    if !live_alias && Arc::strong_count(exports) > 1 {
+                        // A Session-held clone (Singles retains the entry
+                        // through its terminal detach) proves our drop cannot
+                        // be the last one. Release our share as one leaf
+                        // instead of forgetting the graph. Even a race could
+                        // only free one slice bounded by standard names.
+                        drop(self.exports.take());
+                        self.field += 1;
+                        return Ok(false);
+                    }
+                }
+                return self.advance(source);
+            }
+            let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
+            if source
+                .and_then(|pins| pins.by_id.get(&self.id))
+                .is_some_and(|held| Arc::ptr_eq(&held.file, file))
+            {
+                drop(self.file.take());
+            } else {
+                let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
+                handoff.push(file).map_err(|()| {
+                    reserve
+                        .reserve(usize::MAX)
+                        .err()
+                        .map(GraphRefusal::Storage)
+                        .unwrap_or(GraphRefusal::Identity)
+                })?;
+                drop(self.file.take());
+            }
+            self.field += 1;
+            Ok(false)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        New,
+        MeasureEntries,
+        MeasureExports,
+        MeasureClaims,
+        MeasureRaws,
+        MeasureOwnedRows,
+        MeasureOwnedRaws,
+        Admit,
+        IndexClaims,
+        IndexManifest,
+        IndexRaws,
+        Classify,
+        Entries,
+        RawMap,
+        Ownership,
+        RawOwnership,
+        Rejected,
+        Ambiguous,
+        Published,
+        ApplyRejected,
+        Publish,
+        Ready,
+        Rebinding,
+        RebindAborted,
+        Installed,
+        Reclaim,
+        Reclaimed,
+    }
+
+    #[derive(Clone, Copy)]
+    struct SourceFence {
+        identity: PinCopyCacheId,
+        revision: u64,
+        copy_version: u64,
+        changed: bool,
+        selection: PinCopyCacheId,
+    }
+
+    impl SourceFence {
+        fn new(
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<Self, GraphRefusal> {
+            if source.revision == u64::MAX || source.copy_version == u64::MAX {
+                return Err(GraphRefusal::SourceChanged);
+            }
+            Ok(Self {
+                identity: source.copy_source.ok_or(GraphRefusal::Identity)?,
+                revision: source.revision,
+                copy_version: source.copy_version,
+                changed: source.changed.get(),
+                selection: selection.identity,
+            })
+        }
+
+        fn check(
+            &self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            if source.copy_source != Some(self.identity) || selection.identity != self.selection {
+                return Err(GraphRefusal::Identity);
+            }
+            if source.revision != self.revision
+                || source.copy_version != self.copy_version
+                || source.changed.get() != self.changed
+                || source.revision == u64::MAX
+                || source.copy_version == u64::MAX
+            {
+                return Err(GraphRefusal::SourceChanged);
+            }
+            Ok(())
+        }
+    }
+
+    /// Payment for installed canonical pins: the install sink swaps the
+    /// cursor's output into the canonical and moves these leases here. They
+    /// stay charged while the canonical holds the installed output; dropping
+    /// them refunds only after the old canonical was reclaimed.
+    #[derive(Debug)]
+    pub(crate) struct InstalledPinsBacking {
+        claim_backing: Option<ResourceLease>,
+        backing: Option<ResourceLease>,
+        header: Option<ResourceLease>,
+    }
+
+    /// Every output/scratch allocation stays with these leases through borrowed
+    /// Ready and bounded reclamation. There is deliberately no take/swap API.
+    pub(crate) struct PinnedConservativeCursor {
+        phase: Phase,
+        fence: Option<SourceFence>,
+        required: Option<usize>,
+        measured: usize,
+        output: Option<PinnedObjects>,
+        skipped: Vec<Skipped>,
+        removed_ids: BTreeSet<PinnedObjectId>,
+        retained_ids: BTreeSet<PinnedObjectId>,
+        rejected_ids: BTreeSet<PinnedObjectId>,
+        removed_raws: BTreeSet<RawObjectInstance>,
+        retained_raws: BTreeSet<RawObjectInstance>,
+        walker: RawWalker,
+        raw_copy: Option<RawObjectInstance>,
+        raw_action: bool,
+        entry: Option<EntryCopy>,
+        reclaim_entry: Option<EntryReclaim>,
+        claims: Option<(ProcessViewId, ViewClaims)>,
+        skipped_leaf: Option<Skipped>,
+        last_id: Option<PinnedObjectId>,
+        last_view: Option<ProcessViewId>,
+        active_view: Option<ProcessViewId>,
+        last_key: Option<ObjectKey>,
+        bucket: u8,
+        index: usize,
+        retired_count: u64,
+        reclaim_phase: u8,
+        after_claim_reclaim: u8,
+        rebind_owner: Option<PinCopyCacheId>,
+        installed: Option<PinCopyCacheId>,
+        // A growing pin prefix stays with the SAME old H1 backing payment.
+        rebind_old_pins: Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+        rebind_complete: bool,
+        // Owners above are released BEFORE the actual extra payment below.
+        claim_backing: Option<ResourceLease>,
+        backing: Option<ResourceLease>,
+        header: Option<ResourceLease>,
+    }
+
+    impl PinnedConservativeCursor {
+        pub(crate) fn new() -> Self {
+            Self {
+                phase: Phase::New,
+                fence: None,
+                required: None,
+                measured: 0,
+                output: None,
+                skipped: Vec::new(),
+                removed_ids: BTreeSet::new(),
+                retained_ids: BTreeSet::new(),
+                rejected_ids: BTreeSet::new(),
+                removed_raws: BTreeSet::new(),
+                retained_raws: BTreeSet::new(),
+                walker: RawWalker::default(),
+                raw_copy: None,
+                raw_action: false,
+                entry: None,
+                reclaim_entry: None,
+                claims: None,
+                skipped_leaf: None,
+                last_id: None,
+                last_view: None,
+                active_view: None,
+                last_key: None,
+                bucket: 0,
+                index: 0,
+                retired_count: 0,
+                reclaim_phase: 0,
+                after_claim_reclaim: 3,
+                rebind_owner: None,
+                installed: None,
+                rebind_old_pins: None,
+                rebind_complete: false,
+                claim_backing: None,
+                backing: None,
+                header: None,
+            }
+        }
+
+        pub(crate) fn pinned(&self) -> Option<&PinnedObjects> {
+            // A completed bind keeps the Ready-style borrow while the loan is
+            // outstanding; partial mid-bind claims stay hidden as before.
+            (self.phase == Phase::Ready
+                || (self.phase == Phase::Rebinding
+                    && self.rebind_complete
+                    && self.rebind_owner.is_some()))
+            .then_some(self.output.as_ref())
+            .flatten()
+        }
+
+        pub(crate) fn skipped(&self) -> Option<&[Skipped]> {
+            (self.phase == Phase::Ready).then_some(self.skipped.as_slice())
+        }
+
+        /// The copy output while the rebind loan is outstanding. `Some` only
+        /// in `Phase::Rebinding`: the graph's Plan/Facts read the loaned
+        /// output through this, never through `pinned()`.
+        pub(crate) fn loaned_output(&self) -> Option<&PinnedObjects> {
+            (self.phase == Phase::Rebinding)
+                .then_some(self.output.as_ref())
+                .flatten()
+        }
+
+        /// Upper bound on retired files the installed reclaim must hand off:
+        /// removed plus rejected entry ids. `Some` only in `Ready`/`Rebinding`.
+        pub(crate) fn retired_entry_count(&self) -> Option<usize> {
+            if !matches!(self.phase, Phase::Ready | Phase::Rebinding) {
+                return None;
+            }
+            Some(
+                self.removed_ids
+                    .len()
+                    .saturating_add(self.rejected_ids.len()),
+            )
+        }
+
+        pub(crate) fn required_bytes(&self) -> Option<usize> {
+            self.required
+        }
+
+        fn check_pool(
+            &self,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            if !reserve.covers(&selection.storage, 0)
+                || self
+                    .header
+                    .as_ref()
+                    .is_some_and(|lease| !reserve.covers(lease, 0))
+                || self
+                    .backing
+                    .as_ref()
+                    .is_some_and(|lease| !reserve.covers(lease, 0))
+                || self
+                    .claim_backing
+                    .as_ref()
+                    .is_some_and(|lease| !reserve.covers(lease, 0))
+            {
+                return Err(GraphRefusal::Identity);
+            }
+            Ok(())
+        }
+
+        fn keep_after_retirement(&self, id: PinnedObjectId) -> bool {
+            !self.removed_ids.contains(&id) || self.retained_ids.contains(&id)
+        }
+
+        fn output_mut(&mut self) -> Result<&mut PinnedObjects, GraphRefusal> {
+            self.output.as_mut().ok_or(GraphRefusal::Identity)
+        }
+
+        fn next_phase(&mut self, next: Phase) {
+            self.phase = next;
+            self.last_id = None;
+            self.last_view = None;
+            self.active_view = None;
+            self.last_key = None;
+            self.index = 0;
+            self.bucket = 0;
+        }
+
+        fn initial_bound(
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<usize, GraphRefusal> {
+            let mut total = std::mem::size_of::<Self>() + OWNED_ALLOCATION_PADDING;
+            add(
+                &mut total,
+                tree::<PinnedObjectId, Entry>(source.by_id.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<RawObjectInstance, PinnedObjectId>(source.raw_to_id.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<ProcessViewId, ViewClaims>(source.ownership.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<ProcessViewId, BTreeSet<RawObjectInstance>>(source.raw_ownership.len())?,
+            )?;
+            let keys = source
+                .ambiguous_keys
+                .len()
+                .checked_add(selection.rejected.len())
+                .ok_or(GraphRefusal::Overflow)?;
+            add(
+                &mut total,
+                tree::<ObjectKey, ()>(
+                    source
+                        .rejected_keys
+                        .len()
+                        .checked_add(selection.rejected.len())
+                        .ok_or(GraphRefusal::Overflow)?,
+                )?,
+            )?;
+            add(&mut total, tree::<ObjectKey, ()>(keys)?)?;
+            add(
+                &mut total,
+                tree::<ObjectKey, ()>(
+                    source
+                        .ambiguity_published
+                        .len()
+                        .checked_add(keys)
+                        .ok_or(GraphRefusal::Overflow)?,
+                )?,
+            )?;
+            add(&mut total, bytes_for::<Skipped>(keys)?)?;
+            add(
+                &mut total,
+                keys.checked_mul(
+                    AMBIGUOUS_SUBJECT.len() + AMBIGUOUS_REASON.len() + 2 * OWNED_ALLOCATION_PADDING,
+                )
+                .ok_or(GraphRefusal::Overflow)?,
+            )?;
+            // Removed/retained/rejected ID indexes, manifest raw aliases, and
+            // paid raw resume/output scratch can coexist with the output.
+            add(&mut total, tree::<PinnedObjectId, ()>(source.by_id.len())?)?;
+            add(
+                &mut total,
+                tree::<PinnedObjectId, ()>(source.raw_to_id.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<RawObjectInstance, ()>(source.raw_to_id.len())?,
+            )?;
+            Ok(total)
+        }
+
+        fn advance_owned_measure(
+            &mut self,
+            source: &PinnedObjects,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            if let Some(view) = self.active_view {
+                let originals = source
+                    .raw_ownership
+                    .get(&view)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                let next = next_set(originals, self.walker.after());
+                match self.walker.advance(next, reserve, true)? {
+                    WalkStep::Progress => {}
+                    WalkStep::Item => {
+                        let raw = &self.walker.last.as_ref().ok_or(GraphRefusal::Identity)?.raw;
+                        let bytes = text_bytes(&raw.path)?
+                            .checked_mul(6)
+                            .ok_or(GraphRefusal::Overflow)?;
+                        add(&mut self.measured, bytes)?;
+                    }
+                    WalkStep::End => {
+                        if self.walker.release_one() {
+                            self.walker = RawWalker::default();
+                            self.last_view = Some(view);
+                            self.active_view = None;
+                            self.phase = Phase::MeasureOwnedRows;
+                        }
+                    }
+                }
+            } else {
+                return Err(GraphRefusal::Identity);
+            }
+            Ok(())
+        }
+
+        fn advance_claim_index(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            if let Some(view) = self.active_view {
+                let claims = source
+                    .ownership
+                    .get(&view)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                if let Some(id) = claim_id(claims, self.bucket, self.index) {
+                    if selection.retires(source, view) {
+                        self.removed_ids.insert(id);
+                    } else {
+                        self.retained_ids.insert(id);
+                    }
+                    self.index += 1;
+                } else if self.bucket < 2 {
+                    self.bucket += 1;
+                    self.index = 0;
+                } else {
+                    self.last_view = Some(view);
+                    self.active_view = None;
+                    self.bucket = 0;
+                    self.index = 0;
+                }
+            } else if let Some((view, _)) = next_map(&source.ownership, self.last_view.as_ref()) {
+                self.active_view = Some(*view);
+                if selection.retires(source, *view) {
+                    self.retired_count = self
+                        .retired_count
+                        .checked_add(1)
+                        .ok_or(GraphRefusal::Overflow)?;
+                }
+            } else {
+                self.next_phase(Phase::IndexManifest);
+            }
+            Ok(())
+        }
+
+        fn advance_raw_index(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            manifest: bool,
+        ) -> Result<(), GraphRefusal> {
+            if !manifest && self.active_view.is_none() {
+                if let Some((view, _)) = next_map(&source.raw_ownership, self.last_view.as_ref()) {
+                    self.active_view = Some(*view);
+                } else {
+                    self.next_phase(Phase::Classify);
+                }
+                return Ok(());
+            }
+            if self.raw_action {
+                let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                if let Some(copy) = copy_raw(&mut self.raw_copy, raw) {
+                    if manifest
+                        || !selection
+                            .retires(source, self.active_view.ok_or(GraphRefusal::Identity)?)
+                    {
+                        self.retained_raws.insert(copy);
+                    } else {
+                        self.removed_raws.insert(copy);
+                    }
+                    self.raw_action = false;
+                }
+                return Ok(());
+            }
+            let next = if manifest {
+                next_map(&source.raw_to_id, self.walker.after()).map(|(raw, _)| raw)
+            } else {
+                next_set(
+                    source
+                        .raw_ownership
+                        .get(&self.active_view.ok_or(GraphRefusal::Identity)?)
+                        .ok_or(GraphRefusal::SourceChanged)?,
+                    self.walker.after(),
+                )
+            };
+            match self.walker.advance(next, reserve, false)? {
+                WalkStep::Progress => {}
+                WalkStep::Item => {
+                    let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                    if !manifest || raw.mount_namespace.is_none() {
+                        if manifest {
+                            let id = *source
+                                .raw_to_id
+                                .get(raw)
+                                .ok_or(GraphRefusal::SourceChanged)?;
+                            self.retained_ids.insert(id);
+                        }
+                        self.raw_action = true;
+                    }
+                }
+                WalkStep::End => {
+                    if self.walker.release_one() {
+                        self.walker = RawWalker::default();
+                        if manifest {
+                            self.next_phase(Phase::IndexRaws);
+                        } else {
+                            self.last_view = self.active_view.take();
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn advance_raw_output(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            owned: bool,
+        ) -> Result<(), GraphRefusal> {
+            if owned && self.active_view.is_none() {
+                if let Some((view, _)) = next_map(&source.raw_ownership, self.last_view.as_ref()) {
+                    if selection.retires(source, *view) {
+                        self.last_view = Some(*view);
+                    } else {
+                        self.active_view = Some(*view);
+                        self.output_mut()?
+                            .raw_ownership
+                            .insert(*view, BTreeSet::new());
+                    }
+                } else {
+                    self.next_phase(Phase::Rejected);
+                }
+                return Ok(());
+            }
+            if self.raw_action {
+                let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                if let Some(copy) = copy_raw(&mut self.raw_copy, raw) {
+                    if owned {
+                        let view = self.active_view.ok_or(GraphRefusal::Identity)?;
+                        self.output_mut()?
+                            .raw_ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?
+                            .insert(copy);
+                    } else {
+                        let id = *source
+                            .raw_to_id
+                            .get(raw)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        self.output_mut()?.raw_to_id.insert(copy, id);
+                    }
+                    self.raw_action = false;
+                }
+                return Ok(());
+            }
+            let next = if owned {
+                next_set(
+                    source
+                        .raw_ownership
+                        .get(&self.active_view.ok_or(GraphRefusal::Identity)?)
+                        .ok_or(GraphRefusal::SourceChanged)?,
+                    self.walker.after(),
+                )
+            } else {
+                next_map(&source.raw_to_id, self.walker.after()).map(|(raw, _)| raw)
+            };
+            match self.walker.advance(next, reserve, false)? {
+                WalkStep::Progress => {}
+                WalkStep::Item => {
+                    let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                    let keep = if owned {
+                        !selection.rejected.contains(&raw.key)
+                    } else {
+                        let id = *source
+                            .raw_to_id
+                            .get(raw)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        self.keep_after_retirement(id)
+                            && !self.rejected_ids.contains(&id)
+                            && !selection.rejected.contains(&raw.key)
+                            && (!self.removed_raws.contains(raw)
+                                || self.retained_raws.contains(raw))
+                    };
+                    self.raw_action = keep;
+                }
+                WalkStep::End => {
+                    if self.walker.release_one() {
+                        self.walker = RawWalker::default();
+                        if owned {
+                            self.last_view = self.active_view.take();
+                        } else {
+                            self.next_phase(Phase::Ownership);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn advance_ownership(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            if let Some((view, copied)) = &mut self.claims {
+                let original = source
+                    .ownership
+                    .get(view)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                if let Some(id) = claim_id(original, self.bucket, self.index) {
+                    if !self.rejected_ids.contains(&id) {
+                        match self.bucket {
+                            0 => copied.tables.push(id),
+                            1 => copied.targets.push(original.targets[self.index]),
+                            _ => copied.pins.push(id),
+                        }
+                    }
+                    self.index += 1;
+                } else if self.bucket < 2 {
+                    self.bucket += 1;
+                    self.index = 0;
+                } else {
+                    let (view, copied) = self.claims.take().ok_or(GraphRefusal::Identity)?;
+                    self.output_mut()?.ownership.insert(view, copied);
+                    self.last_view = Some(view);
+                    self.bucket = 0;
+                    self.index = 0;
+                }
+            } else if let Some((view, claims)) =
+                next_map(&source.ownership, self.last_view.as_ref())
+            {
+                if selection.retires(source, *view) {
+                    self.last_view = Some(*view);
+                } else {
+                    self.claims = Some((
+                        *view,
+                        ViewClaims {
+                            tables: Vec::with_capacity(claims.tables.len()),
+                            targets: Vec::with_capacity(claims.targets.len()),
+                            pins: Vec::with_capacity(claims.pins.len()),
+                        },
+                    ));
+                }
+            } else {
+                self.next_phase(Phase::RawOwnership);
+            }
+            Ok(())
+        }
+
+        fn advance_sets(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            let original = match self.phase {
+                Phase::Rejected => &source.rejected_keys,
+                Phase::Ambiguous => &source.ambiguous_keys,
+                Phase::Published => &source.ambiguity_published,
+                Phase::ApplyRejected => &selection.rejected,
+                _ => return Err(GraphRefusal::Identity),
+            };
+            if let Some(key) = next_set(original, self.last_key.as_ref()).copied() {
+                self.last_key = Some(key);
+                match self.phase {
+                    Phase::Rejected | Phase::ApplyRejected => {
+                        self.output_mut()?.rejected_keys.insert(key);
+                    }
+                    Phase::Ambiguous => {
+                        self.output_mut()?.ambiguous_keys.insert(key);
+                    }
+                    Phase::Published => {
+                        self.output_mut()?.ambiguity_published.insert(key);
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                if self.phase == Phase::ApplyRejected && source.rejected_keys.contains(&key) {
+                    self.output_mut()?.ambiguous_keys.insert(key);
+                }
+            } else {
+                self.next_phase(match self.phase {
+                    Phase::Rejected => Phase::Ambiguous,
+                    Phase::Ambiguous => Phase::Published,
+                    Phase::Published => Phase::ApplyRejected,
+                    _ => Phase::Publish,
+                });
+            }
+            Ok(())
+        }
+
+        fn advance(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            match self.phase {
+                Phase::New => {
+                    let fence = SourceFence::new(source, selection)?;
+                    let measured = Self::initial_bound(source, selection)?;
+                    let header = reserve
+                        .reserve(std::mem::size_of::<Self>() + OWNED_ALLOCATION_PADDING)
+                        .map_err(GraphRefusal::Storage)?;
+                    self.fence = Some(fence);
+                    self.header = Some(header);
+                    self.measured = measured;
+                    self.phase = Phase::MeasureEntries;
+                }
+                Phase::MeasureEntries => {
+                    if let Some((id, entry)) = next_map(&source.by_id, self.last_id.as_ref()) {
+                        self.last_id = Some(*id);
+                        for text in [&entry.raw.path, &entry.path, &entry.sha256] {
+                            add(
+                                &mut self.measured,
+                                text.capacity()
+                                    .checked_add(OWNED_ALLOCATION_PADDING)
+                                    .ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                        }
+                        if let Some(text) = &entry.build_id {
+                            add(
+                                &mut self.measured,
+                                text.capacity()
+                                    .checked_add(OWNED_ALLOCATION_PADDING)
+                                    .ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                        }
+                        // Shared backing can become uniquely owned during
+                        // reclamation; keep its complete nested envelope paid.
+                        add(
+                            &mut self.measured,
+                            bytes_for::<(String, u64)>(entry.exports.len())?,
+                        )?;
+                        self.index = 0;
+                        self.phase = Phase::MeasureExports;
+                    } else {
+                        self.next_phase(Phase::MeasureClaims);
+                    }
+                }
+                Phase::MeasureExports => {
+                    let old = source
+                        .by_id
+                        .get(&self.last_id.ok_or(GraphRefusal::Identity)?)
+                        .ok_or(GraphRefusal::SourceChanged)?;
+                    if let Some((text, _)) = old.exports.get(self.index) {
+                        add(
+                            &mut self.measured,
+                            text.capacity()
+                                .checked_add(OWNED_ALLOCATION_PADDING)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )?;
+                        self.index += 1;
+                    } else {
+                        self.phase = Phase::MeasureEntries;
+                    }
+                }
+                Phase::MeasureClaims => {
+                    if let Some((view, claims)) =
+                        next_map(&source.ownership, self.last_view.as_ref())
+                    {
+                        self.last_view = Some(*view);
+                        let count = claims
+                            .tables
+                            .len()
+                            .checked_add(claims.targets.len())
+                            .and_then(|sum| sum.checked_add(claims.pins.len()))
+                            .ok_or(GraphRefusal::Overflow)?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<PinnedObjectId>(claims.tables.capacity())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<(PinnedObjectId, u64)>(claims.targets.capacity())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<PinnedObjectId>(claims.pins.capacity())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            tree::<PinnedObjectId, ()>(count)?
+                                .checked_mul(2)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )?;
+                    } else {
+                        self.next_phase(Phase::MeasureRaws);
+                    }
+                }
+                Phase::MeasureRaws => {
+                    let next = next_map(&source.raw_to_id, self.walker.after()).map(|(raw, _)| raw);
+                    match self.walker.advance(next, reserve, true)? {
+                        WalkStep::Progress => {}
+                        WalkStep::Item => {
+                            let raw = &self.walker.last.as_ref().ok_or(GraphRefusal::Identity)?.raw;
+                            let bytes = text_bytes(&raw.path)?
+                                .checked_mul(6)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(&mut self.measured, bytes)?;
+                        }
+                        WalkStep::End => {
+                            if self.walker.release_one() {
+                                self.walker = RawWalker::default();
+                                self.next_phase(Phase::MeasureOwnedRows);
+                            }
+                        }
+                    }
+                }
+                Phase::MeasureOwnedRows => {
+                    if let Some((view, raws)) =
+                        next_map(&source.raw_ownership, self.last_view.as_ref())
+                    {
+                        add(
+                            &mut self.measured,
+                            tree::<RawObjectInstance, ()>(raws.len())?
+                                .checked_mul(3)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )?;
+                        self.active_view = Some(*view);
+                        self.phase = Phase::MeasureOwnedRaws;
+                    } else {
+                        self.required = Some(self.measured);
+                        self.next_phase(Phase::Admit);
+                    }
+                }
+                Phase::MeasureOwnedRaws => self.advance_owned_measure(source, reserve)?,
+                Phase::Admit => {
+                    let required = self.required.ok_or(GraphRefusal::Identity)?;
+                    let header_bytes = std::mem::size_of::<Self>() + OWNED_ALLOCATION_PADDING;
+                    let backing = reserve
+                        .reserve(
+                            required
+                                .checked_sub(header_bytes)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )
+                        .map_err(GraphRefusal::Storage)?;
+                    self.backing = Some(backing);
+                    let mut output = PinnedObjects::empty();
+                    if output.copy_source.is_none() {
+                        return Err(GraphRefusal::Identity);
+                    }
+                    output.next_id = source.next_id;
+                    output.overlay_uncertain = source.overlay_uncertain;
+                    output.changed.set(source.changed.get());
+                    output.revision = source.revision;
+                    output.copy_version = source.copy_version;
+                    self.output = Some(output);
+                    let skips = source
+                        .ambiguous_keys
+                        .len()
+                        .checked_add(selection.rejected.len())
+                        .ok_or(GraphRefusal::Overflow)?;
+                    self.skipped = Vec::with_capacity(skips);
+                    self.next_phase(Phase::IndexClaims);
+                }
+                Phase::IndexClaims => self.advance_claim_index(source, selection)?,
+                Phase::IndexManifest => self.advance_raw_index(source, selection, reserve, true)?,
+                Phase::IndexRaws => self.advance_raw_index(source, selection, reserve, false)?,
+                Phase::Classify => {
+                    if let Some((id, entry)) = next_map(&source.by_id, self.last_id.as_ref()) {
+                        self.last_id = Some(*id);
+                        if self.keep_after_retirement(*id)
+                            && selection.rejected.contains(&entry.raw.key)
+                        {
+                            self.rejected_ids.insert(*id);
+                            self.output_mut()?.ambiguous_keys.insert(entry.raw.key);
+                        }
+                    } else {
+                        self.next_phase(Phase::Entries);
+                    }
+                }
+                Phase::Entries => {
+                    if let Some(copy) = &mut self.entry {
+                        let original = source
+                            .by_id
+                            .get(&copy.id)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        if copy.advance(original) {
+                            let copy = self.entry.take().ok_or(GraphRefusal::Identity)?;
+                            self.output_mut()?.by_id.insert(copy.id, copy.entry);
+                        }
+                    } else if let Some((id, old)) = next_map(&source.by_id, self.last_id.as_ref()) {
+                        self.last_id = Some(*id);
+                        if self.keep_after_retirement(*id) && !self.rejected_ids.contains(id) {
+                            self.entry = Some(EntryCopy::new(*id, old));
+                        }
+                    } else {
+                        self.next_phase(Phase::RawMap);
+                    }
+                }
+                Phase::RawMap => self.advance_raw_output(source, selection, reserve, false)?,
+                Phase::Ownership => self.advance_ownership(source, selection)?,
+                Phase::RawOwnership => self.advance_raw_output(source, selection, reserve, true)?,
+                Phase::Rejected | Phase::Ambiguous | Phase::Published | Phase::ApplyRejected => {
+                    self.advance_sets(source, selection)?
+                }
+                Phase::Publish => {
+                    let next = next_set(
+                        &self
+                            .output
+                            .as_ref()
+                            .ok_or(GraphRefusal::Identity)?
+                            .ambiguous_keys,
+                        self.last_key.as_ref(),
+                    )
+                    .copied();
+                    if let Some(key) = next {
+                        self.last_key = Some(key);
+                        if self.output_mut()?.ambiguity_published.insert(key) {
+                            self.skipped.push(ambiguous_identity_skip());
+                        }
+                    } else {
+                        let revision = source
+                            .revision
+                            .checked_add(self.retired_count)
+                            .and_then(|rev| {
+                                rev.checked_add(u64::try_from(selection.rejected.len()).ok()?)
+                            })
+                            .filter(|rev| *rev < u64::MAX)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        self.output_mut()?.revision = revision;
+                        self.phase = Phase::Ready;
+                    }
+                }
+                Phase::Ready => {}
+                Phase::Rebinding
+                | Phase::RebindAborted
+                | Phase::Installed
+                | Phase::Reclaim
+                | Phase::Reclaimed => {
+                    return Err(GraphRefusal::Cancelled);
+                }
+            }
+            Ok(())
+        }
+
+        /// Reclaims one leaf/node operation per credit. An unknown shared/Weak
+        /// export owner refuses while retaining the paid original, then resumes
+        /// with an actual live source alias or exclusive Arc::get_mut.
+        pub(crate) fn reclaim(
+            &mut self,
+            source: Option<&PinnedObjects>,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<GraphStep, GraphRefusal> {
+            if work == 0 {
+                return Ok(GraphStep::Yielded);
+            }
+            if self.rebind_owner.is_some() || self.rebind_old_pins.is_some() {
+                return Err(GraphRefusal::Identity);
+            }
+            self.check_pool(selection, reserve)?;
+            if let Some(fence) = self.fence {
+                if fence.selection != selection.identity {
+                    return Err(GraphRefusal::Identity);
+                }
+                if let Some(source) = source {
+                    fence.check(source, selection)?;
+                }
+            }
+            if self.phase == Phase::Reclaimed {
+                return Ok(GraphStep::Ready);
+            }
+            self.phase = Phase::Reclaim;
+            for _ in 0..work {
+                self.reclaim_one(source, None, reserve)?;
+                if self.phase == Phase::Reclaimed {
+                    return Ok(GraphStep::Ready);
+                }
+            }
+            Ok(GraphStep::Advanced)
+        }
+
+        /// O(1) install sink: swaps the Ready copy (or the Rebinding loaned
+        /// output) into the canonical, records the installed identity, and
+        /// moves the output payment into the returned backing. The cursor's
+        /// output now holds the old canonical for `reclaim_installed`.
+        pub(crate) fn install_ready(
+            &mut self,
+            canonical: &mut PinnedObjects,
+        ) -> Result<InstalledPinsBacking, GraphRefusal> {
+            match self.phase {
+                Phase::Ready if self.rebind_owner.is_none() => {}
+                Phase::Rebinding if self.rebind_owner.is_some() => {}
+                Phase::RebindAborted | Phase::Reclaim | Phase::Reclaimed | Phase::Installed => {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                _ => return Err(GraphRefusal::Identity),
+            }
+            let output = self.output.as_mut().ok_or(GraphRefusal::Identity)?;
+            std::mem::swap(output, canonical);
+            self.installed = Some(canonical.copy_source.ok_or(GraphRefusal::Identity)?);
+            self.phase = Phase::Installed;
+            Ok(InstalledPinsBacking {
+                claim_backing: self.claim_backing.take(),
+                backing: self.backing.take(),
+                header: self.header.take(),
+            })
+        }
+
+        /// Reclaims the old canonical (held in `output` since `install_ready`)
+        /// against the live installed canonical: live-aliased files are
+        /// released, absent files move into the handoff, never dropped.
+        pub(crate) fn reclaim_installed(
+            &mut self,
+            live: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            handoff: &mut RetiredFileHandoff,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<GraphStep, GraphRefusal> {
+            if work == 0 {
+                return Ok(GraphStep::Yielded);
+            }
+            if self.phase == Phase::Reclaimed {
+                return Ok(GraphStep::Ready);
+            }
+            if self.phase != Phase::Installed
+                || live.copy_source != self.installed
+                || self.rebind_owner.is_some()
+            {
+                return Err(GraphRefusal::Identity);
+            }
+            self.check_pool(selection, reserve)?;
+            for _ in 0..work {
+                self.reclaim_one(Some(live), Some(&mut *handoff), reserve)?;
+                if self.phase == Phase::Reclaimed {
+                    return Ok(GraphStep::Ready);
+                }
+            }
+            Ok(GraphStep::Advanced)
+        }
+
+        fn reclaim_one(
+            &mut self,
+            source: Option<&PinnedObjects>,
+            handoff: Option<&mut RetiredFileHandoff>,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            if let Some(entry) = &mut self.reclaim_entry {
+                let done = match handoff {
+                    Some(handoff) => entry.advance_installed(source, handoff, reserve)?,
+                    None => entry.advance(source)?,
+                };
+                if done {
+                    self.reclaim_entry = None;
+                }
+                return Ok(());
+            }
+            if let Some(copy) = self.entry.take() {
+                self.reclaim_entry = Some(EntryReclaim::new(copy.id, copy.entry));
+                return Ok(());
+            }
+            match self.reclaim_phase {
+                0 => {
+                    if !self.walker.release_one() {
+                        return Ok(());
+                    }
+                    self.reclaim_phase += 1;
+                }
+                1 => {
+                    if self.raw_copy.take().is_some() {
+                        return Ok(());
+                    }
+                    self.reclaim_phase += 1;
+                }
+                2 => {
+                    if let Some((_, claims)) = &mut self.claims {
+                        if claims.tables.capacity() > 0 {
+                            drop(std::mem::take(&mut claims.tables));
+                        } else if claims.targets.capacity() > 0 {
+                            drop(std::mem::take(&mut claims.targets));
+                        } else if claims.pins.capacity() > 0 {
+                            drop(std::mem::take(&mut claims.pins));
+                        } else {
+                            self.claims = None;
+                        }
+                        return Ok(());
+                    }
+                    self.reclaim_phase = self.after_claim_reclaim;
+                    self.after_claim_reclaim = 3;
+                }
+                3 => {
+                    if let Some((id, entry)) =
+                        self.output.as_mut().and_then(|pins| pins.by_id.pop_first())
+                    {
+                        self.reclaim_entry = Some(EntryReclaim::new(id, entry));
+                    } else {
+                        if let Some(pins) = &mut self.output {
+                            drop(std::mem::take(&mut pins.by_id));
+                        }
+                        self.reclaim_phase += 1;
+                    }
+                }
+                4 => {
+                    if let Some(pins) = &mut self.output {
+                        if pins.raw_to_id.pop_first().is_some() {
+                            return Ok(());
+                        }
+                        drop(std::mem::take(&mut pins.raw_to_id));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                5 => {
+                    if self.claims.is_none()
+                        && let Some(pair) = self
+                            .output
+                            .as_mut()
+                            .and_then(|pins| pins.ownership.pop_first())
+                    {
+                        self.claims = Some(pair);
+                        self.reclaim_phase = 2;
+                        // Return to ownership, rather than restart by-id/raws,
+                        // after this row's three primitive Vec leaves.
+                        self.after_claim_reclaim = 5;
+                        return Ok(());
+                    }
+                    if let Some(pins) = &mut self.output {
+                        drop(std::mem::take(&mut pins.ownership));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                6 => {
+                    if let Some(pins) = &mut self.output
+                        && let Some(view) =
+                            pins.raw_ownership.first_key_value().map(|(view, _)| *view)
+                    {
+                        let raws = pins
+                            .raw_ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if raws.pop_first().is_none() {
+                            // The inner set is now actually empty. Removing the
+                            // outer node cannot hide another raw/String drop.
+                            pins.raw_ownership.remove(&view);
+                        }
+                        return Ok(());
+                    }
+                    if let Some(pins) = &mut self.output {
+                        drop(std::mem::take(&mut pins.raw_ownership));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                7..=9 => {
+                    if let Some(pins) = &mut self.output {
+                        let set = match self.reclaim_phase {
+                            7 => &mut pins.rejected_keys,
+                            8 => &mut pins.ambiguous_keys,
+                            _ => &mut pins.ambiguity_published,
+                        };
+                        if set.pop_first().is_some() {
+                            return Ok(());
+                        }
+                        drop(std::mem::take(set));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                10..=12 => {
+                    let set = match self.reclaim_phase {
+                        10 => &mut self.removed_ids,
+                        11 => &mut self.retained_ids,
+                        _ => &mut self.rejected_ids,
+                    };
+                    if set.pop_first().is_none() {
+                        // len==0 can still retain a real root allocation.
+                        drop(std::mem::take(set));
+                        self.reclaim_phase += 1;
+                    }
+                }
+                13..=14 => {
+                    let set = if self.reclaim_phase == 13 {
+                        &mut self.removed_raws
+                    } else {
+                        &mut self.retained_raws
+                    };
+                    if set.pop_first().is_none() {
+                        // len==0 can still retain a real root allocation.
+                        drop(std::mem::take(set));
+                        self.reclaim_phase += 1;
+                    }
+                }
+                15 => {
+                    if let Some(skip) = &mut self.skipped_leaf {
+                        if skip.subject.capacity() > 0 {
+                            drop(std::mem::take(&mut skip.subject));
+                        } else if skip.reason.capacity() > 0 {
+                            drop(std::mem::take(&mut skip.reason));
+                        } else {
+                            self.skipped_leaf = None;
+                        }
+                    } else if let Some(skip) = self.skipped.pop() {
+                        self.skipped_leaf = Some(skip);
+                    } else {
+                        self.reclaim_phase += 1;
+                    }
+                }
+                16 => {
+                    drop(std::mem::take(&mut self.skipped));
+                    self.reclaim_phase += 1;
+                }
+                17 => {
+                    self.output = None;
+                    self.reclaim_phase += 1;
+                }
+                18 => {
+                    self.claim_backing = None;
+                    self.reclaim_phase += 1;
+                }
+                19 => {
+                    self.backing = None;
+                    self.reclaim_phase += 1;
+                }
+                _ => {
+                    self.header = None;
+                    self.phase = Phase::Reclaimed;
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn retained_reclaim_file_for_test(
+            &self,
+            id: PinnedObjectId,
+        ) -> Option<(u8, Option<RawFd>)> {
+            let entry = self.reclaim_entry.as_ref().filter(|entry| entry.id == id)?;
+            Some((
+                entry.field,
+                entry.file.as_ref().map(|file| file.as_raw_fd()),
+            ))
+        }
+
+        #[cfg(test)]
+        pub(super) fn retained_exports_for_test(
+            &self,
+            id: PinnedObjectId,
+        ) -> Option<&[(String, u64)]> {
+            if let Some(entry) = &self.reclaim_entry
+                && entry.id == id
+            {
+                return entry.exports.as_deref();
+            }
+            self.output
+                .as_ref()?
+                .by_id
+                .get(&id)
+                .map(|entry| entry.exports.as_ref())
+        }
+
+        #[cfg(test)]
+        pub(super) fn installed_state_for_test(&self) -> (bool, bool) {
+            (self.phase == Phase::Installed, self.rebind_owner.is_none())
+        }
+
+        #[cfg(test)]
+        pub(super) fn installed_output_for_test(&self) -> Option<&PinnedObjects> {
+            (self.phase == Phase::Installed)
+                .then_some(self.output.as_ref())
+                .flatten()
+        }
+    }
+
+    /// Files-only retirement handoff: old-canonical files with no live alias
+    /// move here during installed reclaim instead of being dropped. The lane
+    /// closes them after the same Session's joined terminal detach via
+    /// `close_some`; chained graphs link through `prev`.
+    #[derive(Debug)]
+    pub(crate) struct RetiredFileHandoff {
+        files: Vec<Arc<std::fs::File>>,
+        pub(crate) prev: Option<Box<RetiredFileHandoff>>,
+        lease: Option<ResourceLease>,
+        reserved: usize,
+    }
+
+    impl RetiredFileHandoff {
+        /// One boxed handoff plus an exact `files`-slot Vec, with padding.
+        pub(crate) fn bytes(files: usize) -> usize {
+            std::mem::size_of::<Self>()
+                .saturating_add(OWNED_ALLOCATION_PADDING)
+                .saturating_add(files.saturating_mul(std::mem::size_of::<Arc<std::fs::File>>()))
+                .saturating_add(OWNED_ALLOCATION_PADDING)
+        }
+
+        /// One reservation covering the box and the exact-capacity Vec.
+        pub(crate) fn reserve(
+            files: usize,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<Box<Self>, GraphRefusal> {
+            let lease = reserve
+                .reserve(Self::bytes(files))
+                .map_err(GraphRefusal::Storage)?;
+            Ok(Box::new(Self {
+                files: Vec::with_capacity(files),
+                prev: None,
+                lease: Some(lease),
+                reserved: files,
+            }))
+        }
+
+        /// Drops at most `max` file shares, head first then the `prev` chain.
+        /// Returns true only when every link is empty.
+        pub(crate) fn close_some(&mut self, max: usize) -> bool {
+            let head = self.files.len().min(max);
+            self.files.drain(..head);
+            let budget = max - head;
+            if budget > 0
+                && let Some(prev) = self.prev.as_mut()
+            {
+                prev.close_some(budget);
+            }
+            self.is_empty()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.files.is_empty() && self.prev.as_ref().is_none_or(|prev| prev.is_empty())
+        }
+
+        fn push(&mut self, file: &Arc<std::fs::File>) -> Result<(), ()> {
+            if self.files.len() >= self.reserved {
+                return Err(());
+            }
+            self.files.push(Arc::clone(file));
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn len_for_test(&self) -> usize {
+            self.files.len()
+        }
+    }
+
+    fn claim_id(claims: &ViewClaims, bucket: u8, index: usize) -> Option<PinnedObjectId> {
+        match bucket {
+            0 => claims.tables.get(index).copied(),
+            1 => claims.targets.get(index).map(|(id, _)| *id),
+            _ => claims.pins.get(index).copied(),
+        }
+    }
+
+    fn copy_raw(
+        copy: &mut Option<RawObjectInstance>,
+        original: &RawObjectInstance,
+    ) -> Option<RawObjectInstance> {
+        if copy.is_none() {
+            *copy = Some(RawObjectInstance {
+                mount_namespace: original.mount_namespace,
+                key: original.key,
+                path: String::with_capacity(original.path.len()),
+                prearm: original.prearm,
+            });
+            return None;
+        }
+        if copy_text(&mut copy.as_mut()?.path, &original.path) {
+            copy.take()
+        } else {
+            None
+        }
+    }
+
+    impl PinnedObjects {
+        pub(crate) fn poll_conservative_copy(
+            &self,
+            cursor: &mut PinnedConservativeCursor,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<GraphStep, GraphRefusal> {
+            if work == 0 {
+                return Ok(GraphStep::Yielded);
+            }
+            cursor.check_pool(selection, reserve)?;
+            if let Some(fence) = cursor.fence {
+                fence.check(self, selection)?;
+            } else {
+                SourceFence::new(self, selection)?;
+            }
+            if matches!(
+                cursor.phase,
+                Phase::Rebinding | Phase::RebindAborted | Phase::Reclaim | Phase::Reclaimed
+            ) {
+                return Err(GraphRefusal::Cancelled);
+            }
+            for _ in 0..work {
+                cursor.advance(self, selection, reserve)?;
+                if cursor.phase == Phase::Ready {
+                    return Ok(GraphStep::Ready);
+                }
+            }
+            Ok(GraphStep::Advanced)
+        }
+    }
+
+    /// Deallocates the SAME unique slice allocation without an O(N) typed Drop
+    /// loop. Only the drained `(String,u64)` path above and resource-free test
+    /// probes may call this. No ManuallyDrop value is stored or exposed.
+    ///
+    /// # Safety
+    /// Caller must immediately establish actual exclusive Arc::get_mut/noWeak,
+    /// drain ALL owned element resources (leaving valid bits), and transfer the
+    /// original Arc without callback/observer/alias exposure. This function
+    /// reconstructs exactly once with identical allocation, len, and Global.
+    pub(super) unsafe fn deallocate_drained_unique_arc<T>(original: Arc<[T]>) {
+        use std::mem::ManuallyDrop;
+        // ManuallyDrop<T> has identical layout AND bit validity to T:
+        // https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html
+        // Arc::from_raw permits equal-size/alignment retyping of the original
+        // Global allocation; slice pointer cast retains the exact length:
+        // https://doc.rust-lang.org/std/sync/struct.Arc.html#method.from_raw
+        let raw = Arc::into_raw(original);
+        let raw = raw as *const [ManuallyDrop<T>];
+        // SAFETY: caller's unique original, same size/alignment/metadata/Global,
+        // valid elements, resources already individually disposed, one recovery.
+        drop(unsafe { Arc::from_raw(raw) });
+    }
+
+    const _: () = {
+        use std::mem::{ManuallyDrop, align_of, needs_drop, size_of};
+        assert!(needs_drop::<(String, u64)>());
+        assert!(!needs_drop::<ManuallyDrop<(String, u64)>>());
+        assert!(size_of::<(String, u64)>() == size_of::<ManuallyDrop<(String, u64)>>());
+        assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
+    };
+
+    pub(crate) use scanned_rebind::{
+        InstalledModulesBacking, RetainedScannedInputs, ScannedInputMeasure, ScannedRebindCursor,
+    };
+
+    mod scanned_rebind {
+        use super::*;
+        use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedTable};
+
+        static NEXT_SCANNED_INPUT: AtomicU64 = AtomicU64::new(0);
+        const MODULE_MISSING: &str =
+            "module has no comparable pinned identity; it was not attached";
+        const MODULE_ABI: &str = "module decoder ABI disagrees with its retained pinned identity; its tables were not attached";
+        const ENTRY_MISSING: &str =
+            " could not be reconciled to a comparable pinned object; entry was not attached";
+        const ENTRY_ABI: &str =
+            " has a different target ABI from its provider; entry was not attached";
+
+        /// Original owned rows plus actual payment, not proof of valid backing,
+        /// admission or pin identity. Only positive-work preflight may take it.
+        pub(crate) struct RetainedScannedInputs {
+            rows: Vec<ScannedModule>,
+            identity: PinCopyCacheId,
+            storage: ResourceLease,
+        }
+
+        pub(crate) struct ScannedInputRefusal {
+            rows: Vec<ScannedModule>,
+            storage: ResourceLease,
+        }
+
+        impl std::fmt::Debug for ScannedInputRefusal {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("ScannedInputRefusal")
+                    .field("rows", &self.rows.len())
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl ScannedInputRefusal {
+            pub(crate) fn into_originals(self) -> (Vec<ScannedModule>, ResourceLease) {
+                (self.rows, self.storage)
+            }
+        }
+
+        impl RetainedScannedInputs {
+            pub(crate) fn from_reserved_originals(
+                rows: Vec<ScannedModule>,
+                storage: ResourceLease,
+            ) -> Result<Self, ScannedInputRefusal> {
+                match mint_pin_copy_cache_id(&NEXT_SCANNED_INPUT) {
+                    Some(identity) => Ok(Self {
+                        rows,
+                        identity,
+                        storage,
+                    }),
+                    None => Err(ScannedInputRefusal { rows, storage }),
+                }
+            }
+
+            pub(crate) fn into_originals(self) -> (Vec<ScannedModule>, ResourceLease) {
+                (self.rows, self.storage)
+            }
+
+            #[cfg(test)]
+            pub(crate) fn originals_for_test(&self) -> &[ScannedModule] {
+                &self.rows
+            }
+            #[cfg(test)]
+            pub(crate) fn original_capacity_for_test(&self) -> usize {
+                self.rows.capacity()
+            }
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct Growth {
+            tables: usize,
+            targets: usize,
+            pins: usize,
+        }
+
+        fn charge_text(text: &String) -> Result<usize, GraphRefusal> {
+            text.capacity()
+                .checked_add(OWNED_ALLOCATION_PADDING)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
+        fn charge_hint(hint: &std::path::Path) -> Result<usize, GraphRefusal> {
+            use std::os::unix::ffi::OsStrExt as _;
+            hint.as_os_str()
+                .as_bytes()
+                .len()
+                .checked_add(OWNED_ALLOCATION_PADDING)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
+        fn normalization_bound(path: &str) -> Result<usize, GraphRefusal> {
+            text_bytes(path)?
+                .checked_add(bytes_for::<usize>(path.len() / 2 + 1)?)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
+        /// A Linux path-component cursor. Neither lookup nor measurement calls
+        /// the allocating, whole-path ordinary normalization helper.
+        struct Normalize {
+            path: String,
+            parents: Vec<usize>,
+            start: usize,
+            scan: usize,
+            copying: Option<(usize, usize)>,
+        }
+
+        impl Normalize {
+            fn new(original: &str) -> Option<Self> {
+                if !original.starts_with('/') {
+                    return None;
+                }
+                let mut path = String::with_capacity(original.len());
+                path.push('/');
+                Some(Self {
+                    path,
+                    parents: Vec::with_capacity(original.len() / 2 + 1),
+                    start: 1,
+                    scan: 1,
+                    copying: None,
+                })
+            }
+
+            fn advance(&mut self, original: &str) -> bool {
+                if let Some((start, end)) = self.copying {
+                    let mut next = start.saturating_add(TEXT_QUANTUM).min(end);
+                    while !original.is_char_boundary(next) {
+                        next -= 1;
+                    }
+                    self.path.push_str(&original[start..next]);
+                    if next == end {
+                        self.copying = None;
+                        self.start = end + 1;
+                        self.scan = end + 1;
+                    } else {
+                        self.copying = Some((next, end));
+                    }
+                    return false;
+                }
+                if self.start > original.len() {
+                    return true;
+                }
+                let stop = self.scan.saturating_add(TEXT_QUANTUM).min(original.len());
+                let slash = original.as_bytes()[self.scan..stop]
+                    .iter()
+                    .position(|byte| *byte == b'/');
+                let end = match slash {
+                    Some(offset) => self.scan + offset,
+                    None if stop < original.len() => {
+                        self.scan = stop;
+                        return false;
+                    }
+                    None => original.len(),
+                };
+                let component = &original[self.start..end];
+                match component {
+                    "" | "." => {
+                        self.start = end + 1;
+                        self.scan = end + 1;
+                    }
+                    ".." => {
+                        if let Some(parent) = self.parents.pop() {
+                            self.path.truncate(parent);
+                        }
+                        self.start = end + 1;
+                        self.scan = end + 1;
+                    }
+                    _ => {
+                        self.parents.push(self.path.len());
+                        if self.path.len() > 1 {
+                            self.path.push('/');
+                        }
+                        self.copying = Some((self.start, end));
+                    }
+                }
+                false
+            }
+
+            fn reclaim_one(&mut self) -> bool {
+                if self.path.capacity() != 0 {
+                    drop(std::mem::take(&mut self.path));
+                    return false;
+                }
+                if self.parents.capacity() != 0 {
+                    drop(std::mem::take(&mut self.parents));
+                    return false;
+                }
+                true
+            }
+        }
+
+        struct SkipCopy {
+            skip: Skipped,
+            stage: u8,
+            prefix_done: usize,
+            suffix_done: usize,
+        }
+        impl SkipCopy {
+            fn new() -> Self {
+                Self {
+                    skip: Skipped {
+                        subject: String::new(),
+                        reason: String::new(),
+                    },
+                    stage: 0,
+                    prefix_done: 0,
+                    suffix_done: 0,
+                }
+            }
+            fn advance(&mut self, subject: &str, prefix: &str, suffix: &str) -> bool {
+                match self.stage {
+                    0 => {
+                        self.skip.subject = String::with_capacity(subject.len());
+                        self.stage = 1;
+                    }
+                    1 => {
+                        if copy_text(&mut self.skip.subject, subject) {
+                            self.stage = 2;
+                        }
+                    }
+                    2 => {
+                        self.skip.reason = String::with_capacity(prefix.len() + suffix.len());
+                        self.stage = 3;
+                    }
+                    3 => {
+                        let mut end = self
+                            .prefix_done
+                            .saturating_add(TEXT_QUANTUM)
+                            .min(prefix.len());
+                        while !prefix.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        self.skip.reason.push_str(&prefix[self.prefix_done..end]);
+                        self.prefix_done = end;
+                        if end == prefix.len() {
+                            self.stage = 4;
+                        }
+                    }
+                    4 => {
+                        let mut end = self
+                            .suffix_done
+                            .saturating_add(TEXT_QUANTUM)
+                            .min(suffix.len());
+                        while !suffix.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        self.skip.reason.push_str(&suffix[self.suffix_done..end]);
+                        self.suffix_done = end;
+                        if end == suffix.len() {
+                            self.stage = 5;
+                        }
+                    }
+                    _ => return true,
+                }
+                false
+            }
+        }
+
+        fn reclaim_skip(skip: &mut Skipped) -> bool {
+            if skip.subject.capacity() != 0 {
+                drop(std::mem::take(&mut skip.subject));
+                false
+            } else if skip.reason.capacity() != 0 {
+                drop(std::mem::take(&mut skip.reason));
+                false
+            } else {
+                true
+            }
+        }
+
+        struct TableDrain {
+            table: ScannedTable,
+            stage: u8,
+            skip: Option<Skipped>,
+        }
+        impl TableDrain {
+            fn new(table: ScannedTable) -> Self {
+                Self {
+                    table,
+                    stage: 0,
+                    skip: None,
+                }
+            }
+            fn advance(&mut self) -> bool {
+                match self.stage {
+                    0 => {
+                        if let Some(entry) = self.table.entries.pop() {
+                            drop(entry.object_path);
+                        } else {
+                            drop(std::mem::take(&mut self.table.entries));
+                            self.stage = 1;
+                        }
+                    }
+                    1 => {
+                        drop(std::mem::take(&mut self.table.null_entries));
+                        self.stage = 2;
+                    }
+                    2 => {
+                        if let Some(skip) = &mut self.skip {
+                            if reclaim_skip(skip) {
+                                self.skip = None;
+                            }
+                        } else if let Some(skip) = self.table.unpinned.pop() {
+                            self.skip = Some(skip);
+                        } else {
+                            drop(std::mem::take(&mut self.table.unpinned));
+                            self.stage = 3;
+                        }
+                    }
+                    _ => return true,
+                }
+                false
+            }
+        }
+
+        struct ModuleDrain {
+            module: ScannedModule,
+            stage: u8,
+            table: Option<TableDrain>,
+            interface: Option<ScannedInterface>,
+        }
+        impl ModuleDrain {
+            fn new(module: ScannedModule) -> Self {
+                Self {
+                    module,
+                    stage: 0,
+                    table: None,
+                    interface: None,
+                }
+            }
+            fn advance(&mut self) -> bool {
+                match self.stage {
+                    0 => {
+                        drop(std::mem::take(&mut self.module.path));
+                        self.stage = 1;
+                    }
+                    1 => {
+                        if self.module.exports.pop().is_none() {
+                            drop(std::mem::take(&mut self.module.exports));
+                            self.stage = 2;
+                        }
+                    }
+                    2 => {
+                        if let Some(table) = &mut self.table {
+                            if table.advance() {
+                                self.table = None;
+                            }
+                        } else if let Some(table) = self.module.tables.pop() {
+                            self.table = Some(TableDrain::new(table));
+                        } else {
+                            drop(std::mem::take(&mut self.module.tables));
+                            self.stage = 3;
+                        }
+                    }
+                    3 => {
+                        if let Some(interface) = &mut self.interface {
+                            if interface.name_lossy.take().is_some() {
+                                return false;
+                            }
+                            if interface.name_private.take().is_some() {
+                                return false;
+                            }
+                            self.interface = None;
+                        } else if let Some(interface) = self.module.interfaces.pop() {
+                            self.interface = Some(interface);
+                        } else {
+                            drop(std::mem::take(&mut self.module.interfaces));
+                            self.stage = 4;
+                        }
+                    }
+                    _ => return true,
+                }
+                false
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum BindPhase {
+            New,
+            MeasureInput,
+            MeasureViews,
+            MeasurePin,
+            MeasurePinExports,
+            Admit,
+            Reset,
+            Grow,
+            NextModule,
+            ProviderStart,
+            ProviderNormalize,
+            ProviderResolve,
+            ModuleSkip,
+            DiscardModule,
+            TableStart,
+            MoveSkips,
+            NextEntry,
+            EntryNormalize,
+            EntryResolve,
+            EntrySkip,
+            EntrySkipCopy,
+            DropEntry,
+            FinishTable,
+            ClaimTables,
+            ClaimModule,
+            ClaimEntries,
+            FinishModule,
+            Ready,
+            Installed,
+            Reclaim,
+            Reclaimed,
+        }
+
+        #[derive(Clone, Copy)]
+        struct BindFence {
+            candidate: PinCopyCacheId,
+            input: PinCopyCacheId,
+            revision: u64,
+            version: u64,
+            changed: bool,
+        }
+
+        /// Stateful input measurer over scanned rows: one field group or
+        /// element per `step` credit. The rebind cursor drives it during
+        /// measurement; the Engine's RawCopy phase drives it directly. Call
+        /// `step` repeatedly for one module until it returns true, then move
+        /// to the next module.
+        pub(crate) struct ScannedInputMeasure {
+            bytes: usize,
+            extra: usize,
+            max_skips: usize,
+            growth: BTreeMap<ProcessViewId, Growth>,
+            table: usize,
+            item: usize,
+            stage: u8,
+        }
+
+        impl ScannedInputMeasure {
+            /// Seeds the retained-input envelope for a row Vec of `rows`
+            /// capacity: the wrapper plus the exact backing array charge.
+            pub(crate) fn new(rows: usize) -> Result<Self, GraphRefusal> {
+                Ok(Self {
+                    bytes: std::mem::size_of::<RetainedScannedInputs>()
+                        .checked_add(bytes_for::<ScannedModule>(rows)?)
+                        .ok_or(GraphRefusal::Overflow)?,
+                    extra: 0,
+                    max_skips: 0,
+                    growth: BTreeMap::new(),
+                    table: 0,
+                    item: 0,
+                    stage: 0,
+                })
+            }
+
+            fn empty() -> Self {
+                Self {
+                    bytes: 0,
+                    extra: 0,
+                    max_skips: 0,
+                    growth: BTreeMap::new(),
+                    table: 0,
+                    item: 0,
+                    stage: 0,
+                }
+            }
+
+            /// Measures one field group or element of `source`; true when
+            /// this module is fully measured.
+            pub(crate) fn step(&mut self, source: &ScannedModule) -> Result<bool, GraphRefusal> {
+                match self.stage {
+                    0 => {
+                        add(&mut self.bytes, charge_text(&source.path)?)?;
+                        if let Some(hint) = source.module_hint.as_ref() {
+                            add(&mut self.bytes, charge_hint(hint)?)?;
+                        }
+                        add(
+                            &mut self.bytes,
+                            bytes_for::<String>(source.exports.capacity())?,
+                        )?;
+                        add(
+                            &mut self.bytes,
+                            bytes_for::<ScannedTable>(source.tables.capacity())?,
+                        )?;
+                        add(
+                            &mut self.bytes,
+                            bytes_for::<ScannedInterface>(source.interfaces.capacity())?,
+                        )?;
+                        add(&mut self.extra, normalization_bound(&source.path)?)?;
+                        add(
+                            &mut self.extra,
+                            bytes_for::<Vec<PinnedObjectId>>(source.tables.len())?,
+                        )?;
+                        add(&mut self.extra, text_bytes(&source.path)?)?;
+                        add(&mut self.extra, text_bytes(MODULE_ABI)?)?;
+                        self.max_skips = self
+                            .max_skips
+                            .checked_add(1)
+                            .ok_or(GraphRefusal::Overflow)?;
+                        let growth = self.growth.entry(source.view).or_default();
+                        growth.tables = growth
+                            .tables
+                            .checked_add(source.tables.len())
+                            .ok_or(GraphRefusal::Overflow)?;
+                        growth.pins = growth.pins.checked_add(1).ok_or(GraphRefusal::Overflow)?;
+                        self.item = 0;
+                        self.stage = 1;
+                        Ok(false)
+                    }
+                    1 => {
+                        if let Some(text) = source.exports.get(self.item) {
+                            add(&mut self.bytes, charge_text(text)?)?;
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.item = 0;
+                            self.stage = 2;
+                            Ok(false)
+                        }
+                    }
+                    2 => {
+                        if let Some(interface) = source.interfaces.get(self.item) {
+                            if let Some(text) = &interface.name_lossy {
+                                add(&mut self.bytes, charge_text(text)?)?;
+                            }
+                            if let Some(bytes) = &interface.name_private {
+                                add(&mut self.bytes, bytes_for::<u8>(bytes.capacity())?)?;
+                            }
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.table = 0;
+                            self.stage = 3;
+                            Ok(false)
+                        }
+                    }
+                    3 => {
+                        if let Some(table) = source.tables.get(self.table) {
+                            add(
+                                &mut self.bytes,
+                                bytes_for::<ScannedEntry>(table.entries.capacity())?,
+                            )?;
+                            add(
+                                &mut self.bytes,
+                                bytes_for::<&'static str>(table.null_entries.capacity())?,
+                            )?;
+                            add(
+                                &mut self.bytes,
+                                bytes_for::<Skipped>(table.unpinned.capacity())?,
+                            )?;
+                            add(
+                                &mut self.extra,
+                                bytes_for::<ScannedEntry>(table.entries.len())?,
+                            )?;
+                            add(
+                                &mut self.extra,
+                                bytes_for::<PinnedObjectId>(table.entries.len())?,
+                            )?;
+                            let skips = table
+                                .unpinned
+                                .len()
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(&mut self.extra, bytes_for::<Skipped>(skips)?)?;
+                            self.max_skips = self
+                                .max_skips
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            let growth = self
+                                .growth
+                                .get_mut(&source.view)
+                                .ok_or(GraphRefusal::Identity)?;
+                            growth.targets = growth
+                                .targets
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            growth.pins = growth
+                                .pins
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            self.item = 0;
+                            self.stage = 4;
+                            Ok(false)
+                        } else {
+                            self.table = 0;
+                            self.item = 0;
+                            self.stage = 0;
+                            Ok(true)
+                        }
+                    }
+                    4 => {
+                        let table = source
+                            .tables
+                            .get(self.table)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(entry) = table.entries.get(self.item) {
+                            add(&mut self.bytes, charge_text(&entry.object_path)?)?;
+                            add(&mut self.extra, normalization_bound(&entry.object_path)?)?;
+                            let strings = text_bytes(entry.name)?
+                                .checked_add(text_bytes(&entry.object_path)?)
+                                .and_then(|bytes| {
+                                    bytes.checked_add(
+                                        ENTRY_MISSING
+                                            .len()
+                                            .max(ENTRY_ABI.len())
+                                            .max(UNVERIFIED_FORWARD_REFUSAL.len()),
+                                    )
+                                })
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(
+                                &mut self.extra,
+                                strings.checked_mul(2).ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.item = 0;
+                            self.stage = 5;
+                            Ok(false)
+                        }
+                    }
+                    _ => {
+                        let table = source
+                            .tables
+                            .get(self.table)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(skip) = table.unpinned.get(self.item) {
+                            add(&mut self.bytes, charge_text(&skip.subject)?)?;
+                            add(&mut self.bytes, charge_text(&skip.reason)?)?;
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.table += 1;
+                            self.stage = 3;
+                            Ok(false)
+                        }
+                    }
+                }
+            }
+
+            pub(crate) fn bytes(&self) -> usize {
+                self.bytes
+            }
+
+            fn extra(&self) -> usize {
+                self.extra
+            }
+
+            fn max_skips(&self) -> usize {
+                self.max_skips
+            }
+
+            fn take_growth(&mut self) -> BTreeMap<ProcessViewId, Growth> {
+                std::mem::take(&mut self.growth)
+            }
+        }
+
+        /// Payment for installed canonical modules: moved out of the rebind
+        /// cursor by the install sink, held while the canonical owns them.
+        #[derive(Debug)]
+        pub(crate) struct InstalledModulesBacking {
+            input_storage: Option<ResourceLease>,
+            output_storage: Option<ResourceLease>,
+            header_storage: Option<ResourceLease>,
+        }
+
+        /// Owns the original iterator/suffix and every output/temporary request.
+        /// No read-only view exists until all original binding and claims finish.
+        pub(crate) struct ScannedRebindCursor {
+            phase: BindPhase,
+            fence: Option<BindFence>,
+            cancelled: bool,
+            taken: bool,
+            completed: bool,
+            input_required: Option<usize>,
+            extra_required: Option<usize>,
+            claim_required: Option<usize>,
+            header_bytes: usize,
+            input_bytes: usize,
+            extra_bytes: usize,
+            claim_bytes: usize,
+            max_skips: usize,
+            growth: BTreeMap<ProcessViewId, Growth>,
+            input_measure: ScannedInputMeasure,
+            module_pos: usize,
+            table_pos: usize,
+            item_pos: usize,
+            last_view: Option<ProcessViewId>,
+            last_pin: Option<PinnedObjectId>,
+            bucket: u8,
+            originals: Option<std::vec::IntoIter<ScannedModule>>,
+            module: Option<ScannedModule>,
+            object: Option<PinnedObjectId>,
+            entries: Option<std::vec::IntoIter<ScannedEntry>>,
+            old_skips: Option<std::vec::IntoIter<Skipped>>,
+            old_skip_leaf: Option<Skipped>,
+            entry: Option<ScannedEntry>,
+            ids: Vec<PinnedObjectId>,
+            entry_objects: Vec<Vec<PinnedObjectId>>,
+            normalize: Option<Normalize>,
+            normalized: Option<String>,
+            skip_copy: Option<SkipCopy>,
+            skip_primary: Option<Skipped>,
+            skip_reason: &'static str,
+            modules: Vec<ReconciledModule>,
+            skipped: Vec<Skipped>,
+            module_drain: Option<ModuleDrain>,
+            reconciled_drain: Option<ReconciledDrain>,
+            reclaim_stage: u8,
+            // Original nested buffers can move into output rows; this payment
+            // stays until ALL those owners, not merely the input Vec, die.
+            input_storage: Option<ResourceLease>,
+            output_storage: Option<ResourceLease>,
+            header_storage: Option<ResourceLease>,
+        }
+
+        impl ScannedRebindCursor {
+            pub(crate) fn new() -> Self {
+                Self {
+                    phase: BindPhase::New,
+                    fence: None,
+                    cancelled: false,
+                    taken: false,
+                    completed: false,
+                    input_required: None,
+                    extra_required: None,
+                    claim_required: None,
+                    header_bytes: 0,
+                    input_bytes: 0,
+                    extra_bytes: 0,
+                    claim_bytes: 0,
+                    max_skips: 0,
+                    growth: BTreeMap::new(),
+                    input_measure: ScannedInputMeasure::empty(),
+                    module_pos: 0,
+                    table_pos: 0,
+                    item_pos: 0,
+                    last_view: None,
+                    last_pin: None,
+                    bucket: 0,
+                    originals: None,
+                    module: None,
+                    object: None,
+                    entries: None,
+                    old_skips: None,
+                    old_skip_leaf: None,
+                    entry: None,
+                    ids: Vec::new(),
+                    entry_objects: Vec::new(),
+                    normalize: None,
+                    normalized: None,
+                    skip_copy: None,
+                    skip_primary: None,
+                    skip_reason: "",
+                    modules: Vec::new(),
+                    skipped: Vec::new(),
+                    module_drain: None,
+                    reconciled_drain: None,
+                    reclaim_stage: 0,
+                    input_storage: None,
+                    output_storage: None,
+                    header_storage: None,
+                }
+            }
+            pub(crate) fn modules(&self) -> Option<&[ReconciledModule]> {
+                (self.phase == BindPhase::Ready).then_some(self.modules.as_slice())
+            }
+            pub(crate) fn skipped(&self) -> Option<&[Skipped]> {
+                (self.phase == BindPhase::Ready).then_some(self.skipped.as_slice())
+            }
+            pub(crate) fn required_bytes(&self) -> Option<usize> {
+                self.extra_required
+            }
+            pub(crate) fn required_input_bytes(&self) -> Option<usize> {
+                self.input_required
+            }
+            pub(crate) fn required_claim_bytes(&self) -> Option<usize> {
+                self.claim_required
+            }
+            pub(crate) fn cancel(&mut self) {
+                self.cancelled = true;
+            }
+
+            fn check_pool(&self, reserve: &SemanticResourceReserver) -> Result<(), GraphRefusal> {
+                for lease in [
+                    &self.header_storage,
+                    &self.input_storage,
+                    &self.output_storage,
+                ] {
+                    if lease
+                        .as_ref()
+                        .is_some_and(|lease| !reserve.covers(lease, 0))
+                    {
+                        return Err(GraphRefusal::Identity);
+                    }
+                }
+                Ok(())
+            }
+
+            fn check_candidate(&self, pins: &PinnedConservativeCursor) -> Result<(), GraphRefusal> {
+                let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                let output = pins.output.as_ref().ok_or(GraphRefusal::Identity)?;
+                if output.copy_source != Some(fence.candidate) {
+                    return Err(GraphRefusal::Identity);
+                }
+                if output.revision != fence.revision
+                    || output.copy_version != fence.version
+                    || output.changed.get() != fence.changed
+                {
+                    return Err(GraphRefusal::SourceChanged);
+                }
+                if self.taken {
+                    if pins.rebind_owner != Some(fence.input) {
+                        return Err(GraphRefusal::Identity);
+                    }
+                } else if pins.phase != Phase::Ready || pins.rebind_owner.is_some() {
+                    return Err(GraphRefusal::Identity);
+                }
+                Ok(())
+            }
+
+            fn begin_measure(
+                &mut self,
+                pins: &PinnedConservativeCursor,
+                input: &RetainedScannedInputs,
+                reserve: &SemanticResourceReserver,
+            ) -> Result<(), GraphRefusal> {
+                if pins.phase != Phase::Ready
+                    || pins.rebind_owner.is_some()
+                    || pins.claim_backing.is_some()
+                    || !reserve.covers(&input.storage, 0)
+                    || pins
+                        .header
+                        .as_ref()
+                        .is_none_or(|lease| !reserve.covers(lease, 0))
+                {
+                    return Err(GraphRefusal::Identity);
+                }
+                let output = pins.output.as_ref().ok_or(GraphRefusal::Identity)?;
+                if output.revision == u64::MAX
+                    || output
+                        .copy_version
+                        .checked_add(2)
+                        .is_none_or(|version| version == u64::MAX)
+                {
+                    return Err(GraphRefusal::SourceChanged);
+                }
+                let header_bytes = std::mem::size_of::<Self>()
+                    .checked_add(OWNED_ALLOCATION_PADDING)
+                    .and_then(|bytes| {
+                        bytes.checked_add(tree::<ProcessViewId, Growth>(input.rows.len()).ok()?)
+                    })
+                    .ok_or(GraphRefusal::Overflow)?;
+                let storage = reserve
+                    .reserve(header_bytes)
+                    .map_err(GraphRefusal::Storage)?;
+                self.fence = Some(BindFence {
+                    candidate: output.copy_source.ok_or(GraphRefusal::Identity)?,
+                    input: input.identity,
+                    revision: output.revision,
+                    version: output.copy_version,
+                    changed: output.changed.get(),
+                });
+                self.header_storage = Some(storage);
+                self.header_bytes = header_bytes;
+                self.input_measure = ScannedInputMeasure::new(input.rows.capacity())?;
+                self.extra_bytes = header_bytes
+                    .checked_add(bytes_for::<ReconciledModule>(input.rows.len())?)
+                    .ok_or(GraphRefusal::Overflow)?;
+                self.claim_bytes = tree::<ProcessViewId, ViewClaims>(input.rows.len())?;
+                self.phase = BindPhase::MeasureInput;
+                Ok(())
+            }
+
+            fn measure(
+                &mut self,
+                pins: &PinnedObjects,
+                input: &RetainedScannedInputs,
+            ) -> Result<(), GraphRefusal> {
+                match self.phase {
+                    BindPhase::MeasureInput => {
+                        if let Some(module) = input.rows.get(self.module_pos) {
+                            if self.input_measure.step(module)? {
+                                self.module_pos += 1;
+                            }
+                        } else {
+                            self.input_bytes = self.input_measure.bytes();
+                            add(&mut self.extra_bytes, self.input_measure.extra())?;
+                            self.max_skips = self.input_measure.max_skips();
+                            self.growth = self.input_measure.take_growth();
+                            add(&mut self.extra_bytes, bytes_for::<Skipped>(self.max_skips)?)?;
+                            self.last_view = None;
+                            self.phase = BindPhase::MeasureViews;
+                        }
+                    }
+                    BindPhase::MeasureViews => {
+                        if let Some((view, growth)) =
+                            next_map(&self.growth, self.last_view.as_ref())
+                        {
+                            self.last_view = Some(*view);
+                            let old = pins.ownership.get(view);
+                            let tables = old
+                                .map_or(0, |old| old.tables.capacity())
+                                .max(growth.tables);
+                            let targets = old
+                                .map_or(0, |old| old.targets.capacity())
+                                .max(growth.targets);
+                            let pin_count = old
+                                .map_or(0, |old| old.pins.len())
+                                .checked_add(growth.pins)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            let pin_count = old.map_or(0, |old| old.pins.capacity()).max(pin_count);
+                            add(&mut self.claim_bytes, bytes_for::<PinnedObjectId>(tables)?)?;
+                            add(
+                                &mut self.claim_bytes,
+                                bytes_for::<(PinnedObjectId, u64)>(targets)?,
+                            )?;
+                            add(
+                                &mut self.claim_bytes,
+                                bytes_for::<PinnedObjectId>(pin_count)?,
+                            )?;
+                        } else {
+                            self.last_pin = None;
+                            self.phase = BindPhase::MeasurePin;
+                        }
+                    }
+                    BindPhase::MeasurePin => {
+                        if let Some((id, entry)) = next_map(&pins.by_id, self.last_pin.as_ref()) {
+                            self.last_pin = Some(*id);
+                            add(
+                                &mut self.extra_bytes,
+                                bytes_for::<(String, u64)>(entry.exports.len())?,
+                            )?;
+                            add(&mut self.extra_bytes, 2 * std::mem::size_of::<usize>())?;
+                            self.item_pos = 0;
+                            self.phase = BindPhase::MeasurePinExports;
+                        } else {
+                            self.input_required = Some(self.input_bytes);
+                            self.claim_required = Some(self.claim_bytes);
+                            self.extra_required = Some(
+                                self.extra_bytes
+                                    .checked_add(self.claim_bytes)
+                                    .ok_or(GraphRefusal::Overflow)?,
+                            );
+                            self.phase = BindPhase::Admit;
+                        }
+                    }
+                    BindPhase::MeasurePinExports => {
+                        let entry = pins
+                            .by_id
+                            .get(&self.last_pin.ok_or(GraphRefusal::Identity)?)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some((text, _)) = entry.exports.get(self.item_pos) {
+                            add(&mut self.extra_bytes, charge_text(text)?)?;
+                            self.item_pos += 1;
+                        } else {
+                            self.phase = BindPhase::MeasurePin;
+                        }
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                Ok(())
+            }
+        }
+
+        impl ScannedRebindCursor {
+            fn admit(
+                &mut self,
+                pins: &mut PinnedConservativeCursor,
+                input: &mut Option<RetainedScannedInputs>,
+                reserve: &SemanticResourceReserver,
+            ) -> Result<(), GraphRefusal> {
+                let original = input.as_ref().ok_or(GraphRefusal::Identity)?;
+                if !reserve.covers(
+                    &original.storage,
+                    self.input_required.ok_or(GraphRefusal::Identity)?,
+                ) {
+                    return Err(GraphRefusal::Identity);
+                }
+                let output_bytes = self
+                    .extra_bytes
+                    .checked_sub(self.header_bytes)
+                    .ok_or(GraphRefusal::Overflow)?;
+                // Both reservations are local until ALL precharges succeed.
+                // A second refusal refunds no live input/claim allocation.
+                let output = reserve
+                    .reserve(output_bytes)
+                    .map_err(GraphRefusal::Storage)?;
+                let claims = reserve
+                    .reserve(self.claim_required.ok_or(GraphRefusal::Identity)?)
+                    .map_err(GraphRefusal::Storage)?;
+                let updated = self
+                    .fence
+                    .ok_or(GraphRefusal::Identity)?
+                    .version
+                    .checked_add(2)
+                    .filter(|version| *version < u64::MAX)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                let original = input.take().ok_or(GraphRefusal::Identity)?;
+                let capacity = original.rows.len();
+                let identity = original.identity;
+                self.originals = Some(original.rows.into_iter());
+                self.input_storage = Some(original.storage);
+                self.output_storage = Some(output);
+                // The candidate, not this module cursor, owns payment for ALL
+                // appended/reset-derived claim backing before the first write.
+                pins.claim_backing = Some(claims);
+                pins.rebind_owner = Some(identity);
+                pins.rebind_complete = false;
+                pins.phase = Phase::Rebinding;
+                pins.output
+                    .as_mut()
+                    .ok_or(GraphRefusal::Identity)?
+                    .copy_version = updated;
+                self.fence.as_mut().ok_or(GraphRefusal::Identity)?.version = updated;
+                self.taken = true;
+                self.modules = Vec::with_capacity(capacity);
+                self.skipped = Vec::with_capacity(self.max_skips);
+                self.last_view = None;
+                self.phase = BindPhase::Reset;
+                Ok(())
+            }
+
+            fn reset_one(&mut self, pins: &mut PinnedObjects) {
+                if let Some((view, _)) = next_map(&pins.ownership, self.last_view.as_ref()) {
+                    let view = *view;
+                    if let Some(claims) = pins.ownership.get_mut(&view) {
+                        // Both element types are Copy/no-drop. Capacity stays
+                        // owned/paid; one original ownership row per credit.
+                        claims.tables.clear();
+                        claims.targets.clear();
+                    }
+                    self.last_view = Some(view);
+                } else {
+                    self.last_view = None;
+                    self.bucket = 0;
+                    self.phase = BindPhase::Grow;
+                }
+            }
+
+            fn grow_one(
+                &mut self,
+                pins: &mut PinnedObjects,
+                old_prefix: &mut Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+            ) -> Result<(), GraphRefusal> {
+                if let Some((view, original)) = old_prefix.as_mut() {
+                    let view = *view;
+                    if let Some(id) = original.next() {
+                        pins.ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?
+                            .pins
+                            .push(id);
+                    } else {
+                        // Empty iterator: only its original scalar backing dies.
+                        // It stayed H1-owned and base-paid throughout transfer.
+                        drop(old_prefix.take());
+                        self.last_view = Some(view);
+                        self.bucket = 0;
+                    }
+                    return Ok(());
+                }
+                let Some((view, growth)) = next_map(&self.growth, self.last_view.as_ref()) else {
+                    self.phase = BindPhase::NextModule;
+                    return Ok(());
+                };
+                let view = *view;
+                if let Some(old) = pins.ownership.get_mut(&view) {
+                    match self.bucket {
+                        // These vectors were cleared one row at a time first;
+                        // they carry no populated prefix into reserve_exact.
+                        0 if old.tables.capacity() < growth.tables => {
+                            old.tables.reserve_exact(growth.tables)
+                        }
+                        1 if old.targets.capacity() < growth.targets => {
+                            old.targets.reserve_exact(growth.targets)
+                        }
+                        2 => {
+                            let wanted = old
+                                .pins
+                                .len()
+                                .checked_add(growth.pins)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            if old.pins.capacity() < wanted {
+                                let fresh = Vec::with_capacity(wanted);
+                                let original = std::mem::replace(&mut old.pins, fresh);
+                                *old_prefix = Some((view, original.into_iter()));
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if self.bucket == 2 {
+                    self.last_view = Some(view);
+                    self.bucket = 0;
+                } else {
+                    self.bucket += 1;
+                }
+                Ok(())
+            }
+
+            fn resolve_normalized(
+                &mut self,
+                pins: &PinnedObjects,
+                key: ObjectKey,
+            ) -> Result<Option<PinnedObjectId>, GraphRefusal> {
+                let Some(path) = self.normalized.take() else {
+                    return Ok(None);
+                };
+                let namespace = self
+                    .module
+                    .as_ref()
+                    .ok_or(GraphRefusal::Identity)?
+                    .mount_namespace;
+                let raw = RawObjectInstance {
+                    mount_namespace: Some(namespace),
+                    key,
+                    path,
+                    prearm: false,
+                };
+                Ok(pins.raw_to_id.get(&raw).copied())
+            }
+
+            fn bind_one(
+                &mut self,
+                pins: &mut PinnedObjects,
+                old_pin_prefix: &mut Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+            ) -> Result<(), GraphRefusal> {
+                match self.phase {
+                    BindPhase::Reset => self.reset_one(pins),
+                    BindPhase::Grow => self.grow_one(pins, old_pin_prefix)?,
+                    BindPhase::NextModule => {
+                        if let Some(module) = self
+                            .originals
+                            .as_mut()
+                            .ok_or(GraphRefusal::Identity)?
+                            .next()
+                        {
+                            self.module = Some(module);
+                            self.object = None;
+                            self.table_pos = 0;
+                            self.item_pos = 0;
+                            self.phase = BindPhase::ProviderStart;
+                        } else {
+                            self.completed = true;
+                            self.phase = BindPhase::Ready;
+                        }
+                    }
+                    BindPhase::ProviderStart => {
+                        let original = &self.module.as_ref().ok_or(GraphRefusal::Identity)?.path;
+                        self.normalize = Normalize::new(original);
+                        if self.normalize.is_some() {
+                            self.phase = BindPhase::ProviderNormalize;
+                        } else {
+                            self.skip_reason = MODULE_MISSING;
+                            self.phase = BindPhase::ModuleSkip;
+                        }
+                    }
+                    BindPhase::ProviderNormalize | BindPhase::EntryNormalize => {
+                        let provider = self.phase == BindPhase::ProviderNormalize;
+                        let original = if provider {
+                            self.module.as_ref().map(|module| module.path.as_str())
+                        } else {
+                            self.entry.as_ref().map(|entry| entry.object_path.as_str())
+                        }
+                        .ok_or(GraphRefusal::Identity)?;
+                        if self
+                            .normalize
+                            .as_mut()
+                            .ok_or(GraphRefusal::Identity)?
+                            .advance(original)
+                        {
+                            let mut normalized =
+                                self.normalize.take().ok_or(GraphRefusal::Identity)?;
+                            self.normalized = Some(std::mem::take(&mut normalized.path));
+                            // Only its primitive stack backing remains here.
+                            drop(normalized);
+                            self.phase = if provider {
+                                BindPhase::ProviderResolve
+                            } else {
+                                BindPhase::EntryResolve
+                            };
+                        }
+                    }
+                    BindPhase::ProviderResolve => {
+                        let key = self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                        match self.resolve_normalized(pins, key)? {
+                            None => {
+                                self.skip_reason = MODULE_MISSING;
+                                self.phase = BindPhase::ModuleSkip;
+                            }
+                            Some(object) => {
+                                let old =
+                                    pins.by_id.get(&object).ok_or(GraphRefusal::SourceChanged)?;
+                                let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                                if module.decoder_abi.is_some_and(|decoded| decoded != old.abi) {
+                                    self.skip_reason = MODULE_ABI;
+                                    self.phase = BindPhase::ModuleSkip;
+                                } else {
+                                    self.object = Some(object);
+                                    self.entry_objects = Vec::with_capacity(module.tables.len());
+                                    self.table_pos = 0;
+                                    self.phase = BindPhase::TableStart;
+                                }
+                            }
+                        }
+                    }
+                    BindPhase::ModuleSkip => {
+                        if self.skip_copy.is_none() {
+                            self.skip_copy = Some(SkipCopy::new());
+                        } else {
+                            let subject = &self.module.as_ref().ok_or(GraphRefusal::Identity)?.path;
+                            if self
+                                .skip_copy
+                                .as_mut()
+                                .ok_or(GraphRefusal::Identity)?
+                                .advance(subject, "", self.skip_reason)
+                            {
+                                let skip =
+                                    self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip;
+                                self.skipped.push(skip);
+                                let module = self.module.take().ok_or(GraphRefusal::Identity)?;
+                                self.module_drain = Some(ModuleDrain::new(module));
+                                self.phase = BindPhase::DiscardModule;
+                            }
+                        }
+                    }
+                    BindPhase::DiscardModule => {
+                        if self
+                            .module_drain
+                            .as_mut()
+                            .ok_or(GraphRefusal::Identity)?
+                            .advance()
+                        {
+                            self.module_drain = None;
+                            self.phase = BindPhase::NextModule;
+                        }
+                    }
+                    BindPhase::TableStart => {
+                        let module = self.module.as_mut().ok_or(GraphRefusal::Identity)?;
+                        if let Some(table) = module.tables.get_mut(self.table_pos) {
+                            let count = table.entries.len();
+                            self.entries = Some(std::mem::take(&mut table.entries).into_iter());
+                            table.entries = Vec::with_capacity(count);
+                            self.ids = Vec::with_capacity(count);
+                            let wanted = table
+                                .unpinned
+                                .len()
+                                .checked_add(count)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            if table.unpinned.capacity() < wanted {
+                                let fresh = Vec::with_capacity(wanted);
+                                let original = std::mem::replace(&mut table.unpinned, fresh);
+                                self.old_skips = Some(original.into_iter());
+                                self.phase = BindPhase::MoveSkips;
+                            } else {
+                                self.phase = BindPhase::NextEntry;
+                            }
+                        } else {
+                            self.table_pos = 0;
+                            self.phase = BindPhase::ClaimTables;
+                        }
+                    }
+                    BindPhase::MoveSkips => {
+                        let original = self.old_skips.as_mut().ok_or(GraphRefusal::Identity)?;
+                        if let Some(skip) = original.next() {
+                            self.module
+                                .as_mut()
+                                .and_then(|module| module.tables.get_mut(self.table_pos))
+                                .ok_or(GraphRefusal::Identity)?
+                                .unpinned
+                                .push(skip);
+                        } else {
+                            // Every original record has moved; dropping this
+                            // empty iterator frees only the old Vec allocation.
+                            drop(self.old_skips.take());
+                            self.phase = BindPhase::NextEntry;
+                        }
+                    }
+                    BindPhase::NextEntry => {
+                        if let Some(entry) =
+                            self.entries.as_mut().ok_or(GraphRefusal::Identity)?.next()
+                        {
+                            self.normalize = Normalize::new(&entry.object_path);
+                            self.entry = Some(entry);
+                            self.phase = if self.normalize.is_some() {
+                                BindPhase::EntryNormalize
+                            } else {
+                                BindPhase::EntryResolve
+                            };
+                        } else {
+                            self.phase = BindPhase::FinishTable;
+                        }
+                    }
+                    BindPhase::EntryResolve => {
+                        let key = self.entry.as_ref().ok_or(GraphRefusal::Identity)?.object;
+                        let candidate = self.resolve_normalized(pins, key)?;
+                        let provider = self.object.ok_or(GraphRefusal::Identity)?;
+                        let compatible = candidate.is_some_and(|target| {
+                            matches!((pins.abi_for(target), pins.abi_for(provider)),
+                                (Some(target), Some(provider)) if target == provider)
+                        });
+                        if compatible {
+                            let id = candidate.ok_or(GraphRefusal::Identity)?;
+                            // Same forward check as `bind_scanned_modules`:
+                            // a cross-object bootstrap forward must resolve
+                            // by name in the pinned target's own exports.
+                            let entry = self.entry.as_ref().ok_or(GraphRefusal::Identity)?;
+                            let module_key =
+                                self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                            if entry.object != module_key
+                                && entry.name == "C_GetFunctionList"
+                                && !forwarded_bootstrap_verified(entry, &pins.exports_for(id))
+                            {
+                                self.skip_reason = UNVERIFIED_FORWARD_REFUSAL;
+                                self.phase = BindPhase::EntrySkip;
+                                return Ok(());
+                            }
+                            self.ids.push(id);
+                            let entry = self.entry.take().ok_or(GraphRefusal::Identity)?;
+                            self.module
+                                .as_mut()
+                                .and_then(|module| module.tables.get_mut(self.table_pos))
+                                .ok_or(GraphRefusal::Identity)?
+                                .entries
+                                .push(entry);
+                            self.phase = BindPhase::NextEntry;
+                        } else {
+                            self.skip_reason = if candidate.is_some() {
+                                ENTRY_ABI
+                            } else {
+                                ENTRY_MISSING
+                            };
+                            self.phase = BindPhase::EntrySkip;
+                        }
+                    }
+                    BindPhase::EntrySkip => {
+                        if self.skip_copy.is_none() {
+                            self.skip_copy = Some(SkipCopy::new());
+                        } else {
+                            let entry = self.entry.as_ref().ok_or(GraphRefusal::Identity)?;
+                            if self
+                                .skip_copy
+                                .as_mut()
+                                .ok_or(GraphRefusal::Identity)?
+                                .advance(entry.name, &entry.object_path, self.skip_reason)
+                            {
+                                self.skip_primary =
+                                    Some(self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip);
+                                self.phase = BindPhase::EntrySkipCopy;
+                            }
+                        }
+                    }
+                    BindPhase::EntrySkipCopy => {
+                        if self.skip_copy.is_none() {
+                            self.skip_copy = Some(SkipCopy::new());
+                        } else {
+                            let skip = self.skip_primary.as_ref().ok_or(GraphRefusal::Identity)?;
+                            if self
+                                .skip_copy
+                                .as_mut()
+                                .ok_or(GraphRefusal::Identity)?
+                                .advance(&skip.subject, &skip.reason, "")
+                            {
+                                let copy =
+                                    self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip;
+                                let primary =
+                                    self.skip_primary.take().ok_or(GraphRefusal::Identity)?;
+                                self.module
+                                    .as_mut()
+                                    .and_then(|module| module.tables.get_mut(self.table_pos))
+                                    .ok_or(GraphRefusal::Identity)?
+                                    .unpinned
+                                    .push(primary);
+                                self.skipped.push(copy);
+                                self.phase = BindPhase::DropEntry;
+                            }
+                        }
+                    }
+                    BindPhase::DropEntry => {
+                        drop(self.entry.take());
+                        self.phase = BindPhase::NextEntry;
+                    }
+                    BindPhase::FinishTable => {
+                        if self
+                            .entries
+                            .as_ref()
+                            .is_some_and(|entries| !entries.as_slice().is_empty())
+                        {
+                            return Err(GraphRefusal::Identity);
+                        }
+                        drop(self.entries.take());
+                        self.entry_objects.push(std::mem::take(&mut self.ids));
+                        self.table_pos += 1;
+                        self.phase = BindPhase::TableStart;
+                    }
+                    BindPhase::ClaimTables => {
+                        let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                        let growth = self
+                            .growth
+                            .get(&module.view)
+                            .ok_or(GraphRefusal::Identity)?;
+                        match pins.ownership.entry(module.view) {
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert(ViewClaims {
+                                    tables: Vec::with_capacity(growth.tables),
+                                    targets: Vec::with_capacity(growth.targets),
+                                    pins: Vec::with_capacity(growth.pins),
+                                });
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut slot)
+                                if self.table_pos < module.tables.len() =>
+                            {
+                                slot.get_mut()
+                                    .tables
+                                    .push(self.object.ok_or(GraphRefusal::Identity)?);
+                                self.table_pos += 1;
+                            }
+                            std::collections::btree_map::Entry::Occupied(_) => {
+                                self.phase = BindPhase::ClaimModule;
+                            }
+                        }
+                    }
+                    BindPhase::ClaimModule => {
+                        let view = self.module.as_ref().ok_or(GraphRefusal::Identity)?.view;
+                        pins.ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?
+                            .pins
+                            .push(self.object.ok_or(GraphRefusal::Identity)?);
+                        self.table_pos = 0;
+                        self.item_pos = 0;
+                        self.phase = BindPhase::ClaimEntries;
+                    }
+                    BindPhase::ClaimEntries => {
+                        let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                        if let Some(table) = module.tables.get(self.table_pos) {
+                            if let Some(entry) = table.entries.get(self.item_pos) {
+                                let id = *self
+                                    .entry_objects
+                                    .get(self.table_pos)
+                                    .and_then(|ids| ids.get(self.item_pos))
+                                    .ok_or(GraphRefusal::Identity)?;
+                                let claims = pins
+                                    .ownership
+                                    .get_mut(&module.view)
+                                    .ok_or(GraphRefusal::Identity)?;
+                                claims.targets.push((id, entry.file_offset));
+                                claims.pins.push(id);
+                                self.item_pos += 1;
+                            } else {
+                                self.table_pos += 1;
+                                self.item_pos = 0;
+                            }
+                        } else {
+                            self.phase = BindPhase::FinishModule;
+                        }
+                    }
+                    BindPhase::FinishModule => {
+                        let object = self.object.take().ok_or(GraphRefusal::Identity)?;
+                        let pinned_entry =
+                            pins.by_id.get(&object).ok_or(GraphRefusal::SourceChanged)?;
+                        let exports = pinned_entry.exports.clone();
+                        let getter_present = pinned_entry.getter_present;
+                        let witness_fault = pinned_entry.witness_fault;
+                        self.modules.push(ReconciledModule {
+                            scanned: self.module.take().ok_or(GraphRefusal::Identity)?,
+                            object,
+                            entry_objects: std::mem::take(&mut self.entry_objects),
+                            exports,
+                            getter_present,
+                            witness_fault,
+                        });
+                        self.phase = BindPhase::NextModule;
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                Ok(())
+            }
+        }
+
+        impl PinnedConservativeCursor {
+            pub(crate) fn poll_scanned_rebind(
+                &mut self,
+                input: &mut Option<RetainedScannedInputs>,
+                cursor: &mut ScannedRebindCursor,
+                reserve: &SemanticResourceReserver,
+                work: usize,
+            ) -> Result<GraphStep, GraphRefusal> {
+                if work == 0 {
+                    return Ok(GraphStep::Yielded);
+                }
+                if cursor.cancelled {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                cursor.check_pool(reserve)?;
+                let mut credits = work;
+                if cursor.phase == BindPhase::New {
+                    cursor.begin_measure(
+                        self,
+                        input.as_ref().ok_or(GraphRefusal::Identity)?,
+                        reserve,
+                    )?;
+                    // Construction/binding of the first measurement itself
+                    // consumes one credit and takes no original allocation.
+                    credits -= 1;
+                }
+                cursor.check_candidate(self)?;
+                if cursor.taken {
+                    if input.is_some() {
+                        return Err(GraphRefusal::Identity);
+                    }
+                } else {
+                    let original = input.as_ref().ok_or(GraphRefusal::Identity)?;
+                    if Some(original.identity) != cursor.fence.map(|fence| fence.input)
+                        || !reserve.covers(&original.storage, 0)
+                    {
+                        return Err(GraphRefusal::Identity);
+                    }
+                }
+                if matches!(cursor.phase, BindPhase::Reclaim | BindPhase::Reclaimed) {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                for _ in 0..credits {
+                    match cursor.phase {
+                        BindPhase::MeasureInput
+                        | BindPhase::MeasureViews
+                        | BindPhase::MeasurePin
+                        | BindPhase::MeasurePinExports => {
+                            let original = input.as_ref().ok_or(GraphRefusal::Identity)?;
+                            cursor.measure(
+                                self.output.as_ref().ok_or(GraphRefusal::Identity)?,
+                                original,
+                            )?;
+                        }
+                        BindPhase::Admit => cursor.admit(self, input, reserve)?,
+                        BindPhase::Ready => return Ok(GraphStep::Ready),
+                        _ => {
+                            cursor.bind_one(
+                                self.output.as_mut().ok_or(GraphRefusal::Identity)?,
+                                &mut self.rebind_old_pins,
+                            )?;
+                            if cursor.phase == BindPhase::Ready {
+                                self.rebind_complete = true;
+                                return Ok(GraphStep::Ready);
+                            }
+                        }
+                    }
+                }
+                Ok(GraphStep::Advanced)
+            }
+
+            #[cfg(test)]
+            pub(crate) fn reference_rebind_claims_for_test(
+                &self,
+                view: ProcessViewId,
+            ) -> Option<&ViewClaims> {
+                self.output.as_ref()?.ownership.get(&view)
+            }
+        }
+
+        impl ScannedRebindCursor {
+            /// Reclamation, not graph/semantic completion. With no borrowed pin
+            /// owner, unknown shared or Weak export backing remains paid/refused.
+            pub(crate) fn reclaim(
+                &mut self,
+                mut pins: Option<&mut PinnedConservativeCursor>,
+                reserve: &SemanticResourceReserver,
+                work: usize,
+            ) -> Result<GraphStep, GraphRefusal> {
+                if work == 0 {
+                    return Ok(GraphStep::Yielded);
+                }
+                self.check_pool(reserve)?;
+                if self.taken && !self.completed && pins.is_none() {
+                    return Err(GraphRefusal::Identity);
+                }
+                if let Some(owner) = pins.as_deref()
+                    && self.fence.is_some()
+                {
+                    if self.phase == BindPhase::Reclaimed {
+                        let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                        if owner.output.as_ref().and_then(|output| output.copy_source)
+                            != Some(fence.candidate)
+                            || owner.rebind_owner.is_some_and(|held| held != fence.input)
+                        {
+                            return Err(GraphRefusal::Identity);
+                        }
+                    } else {
+                        self.check_candidate(owner)?;
+                    }
+                }
+                if self.phase == BindPhase::Reclaimed {
+                    self.release_loan(pins)?;
+                    return Ok(GraphStep::Ready);
+                }
+                self.phase = BindPhase::Reclaim;
+                for _ in 0..work {
+                    if let Some(owner) = pins.as_deref_mut()
+                        && let Some((_, original)) = owner.rebind_old_pins.as_mut()
+                    {
+                        if original.next().is_none() {
+                            drop(owner.rebind_old_pins.take());
+                        }
+                        // Abort disposes at most one original scalar claim;
+                        // both old/new buffers remain with their paid H1 owner.
+                        continue;
+                    }
+                    let actual = pins.as_deref().and_then(|owner| owner.output.as_ref());
+                    self.reclaim_one(actual, None, false)?;
+                    if self.phase == BindPhase::Reclaimed {
+                        self.release_loan(pins)?;
+                        return Ok(GraphStep::Ready);
+                    }
+                }
+                Ok(GraphStep::Advanced)
+            }
+
+            /// O(1) install sink: swaps the bound modules into the canonical;
+            /// the cursor now holds the old canonical modules for
+            /// `reclaim_installed`. The module payment moves into the backing.
+            pub(crate) fn install_ready(
+                &mut self,
+                canonical: &mut Vec<ReconciledModule>,
+            ) -> Result<InstalledModulesBacking, GraphRefusal> {
+                if self.cancelled {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                match self.phase {
+                    BindPhase::Ready => {}
+                    BindPhase::Installed | BindPhase::Reclaim | BindPhase::Reclaimed => {
+                        return Err(GraphRefusal::Cancelled);
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                std::mem::swap(&mut self.modules, canonical);
+                self.phase = BindPhase::Installed;
+                Ok(InstalledModulesBacking {
+                    input_storage: self.input_storage.take(),
+                    output_storage: self.output_storage.take(),
+                    header_storage: self.header_storage.take(),
+                })
+            }
+
+            /// Reclaims the old canonical modules against the live installed
+            /// pins: aliased exports are released, Session-shared exports drop
+            /// our clone, exclusive slices drain element-wise, and the pins
+            /// loan is released last.
+            pub(crate) fn reclaim_installed(
+                &mut self,
+                pins: &mut PinnedConservativeCursor,
+                live_pins: &PinnedObjects,
+                handoff: &mut RetiredFileHandoff,
+                reserve: &SemanticResourceReserver,
+                work: usize,
+            ) -> Result<GraphStep, GraphRefusal> {
+                // Module exports drain exclusively and modules hold no files,
+                // so installed rebind reclaim takes but never fills the
+                // handoff; the shared reservation stays untouched. These
+                // parameters keep the graph's per-credit reclaim loop uniform.
+                let _ = (handoff, reserve);
+                if work == 0 {
+                    return Ok(GraphStep::Yielded);
+                }
+                if self.phase == BindPhase::Reclaimed {
+                    return Ok(GraphStep::Ready);
+                }
+                if self.phase != BindPhase::Installed {
+                    return Err(GraphRefusal::Identity);
+                }
+                let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                if live_pins.copy_source != Some(fence.candidate)
+                    || pins.installed != Some(fence.candidate)
+                    || pins.rebind_owner.is_some_and(|held| held != fence.input)
+                    || pins.rebind_old_pins.is_some()
+                {
+                    return Err(GraphRefusal::Identity);
+                }
+                for _ in 0..work {
+                    let old = pins.output.as_ref();
+                    self.reclaim_one(Some(live_pins), old, true)?;
+                    if self.phase == BindPhase::Reclaimed {
+                        pins.rebind_owner = None;
+                        return Ok(GraphStep::Ready);
+                    }
+                }
+                Ok(GraphStep::Advanced)
+            }
+
+            fn release_loan(
+                &self,
+                pins: Option<&mut PinnedConservativeCursor>,
+            ) -> Result<(), GraphRefusal> {
+                if self.taken
+                    && let Some(pins) = pins
+                {
+                    let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                    if pins.rebind_old_pins.is_some() {
+                        return Err(GraphRefusal::Identity);
+                    }
+                    if let Some(owner) = pins.rebind_owner {
+                        if owner != fence.input {
+                            return Err(GraphRefusal::Identity);
+                        }
+                        pins.rebind_owner = None;
+                        pins.rebind_complete = false;
+                        pins.phase = if self.completed && !self.cancelled {
+                            Phase::Ready
+                        } else {
+                            Phase::RebindAborted
+                        };
+                    }
+                }
+                Ok(())
+            }
+
+            fn reclaim_one(
+                &mut self,
+                pins: Option<&PinnedObjects>,
+                old: Option<&PinnedObjects>,
+                installed: bool,
+            ) -> Result<(), GraphRefusal> {
+                if let Some(skip) = &mut self.old_skip_leaf {
+                    if reclaim_skip(skip) {
+                        self.old_skip_leaf = None;
+                    }
+                    return Ok(());
+                }
+                if let Some(original) = &mut self.old_skips {
+                    if let Some(skip) = original.next() {
+                        self.old_skip_leaf = Some(skip);
+                    } else {
+                        drop(self.old_skips.take());
+                    }
+                    return Ok(());
+                }
+                if let Some(module) = &mut self.reconciled_drain {
+                    if module.advance(pins, old, installed)? {
+                        self.reconciled_drain = None;
+                    }
+                    return Ok(());
+                }
+                if let Some(module) = &mut self.module_drain {
+                    if module.advance() {
+                        self.module_drain = None;
+                    }
+                    return Ok(());
+                }
+                match self.reclaim_stage {
+                    0 => {
+                        if let Some(normalize) = &mut self.normalize {
+                            if normalize.reclaim_one() {
+                                self.normalize = None;
+                            }
+                        } else {
+                            self.reclaim_stage = 1;
+                        }
+                    }
+                    1 => {
+                        drop(self.normalized.take());
+                        self.reclaim_stage = 2;
+                    }
+                    2 => {
+                        if let Some(copy) = &mut self.skip_copy {
+                            if reclaim_skip(&mut copy.skip) {
+                                self.skip_copy = None;
+                            }
+                        } else {
+                            self.reclaim_stage = 3;
+                        }
+                    }
+                    3 => {
+                        if let Some(skip) = &mut self.skip_primary {
+                            if reclaim_skip(skip) {
+                                self.skip_primary = None;
+                            }
+                        } else {
+                            self.reclaim_stage = 4;
+                        }
+                    }
+                    4 => {
+                        drop(self.entry.take());
+                        self.reclaim_stage = 5;
+                    }
+                    5 => {
+                        if let Some(entries) = &mut self.entries {
+                            if let Some(entry) = entries.next() {
+                                drop(entry.object_path);
+                            } else {
+                                drop(self.entries.take());
+                            }
+                        } else {
+                            self.reclaim_stage = 6;
+                        }
+                    }
+                    6 => {
+                        drop(std::mem::take(&mut self.ids));
+                        self.reclaim_stage = 7;
+                    }
+                    7 => {
+                        if self.entry_objects.pop().is_none() {
+                            drop(std::mem::take(&mut self.entry_objects));
+                            self.reclaim_stage = 8;
+                        }
+                    }
+                    8 => {
+                        if let Some(module) = self.module.take() {
+                            self.module_drain = Some(ModuleDrain::new(module));
+                        } else {
+                            self.reclaim_stage = 9;
+                        }
+                    }
+                    9 => {
+                        if let Some(originals) = &mut self.originals {
+                            if let Some(module) = originals.next() {
+                                self.module_drain = Some(ModuleDrain::new(module));
+                            } else {
+                                drop(self.originals.take());
+                            }
+                        } else {
+                            self.reclaim_stage = 10;
+                        }
+                    }
+                    10 => {
+                        if let Some(module) = self.modules.pop() {
+                            self.reconciled_drain = Some(ReconciledDrain::new(module));
+                        } else {
+                            drop(std::mem::take(&mut self.modules));
+                            self.reclaim_stage = 11;
+                        }
+                    }
+                    11 => {
+                        if let Some(skip) = &mut self.skip_primary {
+                            if reclaim_skip(skip) {
+                                self.skip_primary = None;
+                            }
+                        } else if let Some(skip) = self.skipped.pop() {
+                            self.skip_primary = Some(skip);
+                        } else {
+                            drop(std::mem::take(&mut self.skipped));
+                            self.reclaim_stage = 12;
+                        }
+                    }
+                    12 => {
+                        if self.growth.pop_first().is_none() {
+                            drop(std::mem::take(&mut self.growth));
+                            self.reclaim_stage = 13;
+                        }
+                    }
+                    // Refunds follow actual nested/suffix/empty-root teardown.
+                    13 => {
+                        self.input_storage = None;
+                        self.reclaim_stage = 14;
+                    }
+                    14 => {
+                        self.output_storage = None;
+                        self.reclaim_stage = 15;
+                    }
+                    15 => {
+                        self.header_storage = None;
+                        self.reclaim_stage = 16;
+                    }
+                    _ => {
+                        self.phase = BindPhase::Reclaimed;
+                    }
+                }
+                Ok(())
+            }
+
+            #[cfg(test)]
+            pub(crate) fn reference_current_unpinned_for_test(
+                &self,
+            ) -> Option<(usize, &[Skipped])> {
+                let table = self.module.as_ref()?.tables.get(self.table_pos)?;
+                Some((table.unpinned.capacity(), table.unpinned.as_slice()))
+            }
+
+            #[cfg(test)]
+            pub(crate) fn reference_pending_exports_for_test(
+                &self,
+                object: PinnedObjectId,
+            ) -> Option<&[(String, u64)]> {
+                if let Some(module) = &self.reconciled_drain
+                    && module.object == object
+                {
+                    return module.exports.as_deref();
+                }
+                self.modules
+                    .iter()
+                    .find(|module| module.object == object)
+                    .map(|module| module.exports.as_ref())
+            }
+        }
+
+        struct ReconciledDrain {
+            object: PinnedObjectId,
+            module: Option<ModuleDrain>,
+            ids: Vec<Vec<PinnedObjectId>>,
+            exports: Option<Arc<[(String, u64)]>>,
+            drained: usize,
+        }
+        impl ReconciledDrain {
+            fn new(module: ReconciledModule) -> Self {
+                Self {
+                    object: module.object,
+                    module: Some(ModuleDrain::new(module.scanned)),
+                    ids: module.entry_objects,
+                    exports: Some(module.exports),
+                    drained: 0,
+                }
+            }
+            fn advance(
+                &mut self,
+                pins: Option<&PinnedObjects>,
+                old: Option<&PinnedObjects>,
+                installed: bool,
+            ) -> Result<bool, GraphRefusal> {
+                if let Some(module) = &mut self.module {
+                    if module.advance() {
+                        self.module = None;
+                    }
+                    return Ok(false);
+                }
+                if self.ids.pop().is_some() {
+                    return Ok(false);
+                }
+                if self.ids.capacity() != 0 {
+                    drop(std::mem::take(&mut self.ids));
+                    return Ok(false);
+                }
+                if let Some(exports) = self.exports.as_mut() {
+                    let live_alias = pins
+                        .and_then(|pins| pins.by_id.get(&self.object))
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports));
+                    let old_alias = old
+                        .and_then(|pins| pins.by_id.get(&self.object))
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports));
+                    if live_alias || old_alias {
+                        drop(self.exports.take());
+                        return Ok(false);
+                    }
+                    if installed && Arc::strong_count(exports) > 1 {
+                        // Installed mode only: a Session-held clone proves our
+                        // drop cannot be the last one. Release our share as
+                        // one leaf instead of forgetting the graph.
+                        drop(self.exports.take());
+                        return Ok(false);
+                    }
+                    let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                    if self.drained < slice.len() {
+                        drop(std::mem::take(&mut slice[self.drained].0));
+                        self.drained += 1;
+                        return Ok(false);
+                    }
+                    // The same approved final-layout transition as H1. No
+                    // mutable/public Arc exposure exists in reclamation.
+                    let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                    if slice.len() != self.drained {
+                        return Err(GraphRefusal::Identity);
+                    }
+                    let exports = self.exports.take().ok_or(GraphRefusal::Identity)?;
+                    // SAFETY: each owned String was taken/freed individually;
+                    // get_mut just re-proved exclusivity/noWeak, drained==len,
+                    // and the original allocation/metadata is transferred once.
+                    unsafe {
+                        deallocate_drained_unique_arc(exports);
+                    }
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+
+        #[test]
+        fn file_share_release_requires_actual_live_alias() {
+            let (_dir, source, _) = super::super::tests::conservative_cursor_fixture();
+            let (id, original) = source.by_id.first_key_value().unwrap();
+            let id = *id;
+            let actual_fd = original.file.as_raw_fd();
+            let mut independent = source.clone();
+            let reopened = std::fs::File::open(&original.path).unwrap();
+            assert_ne!(reopened.as_raw_fd(), actual_fd);
+            assert_eq!(pin_of(&reopened).unwrap(), original.pin);
+            independent.by_id.get_mut(&id).unwrap().file = Arc::new(reopened);
+            let mut wrong = source.clone();
+            let different = source
+                .by_id
+                .range((Excluded(id), Unbounded))
+                .next()
+                .unwrap()
+                .1;
+            wrong.by_id.get_mut(&id).unwrap().file = different.file.clone();
+            let mut entry = EntryReclaim::new(id, original.clone());
+            for _ in 0..4 {
+                assert!(!entry.advance(None).unwrap());
+            }
+            assert_eq!(
+                entry.field, 4,
+                "actual leaf progress reached the file share"
+            );
+            for borrowed in [None, Some(&independent), Some(&wrong)] {
+                assert!(matches!(
+                    entry.advance(borrowed),
+                    Err(GraphRefusal::Identity)
+                ));
+                assert_eq!(entry.field, 4);
+                assert!(
+                    entry
+                        .file
+                        .as_ref()
+                        .is_some_and(|file| file.as_raw_fd() == actual_fd)
+                );
+                // SAFETY: F_GETFD observes this actual owned descriptor only.
+                assert!(unsafe { libc::fcntl(actual_fd, libc::F_GETFD) } >= 0);
+            }
+            assert!(!entry.advance(Some(&source)).unwrap());
+            assert_eq!(entry.field, 5);
+            assert!(entry.file.is_none());
+            // The borrowed SAME Arc remains live after releasing our share.
+            assert!(unsafe { libc::fcntl(actual_fd, libc::F_GETFD) } >= 0);
+        }
+    }
+}
+
+const AMBIGUOUS_SUBJECT: &str = "discovery subject";
+const AMBIGUOUS_REASON: &str = "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached";
+
 fn ambiguous_identity_skip() -> Skipped {
     Skipped {
-        subject: "discovery subject".into(),
-        reason: "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached".into(),
+        subject: AMBIGUOUS_SUBJECT.into(),
+        reason: AMBIGUOUS_REASON.into(),
     }
 }
 
@@ -1616,6 +6274,8 @@ fn same_open_file(left: &Entry, right: &Entry) -> bool {
 }
 
 fn same_kernel_file(left: &std::fs::File, right: &std::fs::File) -> bool {
+    #[cfg(test)]
+    provider_metadata_read_test::metadata_read();
     match (left.metadata(), right.metadata()) {
         (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
         _ => false,
@@ -1710,8 +6370,52 @@ pub(crate) fn open_view_object_cached(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, ObjectKey), String> {
-    let (file, mountinfo) =
-        view.open_then_cached_mountinfo(|| open_regular(path), mounts, budget)?;
+    open_view_object_with(
+        view,
+        |_: &crate::process::ViewFilesystem<'_>| open_regular(path),
+        mounts,
+        budget,
+    )
+}
+
+pub(crate) fn open_view_rooted_object_cached(
+    view: &ProcessView,
+    path: &Path,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    open_view_object_with(
+        view,
+        |filesystem| filesystem.open_rooted(path),
+        mounts,
+        budget,
+    )
+}
+
+pub(crate) fn open_view_executable_cached(
+    view: &ProcessView,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    open_view_object_with(
+        view,
+        |filesystem| {
+            filesystem
+                .open_executable()
+                .map_err(|error| error.to_string())
+        },
+        mounts,
+        budget,
+    )
+}
+
+fn open_view_object_with(
+    view: &ProcessView,
+    open: impl FnOnce(&crate::process::ViewFilesystem<'_>) -> Result<std::fs::File, String>,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    let (file, mountinfo) = view.open_then_cached_mountinfo(open, mounts, budget)?;
     let first = identity_of_in_mountinfo(&file, mountinfo);
     let key = object_key(identity_in_cached_table(
         view, &file, first, mounts, budget,
@@ -1727,15 +6431,6 @@ pub fn view_object_key(
     Ok(open_view_object(view, path, budget)?.1)
 }
 
-pub(crate) fn view_object_key_cached(
-    view: &ProcessView,
-    path: &Path,
-    mounts: &mut MountTableCache,
-    budget: &mut CaptureWorkBudget,
-) -> Result<ObjectKey, String> {
-    Ok(open_view_object_cached(view, path, mounts, budget)?.1)
-}
-
 /// The cached-table form of the rule above: a missing mount row still forces
 /// exactly one fresh read of the table, under the same retained view checks.
 fn identity_in_cached_table(
@@ -1748,7 +6443,7 @@ fn identity_in_cached_table(
     reread_on_missing_mount(first, file, || {
         mounts.invalidate();
         Ok(view
-            .open_then_cached_mountinfo(|| Ok(()), mounts, budget)?
+            .open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?
             .1
             .to_owned())
     })
@@ -1799,7 +6494,7 @@ pub(crate) fn retained_object_key_cached(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ObjectKey, String> {
-    let ((), mountinfo) = view.open_then_cached_mountinfo(|| Ok(()), mounts, budget)?;
+    let ((), mountinfo) = view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?;
     let first = identity_of_in_mountinfo(file, mountinfo);
     Ok(object_key(identity_in_cached_table(
         view, file, first, mounts, budget,
@@ -1887,6 +6582,23 @@ pub(crate) fn self_mapped_fallback_key(
     )
 }
 
+/// [`self_mapped_fallback_key`] with the full probe answer: the pin-time
+/// drain latches [`PROBED_MAPS_UNPROVEN_NOTE`] on `Inconclusive`, where the
+/// snapshot retry only needs the `Split` key.
+pub(crate) fn self_mapped_fallback_detailed(
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> SelfMappedFallback {
+    p11scope_manifest::identity::self_mapped_fallback_detailed(
+        file,
+        fd_key,
+        &mut BudgetAdapter(budget),
+        probe,
+    )
+}
+
 /// Structural validation + open + size cap + identity match + executable-offset check.
 /// Opens, identifies, and pins every object. Errors are aggregated so an
 /// operator sees every stale or malformed target in one run.
@@ -1923,6 +6635,10 @@ impl StaleManifestObject {
 pub struct ManifestPinning {
     pub pins: PinnedObjects,
     pub stale: Vec<StaleManifestObject>,
+    /// Per-object pin failures that must not abort siblings: each bad
+    /// object becomes one gap (PARTIAL) while good pins continue.
+    /// `Invalid` (structural) and whole-budget refusals stay `Err`.
+    pub skipped: Vec<Skipped>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2089,15 +6805,159 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
     views: &[ProcessView],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views_with_probe(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        0,
+        0,
+    )
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_budget`] with an injected
+/// self-mapping probe, so unit tests can script the kernel side of a
+/// pre-6.8 overlay split. Production always passes the kernel probe.
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+    prior_objects: usize,
+    prior_bytes: u64,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(
+        m,
+        views,
+        budget,
+        probe,
+        false,
+        prior_objects,
+        prior_bytes,
+    )
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_budget`] charging
+/// already-retained capture-level pins (packet 6.13 round-3, finding 3):
+/// inventory retains `--prearm-module` pins before manifests pin, so the
+/// manifest side charges that usage against the shared 512-object/512-MiB
+/// manifest+pre-arm budget (R2-D1-3). Mirrors the run path, where pre-arm
+/// pinning charges already-pinned manifest usage instead.
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    prior_objects: usize,
+    prior_bytes: u64,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views_with_probe(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        prior_objects,
+        prior_bytes,
+    )
+}
+
+/// Pins count-manifest objects, sharing the scan's inspection cache and
+/// actual read allowance. `prior_objects`/`prior_bytes` are
+/// already-retained capture-level pins (packet 6.13 round-3, finding 3):
+/// per-pass count-manifest pins coexist with the run-retained pre-arm
+/// pins, so they charge the same shared object/byte budget.
+pub(crate) fn pin_count_manifest_objects_in_views_with_prior(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    prior_objects: usize,
+    prior_bytes: u64,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        true,
+        prior_objects,
+        prior_bytes,
+    )
+}
+
+fn inspect_count_manifest_file(
+    file: &std::fs::File,
+    before: Pin,
+    mapping: MappingFileKey,
+    budget: &mut CaptureWorkBudget,
+) -> Result<InspectedObject, String> {
+    budget.spend(1).map_err(str::to_owned)?;
+    let key = object_key(mapping);
+    let cache_key = InspectedFileKey {
+        device: key.device,
+        inode: key.inode,
+        pin: before,
+    };
+    if let Some(inspected) = budget.inspected_file(&cache_key) {
+        if pin_of(file)? == before {
+            return Ok(inspected);
+        }
+        return Err("file changed while its cached identity was checked".into());
+    }
+    if before.size > budget.limits().per_object_bytes {
+        return Err("manifest object exceeds the collection per-object read allowance".into());
+    }
+    let mut operation_bytes = 0u64;
+    let inspected = inspect_file_with_reader_exporting(
+        file,
+        |file, bytes, offset| {
+            if let Some(reason) = budget.check_deadline_now() {
+                return Err(std::io::Error::other(reason));
+            }
+            let allowed = budget.allowed_io(operation_bytes, bytes.len());
+            if allowed == 0 {
+                return Err(std::io::Error::other(IO_CEILING_REASON));
+            }
+            let read = file.read_at(&mut bytes[..allowed], offset)?;
+            budget.record_io(read);
+            operation_bytes = operation_bytes.saturating_add(read as u64);
+            Ok(read)
+        },
+        &standard_function_names(),
+    )?;
+    if pin_of(file)? != before {
+        return Err("file changed while it was being identified".into());
+    }
+    budget.note_inspected_file(cache_key, inspected.clone());
+    Ok(inspected)
+}
+
+fn pin_manifest_objects_with_read_policy(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+    meter_identity: bool,
+    prior_objects: usize,
+    prior_bytes: u64,
+) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
         return Err(ManifestPinError::Invalid(structural));
     }
+    // Shared capture-level budget (packet 6.13 round-3, finding 3): this
+    // manifest's objects charge against already-retained pins (pre-arm in
+    // inventory; nothing yet on the run path, where pre-arm charges the
+    // other way instead). The object check runs before any open, so an
+    // over-budget manifest refuses without touching its files.
+    if prior_objects.saturating_add(m.objects.len()) > MAX_OBJECTS {
+        return Err(ManifestPinError::Fatal(vec![format!(
+            "manifest and pre-arm objects total more than the {MAX_OBJECTS}-object limit"
+        )]));
+    }
 
-    let mut problems = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     let mut stale = Vec::new();
     let mut pinned = Vec::new();
-    let mut total_object_bytes = 0u64;
+    let mut total_object_bytes = prior_bytes;
     for object in &m.objects {
         let path = Path::new(&object.path);
         let retained = match retained_view_for_manifest_locator(&object.path, views) {
@@ -2105,26 +6965,31 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
             Err(binding_error) => {
                 // Preserve the actionable permission diagnostic for an inaccessible
                 // locator, but never open or accept an unbound proc-root object.
-                match path.try_exists() {
+                // Never-stop: one bad object becomes a gap, siblings continue.
+                let detail = match path.try_exists() {
                     Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                        problems.push(format!(
-                            "{}: cannot inspect the file locator now ({error})",
-                            object.path
-                        ));
+                        format!("cannot inspect the file locator now ({error})")
                     }
-                    _ => problems.push(binding_error),
-                }
+                    _ => binding_error,
+                };
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {detail}"),
+                });
                 continue;
             }
         };
         let (opened, mountinfo) = match retained {
             Some(view) => {
                 match view
-                    .open_then_mountinfo(|| Ok::<_, String>(open_manifest_locator(path)), budget)
+                    .open_then_mountinfo(|_| Ok::<_, String>(open_manifest_locator(path)), budget)
                 {
                     Ok((opened, mountinfo)) => (opened, Some(mountinfo)),
                     Err(error) => {
-                        problems.push(format!("{}: {error}", object.path));
+                        skipped.push(Skipped {
+                            subject: object.path.clone(),
+                            reason: format!("manifest object unavailable: {error}"),
+                        });
                         continue;
                     }
                 }
@@ -2146,7 +7011,10 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
                 continue;
             }
             ManifestLocatorOpen::Fatal(error) => {
-                problems.push(error);
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
@@ -2159,7 +7027,10 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
                 {
                     Ok(table) => table,
                     Err(error) => {
-                        problems.push(format!("{}: {error}", object.path));
+                        skipped.push(Skipped {
+                            subject: object.path.clone(),
+                            reason: format!("manifest object unavailable: {error}"),
+                        });
                         continue;
                     }
                 };
@@ -2169,61 +7040,97 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
         let pin = match pin_of(&file) {
             Ok(pin) => pin,
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
         let len = pin.size;
         let Some(total) = total_object_bytes.checked_add(len) else {
-            problems.push("total object size overflowed u64".into());
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: "manifest object unavailable: total object size overflowed u64".into(),
+            });
             continue;
         };
         if total > MAX_TOTAL_OBJECT_BYTES {
-            problems.push(format!(
-                "manifest objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-            ));
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: format!(
+                    "manifest object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                ),
+            });
             continue;
         }
         total_object_bytes = total;
         pinned.push((object, file, pin, mountinfo));
     }
-    if !problems.is_empty() {
-        return Err(ManifestPinError::Fatal(problems));
-    }
 
     let mut opened = BTreeMap::new();
     for (object, file, pin, mountinfo) in pinned {
-        let inspected = match inspect_file_with_reader_exporting(
-            &file,
-            |file, bytes, offset| file.read_at(bytes, offset),
-            &standard_function_names(),
-        ) {
+        let count_mapping = if meter_identity {
+            match identity_of_manifest(&file, mountinfo.as_deref()) {
+                Ok(mapping) => Some(mapping),
+                Err(error) => {
+                    skipped.push(Skipped {
+                        subject: object.path.clone(),
+                        reason: format!("manifest object unavailable: {error}"),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let inspected = match if let Some(mapping) = count_mapping {
+            inspect_count_manifest_file(&file, pin, mapping, budget)
+        } else {
+            inspect_file_with_reader_exporting(
+                &file,
+                |file, bytes, offset| file.read_at(bytes, offset),
+                &standard_function_names(),
+            )
+        } {
             Ok(inspected) => inspected,
             Err(error) => {
-                problems.push(format!(
-                    "{}: cannot identify the file now ({error})",
-                    object.path
-                ));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!(
+                        "manifest object unavailable: cannot identify the file now ({error})"
+                    ),
+                });
                 continue;
             }
         };
         // The pin was taken before the bytes were hashed; a write that lands
         // during the hash must not become the baseline the capture trusts.
+        // The clock read precedes the verification it timestamps, so the
+        // pin-time `last_ok_ns` can only understate the proven-ok instant.
+        let verified_ns = crate::attach::monotonic_ns();
         match pin_of(&file) {
             Ok(after) if after == pin => {}
             Ok(_) => {
-                problems.push(format!(
-                    "{}: file changed while it was being identified — retry",
-                    object.path
-                ));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: "manifest object unavailable: file changed while it was being identified — retry".into(),
+                });
                 continue;
             }
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         }
-        let mut offsets_valid = true;
+        // One gap per object, not per function: count the bad offsets and
+        // name the first, so a 67-function manifest with all offsets bad
+        // records one skip, not 67.
+        let mut bad_offsets = 0usize;
+        let mut first_bad: Option<(String, u64)> = None;
         let surface_functions = m.surfaces.iter().flat_map(|surface| &surface.functions);
         let selection_functions = m
             .selection_evidence
@@ -2239,32 +7146,61 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
                 continue;
             };
             if target == object.id && !inspected.contains_executable_offset(file_offset) {
-                problems.push(format!(
-                    "{}: {}+{file_offset:#x} is outside every executable ELF segment",
-                    function.name, object.path
-                ));
-                offsets_valid = false;
+                bad_offsets += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((function.name.clone(), file_offset));
+                }
             }
         }
-        if !offsets_valid {
+        if let Some((name, file_offset)) = first_bad {
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: format!(
+                    "manifest object unavailable: {bad_offsets} function offset(s) outside every executable ELF segment, first {name}+{file_offset:#x}"
+                ),
+            });
             continue;
         }
-        let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
+        let mapping = match count_mapping
+            .map(Ok)
+            .unwrap_or_else(|| identity_of_manifest(&file, mountinfo.as_deref()))
+        {
             Ok(mapping) => mapping,
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
         let key = object_key(mapping);
         let Some(raw) = RawObjectInstance::manifest(key, object.path.clone()) else {
-            problems.push(format!("{}: object path cannot be normalized", object.path));
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: "manifest object unavailable: object path cannot be normalized".into(),
+            });
             continue;
         };
-        let entry = match Entry::new(file, pin, object.path.clone(), &inspected, raw, mapping) {
+        let held = meter_identity
+            .then(|| budget.retained_mapped_identity(&file))
+            .flatten();
+        let mut entry = match Entry::new(
+            file,
+            pin,
+            object.path.clone(),
+            &inspected,
+            raw,
+            mapping,
+            held,
+            verified_ns,
+        ) {
             Ok(entry) => entry,
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
@@ -2290,44 +7226,396 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
             drop(entry);
             continue;
         }
+        // A pre-6.8 overlay fd renders in maps at a different key than
+        // the mount table resolves; record the kernel rendering of this
+        // exact held fd on the entry so the provider proof matches it.
+        // An inconclusive probe latches the named unproven note instead:
+        // the fd key stays primary, and no caller stays unbound silently.
+        // Never a second manifest raw: the one-manifest-raw-per-path
+        // invariant behind `id_for_path` holds.
+        match if held.is_some() {
+            SelfMappedFallback::Agrees
+        } else {
+            self_mapped_fallback_detailed(&entry.file, key, budget, probe)
+        } {
+            SelfMappedFallback::Split(probed) => {
+                entry.probed_maps_key = Some(probed);
+            }
+            SelfMappedFallback::Agrees => {}
+            SelfMappedFallback::Inconclusive => {
+                entry.probed_maps_unproven = true;
+            }
+        }
         opened.insert(object.id, (entry, inspected));
     }
 
-    if !problems.is_empty() {
-        return Err(ManifestPinError::Fatal(problems));
-    }
     let mut result = PinnedObjects::empty();
     for (entry, _) in opened.into_values() {
         let path = entry.path.clone();
-        let mut skipped = Vec::new();
-        if result.insert_entry(entry, &mut skipped).is_none() {
-            problems.extend(
-                skipped
-                    .into_iter()
-                    .map(|skip| format!("{path}: {}", skip.reason)),
-            );
+        let mut insert_skipped = Vec::new();
+        if result.insert_entry(entry, &mut insert_skipped).is_none() {
+            skipped.extend(insert_skipped.into_iter().map(|skip| Skipped {
+                subject: path.clone(),
+                reason: format!("manifest object unavailable: {}", skip.reason),
+            }));
         }
-    }
-    if !problems.is_empty() {
-        return Err(ManifestPinError::Fatal(problems));
     }
     Ok(ManifestPinning {
         pins: result,
         stale,
+        skipped,
     })
 }
 
 /// Strict compatibility API for callers that have no scan fallback context.
 pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> {
     match pin_manifest_objects_deferred(m) {
-        Ok(result) if result.stale.is_empty() => Ok(result.pins),
+        Ok(result) if result.stale.is_empty() && result.skipped.is_empty() => Ok(result.pins),
         Ok(result) => Err(result
             .stale
             .into_iter()
-            .map(|stale| stale.diagnostic)
+            .map(|stale| stale.diagnostic().to_string())
+            .chain(
+                result
+                    .skipped
+                    .into_iter()
+                    .map(|skip| format!("{}: {}", skip.subject, skip.reason)),
+            )
             .collect()),
         Err(error) => Err(error.problems().to_vec()),
     }
+}
+
+/// One `--prearm-module` path resolved and pinned (packet 6.13, R2-D1-1/2).
+/// The pin itself lives in [`PrearmPinning::pins`] under a pre-arm raw; this
+/// records the R2-D1-2(b) provenance split the plan lowers.
+#[derive(Debug, Clone)]
+pub(crate) struct PrearmPinnedInput {
+    /// Normalized operator spelling: messages, raws and plan pieces. Never
+    /// attach identity (attach uses the retained fd only).
+    pub(crate) path: String,
+    pub(crate) key: ObjectKey,
+    /// Standard-name `.dynsym` definitions proved executable in held bytes.
+    pub(crate) proved: Vec<(String, u64)>,
+    /// Standard-name exports not proved executable: disclosed as skipped.
+    pub(crate) non_executable: Vec<(String, u64)>,
+}
+
+/// Every `--prearm-module` pin of one capture: the pin union plus the
+/// per-path provenance splits, in flag order.
+#[derive(Debug)]
+pub(crate) struct PrearmPinning {
+    pub(crate) pins: PinnedObjects,
+    pub(crate) inputs: Vec<PrearmPinnedInput>,
+    /// Per-path pin failures that must not abort siblings: each bad path
+    /// becomes one gap (PARTIAL) while good pins continue. Whole-budget
+    /// refusals stay `Err`.
+    pub(crate) skipped: Vec<Skipped>,
+}
+
+/// Pre-arm pinning refuses whole only on whole-input failures (shared
+/// object budget); one bad path gaps that path (PARTIAL), never the set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrearmPinError {
+    Fatal(Vec<String>),
+}
+
+impl PrearmPinError {
+    pub(crate) fn problems(&self) -> &[String] {
+        match self {
+            Self::Fatal(problems) => problems,
+        }
+    }
+}
+
+/// Pins `--prearm-module` paths through the existing worker discipline
+/// (packet 6.13, R2-D1-1/2/3): open-first, `(ino, size, ctime)` bracket,
+/// whole-file hash, attach via `/proc/self/fd/N` only. Value resolution is
+/// manifest-locator resolution through retained views — an explicit
+/// canonical `/proc/<pid>/root/...` locator binds to that retained view;
+/// otherwise `--pid` resolves against the named view's root and every
+/// other scope against the observer root — never bounded-JSON manifest
+/// reads, never a pathname at attach. Paths must be absolute; one bad
+/// path fails all-or-nothing. Object and byte accounting is shared with
+/// the already-pinned manifest inputs (`prior_objects`/`prior_bytes`
+/// against the same 512-object/512-MiB caps); admission caps are unchanged
+/// and no new knobs are added.
+pub(crate) fn pin_prearm_objects_in_views_with_budget(
+    paths: &[PathBuf],
+    views: &[ProcessView],
+    named_pid: Option<u32>,
+    prior_objects: usize,
+    prior_bytes: u64,
+    budget: &mut CaptureWorkBudget,
+) -> Result<PrearmPinning, PrearmPinError> {
+    let mut skipped: Vec<Skipped> = Vec::new();
+    if prior_objects.saturating_add(paths.len()) > MAX_OBJECTS {
+        return Err(PrearmPinError::Fatal(vec![format!(
+            "manifest and pre-arm objects total more than the {MAX_OBJECTS}-object limit"
+        )]));
+    }
+    // Phase 1: resolve and open every path; one bad path becomes a gap
+    // while good paths continue (never-stop).
+    let mut opened = Vec::new();
+    let mut total_object_bytes = prior_bytes;
+    for path in paths {
+        let spelling = path.to_string_lossy().into_owned();
+        if normalize_target_path(&spelling).is_none() {
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: "prearm object unavailable: --prearm-module paths must be absolute".into(),
+            });
+            continue;
+        }
+        enum PrearmRoot<'a> {
+            NamedView {
+                view: &'a ProcessView,
+                open: PathBuf,
+            },
+            Observer {
+                open: PathBuf,
+            },
+        }
+        let root = match retained_view_for_manifest_locator(&spelling, views) {
+            Ok(Some(view)) => PrearmRoot::NamedView {
+                view,
+                open: path.clone(),
+            },
+            Ok(None) => match named_pid {
+                Some(pid) => match views.iter().find(|view| view.pid() == pid) {
+                    Some(view) => PrearmRoot::NamedView {
+                        view,
+                        open: PathBuf::from(format!("/proc/{pid}/root"))
+                            .join(spelling.trim_start_matches('/')),
+                    },
+                    None => {
+                        skipped.push(Skipped {
+                            subject: spelling.clone(),
+                            reason: format!(
+                                "prearm object unavailable: no exact retained process view exists for pid {pid}"
+                            ),
+                        });
+                        continue;
+                    }
+                },
+                None => PrearmRoot::Observer { open: path.clone() },
+            },
+            Err(binding_error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {binding_error}"),
+                });
+                continue;
+            }
+        };
+        let (located, mountinfo) = match root {
+            PrearmRoot::NamedView { view, open } => {
+                match view
+                    .open_then_mountinfo(|_| Ok::<_, String>(open_manifest_locator(&open)), budget)
+                {
+                    Ok((located, mountinfo)) => (located, Some(mountinfo)),
+                    Err(error) => {
+                        skipped.push(Skipped {
+                            subject: spelling.clone(),
+                            reason: format!("prearm object unavailable: {error}"),
+                        });
+                        continue;
+                    }
+                }
+            }
+            PrearmRoot::Observer { open } => (open_manifest_locator(&open), None),
+        };
+        let file = match located {
+            ManifestLocatorOpen::Opened(file) => file,
+            ManifestLocatorOpen::Stale => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason:
+                        "prearm object unavailable: the pre-arm file locator no longer resolves"
+                            .into(),
+                });
+                continue;
+            }
+            ManifestLocatorOpen::Fatal(error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
+                continue;
+            }
+        };
+        let mountinfo = match mountinfo {
+            Some(mountinfo) => Some(mountinfo),
+            None => {
+                let table = match std::fs::File::open("/proc/self/mountinfo")
+                    .map_err(|error| format!("cannot open observer mount table: {error}"))
+                    .and_then(|table| read_mountinfo(table, budget))
+                {
+                    Ok(table) => table,
+                    Err(error) => {
+                        skipped.push(Skipped {
+                            subject: spelling.clone(),
+                            reason: format!("prearm object unavailable: {error}"),
+                        });
+                        continue;
+                    }
+                };
+                Some(table)
+            }
+        };
+        let pin = match pin_of(&file) {
+            Ok(pin) => pin,
+            Err(error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
+                continue;
+            }
+        };
+        let Some(total) = total_object_bytes.checked_add(pin.size) else {
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: "prearm object unavailable: total object size overflowed u64".into(),
+            });
+            continue;
+        };
+        if total > MAX_TOTAL_OBJECT_BYTES {
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: format!(
+                    "prearm object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                ),
+            });
+            continue;
+        }
+        total_object_bytes = total;
+        opened.push((spelling, file, pin, mountinfo));
+    }
+
+    // Phase 2: identify, hash, bracket and file every opened object.
+    let mut pins = PinnedObjects::empty();
+    let mut inputs = Vec::new();
+    for (spelling, file, pin, mountinfo) in opened {
+        let inspected = match inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        ) {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!(
+                        "prearm object unavailable: cannot identify the file now ({error})"
+                    ),
+                });
+                continue;
+            }
+        };
+        // The pin was taken before the bytes were hashed; a write that lands
+        // during the hash must not become the baseline the capture trusts.
+        // The clock read precedes the verification it timestamps.
+        let verified_ns = crate::attach::monotonic_ns();
+        match pin_of(&file) {
+            Ok(after) if after == pin => {}
+            Ok(_) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: "prearm object unavailable: file changed while it was being identified — retry"
+                        .into(),
+                });
+                continue;
+            }
+            Err(error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
+                continue;
+            }
+        }
+        let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
+                continue;
+            }
+        };
+        let key = object_key(mapping);
+        let Some(raw) = RawObjectInstance::prearm(key, spelling.clone()) else {
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: "prearm object unavailable: object path cannot be normalized".into(),
+            });
+            continue;
+        };
+        let input_path = raw.path.clone();
+        let mut entry = match Entry::new(
+            file,
+            pin,
+            spelling.clone(),
+            &inspected,
+            raw,
+            mapping,
+            None,
+            verified_ns,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
+                continue;
+            }
+        };
+        // Same pin-time self-mapping proof as manifest objects: record how
+        // the kernel renders this exact held fd when it differs (pre-6.8
+        // overlay split), or latch the unproven note when inconclusive.
+        match self_mapped_fallback_detailed(&entry.file, key, budget, &KernelSelfMappingProbe) {
+            SelfMappedFallback::Split(probed) => {
+                entry.probed_maps_key = Some(probed);
+            }
+            SelfMappedFallback::Agrees => {}
+            SelfMappedFallback::Inconclusive => {
+                entry.probed_maps_unproven = true;
+            }
+        }
+        let mut insert_skipped = Vec::new();
+        if pins.insert_entry(entry, &mut insert_skipped).is_none() {
+            skipped.extend(insert_skipped.into_iter().map(|skip| Skipped {
+                subject: spelling.clone(),
+                reason: format!("prearm object unavailable: {}", skip.reason),
+            }));
+            continue;
+        }
+        // R2-D1-2(b): only defined exports proved executable in held bytes
+        // lower pre-mapping; the rest wait for scan corroboration.
+        let mut proved = Vec::new();
+        let mut non_executable = Vec::new();
+        for (name, offset) in &inspected.exports {
+            if inspected.contains_executable_offset(*offset) {
+                proved.push((name.clone(), *offset));
+            } else {
+                non_executable.push((name.clone(), *offset));
+            }
+        }
+        inputs.push(PrearmPinnedInput {
+            path: input_path,
+            key,
+            proved,
+            non_executable,
+        });
+    }
+    Ok(PrearmPinning {
+        pins,
+        inputs,
+        skipped,
+    })
 }
 
 /// Opens, identity-checks, hashes once and pins every object the scan named. Objects
@@ -2347,7 +7635,7 @@ pub fn pin_scanned_objects(
     let id = modules
         .first()
         .map_or(ProcessViewId(0), |module| module.view);
-    let view = ProcessView::open(id, pid)?;
+    let view = ProcessView::open_with_budget(id, pid, budget)?;
     let (local, mut skipped) = pin_scanned_view_objects(&view, modules, budget)?;
     let mut aggregate = PinnedObjects::empty();
     skipped.extend(aggregate.absorb(local));
@@ -2359,11 +7647,11 @@ pub fn pin_scanned_view_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_identity)
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file)
 }
 
-/// Reads a pinned fd's `vm_file` identity ([`self_mapped_identity`]).
-type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<FileIdentity, String>;
+/// Reads a pinned fd's `vm_file` identity ([`self_mapped_file`]).
+type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, String>;
 
 /// [`pin_scanned_view_objects`] with the pinned fd's `vm_file` identity
 /// read through `pinned_identity` (a seam: following `map_files` needs
@@ -2429,7 +7717,8 @@ fn pin_scanned_view_objects_with(
         let candidate = pin_scanned_object(
             view,
             raw.clone(),
-            scanned.map(|scanned| (scanned, pinned_identity)),
+            scanned,
+            pinned_identity,
             &mut mounts,
             budget,
         );
@@ -2511,6 +7800,32 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
     (canonical.len(), lost)
 }
 
+/// Refusal suffix for a forwarded bootstrap the pinned target does not
+/// define, appended to the target path. Shared by both bind paths, so the
+/// refusal reads identically however the table was bound.
+pub(crate) const UNVERIFIED_FORWARD_REFUSAL: &str =
+    " does not define C_GetFunctionList at the forwarded offset; entry was not attached";
+
+/// Whether a `C_GetFunctionList` entry forwarded out of its module is a
+/// genuine linker interposition: the pinned target object's own `.dynsym`
+/// definitions must define `C_GetFunctionList` exactly at the entry's file
+/// offset. The dynamic linker resolves that relocation by name, so a
+/// genuine forward always satisfies this; a wrong export, a stale mapping,
+/// or a non-provider target (no standard exports) stays unproven and the
+/// entry is refused at bind time, keeping export agreement fail-closed.
+/// Pure over caller-held pin evidence — no I/O. Both bind paths
+/// ([`bind_scanned_modules`] and the conservative cursor's `EntryResolve`)
+/// apply it identically.
+pub(crate) fn forwarded_bootstrap_verified(
+    entry: &ScannedEntry,
+    target_exports: &[(String, u64)],
+) -> bool {
+    entry.name == "C_GetFunctionList"
+        && target_exports
+            .iter()
+            .any(|(name, offset)| name == entry.name && *offset == entry.file_offset)
+}
+
 /// Resolves every process-view-local mapping reference to its final capture-local
 /// opened identity. It does not apply overlay heuristics, so callers can bind after
 /// manifest absorption without moving manifest authority between scan peers.
@@ -2518,6 +7833,7 @@ pub fn bind_scanned_modules(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
 ) -> (Vec<ReconciledModule>, Vec<Skipped>) {
+    pinned.bump_copy_version();
     let mut reconciled = Vec::new();
     let mut lost = Vec::new();
     for module in modules {
@@ -2553,8 +7869,27 @@ pub fn bind_scanned_modules(
                             (Some(target), Some(provider)) if target == provider
                         ) =>
                     {
-                        ids.push(id);
-                        kept.push(entry);
+                        // A cross-object bootstrap forward must resolve by
+                        // name in the pinned target's own exports; anything
+                        // else is refused, keeping export agreement
+                        // fail-closed (see `forwarded_bootstrap_verified`).
+                        if entry.object != module.key
+                            && entry.name == "C_GetFunctionList"
+                            && !forwarded_bootstrap_verified(&entry, &pinned.exports_for(id))
+                        {
+                            let skip = Skipped {
+                                subject: entry.name.to_string(),
+                                reason: format!(
+                                    "{}{UNVERIFIED_FORWARD_REFUSAL}",
+                                    entry.object_path
+                                ),
+                            };
+                            table.unpinned.push(skip.clone());
+                            lost.push(skip);
+                        } else {
+                            ids.push(id);
+                            kept.push(entry);
+                        }
                     }
                     candidate => {
                         let skip = Skipped {
@@ -2590,11 +7925,14 @@ pub fn bind_scanned_modules(
                 claims.pins.push(*id);
             }
         }
+        let (getter_present, witness_fault) = pinned.export_witness_flags_for(object);
         reconciled.push(ReconciledModule {
             scanned,
             object,
             entry_objects,
             exports: pinned.exports_for(object),
+            getter_present,
+            witness_fault,
         });
     }
     (reconciled, lost)
@@ -2617,13 +7955,14 @@ pub fn reconcile_scanned_modules(
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
-    scanned: Option<(FileIdentity, ReadPinnedIdentity<'_>)>,
+    scanned: Option<FileIdentity>,
+    pinned_identity: ReadPinnedIdentity<'_>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
     let (file, mountinfo) = view.open_then_cached_mountinfo(
-        || open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path))),
+        |filesystem| filesystem.open_rooted_object(Path::new(&raw.path)),
         mounts,
         budget,
     )?;
@@ -2647,10 +7986,15 @@ fn pin_scanned_object(
             object_key(found),
         ));
     }
-    if let Some((scanned, pinned_identity)) = scanned {
-        check_same_scanned_file(scanned, pinned_identity(&file))?;
-    }
     let before = pin_of(&file)?;
+    let mapped = budget
+        .retained_mapped_identity(&file)
+        .map(Ok)
+        .unwrap_or_else(|| pinned_identity(&file));
+    if let Some(scanned) = scanned {
+        check_same_scanned_file(scanned, mapped.clone().map(|mapped| mapped.identity))?;
+    }
+    let mapped = mapped.ok();
     // The per-file rule can be decided from metadata. Aggregate admission happens
     // incrementally at the reader below, and a partial digest is never trusted.
     if before.size > budget.limits().per_object_bytes {
@@ -2661,7 +8005,7 @@ fn pin_scanned_object(
         ));
     }
     #[cfg(test)]
-    tests::run_before_hash_test_hook();
+    tests::run_before_hash_test_hook(budget);
     // A repeat pin of the unchanged file reuses the cached inspection with zero
     // reads. The key's (device, inode) is the mountinfo-validated identity above.
     let validated = object_key(found);
@@ -2673,8 +8017,19 @@ fn pin_scanned_object(
     if let Some(inspected) = budget.inspected_file(&cache_key) {
         // Nothing was read for this hit, but the file may have changed since
         // `before`; only the still-unchanged file may reuse the cached value.
+        // The clock read precedes the verification it timestamps.
+        let verified_ns = crate::attach::monotonic_ns();
         if pin_of(&file)? == before {
-            return Entry::new(file, before, raw.path.clone(), &inspected, raw, found);
+            return Entry::new(
+                file,
+                before,
+                raw.path.clone(),
+                &inspected,
+                raw,
+                found,
+                mapped,
+                verified_ns,
+            );
         }
     }
     let mut operation_bytes = 0u64;
@@ -2697,12 +8052,23 @@ fn pin_scanned_object(
     )?;
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
+    // The clock read precedes the verification it timestamps.
+    let verified_ns = crate::attach::monotonic_ns();
     if pin_of(&file)? != before {
         return Err("file changed while it was being identified — retry".into());
     }
     // Only the stable read lands here: a file that changed mid-read is never cached.
     budget.note_inspected_file(cache_key, inspected.clone());
-    Entry::new(file, before, raw.path.clone(), &inspected, raw, found)
+    Entry::new(
+        file,
+        before,
+        raw.path.clone(),
+        &inspected,
+        raw,
+        found,
+        mapped,
+        verified_ns,
+    )
 }
 
 #[cfg(test)]
@@ -2725,8 +8091,10 @@ pub(crate) mod test_fixture {
 
     pub(crate) fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: ProcessViewId(key.device.minor as u32),
             mount_namespace: MountNamespaceId {
                 device: 1,
@@ -2751,6 +8119,7 @@ pub(crate) mod test_fixture {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         }
@@ -2803,17 +8172,97 @@ pub(crate) mod test_fixture {
             raw,
             pin: pin_of(&file).unwrap(),
             file: Arc::new(file),
+            mapped: None,
             path: path.into(),
             sha256: sha256.into(),
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay: false,
             collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
         pins
+    }
+
+    /// A small owned ELF for tests that need a real pinnable object. The
+    /// test binary itself doubles as one while thin, but once instrumented
+    /// (coverage) it exceeds the scanner's object limit and every pin of it
+    /// is refused — so pinnable-object fixtures use this instead. Built once
+    /// per process and shared: pins from different calls merge exactly like
+    /// pins of one file. The file is gcc-built, never instrumented, and
+    /// asserted far below the limit, so it stays pinnable under any test
+    /// profile.
+    pub(crate) fn small_owned_object() -> &'static Path {
+        static OBJECT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        OBJECT
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("small-owned-object.c");
+                let path = dir.path().join("small-owned-object.so");
+                std::fs::write(
+                    &source,
+                    "const char p11scope_small_owned_marker[] = \"SMALL-OWNED-0001\";\n\
+                 int p11scope_small_owned_entry(void) { return 0; }\n",
+                )
+                .unwrap();
+                assert!(
+                    std::process::Command::new("gcc")
+                        .args(["-shared", "-fPIC", "-o"])
+                        .arg(&path)
+                        .arg(&source)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "the small owned fixture must compile"
+                );
+                let len = std::fs::metadata(&path).unwrap().len();
+                assert!(
+                    len < p11scope_manifest::identity::MAX_OBJECT_BYTES,
+                    "the small owned fixture must stay pinnable: {len} bytes"
+                );
+                dir.keep().join("small-owned-object.so")
+            })
+            .as_path()
+    }
+
+    /// A scan module over [`small_owned_object`]: the shape
+    /// `mapped_object` builds for a real mapping (empty scan facts, no
+    /// mapped identity), keyed by the fixture's own maps key so pinning it
+    /// exercises the real open/identity path.
+    pub(crate) fn small_owned_module(view: &ProcessView) -> ScannedModule {
+        let path = small_owned_object();
+        let file = open_object(path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        }
     }
 
     /// Objects opened through a container's overlay mount — the shape this is about.
@@ -2838,6 +8287,7 @@ pub(crate) mod test_fixture {
             },
             raw,
             file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
             pin: Pin {
                 ino: module.key.inode,
                 size: 4096,
@@ -2848,8 +8298,15 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay,
             collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -2873,6 +8330,131 @@ pub(crate) mod test_fixture {
         for entry in pins.by_id.values_mut() {
             entry.file = Arc::clone(file);
         }
+    }
+
+    /// Records the object an open `fd` names, so a later check can prove
+    /// the descriptor was closed without depending on the number staying
+    /// free: parallel tests in the same process reuse fd numbers
+    /// immediately, so `fcntl(fd, F_GETFD) == -1` after a drop is a race.
+    /// Panics when `fd` is not open; call before the close/drop.
+    pub(crate) fn record_open_fd(fd: std::os::fd::RawFd) -> (u64, u64) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat only reads; `fd` is open by contract.
+        assert_eq!(
+            unsafe { libc::fstat(fd, &mut stat) },
+            0,
+            "record_open_fd needs an open fd, got {fd}"
+        );
+        (stat.st_dev as u64, stat.st_ino as u64)
+    }
+
+    /// Proves `fd` was closed after `record_open_fd`: the number is either
+    /// free (fstat fails EBADF) or names a different object. Panics when
+    /// the number still names the recorded object, which is exactly the
+    /// skipped-close shape.
+    ///
+    /// Sound only while no other live object shares the recorded
+    /// (st_dev, st_ino): record a unique object, e.g. a pinned
+    /// `NamedTempFile` whose live link keeps its inode from being
+    /// recycled. Never use this for pidfds: every pidfd to one pid
+    /// shares one identity (see `PidfdClosureWitness`).
+    pub(crate) fn assert_fd_closed(fd: std::os::fd::RawFd, recorded: (u64, u64)) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat only reads; `fd` may be closed or reused by now.
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF),
+                "fstat on fd {fd} failed without EBADF"
+            );
+            return;
+        }
+        assert_ne!(
+            (stat.st_dev as u64, stat.st_ino as u64),
+            recorded,
+            "fd {fd} still names the recorded object; the close was skipped"
+        );
+    }
+
+    /// Proves a pidfd was closed without depending on the number staying
+    /// free. Every pidfd to one pid shares one (st_dev, st_ino), so
+    /// `assert_fd_closed` cannot tell the original from another test's
+    /// pidfd to the same process; instead this holds a duplicate of the
+    /// same open file description and compares with `kcmp KCMP_FILE`
+    /// (same-process, needs no privilege): afterwards the number is
+    /// either free (EBADF) or names a different description.
+    pub(crate) struct PidfdClosureWitness {
+        fd: std::os::fd::RawFd,
+        witness: std::os::fd::OwnedFd,
+    }
+
+    impl PidfdClosureWitness {
+        /// Duplicates `fd` as the comparison witness; the dup succeeding
+        /// proves `fd` is open. Call before the close/drop.
+        pub(crate) fn record(fd: std::os::fd::BorrowedFd<'_>) -> Self {
+            use std::os::fd::AsRawFd as _;
+            let raw = fd.as_raw_fd();
+            let witness = fd
+                .try_clone_to_owned()
+                .expect("witness dup needs an open fd");
+            Self { fd: raw, witness }
+        }
+
+        /// Proves the recorded pidfd was closed: panics when the number
+        /// still names the same open file description (the skipped-close
+        /// shape), or when the probe itself fails.
+        pub(crate) fn assert_closed(&self) {
+            use std::os::fd::AsRawFd as _;
+            const KCMP_FILE: libc::c_long = 0;
+            let pid = std::process::id() as libc::c_long;
+            // SAFETY: a pure same-process comparison; sends nothing.
+            let compared = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    pid,
+                    pid,
+                    KCMP_FILE,
+                    self.fd as libc::c_long,
+                    self.witness.as_raw_fd() as libc::c_long,
+                )
+            };
+            assert_ne!(
+                compared, 0,
+                "fd {} still names the same open file description; the close was skipped",
+                self.fd
+            );
+            if compared < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "the kcmp probe itself failed"
+                );
+            }
+            // compared > 0: the number now names a different open file
+            // description, so the recorded pidfd was closed.
+        }
+    }
+
+    /// Attaches the scan-time ownership a `real_scan_pin` + `absorb` fixture
+    /// bypasses: the view's `ownership.pins` entry and its `raw_ownership`
+    /// row. Runs exactly the two inserts `record_scanned_candidate` performs
+    /// for an accepted entry; panics when the key/path names no pinned raw.
+    pub(crate) fn record_scan_ownership(
+        pins: &mut PinnedObjects,
+        view: ProcessViewId,
+        key: ObjectKey,
+        path: &str,
+    ) {
+        let normalized =
+            super::normalize_target_path(path).expect("test ownership path normalizes");
+        let (raw, id) = pins
+            .raw_to_id
+            .iter()
+            .find(|(raw, _)| raw.key == key && raw.path == normalized)
+            .map(|(raw, id)| (raw.clone(), *id))
+            .expect("test key/path names a pinned raw");
+        pins.ownership.entry(view).or_default().pins.push(id);
+        pins.raw_ownership.entry(view).or_default().insert(raw);
     }
 
     /// The mount both halves of a forged pre-6.8 split resolve in: the scan
@@ -2900,6 +8482,7 @@ pub(crate) mod test_fixture {
             },
             raw,
             file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
             pin: Pin {
                 ino: INODE,
                 size: 4096,
@@ -2910,8 +8493,15 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay: true,
             collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -2931,6 +8521,7 @@ pub(crate) mod test_fixture {
             },
             raw,
             file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
             pin: Pin {
                 ino: INODE,
                 size: 4096,
@@ -2941,11 +8532,75 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay: true,
             collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
+        pins
+    }
+
+    /// A pre-arm pin as `pin_prearm_objects` files it: under the opened
+    /// fd's key, with the same mapping, pin and digest as its scan pin. The
+    /// pin's inode is the key's, as a real pin's always is.
+    pub(crate) fn prearm_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
+        let raw = RawObjectInstance::prearm(fd_key, PATH.to_string()).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id: SPLIT_MOUNT_ID,
+                device_major: fd_key.device.major,
+                device_minor: fd_key.device.minor,
+                inode: fd_key.inode,
+            },
+            raw,
+            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
+            pin: Pin {
+                ino: fd_key.inode,
+                size: 4096,
+                ctime: (ctime, 7),
+            },
+            path: PATH.into(),
+            sha256: sha256.into(),
+            build_id: None,
+            abi: ElfAbi::Lp64,
+            exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
+            overlay: true,
+            collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
+    }
+
+    /// A pre-arm pin for a pre-6.8 overlayfs split: filed under the opened
+    /// fd's overlay key while carrying the pin-time probe's maps/backing
+    /// rendering — the shape `pin_prearm_objects` records through the
+    /// self-mapping probe when the kernel splits the two.
+    pub(crate) fn split_prearm_pin(
+        fd_key: ObjectKey,
+        maps_key: ObjectKey,
+        sha256: &str,
+        ctime: i64,
+    ) -> PinnedObjects {
+        let mut pins = prearm_pin(fd_key, sha256, ctime);
+        for entry in pins.by_id.values_mut() {
+            entry.probed_maps_key = Some(maps_key);
+        }
         pins
     }
 
@@ -3003,14 +8658,228 @@ mod tests {
     };
     use std::cell::RefCell;
 
+    #[test]
+    fn small_owned_object_stays_pinnable_under_the_object_limit() {
+        let path = test_fixture::small_owned_object();
+        let len = std::fs::metadata(path).unwrap().len();
+        assert!(
+            len < p11scope_manifest::identity::MAX_OBJECT_BYTES,
+            "the fixture must stay pinnable under any profile: {len} bytes"
+        );
+        // Same path twice: the process shares one file, so pins merge.
+        assert_eq!(path, test_fixture::small_owned_object());
+        let file = p11scope_manifest::identity::open_object(path).unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        assert!(
+            !inspected.executable_ranges.is_empty(),
+            "the fixture is a real ELF with executable ranges"
+        );
+        // A module over it pins through the real open/identity path under
+        // the default budget.
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = test_fixture::small_owned_module(&view);
+        let mut budget = CaptureWorkBudget::default();
+        let (pins, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            pins.id_for_scanned(&module, module.key, &module.path)
+                .is_some(),
+            "the fixture pin resolves"
+        );
+    }
+
+    #[test]
+    fn forwarded_bootstrap_verifies_only_the_named_definition_at_its_offset() {
+        let entry = ScannedEntry {
+            name: "C_GetFunctionList",
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 43,
+            },
+            object_path: "/opt/dep.so".into(),
+            file_offset: 0xebe0,
+        };
+        // Exact definition: genuine interposition.
+        assert!(forwarded_bootstrap_verified(
+            &entry,
+            &[("C_GetFunctionList".to_string(), 0xebe0)]
+        ));
+        // Right name, wrong offset: a stale mapping or hostile craft.
+        assert!(!forwarded_bootstrap_verified(
+            &entry,
+            &[("C_GetFunctionList".to_string(), 0x20)]
+        ));
+        // Right offset, wrong name: another export sits there.
+        assert!(!forwarded_bootstrap_verified(
+            &entry,
+            &[("C_Initialize".to_string(), 0xebe0)]
+        ));
+        // Non-provider target: no standard exports at all.
+        assert!(!forwarded_bootstrap_verified(&entry, &[]));
+        // An alias beside the definition still verifies.
+        assert!(forwarded_bootstrap_verified(
+            &entry,
+            &[
+                ("C_Initialize".to_string(), 0xebe0),
+                ("C_GetFunctionList".to_string(), 0xebe0),
+            ]
+        ));
+    }
+
+    #[test]
+    fn forwarded_bootstrap_check_never_verifies_another_name() {
+        let entry = ScannedEntry {
+            name: "C_Login",
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 43,
+            },
+            object_path: "/opt/dep.so".into(),
+            file_offset: 0x30,
+        };
+        assert!(!forwarded_bootstrap_verified(
+            &entry,
+            &[("C_Login".to_string(), 0x30)]
+        ));
+    }
+
+    #[test]
+    fn retained_target_charge_is_bounded_before_the_first_copy() {
+        let mut pins = test_fixture::real_scan_pin(
+            Path::new("/usr/bin/true"),
+            None,
+            1,
+            "bank-pre-copy-charge",
+        );
+        let id = pins.pinned().next().unwrap().id;
+        assert_eq!(
+            pins.retained_target_copy_allocation_charge(PinnedObjectId(u32::MAX)),
+            None
+        );
+        let entry = pins.by_id.get_mut(&id).unwrap();
+        entry.raw.path = String::with_capacity(4096);
+        entry.raw.path.push_str("/raw/namespace/provider.so");
+        entry.path = String::with_capacity(1024);
+        entry.path.push_str("/display/provider.so");
+        entry.sha256.reserve(2048);
+        entry.build_id = Some(String::with_capacity(512));
+        entry.build_id.as_mut().unwrap().push_str("owned-build-id");
+        let before = pins.revision();
+        let bound = pins.retained_target_copy_allocation_charge(id).unwrap();
+        let original = &pins.by_id[&id];
+        let expected = [
+            Some(&original.raw.path),
+            Some(&original.path),
+            Some(&original.sha256),
+            original.build_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|text| text.capacity() + 32)
+        .sum::<usize>();
+        assert_eq!(bound, expected);
+        assert!(
+            bound > pins.summary(id).unwrap().path.len() + 1024,
+            "raw namespace text and spare capacities must be included"
+        );
+        assert_eq!(pins.revision(), before, "preallocation lookup is read-only");
+        let retained = pins.retain_inventory_target(id).unwrap();
+        assert!(
+            retained.retained_copy_allocation_charge().unwrap() <= bound,
+            "fresh String clones may trim capacity, but cannot exceed the pre-copy bound"
+        );
+        assert_eq!(retained.entry.raw.path, "/raw/namespace/provider.so");
+        assert_eq!(retained.entry.path, "/display/provider.so");
+        assert_eq!(pins.revision(), before);
+    }
+
+    #[test]
+    fn retained_provider_copy_charge_covers_each_actual_cloned_allocation() {
+        let pins = test_fixture::real_scan_pin(
+            Path::new("/usr/bin/true"),
+            None,
+            1,
+            "provider-copy-charge",
+        );
+        let id = pins.pinned().next().unwrap().id;
+        let mut target = pins.retain_inventory_target(id).unwrap();
+        target.entry.raw.path.reserve(129);
+        target.entry.path.reserve(257);
+        target.entry.sha256.reserve(513);
+        let mut build_id = String::with_capacity(128);
+        build_id.push_str("a-real-owned-build-id");
+        target.entry.build_id = Some(build_id);
+        for allocation_case in 0..3 {
+            match allocation_case {
+                1 => target.entry.build_id = None,
+                2 => {
+                    // Tiny fresh allocations also exercise the pinned clone
+                    // bound; these strings are allocation inputs, not proof.
+                    target.entry.raw.path = "r".to_owned();
+                    target.entry.path = "p".to_owned();
+                    target.entry.sha256 = "s".to_owned();
+                    target.entry.build_id = Some("b".to_owned());
+                }
+                _ => {}
+            }
+            let charge = target.retained_copy_allocation_charge().unwrap();
+            let copy = target.share();
+            let sources = [
+                Some(&target.entry.raw.path),
+                Some(&target.entry.path),
+                Some(&target.entry.sha256),
+                target.entry.build_id.as_ref(),
+            ];
+            let copies = [
+                Some(&copy.entry.raw.path),
+                Some(&copy.entry.path),
+                Some(&copy.entry.sha256),
+                copy.entry.build_id.as_ref(),
+            ];
+            let mut actual = 0;
+            let mut expected = 0;
+            for (source, copy) in sources.into_iter().zip(copies) {
+                assert_eq!(source.is_some(), copy.is_some());
+                if let (Some(source), Some(copy)) = (source, copy) {
+                    assert_eq!(source, copy);
+                    assert!(
+                        copy.capacity() <= source.capacity(),
+                        "pinned fresh String clone bound"
+                    );
+                    if !source.is_empty() {
+                        assert_ne!(source.as_ptr(), copy.as_ptr());
+                    }
+                    if source.capacity() != 0 {
+                        expected += source.capacity()
+                            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+                    }
+                    if copy.capacity() != 0 {
+                        actual += copy.capacity()
+                            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+                    }
+                }
+            }
+            assert_eq!(
+                charge, expected,
+                "both independently cloned path fields are included"
+            );
+            assert!(charge >= actual);
+            assert!(Arc::ptr_eq(&target.entry.file, &copy.entry.file));
+            assert!(Arc::ptr_eq(&target.entry.exports, &copy.entry.exports));
+        }
+    }
+
+    type BeforeHashHook = Box<dyn FnOnce(&mut CaptureWorkBudget)>;
+
     thread_local! {
-        static BEFORE_HASH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static BEFORE_HASH_HOOK: RefCell<Option<BeforeHashHook>> = RefCell::new(None);
     }
 
     struct BeforeHashHookGuard;
 
     impl BeforeHashHookGuard {
-        fn install(hook: impl FnOnce() + 'static) -> Self {
+        fn install(hook: impl FnOnce(&mut CaptureWorkBudget) + 'static) -> Self {
             BEFORE_HASH_HOOK.with(|slot| {
                 assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
             });
@@ -3026,10 +8895,10 @@ mod tests {
         }
     }
 
-    pub(super) fn run_before_hash_test_hook() {
+    pub(super) fn run_before_hash_test_hook(budget: &mut CaptureWorkBudget) {
         let hook = BEFORE_HASH_HOOK.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
-            hook();
+            hook(budget);
         }
     }
 
@@ -3570,8 +9439,10 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -3588,7 +9459,7 @@ mod tests {
             interfaces: Vec::new(),
         };
         let changed_path = path.clone();
-        let _hook = BeforeHashHookGuard::install(move || {
+        let _hook = BeforeHashHookGuard::install(move |_| {
             let mut changed = std::fs::OpenOptions::new()
                 .append(true)
                 .open(changed_path)
@@ -3612,6 +9483,63 @@ mod tests {
     }
 
     #[test]
+    fn a_deadline_expiring_at_the_actual_hash_gate_reads_no_object_bytes() {
+        use crate::discovery::scan::SCAN_DEADLINE_REASON;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deadline-at-hash.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut module = test_fixture::module(object_key(mapping));
+        module.view = view.id();
+        module.mount_namespace = view.mount_namespace();
+        module.path = path.display().to_string();
+        module.tables.clear();
+        let before_hash = Rc::new(Cell::new(None));
+        let observed = before_hash.clone();
+        let _hook = BeforeHashHookGuard::install(move |budget| {
+            observed.set(Some(budget.attempted_io_bytes()));
+            budget.set_deadline(Some(0));
+        });
+        let mut budget = CaptureWorkBudget::default();
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        let metadata_bytes = before_hash
+            .get()
+            .expect("the actual hash boundary was reached");
+        assert!(
+            metadata_bytes > 0,
+            "mount identity was proved before cancellation"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            metadata_bytes,
+            "no hash byte was read"
+        );
+        assert_eq!(budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+        assert_eq!(pinned.pinned().count(), 0);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].subject, module.path);
+        assert!(
+            skipped[0].reason.contains(SCAN_DEADLINE_REASON),
+            "{skipped:?}"
+        );
+
+        let (healthy, skipped) =
+            pin_scanned_view_objects(&view, &[module], &mut CaptureWorkBudget::default()).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            healthy.pinned().count(),
+            1,
+            "fresh healthy hashing still succeeds"
+        );
+    }
+
+    #[test]
     fn identical_file_bytes_are_read_once_per_capture() {
         use crate::discovery::scan::ScannedModule;
         use std::io::Write as _;
@@ -3625,8 +9553,10 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -3699,8 +9629,10 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -3843,6 +9775,368 @@ mod tests {
         pins.by_id.get_mut(&id).expect("entry for raw alias").raw = raw.clone();
         pins.raw_to_id.insert(raw, id);
         pins
+    }
+
+    fn count_manifest_file() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Manifest,
+        p11scope_manifest::identity::InspectedObject,
+    ) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count-object.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![0u8; 1 << 20])
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let mut manifest = manifest_for(object_key(mapping));
+        manifest.schema = p11scope_manifest::manifest::SCHEMA.into();
+        manifest.module_path = path.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.objects[0].identity = inspected.identity.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].identity = inspected.identity.clone();
+        manifest.surfaces[0].functions[0].resolution = Resolution::NullPointer;
+        assert!(validate_structure(&manifest).is_empty());
+        (dir, path, manifest, inspected)
+    }
+
+    fn count_manifest_read_budget() -> CaptureWorkBudget {
+        let bytes = std::fs::metadata("/proc/self/mountinfo")
+            .unwrap()
+            .len()
+            .max(std::fs::read("/proc/self/mountinfo").unwrap().len() as u64)
+            + (64 << 10);
+        CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: 8 << 20,
+            total_bytes: bytes,
+        })
+    }
+
+    fn cache_count_inspection(
+        path: &Path,
+        inspected: p11scope_manifest::identity::InspectedObject,
+        budget: &mut CaptureWorkBudget,
+    ) {
+        let file = std::fs::File::open(path).unwrap();
+        let key = object_key(mapping_file_key(&file).unwrap());
+        assert!(budget.note_inspected_file(
+            InspectedFileKey {
+                device: key.device,
+                inode: key.inode,
+                pin: pin_of(&file).unwrap()
+            },
+            inspected
+        ));
+    }
+
+    #[test]
+    fn count_manifest_cold_identity_reads_obey_the_collection_allowance() {
+        let (_dir, path, manifest, _) = count_manifest_file();
+        let mut budget = count_manifest_read_budget();
+        assert!(std::fs::metadata(path).unwrap().len() > budget.limits().total_bytes);
+        let pinning =
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .expect("a cold identity hash past the allowance gaps the object");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
+        assert!(budget.attempted_io_bytes() <= budget.limits().total_bytes);
+    }
+
+    #[test]
+    fn count_manifest_cache_hit_needs_no_second_whole_file_read() {
+        let (_dir, path, manifest, inspected) = count_manifest_file();
+        let mut budget = count_manifest_read_budget();
+        cache_count_inspection(&path, inspected, &mut budget);
+        let result =
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .unwrap();
+        assert!(result.stale.is_empty());
+        assert_eq!(result.pins.pinned().count(), 1);
+        assert!(budget.attempted_io_bytes() < std::fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn count_manifest_changed_file_revalidates_and_charges_the_new_bytes() {
+        use std::io::Write as _;
+        let (_dir, path, manifest, inspected) = count_manifest_file();
+        let mut budget = CaptureWorkBudget::default();
+        cache_count_inspection(&path, inspected, &mut budget);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1])
+            .unwrap();
+        let result =
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .unwrap();
+        assert_eq!(result.stale.len(), 1);
+        assert_eq!(result.pins.pinned().count(), 0);
+        assert!(
+            budget.attempted_io_bytes() >= std::fs::metadata(path).unwrap().len(),
+            "a changed pin must miss the inspection cache and pay for the fresh hash"
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_with_prior_enforces_combined_object_cap() {
+        // Packet 6.13 round-3 (re-audit finding 3, N+1): one real retained
+        // pre-arm pin plus a 512-object manifest exceeds the shared
+        // 512-object budget — the manifest side refuses with the combined
+        // limit message, before opening anything.
+        let dir = tempfile::tempdir().unwrap();
+        let prearm_path = dir.path().join("prearm-real.so");
+        std::fs::copy("/bin/sh", &prearm_path).unwrap();
+        let prearm = pin_prearm_objects_in_views_with_budget(
+            std::slice::from_ref(&prearm_path),
+            &[],
+            None,
+            0,
+            0,
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect("one real pre-arm pin");
+        let prior_objects = prearm.pins.pinned().count();
+        let prior_bytes = prearm.pins.pinned_object_bytes();
+        assert_eq!(prior_objects, 1);
+
+        let (_manifest_dir, _path, mut manifest, _) = count_manifest_file();
+        let identity = manifest.objects[0].identity.clone();
+        for id in 1..(MAX_OBJECTS as u32) {
+            manifest.objects.push(ObjectRecord {
+                id,
+                path: format!("/nonexistent-613r3/obj-{id}"),
+                identity: identity.clone(),
+            });
+        }
+        assert_eq!(manifest.objects.len(), MAX_OBJECTS);
+        assert!(
+            validate_structure(&manifest).is_empty(),
+            "the N+1 manifest is structurally valid, so only the budget can refuse it"
+        );
+        let result = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            prior_objects,
+            prior_bytes,
+        );
+        assert!(
+            result.is_err(),
+            "1 retained + 512 manifest objects exceed the shared cap"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, ManifestPinError::Fatal(_)),
+            "a budget refusal is Fatal, not Invalid: {error:?}"
+        );
+        let limit = format!("{MAX_OBJECTS}-object limit");
+        assert!(
+            error
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined object cap: {:?}",
+            error.problems()
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_with_prior_accepts_combined_object_boundary() {
+        // Boundary twin: 511 already-retained objects plus one manifest
+        // object sit exactly at the shared cap and pin; one more prior
+        // refuses. The accept case guards against over-refusal.
+        let (_dir, _path, manifest, _) = count_manifest_file();
+        let pinning = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            MAX_OBJECTS - 1,
+            0,
+        )
+        .expect("511 retained + 1 manifest object is exactly the cap");
+        assert!(pinning.stale.is_empty());
+        assert_eq!(pinning.pins.pinned().count(), 1);
+        let result = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            MAX_OBJECTS,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "512 retained + 1 manifest object exceed the shared cap"
+        );
+        let limit = format!("{MAX_OBJECTS}-object limit");
+        assert!(
+            result
+                .unwrap_err()
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined object cap"
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_with_prior_enforces_combined_byte_cap() {
+        // Byte twin: a manifest object pins exactly at the shared byte cap
+        // and refuses one byte past it.
+        let (_dir, path, manifest, _) = count_manifest_file();
+        let size = std::fs::metadata(&path).unwrap().len();
+        pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            0,
+            MAX_TOTAL_OBJECT_BYTES - size,
+        )
+        .expect("bytes exactly at the shared cap pin");
+        let result = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            0,
+            MAX_TOTAL_OBJECT_BYTES - size + 1,
+        );
+        let pinning = result.expect("one byte past the shared cap gaps the object");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
+        let limit = format!("{MAX_TOTAL_OBJECT_BYTES}-byte limit");
+        assert!(
+            pinning
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains(&limit)),
+            "gap names the combined byte cap"
+        );
+    }
+
+    #[test]
+    fn count_manifest_pinning_with_prior_enforces_combined_cap() {
+        // The per-pass count reader charges the same shared budget: a full
+        // retained set plus one count object refuses before any read.
+        let (_dir, _path, manifest, _) = count_manifest_file();
+        let result = pin_count_manifest_objects_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            MAX_OBJECTS,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "512 retained + 1 count object exceed the shared cap"
+        );
+        let limit = format!("{MAX_OBJECTS}-object limit");
+        assert!(
+            result
+                .unwrap_err()
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined object cap"
+        );
+    }
+
+    #[test]
+    fn count_manifest_same_digest_other_file_cannot_reuse_the_inspection() {
+        let (dir, path, mut manifest, inspected) = count_manifest_file();
+        let other = dir.path().join("distinct.so");
+        std::fs::copy(&path, &other).unwrap();
+        let mut budget = count_manifest_read_budget();
+        cache_count_inspection(&path, inspected, &mut budget);
+        let key = object_key(mapping_file_key(&std::fs::File::open(&other).unwrap()).unwrap());
+        manifest.module_path = other.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].device_major = key.device.major;
+        manifest.provenance_objects[0].device_minor = key.device.minor;
+        manifest.provenance_objects[0].inode = key.inode;
+        let pinning =
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .expect("a non-witnessed file gaps instead of reusing the inspection");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "private count-manifest cache helper; invoked by count_manifest_full_and_tail_share_the_scan_inspection_cache"]
+    fn count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance() {
+        let paths = [
+            std::env::var("P11SCOPE_COUNT_MANIFEST_FULL")
+                .expect("an actual full-copy helper manifest"),
+            std::env::var("P11SCOPE_COUNT_MANIFEST_TAIL").expect("an actual tail helper manifest"),
+        ];
+        let manifests: Vec<_> = paths
+            .iter()
+            .map(|path| crate::discovery::engine::read_manifest_file(Path::new(path)).unwrap())
+            .collect();
+        let mut budget = count_manifest_read_budget();
+        let mut held = Vec::new();
+        let mut file_bytes = Vec::new();
+        for (manifest, expected) in manifests.iter().zip([68, 32]) {
+            assert!(validate_structure(manifest).is_empty());
+            let targets: BTreeSet<_> = manifest
+                .surfaces
+                .iter()
+                .flat_map(|surface| &surface.functions)
+                .filter_map(|function| match function.resolution {
+                    Resolution::Resolved {
+                        object,
+                        file_offset,
+                    } => Some((object, file_offset)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(targets.len(), expected);
+            assert_eq!(manifest.objects.len(), 1);
+            let path = Path::new(&manifest.module_path);
+            let file = std::fs::File::open(path).unwrap();
+            file_bytes.push(file.metadata().unwrap().len());
+            let inspected = inspect_file_with_reader_exporting(
+                &file,
+                |file, bytes, offset| file.read_at(bytes, offset),
+                &standard_function_names(),
+            )
+            .unwrap();
+            assert_eq!(inspected.identity, manifest.objects[0].identity);
+            assert_eq!(inspected.abi, ElfAbi::Lp64);
+            cache_count_inspection(path, inspected, &mut budget);
+            held.push(file);
+        }
+        assert!(file_bytes[0] > budget.limits().total_bytes);
+        for manifest in &manifests {
+            let result =
+                pin_count_manifest_objects_in_views_with_prior(manifest, &[], &mut budget, 0, 0)
+                    .unwrap();
+            assert!(result.stale.is_empty());
+            assert_eq!(result.pins.pinned().count(), 1);
+            assert!(result.pins.check_unchanged().unwrap());
+        }
+        assert!(budget.attempted_io_bytes() < file_bytes[0]);
+        println!(
+            "COUNT_MANIFEST_INPUTS full_bytes={} tail_bytes={} count_pin_io={} allowance={}",
+            file_bytes[0],
+            file_bytes[1],
+            budget.attempted_io_bytes(),
+            budget.limits().total_bytes
+        );
+        drop(held);
     }
 
     fn manifest_for(key: ObjectKey) -> Manifest {
@@ -4025,6 +10319,79 @@ mod tests {
 
         assert_eq!(first.pinned().count(), 1, "{skipped:?}");
         assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    /// A same-file merge preserves the dropped entry's pin-time maps
+    /// rendering on the kept entry: one file in one mount renders one way,
+    /// so the proof stays true for the kept fd and the split re-filing
+    /// reads it there.
+    #[test]
+    fn absorbing_same_file_preserves_the_probed_maps_rendering() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay, split_prearm_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut kept = manifest_pin(fd_key, SHA, 1);
+        let id = kept.id_for_manifest(fd_key, PATH).unwrap();
+        assert!(
+            !kept.object_matches_key(
+                id,
+                maps_key.device.major,
+                maps_key.device.minor,
+                maps_key.inode
+            ),
+            "no maps rendering before the merge"
+        );
+        let incoming = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        assert!(kept.absorb(incoming).is_empty());
+        assert!(
+            kept.object_matches_key(
+                id,
+                maps_key.device.major,
+                maps_key.device.minor,
+                maps_key.inode
+            ),
+            "the kept entry answers the proved maps rendering after the merge"
+        );
+    }
+
+    /// The cross-mount-namespace escape preserves no maps rendering: a maps
+    /// key proved in another namespace must never ride along onto the kept
+    /// entry.
+    #[test]
+    fn absorbing_across_mount_namespaces_preserves_no_maps_rendering() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let first_file = backing_file(&dir, "provider.so");
+        let second_file = Arc::new(std::fs::File::open(dir.path().join("provider.so")).unwrap());
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &first_file);
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &second_file);
+        let rendered = ObjectKey {
+            device: Device { major: 0, minor: 9 },
+            inode: INODE,
+        };
+        {
+            let entry = second.by_id.values_mut().next().unwrap();
+            entry.mapping.mount_id += 1;
+            entry.probed_maps_key = Some(rendered);
+        }
+        let skipped = first.absorb(second);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(first.pinned().count(), 1, "{skipped:?}");
+        let id = first.pinned().next().unwrap().id;
+        assert!(
+            !first.object_matches_key(
+                id,
+                rendered.device.major,
+                rendered.device.minor,
+                rendered.inode
+            ),
+            "a maps rendering from another mount namespace never rides along"
+        );
     }
 
     #[test]
@@ -4953,6 +11320,161 @@ mod tests {
     }
 
     #[test]
+    fn retained_mapped_identity_keeps_the_original_file_and_rejects_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.so");
+        let other = dir.path().join("other.so");
+        std::fs::write(&path, "same bytes").unwrap();
+        std::fs::copy(&path, &other).unwrap();
+        let mut pins = test_fixture::real_scan_pin(&path, None, 1, "digest");
+        let entry = pins.by_id.values_mut().next().unwrap();
+        // Script only the privileged calibration result. Its device differs
+        // from fstat, ensuring reuse returns that proof, not a new identity
+        // invented from a path, raw maps key or the lookup metadata.
+        let calibrated = MappedFile {
+            identity: FileIdentity { dev: 37, ino: 9 },
+            fs_magic: Some(0x9123_683e),
+        };
+        entry.mapped = Some(calibrated);
+        let original = Arc::downgrade(&entry.file);
+        let id = pins.by_id.keys().next().copied().unwrap();
+        let target = pins.retain_inventory_target(id).unwrap();
+        let snapshot = RetainedMappedIdentities::from_targets([&target, &target]);
+        assert_eq!(snapshot.files.len(), 1, "aliases share one retained proof");
+        drop(target);
+        drop(pins);
+        assert!(original.upgrade().is_some(), "the original Arc stays held");
+
+        let reopened = std::fs::File::open(&path).unwrap();
+        assert_eq!(snapshot.identity_for(&reopened), Some(calibrated));
+        assert_eq!(
+            snapshot.identity_for(&std::fs::File::open(&other).unwrap()),
+            None
+        );
+        // The held inode changes through a second open descriptor.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", reopened.as_raw_fd()))
+            .unwrap();
+        writer.set_len(32).unwrap();
+        assert_eq!(snapshot.identity_for(&reopened), None);
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(
+            snapshot.identity_for(&std::fs::File::open(&path).unwrap()),
+            None
+        );
+        drop(snapshot);
+        assert!(original.upgrade().is_none());
+    }
+
+    #[test]
+    fn retained_mapped_identity_refuses_overlay_unknown_and_unproved_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.so");
+        std::fs::write(&path, "provider").unwrap();
+        let mut pins = test_fixture::real_scan_pin(&path, None, 1, "digest");
+        let id = pins.by_id.keys().next().copied().unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        for (magic, overlay, collapsed, expected) in [
+            (Some(0xef53), false, false, true),
+            (Some(0x9123_683e), false, false, true),
+            (Some(0xef53), true, false, false),
+            (Some(0xef53), false, true, false),
+            (Some(0x794c_7630), false, false, false),
+            (Some(0x0102_1994), false, false, false),
+            (Some(0x6573_5546), false, false, false),
+            (Some(0x1234_5678), false, false, false),
+            (None, false, false, false),
+        ] {
+            let entry = pins.by_id.get_mut(&id).unwrap();
+            entry.mapped = Some(MappedFile {
+                identity: FileIdentity { dev: 37, ino: 9 },
+                fs_magic: magic,
+            });
+            entry.overlay = overlay;
+            entry.collapsed = collapsed;
+            let target = pins.retain_inventory_target(id).unwrap();
+            let snapshot = RetainedMappedIdentities::from_targets([&target]);
+            assert_eq!(
+                snapshot.identity_for(&file).is_some(),
+                expected,
+                "{magic:?}, overlay={overlay}, collapsed={collapsed}"
+            );
+        }
+        pins.by_id.get_mut(&id).unwrap().mapped = None;
+        let target = pins.retain_inventory_target(id).unwrap();
+        assert!(
+            RetainedMappedIdentities::from_targets([&target])
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_retained_pin_reuses_calibration_but_still_checks_the_scanned_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libpinned.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let calibrated = MappedFile {
+            identity: FileIdentity { dev: 37, ino: 9 },
+            fs_magic: Some(0x9123_683e),
+        };
+        let mut module = test_fixture::module(object_key(mapping));
+        module.view = view.id();
+        module.mount_namespace = view.mount_namespace();
+        module.path = path.display().to_string();
+        module.tables.clear();
+        module.mapped_identity = Some(calibrated.identity);
+        let (pins, skipped) = pin_scanned_view_objects_with(
+            &view,
+            std::slice::from_ref(&module),
+            &mut CaptureWorkBudget::default(),
+            &|_| Ok(calibrated),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let id = pins.pinned().next().unwrap().id;
+        let target = pins.retain_inventory_target(id).unwrap();
+        let reusable = pins.by_id[&id].reusable_mapped_file().is_some();
+        let probes = std::cell::Cell::new(0);
+        let probe = |_: &std::fs::File| {
+            probes.set(probes.get() + 1);
+            Ok(calibrated)
+        };
+        let mut budget = CaptureWorkBudget::default()
+            .with_retained_mapped_identities(RetainedMappedIdentities::from_targets([&target]));
+        let (reused, skipped) = pin_scanned_view_objects_with(
+            &view,
+            std::slice::from_ref(&module),
+            &mut budget,
+            &probe,
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(probes.get(), usize::from(!reusable));
+        // Sweep matching uses the same retained proof, without a third probe.
+        if reusable {
+            assert_eq!(
+                reused.object_mapped_identity(reused.pinned().next().unwrap().id),
+                Ok(calibrated)
+            );
+        }
+        module.mapped_identity = Some(FileIdentity { dev: 47, ino: 9 });
+        let (refused, skipped) =
+            pin_scanned_view_objects_with(&view, &[module], &mut budget, &probe).unwrap();
+        assert_eq!(probes.get(), 2 * usize::from(!reusable));
+        assert_eq!(refused.pinned().count(), 0);
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains("identity_mismatch"))
+        );
+    }
+
+    #[test]
     fn the_pin_refuses_a_reopened_file_that_is_not_the_one_the_scan_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("libpinned.so");
@@ -4962,8 +11484,10 @@ mod tests {
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let read = FileIdentity { dev: 37, ino: 9 };
         let module = |mapped_identity| ScannedModule {
+            module_hint: None,
             mapped_identity,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -4985,7 +11509,12 @@ mod tests {
                 &view,
                 std::slice::from_ref(&module),
                 &mut budget,
-                &|_| pinned.clone(),
+                &|_| {
+                    pinned.clone().map(|identity| MappedFile {
+                        identity,
+                        fs_magic: None,
+                    })
+                },
             )
             .unwrap();
             (objects.pinned().count(), skipped)
@@ -5162,7 +11691,7 @@ mod tests {
     /// benchmark; run single-threaded:
     /// `test -- --ignored map_files_name_timing --test-threads=1 --nocapture`).
     #[test]
-    #[ignore]
+    #[ignore = "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded"]
     fn map_files_name_timing_per_thousand() {
         use std::time::Instant;
 
@@ -5233,6 +11762,8 @@ mod tests {
                     0
                 );
                 // SAFETY: initialized by the successful `fstatfs`.
+                // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+                #[allow(clippy::unnecessary_cast)]
                 let magic = (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff;
                 assert_eq!(self_mapped_file(&held).unwrap().fs_magic, Some(magic));
             }
@@ -5569,5 +12100,3414 @@ mod tests {
         let _ = pins.absorb(PinnedObjects::empty());
         assert!(gate.should_sweep(pins.revision(), false));
         assert_eq!((gate.sweeps(), gate.skips()), (2, 1));
+    }
+
+    pub(super) fn conservative_cursor_fixture()
+    -> (tempfile::TempDir, PinnedObjects, Vec<ScannedModule>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = PinnedObjects::empty();
+        let mut modules = Vec::new();
+        for index in 0..3 {
+            let path = dir.path().join(format!("provider-{index}.so"));
+            std::fs::copy("/usr/bin/true", &path).unwrap();
+            let view = ProcessView::open(ProcessViewId(index + 1), std::process::id()).unwrap();
+            // Btrfs st_dev names the subvolume, unlike maps/mountinfo. Obtain
+            // the actual comparable key through the SAME retained view before
+            // sending the row through ordinary opened-file pin validation.
+            let key = view_object_key(&view, &path, &mut CaptureWorkBudget::default()).unwrap();
+            let mut scanned = module(key);
+            scanned.view = view.id();
+            scanned.mount_namespace = view.mount_namespace();
+            scanned.path = path.to_str().unwrap().into();
+            for table in &mut scanned.tables {
+                for entry in &mut table.entries {
+                    entry.object_path = scanned.path.clone();
+                }
+            }
+            let (pins, skipped) = pin_scanned_view_objects(
+                &view,
+                std::slice::from_ref(&scanned),
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert!(source.absorb(pins).is_empty());
+            modules.push(scanned);
+        }
+        // A second ACTUAL process-view pin shares the first opened provider.
+        // The controlled table rows exercise value transformation only; they
+        // do not constitute a bootstrap/attachment receipt.
+        let view = ProcessView::open(ProcessViewId(2), std::process::id()).unwrap();
+        let mut shared = modules[0].clone();
+        shared.view = view.id();
+        let (pins, skipped) = pin_scanned_view_objects(
+            &view,
+            std::slice::from_ref(&shared),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty());
+        assert!(source.absorb(pins).is_empty());
+        modules.push(shared);
+        assert!(bind_scanned_modules(&modules, &mut source).1.is_empty());
+        let entry = source.by_id.values_mut().next().unwrap();
+        entry.path.reserve(3000);
+        entry.build_id = Some("nested-owned-build-id".repeat(64));
+        (dir, source, modules)
+    }
+
+    fn conservative_selection(
+        pool: &crate::semantics_edge::resources::SemanticResourcePool,
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+    ) -> ConservativePinSelection {
+        let bytes = ConservativePinSelection::storage_bound(retired.len(), rejected.len()).unwrap();
+        let storage = pool.reserve(bytes).unwrap();
+        ConservativePinSelection::from_reserved_originals(
+            retired,
+            rejected,
+            storage,
+            &pool.reserver(),
+        )
+        .unwrap()
+    }
+
+    fn assert_conservative_value(expected: &PinnedObjects, actual: &PinnedObjects) {
+        assert_eq!(actual.raw_to_id, expected.raw_to_id);
+        assert_eq!(actual.rejected_keys, expected.rejected_keys);
+        assert_eq!(actual.ambiguous_keys, expected.ambiguous_keys);
+        assert_eq!(actual.ambiguity_published, expected.ambiguity_published);
+        assert_eq!(actual.ownership, expected.ownership);
+        assert_eq!(actual.raw_ownership, expected.raw_ownership);
+        assert_eq!(actual.next_id, expected.next_id);
+        assert_eq!(actual.overlay_uncertain, expected.overlay_uncertain);
+        assert_eq!(actual.changed.get(), expected.changed.get());
+        assert_eq!(actual.revision(), expected.revision());
+        assert_eq!(actual.by_id.len(), expected.by_id.len());
+        for (id, old) in &expected.by_id {
+            let new = &actual.by_id[id];
+            assert_eq!(new.raw, old.raw);
+            assert_eq!(new.mapping, old.mapping);
+            assert_eq!(new.pin, old.pin);
+            assert_eq!(new.mapped, old.mapped);
+            assert_eq!(new.path, old.path);
+            assert_eq!(new.sha256, old.sha256);
+            assert_eq!(new.build_id, old.build_id);
+            assert_eq!(new.abi, old.abi);
+            assert_eq!(new.overlay, old.overlay);
+            assert_eq!(new.collapsed, old.collapsed);
+            assert!(
+                Arc::ptr_eq(&new.file, &old.file),
+                "the SAME opened File is retained"
+            );
+            assert!(Arc::ptr_eq(&new.exports, &old.exports));
+        }
+    }
+
+    fn finish_conservative_copy(
+        source: &PinnedObjects,
+        cursor: &mut PinnedConservativeCursor,
+        selection: &ConservativePinSelection,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) {
+        for _ in 0..4096 {
+            if source
+                .poll_conservative_copy(cursor, selection, reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                return;
+            }
+        }
+        panic!("the tiny real-file copy must finish over bounded credits");
+    }
+
+    #[test]
+    fn conservative_copy_cursor_preserves_originals_and_peak() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, modules) = conservative_cursor_fixture();
+        let rejected = modules[1].key;
+        let pool = SemanticResourcePool::default();
+        let selection = conservative_selection(
+            &pool,
+            BTreeSet::from([ProcessViewId(1)]),
+            BTreeSet::from([rejected]),
+        );
+        let reserve = pool.reserver();
+        let mut expected = source.clone();
+        expected.remove_view(ProcessViewId(1));
+        let expected_skipped = expected.reapply_rejected_keys(&BTreeSet::from([rejected]));
+        let source_revision = source.revision();
+        let initial_charge = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        let (zero, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            source.poll_conservative_copy(&mut cursor, &selection, &reserve, 0)
+        });
+        assert_eq!(zero.unwrap(), GraphStep::Yielded);
+        assert_eq!((allocations, bytes), (0, 0));
+        assert_eq!(pool.snapshot().charged_bytes, initial_charge);
+        assert!(cursor.pinned().is_none());
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            for _ in 0..4096 {
+                let mut before = [0usize; 3];
+                for (count, entry) in before.iter_mut().zip(source.by_id.values()) {
+                    *count = Arc::strong_count(&entry.file);
+                }
+                let step = source
+                    .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                    .unwrap();
+                for (old, entry) in before.into_iter().zip(source.by_id.values()) {
+                    assert!(Arc::strong_count(&entry.file).saturating_sub(old) <= 1);
+                }
+                if step == GraphStep::Ready {
+                    break;
+                }
+            }
+            let copy = cursor
+                .pinned()
+                .expect("bounded copy becomes structurally Ready");
+            assert_conservative_value(&expected, copy);
+            assert_eq!(cursor.skipped().unwrap(), expected_skipped);
+            assert_eq!(source.revision(), source_revision);
+            assert!(
+                source
+                    .by_id
+                    .values()
+                    .all(|entry| pin_of(&entry.file).unwrap() == entry.pin)
+            );
+            assert!(pool.snapshot().charged_bytes > initial_charge);
+            // Ready borrows remain paid; no swap/take can strand canonical backing.
+            for _ in 0..4096 {
+                if cursor
+                    .reclaim(Some(&source), &selection, &reserve, 1)
+                    .unwrap()
+                    == GraphStep::Ready
+                {
+                    break;
+                }
+            }
+            assert!(cursor.pinned().is_none());
+            assert_eq!(pool.snapshot().charged_bytes, initial_charge);
+        });
+        assert!(!peak.incomplete);
+        assert_eq!(
+            peak.live_bytes, 0,
+            "all copied backing dies before its payment refunds"
+        );
+        assert_eq!(
+            peak.live_blocks, 0,
+            "empty B-tree roots are real retained allocations"
+        );
+        assert!(
+            cursor.required_bytes().unwrap() >= peak.realloc_overlap_bytes.max(peak.peak_bytes)
+        );
+    }
+
+    #[test]
+    fn conservative_copy_cursor_refuses_changed_resume_fences() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for change in 0..7 {
+            let (_dir, mut source, _) = conservative_cursor_fixture();
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(1), ProcessViewId(9), ProcessViewId(20)]),
+                BTreeSet::new(),
+            );
+            let mut cursor = PinnedConservativeCursor::new();
+            assert_ne!(
+                source
+                    .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+            let foreign = source.clone();
+            let other_selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(1), ProcessViewId(10), ProcessViewId(20)]),
+                BTreeSet::new(),
+            );
+            let other_pool = SemanticResourcePool::default();
+            let error = match change {
+                0 => foreign.poll_conservative_copy(&mut cursor, &selection, &reserve, 1),
+                1 => {
+                    let membership = source.revision();
+                    source.reset_derived_claims();
+                    assert_eq!(source.revision(), membership);
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+                2 => {
+                    source.changed.set(true);
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+                3 => source.poll_conservative_copy(&mut cursor, &other_selection, &reserve, 1),
+                4 => source.poll_conservative_copy(
+                    &mut cursor,
+                    &selection,
+                    &other_pool.reserver(),
+                    1,
+                ),
+                5 => {
+                    let membership = source.revision();
+                    source.reset_scan_pin_claims();
+                    assert_eq!(source.revision(), membership);
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+                _ => {
+                    source.revision = u64::MAX;
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+            };
+            assert!(matches!(
+                error,
+                Err(GraphRefusal::SourceChanged | GraphRefusal::Identity)
+            ));
+            assert!(cursor.pinned().is_none());
+            if change == 0 || change == 3 || change == 4 {
+                finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+                assert!(
+                    cursor.pinned().is_some(),
+                    "foreign calls cannot consume the correct source's work"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conservative_copy_cursor_exact_fit_short_and_overflow() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        assert!(ConservativePinSelection::storage_bound(usize::MAX, 0).is_none());
+        assert!(
+            conservative_pin_tree_bytes::<RawObjectInstance, PinnedObjectId>(usize::MAX).is_none()
+        );
+        // Packaging is not authority: reject foreign/short actual payment,
+        // returning the SAME immutable original sets and lease untouched.
+        for foreign in [false, true] {
+            let owner = SemanticResourcePool::default();
+            let other = SemanticResourcePool::default();
+            let retired = BTreeSet::from([ProcessViewId(3)]);
+            let rejected = BTreeSet::new();
+            let required = ConservativePinSelection::storage_bound(1, 0).unwrap();
+            let storage = owner
+                .reserve(if foreign { required } else { required - 1 })
+                .unwrap();
+            let reserve = if foreign {
+                other.reserver()
+            } else {
+                owner.reserver()
+            };
+            let charged = owner.snapshot().charged_bytes;
+            let refusal = ConservativePinSelection::from_reserved_originals(
+                retired, rejected, storage, &reserve,
+            )
+            .unwrap_err();
+            assert_eq!(owner.snapshot().charged_bytes, charged);
+            let (retired, rejected, storage) = refusal.into_originals();
+            assert_eq!(retired, BTreeSet::from([ProcessViewId(3)]));
+            assert!(rejected.is_empty());
+            assert!(owner.reserver().covers(&storage, required - 1));
+            assert_eq!(owner.snapshot().charged_bytes, charged);
+        }
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        for _ in 0..4096 {
+            if cursor.required_bytes().is_some() {
+                break;
+            }
+            assert_ne!(
+                source
+                    .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+        }
+        let required = cursor
+            .required_bytes()
+            .expect("actual measured storage envelope");
+        pool.reference_set_limit(baseline.checked_add(required).unwrap() - 1);
+        let counts: Vec<_> = source
+            .by_id
+            .values()
+            .map(|entry| Arc::strong_count(&entry.file))
+            .collect();
+        let mut refused = false;
+        for _ in 0..4096 {
+            match source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1) {
+                Err(GraphRefusal::Storage(_)) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected copy refusal: {other:?}"),
+            }
+        }
+        assert!(refused);
+        assert!(cursor.pinned().is_none());
+        assert_eq!(
+            counts,
+            source
+                .by_id
+                .values()
+                .map(|entry| Arc::strong_count(&entry.file))
+                .collect::<Vec<_>>()
+        );
+        pool.reference_set_limit(baseline.checked_add(required).unwrap());
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        assert_conservative_value(&source, cursor.pinned().unwrap());
+        assert_eq!(pool.snapshot().charged_bytes, baseline + required);
+        for _ in 0..4096 {
+            if cursor
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_copy_cursor_refuses_final_file_close() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let id = *source.by_id.keys().next().unwrap();
+        let actual_fd = source.file_for(id).unwrap().as_raw_fd();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        drop(source);
+        // There is now no borrowed or separately retained share of this real
+        // File. Reclamation may free copied text, but it cannot close the FD.
+        for _ in 0..4096 {
+            if cursor.retained_reclaim_file_for_test(id) == Some((4, Some(actual_fd))) {
+                break;
+            }
+            assert_ne!(
+                cursor.reclaim(None, &selection, &reserve, 1).unwrap(),
+                GraphStep::Ready,
+            );
+        }
+        let before = cursor.retained_reclaim_file_for_test(id);
+        assert_eq!(before, Some((4, Some(actual_fd))));
+        let held = pool.snapshot().charged_bytes;
+        assert!(held > baseline);
+        assert_eq!(
+            cursor.reclaim(None, &selection, &reserve, 0).unwrap(),
+            GraphStep::Yielded
+        );
+        assert_eq!(cursor.retained_reclaim_file_for_test(id), before);
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert!(
+            matches!(
+                cursor.reclaim(None, &selection, &reserve, 1),
+                Err(GraphRefusal::Identity)
+            ),
+            "no borrowed matching File alias permits a synchronous final close"
+        );
+        assert_eq!(cursor.retained_reclaim_file_for_test(id), before);
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        // SAFETY: F_GETFD observes the original descriptor; no open/poll/native
+        // work between dropping the source and this check can replace its slot.
+        assert!(unsafe { libc::fcntl(actual_fd, libc::F_GETFD) } >= 0);
+        assert!(cursor.pinned().is_none());
+        // The paid cursor is intentionally still retained here. Eventual final
+        // File handoff/abandonment belongs to the later Engine/native port.
+    }
+
+    #[test]
+    fn conservative_copy_cursor_reclaims_unique_nested_and_guarded_shared_arc() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, _) = conservative_cursor_fixture();
+        let id = *source.by_id.keys().next().unwrap();
+        source.by_id.get_mut(&id).unwrap().exports = Arc::from(vec![
+            ("controlled-first-label".repeat(8), 1),
+            ("controlled-second-label".repeat(16), 2),
+            ("controlled-third-label".repeat(32), 3),
+        ]);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        // Only this entry's unique export backing is under test. Other real
+        // entries are conservatively rejected before copying, so their final
+        // File owners are not an unrelated pending handoff in this control.
+        let rejected = source
+            .by_id
+            .iter()
+            .filter_map(|(other, entry)| (*other != id).then_some(entry.raw.key))
+            .collect();
+        let selection = conservative_selection(&pool, BTreeSet::new(), rejected);
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        assert_eq!(cursor.pinned().unwrap().by_id.len(), 1);
+        let alias = source.exports_for(id);
+        // Settle our File share under the borrowed LIVE actual source, then
+        // stop BEFORE touching its exports. No final FD close is delegated to
+        // the pure helper when the source goes away below.
+        for _ in 0..4096 {
+            let step = cursor
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap();
+            assert_ne!(step, GraphStep::Ready);
+            if cursor.retained_reclaim_file_for_test(id) == Some((5, None)) {
+                break;
+            }
+        }
+        assert_eq!(cursor.retained_reclaim_file_for_test(id), Some((5, None)));
+        assert_eq!(cursor.retained_exports_for_test(id).unwrap().len(), 3);
+        drop(source);
+        let held = pool.snapshot().charged_bytes;
+        let mut shared_refusal = false;
+        for _ in 0..4096 {
+            match cursor.reclaim(None, &selection, &reserve, 1) {
+                Err(GraphRefusal::Identity) => {
+                    shared_refusal = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected reclamation refusal: {other:?}"),
+            }
+        }
+        assert!(
+            shared_refusal,
+            "an unknown shared last-drop race retains actual paid ownership"
+        );
+        assert!(pool.snapshot().charged_bytes > baseline);
+        assert!(pool.snapshot().charged_bytes <= held);
+        assert_eq!(alias.iter().filter(|(text, _)| !text.is_empty()).count(), 3);
+        let weak = Arc::downgrade(&alias);
+        drop(alias);
+        assert!(matches!(
+            cursor.reclaim(None, &selection, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        assert!(pool.snapshot().charged_bytes > baseline);
+        drop(weak);
+        let mut prior = 3usize;
+        for _ in 0..4096 {
+            let step = cursor.reclaim(None, &selection, &reserve, 1).unwrap();
+            let left = cursor.retained_exports_for_test(id).map_or(0, |exports| {
+                exports.iter().filter(|(text, _)| !text.is_empty()).count()
+            });
+            assert!(
+                prior.saturating_sub(left) <= 1,
+                "one credit cannot destroy the complete nested array"
+            );
+            prior = left;
+            if step == GraphStep::Ready {
+                break;
+            }
+        }
+        assert_eq!(prior, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_copy_cache_exhaustion_preserves_legacy_clone() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use std::sync::atomic::AtomicU64;
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert!(mint_pin_copy_cache_id(&counter).is_some());
+        assert!(mint_pin_copy_cache_id(&counter).is_none());
+        assert!(mint_pin_copy_cache_id(&counter).is_none());
+        let (_dir, mut source, _) = conservative_cursor_fixture();
+        let ordinary = source.clone();
+        assert!(source.copy_source != ordinary.copy_source);
+        assert_conservative_value(&source, &ordinary);
+        source.copy_source = None;
+        let legacy = source.clone();
+        assert_conservative_value(&source, &legacy);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        let charged = pool.snapshot().charged_bytes;
+        let (answer, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+        });
+        assert!(matches!(answer, Err(GraphRefusal::Identity)));
+        assert_eq!(allocations, 0);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert!(cursor.pinned().is_none());
+    }
+
+    #[test]
+    fn conservative_copy_final_slice_release_does_not_walk_drained_elements() {
+        use std::mem::{ManuallyDrop, align_of, needs_drop, size_of};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Resource-free: suppressing this destructor cannot leak a payload.
+        struct DropProbe;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        const {
+            assert!(needs_drop::<(String, u64)>());
+            assert!(!needs_drop::<ManuallyDrop<(String, u64)>>());
+            assert!(size_of::<(String, u64)>() == size_of::<ManuallyDrop<(String, u64)>>());
+            assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
+        }
+        let mut probes: Arc<[DropProbe]> = Arc::from([DropProbe, DropProbe, DropProbe]);
+        assert!(Arc::get_mut(&mut probes).is_some());
+        // SAFETY: resource-free elements, actual unique allocation/no Weak,
+        // no live borrow or observer between the check and transfer.
+        unsafe { deallocate_drained_unique_arc(probes) };
+        assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            let mut payloads: Arc<[(String, u64)]> = Arc::from([
+                ("one owned allocation".repeat(64), 1),
+                ("another owned allocation".repeat(128), 2),
+            ]);
+            let before = crate::test_alloc::armed_requested_snapshot();
+            for item in Arc::get_mut(&mut payloads).unwrap() {
+                drop(std::mem::take(&mut item.0));
+                assert_eq!(item.0.capacity(), 0);
+            }
+            let drained = crate::test_alloc::armed_requested_snapshot();
+            assert_eq!(before.live_blocks - drained.live_blocks, 2);
+            assert!(before.live_bytes > drained.live_bytes);
+            assert!(
+                drained.live_bytes > 0,
+                "the SAME slice allocation is still held"
+            );
+            assert!(Arc::get_mut(&mut payloads).is_some());
+            // SAFETY: every payload has actually been freed above. Remaining
+            // elements are valid zero-capacity Strings plus integers, exclusive
+            // with no Weak; the final release skips their typed Drop loop.
+            unsafe { deallocate_drained_unique_arc(payloads) };
+        });
+        assert!(!peak.incomplete);
+        assert_eq!(peak.live_bytes, 0);
+        assert_eq!(peak.live_blocks, 0);
+    }
+
+    fn retained_rebind_inputs(
+        pool: &crate::semantics_edge::resources::SemanticResourcePool,
+        originals: &[ScannedModule],
+        short_backing: bool,
+    ) -> (Option<RetainedScannedInputs>, usize) {
+        // Real owned rows derived from the same normal pin fixture. Measure
+        // the actual heterogeneous retained requests; no production bound or
+        // receipt is supplied by this test-only input setup.
+        let (owned, peak) = crate::test_alloc::requested_peak_during(|| {
+            let mut owned = originals.to_vec();
+            owned.reserve(7);
+            if let Some(first) = owned.first_mut() {
+                first.path.reserve(113);
+                first.exports.reserve(5);
+                if let Some(table) = first.tables.first_mut() {
+                    table.entries.reserve(9);
+                }
+            }
+            owned
+        });
+        assert!(!peak.incomplete);
+        let storage_bytes = peak
+            .live_bytes
+            .checked_add(peak.live_blocks.checked_mul(64).unwrap())
+            .unwrap()
+            .checked_add(4096)
+            .unwrap();
+        let storage = pool
+            .reserve(if short_backing { 1 } else { storage_bytes })
+            .unwrap();
+        let original_pointer = owned.as_ptr();
+        let original_capacity = owned.capacity();
+        let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            RetainedScannedInputs::from_reserved_originals(owned, storage)
+        });
+        assert_eq!(
+            (allocations, bytes),
+            (0, 0),
+            "input packaging is an O(1) move"
+        );
+        let input = result.unwrap();
+        assert_eq!(input.originals_for_test().as_ptr(), original_pointer);
+        assert_eq!(input.original_capacity_for_test(), original_capacity);
+        (Some(input), storage_bytes)
+    }
+
+    fn finish_scanned_rebind(
+        pins: &mut PinnedConservativeCursor,
+        input: &mut Option<RetainedScannedInputs>,
+        rebind: &mut ScannedRebindCursor,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) {
+        for _ in 0..4096 {
+            if pins.poll_scanned_rebind(input, rebind, reserve, 1).unwrap() == GraphStep::Ready {
+                return;
+            }
+        }
+        panic!("the tiny retained scanned originals must bind over finite credits");
+    }
+
+    fn rebind_claim_lengths(pins: &PinnedConservativeCursor) -> [(usize, usize, usize); 3] {
+        [ProcessViewId(1), ProcessViewId(2), ProcessViewId(3)].map(|view| {
+            pins.reference_rebind_claims_for_test(view)
+                .map_or((0, 0, 0), |claims| {
+                    (claims.tables.len(), claims.targets.len(), claims.pins.len())
+                })
+        })
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_matches_original_binding() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, mut raw) = conservative_cursor_fixture();
+        let missing = raw[2].key;
+        let missing_path = raw[2].path.clone();
+        // Same actual normalized provider; no filesystem reopen may be hidden
+        // in the rebind lookup. Its real pin was accepted before this spelling.
+        let canonical = PathBuf::from(&raw[0].path);
+        raw[0].path = canonical
+            .parent()
+            .unwrap()
+            .join("unused/../provider-0.so")
+            .to_str()
+            .unwrap()
+            .into();
+        raw[0].tables[0].entries[0].object_path = raw[0].path.clone();
+        let duplicate = raw[0].tables[0].entries[0].clone();
+        raw[0].tables[0]
+            .entries
+            .extend(std::iter::repeat_n(duplicate.clone(), 12));
+        let mut absent_entry = duplicate;
+        absent_entry.object = missing;
+        absent_entry.object_path = missing_path;
+        raw[0].tables[0].entries.push(absent_entry);
+        raw[0]
+            .exports
+            .push("controlled heterogeneous input text".repeat(37));
+        raw[0]
+            .interfaces
+            .push(crate::discovery::scan::ScannedInterface {
+                index: 0,
+                name_class: "other",
+                name_lossy: Some("private fixture name".repeat(9)),
+                name_private: Some(vec![1, 2, 3, 4]),
+                flags: 0,
+                table: Some(0),
+            });
+        raw[1].decoder_abi = Some(ElfAbi::Ilp32);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::from([missing]));
+        let baseline = pool.snapshot().charged_bytes;
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let mut expected = pins.pinned().unwrap().clone();
+        expected.reset_derived_claims();
+        let (expected_modules, expected_skips) = bind_scanned_modules(&raw, &mut expected);
+        assert!(!expected_modules.is_empty());
+        assert!(
+            expected_skips.len() >= 3,
+            "entry, ABI, and missing-provider negatives are genuine"
+        );
+        let (mut input, input_bytes) = retained_rebind_inputs(&pool, &raw, false);
+        let pointer = input.as_ref().unwrap().originals_for_test().as_ptr();
+        let held = pool.snapshot().charged_bytes;
+        let mut rebind = ScannedRebindCursor::new();
+        let (zero, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 0)
+        });
+        assert_eq!(zero.unwrap(), GraphStep::Yielded);
+        assert_eq!((allocations, bytes), (0, 0));
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert_eq!(
+            input.as_ref().unwrap().originals_for_test().as_ptr(),
+            pointer
+        );
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            for _ in 0..4096 {
+                let before_claims = rebind_claim_lengths(&pins);
+                let mut before_refs = [0usize; 3];
+                for (count, entry) in before_refs.iter_mut().zip(source.by_id.values()) {
+                    *count = Arc::strong_count(&entry.exports);
+                }
+                let step = pins
+                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap();
+                let after_claims = rebind_claim_lengths(&pins);
+                let changed = before_claims
+                    .into_iter()
+                    .zip(after_claims)
+                    .filter(|(before, after)| before != after)
+                    .count();
+                assert!(
+                    changed <= 1,
+                    "one credit cannot reset or bind every process view"
+                );
+                let growth = before_claims
+                    .into_iter()
+                    .zip(after_claims)
+                    .map(|(before, after)| {
+                        after.0.saturating_sub(before.0)
+                            + after.1.saturating_sub(before.1)
+                            + after.2.saturating_sub(before.2)
+                    })
+                    .sum::<usize>();
+                assert!(
+                    growth <= 2,
+                    "one entry may add its target+pin, never a whole table of claims"
+                );
+                for (before, entry) in before_refs.into_iter().zip(source.by_id.values()) {
+                    assert!(Arc::strong_count(&entry.exports).saturating_sub(before) <= 1);
+                }
+                if step == GraphStep::Ready {
+                    break;
+                }
+            }
+        });
+        assert!(!peak.incomplete);
+        assert!(input.is_none(), "the same original Vec was taken once");
+        let actual_modules = rebind
+            .modules()
+            .expect("all originals and claims reach structural readiness");
+        assert_eq!(actual_modules, expected_modules);
+        assert_eq!(rebind.skipped().unwrap(), expected_skips);
+        for (actual, expected) in actual_modules.iter().zip(&expected_modules) {
+            assert!(Arc::ptr_eq(&actual.exports, &expected.exports));
+            for (actual, expected) in actual.scanned.tables.iter().zip(&expected.scanned.tables) {
+                assert_eq!(actual.live_return, expected.live_return);
+                assert_eq!(actual.manifest_supported, expected.manifest_supported);
+            }
+        }
+        assert_conservative_value(&expected, pins.pinned().unwrap());
+        assert!(rebind.required_input_bytes().unwrap() <= input_bytes);
+        assert!(
+            rebind.required_bytes().unwrap() >= peak.peak_bytes.max(peak.realloc_overlap_bytes)
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            held + rebind.required_bytes().unwrap()
+        );
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(rebind.modules().is_none());
+        for _ in 0..4096 {
+            if pins
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_refuses_unverified_forward_like_original_binding() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        const VERIFIED_OFFSET: u64 = 0xebe0;
+        const MISDIRECTED_OFFSET: u64 = 0x20;
+        let (_dir, mut source, mut raw) = conservative_cursor_fixture();
+        // The pinned target's own exports define the bootstrap at the
+        // verified offset only; the misdirected offset is unproven.
+        let target = source
+            .id_for_scanned(&raw[1], raw[1].key, &raw[1].path)
+            .expect("the second provider is pinned");
+        source.by_id.get_mut(&target).unwrap().exports =
+            Arc::from(vec![("C_GetFunctionList".to_string(), VERIFIED_OFFSET)]);
+        // A cross-object forward pair out of the first module: one
+        // genuine interposition (binds), one wrong offset (refused).
+        let forward_key = raw[1].key;
+        let forward_path = raw[1].path.clone();
+        assert_ne!(forward_key, raw[0].key);
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetFunctionList",
+            object: forward_key,
+            object_path: forward_path.clone(),
+            file_offset: VERIFIED_OFFSET,
+        });
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetFunctionList",
+            object: forward_key,
+            object_path: forward_path,
+            file_offset: MISDIRECTED_OFFSET,
+        });
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        // Both paths start from the same copied pins.
+        let mut expected = pins.pinned().unwrap().clone();
+        expected.reset_derived_claims();
+        let (expected_modules, expected_skips) = bind_scanned_modules(&raw, &mut expected);
+        // The original binding proves the pair: verified binds, wrong offset
+        // refuses with the shared reason.
+        let expected_entries = &expected_modules[0].scanned.tables[0].entries;
+        assert!(
+            expected_entries.iter().any(|entry| {
+                entry.name == "C_GetFunctionList" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the verified forward binds: {expected_entries:?}"
+        );
+        assert!(
+            !expected_entries.iter().any(|entry| {
+                entry.name == "C_GetFunctionList" && entry.file_offset == MISDIRECTED_OFFSET
+            }),
+            "the misdirected forward never binds: {expected_entries:?}"
+        );
+        assert!(
+            expected_skips.iter().any(|skip| {
+                skip.subject == "C_GetFunctionList"
+                    && skip.reason.contains(UNVERIFIED_FORWARD_REFUSAL)
+            }),
+            "the wrong offset refuses with the shared reason: {expected_skips:?}"
+        );
+        // The cursor must reach the same binding over finite credits.
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let held = pool.snapshot().charged_bytes;
+        let mut rebind = ScannedRebindCursor::new();
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        });
+        assert!(!peak.incomplete);
+        let actual_modules = rebind
+            .modules()
+            .expect("the forward pair rebinds to structural readiness");
+        assert_eq!(actual_modules, expected_modules);
+        assert_eq!(rebind.skipped().unwrap(), expected_skips);
+        // The cursor's own branch ran: same verified bind, same refusal text.
+        let actual_entries = &actual_modules[0].scanned.tables[0].entries;
+        assert!(
+            actual_entries.iter().any(|entry| {
+                entry.name == "C_GetFunctionList" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the cursor binds the verified forward: {actual_entries:?}"
+        );
+        assert!(
+            rebind.skipped().unwrap().iter().any(|skip| {
+                skip.subject == "C_GetFunctionList"
+                    && skip.reason.contains(UNVERIFIED_FORWARD_REFUSAL)
+            }),
+            "the cursor refuses the wrong offset: {:?}",
+            rebind.skipped().unwrap()
+        );
+        // Byte accounting covers the new refusal suffix.
+        assert!(
+            rebind.required_bytes().unwrap() >= peak.peak_bytes.max(peak.realloc_overlap_bytes)
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            held + rebind.required_bytes().unwrap()
+        );
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(rebind.modules().is_none());
+        for _ in 0..4096 {
+            if pins
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_keeps_claim_growth_paid() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for exit in 0..3 {
+            let (_dir, source, mut raw) = conservative_cursor_fixture();
+            let entry = raw[0].tables[0].entries[0].clone();
+            raw[0].tables[0]
+                .entries
+                .extend(std::iter::repeat_n(entry, 24));
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+            let baseline = pool.snapshot().charged_bytes;
+            let mut pins = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            let pin_charge = pool.snapshot().charged_bytes;
+            let view = raw[0].view;
+            let old_capacity = pins
+                .pinned()
+                .unwrap()
+                .view_claims(view)
+                .unwrap()
+                .pins
+                .capacity();
+            let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+            let mut rebind = ScannedRebindCursor::new();
+            for _ in 0..4096 {
+                assert_ne!(
+                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .unwrap(),
+                    GraphStep::Ready
+                );
+                if pins
+                    .reference_rebind_claims_for_test(view)
+                    .is_some_and(|claims| {
+                        claims.pins.capacity() > old_capacity && !claims.targets.is_empty()
+                    })
+                {
+                    break;
+                }
+            }
+            assert!(input.is_none());
+            assert!(
+                pins.pinned().is_none(),
+                "partial mutable claims are not a Ready output"
+            );
+            assert!(
+                pins.reference_rebind_claims_for_test(view)
+                    .unwrap()
+                    .pins
+                    .capacity()
+                    > old_capacity
+            );
+            let claim_bytes = rebind.required_claim_bytes().unwrap();
+            assert!(claim_bytes > 0);
+            if exit == 2 {
+                // This tests PAYMENT lifetime only, not a bounded abandonment
+                // completion: that separate Engine/native obligation stays open.
+                drop(rebind);
+                assert_eq!(pool.snapshot().charged_bytes, pin_charge + claim_bytes);
+                assert!(pins.pinned().is_none());
+                assert!(
+                    pins.reference_rebind_claims_for_test(view)
+                        .unwrap()
+                        .pins
+                        .capacity()
+                        > old_capacity
+                );
+                drop(pins);
+                assert_eq!(pool.snapshot().charged_bytes, baseline);
+                continue;
+            }
+            if exit == 1 {
+                rebind.cancel();
+                assert!(matches!(
+                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                    Err(GraphRefusal::Cancelled)
+                ));
+                assert!(pins.pinned().is_none());
+            } else {
+                finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+                assert!(rebind.modules().is_some());
+            }
+            for _ in 0..4096 {
+                if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                    break;
+                }
+            }
+            assert!(rebind.modules().is_none());
+            drop(rebind);
+            assert_eq!(pool.snapshot().charged_bytes, pin_charge + claim_bytes);
+            assert!(
+                pins.reference_rebind_claims_for_test(view)
+                    .unwrap()
+                    .pins
+                    .capacity()
+                    > old_capacity
+            );
+            for _ in 0..4096 {
+                if pins
+                    .reclaim(Some(&source), &selection, &reserve, 1)
+                    .unwrap()
+                    == GraphStep::Ready
+                {
+                    break;
+                }
+            }
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+
+        // The module cursor can actually become the last export-slice owner.
+        // Keep independent LIVE shares of the SAME Files so this setup does
+        // not disguise a final FD close as pure per-credit export reclamation.
+        let (_dir, mut source, raw) = conservative_cursor_fixture();
+        let id = *source.by_id.keys().next().unwrap();
+        source.by_id.get_mut(&id).unwrap().exports = Arc::from(vec![
+            ("first retained module label".repeat(8), 1),
+            ("second retained module label".repeat(16), 2),
+            ("third retained module label".repeat(32), 3),
+        ]);
+        let file_guards: Vec<_> = source
+            .by_id
+            .values()
+            .map(|entry| entry.file.clone())
+            .collect();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw[..1], false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert_eq!(rebind.modules().unwrap().len(), 1);
+        let alias = source.exports_for(id);
+        drop(source);
+        drop(pins);
+        let mut refused = false;
+        for _ in 0..4096 {
+            match rebind.reclaim(None, &reserve, 1) {
+                Err(GraphRefusal::Identity) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected last-owner refusal: {other:?}"),
+            }
+        }
+        assert!(
+            refused,
+            "unknown shared exports retain their actual module owner and payment"
+        );
+        assert_eq!(alias.iter().filter(|(text, _)| !text.is_empty()).count(), 3);
+        assert!(pool.snapshot().charged_bytes > baseline);
+        let weak = Arc::downgrade(&alias);
+        drop(alias);
+        assert!(matches!(
+            rebind.reclaim(None, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        drop(weak);
+        let mut prior = 3usize;
+        for _ in 0..4096 {
+            let step = rebind.reclaim(None, &reserve, 1).unwrap();
+            let left = rebind
+                .reference_pending_exports_for_test(id)
+                .map_or(0, |exports| {
+                    exports.iter().filter(|(text, _)| !text.is_empty()).count()
+                });
+            assert!(prior.saturating_sub(left) <= 1);
+            prior = left;
+            if step == GraphStep::Ready {
+                break;
+            }
+        }
+        assert_eq!(prior, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        for file in &file_guards {
+            // SAFETY: read-only check of each retained actual descriptor.
+            assert!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } >= 0);
+        }
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_refuses_changed_inputs_and_short_pool() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut short, _) = retained_rebind_inputs(&pool, &raw, true);
+        let pointer = short.as_ref().unwrap().originals_for_test().as_ptr();
+        let before = pins.pinned().unwrap().clone();
+        let mut invalid = ScannedRebindCursor::new();
+        let mut refused = false;
+        for _ in 0..4096 {
+            match pins.poll_scanned_rebind(&mut short, &mut invalid, &reserve, 1) {
+                Err(GraphRefusal::Identity) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected input-backing refusal: {other:?}"),
+            }
+        }
+        assert!(refused);
+        assert!(invalid.required_input_bytes().unwrap() > 1);
+        assert_eq!(
+            short.as_ref().unwrap().originals_for_test().as_ptr(),
+            pointer
+        );
+        assert_conservative_value(&before, pins.pinned().unwrap());
+        for _ in 0..4096 {
+            if invalid.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        drop(invalid);
+        let original = short.take().unwrap();
+        let (rows, lease) = original.into_originals();
+        assert_eq!(rows.as_ptr(), pointer);
+        assert!(reserve.covers(&lease, 1));
+        drop(rows);
+        drop(lease);
+
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+            .unwrap();
+        assert!(input.is_some());
+        // Equal-valued pins from the SAME original source remain a different
+        // private candidate allocation. They cannot take this cursor/input.
+        let mut foreign_pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut foreign_pins, &selection, &reserve);
+        let held = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            foreign_pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        assert!(input.is_some());
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert_conservative_value(&before, foreign_pins.pinned().unwrap());
+        drop(foreign_pins);
+        let pointer = input.as_ref().unwrap().originals_for_test().as_ptr();
+        let (rows, lease) = input.take().unwrap().into_originals();
+        input = Some(RetainedScannedInputs::from_reserved_originals(rows, lease).unwrap());
+        assert_eq!(
+            input.as_ref().unwrap().originals_for_test().as_ptr(),
+            pointer
+        );
+        assert!(
+            matches!(
+                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                Err(GraphRefusal::Identity)
+            ),
+            "consuming/re-wrapping the SAME allocation cannot inherit an earlier sizing cursor"
+        );
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        drop(rebind);
+        let mut rebind = ScannedRebindCursor::new();
+        let before_rebind = pool.snapshot().charged_bytes;
+        let other = SemanticResourcePool::default();
+        let (foreign, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &other.reserver(), 1)
+        });
+        assert!(matches!(foreign, Err(GraphRefusal::Identity)));
+        assert_eq!((allocations, bytes), (0, 0));
+        assert!(input.is_some());
+        assert_eq!(pool.snapshot().charged_bytes, before_rebind);
+        for _ in 0..4096 {
+            if rebind.required_bytes().is_some() {
+                break;
+            }
+            assert_ne!(
+                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+        }
+        let required = rebind.required_bytes().unwrap();
+        assert!(required > 1);
+        pool.reference_set_limit(before_rebind.checked_add(required).unwrap() - 1);
+        let mut refused = false;
+        for _ in 0..4096 {
+            match pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1) {
+                Err(GraphRefusal::Storage(_)) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected output/claim refusal: {other:?}"),
+            }
+        }
+        assert!(refused);
+        assert!(
+            input.is_some(),
+            "precharge refusal takes no original and resets no claims"
+        );
+        assert_conservative_value(&before, pins.pinned().unwrap());
+        pool.reference_set_limit(before_rebind.checked_add(required).unwrap());
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(input.is_none());
+        assert_eq!(pool.snapshot().charged_bytes, before_rebind + required);
+        assert!(rebind.modules().is_some());
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_moves_retained_pin_prefix_over_credits() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for cancel in [false, true] {
+            let (_dir, mut source, raw) = conservative_cursor_fixture();
+            let repeated: Vec<_> = std::iter::repeat_n(raw[0].clone(), 64).collect();
+            assert!(bind_scanned_modules(&repeated, &mut source).1.is_empty());
+            let view = raw[0].view;
+            let expected_prefix = source.view_claims(view).unwrap().pins.clone();
+            assert!(expected_prefix.len() > 64);
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+            let baseline = pool.snapshot().charged_bytes;
+            let (mut input, _) = retained_rebind_inputs(&pool, &raw[..1], false);
+            let mut pins = PinnedConservativeCursor::new();
+            let mut rebind = ScannedRebindCursor::new();
+            let mut observed_growth = false;
+            let mut released_original = false;
+            let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+                finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+                let old_capacity = pins
+                    .pinned()
+                    .unwrap()
+                    .view_claims(view)
+                    .unwrap()
+                    .pins
+                    .capacity();
+                let old_bytes = old_capacity * std::mem::size_of::<PinnedObjectId>();
+                let mut previous = 0usize;
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = pins
+                        .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    let actual = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                    if !observed_growth && actual.capacity() > old_capacity {
+                        observed_growth = true;
+                        assert!(
+                            actual.len() <= 1,
+                            "a populated pin prefix cannot move in its allocation credit"
+                        );
+                        let new_bytes = actual.capacity() * std::mem::size_of::<PinnedObjectId>();
+                        assert!(
+                            after.live_bytes >= before.live_bytes + new_bytes,
+                            "the old actual pin allocation remains held alongside fresh backing"
+                        );
+                        previous = actual.len();
+                    } else if observed_growth && previous < expected_prefix.len() {
+                        assert!(
+                            actual.len() <= previous + 1,
+                            "work1 moves at most one original pin claim"
+                        );
+                        previous = actual.len();
+                    }
+                    if observed_growth {
+                        let prefix = actual.len().min(expected_prefix.len());
+                        assert_eq!(&actual[..prefix], &expected_prefix[..prefix]);
+                        if actual.len() >= expected_prefix.len()
+                            && before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes
+                        {
+                            released_original = true;
+                        }
+                    }
+
+                    if cancel
+                        && observed_growth
+                        && !actual.is_empty()
+                        && actual.len() < expected_prefix.len()
+                    {
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        let custody = (current.as_ptr(), current.len(), current.capacity());
+                        let held = pool.snapshot();
+                        let allocated = crate::test_alloc::armed_requested_snapshot();
+                        let pending = (
+                            input.is_none(),
+                            pins.pinned().is_none(),
+                            rebind.modules().is_none(),
+                        );
+                        assert_eq!(pending, (true, true, true));
+                        assert!(matches!(
+                            rebind.reclaim(None, &reserve, 1),
+                            Err(GraphRefusal::Identity)
+                        ));
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        assert_eq!(
+                            (current.as_ptr(), current.len(), current.capacity()),
+                            custody
+                        );
+                        assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                        assert_eq!(pool.snapshot(), held);
+                        assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                        // Normal binding still advances: ownerless refusal did not switch the
+                        // original live transfer into its reclaim phase.
+                        assert_eq!(
+                            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                                .unwrap(),
+                            GraphStep::Advanced
+                        );
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        assert!(!current.is_empty() && current.len() < expected_prefix.len());
+                        assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                        let custody = (current.as_ptr(), current.len(), current.capacity());
+                        rebind.cancel();
+                        let held = pool.snapshot();
+                        let allocated = crate::test_alloc::armed_requested_snapshot();
+                        assert!(matches!(
+                            rebind.reclaim(None, &reserve, 1),
+                            Err(GraphRefusal::Identity)
+                        ));
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        assert_eq!(
+                            (current.as_ptr(), current.len(), current.capacity()),
+                            custody
+                        );
+                        assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                        assert_eq!(
+                            (
+                                input.is_none(),
+                                pins.pinned().is_none(),
+                                rebind.modules().is_none()
+                            ),
+                            pending
+                        );
+                        assert_eq!(pool.snapshot(), held);
+                        assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                        assert!(matches!(
+                            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                            Err(GraphRefusal::Cancelled)
+                        ));
+                        break;
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
+                }
+                assert!(observed_growth);
+                if cancel {
+                    assert!(rebind.modules().is_none());
+                } else {
+                    assert!(released_original);
+                    assert!(rebind.modules().is_some());
+                }
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    assert!(
+                        before.live_blocks.saturating_sub(after.live_blocks) <= 1,
+                        "work1 cancellation cannot destroy a populated original suffix"
+                    );
+                    if before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes {
+                        released_original = true;
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
+                }
+                assert!(released_original);
+                for _ in 0..4096 {
+                    if pins
+                        .reclaim(Some(&source), &selection, &reserve, 1)
+                        .unwrap()
+                        == GraphStep::Ready
+                    {
+                        break;
+                    }
+                }
+            });
+            assert!(!peak.incomplete);
+            assert_eq!(peak.live_bytes, 0);
+            assert_eq!(peak.live_blocks, 0);
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_moves_original_skip_prefix_over_credits() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for cancel in [false, true] {
+            let (_dir, mut source, raw) = conservative_cursor_fixture();
+            source.reject_observation(raw[2].key);
+            let mut negative = raw[0].clone();
+            negative.tables[0].entries.clear();
+            for ordinal in 0..64 {
+                let mut entry = raw[0].tables[0].entries[0].clone();
+                entry.object = raw[2].key;
+                entry.object_path = format!(
+                    "{}/unused-{ordinal}/../provider-2.so",
+                    Path::new(&raw[2].path).parent().unwrap().display()
+                );
+                negative.tables[0].entries.push(entry);
+            }
+            // These are original, actual ordinary-binder negative records, with
+            // distinct owned path reasons; no scalar debt or readiness is seeded.
+            let (mut bound, skipped) = bind_scanned_modules(&[negative], &mut source);
+            assert_eq!(skipped.len(), 64);
+            let mut original = bound.remove(0).scanned;
+            let expected_prefix = original.tables[0].unpinned.clone();
+            assert_eq!(expected_prefix.len(), 64);
+            let mut entry = raw[0].tables[0].entries[0].clone();
+            entry.object = raw[2].key;
+            entry.object_path = raw[2].path.clone();
+            original.tables[0].entries.push(entry);
+            let originals = [original];
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+            let baseline = pool.snapshot().charged_bytes;
+            // Establish the retained-request envelope with the existing allocator
+            // oracle, then admit a same-shape actual copy BEFORE its allocation.
+            let (prepared, _) = retained_rebind_inputs(&pool, &originals, false);
+            let (prepared_rows, storage) = prepared.unwrap().into_originals();
+            drop(prepared_rows);
+            let mut pins = PinnedConservativeCursor::new();
+            let mut rebind = ScannedRebindCursor::new();
+            let mut observed_growth = false;
+            let mut released_original = false;
+            let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+                let rows = originals.to_vec();
+                let mut input =
+                    Some(RetainedScannedInputs::from_reserved_originals(rows, storage).unwrap());
+                finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+                let old_capacity = input.as_ref().unwrap().originals_for_test()[0].tables[0]
+                    .unpinned
+                    .capacity();
+                assert_eq!(
+                    old_capacity,
+                    expected_prefix.len(),
+                    "the actual owned clone has a tight prefix"
+                );
+                let old_bytes = old_capacity * std::mem::size_of::<Skipped>();
+                let mut previous = 0usize;
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = pins
+                        .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    if let Some((capacity, actual)) = rebind.reference_current_unpinned_for_test() {
+                        if !observed_growth && capacity > old_capacity {
+                            observed_growth = true;
+                            assert!(
+                                actual.len() <= 1,
+                                "allocation cannot copy the complete original skip prefix"
+                            );
+                            assert!(
+                                after.live_bytes
+                                    >= before.live_bytes
+                                        + capacity * std::mem::size_of::<Skipped>(),
+                                "old and fresh actual skip buffers overlap until prefix transfer finishes"
+                            );
+                            previous = actual.len();
+                        } else if observed_growth && previous < expected_prefix.len() {
+                            assert!(
+                                actual.len() <= previous + 1,
+                                "work1 moves at most one original skip record"
+                            );
+                            previous = actual.len();
+                        }
+                        if observed_growth {
+                            let prefix = actual.len().min(expected_prefix.len());
+                            assert_eq!(&actual[..prefix], &expected_prefix[..prefix]);
+                            if actual.len() >= expected_prefix.len()
+                                && before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes
+                            {
+                                released_original = true;
+                            }
+                        }
+
+                        if cancel
+                            && observed_growth
+                            && !actual.is_empty()
+                            && actual.len() < expected_prefix.len()
+                        {
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            let custody = (current.as_ptr(), current.len(), capacity);
+                            let held = pool.snapshot();
+                            let allocated = crate::test_alloc::armed_requested_snapshot();
+                            let pending = (
+                                input.is_none(),
+                                pins.pinned().is_none(),
+                                rebind.modules().is_none(),
+                            );
+                            assert_eq!(pending, (true, true, true));
+                            assert!(matches!(
+                                rebind.reclaim(None, &reserve, 1),
+                                Err(GraphRefusal::Identity)
+                            ));
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            assert_eq!((current.as_ptr(), current.len(), capacity), custody);
+                            assert_eq!(current, &expected_prefix[..current.len()]);
+                            assert_eq!(pool.snapshot(), held);
+                            assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                            // Normal binding still advances: ownerless refusal did not switch the
+                            // original live transfer into its reclaim phase.
+                            assert_eq!(
+                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                                    .unwrap(),
+                                GraphStep::Advanced
+                            );
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            assert!(!current.is_empty() && current.len() < expected_prefix.len());
+                            assert_eq!(current, &expected_prefix[..current.len()]);
+                            let custody = (current.as_ptr(), current.len(), capacity);
+                            rebind.cancel();
+                            let held = pool.snapshot();
+                            let allocated = crate::test_alloc::armed_requested_snapshot();
+                            assert!(matches!(
+                                rebind.reclaim(None, &reserve, 1),
+                                Err(GraphRefusal::Identity)
+                            ));
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            assert_eq!((current.as_ptr(), current.len(), capacity), custody);
+                            assert_eq!(current, &expected_prefix[..current.len()]);
+                            assert_eq!(
+                                (
+                                    input.is_none(),
+                                    pins.pinned().is_none(),
+                                    rebind.modules().is_none()
+                                ),
+                                pending
+                            );
+                            assert_eq!(pool.snapshot(), held);
+                            assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                            assert!(matches!(
+                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                                Err(GraphRefusal::Cancelled)
+                            ));
+                            break;
+                        }
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
+                }
+                assert!(observed_growth);
+                if !cancel {
+                    assert!(released_original);
+                    let module = &rebind.modules().unwrap()[0];
+                    assert_eq!(
+                        &module.scanned.tables[0].unpinned[..64],
+                        expected_prefix.as_slice()
+                    );
+                    assert_eq!(module.scanned.tables[0].unpinned.len(), 65);
+                    assert_eq!(rebind.skipped().unwrap().len(), 1);
+                } else {
+                    assert!(rebind.modules().is_none());
+                }
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    assert!(
+                        before.live_blocks.saturating_sub(after.live_blocks) <= 1,
+                        "work1 cancellation cannot destroy a populated original suffix"
+                    );
+                    if before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes {
+                        released_original = true;
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
+                }
+                assert!(released_original);
+                for _ in 0..4096 {
+                    if pins
+                        .reclaim(Some(&source), &selection, &reserve, 1)
+                        .unwrap()
+                        == GraphStep::Ready
+                    {
+                        break;
+                    }
+                }
+            });
+            assert!(!peak.incomplete);
+            assert_eq!(peak.live_bytes, 0);
+            assert_eq!(peak.live_blocks, 0);
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+    }
+
+    fn drive_pins_installed_reclaim(
+        cursor: &mut PinnedConservativeCursor,
+        live: &PinnedObjects,
+        selection: &ConservativePinSelection,
+        handoff: &mut RetiredFileHandoff,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) -> Result<(), GraphRefusal> {
+        for _ in 0..4096 {
+            match cursor.reclaim_installed(live, selection, handoff, reserve, 1) {
+                Ok(GraphStep::Ready) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        panic!("installed pins reclaim must finish over bounded credits");
+    }
+
+    fn drive_rebind_installed_reclaim(
+        rebind: &mut ScannedRebindCursor,
+        pins: &mut PinnedConservativeCursor,
+        live: &PinnedObjects,
+        handoff: &mut RetiredFileHandoff,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) -> Result<(), GraphRefusal> {
+        for _ in 0..4096 {
+            match rebind.reclaim_installed(pins, live, handoff, reserve, 1) {
+                Ok(GraphStep::Ready) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        panic!("installed rebind reclaim must finish over bounded credits");
+    }
+
+    #[test]
+    fn conservative_install_sink_keeps_leases_until_old_canonical_reclaimed() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        let expected = source.clone();
+        let before_install = pool.snapshot().charged_bytes;
+        assert!(before_install > baseline);
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(
+            installed.is_ok(),
+            "install_ready accepts a Ready copy with no loan: {installed:?}"
+        );
+        let backing = installed.unwrap();
+        // The swap moved leases; it refunded nothing.
+        assert_eq!(pool.snapshot().charged_bytes, before_install);
+        assert_conservative_value(&expected, &canonical);
+        // The cursor now holds the old canonical.
+        let old = cursor.installed_output_for_test();
+        assert!(old.is_some(), "installed cursor retains the old canonical");
+        assert_conservative_value(&expected, old.unwrap());
+        assert_eq!(cursor.installed_state_for_test(), (true, true));
+        assert!(cursor.pinned().is_none());
+        assert!(cursor.loaned_output().is_none());
+        // Nothing is retired, so every old file is live-aliased and the
+        // handoff stays empty while the old canonical is reclaimed.
+        assert_eq!(
+            cursor.retired_entry_count(),
+            None,
+            "installed cursor answers no pre-install count"
+        );
+        let handoff = RetiredFileHandoff::reserve(0, &reserve);
+        assert!(handoff.is_ok(), "empty handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        let handoff_bytes = RetiredFileHandoff::bytes(0);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            before_install + handoff_bytes
+        );
+        let outcome = drive_pins_installed_reclaim(
+            &mut cursor,
+            &canonical,
+            &selection,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "old canonical reclaims against live: {outcome:?}"
+        );
+        // Leases stay charged through reclaim; only the backing drop refunds.
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            before_install + handoff_bytes
+        );
+        assert_eq!(handoff.len_for_test(), 0);
+        assert_eq!(cursor.installed_state_for_test(), (false, true));
+        drop(handoff);
+        assert_eq!(pool.snapshot().charged_bytes, before_install);
+        drop(canonical);
+        drop(backing);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_install_sink_refuses_unready_cursor() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut canonical = source.clone();
+        // Fresh and mid-copy pins cursors are not Ready.
+        let mut fresh = PinnedConservativeCursor::new();
+        assert!(matches!(
+            fresh.install_ready(&mut canonical),
+            Err(GraphRefusal::Identity)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        let mut partial = PinnedConservativeCursor::new();
+        assert_ne!(
+            source
+                .poll_conservative_copy(&mut partial, &selection, &reserve, 1)
+                .unwrap(),
+            GraphStep::Ready
+        );
+        assert!(matches!(
+            partial.install_ready(&mut canonical),
+            Err(GraphRefusal::Identity)
+        ));
+        // A refusal consumes nothing: the same cursor still installs at Ready.
+        finish_conservative_copy(&source, &mut partial, &selection, &reserve);
+        let held = pool.snapshot().charged_bytes;
+        let installed = partial.install_ready(&mut canonical);
+        assert!(
+            installed.is_ok(),
+            "refused cursor installs at Ready: {installed:?}"
+        );
+        let backing = installed.unwrap();
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        drop(canonical);
+        drop(backing);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // A reclaimed pins cursor reports Cancelled, not Identity.
+        let mut spent = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut spent, &selection, &reserve);
+        for _ in 0..4096 {
+            if spent
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        let mut canonical = source.clone();
+        assert!(matches!(
+            spent.install_ready(&mut canonical),
+            Err(GraphRefusal::Cancelled)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // An aborted pins cursor (rebind cancelled mid-bind, loan released).
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let mut aborted = ScannedRebindCursor::new();
+        for _ in 0..4096 {
+            if input.is_none() {
+                break;
+            }
+            pins.poll_scanned_rebind(&mut input, &mut aborted, &reserve, 1)
+                .unwrap();
+        }
+        assert!(input.is_none(), "admit takes the input before cancel");
+        aborted.cancel();
+        for _ in 0..4096 {
+            if aborted.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(matches!(
+            pins.install_ready(&mut canonical),
+            Err(GraphRefusal::Cancelled)
+        ));
+        drop(aborted);
+        drop(pins);
+        // Rebind sink: fresh, mid-bind and cancelled refuse without charging.
+        let (mut input2, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins2 = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins2, &selection, &reserve);
+        let mut rebind = ScannedRebindCursor::new();
+        let mut modules = Vec::new();
+        let charged = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            rebind.install_ready(&mut modules),
+            Err(GraphRefusal::Identity)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        pins2
+            .poll_scanned_rebind(&mut input2, &mut rebind, &reserve, 1)
+            .unwrap();
+        let charged = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            rebind.install_ready(&mut modules),
+            Err(GraphRefusal::Identity)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        rebind.cancel();
+        assert!(matches!(
+            rebind.install_ready(&mut modules),
+            Err(GraphRefusal::Cancelled)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        // A reclaimed rebind reports Cancelled.
+        let (mut input3, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins3 = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins3, &selection, &reserve);
+        let mut done = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins3, &mut input3, &mut done, &reserve);
+        for _ in 0..4096 {
+            if done.reclaim(Some(&mut pins3), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        let charged = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            done.install_ready(&mut modules),
+            Err(GraphRefusal::Cancelled)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        drop(done);
+        drop(pins3);
+        drop(input3);
+        // A Ready rebind installs, moving its payment into the backing.
+        let (mut input4, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins4 = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins4, &selection, &reserve);
+        let mut ready = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins4, &mut input4, &mut ready, &reserve);
+        assert!(input4.is_none());
+        let held = pool.snapshot().charged_bytes;
+        let installed = ready.install_ready(&mut modules);
+        assert!(installed.is_ok(), "Ready rebind installs: {installed:?}");
+        let backing = installed.unwrap();
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert!(!modules.is_empty(), "installed modules reach the canonical");
+        drop(modules);
+        drop(ready);
+        drop(pins4);
+        drop(backing);
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_hands_off_absent_files_and_releases_live_aliases() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(
+            &pool,
+            BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]),
+            BTreeSet::new(),
+        );
+        let id_for = |provider: &str| {
+            source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains(provider))
+                .map(|(id, _)| *id)
+                .unwrap()
+        };
+        let id_a = id_for("provider-0");
+        let id_r1 = id_for("provider-1");
+        let id_r2 = id_for("provider-2");
+        // Sanity: A is claimed by surviving view 1; R ids only by retired views.
+        let surviving: BTreeSet<PinnedObjectId> = source
+            .ownership
+            .iter()
+            .filter(|(view, _)| **view == ProcessViewId(1))
+            .flat_map(|(_, claims)| {
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.pins.iter())
+                    .copied()
+                    .chain(claims.targets.iter().map(|(id, _)| *id))
+            })
+            .collect();
+        assert!(surviving.contains(&id_a));
+        assert!(!surviving.contains(&id_r1) && !surviving.contains(&id_r2));
+        let retired_claims: BTreeSet<PinnedObjectId> = source
+            .ownership
+            .iter()
+            .filter(|(view, _)| **view != ProcessViewId(1))
+            .flat_map(|(_, claims)| {
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.pins.iter())
+                    .copied()
+                    .chain(claims.targets.iter().map(|(id, _)| *id))
+            })
+            .collect();
+        let weak_a = Arc::downgrade(&source.by_id.get(&id_a).unwrap().file);
+        let weak_r1 = Arc::downgrade(&source.by_id.get(&id_r1).unwrap().file);
+        let weak_r2 = Arc::downgrade(&source.by_id.get(&id_r2).unwrap().file);
+        let fd_a = source.by_id.get(&id_a).unwrap().file.as_raw_fd();
+        let fd_r1 = source.by_id.get(&id_r1).unwrap().file.as_raw_fd();
+        let fd_r2 = source.by_id.get(&id_r2).unwrap().file.as_raw_fd();
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        {
+            let copy = cursor.pinned().unwrap();
+            assert!(!copy.by_id.contains_key(&id_r1) && !copy.by_id.contains_key(&id_r2));
+            assert!(copy.by_id.contains_key(&id_a));
+        }
+        // Handoff capacity: removed plus rejected ids of this copy.
+        let count = cursor.retired_entry_count();
+        assert_eq!(
+            count,
+            Some(retired_claims.len()),
+            "retired count covers every removed claim"
+        );
+        let handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve);
+        assert!(handoff.is_ok(), "handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "Ready copy installs: {installed:?}");
+        let backing = installed.unwrap();
+        assert!(canonical.by_id.contains_key(&id_a));
+        assert!(!canonical.by_id.contains_key(&id_r1));
+        assert!(!canonical.by_id.contains_key(&id_r2));
+        let outcome = drive_pins_installed_reclaim(
+            &mut cursor,
+            &canonical,
+            &selection,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "installed reclaim hands off absent files: {outcome:?}"
+        );
+        // Kept entry: the old share dropped under the live alias.
+        assert_eq!(
+            weak_a.strong_count(),
+            1,
+            "live canonical holds the only A share"
+        );
+        // SAFETY: read-only checks of retained descriptors.
+        assert!(unsafe { libc::fcntl(fd_a, libc::F_GETFD) } >= 0);
+        // Retired entries: alive in the handoff, FDs still open.
+        assert_eq!(handoff.len_for_test(), 2);
+        for (weak, fd) in [(&weak_r1, fd_r1), (&weak_r2, fd_r2)] {
+            assert!(
+                weak.upgrade().is_some(),
+                "retired file stays open in the handoff"
+            );
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        }
+        // Lane-style close: one file per call until the chain is empty.
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            if handoff.close_some(1) {
+                break;
+            }
+            assert!(calls < 8, "bounded handoff close");
+        }
+        assert_eq!(calls, 2, "two files close in two single-file calls");
+        assert!(weak_r1.upgrade().is_none() && weak_r2.upgrade().is_none());
+        drop(canonical);
+        drop(backing);
+        drop(handoff);
+    }
+
+    #[test]
+    fn scanned_installed_reclaim_drains_absent_exports_elementwise() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, modules) = conservative_cursor_fixture();
+        // Retire view 3: provider-2's module is absent from the live output.
+        let id_r = source
+            .by_id
+            .iter()
+            .find(|(_, entry)| entry.path.contains("provider-2"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        // Old-canonical modules bind first, cloning this exclusive slice...
+        source.by_id.get_mut(&id_r).unwrap().exports = Arc::from(vec![
+            ("retired-first-export".repeat(8), 11),
+            ("retired-second-export".repeat(16), 22),
+            ("retired-third-export".repeat(32), 33),
+        ]);
+        let mut old_pins = source.clone();
+        old_pins.reset_derived_claims();
+        let (old_modules, _) = bind_scanned_modules(&modules, &mut old_pins);
+        drop(old_pins);
+        assert!(old_modules.iter().any(|module| module.object == id_r));
+        // ...then the live pins move on, leaving the module the last owner.
+        source.by_id.get_mut(&id_r).unwrap().exports =
+            Arc::from(vec![("live-successor-export".into(), 44)]);
+        let bound_exports = old_modules
+            .iter()
+            .find(|module| module.object == id_r)
+            .unwrap()
+            .exports
+            .clone();
+        assert_eq!(
+            Arc::strong_count(&bound_exports),
+            2,
+            "old module plus this probe hold the only shares"
+        );
+        drop(bound_exports);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection =
+            conservative_selection(&pool, BTreeSet::from([ProcessViewId(3)]), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        assert!(!pins.pinned().unwrap().by_id.contains_key(&id_r));
+        // Surviving rows only (retired view excluded, like the Engine filter).
+        let rows: Vec<ScannedModule> = modules
+            .iter()
+            .filter(|module| module.view != ProcessViewId(3))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let (mut input, _) = retained_rebind_inputs(&pool, &rows, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(input.is_none());
+        let count = pins.retired_entry_count();
+        assert_eq!(count, Some(1), "one retired claim bounds the handoff");
+        let handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve);
+        assert!(handoff.is_ok(), "handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        let mut canonical = source;
+        let mut canonical_modules = old_modules;
+        let pins_installed = pins.install_ready(&mut canonical);
+        assert!(
+            pins_installed.is_ok(),
+            "loaned pins install: {pins_installed:?}"
+        );
+        let pins_backing = pins_installed.unwrap();
+        let rebind_installed = rebind.install_ready(&mut canonical_modules);
+        assert!(
+            rebind_installed.is_ok(),
+            "bound rebind installs: {rebind_installed:?}"
+        );
+        let modules_backing = rebind_installed.unwrap();
+        // The retired module's exclusive slice drains one element per credit.
+        let mut prior = 3usize;
+        let mut done = false;
+        let mut error = None;
+        for _ in 0..4096 {
+            match rebind.reclaim_installed(&mut pins, &canonical, &mut handoff, &reserve, 1) {
+                Ok(GraphStep::Ready) => {
+                    done = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(refused) => {
+                    error = Some(refused);
+                    break;
+                }
+            }
+            let left = rebind
+                .reference_pending_exports_for_test(id_r)
+                .map_or(0, |exports| {
+                    exports.iter().filter(|(text, _)| !text.is_empty()).count()
+                });
+            assert!(
+                prior.saturating_sub(left) <= 1,
+                "one credit drains at most one export"
+            );
+            prior = left;
+        }
+        assert!(
+            error.is_none(),
+            "installed rebind reclaim refused: {error:?}"
+        );
+        assert!(done, "installed rebind reclaim reaches Ready");
+        assert_eq!(prior, 0, "exclusive slice fully drained");
+        assert_eq!(
+            handoff.len_for_test(),
+            0,
+            "module exports never enter the file handoff"
+        );
+        assert_eq!(pins.installed_state_for_test(), (true, true));
+        // The retired file still hands off through the pins step.
+        let outcome =
+            drive_pins_installed_reclaim(&mut pins, &canonical, &selection, &mut handoff, &reserve);
+        assert!(
+            outcome.is_ok(),
+            "installed pins reclaim hands off the file: {outcome:?}"
+        );
+        assert_eq!(handoff.len_for_test(), 1);
+        drop(canonical);
+        drop(canonical_modules);
+        drop(pins_backing);
+        drop(modules_backing);
+        drop(handoff);
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_refuses_replaced_live_canonical() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        // A non-installed cursor refuses installed reclaim outright.
+        let handoff = RetiredFileHandoff::reserve(0, &reserve);
+        assert!(handoff.is_ok(), "empty handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        assert!(matches!(
+            cursor.reclaim_installed(&source, &selection, &mut handoff, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "Ready copy installs: {installed:?}");
+        let backing = installed.unwrap();
+        // One credit against the true live canonical advances.
+        assert_eq!(
+            cursor
+                .reclaim_installed(&canonical, &selection, &mut handoff, &reserve, 1)
+                .unwrap(),
+            GraphStep::Advanced
+        );
+        // A replaced live canonical (fresh copy identity) refuses.
+        let replaced = canonical.clone();
+        assert!(matches!(
+            cursor.reclaim_installed(&replaced, &selection, &mut handoff, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        // The refusal kept every owner: resume against the true live.
+        let outcome = drive_pins_installed_reclaim(
+            &mut cursor,
+            &canonical,
+            &selection,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "reclaim resumes after refusal: {outcome:?}"
+        );
+        drop(canonical);
+        drop(replaced);
+        drop(backing);
+        drop(handoff);
+    }
+
+    /// One joint-graph round at the identity seam: copy, rebind, install both
+    /// into the canonical, then rebind reclaim before pins reclaim. Returns
+    /// the round's backings, the post-install charge, and the round-local
+    /// selection and handoff charges for exact baseline accounting.
+    fn run_graph_round(
+        pool: &crate::semantics_edge::resources::SemanticResourcePool,
+        canonical: &mut PinnedObjects,
+        canonical_modules: &mut Vec<ReconciledModule>,
+        rows: &[ScannedModule],
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+        round: u32,
+    ) -> (
+        InstalledPinsBacking,
+        InstalledModulesBacking,
+        usize,
+        usize,
+        usize,
+    ) {
+        let reserve = pool.reserver();
+        let selection_bytes =
+            ConservativePinSelection::storage_bound(retired.len(), rejected.len()).unwrap();
+        let selection = conservative_selection(pool, retired.clone(), rejected.clone());
+        assert_eq!(
+            selection.retired(),
+            &retired,
+            "round {round}: selection keeps retired views"
+        );
+        assert_eq!(
+            selection.rejected(),
+            &rejected,
+            "round {round}: selection keeps rejected keys"
+        );
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(canonical, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(pool, rows, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(input.is_none(), "round {round}: rebind takes its input");
+        let count = pins.retired_entry_count();
+        assert!(
+            count.is_some(),
+            "round {round}: loaned copy answers a retired count"
+        );
+        let handoff_bytes = RetiredFileHandoff::bytes(count.unwrap());
+        let handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve);
+        assert!(
+            handoff.is_ok(),
+            "round {round}: handoff reserves: {handoff:?}"
+        );
+        let mut handoff = handoff.unwrap();
+        let pins_installed = pins.install_ready(canonical);
+        assert!(
+            pins_installed.is_ok(),
+            "round {round}: loaned pins install: {pins_installed:?}"
+        );
+        let pins_backing = pins_installed.unwrap();
+        let rebind_installed = rebind.install_ready(canonical_modules);
+        assert!(
+            rebind_installed.is_ok(),
+            "round {round}: bound rebind installs: {rebind_installed:?}"
+        );
+        let modules_backing = rebind_installed.unwrap();
+        let installed_charge = pool.snapshot().charged_bytes;
+        // Order: pins reclaim while the loan is outstanding refuses.
+        assert!(
+            matches!(
+                pins.reclaim_installed(canonical, &selection, &mut handoff, &reserve, 1),
+                Err(GraphRefusal::Identity)
+            ),
+            "round {round}: pins reclaim refuses while the loan is held"
+        );
+        let outcome = drive_rebind_installed_reclaim(
+            &mut rebind,
+            &mut pins,
+            canonical,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "round {round}: rebind reclaim releases the loan: {outcome:?}"
+        );
+        assert_eq!(
+            pins.installed_state_for_test(),
+            (true, true),
+            "round {round}: loan released, phase stays Installed"
+        );
+        let outcome =
+            drive_pins_installed_reclaim(&mut pins, canonical, &selection, &mut handoff, &reserve);
+        assert!(
+            outcome.is_ok(),
+            "round {round}: pins reclaim hands off retired files: {outcome:?}"
+        );
+        // Lane-style close, then release every round-local owner.
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            if handoff.close_some(256) {
+                break;
+            }
+            assert!(calls < 64, "round {round}: bounded handoff close");
+        }
+        drop(handoff);
+        drop(selection);
+        drop(pins);
+        drop(rebind);
+        (
+            pins_backing,
+            modules_backing,
+            installed_charge,
+            selection_bytes,
+            handoff_bytes,
+        )
+    }
+
+    #[test]
+    fn conservative_graph_install_and_reclaim_returns_pool_to_baseline() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, modules) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let baseline = pool.snapshot().charged_bytes;
+        // Round-0 canonical: all rows bound against the pristine pins.
+        let mut canonical = source;
+        let mut pins0 = canonical.clone();
+        pins0.reset_derived_claims();
+        let (canonical_modules_init, skips0) = bind_scanned_modules(&modules, &mut pins0);
+        assert!(skips0.is_empty(), "pristine rows all bind: {skips0:?}");
+        drop(pins0);
+        let mut canonical_modules = canonical_modules_init;
+        // Round 1: retire view 1, reject view 2's key.
+        let rows1: Vec<ScannedModule> = modules
+            .iter()
+            .filter(|module| module.view != ProcessViewId(1) && module.key != modules[1].key)
+            .cloned()
+            .collect();
+        assert_eq!(rows1.len(), 2);
+        let (pins_backing1, modules_backing1, installed1, sel1, ho1) = run_graph_round(
+            &pool,
+            &mut canonical,
+            &mut canonical_modules,
+            &rows1,
+            BTreeSet::from([ProcessViewId(1)]),
+            BTreeSet::from([modules[1].key]),
+            1,
+        );
+        // Round 1 kept nothing but the live canonical's own leases.
+        assert_eq!(pool.snapshot().charged_bytes, installed1 - sel1 - ho1);
+        assert!(!canonical.ownership.contains_key(&ProcessViewId(1)));
+        // Exact fit for one graph above the live canonical.
+        let live1 = pool.snapshot().charged_bytes - baseline;
+        let peak1 = pool.snapshot().peak_charged_bytes;
+        pool.reference_set_limit(pool.snapshot().charged_bytes + (peak1 - baseline));
+        // Round 2: retire view 2 (cumulative filter).
+        let rows2: Vec<ScannedModule> = modules
+            .iter()
+            .filter(|module| {
+                module.view != ProcessViewId(1)
+                    && module.view != ProcessViewId(2)
+                    && module.key != modules[1].key
+            })
+            .cloned()
+            .collect();
+        assert_eq!(rows2.len(), 1);
+        let (pins_backing2, modules_backing2, installed2, sel2, ho2) = run_graph_round(
+            &pool,
+            &mut canonical,
+            &mut canonical_modules,
+            &rows2,
+            BTreeSet::from([ProcessViewId(2)]),
+            BTreeSet::new(),
+            2,
+        );
+        drop(pins_backing1);
+        drop(modules_backing1);
+        // Round 2 kept nothing but the new live canonical's own leases.
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            installed2 - sel2 - ho2 - live1
+        );
+        assert!(!canonical.ownership.contains_key(&ProcessViewId(2)));
+        assert!(canonical.ownership.contains_key(&ProcessViewId(3)));
+        // Tidy: live canonical released while still paid, then the bill.
+        drop(canonical);
+        drop(canonical_modules);
+        drop(pins_backing2);
+        drop(modules_backing2);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn loaned_output_is_some_only_while_rebinding() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        assert!(pins.loaned_output().is_none(), "New loans nothing");
+        assert_ne!(
+            source
+                .poll_conservative_copy(&mut pins, &selection, &reserve, 1)
+                .unwrap(),
+            GraphStep::Ready
+        );
+        assert!(pins.loaned_output().is_none(), "mid-copy loans nothing");
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        assert!(pins.pinned().is_some());
+        assert!(
+            pins.loaned_output().is_none(),
+            "Ready without a loan loans nothing"
+        );
+        let expected = pins.pinned().unwrap().clone();
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        // Drive to admit (input taken) without finishing.
+        for _ in 0..4096 {
+            if input.is_none() {
+                break;
+            }
+            assert_ne!(
+                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+        }
+        assert!(input.is_none(), "admit takes the input");
+        assert!(pins.pinned().is_none(), "mid-bind hides the partial output");
+        assert!(
+            pins.loaned_output().is_some(),
+            "admit exposes the loaned output"
+        );
+        // One more bind credit keeps the loan visible.
+        assert_ne!(
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                .unwrap(),
+            GraphStep::Ready
+        );
+        assert!(
+            pins.loaned_output().is_some(),
+            "mid-bind keeps the loan visible"
+        );
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(rebind.modules().is_some());
+        assert!(
+            pins.pinned().is_some(),
+            "completed bind keeps the Ready borrow"
+        );
+        let loaned = pins.loaned_output();
+        assert!(loaned.is_some(), "completed bind still holds the loan");
+        let mut bound = expected.clone();
+        bound.reset_derived_claims();
+        let (oracle_modules, _) = bind_scanned_modules(&raw, &mut bound);
+        assert_conservative_value(&bound, loaned.unwrap());
+        assert_eq!(rebind.modules().unwrap(), &oracle_modules);
+        // Release the loan: the output is no longer loaned.
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(
+            pins.pinned().is_some(),
+            "released loan restores the Ready borrow"
+        );
+        assert!(
+            pins.loaned_output().is_none(),
+            "released loan loans nothing"
+        );
+        // Install: neither borrow answers.
+        let mut canonical = source.clone();
+        let installed = pins.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "released pins install: {installed:?}");
+        let backing = installed.unwrap();
+        assert!(pins.pinned().is_none());
+        assert!(
+            pins.loaned_output().is_none(),
+            "installed output is not a loan"
+        );
+        drop(canonical);
+        drop(backing);
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_refuses_full_handoff_with_storage() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "Ready copy installs: {installed:?}");
+        let backing = installed.unwrap();
+        // Zero reserved slots: any absent file overflows the handoff.
+        let handoff = RetiredFileHandoff::reserve(0, &reserve);
+        assert!(handoff.is_ok(), "empty handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        // Forge the live canonical: same value identity, a stranger file at
+        // the first entry, so the old share has no live alias to drop under.
+        let id = *canonical.by_id.keys().next().unwrap();
+        let fd = canonical.by_id.get(&id).unwrap().file.as_raw_fd();
+        let stranger = canonical.by_id.values().nth(1).unwrap().file.clone();
+        assert!(!Arc::ptr_eq(
+            &canonical.by_id.get(&id).unwrap().file,
+            &stranger
+        ));
+        canonical.by_id.get_mut(&id).unwrap().file = stranger;
+        assert!(matches!(
+            drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve
+            ),
+            Err(GraphRefusal::Storage(_))
+        ));
+        // The refusal kept every owner: nothing was dropped or pushed.
+        assert_eq!(handoff.len_for_test(), 0);
+        assert_eq!(cursor.installed_state_for_test(), (true, true));
+        assert_eq!(
+            cursor.retained_reclaim_file_for_test(id),
+            Some((4, Some(fd)))
+        );
+        drop(canonical);
+        drop(backing);
+        drop(handoff);
+    }
+
+    #[test]
+    fn scanned_input_measure_matches_cursor_input_accounting() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        // Direct unit: one group or element per step, true at module end.
+        let capacity = input.as_ref().unwrap().original_capacity_for_test();
+        let mut measure = ScannedInputMeasure::new(capacity).unwrap();
+        assert!(measure.bytes() > 0, "seeded Vec envelope is positive");
+        let mut steps = 0usize;
+        for module in input.as_ref().unwrap().originals_for_test() {
+            let mut module_steps = 0usize;
+            loop {
+                steps += 1;
+                module_steps += 1;
+                assert!(module_steps < 4096, "bounded steps per module");
+                if measure.step(module).unwrap() {
+                    break;
+                }
+            }
+            assert!(
+                module_steps >= 4,
+                "header, exports, interfaces, tables measured"
+            );
+        }
+        assert!(steps > raw.len());
+        let total = measure.bytes();
+        // The cursor charges exactly the same input total for the same rows.
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        let required = rebind.required_input_bytes();
+        assert!(
+            required.is_some(),
+            "bound rebind answers an input requirement"
+        );
+        assert_eq!(
+            required.unwrap(),
+            total,
+            "cursor input accounting matches the standalone measure"
+        );
+    }
+
+    #[test]
+    fn scanned_input_measure_charges_the_operator_module_hint() {
+        use crate::discovery::scan::ScannedModule;
+        use std::os::unix::ffi::OsStrExt as _;
+        let key = overlay(9);
+        let plain = module(key);
+        let mut named = module(key);
+        named.module_hint = Some(PathBuf::from("/opt/operator/provider.so"));
+        let measured = |source: &ScannedModule| {
+            let mut measure = ScannedInputMeasure::new(1).unwrap();
+            for _ in 0..4096 {
+                if measure.step(source).unwrap() {
+                    return measure.bytes();
+                }
+            }
+            panic!("the tiny module must measure over finite steps");
+        };
+        let plain_bytes = measured(&plain);
+        let named_bytes = measured(&named);
+        let hint_len = named
+            .module_hint
+            .as_ref()
+            .unwrap()
+            .as_os_str()
+            .as_bytes()
+            .len();
+        let expected = hint_len
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+            .unwrap();
+        assert_eq!(
+            named_bytes - plain_bytes,
+            expected,
+            "the hint bytes are reserved with the row"
+        );
+    }
+
+    #[test]
+    fn conservative_tree_bound_covers_std_btree_allocations() {
+        fn tight_nodes(entries: usize) -> usize {
+            if entries == 0 {
+                0
+            } else {
+                1 + (entries - 1) / 5
+            }
+        }
+        fn expected_bytes<K, V>(entries: usize) -> usize {
+            fn align8(bytes: usize) -> usize {
+                (bytes + 7) & !7
+            }
+            let node = 16
+                + align8(std::mem::size_of::<K>() * 11)
+                + align8(std::mem::size_of::<V>() * 11)
+                + 12 * 8
+                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+            tight_nodes(entries) * node
+        }
+        fn ascending(n: usize) -> Vec<u64> {
+            (0..n as u64).collect()
+        }
+        fn descending(n: usize) -> Vec<u64> {
+            (0..n as u64).rev().collect()
+        }
+        fn xorshifted(n: usize) -> Vec<u64> {
+            let mut keys: Vec<u64> = (0..n as u64).collect();
+            let mut state = 0x9E3779B97F4A7C15u64;
+            for i in (1..n).rev() {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let j = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as usize % (i + 1);
+                keys.swap(i, j);
+            }
+            keys
+        }
+        fn check_cover<K: Ord, V>(
+            entries: usize,
+            order: &[u64],
+            mut key: impl FnMut(u64) -> K,
+            mut value: impl FnMut(u64) -> V,
+        ) {
+            let bound = conservative_pin_tree_bytes::<K, V>(entries)
+                .expect("tight bound fits for the test sizes");
+            assert_eq!(
+                bound,
+                expected_bytes::<K, V>(entries),
+                "tight node count for {entries} entries"
+            );
+            let (map, peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut map = std::collections::BTreeMap::new();
+                for k in order {
+                    map.insert(key(*k), value(*k));
+                }
+                map
+            });
+            assert_eq!(map.len(), entries, "all test keys inserted");
+            assert!(!peak.incomplete, "allocation probe stayed complete");
+            assert_eq!(peak.failed_requests, 0, "no failed test allocations");
+            if entries == 0 {
+                assert_eq!(peak.live_blocks, 0, "empty map allocates nothing");
+            } else {
+                assert!(peak.live_blocks > 0, "nonempty map retains nodes");
+                assert!(peak.peak_bytes > 0, "nonempty map requests bytes");
+            }
+            let need = peak
+                .peak_bytes
+                .max(peak.live_bytes)
+                .max(peak.realloc_overlap_bytes);
+            assert!(
+                bound >= need,
+                "bound {bound} covers heap {need} for {entries} entries"
+            );
+            drop(map);
+        }
+        fn check_half_removed<K: Ord, V>(
+            entries: usize,
+            mut key: impl FnMut(u64) -> K,
+            mut value: impl FnMut(u64) -> V,
+        ) {
+            let remaining = entries / 2;
+            let full = conservative_pin_tree_bytes::<K, V>(entries)
+                .expect("tight bound fits for the test sizes");
+            assert_eq!(
+                full,
+                expected_bytes::<K, V>(entries),
+                "tight node count for {entries} entries"
+            );
+            let rest = conservative_pin_tree_bytes::<K, V>(remaining)
+                .expect("tight bound fits for the test sizes");
+            assert_eq!(
+                rest,
+                expected_bytes::<K, V>(remaining),
+                "tight node count for {remaining} entries"
+            );
+            let (map, peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut map = std::collections::BTreeMap::new();
+                for k in 0..entries as u64 {
+                    map.insert(key(k), value(k));
+                }
+                for k in (0..entries as u64).filter(|k| k % 2 == 0) {
+                    map.remove(&key(k));
+                }
+                map
+            });
+            assert_eq!(map.len(), remaining, "half the test keys removed");
+            assert!(!peak.incomplete, "allocation probe stayed complete");
+            assert_eq!(peak.failed_requests, 0, "no failed test allocations");
+            assert!(
+                full >= peak.peak_bytes.max(peak.realloc_overlap_bytes),
+                "full bound {full} covers insertion peak {}",
+                peak.peak_bytes.max(peak.realloc_overlap_bytes),
+            );
+            assert!(
+                rest >= peak.live_bytes,
+                "remaining bound {rest} covers live {}",
+                peak.live_bytes,
+            );
+            drop(map);
+        }
+        for entries in [0, 1, 5, 11, 12, 64, 4096] {
+            for order in [ascending(entries), descending(entries), xorshifted(entries)] {
+                check_cover::<u64, u64>(entries, &order, |k| k, |k| k.wrapping_mul(3));
+                check_cover::<u64, ()>(entries, &order, |k| k, |_| ());
+                check_cover::<u64, [u64; 16]>(entries, &order, |k| k, |k| [k; 16]);
+                check_cover::<[u64; 4], [u64; 4]>(entries, &order, |k| [k, 0, 1, 2], |k| [k; 4]);
+            }
+            if entries >= 2 {
+                check_half_removed::<u64, u64>(entries, |k| k, |k| k);
+                check_half_removed::<u64, ()>(entries, |k| k, |_| ());
+                check_half_removed::<u64, [u64; 16]>(entries, |k| k, |k| [k; 16]);
+                check_half_removed::<[u64; 4], [u64; 4]>(entries, |k| [k, 0, 1, 2], |k| [k; 4]);
+            }
+        }
+        #[repr(align(16))]
+        struct OverAligned;
+        assert!(
+            conservative_pin_tree_bytes::<OverAligned, u64>(1).is_none(),
+            "over-aligned keys refuse"
+        );
+        assert!(
+            conservative_pin_tree_bytes::<u64, OverAligned>(1).is_none(),
+            "over-aligned values refuse"
+        );
+        assert!(
+            conservative_pin_tree_bytes::<u64, u64>(usize::MAX).is_none(),
+            "huge maps refuse instead of wrapping"
+        );
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_releases_session_shared_exports() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        // A Session-held clone of retired exports is released by dropping our
+        // share; reclaim completes and the holder keeps its data.
+        {
+            let (_dir, mut source, _) = conservative_cursor_fixture();
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]),
+                BTreeSet::new(),
+            );
+            let id_for = |provider: &str| {
+                source
+                    .by_id
+                    .iter()
+                    .find(|(_, entry)| entry.path.contains(provider))
+                    .map(|(id, _)| *id)
+                    .unwrap()
+            };
+            let id_r1 = id_for("provider-1");
+            let id_r2 = id_for("provider-2");
+            source.by_id.get_mut(&id_r1).unwrap().exports = Arc::from(vec![
+                ("session-shared-r1-first".repeat(8), 11),
+                ("session-shared-r1-second".repeat(8), 22),
+            ]);
+            source.by_id.get_mut(&id_r2).unwrap().exports =
+                Arc::from(vec![("session-shared-r2-only".repeat(16), 33)]);
+            let outside_r1 = source.by_id.get(&id_r1).unwrap().exports.clone();
+            let outside_r2 = source.by_id.get(&id_r2).unwrap().exports.clone();
+            assert_eq!(
+                Arc::strong_count(&outside_r1),
+                2,
+                "old entry plus the Session holder"
+            );
+            assert_eq!(
+                Arc::strong_count(&outside_r2),
+                2,
+                "old entry plus the Session holder"
+            );
+            let mut cursor = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+            let count = cursor.retired_entry_count().unwrap();
+            let mut handoff = RetiredFileHandoff::reserve(count, &reserve).unwrap();
+            let mut canonical = source;
+            let backing = cursor.install_ready(&mut canonical).unwrap();
+            let outcome = drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "shared exports release: {outcome:?}");
+            assert_eq!(handoff.len_for_test(), 2, "files hand off, exports do not");
+            assert_eq!(Arc::strong_count(&outside_r1), 1);
+            assert_eq!(Arc::strong_count(&outside_r2), 1);
+            assert_eq!(outside_r1.len(), 2);
+            assert!(outside_r1.iter().all(|(text, _)| !text.is_empty()));
+            assert!(outside_r1[0].0.starts_with("session-shared-r1-first"));
+            assert_eq!(outside_r2.len(), 1);
+            assert!(outside_r2[0].0.starts_with("session-shared-r2-only"));
+            drop(canonical);
+            drop(backing);
+            drop(handoff);
+        }
+        // An unknown Weak still refuses; dropping it lets the exclusive drain
+        // finish.
+        {
+            let (_dir, mut source, _) = conservative_cursor_fixture();
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]),
+                BTreeSet::new(),
+            );
+            let id_r1 = source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains("provider-1"))
+                .map(|(id, _)| *id)
+                .unwrap();
+            source.by_id.get_mut(&id_r1).unwrap().exports =
+                Arc::from(vec![("weak-guarded-export".repeat(8), 1)]);
+            let mut cursor = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+            let count = cursor.retired_entry_count().unwrap();
+            let mut handoff = RetiredFileHandoff::reserve(count, &reserve).unwrap();
+            let mut canonical = source;
+            let backing = cursor.install_ready(&mut canonical).unwrap();
+            let weak = Arc::downgrade(
+                &cursor
+                    .installed_output_for_test()
+                    .unwrap()
+                    .by_id
+                    .get(&id_r1)
+                    .unwrap()
+                    .exports,
+            );
+            let refused = drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(matches!(refused, Err(GraphRefusal::Identity)));
+            assert_eq!(handoff.len_for_test(), 1);
+            assert!(weak.upgrade().is_some(), "refused exports keep their data");
+            drop(weak);
+            let outcome = drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(
+                outcome.is_ok(),
+                "drain finishes after Weak drops: {outcome:?}"
+            );
+            assert_eq!(handoff.len_for_test(), 2);
+            drop(canonical);
+            drop(backing);
+            drop(handoff);
+        }
+    }
+
+    #[test]
+    fn scanned_installed_reclaim_releases_session_shared_exports() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        // A Session-held clone of a retired module's exports is released by
+        // dropping our share; reclaim completes and the holder keeps its data.
+        {
+            let (_dir, mut source, modules) = conservative_cursor_fixture();
+            let id_r = source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains("provider-2"))
+                .map(|(id, _)| *id)
+                .unwrap();
+            source.by_id.get_mut(&id_r).unwrap().exports = Arc::from(vec![
+                ("session-shared-module-first".repeat(8), 11),
+                ("session-shared-module-second".repeat(16), 22),
+                ("session-shared-module-third".repeat(32), 33),
+            ]);
+            let mut old_pins = source.clone();
+            old_pins.reset_derived_claims();
+            let (old_modules, _) = bind_scanned_modules(&modules, &mut old_pins);
+            drop(old_pins);
+            assert!(old_modules.iter().any(|module| module.object == id_r));
+            source.by_id.get_mut(&id_r).unwrap().exports =
+                Arc::from(vec![("live-successor-export".into(), 44)]);
+            let outside = old_modules
+                .iter()
+                .find(|module| module.object == id_r)
+                .unwrap()
+                .exports
+                .clone();
+            assert_eq!(
+                Arc::strong_count(&outside),
+                2,
+                "old module plus the Session holder"
+            );
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection =
+                conservative_selection(&pool, BTreeSet::from([ProcessViewId(3)]), BTreeSet::new());
+            let mut pins = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            assert!(!pins.pinned().unwrap().by_id.contains_key(&id_r));
+            let rows: Vec<ScannedModule> = modules
+                .iter()
+                .filter(|module| module.view != ProcessViewId(3))
+                .cloned()
+                .collect();
+            assert_eq!(rows.len(), 3);
+            let (mut input, _) = retained_rebind_inputs(&pool, &rows, false);
+            let mut rebind = ScannedRebindCursor::new();
+            finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+            assert!(input.is_none());
+            let count = pins.retired_entry_count();
+            assert_eq!(count, Some(1), "one retired claim bounds the handoff");
+            let mut handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve).unwrap();
+            let mut canonical = source;
+            let mut canonical_modules = old_modules;
+            let pins_backing = pins.install_ready(&mut canonical).unwrap();
+            let modules_backing = rebind.install_ready(&mut canonical_modules).unwrap();
+            let outcome = drive_rebind_installed_reclaim(
+                &mut rebind,
+                &mut pins,
+                &canonical,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(
+                outcome.is_ok(),
+                "shared module exports release: {outcome:?}"
+            );
+            assert_eq!(
+                handoff.len_for_test(),
+                0,
+                "module exports never enter the file handoff"
+            );
+            assert_eq!(pins.installed_state_for_test(), (true, true));
+            assert_eq!(Arc::strong_count(&outside), 1);
+            assert_eq!(outside.len(), 3);
+            assert!(outside.iter().all(|(text, _)| !text.is_empty()));
+            assert!(outside[0].0.starts_with("session-shared-module-first"));
+            let outcome = drive_pins_installed_reclaim(
+                &mut pins,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "retired file still hands off: {outcome:?}");
+            assert_eq!(handoff.len_for_test(), 1);
+            drop(canonical);
+            drop(canonical_modules);
+            drop(pins_backing);
+            drop(modules_backing);
+            drop(handoff);
+        }
+        // An unknown Weak still refuses; dropping it lets the exclusive drain
+        // finish.
+        {
+            let (_dir, mut source, modules) = conservative_cursor_fixture();
+            let id_r = source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains("provider-2"))
+                .map(|(id, _)| *id)
+                .unwrap();
+            source.by_id.get_mut(&id_r).unwrap().exports = Arc::from(vec![
+                ("weak-guarded-module-first".repeat(8), 11),
+                ("weak-guarded-module-second".repeat(8), 22),
+            ]);
+            let mut old_pins = source.clone();
+            old_pins.reset_derived_claims();
+            let (old_modules, _) = bind_scanned_modules(&modules, &mut old_pins);
+            drop(old_pins);
+            source.by_id.get_mut(&id_r).unwrap().exports =
+                Arc::from(vec![("live-successor-export".into(), 44)]);
+            let probe = old_modules
+                .iter()
+                .find(|module| module.object == id_r)
+                .unwrap()
+                .exports
+                .clone();
+            assert_eq!(Arc::strong_count(&probe), 2);
+            drop(probe);
+            let weak = Arc::downgrade(
+                &old_modules
+                    .iter()
+                    .find(|module| module.object == id_r)
+                    .unwrap()
+                    .exports,
+            );
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection =
+                conservative_selection(&pool, BTreeSet::from([ProcessViewId(3)]), BTreeSet::new());
+            let mut pins = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            let rows: Vec<ScannedModule> = modules
+                .iter()
+                .filter(|module| module.view != ProcessViewId(3))
+                .cloned()
+                .collect();
+            let (mut input, _) = retained_rebind_inputs(&pool, &rows, false);
+            let mut rebind = ScannedRebindCursor::new();
+            finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+            let count = pins.retired_entry_count().unwrap();
+            let mut handoff = RetiredFileHandoff::reserve(count, &reserve).unwrap();
+            let mut canonical = source;
+            let mut canonical_modules = old_modules;
+            let pins_backing = pins.install_ready(&mut canonical).unwrap();
+            let modules_backing = rebind.install_ready(&mut canonical_modules).unwrap();
+            let refused = drive_rebind_installed_reclaim(
+                &mut rebind,
+                &mut pins,
+                &canonical,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(matches!(refused, Err(GraphRefusal::Identity)));
+            assert_eq!(handoff.len_for_test(), 0);
+            assert!(weak.upgrade().is_some(), "refused exports keep their data");
+            drop(weak);
+            let outcome = drive_rebind_installed_reclaim(
+                &mut rebind,
+                &mut pins,
+                &canonical,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(
+                outcome.is_ok(),
+                "drain finishes after Weak drops: {outcome:?}"
+            );
+            assert_eq!(handoff.len_for_test(), 0);
+            let outcome = drive_pins_installed_reclaim(
+                &mut pins,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "retired file still hands off: {outcome:?}");
+            assert_eq!(handoff.len_for_test(), 1);
+            drop(canonical);
+            drop(canonical_modules);
+            drop(pins_backing);
+            drop(modules_backing);
+            drop(handoff);
+        }
+    }
+
+    #[test]
+    fn test_fixture_record_scan_ownership_adds_product_shape_ownership() {
+        let shared_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 4096]).unwrap();
+        let shared_path = shared_file.path().to_path_buf();
+        let shared_path_text = shared_path.to_str().unwrap().to_string();
+        let keys: Vec<ObjectKey> = (0..2u64)
+            .map(|index| ObjectKey {
+                device: Device {
+                    major: 8,
+                    minor: index,
+                },
+                inode: 1000 + index,
+            })
+            .collect();
+        let mut pins = PinnedObjects::empty();
+        for (index, key) in keys.iter().enumerate() {
+            let absorbed = pins.absorb(test_fixture::real_scan_pin(
+                &shared_path,
+                Some(*key),
+                index as u64,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ));
+            assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        }
+        assert!(pins.ownership.is_empty(), "absorb bypasses scan ownership");
+        assert!(
+            pins.raw_ownership.is_empty(),
+            "absorb bypasses raw ownership"
+        );
+        for (index, key) in keys.iter().enumerate() {
+            test_fixture::record_scan_ownership(
+                &mut pins,
+                ProcessViewId(index as u32),
+                *key,
+                &shared_path_text,
+            );
+        }
+        assert_eq!(pins.ownership.len(), 2);
+        assert_eq!(pins.raw_ownership.len(), 2);
+        for (index, key) in keys.iter().enumerate() {
+            let view = ProcessViewId(index as u32);
+            let claims = pins.ownership.get(&view).unwrap();
+            assert_eq!(claims.pins.len(), 1);
+            let raws = pins.raw_ownership.get(&view).unwrap();
+            assert_eq!(raws.len(), 1);
+            let raw = raws.iter().next().unwrap();
+            assert_eq!(raw.key, *key);
+            assert_eq!(pins.raw_to_id.get(raw).copied(), Some(claims.pins[0]));
+        }
+    }
+
+    /// The subset pinning path files manifest-only pins with no scan join
+    /// and no refile pass: on a pre-6.8 overlayfs split the probed maps
+    /// key must replace the fd raw at pin time, or every later exact join
+    /// misses and the refresh universe stays empty (6.6.157 guests bind
+    /// nothing). The fd raw is replaced (not kept alongside): the helper
+    /// records maps-domain keys, so no downstream join needs the fd key,
+    /// and a second manifest raw would break path resolution uniqueness.
+    #[test]
+    fn manifest_pinning_files_the_probed_maps_alias_on_split() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins
+            .id_for_manifest(fd_key, PATH)
+            .expect("manifest pin files under the fd key");
+        assert_eq!(
+            pins.id_for_manifest(maps_key, PATH),
+            None,
+            "no maps alias before the probe files it"
+        );
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, PATH);
+        assert_eq!(
+            pins.id_for_manifest(maps_key, PATH),
+            Some(id),
+            "the probed maps alias joins"
+        );
+        assert_eq!(
+            pins.id_for_manifest(fd_key, PATH),
+            None,
+            "the fd raw is replaced, not kept alongside"
+        );
+        assert!(
+            pins.raw_keys_for(id).contains(&maps_key),
+            "the maps domain resolves"
+        );
+        assert_eq!(
+            pins.summary(id).map(|pin| pin.key),
+            Some(maps_key),
+            "the entry re-keys with its raw: retargeting and merges read the entry"
+        );
+    }
+
+    /// Path resolution stays unique through the split: one path names one
+    /// object even when the probe re-keys its raw.
+    #[test]
+    fn manifest_maps_alias_keeps_path_resolution_unique() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, PATH);
+        assert_eq!(
+            pins.id_for_path(PATH),
+            Some(id),
+            "one path still names one object after the re-key"
+        );
+    }
+
+    /// A maps key already claimed by another object must not be stolen:
+    /// the alias files nothing and the prior resolution stands.
+    #[test]
+    fn manifest_maps_alias_refuses_a_claimed_key() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        let other = manifest_pin(
+            maps_key,
+            "claimed0000000000000000000000000000000000000000000000000000000000",
+            2,
+        );
+        assert!(pins.absorb(other).is_empty());
+        let other_id = pins.id_for_manifest(maps_key, PATH).unwrap();
+        assert_ne!(id, other_id);
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, PATH);
+        assert_eq!(
+            pins.id_for_manifest(maps_key, PATH),
+            Some(other_id),
+            "the claimed key keeps its owner"
+        );
+        assert_eq!(
+            pins.raw_keys_for(id),
+            vec![fd_key],
+            "no alias filed on conflict"
+        );
+    }
+
+    /// Equal keys file nothing: the fd alias already resolves.
+    #[test]
+    fn manifest_maps_alias_ignores_equal_keys() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        pins.refile_manifest_raw_onto_maps_key(id, fd_key, PATH);
+        assert_eq!(pins.raw_keys_for(id), vec![fd_key]);
+    }
+
+    /// A re-key for a path the id never filed mints nothing: the probe
+    /// must not fabricate a path association.
+    #[test]
+    fn manifest_maps_alias_refuses_an_unowned_path() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, "/other/path.so");
+        assert_eq!(
+            pins.id_for_manifest(fd_key, PATH),
+            Some(id),
+            "the owned raw is untouched"
+        );
+        assert_eq!(
+            pins.id_for_manifest(maps_key, "/other/path.so"),
+            None,
+            "no path association is minted"
+        );
+    }
+
+    #[test]
+    fn one_bad_manifest_object_keeps_the_good_pin() {
+        // Never-stop: one bad object must not abort the whole capture.
+        // RED: currently Err(Fatal), dropping the good pin.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::copy("/bin/sh", &good).unwrap();
+        let bad_dir = dir.path().join("bad-dir");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let file = std::fs::File::open(&good).unwrap();
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let key = object_key(mapping_file_key(&file).unwrap());
+        let mut manifest = manifest_for(key);
+        manifest.schema = p11scope_manifest::manifest::SCHEMA.into();
+        manifest.module_path = good.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.objects[0].identity = inspected.identity.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].device_major = key.device.major;
+        manifest.provenance_objects[0].device_minor = key.device.minor;
+        manifest.provenance_objects[0].inode = key.inode;
+        manifest.provenance_objects[0].identity = inspected.identity.clone();
+        let bad_ino = std::fs::metadata(&bad_dir).unwrap().ino();
+        manifest.objects.push(ObjectRecord {
+            id: 1,
+            path: bad_dir.to_str().unwrap().into(),
+            identity: inspected.identity.clone(),
+        });
+        manifest.provenance_objects.push(ProvenanceObject {
+            path: bad_dir.to_str().unwrap().into(),
+            device_major: 0,
+            device_minor: 0,
+            inode: bad_ino,
+            identity: inspected.identity.clone(),
+        });
+        manifest.surfaces[0].functions[0].resolution = Resolution::NullPointer;
+        assert!(validate_structure(&manifest).is_empty());
+        let pinning = pin_manifest_objects_deferred(&manifest)
+            .expect("one bad object must not abort good pins");
+        assert_eq!(pinning.pins.pinned().count(), 1);
+        assert!(pinning.stale.is_empty());
+        assert_eq!(pinning.skipped.len(), 1);
+        assert_eq!(pinning.skipped[0].subject, bad_dir.to_str().unwrap());
+        assert!(
+            pinning.skipped[0]
+                .reason
+                .starts_with("manifest object unavailable"),
+            "{}",
+            pinning.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn two_good_manifest_objects_pin_together() {
+        // Healthy twin: full coverage unchanged when every object pins.
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::copy("/bin/sh", &first).unwrap();
+        std::fs::copy("/bin/sh", &second).unwrap();
+        let file = std::fs::File::open(&first).unwrap();
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let key = object_key(mapping_file_key(&file).unwrap());
+        let second_file = std::fs::File::open(&second).unwrap();
+        let second_inspected = inspect_file_with_reader_exporting(
+            &second_file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let second_key = object_key(mapping_file_key(&second_file).unwrap());
+        let mut manifest = manifest_for(key);
+        manifest.schema = p11scope_manifest::manifest::SCHEMA.into();
+        manifest.module_path = first.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.objects[0].identity = inspected.identity.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].device_major = key.device.major;
+        manifest.provenance_objects[0].device_minor = key.device.minor;
+        manifest.provenance_objects[0].inode = key.inode;
+        manifest.provenance_objects[0].identity = inspected.identity.clone();
+        manifest.objects.push(ObjectRecord {
+            id: 1,
+            path: second.to_str().unwrap().into(),
+            identity: second_inspected.identity.clone(),
+        });
+        manifest.provenance_objects.push(ProvenanceObject {
+            path: second.to_str().unwrap().into(),
+            device_major: second_key.device.major,
+            device_minor: second_key.device.minor,
+            inode: second_key.inode,
+            identity: second_inspected.identity.clone(),
+        });
+        manifest.surfaces[0].functions[0].resolution = Resolution::NullPointer;
+        assert!(validate_structure(&manifest).is_empty());
+        let pinning = pin_manifest_objects_deferred(&manifest).expect("two good objects pin");
+        assert!(pinning.stale.is_empty());
+        assert!(pinning.skipped.is_empty());
+        assert_eq!(pinning.pins.pinned().count(), 2);
+    }
+
+    #[test]
+    fn one_bad_prearm_path_keeps_the_good_pins() {
+        // Never-stop: one bad --prearm-module path must not abort the rest.
+        // RED: currently Err(Fatal), dropping the good pins.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::copy("/bin/sh", &good).unwrap();
+        let bad_dir = dir.path().join("bad-dir");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let bad_path = bad_dir.clone();
+        let pinning = pin_prearm_objects_in_views_with_budget(
+            &[good.clone(), bad_dir],
+            &[],
+            None,
+            0,
+            0,
+            &mut budget,
+        )
+        .expect("one bad prearm path must not abort good pins");
+        assert_eq!(pinning.pins.pinned().count(), 1);
+        assert_eq!(pinning.inputs.len(), 1);
+        assert_eq!(pinning.skipped.len(), 1);
+        assert_eq!(pinning.skipped[0].subject, bad_path.to_string_lossy());
+        assert!(
+            pinning.skipped[0]
+                .reason
+                .starts_with("prearm object unavailable"),
+            "{}",
+            pinning.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn two_good_prearm_paths_pin_together() {
+        // Healthy twin: full coverage unchanged when every path pins.
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::copy("/bin/sh", &first).unwrap();
+        std::fs::copy("/bin/sh", &second).unwrap();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let pinning =
+            pin_prearm_objects_in_views_with_budget(&[first, second], &[], None, 0, 0, &mut budget)
+                .expect("two good prearm paths pin");
+        assert_eq!(pinning.pins.pinned().count(), 2);
+        assert_eq!(pinning.inputs.len(), 2);
+        assert!(pinning.skipped.is_empty());
     }
 }

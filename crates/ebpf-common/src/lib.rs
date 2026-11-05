@@ -4,10 +4,58 @@
 //! policy types, including `object_policy`, are not map or event layouts.
 #![no_std]
 
+pub mod counter_policy;
 pub mod inventory_callers;
+pub mod object_capture;
+pub mod object_flow;
+pub mod object_journal;
 pub mod object_policy;
+pub mod object_wire;
 
+pub use counter_policy::CounterMode;
 pub use pkcs11_module::layout::LinuxLayout;
+
+/// Target-word reader for the shared object adapters.
+///
+/// BPF passes a zero-sized reader whose always-inlined method dissolves
+/// into the adapter: no closure, no `FnMut::call_mut` shim, and no
+/// 16-byte `Result` crossing a subprogram boundary (the 7.4 verifier
+/// rejects the caller-stack out-pointer such a return leaves in R2).
+/// Host tests wrap closures in `FnReader`. The `subprog_return_shape`
+/// test enforces the BPF side.
+pub trait WordReader {
+    // `()` error is the established reader protocol: failure distinct
+    // from any value including zero. A custom error type would ripple
+    // through every adapter and spy for no benefit.
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()>;
+}
+
+/// Closure-backed reader for host tests (a concrete type, so it never
+/// overlaps the `&mut R` impl below).
+pub struct FnReader<F>(pub F);
+
+impl<F> WordReader for FnReader<F>
+where
+    F: FnMut(u64, LinuxLayout) -> Result<u64, ()>,
+{
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()> {
+        (self.0)(addr, layout)
+    }
+}
+
+impl<R> WordReader for &mut R
+where
+    R: WordReader,
+{
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()> {
+        (**self).read_word(addr, layout)
+    }
+}
 
 /// Conventional x86 userspace code selectors accepted by the observer.
 /// Exact equality is intentional: masking or narrowing would authorize an
@@ -257,6 +305,10 @@ pub mod lifecycle {
     pub const ASYNC_JOIN: u8 = 13;
     /// C_FindObjects while a search is active; success keeps it active.
     pub const FIND_OPERATION: u8 = 14;
+    /// C_Initialize: initialization-era boundary (P4, owner 2026-10-29).
+    /// Appended; no existing value renumbered. Distinct from
+    /// `transition::INITIALIZE` (operation initialization).
+    pub const CRYPTOKI_INITIALIZE: u8 = 15;
 }
 
 pub mod direct {
@@ -326,6 +378,10 @@ pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
 pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
 /// Dedicated compact inventory object. Detailed objects deliberately reject it.
 pub const FLAG_POLICY_INVENTORY: u64 = 1 << 7;
+/// 6.14 Option B: extensive mode arms the exec-time exe-identity word
+/// in EXEC records (`--track-short-lived`, default off). Detailed
+/// objects only; the inventory-only exact config refuses it.
+pub const FLAG_TRACK_SHORT_LIVED: u64 = 1 << 8;
 
 /// Inventory accepts one external scope and its own policy, without detail or pause.
 pub const fn valid_inventory_config(flags: u64) -> bool {
@@ -423,7 +479,8 @@ pub const fn valid_config(flags: u64) -> bool {
         | FLAG_POLICY_ALLOWLISTED
         | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
         | FLAG_POLICY_AGGREGATE
-        | FLAG_PAUSE_ENABLED;
+        | FLAG_PAUSE_ENABLED
+        | FLAG_TRACK_SHORT_LIVED;
     matches!(
         scope,
         FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER
@@ -440,6 +497,42 @@ pub const DISCOVERY_KIND_LOADER: u8 = 3;
 pub const DISCOVERY_KIND_INTERFACE_RETURN: u8 = 4;
 pub const DISCOVERY_KIND_EXEC: u8 = 5;
 pub const DISCOVERY_KIND_LEADER_EXIT: u8 = 6;
+/// Leader exit with an instance-epoch mapping summary: `pointers[0..8]`
+/// carry the leader record's eight slot+1 cells (0 = empty, else the
+/// watched-file slot + 1, at most `instance::FILE_SLOTS`), and
+/// `status_flags` projects the record refusal bits below. Kind 6 stays
+/// byte-identical; inventory-only builds keep emitting it.
+///
+/// Landed with 6.14 Option A: the Detailed BPF exit hook emits kind
+/// 7 in extensive captures (kind 6 elsewhere and in every other
+/// flavor), and the engine routes it as a leader exit. Producer and
+/// consumer landed atomically: emitting without the consumer would
+/// turn every leader exit into recorded loss.
+pub const DISCOVERY_KIND_LEADER_EXIT_MAPPINGS: u8 = 7;
+
+/// Private EXEC classification: candidacy alone never proves paired links.
+pub const DISCOVERY_EXEC_UNKNOWN: u8 = 0;
+pub const DISCOVERY_EXEC_SAME_TASK_CANDIDATE: u8 = 1;
+pub const DISCOVERY_EXEC_TASK_REPLACED: u8 = 2;
+
+fn valid_exec_leader(pid_tgid: u64) -> bool {
+    let tid = pid_tgid as u32;
+    tid != 0 && tid <= i32::MAX as u32 && tid == (pid_tgid >> 32) as u32
+}
+
+/// The raw old_pid argument must be checked before narrowing. The native
+/// predicate is finite: only an exact checked 1 authorizes candidacy.
+pub fn classify_exec_task(old_pid: u64, pid_tgid: u64, user_dumpable: u32) -> u8 {
+    if old_pid == 0 || old_pid > i32::MAX as u64 || !valid_exec_leader(pid_tgid) {
+        DISCOVERY_EXEC_UNKNOWN
+    } else if old_pid != u64::from(pid_tgid as u32) {
+        DISCOVERY_EXEC_TASK_REPLACED
+    } else if user_dumpable == 1 {
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE
+    } else {
+        DISCOVERY_EXEC_UNKNOWN
+    }
+}
 
 pub const DISCOVERY_NAME_NA: u8 = 0;
 pub const DISCOVERY_NAME_EXACT_STANDARD: u8 = 1;
@@ -458,6 +551,21 @@ pub const DISCOVERY_VERSION_OTHER: u8 = 6;
 pub const DISCOVERY_STATUS_READ_FAILURE: u8 = 0x01;
 pub const DISCOVERY_STATUS_COALESCED_NO_HELPER: u8 = 0x02;
 pub const DISCOVERY_STATUS_LOADER_CONTEXT_INVALID: u8 = 0x04;
+/// Kind 7 only: the leader record carried SHARED_MM, so the summary is
+/// not localizable to the exiting process (`unknown`, never negative).
+pub const DISCOVERY_STATUS_EXIT_MAP_SHARED_MM: u8 = 0x08;
+/// Kind 7 only: the leader record overflowed; named slots still count,
+/// but the set may be partial.
+pub const DISCOVERY_STATUS_EXIT_MAP_OVERFLOW: u8 = 0x10;
+/// Kind 7 only: a local fault was recorded for the exiting process.
+pub const DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT: u8 = 0x20;
+/// Kind 7 only: instance hooks were refused or off in this session, so
+/// an empty summary is `unknown`, never a watched-provider negative.
+pub const DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED: u8 = 0x40;
+/// Kind 3 only: the loader hit names a token whose slot is retired but
+/// userspace has not armed reuse yet. The binding word carries the
+/// token; the record waits for the acknowledgement instead of resolving.
+pub const DISCOVERY_STATUS_LOADER_ACK_PENDING: u8 = 0x80;
 
 pub const DISCOVERY_COUNTER_RING_LOSS: u32 = 0;
 pub const DISCOVERY_COUNTER_EXPORT_STATE_FAILURES: u32 = 1;
@@ -509,13 +617,17 @@ const _: () = assert!(
 pub const DISCOVERY_BYTES: u32 = 65_536;
 #[cfg(feature = "small-discovery-ring")]
 pub const DISCOVERY_BYTES: u32 = 4_096;
-/// The Inventory flavors' lifecycle (DISCOVERY) ring: 2 MiB holds 2,259
-/// records of 920 B plus an 8 B header, about 1.1 s of headroom at
-/// 1,000 execs/s against the ≤ 350 ms non-draining spans. The Detailed
-/// path keeps [`DISCOVERY_BYTES`]; the `small-discovery-ring` feature
-/// shrinks this constant to 4 KiB, as before, for the induced-loss leg.
+/// The Inventory flavors' lifecycle (DISCOVERY) ring: 8 MiB holds about
+/// 9,100 records of 920 B plus an 8 B header, about 4.3 s of headroom at
+/// 1,000 execs/s (two records each). Startup spans the semantic lane's
+/// load and the first pass, and under heavy churn 2 MiB lost about 18,000
+/// records there even with the startup drain; the userspace held bound
+/// absorbs the rest. Locked kernel memory: 8 MiB per Inventory capture.
+/// The Detailed path keeps [`DISCOVERY_BYTES`]; the `small-discovery-ring`
+/// feature shrinks this constant to 4 KiB, as before, for the induced-loss
+/// leg.
 #[cfg(not(feature = "small-discovery-ring"))]
-pub const INVENTORY_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
+pub const INVENTORY_DISCOVERY_BYTES: u32 = 8 * 1024 * 1024;
 #[cfg(feature = "small-discovery-ring")]
 pub const INVENTORY_DISCOVERY_BYTES: u32 = 4_096;
 
@@ -528,12 +640,18 @@ pub const R_STATE_OFFSET: u64 = 24;
 pub const STATE_DOMAIN_EXPORT: u64 = 1;
 pub const STATE_DOMAIN_SELECTION: u64 = 2;
 
-pub const fn discovery_table_slots(version_major: u8, version_minor: u8) -> u8 {
-    match (version_major, version_minor) {
-        (2, 0) => 67,
-        (2, _) => 68,
-        (3, 0 | 1) => 92,
-        (3, 2..) => 104,
+/// Bound acquisition by the getter's ABI. Version bytes may hint at known
+/// interface extensions, but never erase the common ordinal catalog.
+pub const fn discovery_table_slots(kind: u8, version_major: u8, version_minor: u8) -> u8 {
+    match kind {
+        DISCOVERY_KIND_FUNCTION_LIST_RETURN => 68,
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
+            match (version_major, version_minor) {
+                (3, 0 | 1) => 92,
+                (3, 2..) => 104,
+                _ => 68,
+            }
+        }
         _ => 0,
     }
 }
@@ -548,18 +666,33 @@ pub const fn discovery_version_class(major: u8, minor: u8) -> u8 {
     }
 }
 
-pub const fn discovery_usable_prefix(read_failed: bool, completed: u8) -> u8 {
-    if read_failed {
-        0
-    } else {
-        completed
-    }
+/// Complete pointer words remain observations after a later read fails. The
+/// producer carries that failure separately in its status and loss counter.
+pub const fn discovery_usable_prefix(_read_failed: bool, completed: u8) -> u8 {
+    completed
 }
 
 pub const fn valid_loader_cookie(cookie: u64) -> bool {
     let state_present = cookie & LOADER_STATE_PRESENT != 0;
     let payload = cookie >> LOADER_STATE_SHIFT;
     cookie != 0 && (state_present || payload == LOADER_STATE_ABSENT_SENTINEL)
+}
+
+/// Widest 40-bit loader token: 32 generation bits over 8 slot bits.
+/// Mirrors the native gate's token ceiling.
+pub const LOADER_TOKEN_MAX: u64 = 0xffffffffff;
+
+/// A token cookie names a nonzero generation in 40 bits. Old-format
+/// cookies that coincide numerically stay valid under their own rule;
+/// only the cutover latch tells the producer which reading applies.
+pub const fn valid_loader_token(cookie: u64) -> bool {
+    cookie != 0 && cookie <= LOADER_TOKEN_MAX && cookie >> 8 != 0
+}
+
+/// The kind-3 binding word: zero on records the old producer wrote, a
+/// valid old-format cookie before the latch, or the full token after.
+pub const fn valid_loader_binding(binding: u64) -> bool {
+    binding == 0 || valid_loader_cookie(binding) || valid_loader_token(binding)
 }
 
 pub const fn discovery_pause_enabled(eligible: bool, flags: u64, generation_token: u64) -> bool {
@@ -667,8 +800,29 @@ pub struct DiscoveryRecord {
     pub return_rv: u64,
     /// Full request CK_FLAGS for kind 4.
     pub request_flags: u64,
-    /// Full-width private selection binding id for kind 4.
+    /// Full-width private selection binding id for kind4. For kind5 only,
+    /// the original producer's group-leader TASK_COOKIE ticket (zero means
+    /// unavailable). For kind3, the loader cookie word: the full token
+    /// once the gate latches, a valid old-format cookie before, or zero
+    /// on records the old producer wrote. Every other kind keeps this
+    /// word zero. None of these values is a public identity or proof of
+    /// an exact executable image.
     pub binding_id: u64,
+}
+
+impl DiscoveryRecord {
+    /// The bounded original task ticket carried by an EXEC, if available.
+    /// Record decoding separately validates every other kind-owned field.
+    pub const fn exec_task_ticket(&self) -> Option<u64> {
+        if self.kind == DISCOVERY_KIND_EXEC
+            && self.binding_id != 0
+            && self.binding_id <= IMAGE_IDENTITY_TICKET_LIMIT
+        {
+            Some(self.binding_id)
+        } else {
+            None
+        }
+    }
 }
 
 #[repr(C)]
@@ -696,9 +850,12 @@ pub struct PauseKey {
 }
 
 fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
+    record.binding_id == 0 && zero_discovery_payload_except_binding(record)
+}
+
+fn zero_discovery_scalar_payload(record: &DiscoveryRecord) -> bool {
     record.table_ptr == 0
         && record.interface_flags == 0
-        && record.pointers.iter().all(|pointer| *pointer == 0)
         && record.interface_index == 0
         && record.name_class == DISCOVERY_NAME_NA
         && record.usable_n == 0
@@ -710,7 +867,19 @@ fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
         && record.symbol_id == 0
         && record.return_rv == 0
         && record.request_flags == 0
-        && record.binding_id == 0
+}
+
+fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
+    zero_discovery_scalar_payload(record) && record.pointers.iter().all(|pointer| *pointer == 0)
+}
+
+/// 6.14 Option B: EXEC payload shape. `pointers[0..2]` carry the raw
+/// exe `(s_dev, i_ino)` data pair when extensive mode is armed and
+/// stay zero otherwise; the pair is data, so any value validates.
+/// The tail always stays zero. `(0, 0)` means absent.
+fn zero_discovery_exec_tail(record: &DiscoveryRecord) -> bool {
+    zero_discovery_scalar_payload(record)
+        && record.pointers[2..].iter().all(|pointer| *pointer == 0)
 }
 
 fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
@@ -721,12 +890,14 @@ fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
 }
 
 fn valid_export_prefix(record: &DiscoveryRecord) -> bool {
-    if record.pointers_attempted as usize > DISCOVERY_POINTERS
+    let pointer_limit = if record.kind == DISCOVERY_KIND_FUNCTION_LIST_RETURN {
+        68
+    } else {
+        DISCOVERY_POINTERS
+    };
+    if record.pointers_attempted as usize > pointer_limit
         || record.completed_prefix > record.pointers_attempted
-        || record.usable_n > record.completed_prefix
-        || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0 && record.usable_n != 0)
-        || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE == 0
-            && record.usable_n != record.completed_prefix)
+        || record.usable_n != record.completed_prefix
     {
         return false;
     }
@@ -819,7 +990,10 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.version_major == 0
                 && record.version_minor == 0
                 && record.symbol_id == 0
-                && zero_selection_payload(record)
+                && record.return_rv == 0
+                && record.request_flags == 0
+                && valid_loader_binding(record.binding_id)
+                && record.selection_version_class == 0
                 && match record.status_flags {
                     0 | DISCOVERY_STATUS_COALESCED_NO_HELPER => {
                         record.table_ptr != 0 && record.announced_count <= 2
@@ -829,6 +1003,12 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                             && record.case_id == 0
                             && record.announced_count == 0
                             && record.send_signal_rc == 0
+                            && record.binding_id == 0
+                    }
+                    DISCOVERY_STATUS_LOADER_ACK_PENDING => {
+                        record.table_ptr != 0
+                            && record.announced_count == 0
+                            && valid_loader_token(record.binding_id)
                     }
                     _ => false,
                 }
@@ -887,9 +1067,15 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
             matches!(
                 record.status_flags,
                 0 | DISCOVERY_STATUS_COALESCED_NO_HELPER
-            ) && record.case_id == 0
+            ) && matches!(
+                record.case_id,
+                DISCOVERY_EXEC_UNKNOWN
+                    | DISCOVERY_EXEC_SAME_TASK_CANDIDATE
+                    | DISCOVERY_EXEC_TASK_REPLACED
+            ) && valid_exec_leader(record.pid_tgid)
                 && record.announced_count == 0
-                && zero_discovery_payload(record)
+                && record.binding_id <= IMAGE_IDENTITY_TICKET_LIMIT
+                && zero_discovery_exec_tail(record)
         }
         DISCOVERY_KIND_LEADER_EXIT => {
             record.status_flags == 0
@@ -897,6 +1083,28 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.announced_count == 0
                 && record.send_signal_rc == 0
                 && zero_discovery_payload(record)
+        }
+        // Kind 7 (6.14 Option A): the payload rules below are the
+        // producer/consumer contract; producer and consumer landed
+        // atomically, see the constant docs.
+        DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
+            record.status_flags
+                & !(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM
+                    | DISCOVERY_STATUS_EXIT_MAP_OVERFLOW
+                    | DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT
+                    | DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED)
+                == 0
+                && record.case_id == 0
+                && record.announced_count == 0
+                && record.send_signal_rc == 0
+                && record.binding_id == 0
+                && record.pointers[..instance::RECORD_SLOTS]
+                    .iter()
+                    .all(|cell| *cell <= u64::from(instance::FILE_SLOTS))
+                && record.pointers[instance::RECORD_SLOTS..]
+                    .iter()
+                    .all(|cell| *cell == 0)
+                && zero_discovery_scalar_payload(record)
         }
         _ => false,
     }
@@ -915,6 +1123,29 @@ pub struct SlotStats {
     pub max_ns: u64,
     pub buckets: [u64; LATENCY_BUCKETS],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CountStats {
+    pub entered: u64,
+    pub returned: u64,
+    pub errors: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TimestampStats {
+    pub entered: u64,
+    pub returned: u64,
+    pub errors: u64,
+    pub total_ns: u64,
+    pub max_ns: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CountStats {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for TimestampStats {}
 
 impl SlotStats {
     pub const ZERO: Self = Self {
@@ -1101,6 +1332,17 @@ pub const SESSION_NONE: u64 = u64::MAX;
 pub const USER_TYPE_NONE: u32 = u32::MAX;
 pub const FUNCTION_NONE: u32 = u32::MAX;
 
+/// Preserve only exact CKU_SO, CKU_USER and CKU_CONTEXT_SPECIFIC values.
+/// Validate the complete target word before narrowing so an unknown LP64
+/// value cannot alias a recognized login type or its semantic exemption.
+#[inline(always)]
+pub const fn finite_login_user_type(raw: u64) -> u32 {
+    match raw {
+        0..=2 => raw as u32,
+        _ => USER_TYPE_NONE,
+    }
+}
+
 /// Longest published standard function name in the 3.2 table.
 pub const FUNCTION_NAME_MAX_BYTES: usize = 27;
 
@@ -1178,6 +1420,18 @@ pub mod capture {
     pub const ARG_READ_FAILURE: u32 = 1 << 4;
     pub const ASYNC_SESSION: u32 = 1 << 5;
     pub const ASYNC_VALUE_UNREADABLE: u32 = 1 << 6;
+    /// The published mechanism id is outside `MECH_SHAPE` (no registry
+    /// membership, no parameter shape). Set by the Detailed return path
+    /// only (the journal lane keeps withholding), beside
+    /// `MECHANISM_VALUE`: the id and its call/error counts are
+    /// published, parameters stay undecoded, and the
+    /// `EVIDENCE_UNREGISTERED_MECHANISMS` total still counts every
+    /// occurrence in both lanes. Orthogonal to the state enums above:
+    /// masked comparisons are unaffected. Set at entry only by the
+    /// unsafe diagnostic arm (whose builds never carry the journal
+    /// object); the frozen journal BEGIN `CAPTURE_MASK` refuses it.
+    /// Never cleared.
+    pub const MECHANISM_UNREGISTERED: u32 = 1 << 7;
 }
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
@@ -1192,6 +1446,15 @@ pub mod capture {
 pub const RING_BYTES: u32 = 4 * 1024 * 1024;
 #[cfg(feature = "small-ring")]
 pub const RING_BYTES: u32 = 4096;
+
+/// EVENTS capacity for a capture whose journal (Joint key-operations)
+/// lane is active, sized at load; every other capture keeps
+/// [`RING_BYTES`]. A journaled call writes a 224 B START and a 632 B END,
+/// so 4 MiB holds about 0.45 s at 10,000 calls/s, less than one large
+/// quantum's seal; 16 MiB holds about 1.9 s. Locked kernel memory: 12 MiB
+/// more than the default, only while that lane is active.
+pub const JOINT_RING_BYTES: u32 = 16 * 1024 * 1024;
+const _: () = assert!(JOINT_RING_BYTES.is_power_of_two() && JOINT_RING_BYTES >= RING_BYTES);
 
 /// Maximum template attributes captured per event.
 pub const MAX_ATTRS: usize = 8;
@@ -1315,6 +1578,69 @@ pub struct ImageIdentityControl {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ImageIdentityControl {}
 
+/// T-L2c loader gate slots, shared with native `loader_gate.h`
+/// (`LOADER_GATE_SLOTS`). Reuse recycles storage, never identity.
+pub const LOADER_GATE_SLOTS: u32 = 256;
+
+/// One loader gate row, shared with native `struct loader_gate_row`.
+/// BPF owns every field; userspace sets `acked` once per retired
+/// generation after its T-L3 acknowledgement completes. Userspace never
+/// reads rows into output (privacy); the BPF map needs the value type.
+/// `state` is 64 bits: the BPF backend selects compare-and-swap only
+/// at 64 bits, and claim/retire each need exactly one CAS winner.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoaderGateRow {
+    pub generation: u64,
+    pub state: u64,
+    pub disposition: u32,
+    pub acked: u32,
+    pub last_gen: u32,
+}
+
+/// LOADER_GATE_CTL[0], shared with native `struct loader_gate_control`.
+/// Before links, the loader publishes limit=LOADER_GATE_SLOTS and all
+/// other fields zero, then freezes userspace mutation. While linked,
+/// BPF alone mutates. Counting cells saturate, never wrap.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoaderGateControl {
+    pub limit: u64,
+    pub cutover: u64,
+    pub admitted: u64,
+    pub refusals: u64,
+    pub retired: u64,
+    pub reclaims: u64,
+    pub retained: u64,
+    pub retained_peak: u64,
+    pub update_losses: u64,
+}
+
+/// IMAGE_BANK_SELECT[0], shared with native `struct image_bank_select`.
+/// Single-word bank flip plus the L4b image cells. The loader publishes
+/// bank=0, prepared={1,0} and zero counts before links. Counting cells
+/// saturate, never wrap.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageBankSelect {
+    pub bank: u64,
+    pub prepared: [u64; 2],
+    pub cuts: u64,
+    pub refusals: u64,
+    pub incarnation: [u64; 2],
+    pub folded: [u64; 2],
+    pub folds: u64,
+    pub folded_issued: u64,
+    pub update_losses: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for LoaderGateRow {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for LoaderGateControl {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ImageBankSelect {}
+
 /// Task 3 Stage A: kernel-side load-instance continuity witness.
 ///
 /// The hooks read only kernel VMA/file/mm metadata (never syscall arguments,
@@ -1352,7 +1678,9 @@ pub mod instance {
     pub const GEN_FAULT: u32 = 0;
     pub const GEN_ATTACH: u32 = 1;
     pub const GEN_STICKY: u32 = 2;
-    pub const GEN_CELLS: u32 = 3;
+    /// Image continuity is Disabled=0, Enabled=1 or permanently Failed=2.
+    pub const GEN_IMAGE_COVERAGE: u32 = 3;
+    pub const GEN_CELLS: u32 = 4;
     /// `INSTANCE_GEN[GEN_STICKY]`: a CLONE_VM child could not be marked.
     pub const STICKY_FORK_UNMARKED: u64 = 1;
 
@@ -1421,6 +1749,65 @@ pub struct InstanceRecord {
     pub epoch: [u64; instance::RECORD_SLOTS],
     pub flags: u64,
     pub exec_attach_gen: u64,
+    /// H8-D atomic birth marker (`journal_marker.h` encoding): 0
+    /// unpublished, 1 DIRTY, else READY naming an exec generation.
+    pub journal_bootstrap: u64,
+}
+
+/// H8-D atomic birth marker encoding (mirrors
+/// `crates/ebpf/native/journal_marker.h`; pinned by layout test).
+pub mod journal_marker {
+    /// Unpublished marker word: fresh storage.
+    pub const MARKER_UNPUBLISHED: u64 = 0;
+    /// DIRTY marker word: a scope gap poisoned the marker path.
+    pub const MARKER_DIRTY: u64 = 1;
+    /// Low two bits carry the marker state.
+    pub const MARKER_STATE_MASK: u64 = 3;
+    /// READY state bits.
+    pub const MARKER_READY_STATE: u64 = 2;
+    /// Admission control cap: spent permits before the failed latch trips.
+    pub const MARKER_ADMIT_CAP: u64 = 1 << 24;
+
+    /// A validated marker readback.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MarkerRead {
+        /// Fresh storage: nothing was ever published.
+        Unpublished,
+        /// READY naming this exec generation.
+        Ready(u64),
+        /// A scope gap poisoned the marker path.
+        Dirty,
+        /// Not a marker word: fails closed.
+        Invalid,
+    }
+
+    /// Encode READY naming `exec`.
+    pub const fn ready_word(exec: u64) -> u64 {
+        (exec << 2) | MARKER_READY_STATE
+    }
+
+    /// Validate one marker word read back from a PROC_EPOCH row.
+    pub const fn read_word(word: u64) -> MarkerRead {
+        if word == MARKER_UNPUBLISHED {
+            MarkerRead::Unpublished
+        } else if word == MARKER_DIRTY {
+            MarkerRead::Dirty
+        } else if word & MARKER_STATE_MASK == MARKER_READY_STATE {
+            MarkerRead::Ready(word >> 2)
+        } else {
+            MarkerRead::Invalid
+        }
+    }
+}
+
+/// `JOURNAL_MARKER_CTL[0]`: Detailed-only admission control row, spent
+/// permits plus the failed latch. Initialized once (zero) before
+/// links; userspace never writes it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct JournalAdmissionControl {
+    pub spent: u64,
+    pub failed: u64,
 }
 
 /// `WATCHED_FILES` key: the kernel's `vm_file->f_inode` identity
@@ -1477,6 +1864,24 @@ unsafe impl aya::Pod for InstanceFileKey {}
 unsafe impl aya::Pod for InstanceCalib {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for InstanceCounters {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for JournalAdmissionControl {}
+
+/// Immutable seed for native construction of one owned START row. The original
+/// timestamp remains S1's duration origin and the future native BEGIN time.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CallStartSeed {
+    pub ts_ns: u64,
+    pub image: ImageIdentity,
+    pub object_required: u64,
+}
+
+const _: [(); 32] = [(); core::mem::size_of::<CallStartSeed>()];
+const _: () = assert!(core::mem::align_of::<CallStartSeed>() == 8);
+const _: () = assert!(core::mem::offset_of!(CallStartSeed, ts_ns) == 0);
+const _: () = assert!(core::mem::offset_of!(CallStartSeed, image) == 8);
+const _: () = assert!(core::mem::offset_of!(CallStartSeed, object_required) == 24);
 
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.
@@ -1518,7 +1923,9 @@ pub struct CallStart {
     pub attr_bools_seen1: u32,
     pub capture: u32,
     pub target_function: u32,
-    pub _pad: u64,
+    /// Finite required-object marker (H7): zero is ordinary, otherwise
+    /// `descriptor_index + 1` (see `object_wire::validate_start_marker`).
+    pub object_required: u64,
     pub image: ImageIdentity,
 }
 
@@ -1760,6 +2167,57 @@ mod tests {
     }
 
     #[test]
+    fn compact_counter_stats_have_exact_layout_and_zero_defaults() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<CountStats>(), 24);
+        assert_eq!(align_of::<CountStats>(), 8);
+        assert_eq!(offset_of!(CountStats, entered), 0);
+        assert_eq!(offset_of!(CountStats, returned), 8);
+        assert_eq!(offset_of!(CountStats, errors), 16);
+        assert_eq!(
+            CounterMode::Counts.stats_bytes(),
+            size_of::<CountStats>() as u64
+        );
+        let counts = CountStats::default();
+        assert_eq!([counts.entered, counts.returned, counts.errors], [0; 3]);
+
+        assert_eq!(size_of::<TimestampStats>(), 40);
+        assert_eq!(align_of::<TimestampStats>(), 8);
+        assert_eq!(offset_of!(TimestampStats, entered), 0);
+        assert_eq!(offset_of!(TimestampStats, returned), 8);
+        assert_eq!(offset_of!(TimestampStats, errors), 16);
+        assert_eq!(offset_of!(TimestampStats, total_ns), 24);
+        assert_eq!(offset_of!(TimestampStats, max_ns), 32);
+        assert_eq!(
+            CounterMode::Timestamps.stats_bytes(),
+            size_of::<TimestampStats>() as u64
+        );
+        let timestamps = TimestampStats::default();
+        assert_eq!(
+            [
+                timestamps.entered,
+                timestamps.returned,
+                timestamps.errors,
+                timestamps.total_ns,
+                timestamps.max_ns,
+            ],
+            [0; 5]
+        );
+        assert_eq!(
+            CounterMode::Latency.stats_bytes(),
+            size_of::<SlotStats>() as u64
+        );
+
+        #[cfg(feature = "user")]
+        {
+            fn assert_pod<T: aya::Pod>() {}
+            assert_pod::<CountStats>();
+            assert_pod::<TimestampStats>();
+        }
+    }
+
+    #[test]
     fn task_newtask_offset_config_cell_is_exact_and_fail_closed() {
         assert_eq!(CFG_TASK_NEWTASK_OFFSETS, 1);
         let packed = pack_task_newtask_offsets(32, 56);
@@ -1926,6 +2384,11 @@ mod tests {
         use core::mem::{offset_of, size_of};
         assert_eq!(size_of::<ImageIdentity>(), 16);
         assert_eq!(offset_of!(ImageIdentity, exec_id), 8);
+        assert_eq!(size_of::<CallStartSeed>(), 32);
+        assert_eq!(core::mem::align_of::<CallStartSeed>(), 8);
+        assert_eq!(offset_of!(CallStartSeed, ts_ns), 0);
+        assert_eq!(offset_of!(CallStartSeed, image), 8);
+        assert_eq!(offset_of!(CallStartSeed, object_required), 24);
         assert_eq!(size_of::<ImageIdentityControl>(), 40);
         assert_eq!(offset_of!(ImageIdentityControl, limit), 0);
         assert_eq!(offset_of!(ImageIdentityControl, next_ticket), 8);
@@ -1935,11 +2398,43 @@ mod tests {
         assert_eq!(offset_of!(CallStart, attr_types), 96);
         assert_eq!(offset_of!(CallStart, attr_types1), 176);
         assert_eq!(offset_of!(CallStart, capture), 256);
-        assert_eq!(offset_of!(CallStart, _pad), 264);
+        assert_eq!(offset_of!(CallStart, object_required), 264);
         assert_eq!(offset_of!(CallStart, image), 272);
         assert_eq!(offset_of!(Event, image), 288);
         assert_eq!(offset_of!(Event, child_image), 304);
         assert_eq!(offset_of!(Event, root_affiliation), 320);
+    }
+
+    #[test]
+    fn loader_gate_and_bank_select_have_exact_native_layouts() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(LOADER_GATE_SLOTS, 256);
+        assert_eq!(size_of::<LoaderGateRow>(), 32);
+        assert_eq!(offset_of!(LoaderGateRow, generation), 0);
+        assert_eq!(offset_of!(LoaderGateRow, state), 8);
+        assert_eq!(offset_of!(LoaderGateRow, disposition), 16);
+        assert_eq!(offset_of!(LoaderGateRow, acked), 20);
+        assert_eq!(offset_of!(LoaderGateRow, last_gen), 24);
+        assert_eq!(size_of::<LoaderGateControl>(), 72);
+        assert_eq!(offset_of!(LoaderGateControl, limit), 0);
+        assert_eq!(offset_of!(LoaderGateControl, cutover), 8);
+        assert_eq!(offset_of!(LoaderGateControl, admitted), 16);
+        assert_eq!(offset_of!(LoaderGateControl, refusals), 24);
+        assert_eq!(offset_of!(LoaderGateControl, retired), 32);
+        assert_eq!(offset_of!(LoaderGateControl, reclaims), 40);
+        assert_eq!(offset_of!(LoaderGateControl, retained), 48);
+        assert_eq!(offset_of!(LoaderGateControl, retained_peak), 56);
+        assert_eq!(offset_of!(LoaderGateControl, update_losses), 64);
+        assert_eq!(size_of::<ImageBankSelect>(), 96);
+        assert_eq!(offset_of!(ImageBankSelect, bank), 0);
+        assert_eq!(offset_of!(ImageBankSelect, prepared), 8);
+        assert_eq!(offset_of!(ImageBankSelect, cuts), 24);
+        assert_eq!(offset_of!(ImageBankSelect, refusals), 32);
+        assert_eq!(offset_of!(ImageBankSelect, incarnation), 40);
+        assert_eq!(offset_of!(ImageBankSelect, folded), 56);
+        assert_eq!(offset_of!(ImageBankSelect, folds), 72);
+        assert_eq!(offset_of!(ImageBankSelect, folded_issued), 80);
+        assert_eq!(offset_of!(ImageBankSelect, update_losses), 88);
     }
 
     #[test]
@@ -1995,11 +2490,35 @@ mod tests {
         assert_eq!(offset_of!(InstanceStamp, fault), 8);
         assert_eq!(offset_of!(InstanceStamp, file_slot_plus1), 12);
         assert_eq!(offset_of!(InstanceStamp, flags), 14);
-        assert_eq!(size_of::<InstanceRecord>(), 144);
+        assert_eq!(size_of::<InstanceRecord>(), 152);
         assert_eq!(offset_of!(InstanceRecord, slot_plus1), 0);
         assert_eq!(offset_of!(InstanceRecord, epoch), 64);
         assert_eq!(offset_of!(InstanceRecord, flags), 128);
         assert_eq!(offset_of!(InstanceRecord, exec_attach_gen), 136);
+        assert_eq!(offset_of!(InstanceRecord, journal_bootstrap), 144);
+        assert_eq!(size_of::<JournalAdmissionControl>(), 16);
+        assert_eq!(offset_of!(JournalAdmissionControl, spent), 0);
+        assert_eq!(offset_of!(JournalAdmissionControl, failed), 8);
+        assert_eq!(
+            journal_marker::read_word(0),
+            journal_marker::MarkerRead::Unpublished
+        );
+        assert_eq!(
+            journal_marker::read_word(1),
+            journal_marker::MarkerRead::Dirty
+        );
+        assert_eq!(
+            journal_marker::read_word(journal_marker::ready_word(7)),
+            journal_marker::MarkerRead::Ready(7)
+        );
+        assert_eq!(
+            journal_marker::read_word(3),
+            journal_marker::MarkerRead::Invalid
+        );
+        assert_eq!(
+            journal_marker::read_word(4),
+            journal_marker::MarkerRead::Invalid
+        );
         assert_eq!(size_of::<InstanceFileKey>(), 16);
         assert_eq!(size_of::<InstanceCalib>(), 40);
         assert_eq!(offset_of!(InstanceCalib, vm_start), 8);
@@ -2109,6 +2628,13 @@ mod tests {
         assert_eq!(RING_BYTES, 4 * 1024 * 1024);
     }
 
+    /// Only a journal (Joint) capture loads the larger EVENTS ring.
+    #[test]
+    fn joint_ring_bytes_is_16mib() {
+        assert_eq!(JOINT_RING_BYTES, 16 * 1024 * 1024);
+        assert_eq!(JOINT_RING_BYTES % 4096, 0);
+    }
+
     #[test]
     fn induced_gap_capacities_are_explicit() {
         #[cfg(not(feature = "small-state-maps"))]
@@ -2135,6 +2661,33 @@ mod tests {
         assert_ne!(MECH_NONE, 0x250);
         assert_ne!(USER_TYPE_NONE, 1);
         assert_ne!(SESSION_NONE, 0);
+    }
+
+    /// Narrowing before validation would turn an unknown LP64 user type
+    /// into an allowed login, including a context-specific login exemption.
+    #[test]
+    fn finite_login_user_type_checks_full_width_before_narrowing() {
+        for (raw, expected) in [
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, USER_TYPE_NONE),
+            (0x8000_0000, USER_TYPE_NONE),
+            (u32::MAX as u64, USER_TYPE_NONE),
+            (u64::MAX, USER_TYPE_NONE),
+        ] {
+            assert_eq!(finite_login_user_type(raw), expected, "user type {raw:#x}");
+        }
+        for bit in 32..64 {
+            for user_type in [0, 1, 2] {
+                let raw = (1u64 << bit) | user_type;
+                assert_eq!(
+                    finite_login_user_type(raw),
+                    USER_TYPE_NONE,
+                    "high-bit alias {raw:#x}"
+                );
+            }
+        }
     }
 
     /// Mutation caught: any field reorder, type-width change, or tail reuse
@@ -2208,15 +2761,163 @@ mod tests {
         assert_eq!(key.pad, 0);
     }
 
+    /// Packet 6.14 (Option A): kind-7 leader-exit-mapping summaries reuse
+    /// `DiscoveryRecord` byte-identical and validate their exact payload
+    /// shape: slot+1 cells in `pointers[0..8]`, kind-7 status bits only.
+    #[test]
+    fn leader_exit_mappings_abi_offsets_unchanged() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<DiscoveryRecord>(), 920);
+        assert_eq!(offset_of!(DiscoveryRecord, pointers), 32);
+        assert_eq!(offset_of!(DiscoveryRecord, kind), 864);
+        assert_eq!(offset_of!(DiscoveryRecord, status_flags), 868);
+        assert_eq!(offset_of!(DiscoveryRecord, binding_id), 912);
+
+        // Guards: nonzero reserved words, wrong kind, oversized slot ids
+        // and unknown status bits stay invalid. Slot cells are slot+1, so
+        // instance::FILE_SLOTS is the largest encodable value.
+        let mut reserved = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        reserved.pointers[8] = 1;
+        assert!(!valid_discovery_record(&reserved));
+        let mut wrong_kind = discovery_record(8);
+        wrong_kind.pointers[0] = 3;
+        assert!(!valid_discovery_record(&wrong_kind));
+        let mut oversized = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        oversized.pointers[0] = u64::from(instance::FILE_SLOTS) + 1;
+        assert!(!valid_discovery_record(&oversized));
+        let mut bad_status = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        bad_status.pointers[0] = 3;
+        bad_status.status_flags = 0x80; // the remaining free bit
+        assert!(!valid_discovery_record(&bad_status));
+        let mut foreign_status = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        foreign_status.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        assert!(!valid_discovery_record(&foreign_status));
+
+        // The exact kind-7 payload shape validates.
+        let mut summary = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        summary.pointers[0] = 3;
+        assert!(valid_discovery_record(&summary));
+        let mut boundary = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        boundary.pointers[7] = u64::from(instance::FILE_SLOTS);
+        boundary.status_flags =
+            DISCOVERY_STATUS_EXIT_MAP_SHARED_MM | DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT;
+        assert!(valid_discovery_record(&boundary));
+        let mut empty = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        empty.status_flags = DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED;
+        assert!(valid_discovery_record(&empty));
+    }
+
+    /// 6.14 Option A remap contract: the BPF exit hook projects each
+    /// set native record bit to the ABI status bit one position
+    /// higher and drops every other bit. The native values are read
+    /// from the C header (no literals on either side of the header
+    /// comparison); the ABI values are pinned by the value test.
+    #[test]
+    fn exit_map_native_to_abi_remap_matches_c_header() {
+        let header = include_str!("../../ebpf/native/instance_epoch.h");
+        let native = |name: &str| -> u64 {
+            let line = header
+                .lines()
+                .find(|line| {
+                    line.strip_prefix("#define ").is_some_and(|rest| {
+                        rest.starts_with(name) && rest[name.len()..].starts_with(' ')
+                    })
+                })
+                .unwrap_or_else(|| panic!("{name} missing from instance_epoch.h"));
+            let shift: u32 = line
+                .split("<<")
+                .nth(1)
+                .expect("native record bit is a left shift")
+                .trim()
+                .trim_end_matches(')')
+                .parse()
+                .expect("numeric shift");
+            1u64 << shift
+        };
+        assert_eq!(native("INST_RECORD_SHARED_MM"), instance::RECORD_SHARED_MM);
+        assert_eq!(native("INST_RECORD_OVERFLOW"), instance::RECORD_OVERFLOW);
+        assert_eq!(
+            native("INST_RECORD_LOCAL_FAULT"),
+            instance::RECORD_LOCAL_FAULT
+        );
+        assert_eq!(
+            u64::from(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM),
+            instance::RECORD_SHARED_MM << 1
+        );
+        assert_eq!(
+            u64::from(DISCOVERY_STATUS_EXIT_MAP_OVERFLOW),
+            instance::RECORD_OVERFLOW << 1
+        );
+        assert_eq!(
+            u64::from(DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT),
+            instance::RECORD_LOCAL_FAULT << 1
+        );
+    }
+
+    #[test]
+    fn exec_exe_identity_abi_pointers_shape() {
+        // 6.14 Option B RED: an EXEC may carry the raw exe (s_dev,
+        // i_ino) pair in pointers[0..2] when extensive mode is armed.
+        // The pair is data: any value validates, the tail stays zero,
+        // and every other EXEC rule is unchanged.
+        let mut present = discovery_record(DISCOVERY_KIND_EXEC);
+        present.pointers[0] = 0x103_00001;
+        present.pointers[1] = 802;
+        assert!(valid_discovery_record(&present));
+        let mut tail = discovery_record(DISCOVERY_KIND_EXEC);
+        tail.pointers[2] = 1;
+        assert!(!valid_discovery_record(&tail));
+        let absent = discovery_record(DISCOVERY_KIND_EXEC);
+        assert!(valid_discovery_record(&absent));
+    }
+
+    #[test]
+    fn track_short_lived_bit_arms_detailed_scopes_only() {
+        // 6.14 Option B RED: the extensive-mode bit is orthogonal to
+        // scope and policy on detailed objects, and refused by the
+        // inventory-only exact config (Detailed-only arming).
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+            for policy in [
+                FLAG_POLICY_ALLOWLISTED,
+                FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+                FLAG_POLICY_AGGREGATE,
+            ] {
+                assert!(
+                    valid_config(scope | policy | FLAG_TRACK_SHORT_LIVED),
+                    "scope {scope:#x}"
+                );
+            }
+        }
+        assert!(!valid_inventory_config(
+            FLAG_POLICY_INVENTORY | FLAG_TRACK_SHORT_LIVED
+        ));
+    }
+
     #[test]
     fn discovery_producer_decisions_cover_the_finite_edges() {
-        assert_eq!(discovery_table_slots(2, 0), 67);
-        assert_eq!(discovery_table_slots(2, 40), 68);
-        assert_eq!(discovery_table_slots(3, 1), 92);
-        assert_eq!(discovery_table_slots(3, 2), 104);
-        assert_eq!(discovery_table_slots(4, 0), 0);
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 2, 0),
+            68
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 2, 40),
+            68
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, 3, 1),
+            92
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_INTERFACE_RETURN, 3, 2),
+            104
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_INTERFACE_RETURN, 4, 0),
+            68
+        );
+        assert_eq!(discovery_table_slots(DISCOVERY_KIND_EXEC, 3, 2), 0);
         assert_eq!(discovery_usable_prefix(false, 104), 104);
-        assert_eq!(discovery_usable_prefix(true, 67), 0);
+        assert_eq!(discovery_usable_prefix(true, 67), 67);
 
         assert!(!valid_loader_cookie(0));
         assert!(!valid_loader_cookie(1));
@@ -2234,6 +2935,56 @@ mod tests {
         assert!(!discovery_state_take_failed(true, true));
         assert!(discovery_state_take_failed(false, true));
         assert!(discovery_state_take_failed(true, false));
+    }
+
+    /// A legacy acquisition describes the common ordinal catalog, independently
+    /// of the provider's version bytes, including sparse and empty tables.
+    #[test]
+    fn discovery_legacy_acquisition_width_ignores_version_metadata() {
+        for (major, minor) in [
+            (0, 0),
+            (2, 0),
+            (2, 40),
+            (3, 0),
+            (3, 1),
+            (3, 2),
+            (4, 0),
+            (255, 255),
+        ] {
+            assert_eq!(
+                discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, major, minor),
+                68,
+                "{major}.{minor}"
+            );
+        }
+    }
+
+    /// Unrecognized metadata cannot erase the common prefix of a standard
+    /// interface; recognized extension hints stay within the known catalog.
+    #[test]
+    fn discovery_interface_acquisition_keeps_common_slots_for_unknown_metadata() {
+        for (major, minor, expected) in [
+            (0, 0, 68),
+            (2, 0, 68),
+            (2, 40, 68),
+            (3, 0, 92),
+            (3, 1, 92),
+            (3, 2, 104),
+            (3, 3, 104),
+            (4, 0, 68),
+            (255, 255, 68),
+        ] {
+            for kind in [
+                DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+                DISCOVERY_KIND_INTERFACE_RETURN,
+            ] {
+                assert_eq!(
+                    discovery_table_slots(kind, major, minor),
+                    expected,
+                    "{major}.{minor}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2334,6 +3085,7 @@ mod tests {
         assert_eq!(DISCOVERY_KIND_INTERFACE_RETURN, 4);
         assert_eq!(DISCOVERY_KIND_EXEC, 5);
         assert_eq!(DISCOVERY_KIND_LEADER_EXIT, 6);
+        assert_eq!(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS, 7);
         assert_eq!(DISCOVERY_NAME_NA, 0);
         assert_eq!(DISCOVERY_NAME_EXACT_STANDARD, 1);
         assert_eq!(DISCOVERY_NAME_OTHER, 2);
@@ -2342,6 +3094,10 @@ mod tests {
         assert_eq!(DISCOVERY_STATUS_READ_FAILURE, 0x01);
         assert_eq!(DISCOVERY_STATUS_COALESCED_NO_HELPER, 0x02);
         assert_eq!(DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, 0x04);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM, 0x08);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_OVERFLOW, 0x10);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT, 0x20);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED, 0x40);
         assert_eq!(PAUSE_ARMED, 1);
         assert_eq!(PAUSE_REQUESTED, 2);
         assert_eq!(COALESCED_NO_HELPER_RC, i64::MIN);
@@ -2356,6 +3112,7 @@ mod tests {
     fn discovery_record(kind: u8) -> DiscoveryRecord {
         let mut record: DiscoveryRecord = unsafe { core::mem::zeroed() };
         record.kind = kind;
+        record.pid_tgid = (17u64 << 32) | 17;
         record
     }
 
@@ -2364,6 +3121,270 @@ mod tests {
         record.table_ptr = 0x1000;
         record.symbol_id = 1;
         record
+    }
+
+    /// A failed next-word read must not erase words the probe already read,
+    /// including an observed NULL between two non-NULL target words.
+    #[test]
+    fn discovery_failed_read_preserves_completed_pointer_words() {
+        for completed in [1, 3, 67, 68, 91, 92, 103] {
+            assert_eq!(discovery_usable_prefix(true, completed), completed);
+        }
+        let mut record = function_list_record();
+        record.version_major = 3;
+        record.version_minor = 2;
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.pointers_attempted = 4;
+        record.completed_prefix = 3;
+        record.usable_n = 3;
+        record.pointers[0] = 0x2000;
+        record.pointers[2] = 0x3000;
+        assert!(valid_discovery_record(&record));
+        assert_eq!(record.pointers[1], 0, "the middle NULL was read");
+
+        for usable in [0, 1, 2, 4] {
+            record.usable_n = usable;
+            assert!(!valid_discovery_record(&record), "usable={usable}");
+        }
+        record.usable_n = 3;
+        record.pointers[3] = 0x4000;
+        assert!(
+            !valid_discovery_record(&record),
+            "an unread trailing word cannot be transported as observed"
+        );
+    }
+
+    /// Interface classification still bounds the carried data: partial standard
+    /// tables survive, while a nonstandard name cannot acquire a raw prefix.
+    #[test]
+    fn discovery_failed_interface_read_keeps_prefix_and_name_guards() {
+        let mut listed = discovery_record(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN);
+        listed.symbol_id = 2;
+        listed.announced_count = 1;
+        listed.table_ptr = 0x1000;
+        listed.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        listed.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        listed.version_major = 3;
+        listed.version_minor = 2;
+        listed.pointers_attempted = 69;
+        listed.completed_prefix = 68;
+        listed.usable_n = 68;
+        listed.pointers[67] = 0x2000;
+        assert!(valid_discovery_record(&listed));
+        listed.name_class = DISCOVERY_NAME_OTHER;
+        assert!(!valid_discovery_record(&listed));
+
+        let mut selected = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        selected.binding_id = 9;
+        selected.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        selected.interface_index = DISCOVERY_VERSION_NULL;
+        selected.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        selected.selection_version_class = DISCOVERY_VERSION_OTHER;
+        selected.table_ptr = 0x1000;
+        selected.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        selected.pointers_attempted = 4;
+        selected.completed_prefix = 3;
+        selected.usable_n = 3;
+        selected.pointers[2] = 0x2000;
+        assert!(valid_discovery_record(&selected));
+        selected.name_class = DISCOVERY_NAME_OTHER;
+        assert!(!valid_discovery_record(&selected));
+    }
+
+    /// A legacy record cannot carry more words than its producer can acquire;
+    /// interface records retain their larger transport capacity.
+    #[test]
+    fn discovery_export_prefix_respects_acquisition_capacity() {
+        for (words, expected) in [(68, true), (69, false), (104, false)] {
+            let mut record = function_list_record();
+            record.version_major = 255;
+            record.version_minor = 255;
+            record.pointers_attempted = words;
+            record.completed_prefix = words;
+            record.usable_n = words;
+            record.pointers[usize::from(words) - 1] = 0x2000;
+            assert_eq!(valid_discovery_record(&record), expected, "legacy {words}");
+        }
+
+        let mut record = function_list_record();
+        record.pointers_attempted = 69;
+        record.completed_prefix = 68;
+        record.usable_n = 68;
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.pointers[67] = 0x2000;
+        assert!(!valid_discovery_record(&record), "attempted-only overflow");
+
+        record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        record.symbol_id = 2;
+        record.announced_count = 1;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.status_flags = 0;
+        record.pointers_attempted = 104;
+        record.completed_prefix = 104;
+        record.usable_n = 104;
+        record.pointers[103] = 0x3000;
+        assert!(valid_discovery_record(&record), "full interface capacity");
+        record.pointers_attempted = 105;
+        assert!(
+            !valid_discovery_record(&record),
+            "interface capacity overflow"
+        );
+    }
+
+    /// A finite native candidacy value must survive decoding without making
+    /// any other lifecycle payload admissible.
+    #[test]
+    fn exec_task_decoder_accepts_only_finite_classes_and_valid_leader_ids() {
+        let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+        record.hook_ts_ns = 10;
+        record.pid_tgid = (17u64 << 32) | 17;
+        record.case_id = 1;
+        assert!(
+            valid_discovery_record(&record),
+            "checked same-task EXEC candidacy must be decoded"
+        );
+        for class in [0, 1, 2] {
+            record.case_id = class;
+            assert!(valid_discovery_record(&record), "finite EXEC class {class}");
+        }
+        for class in 3..=u8::MAX {
+            record.case_id = class;
+            assert!(
+                !valid_discovery_record(&record),
+                "invalid EXEC class {class}"
+            );
+        }
+        for ids in [0, 17, 17u64 << 32, (17u64 << 32) | 18, u64::MAX] {
+            record.case_id = 1;
+            record.pid_tgid = ids;
+            assert!(!valid_discovery_record(&record), "invalid EXEC IDs {ids}");
+        }
+    }
+
+    /// A bounded original task ticket is private EXEC transport, independent
+    /// of its finite same-task class; it never relaxes another payload field.
+    #[test]
+    fn exec_generation_ticket_is_bounded_and_kind_specific() {
+        for class in 0..=2 {
+            for ticket in [0, 1, IMAGE_IDENTITY_TICKET_LIMIT] {
+                let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+                record.case_id = class;
+                record.binding_id = ticket;
+                assert!(
+                    valid_discovery_record(&record),
+                    "class={class} ticket={ticket}"
+                );
+                assert_eq!(record.exec_task_ticket(), (ticket != 0).then_some(ticket));
+                record.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+                record.send_signal_rc = COALESCED_NO_HELPER_RC;
+                assert!(valid_discovery_record(&record));
+                record.send_signal_rc = 0;
+                assert!(!valid_discovery_record(&record));
+            }
+        }
+        for ticket in [IMAGE_IDENTITY_TICKET_LIMIT + 1, 1 << 32, u64::MAX] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.binding_id = ticket;
+            assert!(
+                !valid_discovery_record(&record),
+                "noncanonical ticket={ticket}"
+            );
+            assert_eq!(record.exec_task_ticket(), None);
+        }
+        for kind in [DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER] {
+            let mut record = discovery_record(kind);
+            record.binding_id = 1;
+            assert!(!valid_discovery_record(&record), "wrong kind={kind}");
+            assert_eq!(record.exec_task_ticket(), None);
+        }
+        let mut selection = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        selection.binding_id = IMAGE_IDENTITY_TICKET_LIMIT + 1;
+        assert_eq!(
+            selection.exec_task_ticket(),
+            None,
+            "kind4 is not an EXEC ticket"
+        );
+    }
+
+    #[test]
+    fn exec_task_classification_requires_checked_equal_leader_and_user_dumpability() {
+        let leader = (17u64 << 32) | 17;
+        let maximum = i32::MAX as u64;
+        for (old, current, dumpable, expected) in [
+            (17, leader, 1, 1),
+            (maximum, (maximum << 32) | maximum, 1, 1),
+            (17, leader, 0, 0),
+            (17, leader, 2, 0),
+            (17, leader, u32::MAX, 0),
+            (18, leader, 0, 2),
+            (18, leader, 1, 2),
+            (0, leader, 1, 0),
+            (u64::MAX, leader, 1, 0),
+            (1u64 << 32 | 17, leader, 1, 0),
+            (i32::MAX as u64 + 1, leader, 1, 0),
+            (17, 0, 1, 0),
+            (17, 17, 1, 0),
+            (17, 17u64 << 32, 1, 0),
+            (17, (17u64 << 32) | 18, 1, 0),
+            (17, (1u64 << 63) | (1u64 << 31), 1, 0),
+            (u32::MAX as u64, u64::MAX, 1, 0),
+        ] {
+            assert_eq!(
+                classify_exec_task(old, current, dumpable),
+                expected,
+                "old={old} current={current} dumpable={dumpable}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_task_decoder_retains_zero_payload_reserved_and_pause_contract() {
+        let mutations: &[fn(&mut DiscoveryRecord)] = &[
+            |r| r.table_ptr = 1,
+            |r| r.interface_flags = 1,
+            // 6.14 Option B (ratified Row A, owner 2026-10-29 item 5):
+            // pointers[0..2] are the exe (s_dev, i_ino) data pair, not
+            // reserved; the reserved tail starts at pointers[2].
+            |r| r.pointers[2] = 1,
+            |r| r.pointers[DISCOVERY_POINTERS - 1] = 1,
+            |r| r.interface_index = 1,
+            |r| r.name_class = 1,
+            |r| r.status_flags = DISCOVERY_STATUS_READ_FAILURE,
+            |r| r.usable_n = 1,
+            |r| r.pointers_attempted = 1,
+            |r| r.completed_prefix = 1,
+            |r| r.version_major = 1,
+            |r| r.version_minor = 1,
+            |r| r.selection_version_class = 1,
+            |r| r.reserved_zero[0] = 1,
+            |r| r.symbol_id = 1,
+            |r| r.announced_count = 1,
+            |r| r.reserved_tail_zero[3] = 1,
+            |r| r.return_rv = 1,
+            |r| r.request_flags = 1,
+            |r| r.binding_id = IMAGE_IDENTITY_TICKET_LIMIT + 1,
+            |r| r.send_signal_rc = COALESCED_NO_HELPER_RC,
+            |r| r.send_signal_rc = i64::MAX,
+        ];
+        for class in [0, 1, 2] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.case_id = class;
+            for mutate in mutations {
+                let mut bad = record;
+                mutate(&mut bad);
+                assert!(!valid_discovery_record(&bad));
+            }
+            record.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+            record.send_signal_rc = COALESCED_NO_HELPER_RC;
+            assert!(valid_discovery_record(&record));
+            record.send_signal_rc = 0;
+            assert!(!valid_discovery_record(&record));
+        }
+        for class in 1..=u8::MAX {
+            let mut exit = discovery_record(DISCOVERY_KIND_LEADER_EXIT);
+            exit.case_id = class;
+            assert!(!valid_discovery_record(&exit));
+        }
     }
 
     /// Mutation caught: a malformed private value or phase-owned field reaches
@@ -2381,7 +3402,6 @@ mod tests {
 
         export.status_flags = DISCOVERY_STATUS_READ_FAILURE | DISCOVERY_STATUS_COALESCED_NO_HELPER;
         export.send_signal_rc = COALESCED_NO_HELPER_RC;
-        export.usable_n = 0;
         assert!(valid_discovery_record(&export));
         export.send_signal_rc = 0;
         assert!(!valid_discovery_record(&export));
@@ -2390,7 +3410,7 @@ mod tests {
         assert!(!valid_discovery_record(&export));
 
         let mut non_loader_case = discovery_record(DISCOVERY_KIND_EXEC);
-        non_loader_case.case_id = 1;
+        non_loader_case.case_id = 3;
         assert!(!valid_discovery_record(&non_loader_case));
 
         let mut invalid_loader = discovery_record(DISCOVERY_KIND_LOADER);
@@ -2419,6 +3439,52 @@ mod tests {
         assert!(valid_discovery_record(&loader));
         loader.announced_count = 3;
         assert!(!valid_discovery_record(&loader));
+    }
+
+    /// The loader token word: zero (pre-existing records), 40-bit tokens
+    /// and old-format cookies all cross; garbage never does.
+    #[test]
+    fn loader_binding_accepts_zero_token_and_old_cookie_shapes() {
+        let mut base = discovery_record(DISCOVERY_KIND_LOADER);
+        base.table_ptr = 0x3000;
+        for binding in [
+            0,
+            0x100,            // twin: delta-0 old cookie and gen-1 token coincide
+            0x201,            // old absent cookie, context 2
+            0x0080_0000_0000, // wide token-only: generation 2^31, slot 0
+            0xffffffffff,     // widest token: generation 2^32 - 1, slot 255
+            0xb00,            // old present cookie, delta 5
+        ] {
+            base.binding_id = binding;
+            assert!(valid_discovery_record(&base), "binding={binding:#x}");
+        }
+    }
+
+    #[test]
+    fn loader_binding_rejects_garbage_and_invalid_arm_pins_zero() {
+        let mut base = discovery_record(DISCOVERY_KIND_LOADER);
+        base.table_ptr = 0x3000;
+        for binding in [0x1, 0xff, 0x1_0000_0000_0000, 0x0100_0000_0000] {
+            base.binding_id = binding;
+            assert!(!valid_discovery_record(&base), "binding={binding:#x}");
+        }
+        let mut invalid = discovery_record(DISCOVERY_KIND_LOADER);
+        invalid.status_flags = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+        assert!(valid_discovery_record(&invalid));
+        invalid.binding_id = 0x100;
+        assert!(!valid_discovery_record(&invalid));
+    }
+
+    #[test]
+    fn loader_pending_status_carries_a_token_shaped_word() {
+        let mut pending = discovery_record(DISCOVERY_KIND_LOADER);
+        pending.table_ptr = 0x3000;
+        // 0x80 is DISCOVERY_STATUS_LOADER_ACK_PENDING, defined with the impl.
+        pending.status_flags = 0x80;
+        pending.binding_id = 0x100;
+        assert!(valid_discovery_record(&pending));
+        pending.binding_id = 0x1;
+        assert!(!valid_discovery_record(&pending));
     }
 
     /// Mutation caught: an arbitrary 64-bit private value is accepted as a
@@ -2714,7 +3780,7 @@ mod tests {
         assert!(!valid_discovery_record(&malformed));
         malformed = function_list_record();
         malformed.status_flags = DISCOVERY_STATUS_READ_FAILURE;
-        malformed.usable_n = 1;
+        malformed.usable_n = 0;
         malformed.pointers_attempted = 1;
         malformed.completed_prefix = 1;
         malformed.pointers[0] = 7;
@@ -2800,7 +3866,7 @@ mod tests {
         assert!(!valid_discovery_record(&exit));
 
         assert!(!valid_discovery_record(&discovery_record(0)));
-        assert!(!valid_discovery_record(&discovery_record(7)));
+        assert!(!valid_discovery_record(&discovery_record(8)));
     }
 
     /// Mutation caught: pause can be enabled for a cgroup or without the PID
@@ -2829,12 +3895,12 @@ mod tests {
         }
     }
 
-    /// The Inventory flavors compile a 2 MiB lifecycle ring (4 KiB under
+    /// The Inventory flavors compile an 8 MiB lifecycle ring (4 KiB under
     /// the small-ring feature); Detailed keeps its 64 KiB constant above.
     #[test]
-    fn inventory_lifecycle_ring_is_two_mebibytes() {
+    fn inventory_lifecycle_ring_is_eight_mebibytes() {
         #[cfg(not(feature = "small-discovery-ring"))]
-        assert_eq!(INVENTORY_DISCOVERY_BYTES, 2 * 1024 * 1024);
+        assert_eq!(INVENTORY_DISCOVERY_BYTES, 8 * 1024 * 1024);
         #[cfg(feature = "small-discovery-ring")]
         assert_eq!(INVENTORY_DISCOVERY_BYTES, 4_096);
     }
@@ -2947,6 +4013,26 @@ mod safe_capture {
         assert_eq!(event.mechanism, u64::MAX);
         assert_eq!(
             event.capture & capture::MECHANISM_MASK,
+            capture::MECHANISM_VALUE
+        );
+    }
+
+    #[test]
+    fn mechanism_unregistered_bit_sits_outside_every_capture_state() {
+        // The unregistered flag is orthogonal to the mechanism/output
+        // state enums: every existing masked comparison keeps working
+        // with the bit set.
+        assert_eq!(
+            capture::MECHANISM_UNREGISTERED
+                & (capture::MECHANISM_MASK
+                    | capture::OUTPUT_MASK
+                    | capture::ARG_READ_FAILURE
+                    | capture::ASYNC_SESSION
+                    | capture::ASYNC_VALUE_UNREADABLE),
+            0
+        );
+        assert_eq!(
+            (capture::MECHANISM_VALUE | capture::MECHANISM_UNREGISTERED) & capture::MECHANISM_MASK,
             capture::MECHANISM_VALUE
         );
     }

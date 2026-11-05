@@ -59,6 +59,23 @@ def scaled_whole_seconds(seconds):
     return str(math.ceil(seconds * TIME_SCALE))
 
 
+def _restore_hup_int_quit():
+    """Restore default SIGHUP/SIGINT/SIGQUIT in the driver subtree (preexec_fn).
+
+    A launcher that ignores SIGHUP passes the ignored disposition through
+    fork+exec, and a non-interactive bourne shell cannot trap an ignored
+    signal back: the driver's `trap 'exit 129' HUP` would stay dead and the
+    self-HUP cases would fall through to the wrong exit status. The drivers
+    trap HUP and INT, so the subtree needs the default disposition; QUIT is
+    restored for backgrounded-launcher parity, as in
+    test_key_operations_linked_control.py. Foreground CI steps already have
+    it; this only repairs ignoring launchers.
+    """
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+
+
 def starttime(pid):
     return int(Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()[19])
 
@@ -167,6 +184,8 @@ class Ia32LifecycleTests(unittest.TestCase):
         # Every owned direct child leads its own process group, so cleanup
         # can end the whole tree (stopped members included) with one group
         # SIGKILL while the unreaped leader still pins the group id.
+        # Trappable-signal repair for every owned child (see _restore_hup_int_quit).
+        kwargs.setdefault("preexec_fn", _restore_hup_int_quit)
         proc = subprocess.Popen(*args, process_group=0, **kwargs)
         owned = {"pid": proc.pid, "generation": None, "fd": None,
                  "proc": proc, "closed": False, "verified": False,

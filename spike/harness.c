@@ -51,12 +51,12 @@ static void **fns;
 
 int main(int argc, char **argv)
 {
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "usage: %s /path/to/module.so [go-file]\n", argv[0]);
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "usage: %s /path/to/module.so [go-file [finish-file]]\n", argv[0]);
         return 2;
     }
 
-    if (argc == 3) {
+    if (argc >= 3) {
         struct mapped_query query = { argv[1], 0 };
         dl_iterate_phdr(find_mapped, &query);
         fputs(query.found ? "HARNESS_PROVIDER_INITIAL_SET\n"
@@ -66,7 +66,7 @@ int main(int argc, char **argv)
 
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-    if (argc == 3) {
+    if (argc >= 3) {
         fputs("HARNESS_PROVIDER_MAPPED\n", stderr);
         fflush(stderr);
     }
@@ -76,7 +76,7 @@ int main(int argc, char **argv)
      * Waiting in the shell instead would
      * leave nothing mapped to scan. Call counts are unchanged either way —
      * C_GetFunctionList below still runs after the wait. */
-    if (argc == 3) {
+    if (argc >= 3) {
         struct timespec tick = { 0, 50 * 1000 * 1000 };
         while (access(argv[2], F_OK) != 0)
             nanosleep(&tick, NULL);
@@ -121,5 +121,14 @@ int main(int argc, char **argv)
     CHECK("C_Finalize", ((fn_gen)fns[I_Finalize])(NULL));
 
     printf("harness OK\n");
+    if (argc == 4) {
+        /* All fixed calls, including C_Finalize, are complete. Keep the
+         * process and its provider mapping available until the observer has
+         * collected its terminal records and released its links. */
+        if (fflush(stdout) != 0) { perror("completion acknowledgement"); return 1; }
+        struct timespec tick = { 0, 50 * 1000 * 1000 };
+        while (access(argv[3], F_OK) != 0)
+            nanosleep(&tick, NULL);
+    }
     return 0;
 }

@@ -84,7 +84,7 @@ releases GO, checks the ledger and requires exit 0. A last test pins the
 protocol's fail-closed exits.
 
 ```sh
-TMPDIR=/var/tmp/p11scope-ws-tmp mise exec -- ./scripts/cargo.sh +1.98.1 \
+TMPDIR=/var/tmp/p11scope-ws-tmp mise exec -- ./scripts/cargo.sh +"$(cat .release-rust-version)" \
   test --locked --test e16_execution_surfaces
 python3 -I tests/python/test_e16_oracle.py -v
 python3 -I scripts/qualify-e16-surfaces.py --self-test
@@ -103,7 +103,7 @@ for the report row contract.
 
 ```sh
 # 1. As the checkout owner, from a clean commit: bind the built observer.
-mise exec -- ./scripts/cargo.sh +1.98.1 build --locked --release --bin p11scope
+mise exec -- ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --release --bin p11scope
 python3 -I scripts/qualify-e16-surfaces.py provenance \
   --observer target/release/p11scope \
   --bpf-object target/release/build/p11scope-<hash>/out/p11scope-ebpf \

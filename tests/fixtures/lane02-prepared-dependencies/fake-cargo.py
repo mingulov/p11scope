@@ -18,7 +18,8 @@ def event(kind: str, **values) -> None:
 
 
 if sys.argv[1:] == ["--version"]:
-    print("cargo 1.98.1 (lane02 fixture)")
+    release = Path(".release-rust-version").read_text(encoding="utf-8").strip()
+    print(f"cargo {release} (lane02 fixture)")
     status = config.get("cargo_version_status", 0)
     if status:
         print("controlled selected cargo version failure", file=sys.stderr)

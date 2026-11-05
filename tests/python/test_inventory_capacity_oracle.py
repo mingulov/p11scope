@@ -1,0 +1,1984 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Capacity oracle controls use independent target ledgers, never observer totals."""
+
+import copy
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import runpy
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+ORACLE = ROOT / "scripts/inventory-native-oracle.py"
+SHELL = ROOT / "scripts/qualify-inventory-native.sh"
+
+
+def population():
+    providers = []
+    for index in range(97):
+        offsets = [4096 + 16 * offset for offset in range(68 if index < 96 else 3)]
+        providers.append({"key": f"p{index}", "path": f"/owned/{index}.so",
+                          "pin": {"dev": [0, 35], "ino": 100 + index,
+                                  "sha256": "a" * 64},
+                          "offsets": offsets + [offsets[-1]]})
+    owner = {"pid": 4000, "start_time": 50, "exe": "/owned/driver",
+             "providers": [provider["key"] for provider in providers], "ledger": "owner.jsonl"}
+    ledger = [{"kind": "owner", **{key: owner[key] for key in ("pid", "start_time", "exe")}}]
+    for provider in providers:
+        ledger.append({"kind": "surface", "pid": 4000, "start_time": 50,
+                       "path": provider["path"], "dev": [0, 35],
+                       "ino": provider["pin"]["ino"], "offsets": provider["offsets"]})
+        index = int(provider["key"][1:])
+        phases = ("initial", "middle", "late") if index < 32 else ("middle", "late") if index < 61 else ("late",)
+        for phase in phases:
+            ledger.append({"kind": "call", "pid": 4000, "start_time": 50,
+                           "path": provider["path"], "offset": 4096, "phase": phase,
+                           "n": 3, "rv": 0, "t0": {"initial": 100, "middle": 200, "late": 300}[phase],
+                           "t1": {"initial": 110, "middle": 210, "late": 310}[phase]})
+    document = {"schema": "p11scope/inventory/v1", "scope": "system",
+                "budgets": {"inventory_endpoints": {"limit": 8192, "occupied": 2176, "refused": 0}},
+                "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+                "observation": {"lane": "native", "started_ns": 50, "ended_ns": 500}, "gaps": [], "gaps_suppressed": 0,
+                "modules": [], "callers": [{"id": "c0", "pid": 4000, "start_time": 50,
+                                             "image": {"authority": "native_exact"}}], "edges": []}
+    for index, provider in enumerate(providers):
+        document["modules"].append({"id": f"m{index}", "paths": [provider["path"]],
+                                    "identity": {"device": {"major": 0, "minor": 35},
+                                                 "inode": 100 + index, "sha256": "a" * 64},
+                                    "admission": {"state": "admitted", "endpoints": len(set(provider["offsets"]))}})
+        document["edges"].append({"caller": "c0", "module": f"m{index}",
+                                  "mapping": {"state": "mapped", "evidence": "deep_scan"},
+                                  "entries": {"count": 3, "observation": "observed",
+                                              "coverage": {"state": "counted", "lossy": False}}})
+    scan_lane_authority(document)
+    late = copy.deepcopy(document)
+    for edge in late["edges"][:32]:
+        edge["entries"]["count"] = 9
+    for edge in late["edges"][32:61]:
+        edge["entries"]["count"] = 6
+    late["budgets"]["inventory_endpoints"]["occupied"] = 6531
+    middle = copy.deepcopy(late)
+    middle["modules"] = middle["modules"][:61]
+    middle["edges"] = middle["edges"][:61]
+    middle["budgets"]["inventory_endpoints"]["occupied"] = 4148
+    for index, edge in enumerate(middle["edges"]):
+        edge["entries"]["count"] = 6 if index < 32 else 3
+    document["modules"] = document["modules"][:32]
+    document["edges"] = document["edges"][:32]
+    manifest = {"manifest": "p11scope-inventory-capacity/1", "population": "growth",
+                "expect_lane": "native", "limit": 8192, "demand": 6531,
+                "providers": providers, "owners": [owner], "middle_doc": middle,
+                "phases": [{"name": "initial", "providers": [p["key"] for p in providers[:32]], "snapshot": "initial.json"},
+                           {"name": "middle", "providers": [p["key"] for p in providers[:61]], "snapshot": "middle.json"},
+                           {"name": "late", "providers": [p["key"] for p in providers], "snapshot": "late.json"}]}
+    return manifest, ledger, document, late
+
+
+def owner_population(manifest, ledger, initial, last):
+    manifest.update(population="owners", owner_demand=257, demand=257,
+                    native_owner_activation=True, providers=[], owners=[],
+                    phases=[{"name": "late", "providers": [], "snapshot": "late.json"}])
+    ledger.clear()
+    last["modules"], last["callers"], last["edges"] = [], [], []
+    last["budgets"]["inventory_endpoints"]["occupied"] = 257
+    for index in range(257):
+        key, path, pid, inode = f"p{index}", f"/owned/{index}.so", 5000 + index, 300 + index
+        manifest["providers"].append({"key": key, "path": path, "pin": {
+            "dev": [0, 35], "ino": inode, "sha256": "a" * 64}, "offsets": [4096]})
+        manifest["phases"][0]["providers"].append(key)
+        manifest["owners"].append({"pid": pid, "start_time": 70, "exe": "/owned/driver",
+                                   "providers": [key], "ledger": "owner.jsonl"})
+        ledger.extend([{"kind": "owner", "pid": pid, "start_time": 70, "exe": "/owned/driver"},
+                       {"kind": "surface", "pid": pid, "start_time": 70, "path": path,
+                        "dev": [0, 35], "ino": inode, "offsets": [4096]},
+                       {"kind": "call", "pid": pid, "start_time": 70, "path": path,
+                        "offset": 4096, "phase": "late", "n": 1, "rv": 0, "t0": 100, "t1": 110}])
+        last["modules"].append({"id": f"m{index}", "paths": [path], "identity": {
+            "device": {"major": 0, "minor": 35}, "inode": inode, "sha256": "a" * 64},
+            "admission": {"state": "admitted", "endpoints": 1}})
+        last["callers"].append({"id": f"c{index}", "pid": pid, "start_time": 70,
+                                "image": {"authority": "scan_pinned"}})
+        last["edges"].append({"caller": f"c{index}", "module": f"m{index}", "mapping": {
+            "state": "mapped", "evidence": "deep_scan"}, "entries": {
+            "count": 1, "observation": "observed", "coverage": {"state": "counted", "lossy": False}}})
+    initial.update(copy.deepcopy(last))
+
+
+def refusal_case(limit=4096):
+    """Single-shot N+1 refusal: demand exactly one past the selected budget.
+
+    Sixty full 68-endpoint copies plus a 17-endpoint tail make 4,097; the
+    tail is refused whole with the lowering wording observed on a real N+1
+    run, and the admitted 4,080 endpoints keep exact native counts.
+    """
+    demand = limit + 1
+    full, tail = divmod(demand, 68)
+    providers = []
+    for index in range(full + 1):
+        unique = 68 if index < full else tail
+        offsets = [4096 + 16 * offset for offset in range(unique)]
+        providers.append({"key": f"p{index}", "path": f"/owned/{index}.so",
+                          "pin": {"dev": [0, 35], "ino": 100 + index, "sha256": "a" * 64},
+                          "offsets": offsets})
+    refused_key = providers[-1]["key"]
+    owner = {"pid": 4000, "start_time": 50, "exe": "/owned/driver",
+             "providers": [provider["key"] for provider in providers], "ledger": "owner.jsonl"}
+    ledger = [{"kind": "owner", "pid": 4000, "start_time": 50, "exe": "/owned/driver"}]
+    for provider in providers:
+        ledger.append({"kind": "surface", "pid": 4000, "start_time": 50,
+                       "path": provider["path"], "dev": [0, 35],
+                       "ino": provider["pin"]["ino"], "offsets": provider["offsets"]})
+        ledger.append({"kind": "call", "pid": 4000, "start_time": 50,
+                       "path": provider["path"], "offset": 4096, "phase": "activity",
+                       "n": 11, "rv": 0, "t0": 100, "t1": 110})
+    admitted_endpoints = sum(len(provider["offsets"]) for provider in providers[:-1])
+    document = {"schema": "p11scope/inventory/v1", "scope": "system",
+                "budgets": {"inventory_endpoints": {"limit": limit, "occupied": admitted_endpoints, "refused": 0},
+                            "inventory_attach_modules": {"limit": limit, "occupied": full, "refused": 0},
+                            "endpoints": {"limit": 1048576, "occupied": admitted_endpoints, "refused": 0}},
+                "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+                "observation": {"lane": "native", "started_ns": 50, "ended_ns": 500,
+                                "retirement": "closed", "settlement": "unsettled"},
+                "gaps": [], "gaps_suppressed": 0, "modules": [],
+                "callers": [{"id": "c0", "pid": 4000, "start_time": 50,
+                             "image": {"authority": "native_exact"}}], "edges": []}
+    for index, provider in enumerate(providers):
+        unique = len(provider["offsets"])
+        if provider["key"] == refused_key:
+            admission = {"state": "refused", "endpoints": None,
+                         "reasons": [f"module needs {unique} more; only {limit} attach slots are available; "
+                                     f"{admitted_endpoints} are in use ({admitted_endpoints} active, 0 retired; "
+                                     f"held by /owned/0.so 68) \u2014 refusing to attach a prefix; to capture one "
+                                     f"provider, name it with --module <path>"]}
+        else:
+            admission = {"state": "admitted", "endpoints": unique, "reasons": []}
+        document["modules"].append({"id": f"m{index}", "paths": [provider["path"]],
+                                    "identity": {"device": {"major": 0, "minor": 35},
+                                                 "inode": 100 + index, "sha256": "a" * 64},
+                                    "admission": admission})
+        count = 0 if provider["key"] == refused_key else 11
+        document["edges"].append({"caller": "c0", "module": f"m{index}",
+                                  "mapping": {"state": "mapped", "evidence": "deep_scan"},
+                                  "entries": {"count": count, "observation": "observed",
+                                              "coverage": {"state": "counted", "lossy": False}}})
+    manifest = {"manifest": "p11scope-inventory-capacity/1", "population": "refusal",
+                "expect_lane": "native", "limit": limit, "demand": demand, "refusal_limit": limit,
+                "require_retirement": "closed", "providers": providers, "owners": [owner],
+                "phases": [{"name": "activity", "providers": [p["key"] for p in providers],
+                            "snapshot": "late.json"}]}
+    scan_lane_authority(document)
+    return manifest, ledger, document
+
+
+def standing_authority_gap():
+    """The report's standing exact-image disclosure (docs/schema/inventory-v1.md).
+
+    The native lane binds counts but never claims the exact-image contract,
+    so every caller stays scan_pinned and the report carries this gap.
+    """
+    return {"caller": None, "module": None, "pid": None,
+            "subject": "exact image authority unavailable",
+            "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time "
+                      "with exe-identity exec detection",
+            "budget": None}
+
+
+def scan_lane_authority(doc):
+    """Rewrite one judged document to the documented scan-lane authority shape."""
+    for caller in doc["callers"]:
+        caller["image"]["authority"] = "scan_pinned"
+    doc["gaps"].append(standing_authority_gap())
+
+
+class CapacityOracleTests(unittest.TestCase):
+    def run_case(self, mutate=None, want=0, check=None):
+        manifest, ledger, initial, late = population()
+        if mutate:
+            mutate(manifest, ledger, initial, late)
+        middle = manifest.pop("middle_doc")
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-oracle-") as temporary:
+            directory = Path(temporary)
+            for name, data in (("capacity.json", manifest), ("initial.json", initial), ("late.json", late)):
+                (directory / name).write_text(json.dumps(data))
+            (directory / "middle.json").write_text(json.dumps(middle))
+            if "events" in manifest:
+                (directory / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in manifest.pop("events")))
+            (directory / "owner.jsonl").write_text("".join(json.dumps(row) + "\n" for row in ledger))
+            result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-check", temporary],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, want, result.stdout + result.stderr)
+            if check:
+                self.assertIn(check, result.stdout)
+
+    def test_physical_aliases_and_distinct_inode_copies_pass(self):
+        self.run_case()
+
+    def test_duplicate_offsets_cannot_inflate_demand(self):
+        self.run_case(lambda m, _l, _a, _b: m.update(demand=6), 1, "CAPACITY-UNION")
+
+    def test_equal_bytes_do_not_collapse_distinct_inodes(self):
+        def collapse(_m, _l, first, last):
+            for doc in (first, last):
+                doc["modules"].pop()
+                doc["edges"].pop()
+        self.run_case(collapse, 1, "CAPACITY-PROVIDER")
+
+    def test_absent_provider_fails(self):
+        self.run_case(lambda _m, _l, _a, last: last["modules"].pop(), 1, "CAPACITY-PROVIDER")
+
+    def test_refused_in_envelope_provider_fails(self):
+        self.run_case(lambda _m, _l, _a, last: last["modules"][1]["admission"].update(state="refused"),
+                      1, "CAPACITY-ADMISSION")
+
+    def test_observed_shortfall_fails(self):
+        self.run_case(lambda _m, _l, _a, last: last["edges"][1]["entries"].update(count=5),
+                      1, "CAPACITY-COUNT")
+
+    def test_foreign_positive_fails(self):
+        def foreign(_m, _l, _a, last):
+            last["callers"].append({"id": "foreign", "pid": 4001, "start_time": 51})
+            edge = copy.deepcopy(last["edges"][0])
+            edge["caller"] = "foreign"
+            last["edges"].append(edge)
+        self.run_case(foreign, 1, "CAPACITY-FOREIGN")
+
+    def test_old_count_reset_during_growth_fails(self):
+        self.run_case(lambda _m, _l, _a, last: last["edges"][0]["entries"].update(count=3),
+                      1, "CAPACITY-COUNT")
+
+    def test_json_callers_do_not_establish_257_owners(self):
+        def fabricated(manifest, ledger, first, last):
+            owner_population(manifest, ledger, first, last)
+            manifest["owners"] = manifest["owners"][:1]
+        self.run_case(fabricated, 1, "CAPACITY-OWNERS")
+
+    def test_maps_matched_owner_does_not_count_as_deep_scan(self):
+        def matched(manifest, ledger, first, last):
+            owner_population(manifest, ledger, first, last)
+            last["edges"][0]["mapping"]["evidence"] = "maps_match"
+        self.run_case(matched, 1, "CAPACITY-DEEP-SCAN")
+
+    def test_earlier_stream_deep_scan_establishes_each_owner(self):
+        def historical(manifest, ledger, first, last):
+            owner_population(manifest, ledger, first, last)
+            manifest["event_log"] = "events.jsonl"
+            rows = [{"seq": 0, "at_ns": 1, "kind": "started", "event": {}}]
+            for edge, caller, module in zip(last["edges"], last["callers"], last["modules"]):
+                observed = copy.deepcopy(edge)
+                observed["identity_context"] = {"version": 1, "caller": {
+                    "id": caller["id"], "pid": caller["pid"], "start_time": caller["start_time"]}, "module": {
+                    "id": module["id"], "path": module["paths"][0], "device_major": 0,
+                    "device_minor": 35, "inode": module["identity"]["inode"]}}
+                rows.append({"seq": len(rows), "at_ns": 2, "kind": "edge_observed", "event": observed})
+                edge["mapping"]["evidence"] = "maps_match"
+            rows.append({"seq": len(rows), "at_ns": 3, "kind": "ended", "event": {}})
+            manifest["events"] = rows
+        self.run_case(historical)
+
+    def test_owner_activation_unavailable_is_nonqualifying(self):
+        def unavailable(manifest, ledger, first, last):
+            owner_population(manifest, ledger, first, last)
+            manifest.update(native_owner_activation=False)
+        self.run_case(unavailable, 2, "CAPACITY-NATIVE-OWNERS")
+
+    def test_provider_surface_must_match_the_held_object(self):
+        self.run_case(lambda _m, ledger, _a, _b: ledger[1].update(ino=999),
+                      1, "CAPACITY-SURFACE")
+
+    def test_stream_prefix_counts_are_lower_bounds_until_terminal_json(self):
+        def prefix(manifest, _ledger, initial, _last):
+            rows = [{"seq": 0, "at_ns": 1, "kind": "started", "event": {
+                "limits": {"inventory_endpoints": 8192}}}]
+            for edge, module in zip(initial["edges"], initial["modules"]):
+                observed = copy.deepcopy(edge)
+                observed["entries"]["count"] = 2
+                observed["identity_context"] = {"version": 1, "caller": {
+                    "id": "c0", "pid": 4000, "start_time": 50}, "module": {
+                    "id": module["id"], "path": module["paths"][0], "device_major": 0,
+                    "device_minor": 35, "inode": module["identity"]["inode"]}}
+                rows.append({"seq": len(rows), "at_ns": 2, "kind": "edge_observed", "event": observed})
+            manifest["events"] = rows
+            manifest["phases"][0] = {"name": "initial", "providers": manifest["phases"][0]["providers"],
+                                      "stream": "events.jsonl", "until_ns": 2}
+        self.run_case(prefix)
+
+    def test_native_counts_cannot_qualify_a_scan_lane(self):
+        self.run_case(lambda _m, _l, _a, last: last["observation"].update(lane="scan"),
+                      1, "CAPACITY-LANE")
+
+    def test_calls_outside_capture_cannot_supply_exact_counts(self):
+        def outside(_manifest, ledger, _initial, _last):
+            next(row for row in ledger if row["kind"] == "call").update(t0=1, t1=2)
+        self.run_case(outside, 1, "CAPACITY-WINDOW")
+
+    def test_scan_lane_positive_requires_caller_authority(self):
+        self.run_case(lambda _m, _l, _a, last: last["callers"][0].pop("image"),
+                      1, "CAPACITY-AUTHORITY")
+
+    def test_scan_pinned_callers_with_disclosure_pass_authority(self):
+        # population() already applies scan_lane_authority to all three docs.
+        self.run_case()
+
+    def test_authority_rejects_stale_native_exact(self):
+        def stale(_manifest, _ledger, _first, last):
+            last["callers"][0]["image"]["authority"] = "native_exact"
+            last["gaps"].append(standing_authority_gap())
+        self.run_case(stale, 1, "CAPACITY-AUTHORITY")
+
+    def test_authority_without_disclosure_gap_fails(self):
+        def undisclosed(_manifest, _ledger, _first, last):
+            last["gaps"] = [gap for gap in last["gaps"]
+                            if gap.get("subject") != standing_authority_gap()["subject"]]
+        self.run_case(undisclosed, 1, "CAPACITY-AUTHORITY")
+
+    def test_growth_cannot_skip_the_middle_capacity_population(self):
+        def skipped(manifest, ledger, _first, _last):
+            manifest["phases"].pop(1)
+            for row in ledger:
+                if row.get("phase") == "middle":
+                    row["phase"] = "late"
+        self.run_case(skipped, 1, "CAPACITY-GROWTH")
+
+    def run_refusal_case(self, mutate=None, want=0, check=None):
+        manifest, ledger, late = refusal_case()
+        if mutate:
+            mutate(manifest, ledger, late)
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-") as temporary:
+            directory = Path(temporary)
+            (directory / "capacity.json").write_text(json.dumps(manifest))
+            (directory / "late.json").write_text(json.dumps(late))
+            (directory / "owner.jsonl").write_text("".join(json.dumps(row) + "\n" for row in ledger))
+            result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-check", temporary],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, want, result.stdout + result.stderr)
+            if check:
+                self.assertIn(check, result.stdout)
+
+    def test_refusal_pair_accepts_named_whole_refusal(self):
+        self.run_refusal_case()
+
+    def test_refusal_scan_pinned_with_disclosure_passes_authority(self):
+        def scan_lane(_manifest, _ledger, late):
+            scan_lane_authority(late)
+        self.run_refusal_case(scan_lane)
+
+    def test_refusal_authority_rejects_stale_native_exact(self):
+        def stale(_manifest, _ledger, late):
+            late["callers"][0]["image"]["authority"] = "native_exact"
+            late["gaps"].append(standing_authority_gap())
+        self.run_refusal_case(stale, 1, "CAPACITY-AUTHORITY")
+
+    def test_refusal_accepts_absent_edge_for_refused_demand(self):
+        self.run_refusal_case(lambda _m, _l, late: late["edges"].pop())
+
+    def test_refusal_accepts_lifetime_wording_with_budget_gap(self):
+        def lifetime(_manifest, _ledger, late):
+            path = "/owned/60.so"
+            late["modules"][-1]["admission"]["reasons"] = [
+                f"{path} needs 17 more endpoints; the inventory attach set holds 4080 of 4096 "
+                f"capture-lifetime endpoints and never reuses an endpoint ID \u2014 refusing to add a prefix"]
+            late["gaps"].append({"caller": None, "module": "m60", "pid": None,
+                                 "subject": "inventory attach set refused module",
+                                 "reason": late["modules"][-1]["admission"]["reasons"][0],
+                                 "budget": {"resource": "inventory_endpoints", "limit": 4096,
+                                            "requested": 4097}, "repeats": 1})
+        self.run_refusal_case(lifetime)
+
+    def test_refusal_rejects_over_limit_occupation(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["budgets"]["inventory_endpoints"].update(occupied=4097),
+            1, "CAPACITY-REFUSAL-BUDGET")
+
+    def test_refusal_rejects_silent_drop(self):
+        self.run_refusal_case(lambda _m, _l, late: late["modules"].pop(), 1, "CAPACITY-PROVIDER")
+
+    def test_refusal_rejects_truncated_admission(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][0]["admission"].update(endpoints=67),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_partial_admission_reasons(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][0]["admission"].update(reasons=["kept 60 of 68"]),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_unnamed_refusal(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][-1]["admission"].update(reasons=["the set is full"]),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_wrong_needed_count(self):
+        def miscount(_manifest, _ledger, late):
+            reason = late["modules"][-1]["admission"]["reasons"][0]
+            late["modules"][-1]["admission"]["reasons"] = [reason.replace("needs 17 more", "needs 16 more")]
+        self.run_refusal_case(miscount, 1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_endpoints_on_refused_verdict(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][-1]["admission"].update(endpoints=17),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_positive_on_refused_demand(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["edges"][-1]["entries"].update(count=11),
+            1, "CAPACITY-REFUSAL-NO-COUNT")
+
+    def test_refusal_rejects_mismatched_pair(self):
+        self.run_refusal_case(lambda m, _l, _b: m.update(limit=4095), 1, "CAPACITY-REFUSAL-PAIR")
+
+    def test_refusal_rejects_stream_phase(self):
+        def streamed(manifest, _ledger, _late):
+            manifest["phases"] = [{"name": "activity", "providers": manifest["phases"][0]["providers"],
+                                   "stream": "events.jsonl", "until_ns": 2}]
+        self.run_refusal_case(streamed, 1, "CAPACITY-REFUSAL-SINGLE-SNAPSHOT")
+
+    def test_refusal_rejects_malformed_budget_gap(self):
+        def gap(_manifest, _ledger, late):
+            late["gaps"].append({"caller": None, "module": "m60", "pid": None,
+                                 "subject": "inventory attach set refused module",
+                                 "reason": "/owned/60.so needs 17 more endpoints",
+                                 "budget": {"resource": "inventory_endpoints", "limit": 4096,
+                                            "requested": 4096}, "repeats": 1})
+        self.run_refusal_case(gap, 1, "CAPACITY-REFUSAL-GAP")
+
+    def test_refusal_requires_gap_for_lifetime_wording(self):
+        def unrecorded(_manifest, _ledger, late):
+            path = "/owned/60.so"
+            late["modules"][-1]["admission"]["reasons"] = [
+                f"{path} needs 17 more endpoints; the inventory attach set holds 4080 of 4096 "
+                f"capture-lifetime endpoints and never reuses an endpoint ID \u2014 refusing to add a prefix"]
+        self.run_refusal_case(unrecorded, 1, "CAPACITY-REFUSAL-GAP")
+
+    def test_refusal_rejects_wrong_module_records(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["budgets"]["inventory_attach_modules"].update(occupied=61),
+            1, "CAPACITY-REFUSAL-RECORDS")
+
+    def test_refusal_rejects_refusing_every_provider(self):
+        def refuse_all(manifest, _ledger, late):
+            limit = manifest["limit"]
+            sizes = {provider["key"]: len(provider["offsets"]) for provider in manifest["providers"]}
+            for module, provider in zip(late["modules"], manifest["providers"]):
+                unique = sizes[provider["key"]]
+                module["admission"] = {"state": "refused", "endpoints": None,
+                                        "reasons": [f"module needs {unique} more; only {limit} attach slots "
+                                                    f"are available; 0 are in use (0 active, 0 retired) \u2014 "
+                                                    f"refusing to attach a prefix; to capture one provider, "
+                                                    f"name it with --module <path>"]}
+            late["budgets"]["inventory_endpoints"]["occupied"] = 0
+            late["budgets"]["inventory_attach_modules"]["occupied"] = 0
+            late["budgets"]["endpoints"]["occupied"] = 0
+            for edge in late["edges"]:
+                edge["entries"]["count"] = 0
+        self.run_refusal_case(refuse_all, 1, "CAPACITY-REFUSAL-MINIMAL")
+
+    def test_refusal_rejects_unnecessary_second_refusal(self):
+        def refuse_two(manifest, _ledger, late):
+            limit = manifest["limit"]
+            sizes = {provider["key"]: len(provider["offsets"]) for provider in manifest["providers"]}
+            extra = manifest["providers"][-2]
+            unique = sizes[extra["key"]]
+            admitted = sum(sizes[provider["key"]] for provider in manifest["providers"][:-2])
+            late["modules"][-2]["admission"] = {"state": "refused", "endpoints": None,
+                                                "reasons": [f"module needs {unique} more; only {limit} attach slots "
+                                                            f"are available; {admitted} are in use ({admitted} active, "
+                                                            f"0 retired; held by /owned/0.so 68) \u2014 refusing to "
+                                                            f"attach a prefix; to capture one provider, name it "
+                                                            f"with --module <path>"]}
+            late["budgets"]["inventory_endpoints"]["occupied"] = admitted
+            late["budgets"]["inventory_attach_modules"]["occupied"] = len(manifest["providers"]) - 2
+            late["budgets"]["endpoints"]["occupied"] = admitted
+            late["edges"][-2]["entries"]["count"] = 0
+        self.run_refusal_case(refuse_two, 1, "CAPACITY-REFUSAL-MINIMAL")
+
+    def test_refusal_scan_lane_is_nonqualifying(self):
+        def scan(manifest, _ledger, late):
+            manifest["expect_lane"] = "scan"
+            late["observation"]["lane"] = "scan"
+        self.run_refusal_case(scan, 2, "CAPACITY-NATIVE")
+
+
+class CapacityFixtureTests(unittest.TestCase):
+    def cleanup_case(self, repeated_signals=False, wait_failure=False, close_failure=False, acquisition_signal=False):
+        namespace = runpy.run_path(str(ORACLE))
+        owned = []
+        old_handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+        real_popen = subprocess.Popen
+
+        class BrokenClose:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def close(self):
+                raise OSError("injected close failure")
+
+        class Child:
+            def __init__(self, process, index):
+                self.process, self.index, self.failed = process, index, False
+
+            def __getattr__(self, name):
+                if close_failure and self.index == 0 and name == "stdin":
+                    return BrokenClose(self.process.stdin)
+                return getattr(self.process, name)
+
+            def terminate(self):
+                if repeated_signals and self.index == 0:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    os.kill(os.getpid(), signal.SIGINT)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                self.process.terminate()
+
+            def wait(self, timeout=None):
+                if wait_failure and self.index == 0 and not self.failed:
+                    self.failed = True
+                    raise OSError("injected wait failure")
+                return self.process.wait(timeout=timeout)
+
+        def launch(arguments, **_kwargs):
+            index = len(owned)
+            process = real_popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, "
+                                  "signal.SIG_IGN); print('ready', flush=True); time.sleep(120)"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            owned.append(process)
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            if "--ready" in arguments:
+                ready = Path(arguments[arguments.index("--ready") + 1])
+                ready.write_text(f"READY {process.pid}\n")
+                ledger = Path(arguments[arguments.index("--surface") + 1])
+                ledger.write_text(json.dumps({"kind": "owner", "pid": process.pid, "start_time": 1,
+                                               "exe": sys.executable}) + "\n")
+            if acquisition_signal and index == 0:
+                os.kill(os.getpid(), signal.SIGTERM)
+            return Child(process, index)
+
+        manifest = {"demand": 2, "providers": [{"key": f"p{index}", "path": f"/owned/{index}.so"}
+                                                 for index in range(2)], "owners": [], "phases": []}
+        error = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="inventory-capacity-cleanup-control-") as temporary:
+                with mock.patch.dict(namespace["capacity_run"].__globals__, capacity_prepare=lambda *_: manifest):
+                    with mock.patch.object(subprocess, "Popen", side_effect=launch):
+                        with mock.patch.dict(os.environ, CAPACITY_DURATION="1", CAPACITY_WAIT_S="1"):
+                            try:
+                                namespace["capacity_run"]("/owned/observer", temporary, "scan", "owners",
+                                                           8192, 257, os.getuid(), os.getgid())
+                            except BaseException as caught:
+                                error = caught
+                self.assertEqual(len(owned), 1 if acquisition_signal else 3)
+                self.assertTrue(all(child.returncode is not None for child in owned),
+                                "cleanup must reap every owned child despite signals/resource failures")
+                self.assertTrue(all(child.stdout.closed for child in owned), "every owned output pipe was closed")
+                self.assertTrue(all(child.stdin.closed for child in owned[1:]), "later owned input pipes were closed")
+                self.assertIsInstance(error, ValueError)
+                if acquisition_signal:
+                    self.assertIn("interrupted by signal", str(error))
+                else:
+                    self.assertIn("bounded wait failed:observer initial discovery", str(error))
+                if wait_failure or close_failure:
+                    detail = "injected wait failure" if wait_failure else "injected close failure"
+                    self.assertIn(detail, str(error))
+                    self.assertTrue(hasattr(error, "failures"), "aggregate retains underlying resource exceptions")
+                    self.assertTrue(any(isinstance(failure, OSError) and detail in str(failure)
+                                        for _label, failure in error.failures))
+                    self.assertIn("observer initial discovery", str(error.original))
+                self.assertEqual({number: signal.getsignal(number) for number in old_handlers}, old_handlers)
+        finally:
+            for number, handler in old_handlers.items():
+                signal.signal(number, handler)
+            for child in owned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                child.stdin.close()
+                child.stdout.close()
+
+    def test_repeated_termination_signals_do_not_interrupt_owned_cleanup(self):
+        self.cleanup_case(repeated_signals=True)
+
+    def test_one_wait_failure_does_not_skip_later_owned_children(self):
+        self.cleanup_case(wait_failure=True)
+
+    def test_one_close_failure_does_not_skip_later_owned_pipes(self):
+        self.cleanup_case(close_failure=True)
+
+    def test_signal_during_acquisition_enrolls_child_before_validation(self):
+        self.cleanup_case(acquisition_signal=True)
+
+    def test_signal_during_blocking_wait_unwinds_promptly_and_reaps_children(self):
+        namespace = runpy.run_path(str(ORACLE))
+        custody = namespace["CapacityCustody"]()
+        error, wait_elapsed = None, 0
+        previous = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            try:
+                with custody:
+                    target = custody.launch([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, "
+                                             "signal.SIG_IGN); print('ready',flush=True); time.sleep(120)"],
+                                            stdout=subprocess.PIPE, text=True)
+                    self.assertEqual(target.stdout.readline().strip(), "ready")
+                    custody.launch([sys.executable, "-c", "import os,signal,time; signal.signal(signal.SIGTERM, "
+                                    f"signal.SIG_IGN); time.sleep(.2); os.kill({os.getpid()},signal.SIGTERM); time.sleep(120)"])
+                    started = time.monotonic()
+                    try:
+                        target.wait(timeout=2)
+                    finally:
+                        wait_elapsed = time.monotonic() - started
+            except BaseException as caught:
+                error = caught
+            self.assertLess(wait_elapsed, 1.2, "termination must unwind a normal blocking wait before its timeout")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("interrupted by signal", str(error))
+            self.assertTrue(all(child.returncode is not None for child in custody.children))
+            self.assertEqual({number: signal.getsignal(number) for number in previous}, previous)
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+            for child in custody.children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                if child.stdout:
+                    child.stdout.close()
+
+    def test_failed_observer_reaps_its_owned_capacity_target(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-cleanup-") as temporary:
+            directory = Path(temporary)
+            observer = directory / "failed-observer"
+            observer.write_text("#!/bin/sh\nexit 7\n")
+            observer.chmod(0o755)
+            environment = dict(os.environ, CAPACITY_DURATION="1", CAPACITY_WAIT_S="1")
+            result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-run", str(observer),
+                                     str(directory), "scan", "growth", "8192", "8192", str(os.getuid()), str(os.getgid())],
+                                    env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("observer exited", result.stderr)
+            ready = next(directory.glob("capacity-*/growth/ready"))
+            pid = int(ready.read_text().split()[1])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_runner_rejects_invalid_capacity_selection_before_any_output(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-usage-") as temporary:
+            output = Path(temporary) / "must-not-exist"
+            result = subprocess.run(["bash", str(SHELL), sys.executable, "--base", str(output),
+                                     "--capacity", "boundary", "--max-endpoints", "8193"],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+            self.assertIn("1..8192", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_capacity_population_requires_explicit_endpoint_selection(self):
+        result = subprocess.run(["bash", str(SHELL), sys.executable, "--capacity", "boundary"],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertIn("requires --max-endpoints", result.stderr)
+
+    def test_prepared_boundary_demands_come_from_distinct_mapped_objects(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-boundaries-") as temporary:
+            for demand in (4097, 6531, 8192):
+                directory = Path(temporary) / str(demand)
+                result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-prepare",
+                                         str(directory), "boundary", str(demand)],
+                                        text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                manifest = json.loads((directory / "capacity.json").read_text())
+                physical = {(*provider["pin"]["dev"], provider["pin"]["ino"], offset)
+                            for provider in manifest["providers"] for offset in provider["offsets"]}
+                self.assertEqual(len(physical), demand)
+                self.assertGreater(len({provider["pin"]["ino"] for provider in manifest["providers"]}), 1)
+
+    def test_prepared_refusal_demands_are_exactly_one_past_their_limits(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-") as temporary:
+            for limit, demand in ((4096, 4097), (6530, 6531), (8191, 8192)):
+                directory = Path(temporary) / str(demand)
+                result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-prepare",
+                                         str(directory), "refusal", str(demand)],
+                                        text=True, capture_output=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                manifest = json.loads((directory / "capacity.json").read_text())
+                self.assertEqual(manifest["demand"], demand)
+                self.assertEqual(manifest["refusal_limit"], limit)
+                physical = {(*provider["pin"]["dev"], provider["pin"]["ino"], offset)
+                            for provider in manifest["providers"] for offset in provider["offsets"]}
+                self.assertEqual(len(physical), demand)
+                self.assertGreater(len({provider["pin"]["ino"] for provider in manifest["providers"]}), 1)
+
+    def test_refusal_runner_rejects_mismatched_limit_without_launching(self):
+        namespace = runpy.run_path(str(ORACLE))
+        manifest = {"demand": 4097, "refusal_limit": 4096, "providers": [], "owners": [], "phases": []}
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("mismatched refusal selection must fail before any launch")
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-guard-") as temporary:
+            with mock.patch.dict(namespace["capacity_run_owned"].__globals__, capacity_prepare=lambda *_: manifest):
+                with mock.patch.object(subprocess, "Popen", side_effect=forbidden):
+                    with namespace["CapacityCustody"]() as custody:
+                        with self.assertRaises(ValueError) as caught:
+                            namespace["capacity_run_owned"]("/owned/observer", temporary, "scan", "refusal",
+                                                           4095, 4097, os.getuid(), os.getgid(), custody)
+        self.assertIn("exactly one above", str(caught.exception))
+
+    def test_failed_refusal_observer_reaps_its_owned_capacity_target(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-cleanup-") as temporary:
+            directory = Path(temporary)
+            observer = directory / "failed-observer"
+            observer.write_text("#!/bin/sh\nexit 7\n")
+            observer.chmod(0o755)
+            environment = dict(os.environ, CAPACITY_DURATION="1", CAPACITY_WAIT_S="1")
+            result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-run", str(observer),
+                                     str(directory), "scan", "refusal", "4096", "4097",
+                                     str(os.getuid()), str(os.getgid())],
+                                    env=environment, capture_output=True, text=True, timeout=180)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("observer exited", result.stderr)
+            ready = next(directory.glob("capacity-*/refusal/ready"))
+            pid = int(ready.read_text().split()[1])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_runner_pairs_refusal_demand_with_its_limit(self):
+        matched = subprocess.run(["bash", str(SHELL), sys.executable,
+                                  "--capacity", "refusal", "--max-endpoints", "4096", "--demand", "4097"],
+                                 capture_output=True, text=True, timeout=5)
+        self.assertEqual(matched.returncode, 70, matched.stdout + matched.stderr)
+        self.assertIn("must run as root", matched.stderr)
+        mismatched = subprocess.run(["bash", str(SHELL), sys.executable,
+                                     "--capacity", "refusal", "--max-endpoints", "4096", "--demand", "6531"],
+                                    capture_output=True, text=True, timeout=5)
+        self.assertEqual(mismatched.returncode, 64, mismatched.stdout + mismatched.stderr)
+        self.assertIn("exactly one above", mismatched.stderr)
+
+    def test_alias_surface_and_bounded_control_calls(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-fixture-") as temporary:
+            directory = Path(temporary)
+            provider, driver = directory / "provider.so", directory / "driver"
+            subprocess.run(["gcc", "-shared", "-fPIC", "-DCAPACITY_UNIQUE=3", "-o", str(provider),
+                            str(ROOT / "crates/discover/tests/fixture/version_matrix.c")], check=True, timeout=30)
+            subprocess.run(["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-o", str(driver),
+                            str(ROOT / "tests/fixtures/catalog-driver.c"), "-ldl"], check=True, timeout=30)
+            ledger = directory / "surface.jsonl"
+            result = subprocess.run([str(driver), "--ready", str(directory / "ready"), "--call",
+                                     "--surface", str(ledger), "--control", str(provider)],
+                                    input="call initial 2\nquit\n", text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+            self.assertEqual(len([row for row in rows if row["kind"] == "owner"]), 1)
+            surface = next(row for row in rows if row["kind"] == "surface")
+            self.assertEqual(len(surface["offsets"]), 68)
+            self.assertEqual(len(set(surface["offsets"])), 3)
+            calls = [row for row in rows if row["kind"] == "call" and row["phase"] == "initial"]
+            self.assertEqual(sum(row["n"] for row in calls), 2)
+            self.assertTrue(all(row["offset"] in surface["offsets"] and row["rv"] == 0 for row in calls))
+
+
+def c8_gate_namespace():
+    text = SHELL.read_text()
+    marker = "<<'C8_GATE_PY'\n"
+    if marker not in text:
+        raise AssertionError("C8 shell has no actual readiness predicate to exercise")
+    code = text.split(marker, 1)[1].split("\nC8_GATE_PY", 1)[0]
+    namespace = {"__name__": "c8_gate_controls"}
+    exec(compile(code, str(SHELL), "exec"), namespace)
+    return namespace
+
+
+class C8GatePredicateTests(unittest.TestCase):
+    def setUp(self):
+        self.gate = c8_gate_namespace()
+        self.gate["monotonic_ns"] = lambda: 500
+        self.exe = {"path": "/owned/ledger", "dev": 37, "ino": 101, "mtime_ns": 1234}
+        self.provider = {"path": "/owned/A.so", "dev": [0, 35], "ino": 201}
+        self.want = {"pid": 101, "start": 77, "gen": 0, "exe": self.exe,
+                     "provider": self.provider, "deadline": 1000}
+        self.context = {"id": "c0", "pid": 101, "start_time": 77, "incarnation": 0,
+            "authority": "scan_pinned", "status": "observed", "lifecycle": "mapped",
+            "executable": {"path": "/owned/ledger", "dev": 37, "ino": 101,
+                           "mtime_secs": 0, "mtime_nanos": 1234}}
+        self.module = {"id": "m0", "path": "/owned/A.so", "device_major": 0,
+                       "device_minor": 35, "inode": 201, "status": "observed"}
+        self.rows = []
+        self.add("started", {"started_ns": 100, "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"}}, 100)
+        self.add("caller_event", {"event": "admitted", "caller": "c0",
+                                  "identity_context": {"version": 1, "caller": self.context}}, 110)
+        self.add("edge_observed", self.edge(), 120)
+        self.add("pass_committed", {"pass": 0, "new_gaps": 99}, 130)
+
+    def add(self, kind, event, at):
+        self.rows.append({"schema": "p11scope/inventory-events/v1", "seq": len(self.rows),
+                          "at_ns": at, "kind": kind, "event": copy.deepcopy(event)})
+
+    def edge(self, *, counted=False, count=0):
+        return copy.deepcopy({"caller": self.context["id"], "module": "m0", "presence": "mapped",
+            "capture": "counted" if counted else "armed", "mapping": {"state": "mapped"},
+            "identity_context": {"version": 1, "caller": self.context, "module": self.module},
+            "entries": {"count": count, "saturated": False, "in_flight": False,
+                "first_seen_ns": 140 if counted else None, "last_seen_ns": 150 if counted else None,
+                "coverage": {"state": "counted" if counted else "watched_no_use",
+                    "since_ns": 140 if counted else 115, "until_ns": None,
+                    "lossy": False if counted else None, "reason": None, "detail": None}}})
+
+    def select(self, phase="pre", **extra):
+        return self.gate["select_gate"](self.rows, {**self.want, **extra}, phase)
+
+    def post(self):
+        pre = self.select()
+        self.add("edge_observed", self.edge(counted=True, count=18), 150)
+        self.add("pass_committed", {"pass": 1}, 170)
+        self.want.update(pre=pre, count=18, done_ns=160, last_entry_ns=145)
+
+    def successor(self):
+        self.post()
+        previous = self.select("post")
+        old = copy.deepcopy(self.context)
+        old["lifecycle"] = "exec_retired"
+        self.context.update(id="c1", incarnation=1)
+        self.add("caller_event", {"event": "exec_retired", "old": "c0", "new": "c1",
+            "identity_context": {"version": 1, "old": old, "new": self.context}}, 180)
+        self.add("edge_observed", self.edge(), 190)
+        self.add("pass_committed", {"pass": 2}, 200)
+        self.want.update(gen=1, previous=previous)
+
+    def test_actual_clean_watch_ignores_unrelated_host_gaps(self):
+        self.assertEqual(self.select()["caller"], "c0")
+
+    def test_same_path_successor_needs_fresh_exec_retired_new_context(self):
+        self.successor()
+        self.assertEqual(self.select()["caller"], "c1")
+        self.rows = self.rows[:6]
+        self.assertIsNone(self.select())
+
+    def test_exited_before_exec_retired_cannot_resurrect_caller(self):
+        self.successor()
+        exited = {"event": "exited", "caller": "c1"}
+        self.rows.insert(6, {"schema": "p11scope/inventory-events/v1", "seq": 6,
+                            "at_ns": 175, "kind": "caller_event", "event": exited})
+        for index, row in enumerate(self.rows): row["seq"] = index
+        self.assertIsNone(self.select())
+
+    def test_later_retired_event_invalidates_healthy_watch_and_count(self):
+        for phase in ('pre', 'post'):
+            with self.subTest(phase=phase):
+                rows, want = copy.deepcopy(self.rows), copy.deepcopy(self.want)
+                try:
+                    if phase == 'post': self.post()
+                    self.assertIsNotNone(self.select(phase))
+                    retired = copy.deepcopy(self.context)
+                    retired['lifecycle'] = 'exec_retired'
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c0',
+                        'identity_context': {'version': 1, 'caller': retired}}, 180)
+                    self.assertIsNone(self.select(phase))
+                finally:
+                    self.rows, self.want = rows, want
+
+    def test_later_final_pass_invalidates_healthy_watch_and_count(self):
+        for phase in ('pre', 'post'):
+            with self.subTest(phase=phase):
+                rows, want = copy.deepcopy(self.rows), copy.deepcopy(self.want)
+                try:
+                    if phase == 'post': self.post()
+                    self.assertIsNotNone(self.select(phase))
+                    self.add('pass_committed', {'pass': 2, 'final': True}, 180)
+                    self.assertIsNone(self.select(phase))
+                finally:
+                    self.rows, self.want = rows, want
+
+    def test_wrong_owned_birth_executable_and_provider_are_refused(self):
+        for area, field, value in (("caller", "pid", 102), ("caller", "start_time", 78),
+                ("caller", "id", "c9"), ("module", "id", "m9"),
+                ("caller", "incarnation", 1), ("module", "device_major", False),
+                ("module", "inode", 202), ("module", "device_minor", 36),
+                ("module", "path", "/owned/B.so"), ("caller", "lifecycle", "exited")):
+            with self.subTest(area=area, field=field):
+                rows = copy.deepcopy(self.rows)
+                self.rows[2]["event"]["identity_context"][area][field] = value
+                self.assertIsNone(self.select())
+                self.rows = rows
+        for field, value in (("ino", 102), ("path", "/owned/other"), ("mtime_nanos", 1235)):
+            with self.subTest(exe=field):
+                rows = copy.deepcopy(self.rows)
+                self.rows[2]["event"]["identity_context"]["caller"]["executable"][field] = value
+                self.assertIsNone(self.select())
+                self.rows = rows
+
+    def test_partial_pending_refused_and_frozen_watch_are_not_ready(self):
+        for state, reason, until, lossy in (("unknown", "not_attached", None, None),
+                ("unknown", "pending_first_use", None, None),
+                ("unknown", "attach_failed", None, None),
+                ("watched_no_use", None, 125, None),
+                ("watched_no_use", None, None, False)):
+            with self.subTest(state=state, reason=reason, until=until, lossy=lossy):
+                rows = copy.deepcopy(self.rows)
+                self.rows[2]["event"]["entries"]["coverage"].update(
+                    state=state, reason=reason, until_ns=until, lossy=lossy)
+                self.assertIsNone(self.select())
+                self.rows = rows
+
+    def test_missing_commit_partial_publication_and_pass_only_refuse(self):
+        complete = copy.deepcopy(self.rows)
+        for rows in (complete[:3], [complete[0], complete[3]]):
+            self.rows = copy.deepcopy(rows)
+            for index, row in enumerate(self.rows): row["seq"] = index
+            self.assertIsNone(self.select())
+        self.rows = complete
+        self.rows[-1]["event"]["final"] = True
+        self.assertIsNone(self.select())
+
+    def test_later_demotion_invalidates_cached_committed_watch(self):
+        edge = self.edge()
+        edge["entries"]["coverage"].update(state="unknown", reason="loss")
+        self.add("edge_observed", edge, 140)
+        self.assertIsNone(self.select())
+
+    def test_unrelated_provider_does_not_poison_wanted_watch_or_count(self):
+        for counted in (False, True):
+            with self.subTest(counted=counted):
+                original_rows, original_want = copy.deepcopy(self.rows), copy.deepcopy(self.want)
+                try:
+                    if counted: self.post()
+                    unrelated = self.edge(counted=counted, count=18 if counted else 0)
+                    unrelated['module'] = 'm9'
+                    unrelated['identity_context']['module'].update(id='m9', path='/owned/B.so', inode=202)
+                    self.add('edge_observed', unrelated, 180)
+                    self.add('pass_committed', {'pass': 2}, 190)
+                    proof = self.select('post' if counted else 'pre')
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['module'], 'm0')
+                finally:
+                    self.rows, self.want = original_rows, original_want
+
+    def test_same_pair_identity_change_cannot_restore_old_authority(self):
+        wrong = self.edge()
+        wrong['identity_context']['module']['inode'] = 202
+        self.add('edge_observed', wrong, 140)
+        self.add('edge_observed', self.edge(), 150)
+        self.add('pass_committed', {'pass': 1}, 160)
+        self.assertIsNone(self.select())
+
+    def test_unready_evidence_can_be_replaced_by_a_fresh_clean_watch(self):
+        unready = self.edge()
+        unready['entries']['coverage'].update(state='unknown', reason='not_attached')
+        unready['identity_context']['module']['status'] = 'unavailable'
+        self.add('edge_observed', unready, 140)
+        self.add('edge_observed', self.edge(), 150)
+        self.add('pass_committed', {'pass': 1}, 160)
+        self.assertIsNotNone(self.select())
+
+    def test_full_count_before_done_is_sealed_by_later_commit(self):
+        self.post()
+        self.assertEqual(self.select("post")["count"], 18)
+        self.want["done_ns"] = 180
+        self.assertIsNone(self.select("post"))
+
+    def test_partial_excess_lossy_or_saturated_count_never_releases_exec(self):
+        self.post()
+        for field, value in (("count", 17), ("count", 19), ("saturated", True), ("in_flight", True)):
+            with self.subTest(field=field, value=value):
+                rows = copy.deepcopy(self.rows)
+                self.rows[4]["event"]["entries"][field] = value
+                self.assertIsNone(self.select("post"))
+                self.rows = rows
+        self.rows[4]["event"]["entries"]["coverage"]["lossy"] = True
+        self.assertIsNone(self.select("post"))
+
+    def test_original_absolute_deadline_refuses_buffered_and_late_positive(self):
+        for now in (1000, 1001):
+            with self.subTest(now=now):
+                self.gate["monotonic_ns"] = lambda: now
+                with self.assertRaisesRegex(ValueError, "deadline"):
+                    self.select()
+        times = iter((999, 1000))
+        self.gate["monotonic_ns"] = lambda: next(times)
+        with self.assertRaisesRegex(ValueError, "deadline"):
+            self.select()
+
+    def test_future_publication_and_incomplete_jsonl_are_not_ready(self):
+        original = self.rows[-1]['at_ns']
+        for stamp in (900, 1001):
+            self.rows[-1]['at_ns'] = stamp
+            self.assertIsNone(self.select())
+        self.rows[-1]['at_ns'] = original
+        data = ''.join(json.dumps(row) + '\n' for row in self.rows).encode()
+        self.assertIsNone(self.gate['records_from'](data[:-1]))
+        self.assertEqual(self.gate['records_from'](data), self.rows)
+
+    def successor_progress(self, *, bound=False):
+        self.successor()
+        self.want.update(pre={'proof': 'native_ready', 'seq': 8}, count=28,
+                         first_entry_ns=210, last_entry_ns=230, done_ns=240)
+        edge = self.edge(counted=bound, count=28 if bound else 0)
+        if not bound:
+            edge['entries']['coverage'].update(state='unknown', reason='use_before_admission', since_ns=None)
+        self.add('edge_observed', edge, 232)
+        self.add('pass_committed', {'pass': 3, 'unbound_rows': [
+            {'module': 'm0', 'reason': 'before_admission', 'rows': 1}]}, 235)
+        self.add('pass_committed', {'pass': 4}, 250)
+
+    def test_successor_post_accepts_exact_bound_count_without_a_public_pre_watch(self):
+        self.successor_progress(bound=True)
+        proof = self.select('post')
+        self.assertEqual(proof['proof'], 'bound_exact')
+        self.assertEqual(proof['count'], 28)
+
+    def test_bound_successor_cannot_borrow_anonymous_rows_to_hide_a_bad_count(self):
+        self.successor_progress(bound=True)
+        self.add('gap_recorded', {'module': 'm0', 'pid': None,
+                                  'subject': 'unidentified caller image'}, 260)
+        self.add('pass_committed', {'pass': 5}, 270)
+        self.assertEqual(self.select('post')['proof'], 'bound_exact')
+        self.rows[9]['event']['entries']['count'] = 27
+        self.assertIsNone(self.select('post'))
+
+    def test_successor_post_retains_anonymous_delta_before_done_without_claiming_api_count(self):
+        self.successor_progress()
+        proof = self.select('post')
+        self.assertEqual(proof['proof'], 'publication_progress')
+        self.assertEqual(proof['caller'], 'c1')
+        self.assertEqual(proof['witness']['seq'], 10)
+        self.assertNotIn('count', proof)
+        self.assertEqual(proof['seq'], 11)
+
+    def test_anonymous_progress_requires_later_done_seal_and_disclosure(self):
+        self.successor_progress()
+        self.assertIsNotNone(self.select('post'))
+        seal = self.rows.pop()
+        self.assertIsNone(self.select('post'))
+        self.rows.append(seal)
+        self.rows[9]['event']['entries']['coverage']['reason'] = 'pending_first_use'
+        self.assertIsNone(self.select('post'))
+        self.add('gap_recorded', {'module': 'm0', 'pid': None,
+                                  'subject': 'unidentified caller image', 'reason': 'before_admission'}, 260)
+        self.add('pass_committed', {'pass': 5}, 270)
+        self.assertIsNotNone(self.select('post'))
+        self.rows[-2]['event']['pid'] = 101
+        self.assertIsNone(self.select('post'))
+
+    def test_delta_pass_itself_seals_done_when_its_timestamp_already_covers_done(self):
+        self.successor_progress()
+        self.rows.pop()
+        self.want['done_ns'] = 235
+        proof = self.select('post')
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['witness']['seq'], proof['seq'])
+
+    def test_anonymous_progress_rejects_missing_old_reused_wrong_module_and_bad_rows(self):
+        self.successor_progress()
+        baseline = copy.deepcopy(self.rows)
+        for change in ('missing', 'old', 'reused', 'wrong_module', 'wrong_reason', 'zero', 'bool'):
+            with self.subTest(change=change):
+                self.rows = copy.deepcopy(baseline)
+                item = self.rows[10]['event']['unbound_rows'][0]
+                extra = {}
+                if change == 'missing': self.rows[10]['event']['unbound_rows'] = []
+                elif change == 'old': extra['first_entry_ns'] = 236
+                elif change == 'reused': extra['unbound_watermark'] = 10
+                elif change == 'wrong_module': item['module'] = 'm9'
+                elif change == 'wrong_reason': item['reason'] = 'caller_exited'
+                elif change == 'zero': item['rows'] = 0
+                elif change == 'bool': item['rows'] = True
+                self.assertIsNone(self.select('post', **extra))
+
+    def test_anonymous_progress_needs_fresh_identity_and_refuses_retired_final_and_late(self):
+        self.successor_progress()
+        baseline = copy.deepcopy(self.rows)
+        for change in ('identity', 'retired', 'final', 'deadline'):
+            with self.subTest(change=change):
+                self.rows = copy.deepcopy(baseline)
+                if change == 'identity':
+                    self.rows[6]['event']['identity_context']['new']['incarnation'] = 0
+                elif change == 'retired':
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c1'}, 260)
+                elif change == 'final':
+                    self.add('pass_committed', {'pass': 5, 'final': True}, 260)
+                else:
+                    self.gate['monotonic_ns'] = lambda: 1000
+                    with self.assertRaisesRegex(ValueError, 'deadline'):
+                        self.select('post')
+                    continue
+                self.assertIsNone(self.select('post'))
+
+    def test_anonymous_reasons_match_the_unchanged_final_oracle(self):
+        oracle = runpy.run_path(str(ORACLE))
+        self.assertEqual(self.gate['EXEC_REASONS'], oracle['COUNTED_EXEC_CHAIN_REASONS'])
+
+    def gen2_quiet(self, *, inherited=False, registered=True):
+        self.successor_progress()
+        previous = self.select('post')
+        old = copy.deepcopy(self.context)
+        old['lifecycle'] = 'exec_retired'
+        self.exe = {**self.exe, 'path': '/owned/ledger2', 'ino': 102}
+        self.context.update(id='c2', incarnation=2)
+        self.context['executable'].update(path=self.exe['path'], ino=self.exe['ino'])
+        self.want.update(gen=2, exe=self.exe, previous=previous)
+        self.want.pop('pre', None)
+        self.add('caller_event', {'event': 'exec_retired', 'old': 'c1', 'new': 'c2',
+            'identity_context': {'version': 1, 'old': old, 'new': self.context}}, 260)
+        edge = self.edge()
+        if inherited:
+            edge['entries']['coverage'].update(state='unknown', reason='use_before_admission', since_ns=None)
+        self.add('edge_observed', edge, 270)
+        self.add('pass_committed', {'pass': 5}, 272)
+        pre = self.select()
+        self.want.update(pre=pre, getter_entry_ns=280, semantic_ns=285, count=1, last_entry_ns=280)
+        edge = self.edge(counted=True, count=1)
+        edge['entries'].update(first_seen_ns=281, last_seen_ns=281)
+        edge['entries']['coverage']['since_ns'] = 281
+        self.add('edge_observed', edge, 290)
+        instance = {'id': 'i2', 'caller': 'c2', 'module': 'm0', 'state': 'observed',
+                    'reason': None, 'first_seen_ns': 281, 'last_seen_ns': 281}
+        child = {'caller': 'c2', 'module': 'm0', 'instance': 'i2',
+            'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
+            'api_returns': {'count': None, 'historical_only_returns': 0, 'saturated': False, 'unit': 'api_returns'},
+            'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
+            'coverage': {'lossy': False, 'reasons': ['no_calls']}}
+        if registered:
+            self.add('instance_observed', instance, 295)
+            self.add('semantic_edge_observed', child, 296)
+        self.add('pass_committed', {'pass': 6}, 300)
+        return instance, child
+
+    def test_gen2_requires_both_quiet_registrations_and_their_following_commit(self):
+        instance, child = self.gen2_quiet(registered=False)
+        self.assertIsNone(self.select('semantic'))  # Physical count1 and a pass are insufficient.
+        self.add('instance_observed', instance, 310)
+        self.add('pass_committed', {'pass': 7}, 320)
+        self.assertIsNone(self.select('semantic'))
+        self.add('semantic_edge_observed', child, 330)
+        self.assertIsNone(self.select('semantic'))
+        self.add('pass_committed', {'pass': 8}, 340)
+        proof = self.select('semantic')
+        self.assertEqual((proof['proof'], proof['instance']), ('quiet_ready', 'i2'))
+
+    def test_gen2_preserves_inherited_zero_coverage_without_inventing_a_watch(self):
+        self.gen2_quiet(inherited=True)
+        proof = self.want['pre']
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['proof'], 'mapped_ready')
+        self.assertNotIn('instance', proof)
+        self.assertEqual((proof['coverage_state'], proof['coverage_reason']), ('unknown', 'use_before_admission'))
+        self.assertEqual(proof['count'], 0)
+
+    def test_gen2_rejects_stale_wrong_pair_ambiguous_retired_and_nonquiet_children(self):
+        self.gen2_quiet()
+        baseline = copy.deepcopy(self.rows)
+        mutations = [('instance', 'caller', 'c9'), ('instance', 'module', 'm9'),
+            ('instance', 'state', 'retired'), ('instance', 'first_seen_ns', 200),
+            ('child', 'caller', 'c9'), ('child', 'module', 'm9'), ('child', 'instance', 'i9'),
+            ('child', 'semantics', 'observed'), ('child', 'mechanisms', []), ('child', 'operations', {}),
+            ('entries', 'count', 0), ('returns', 'count', 1), ('returns', 'historical_only_returns', 1),
+            ('returns', 'historical_only_returns', False), ('returns', 'saturated', True),
+            ('returns', 'saturated', 0), ('coverage', 'lossy', True), ('coverage', 'lossy', 0),
+            ('coverage', 'reasons', ['semantic_loss'])]
+        for area, key, value in mutations:
+            with self.subTest(area=area, key=key):
+                self.rows = copy.deepcopy(baseline)
+                instance = next(r['event'] for r in self.rows if r['kind'] == 'instance_observed')
+                child = next(r['event'] for r in self.rows if r['kind'] == 'semantic_edge_observed')
+                target = {'instance': instance, 'child': child, 'entries': child['entries'],
+                          'returns': child['api_returns'], 'coverage': child['coverage']}[area]
+                target[key] = value
+                self.assertIsNone(self.select('semantic'))
+        self.rows = baseline
+        extra = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'instance_observed'))
+        extra['id'] = 'i3'
+        self.add('instance_observed', extra, 310)
+        self.add('pass_committed', {'pass': 7}, 320)
+        self.assertIsNone(self.select('semantic'))
+
+    def test_gen2_latest_retirement_child_update_and_final_pass_invalidate_quiet_proof(self):
+        self.gen2_quiet()
+        baseline = copy.deepcopy(self.rows)
+        for change in ('instance', 'child', 'caller', 'final'):
+            with self.subTest(change=change):
+                self.rows = copy.deepcopy(baseline)
+                self.assertIsNotNone(self.select('semantic'))
+                if change == 'instance':
+                    item = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'instance_observed'))
+                    item.update(state='retired', reason='task_retired')
+                    self.add('instance_observed', item, 310)
+                elif change == 'child':
+                    item = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'semantic_edge_observed'))
+                    item['api_returns']['historical_only_returns'] = 1
+                    self.add('semantic_edge_observed', item, 310)
+                elif change == 'caller':
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c2'}, 310)
+                self.add('pass_committed', {'pass': 7, 'final': change == 'final'}, 320)
+                self.assertIsNone(self.select('semantic'))
+
+    def test_gen2_other_unknowns_positive_entries_and_original_deadline_still_refuse(self):
+        self.gen2_quiet(inherited=True)
+        baseline = copy.deepcopy(self.rows)
+        for field, value in [('count', 0), ('count', 2), ('first_seen_ns', 270), ('last_seen_ns', 291),
+                             ('in_flight', True), ('saturated', True), ('reason', 'pending_first_use')]:
+            with self.subTest(field=field):
+                self.rows = copy.deepcopy(baseline)
+                entries = next(r['event']['entries'] for r in reversed(self.rows) if r['kind'] == 'edge_observed')
+                (entries['coverage'] if field == 'reason' else entries)[field] = value
+                self.assertIsNone(self.select('semantic'))
+        self.rows = baseline
+        for times in ((1000,), (999, 1000)):
+            clock = iter(times)
+            self.gate['monotonic_ns'] = lambda: next(clock)
+            with self.assertRaisesRegex(ValueError, 'deadline'):
+                self.select('semantic')
+
+    def test_completed_getter_prefix_requires_one_successful_original_call_and_actual_hold(self):
+        getter = {'fn': 'C_GetFunctionList', 'module': '/owned/A.so', 'phase': 'setup',
+                  'n': '1', 'bad': '0', 't0': '210', 't1': '210'}
+        hold = {'phase': 'semantic', 't': '230', 'deadline': '1000'}
+        native = [('LEDGER', getter), ('WATCH_READY', hold)]
+        prefix = self.gate['completed_getter'](native, '/owned/A.so', 1000)
+        self.assertEqual(prefix, {'getter_entry_ns': 210, 'semantic_ns': 230, 'count': 1, 'last_entry_ns': 210})
+        self.assertIsNone(self.gate['completed_getter'](native[:1], '/owned/A.so', 1000))
+        for field, value in [('fn', 'C_Initialize'), ('module', '/owned/B.so'), ('n', '2'), ('bad', '1'),
+                             ('phase', 'main'), ('t1', '211')]:
+            with self.subTest(field=field):
+                bad = copy.deepcopy(native)
+                bad[0][1][field] = value
+                with self.assertRaises(ValueError): self.gate['completed_getter'](bad, '/owned/A.so', 1000)
+        with self.assertRaises(ValueError): self.gate['completed_getter'](native + native[:1], '/owned/A.so', 1000)
+        hold['t'] = '209'
+        with self.assertRaises(ValueError): self.gate['completed_getter'](native, '/owned/A.so', 1000)
+
+    def test_semantic_gate_accepts_physical_poll_time_after_getter_completion(self):
+        self.gen2_quiet()
+        edge = next(row['event'] for row in reversed(self.rows) if row['kind'] == 'edge_observed')
+        edge['entries']['last_seen_ns'] = 289  # Read after hold285, before publication290.
+        proof = self.select('semantic')
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['count'], 1)
+
+
+class C8GateFixtureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="c8-gated-native-")
+        cls.base = Path(cls.temporary.name)
+        cls.driver = cls.base / "ledger"
+        cls.other = cls.base / "ledger2"
+        subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-Werror", "-pthread",
+            str(ROOT / "tests/fixtures/public-cli/inventory-ledger.c"), "-ldl", "-o", str(cls.driver)],
+            check=True, timeout=30)
+        cls.other.write_bytes(cls.driver.read_bytes())
+        cls.other.chmod(0o755)
+        tokens = cls.base / "tokens"
+        tokens.mkdir()
+        cls.conf = cls.base / "softhsm2.conf"
+        cls.conf.write_text(f"directories.tokendir = {tokens}\nobjectstore.backend = file\nlog.level = ERROR\n")
+        subprocess.run(["softhsm2-util", "--init-token", "--free", "--label", "c8-owned",
+            "--so-pin", "5678", "--pin", "1234"],
+            env={**os.environ, "SOFTHSM2_CONF": str(cls.conf)}, check=True,
+            stdout=subprocess.DEVNULL, timeout=10)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def start(self, *, chain=False, seconds=10, stale=False, delay_ms=0,
+              cell=None, warm=False, late=False, shared_open=True):
+        root = Path(tempfile.mkdtemp(dir=self.base, prefix="case-"))
+        prefix, ledger = root / "gate", root / "ledger.out"
+        if stale: Path(str(prefix) + ".0.go").touch()
+        shared = root / "shared"
+        if shared_open: shared.touch()
+        output, errors = ledger.open("w"), (root / "ledger.err").open("w")
+        args = [str(self.driver), "exec-chain" if chain else "mech", "--cell", cell or ("P5" if chain else "P2"),
+            "--module", "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so", "--iters", "1" if chain else "4",
+            "--gate", str(shared), "--ledger-singletons", "--c8-gate-prefix", str(prefix),
+            "--c8-gated-images", "3" if chain else "1", "--c8-deadline",
+            str(time.monotonic_ns() + int(seconds * 1e9))]
+        if chain: args += ["--chain", f"leader:{self.driver},leader:{self.other},thread:{self.driver}",
+                           "--delay-ms", str(delay_ms)]
+        else: args += ["--hold"]
+        if warm: args += ['--c8-warm-initial']
+        if late: args += ['--late', '--delay-ms', str(delay_ms)]
+        child = subprocess.Popen(args, stdout=output, stderr=errors,
+            env={**os.environ, "SOFTHSM2_CONF": str(self.conf)})
+        self.addCleanup(output.close)
+        self.addCleanup(errors.close)
+        def stop():
+            if child.poll() is None: child.kill()
+            child.wait(timeout=5)
+        self.addCleanup(stop)
+        return child, prefix, ledger
+
+    def wait(self, child, ledger, prefix, *, gen, phase):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            text = ledger.read_text()
+            if any(line.startswith(prefix + " ") and f" gen={gen} " in line
+                   and (phase is None or f" phase={phase} " in line) for line in text.splitlines()):
+                return text
+            if child.poll() is not None:
+                self.fail(f"native fixture exited{child.returncode} before {prefix}/{gen}/{phase}: "
+                          f"{ledger.with_name('ledger.err').read_text()} {text}")
+            time.sleep(.005)
+        self.fail(f"native fixture did not reach {prefix}/{gen}/{phase}")
+
+    def test_warm_initial_roles_hold_one_getter_before_setup_ready(self):
+        for cell, chain, total in (('P1', False, 48), ('P5', True, 18)):
+            with self.subTest(cell=cell):
+                child, prefix, ledger = self.start(cell=cell, chain=chain, warm=True, shared_open=False)
+                text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='go')
+                self.assertNotIn('LEDGER ', text)
+                self.assertNotIn('READY ', '\n'.join(x for x in text.splitlines() if not x.startswith('WATCH_READY ')))
+                Path(str(prefix) + '.0.go').touch()
+                text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='semantic')
+                calls = [parse_native_row(x) for x in text.splitlines() if x.startswith('LEDGER ')]
+                self.assertEqual([x['fn'] for x in calls], ['C_GetFunctionList'])
+                self.assertEqual((calls[0]['n'], calls[0]['bad']), ('1', '0'))
+                self.assertFalse(any(x.startswith('READY ') for x in text.splitlines()))
+                Path(str(prefix) + '.0.semantic').touch()
+                text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+                self.assertFalse(any(x.startswith('LEDGER ') and ' phase=main ' in x for x in text.splitlines()))
+                (ledger.parent / 'shared').touch()
+                text = self.wait(child, ledger, 'DONE', gen=0, phase=None)
+                self.assertEqual(len([x for x in text.splitlines() if x.startswith('LEDGER ') and ' gen=0 ' in x]), total)
+
+    def test_warm_late_ready_stays_unmapped_until_the_original_global_gate(self):
+        child, prefix, ledger = self.start(cell='P7', warm=True, late=True, shared_open=False, delay_ms=20)
+        text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+        self.assertNotIn('MAPPED ', text)
+        self.assertNotIn('LEDGER ', text)
+        provider = Path('/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so')
+        inode = str(provider.stat().st_ino)
+        self.assertFalse(any(x.split()[4] == inode for x in Path(f'/proc/{child.pid}/maps').read_text().splitlines()))
+        opened = time.monotonic_ns()
+        (ledger.parent / 'shared').touch()
+        text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='go')
+        self.assertIn('MAPPED ', text)
+        self.assertNotIn('LEDGER ', text)
+        ready = next(parse_native_row(x) for x in text.splitlines() if x.startswith('WATCH_READY '))
+        self.assertGreaterEqual(int(ready['t']) - opened, 20_000_000)
+        Path(str(prefix) + '.0.go').touch()
+        text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='semantic')
+        self.assertEqual([parse_native_row(x)['fn'] for x in text.splitlines() if x.startswith('LEDGER ')],
+                         ['C_GetFunctionList'])
+        Path(str(prefix) + '.0.semantic').touch()
+        text = self.wait(child, ledger, 'DONE', gen=0, phase=None)
+        self.assertEqual(len([x for x in text.splitlines() if x.startswith('LEDGER ')]), 48)
+        child.terminate()
+        self.assertEqual(child.wait(timeout=5), 0)
+
+    def test_real_mech_holds_before_getter_and_keeps_singleton_plan(self):
+        child, prefix, ledger = self.start()
+        text = self.wait(child, ledger, "WATCH_READY", gen=0, phase="go")
+        self.assertNotIn("LEDGER ", text)
+        Path(str(prefix) + ".0.go").touch()
+        self.wait(child, ledger, "DONE", gen=0, phase=None)
+        self.assertIsNone(child.poll())
+        child.terminate()
+        self.assertEqual(child.wait(timeout=5), 0)
+        entries = [parse_native_row(line) for line in ledger.read_text().splitlines() if line.startswith("LEDGER ")]
+        self.assertEqual(len(entries), 48)
+        self.assertTrue(all(x["n"] == "1" and x["t0"] == x["t1"] and x["bad"] == "0" for x in entries))
+        oracle = runpy.run_path(str(ORACLE))
+        errors = []
+        image = next(iter(oracle['parse_ledger'](ledger.read_text(), errors).values()))
+        self.assertEqual(errors, [])
+        first, last = min(int(x['t0']) for x in entries), max(int(x['t1']) for x in entries)
+        window = (first - 1000, last + 1000)
+        use = oracle['use_in'](image, entries[0]['module'], window)
+        verdict, count, _detail = oracle['exact_window_count'](
+            use, first + 1, window, None, first - 100, first - 100, 68)
+        self.assertEqual((verdict, count), ('exact', 48), 'unchanged oracle must count the armed getter')
+
+    def test_singleton_error_preserves_actual_bad_return(self):
+        root = Path(tempfile.mkdtemp(dir=self.base, prefix='bad-pin-'))
+        (root / 'tokens').mkdir()
+        conf = root / 'softhsm2.conf'
+        conf.write_text(f'directories.tokendir = {root}/tokens\nobjectstore.backend = file\nlog.level = ERROR\n')
+        env = {**os.environ, 'SOFTHSM2_CONF': str(conf)}
+        subprocess.run(['softhsm2-util', '--init-token', '--free', '--label', 'c8-error',
+            '--so-pin', '5678', '--pin', '9999'], env=env, check=True,
+            stdout=subprocess.DEVNULL, timeout=10)
+        result = subprocess.run([str(self.driver), 'mech', '--cell', 'P2', '--module',
+            '/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so', '--ledger-singletons'],
+            env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        rows = [parse_native_row(x) for x in result.stdout.splitlines() if x.startswith('LEDGER ')]
+        login = [r for r in rows if r['fn'] == 'C_Login']
+        self.assertEqual(len(login), 1)
+        self.assertEqual((login[0]['n'], login[0]['bad']), ('1', '1'))
+
+    def test_parent_shell_pin_fds_survive_command_substitution(self):
+        text = SHELL.read_text()
+        function = text.split('c8_gate() {', 1)[1].split('\n}\n\nmono_ns', 1)[0]
+        target = self.base / 'shell-pins.json'
+        script = ('REPO=$1\nc8_gate() {' + function + '\n}\n'
+            'exec {one}<"$2"\nexec {two}<"$3"\nexec {three}<"$4"\nexec {four}<"$4"\n'
+            'result=$(c8_gate prepare "$5" "$one" "$two" "$three" "$four")\n')
+        result = subprocess.run(['bash', '-eu', '-c', script, 'c8-pins', str(ROOT),
+            str(self.driver), str(self.other), '/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so',
+            str(target)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(json.loads(target.read_text())['pins']), {'L', 'L2', 'A', 'B'})
+
+    def test_real_chain_holds_required_images_and_leaves_thread_image_optional(self):
+        self.assert_real_chain(warm=False)
+
+    def test_warm_initial_gate_does_not_add_semantic_holds_to_later_images(self):
+        self.assert_real_chain(warm=True)
+
+    def assert_real_chain(self, *, warm):
+        child, prefix, ledger = self.start(chain=True, warm=warm)
+        for gen, wanted in enumerate((18, 28, 38)):
+            text = self.wait(child, ledger, "WATCH_READY", gen=gen, phase="go")
+            self.assertFalse(any(line.startswith("LEDGER ") and f" gen={gen} " in line for line in text.splitlines()))
+            Path(str(prefix) + f".{gen}.go").touch()
+            if (warm and gen == 0) or gen == 2:
+                text = self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='semantic')
+                prefix_calls = [parse_native_row(line) for line in text.splitlines()
+                                if line.startswith('LEDGER ') and f' gen={gen} ' in line]
+                self.assertEqual(len(prefix_calls), 1)
+                self.assertEqual(prefix_calls[0]['fn'], 'C_GetFunctionList')
+                Path(str(prefix) + f'.{gen}.semantic').touch()
+            self.wait(child, ledger, "WATCH_READY", gen=gen, phase="next")
+            rows = [parse_native_row(line) for line in ledger.read_text().splitlines()
+                    if line.startswith("LEDGER ") and f" gen={gen} " in line]
+            self.assertEqual(len(rows), wanted)
+            self.assertIsNone(child.poll())
+            self.assertNotIn(f" gen={gen + 1} ", ledger.read_text())
+            Path(str(prefix) + f".{gen}.next").touch()
+        self.assertEqual(child.wait(timeout=5), 0)
+        text = ledger.read_text()
+        rows = [parse_native_row(line) for line in text.splitlines() if line.startswith("LEDGER ")]
+        self.assertEqual([sum(x["gen"] == str(gen) and x["fn"] != "C_GetFunctionList" for x in rows)
+                          for gen in range(4)], [17, 27, 37, 47])
+        idents = [parse_native_row(line) for line in text.splitlines() if line.startswith("IDENT ")]
+        self.assertEqual(len({(x["pid"], x["start"]) for x in idents}), 1)
+        self.assertEqual([x["exe"] for x in idents], [str(self.driver), str(self.driver), str(self.other), str(self.driver)])
+        self.assertEqual([int(parse_native_row(line)['gen']) for line in text.splitlines()
+                          if line.startswith('WATCH_READY ') and ' phase=semantic ' in line],
+                         [0, 2] if warm else [2])
+        self.assertFalse(any(line.startswith("WATCH_READY ") and " gen=3 " in line for line in text.splitlines()))
+
+    def test_semantic_hold_stop_and_original_deadline_keep_the_remaining_calls_unrun(self):
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                child, prefix, ledger = self.start(chain=True, seconds=1)
+                for gen in (0, 1):
+                    self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='go')
+                    Path(str(prefix) + f'.{gen}.go').touch()
+                    self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='next')
+                    Path(str(prefix) + f'.{gen}.next').touch()
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+                Path(str(prefix) + '.2.go').touch()
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='semantic')
+                if stopped: child.terminate()
+                self.assertNotEqual(child.wait(timeout=3), 0)
+                calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                         if x.startswith('LEDGER ') and ' gen=2 ' in x]
+                self.assertEqual([x['fn'] for x in calls], ['C_GetFunctionList'])
+                self.assertEqual((calls[0]['n'], calls[0]['bad']), ('1', '0'))
+
+    def test_stale_gate_is_refused_without_calls(self):
+        child, _prefix, ledger = self.start(stale=True)
+        self.assertNotEqual(child.wait(timeout=5), 0)
+        self.assertNotIn("LEDGER ", ledger.read_text())
+
+    def test_original_deadline_and_stop_abort_before_calls(self):
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                child, _prefix, ledger = self.start(seconds=1 if stopped else .1)
+                self.wait(child, ledger, "WATCH_READY", gen=0, phase="go")
+                if stopped: child.terminate()
+                self.assertNotEqual(child.wait(timeout=3), 0)
+                self.assertNotIn("LEDGER ", ledger.read_text())
+
+    def controller_inputs(self, *, delay_ms=0, cell='P5', warm=False, late=False):
+        """Real owned processes/FDs; JSONL is explicitly controlled unit input."""
+        child, prefix, ledger = self.start(chain=cell == 'P5', delay_ms=delay_ms,
+            cell=cell, warm=warm, late=late, shared_open=not warm)
+        if late:
+            text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+            self.assertNotIn('MAPPED ', text)
+            (ledger.parent / 'shared').touch()
+        self.wait(child, ledger, "WATCH_READY", gen=0, phase="go")
+        ready = next(parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith("WATCH_READY "))
+        root = ledger.parent
+        provider = Path('/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so')
+        descriptors = [os.open(x, os.O_RDONLY) for x in (self.driver, self.other, provider, provider)]
+        for fd in descriptors: self.addCleanup(os.close, fd)
+        observer = subprocess.Popen([sys.executable, '-I', '-c', 'import time;time.sleep(30)'])
+        def stop_observer():
+            if observer.poll() is None: observer.kill()
+            observer.wait(timeout=5)
+        self.addCleanup(stop_observer)
+        ns, pins, stream = c8_gate_namespace(), root / 'pins.json', root / 'events.jsonl'
+
+        def invoke(operation, *arguments):
+            argv = [str(SHELL), str(ROOT), operation, str(pins), *map(str, arguments)]
+            with mock.patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+                ns['main']()
+
+        invoke('prepare', *descriptors)
+        state = json.loads(pins.read_text())
+        exe, mapped = state['pins']['L']['exe'], state['pins']['A']['provider']
+        context = {'id': 'c0', 'pid': child.pid, 'start_time': int(ready['start']), 'incarnation': 0,
+            'authority': 'scan_pinned', 'status': 'observed', 'lifecycle': 'mapped',
+            'executable': {'path': exe['path'], 'dev': exe['dev'], 'ino': exe['ino'],
+                'mtime_secs': exe['mtime_ns'] // 1_000_000_000, 'mtime_nanos': exe['mtime_ns'] % 1_000_000_000}}
+        module = {'id': 'm0', 'path': mapped['path'], 'device_major': mapped['dev'][0],
+                  'device_minor': mapped['dev'][1], 'inode': mapped['ino'], 'status': 'observed'}
+        edge = {'caller': 'c0', 'module': 'm0', 'mapping': {'state': 'mapped'},
+            'identity_context': {'version': 1, 'caller': context, 'module': module},
+            'entries': {'count': 0, 'saturated': False, 'in_flight': False,
+                'first_seen_ns': None, 'last_seen_ns': None,
+                'coverage': {'state': 'watched_no_use', 'since_ns': int(ready['t']),
+                             'until_ns': None, 'reason': None, 'detail': None, 'lossy': None}}}
+        rows = []
+        def append(kind, event, at=None):
+            rows.append({'schema': 'p11scope/inventory-events/v1', 'seq': len(rows),
+                         'at_ns': time.monotonic_ns() if at is None else at,
+                         'kind': kind, 'event': copy.deepcopy(event)})
+            with stream.open('a') as output:
+                output.write(json.dumps(rows[-1]) + '\n')
+        origin = int(ready['deadline']) - 10_000_000_000
+        append('started', {'started_ns': origin, 'clock': {'basis': 'CLOCK_MONOTONIC', 'unit': 'ns'}}, origin)
+        append('caller_event', {'event': 'admitted', 'caller': 'c0',
+                                'identity_context': {'version': 1, 'caller': context}})
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 0})
+        fd = os.open(stream, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        invoke('start', stream, fd, 10, observer.pid, os.getpid())
+        def gate(phase, gen=0):
+            total = [18 if cell == 'P5' else 48] if warm and gen == 0 else []
+            return invoke(phase, cell, child.pid, gen, 'L2' if gen == 2 else 'L',
+                          'A', ledger, prefix, os.getpid(), os.getuid(), *total)
+        return child, observer, prefix, ledger, ns, edge, append, gate
+
+    def warm_controller_case(self, cell, *, late=False):
+        child, _observer, prefix, ledger, ns, edge, append, gate = self.controller_inputs(
+            cell=cell, warm=True, late=late, delay_ms=20 if late else 0)
+        stopped, errors = threading.Event(), []
+        original_select = ns['select_gate']
+        def checked_select(*args):
+            if errors: raise AssertionError(f'warm publisher failed: {errors!r}') from errors[0]
+            return original_select(*args)
+        ns['select_gate'] = checked_select
+        def publish_after_getter():
+            try:
+                text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='semantic')
+                if stopped.is_set(): return
+                calls = [parse_native_row(x) for x in text.splitlines() if x.startswith('LEDGER ')]
+                if [x['fn'] for x in calls] != ['C_GetFunctionList']:
+                    raise AssertionError('warm role ran remaining calls before quiet registration')
+                stamp, now = int(calls[0]['t0']) + 1, time.monotonic_ns()
+                edge['entries'].update(count=1, first_seen_ns=stamp, last_seen_ns=now)
+                edge['entries']['coverage'].update(state='counted', lossy=False, since_ns=stamp)
+                append('edge_observed', edge)
+                append('instance_observed', {'id': 'i0', 'caller': 'c0', 'module': 'm0', 'state': 'observed',
+                    'reason': None, 'first_seen_ns': now, 'last_seen_ns': now})
+                append('semantic_edge_observed', {'caller': 'c0', 'module': 'm0', 'instance': 'i0',
+                    'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
+                    'api_returns': {'count': None, 'historical_only_returns': 0, 'saturated': False, 'unit': 'api_returns'},
+                    'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
+                    'coverage': {'lossy': False, 'reasons': ['no_calls']}})
+                append('pass_committed', {'pass': 1})
+            except BaseException as error:
+                errors.append(error)
+        publisher = threading.Thread(target=publish_after_getter)
+        publisher.start()
+        self.addCleanup(publisher.join, 5)
+        self.addCleanup(stopped.set)
+        gate('pre')
+        gate('semantic')
+        proof = json.loads(Path(str(prefix) + '.0.semantic.json').read_text())
+        self.assertEqual((proof['proof'], proof['count'], proof['instance']), ('quiet_ready', 1, 'i0'))
+        publisher.join(2)
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(errors, [])
+        if not late:
+            text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+            self.assertFalse(any(x.startswith('LEDGER ') and ' phase=main ' in x for x in text.splitlines()))
+            (ledger.parent / 'shared').touch()
+        text = self.wait(child, ledger, 'DONE', gen=0, phase=None)
+        calls = [parse_native_row(x) for x in text.splitlines() if x.startswith('LEDGER ') and ' gen=0 ' in x]
+        self.assertEqual(len(calls), 18 if cell == 'P5' else 48)
+        if cell == 'P5':
+            edge['entries'].update(count=18, last_seen_ns=time.monotonic_ns())
+            append('edge_observed', edge)
+            append('pass_committed', {'pass': 2})
+            receipt = Path(str(prefix) + '.0.semantic.json')
+            saved = receipt.read_bytes()
+            receipt.unlink()
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    gate('post')
+                self.assertFalse(Path(str(prefix) + '.0.next').exists())
+            finally:
+                receipt.write_bytes(saved)
+            gate('post')
+            self.wait(child, ledger, 'WATCH_READY', gen=1, phase='go')
+        else:
+            child.terminate()
+            self.assertEqual(child.wait(timeout=5), 0)
+
+    def test_warm_initial_controller_waits_for_actual_getter_before_semantic_publication(self):
+        for cell in ('P1', 'P5'):
+            with self.subTest(cell=cell): self.warm_controller_case(cell)
+
+    def test_warm_late_controller_uses_the_existing_unmapped_global_gate(self):
+        self.warm_controller_case('P7', late=True)
+
+    def test_successor_publisher_waits_for_real_native_use_instead_of_deadlocking_pre(self):
+        self.successor_controller_case()
+
+    def test_next_executable_pre_waits_through_the_real_previous_image_quiet_gap(self):
+        self.successor_controller_case(delay_ms=300, immediate_next=True)
+
+    def successor_controller_case(self, *, delay_ms=0, immediate_next=False):
+        child, _observer, prefix, ledger, ns, edge, append, gate = self.controller_inputs(delay_ms=delay_ms)
+        gate('pre')
+        self.wait(child, ledger, 'WATCH_READY', gen=0, phase='next')
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
+        edge['entries'].update(count=18, first_seen_ns=int(calls[0]['t0']) + 1,
+                               last_seen_ns=int(calls[-1]['t1']) + 1)
+        edge['entries']['coverage'].update(state='counted', lossy=False, since_ns=int(calls[0]['t0']) + 1)
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 1})
+        gate('post')
+        self.wait(child, ledger, 'WATCH_READY', gen=1, phase='go')
+        # The controlled publisher cannot mint the successor before its first
+        # actual native call. The old public-PRE wait therefore expires here.
+        ready = next(parse_native_row(x) for x in ledger.read_text().splitlines()
+                     if x.startswith('WATCH_READY ') and ' gen=1 ' in x)
+        stopped, errors = threading.Event(), []
+        def publish_after_native_use():
+            try:
+                while not stopped.wait(.002):
+                    if any(x.startswith('LEDGER ') and ' gen=1 ' in x for x in ledger.read_text().splitlines()):
+                        break
+                else:
+                    return
+                self.wait(child, ledger, 'WATCH_READY', gen=1, phase='next')
+                old = copy.deepcopy(edge['identity_context']['caller'])
+                old['lifecycle'] = 'exec_retired'
+                current = copy.deepcopy(old)
+                current.update(id='c1', incarnation=1, lifecycle='mapped')
+                append('caller_event', {'event': 'exec_retired', 'old': 'c0', 'new': 'c1',
+                    'identity_context': {'version': 1, 'old': old, 'new': current}})
+                edge.update(caller='c1')
+                edge['identity_context']['caller'] = current
+                edge['entries'].update(count=0, first_seen_ns=None, last_seen_ns=None)
+                edge['entries']['coverage'].update(state='unknown', reason='use_before_admission',
+                                                     lossy=None, since_ns=None)
+                append('edge_observed', edge)
+                append('pass_committed', {'pass': 2, 'unbound_rows': [
+                    {'module': 'm0', 'reason': 'before_admission', 'rows': 1}]})
+                append('pass_committed', {'pass': 3})
+            except BaseException as error:
+                errors.append(error)
+        publisher = threading.Thread(target=publish_after_native_use)
+        publisher.start()
+        self.addCleanup(publisher.join, 5)
+        self.addCleanup(stopped.set)
+        actual_clock = ns['monotonic_ns']
+        if not delay_ms: ns['monotonic_ns'] = lambda: time.monotonic_ns() + 9_000_000_000
+        gate('pre', 1)
+        ns['monotonic_ns'] = actual_clock
+        proof = json.loads(Path(str(prefix) + '.1.pre.json').read_text())
+        self.assertEqual(proof['proof'], 'native_ready')
+        self.assertNotIn('caller', proof)
+        self.assertEqual(proof['deadline'], int(ready['deadline']))
+        self.wait(child, ledger, 'WATCH_READY', gen=1, phase='next')
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                 if x.startswith('LEDGER ') and ' gen=1 ' in x]
+        self.assertEqual(len(calls), 28)
+        publisher.join(2)
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(errors, [])
+        gate('post', 1)
+        proof = json.loads(Path(str(prefix) + '.1.post.json').read_text())
+        self.assertEqual(proof['proof'], 'publication_progress')
+        self.assertNotIn('count', proof)
+        physical_seen, instance_seen = threading.Event(), threading.Event()
+        # The publisher owns the original held identity. The negative mapping
+        # control below mutates the controller's separate serialized input.
+        gen2_exe = json.loads((ledger.parent / 'pins.json').read_text())['pins']['L2']['exe']
+        original_select = ns['select_gate']
+        def observe_gen2(rows, want, phase):
+            if errors:
+                raise AssertionError(f'controlled publisher failed: {errors!r}') from errors[0]
+            result = original_select(rows, want, phase)
+            if want['gen'] == 2 and phase == 'semantic' and any(r['kind'] == 'edge_observed'
+                    and r['event'].get('caller') == 'c2' for r in rows):
+                registered = any(r['kind'] == 'instance_observed' for r in rows)
+                child = any(r['kind'] == 'semantic_edge_observed' for r in rows)
+                if not registered or not child:
+                    if result is not None: errors.append(AssertionError('gen2 released before quiet S1 registration'))
+                    (instance_seen if registered else physical_seen).set()
+            return result
+        ns['select_gate'] = observe_gen2
+        def publish_quiet_gen2():
+            try:
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+                if stopped.is_set(): return
+                old = copy.deepcopy(edge['identity_context']['caller'])
+                old['lifecycle'] = 'exec_retired'
+                current = copy.deepcopy(old)
+                exe = gen2_exe
+                current.update(id='c2', incarnation=2, lifecycle='mapped')
+                current['executable'].update(path=exe['path'], ino=exe['ino'], dev=exe['dev'],
+                    mtime_secs=exe['mtime_ns'] // 1_000_000_000, mtime_nanos=exe['mtime_ns'] % 1_000_000_000)
+                append('caller_event', {'event': 'exec_retired', 'old': 'c1', 'new': 'c2',
+                    'identity_context': {'version': 1, 'old': old, 'new': current}})
+                edge.update(caller='c2')
+                edge['identity_context']['caller'] = current
+                append('edge_observed', edge)
+                append('pass_committed', {'pass': 4})
+                # Detailed registration is unavailable until the real original
+                # getter entry. The native semantic hold must finish that one
+                # call and prevent Initialize or any of the remaining37 calls.
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='semantic')
+                prefix_calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                                if x.startswith('LEDGER ') and ' gen=2 ' in x]
+                if len(prefix_calls) != 1 or prefix_calls[0]['fn'] != 'C_GetFunctionList':
+                    raise AssertionError('semantic hold did not preserve the one-getter prefix')
+                if prefix_calls[0]['n'] != '1' or prefix_calls[0]['bad'] != '0':
+                    raise AssertionError('original getter did not complete successfully once')
+                stamp = int(prefix_calls[0]['t0']) + 1
+                edge['entries'].update(count=1, first_seen_ns=stamp, last_seen_ns=time.monotonic_ns())
+                edge['entries']['coverage'].update(state='counted', since_ns=stamp, reason=None, lossy=False)
+                append('edge_observed', edge)
+                append('pass_committed', {'pass': 5})
+                for observed in (physical_seen, instance_seen):
+                    if not observed.wait(2):
+                        if stopped.is_set(): return
+                        raise AssertionError('controller did not inspect incomplete gen2 registration')
+                    if stopped.is_set(): return
+                    calls = [x for x in ledger.read_text().splitlines() if x.startswith('LEDGER ') and ' gen=2 ' in x]
+                    if len(calls) != 1:
+                        raise AssertionError('remaining gen2 APIs ran before quiet S1 readiness')
+                    now = time.monotonic_ns()
+                    if observed is physical_seen:
+                        append('instance_observed', {'id': 'i2', 'caller': 'c2', 'module': 'm0',
+                            'state': 'observed', 'reason': None, 'first_seen_ns': now, 'last_seen_ns': now})
+                    else:
+                        append('semantic_edge_observed', {'caller': 'c2', 'module': 'm0', 'instance': 'i2',
+                            'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
+                            'api_returns': {'count': None, 'historical_only_returns': 0,
+                                            'saturated': False, 'unit': 'api_returns'},
+                            'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
+                            'coverage': {'lossy': False, 'reasons': ['no_calls']}})
+                    append('pass_committed', {'pass': 6 if observed is physical_seen else 7})
+            except BaseException as error:
+                errors.append(error)
+        quiet_publisher = threading.Thread(target=publish_quiet_gen2)
+        original_read = Path.read_text
+        def publisher_read_guard(path, *args, **kwargs):
+            if path == ledger.parent / 'pins.json' and threading.current_thread() is quiet_publisher:
+                raise AssertionError('publisher consulted concurrently mutable controller pins')
+            return original_read(path, *args, **kwargs)
+        read_guard = mock.patch.object(Path, 'read_text', publisher_read_guard)
+        read_guard.start()
+        self.addCleanup(read_guard.stop)
+        quiet_publisher.start()
+        self.addCleanup(quiet_publisher.join, 5)
+        self.addCleanup(stopped.set)
+        if immediate_next:
+            # POST has just released .1.next. The original 300ms quiet gap
+            # still holds L; PRE must wait for real ledger2 readiness itself.
+            self.assertEqual(os.readlink(f'/proc/{child.pid}/exe'), str(self.driver))
+            self.assertFalse(any(x.startswith('WATCH_READY ') and ' gen=2 ' in x
+                                 for x in ledger.read_text().splitlines()))
+            gate('pre', 2)
+            self.assertEqual(os.readlink(f'/proc/{child.pid}/exe'), str(self.other))
+        else:
+            self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+            # The other executable's native PRE needs no imagined new public watch.
+            pins = ledger.parent / 'pins.json'
+            saved = pins.read_text()
+            wrong = json.loads(saved)
+            wrong['pins']['A']['provider']['ino'] += 1
+            pins.write_text(json.dumps(wrong))
+            with self.assertRaisesRegex(ValueError, 'provider code mapping'):
+                gate('pre', 2)
+            self.assertFalse(Path(str(prefix) + '.2.go').exists())
+            pins.write_text(saved)
+            gate('pre', 2)
+        proof = json.loads(Path(str(prefix) + '.2.pre.json').read_text())
+        self.assertEqual(proof['proof'], 'mapped_ready')
+        self.assertNotIn('instance', proof)
+        gate('semantic', 2)
+        proof = json.loads(Path(str(prefix) + '.2.semantic.json').read_text())
+        self.assertEqual(proof['proof'], 'quiet_ready')
+        self.assertEqual(proof['count'], 1)
+        self.assertEqual(proof['instance'], 'i2')
+        quiet_publisher.join(2)
+        self.assertFalse(quiet_publisher.is_alive())
+        self.assertEqual(errors, [])
+        self.wait(child, ledger, 'WATCH_READY', gen=2, phase='next')
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                 if x.startswith('LEDGER ') and ' gen=2 ' in x]
+        self.assertEqual(len(calls), 38)
+        edge['entries'].update(count=38, last_seen_ns=time.monotonic_ns())
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 8})
+        gate('post', 2)
+        proof = json.loads(Path(str(prefix) + '.2.post.json').read_text())
+        self.assertEqual((proof['proof'], proof['count']), ('bound_exact', 38))
+        self.assertEqual(child.wait(timeout=5), 0)
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
+        self.assertEqual([sum(x['gen'] == str(gen) and x['fn'] != 'C_GetFunctionList' for x in calls)
+                          for gen in range(4)], [17, 27, 37, 47])
+
+    def test_actual_embedded_controller_releases_only_after_current_watch_and_full_count(self):
+        child, _observer, prefix, ledger, _ns, edge, append, gate = self.controller_inputs()
+        gate('pre')
+        self.assertTrue(Path(str(prefix) + '.0.go').is_file())
+        self.wait(child, ledger, 'WATCH_READY', gen=0, phase='next')
+        self.assertNotIn(' gen=1 ', ledger.read_text())
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
+        edge['entries'].update(count=18, first_seen_ns=int(calls[0]['t0']) + 1,
+                               last_seen_ns=int(calls[-1]['t1']) + 1)
+        edge['entries']['coverage'].update(state='counted', lossy=False,
+                                            since_ns=int(calls[0]['t0']) + 1)
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 1})
+        gate('post')
+        self.assertTrue(Path(str(prefix) + '.0.next').is_file())
+        self.wait(child, ledger, 'WATCH_READY', gen=1, phase='go')
+        proof = json.loads(Path(str(prefix) + '.0.post.json').read_text())
+        self.assertEqual(proof['count'], 18)
+
+    def test_dead_publisher_cannot_release_a_buffered_watch(self):
+        _child, observer, prefix, ledger, _ns, _edge, _append, gate = self.controller_inputs()
+        observer.kill()
+        os.waitid(os.P_PID, observer.pid, os.WEXITED | os.WNOWAIT)
+        opened = len(os.listdir('/proc/self/fd'))
+        with self.assertRaises((ValueError, OSError)):
+            gate('pre')
+        self.assertEqual(len(os.listdir('/proc/self/fd')), opened, 'failed gate acquisition closes all its own FDs')
+        self.assertFalse(Path(str(prefix) + '.0.go').exists())
+        self.assertNotIn('LEDGER ', ledger.read_text())
+
+    def test_dead_actor_and_late_buffered_watch_cannot_create_gate(self):
+        for dead in (False, True):
+            with self.subTest(dead=dead):
+                child, _observer, prefix, ledger, ns, _edge, _append, gate = self.controller_inputs()
+                if dead:
+                    child.kill()
+                    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+                else:
+                    ns['monotonic_ns'] = lambda: 2 ** 63
+                with self.assertRaises((ValueError, OSError)):
+                    gate('pre')
+                self.assertFalse(Path(str(prefix) + '.0.go').exists())
+                self.assertNotIn('LEDGER ', ledger.read_text())
+
+
+class AttachDrainGateTests(unittest.TestCase):
+    """The capacity burst waits for the kernel attach backlog to drain."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.oracle = runpy.run_path(str(ORACLE))
+
+    def rows(self, *events):
+        return [{"at_ns": at_ns, "kind": kind, "event": event}
+                for at_ns, kind, event in events]
+
+    def test_two_passes_without_gaps_are_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "pass_committed", {"pass": 1}))
+        self.assertTrue(drained(rows))
+
+    def test_deferred_gap_after_last_pass_blocks(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        self.assertFalse(drained(rows))
+
+    def test_pass_after_deferred_gap_is_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "pass_committed", {"pass": 1}))
+        self.assertTrue(drained(rows))
+
+    def test_deferred_repeat_after_last_pass_blocks(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "gap_repeated", {"index": 4, "repeats": 2}))
+        self.assertFalse(drained(rows))
+
+    def test_failed_only_gaps_do_not_block(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "2 of 68 endpoints failed to attach (sticky, never retried)"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}))
+        self.assertTrue(drained(rows))
+
+    def test_final_pass_alone_is_not_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 3, "final": True}))
+        self.assertFalse(drained(rows))
+
+    def test_closeout_flush_repeats_are_not_backlog(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "pass_committed", {"pass": 1}),
+                         (40, "gap_repeated", {"index": 4, "repeats": 3}),
+                         (40, "ended", {}))
+        self.assertTrue(drained(rows))
+
+    def test_drained_stream_past_deadline_returns(self):
+        gate = self.oracle["wait_until_attach_drained"]
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "pass_committed", {"pass": 1}))
+        custody = mock.Mock()
+        gate(time.monotonic() - 1, lambda: rows, custody, None)
+        custody.checkpoint.assert_called()
+
+    def test_undrained_stream_past_deadline_raises(self):
+        gate = self.oracle["wait_until_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        with self.assertRaisesRegex(ValueError, "did not drain"):
+            gate(time.monotonic() - 1, lambda: rows, mock.Mock(), None)
+
+    def test_observer_exit_before_drain_raises(self):
+        gate = self.oracle["wait_until_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        observer = mock.Mock()
+        observer.poll.return_value = 1
+        with self.assertRaisesRegex(ValueError, "observer exited"):
+            gate(time.monotonic() + 60, lambda: rows, mock.Mock(), observer)
+
+
+def parse_native_row(line):
+    return dict(token.split("=", 1) for token in line.split()[1:])
+
+
+if __name__ == "__main__":
+    unittest.main()

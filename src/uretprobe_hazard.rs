@@ -31,6 +31,30 @@ use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope
 #[cfg(target_arch = "x86_64")]
 const NR_URETPROBE: u32 = 335;
 
+/// The self-probe's program: the cheapest-to-verify `uretprobe` program in
+/// the capture object (1,477 instructions, the fastest verification in the
+/// startup traces; `function_list_return` has fewer instructions at 1,434
+/// but verifies slower, and `p11_return` is 4,960 and the session verifies
+/// it again seconds later).
+///
+/// It must stay a `uretprobe`-section program: aya derives return-vs-entry
+/// attach from the ELF section, and only a real return trampoline
+/// exercises the hazard an entry probe would miss. It stays a real
+/// production return probe from the same object rather than a synthetic
+/// stand-in: attached to a real return under a deny-uretprobe filter, it
+/// exercises the identical kernel path, and with no entry ever recorded
+/// for the probe child it takes its export-state miss and returns 0, so
+/// the probe emits nothing. Which bytecode runs cannot move the verdict —
+/// the signal is the kernel's trampoline issuing the uretprobe syscall in
+/// the child's context — while the loader configuration stays the shared
+/// one a capture uses (J-DOSSIER#28), so load-success agreement is kept.
+/// The one narrowed case is fail-closed both ways: a kernel that verifies
+/// this program but rejects `p11_return` now yields a clean probe verdict
+/// followed by the session's detailed per-program load refusal, instead of
+/// a probe-`Unknown` refusal.
+#[cfg(target_arch = "x86_64")]
+const SELF_PROBE_PROGRAM: &str = "interface_list_return";
+
 /// What this kernel does with the uretprobe syscall when the target is filtered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KernelVerdict {
@@ -47,6 +71,12 @@ pub(crate) enum KernelVerdict {
     /// capture would be refused the same way at attach, so it is reported as
     /// what it is, and the uretprobe override cannot help.
     NotPermitted(String),
+    /// The embedded BPF object does not match this build (a stale or
+    /// mismatched object): the probe refused its own load, so the kernel
+    /// was never assessed — and no capture lane can work until the
+    /// observer is rebuilt. Never an unknown kernel, and never something
+    /// the override can accept.
+    FlavorMismatch(String),
 }
 
 /// The target's seccomp mode, as `/proc/<pid>/status` reports it.
@@ -79,50 +109,204 @@ pub(crate) enum Action {
     /// The self-probe was not permitted to load BPF: whatever the override
     /// says, nothing can attach. Carries the kernel's refusal.
     NotPermitted(String),
+    /// The embedded object does not match this build: nothing can attach
+    /// until the observer is rebuilt, whatever the override says. Carries
+    /// the gate's plain mismatch message.
+    FlavorMismatch(String),
+}
+
+/// Observer credentials are per-thread. A missing proc fact never makes two
+/// assessments reusable merely because both reads failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssessmentContext {
+    process: u32,
+    euid: u32,
+    egid: u32,
+    capabilities: Option<u64>,
+    user_namespace: Option<u64>,
+    seccomp: Option<SeccompMode>,
+    filters: Option<u64>,
+}
+
+impl AssessmentContext {
+    fn current() -> Self {
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok();
+        Self {
+            process: std::process::id(),
+            // SAFETY: credential queries have no preconditions.
+            euid: unsafe { libc::geteuid() },
+            // SAFETY: getegid has no preconditions and cannot fail.
+            egid: unsafe { libc::getegid() },
+            capabilities: status.as_deref().and_then(parse_cap_eff),
+            user_namespace: std::fs::read_link("/proc/thread-self/ns/user")
+                .ok()
+                .and_then(|path| parse_user_ns_link(&path.to_string_lossy())),
+            seccomp: status.as_deref().and_then(parse_seccomp_mode),
+            filters: status.as_deref().and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Seccomp_filters:")?.trim().parse().ok())
+            }),
+        }
+    }
+
+    fn reusable(&self) -> bool {
+        self.capabilities.is_some()
+            && self.user_namespace.is_some()
+            && self.seccomp.is_some()
+            && (self.seccomp != Some(SeccompMode::Filter) || self.filters.is_some())
+    }
+}
+
+#[derive(Default)]
+struct AssessmentCache(std::sync::Mutex<Option<AssessmentContext>>);
+
+impl AssessmentCache {
+    fn assess(
+        &self,
+        context: &AssessmentContext,
+        probe: impl FnOnce() -> KernelVerdict,
+    ) -> KernelVerdict {
+        let mut clean = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if context.reusable() && clean.as_ref() == Some(context) {
+            return KernelVerdict::Clean;
+        }
+        *clean = None;
+        let verdict = probe();
+        if verdict == KernelVerdict::Clean && context.reusable() {
+            *clean = Some(context.clone());
+        }
+        verdict
+    }
+}
+
+/// Authority for this capture's return links. An explicit risk acceptance is
+/// retained as such; it can never populate the positive kernel cache.
+#[derive(Debug, Clone)]
+pub(crate) struct ReturnProbeAdmission {
+    context: AssessmentContext,
+    override_reason: Option<String>,
+}
+
+impl ReturnProbeAdmission {
+    pub(crate) fn override_reason(&self) -> Option<&str> {
+        self.override_reason.as_deref()
+    }
+}
+
+pub(crate) fn admit(
+    target: Option<u32>,
+    overridden: bool,
+) -> std::result::Result<ReturnProbeAdmission, Action> {
+    let context = AssessmentContext::current();
+    let action = evaluate(target, overridden);
+    if context != AssessmentContext::current() {
+        return Err(Action::Refuse(
+            "observer credentials changed during return-probe safety assessment".into(),
+        ));
+    }
+    match action {
+        Action::Proceed => Ok(ReturnProbeAdmission {
+            context,
+            override_reason: None,
+        }),
+        Action::ProceedUnderOverride(reason) => Ok(ReturnProbeAdmission {
+            context,
+            override_reason: Some(reason),
+        }),
+        refusal => Err(refusal),
+    }
+}
+
+/// A shared Session backstop, checked once per link mutation, not per endpoint.
+/// A credential change needs a fresh assessment under the same explicit risk
+/// acceptance, if any; default Sessions never inherit another capture's override.
+pub(crate) fn ensure_admission(
+    retained: &mut Option<ReturnProbeAdmission>,
+) -> std::result::Result<(), Action> {
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        return Err(Action::FlavorMismatch(format!("{error:#}")));
+    }
+    let context = AssessmentContext::current();
+    ensure_admission_with(retained, context, |overridden| admit(None, overridden))
+}
+
+fn ensure_admission_with(
+    retained: &mut Option<ReturnProbeAdmission>,
+    context: AssessmentContext,
+    assess: impl FnOnce(bool) -> std::result::Result<ReturnProbeAdmission, Action>,
+) -> std::result::Result<(), Action> {
+    if retained
+        .as_ref()
+        .is_some_and(|admission| context.reusable() && admission.context == context)
+    {
+        return Ok(());
+    }
+    let overridden = retained
+        .as_ref()
+        .is_some_and(|admission| admission.override_reason.is_some());
+    *retained = Some(assess(overridden)?);
+    Ok(())
+}
+
+pub(crate) fn refusal_error(action: Action) -> anyhow::Error {
+    match action {
+        Action::Refuse(reason) => anyhow!(
+            "refusing to attach: {reason}. Capture on a kernel that exempts the trampoline \
+             (`p11scope doctor` shows this kernel's `uretprobe vs seccomp` verdict). \
+             The --allow-uretprobe-on-confined-target risk override is supported only by \
+             profile, trace and run"
+        ),
+        Action::NotPermitted(why) => {
+            anyhow!(not_permitted_message(&why, PrivilegeFacts::current()))
+        }
+        Action::FlavorMismatch(why) => anyhow!("{why}"),
+        _ => anyhow!("return-probe admission did not provide a refusal"),
+    }
 }
 
 /// The whole policy, in one pure function so it is testable without a kernel.
 ///
-/// Two facts decide it: whether this kernel filters the trampoline's syscall,
-/// and whether the target confines syscalls at all. Both must be true for the
-/// hazard to exist, so an ordinary unconfined target — the common case — is
-/// never refused however bad the kernel is.
+/// Admission depends on positive kernel evidence, not a seccomp snapshot.
+/// A sibling may already be filtered, or the target may install a filter
+/// after this check. The snapshot only explains an existing confinement.
 pub(crate) fn decide(
     kernel: &KernelVerdict,
     target: Option<SeccompMode>,
     overridden: bool,
 ) -> Action {
     let reason = match (kernel, target) {
+        // Not a verdict about the kernel at all: the embedded object does
+        // not match this build, so no capture lane can work whatever the
+        // target confines — and the override (which only accepts a hazard)
+        // must not be offered or taken.
+        (KernelVerdict::FlavorMismatch(why), _) => return Action::FlavorMismatch(why.clone()),
         // Nothing to fear: the kernel exempts the trampoline.
         (KernelVerdict::Clean, _) => return Action::Proceed,
-        // The target cannot refuse a syscall, so the trampoline cannot kill it.
-        (_, Some(mode)) if !mode.confines_syscalls() => return Action::Proceed,
         // Not a hazard verdict at all: this process may not load BPF, so the
         // override (which only accepts a hazard) must not be offered or taken.
         (KernelVerdict::NotPermitted(why), _) => return Action::NotPermitted(why.clone()),
-        (KernelVerdict::Affected(how), Some(_)) => format!(
+        (KernelVerdict::Affected(how), Some(mode)) if mode.confines_syscalls() => format!(
             "this kernel filters the uretprobe trampoline's syscall through seccomp (self-probe: \
              {how}) and the target confines syscalls, so attaching a uretprobe would kill it on \
              the first return and capture nothing"
         ),
-        (KernelVerdict::Affected(how), None) => format!(
+        (KernelVerdict::Affected(how), _) => format!(
             "this kernel filters the uretprobe trampoline's syscall through seccomp (self-probe: \
-             {how}) and the target cannot be shown unconfined (its seccomp mode could not be \
-             read, the scope's targets cannot be enumerated, or an owned run child may confine \
-             itself after attach), so attaching a uretprobe might kill it"
+             {how}) and a sibling thread may be confined or the target may install a filter \
+             after attach, so attaching a uretprobe might kill it"
         ),
-        (KernelVerdict::Unknown(why), Some(_)) => format!(
+        (KernelVerdict::Unknown(why), Some(mode)) if mode.confines_syscalls() => format!(
             "the target confines syscalls and this kernel could not be shown to exempt the \
              uretprobe trampoline's syscall ({why}), so attaching a uretprobe might kill it"
         ),
         // F-01: fail closed. An unproven kernel with a target that cannot be
         // shown unconfined is the widest blast radius under the weakest
         // protection; it used to proceed.
-        (KernelVerdict::Unknown(why), None) => format!(
+        (KernelVerdict::Unknown(why), _) => format!(
             "this kernel could not be shown to exempt the uretprobe trampoline's syscall \
-             ({why}) and the target cannot be shown unconfined (its seccomp mode could not \
-             be read, the scope's targets cannot be enumerated, or an owned run child may \
-             confine itself after attach), so attaching a uretprobe might kill it"
+             ({why}); a sibling thread may be confined or the target may install a \
+             filter after attach, so attaching a uretprobe might kill it"
         ),
     };
     if overridden {
@@ -189,17 +373,6 @@ pub(crate) extern "C" fn probe_point(seed: u64) -> u64 {
     std::hint::black_box(seed).wrapping_add(1)
 }
 
-/// Whether the expensive self-probe is worth running for this target.
-///
-/// A target that cannot refuse a syscall cannot be killed by the trampoline,
-/// so the common case — an ordinary unconfined process — never pays for the
-/// fork. `None` (a cgroup scope, or a target we could not read) does probe:
-/// there the blast radius is every process mapping the object, which is
-/// exactly when a wrong guess is worst.
-fn needs_kernel_probe(mode: Option<SeccompMode>) -> bool {
-    !matches!(mode, Some(mode) if !mode.confines_syscalls())
-}
-
 /// The hazard for one capture, cheapest check first.
 ///
 /// `target` is the single pid a `--pid` capture probes. `None` means the scope
@@ -208,8 +381,13 @@ fn needs_kernel_probe(mode: Option<SeccompMode>) -> bool {
 /// enumerated and must be treated as possibly confined — or an owned `run`
 /// child, which may confine itself after attach.
 pub(crate) fn evaluate(target: Option<u32>, overridden: bool) -> Action {
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        return Action::FlavorMismatch(format!("{error:#}"));
+    }
     let mode = target.and_then(target_seccomp_mode);
-    evaluate_mode(mode, overridden, probe_kernel)
+    static CLEAN: AssessmentCache = AssessmentCache(std::sync::Mutex::new(None));
+    let context = AssessmentContext::current();
+    evaluate_mode(mode, overridden, || CLEAN.assess(&context, probe_kernel))
 }
 
 /// The policy half of [`evaluate`], with the kernel verdict injected so the
@@ -221,9 +399,6 @@ fn evaluate_mode(
     overridden: bool,
     probe: impl FnOnce() -> KernelVerdict,
 ) -> Action {
-    if !needs_kernel_probe(mode) {
-        return Action::Proceed;
-    }
     decide(&probe(), mode, overridden)
 }
 
@@ -231,11 +406,14 @@ fn evaluate_mode(
 /// attach a real uretprobe to it, and see whether it survives its own return.
 ///
 /// The victim is a child of ours, so no target process is ever at risk of
-/// answering this question. `p11_return` is the probe program deliberately —
-/// it is the one that would kill a target, so the probe exercises the exact
-/// path it is protecting rather than a stand-in. With no entry ever recorded
-/// for the child it takes its `START.get` miss and returns 0, so the probe
-/// emits nothing into the ring.
+/// answering this question. The probe program is `SELF_PROBE_PROGRAM`,
+/// the cheapest-to-verify `uretprobe` program in the capture object: which bytecode
+/// runs cannot move the verdict — the signal is the kernel's return
+/// trampoline issuing the uretprobe syscall in the child's context, and any
+/// attached return probe exercises that path — while `p11_return` would
+/// cost a second full verification the session repeats seconds later. With
+/// no entry ever recorded for the child it takes its export-state miss and
+/// returns 0, so the probe emits nothing into the ring.
 ///
 /// Every failure is `Unknown`, never `Clean`: this exists to prevent an
 /// irreversible harm to someone else's process, so silence is not consent.
@@ -243,6 +421,12 @@ fn evaluate_mode(
 /// The probe then needs nothing from the attach path, runs before a session
 /// exists, and cannot leave a link or a stray event behind in one.
 pub(crate) fn probe_kernel() -> KernelVerdict {
+    // The flavor gate first, as its own verdict: a stale or mismatched
+    // embedded object is a broken observer build, not an unknown kernel.
+    // The load is still refused; only the report changes.
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        return KernelVerdict::FlavorMismatch(format!("{error:#}"));
+    }
     match probe_kernel_inner() {
         Ok(verdict) => verdict,
         Err(error) => classify_probe_error(&error),
@@ -268,10 +452,18 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
         })
     };
     let attaching = error.to_string() == SELF_PROBE_ATTACH_CONTEXT;
+    // A refused program load carries the kernel's whole verifier log, and
+    // the verdict reaches stderr and doctor as a plain string no later seam
+    // can bound — so a load refusal routes through the shared bounded
+    // formatter. Any other failure is small and keeps its text.
+    let why = match crate::attach::summarize_load_refusal_for_stderr(error) {
+        Some(summary) => summary,
+        None => format!("{error:#}"),
+    };
     if errno(libc::EPERM) || (attaching && errno(libc::EACCES)) {
-        KernelVerdict::NotPermitted(format!("{error:#}"))
+        KernelVerdict::NotPermitted(why)
     } else {
-        KernelVerdict::Unknown(format!("{error:#}"))
+        KernelVerdict::Unknown(why)
     }
 }
 
@@ -447,6 +639,10 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
 
 #[cfg(target_arch = "x86_64")]
 fn probe_kernel_inner() -> Result<KernelVerdict> {
+    // The self-probe attaches, so it holds the embedded-flavor gate itself
+    // (one cached read) instead of trusting every caller to check first; a
+    // stale or mismatched object refuses here, before any load.
+    crate::attach::checked_embedded_flavor()?;
     // Loaded exactly as a capture loads it (J-DOSSIER#28), at the default
     // ring sizes of a `--pid` capture.
     let btf = aya::Btf::from_sys_fs().context("loading required vmlinux BTF")?;
@@ -458,11 +654,13 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
     .context("loading the BPF object")?;
     {
         let program: &mut UProbe = ebpf
-            .program_mut("p11_return")
-            .context("program p11_return missing from the BPF object")?
+            .program_mut(SELF_PROBE_PROGRAM)
+            .with_context(|| format!("program {SELF_PROBE_PROGRAM} missing from the BPF object"))?
             .try_into()
             .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?;
-        program.load().context("loading p11_return")?;
+        program
+            .load()
+            .with_context(|| format!("loading {SELF_PROBE_PROGRAM}"))?;
     }
     let ebpf = &mut ebpf;
     let offset = own_text_file_offset(probe_point as *const () as usize as u64)
@@ -540,8 +738,8 @@ fn probe_parent(
     }
 
     let program: &mut UProbe = ebpf
-        .program_mut("p11_return")
-        .context("program p11_return missing from the BPF object")?
+        .program_mut(SELF_PROBE_PROGRAM)
+        .with_context(|| format!("program {SELF_PROBE_PROGRAM} missing from the BPF object"))?
         .try_into()
         .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?;
     let point = UProbeAttachPoint {
@@ -750,12 +948,14 @@ fn describe_owned_child_death_with(
                 ". This kernel exempts the uretprobe trampoline from seccomp, so p11scope's \
                  uretprobes are not the cause",
             ),
-            KernelVerdict::Unknown(why) | KernelVerdict::NotPermitted(why) => {
-                message.push_str(&format!(
-                    ". Whether this kernel filters the uretprobe trampoline could not be \
+            // A broken build never assessed the kernel either (unreachable: a
+            // mismatch attaches nothing, so this arm only keeps the match total).
+            KernelVerdict::Unknown(why)
+            | KernelVerdict::NotPermitted(why)
+            | KernelVerdict::FlavorMismatch(why) => message.push_str(&format!(
+                ". Whether this kernel filters the uretprobe trampoline could not be \
                      established ({why}), so p11scope's uretprobes cannot be ruled out"
-                ))
-            }
+            )),
         }
     }
     Some(message)
@@ -770,6 +970,184 @@ pub(crate) fn describe_owned_child_death(exit_code: i32, attached_probes: usize)
 mod tests {
     use super::*;
 
+    fn assessment_context() -> AssessmentContext {
+        AssessmentContext {
+            process: 7,
+            euid: 1000,
+            egid: 1000,
+            capabilities: Some(0),
+            user_namespace: Some(42),
+            seccomp: Some(SeccompMode::Disabled),
+            filters: Some(0),
+        }
+    }
+
+    #[test]
+    fn only_clean_assessments_are_reused_in_the_same_credential_context() {
+        let cache = AssessmentCache::default();
+        let context = assessment_context();
+        let calls = std::cell::Cell::new(0);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            KernelVerdict::Clean
+        };
+        assert_eq!(cache.assess(&context, probe), KernelVerdict::Clean);
+        assert_eq!(
+            cache.assess(&context, || panic!("one positive probe")),
+            KernelVerdict::Clean
+        );
+        assert_eq!(calls.get(), 1);
+        for field in 0..7 {
+            let mut changed = context.clone();
+            match field {
+                0 => changed.process += 1,
+                1 => changed.euid += 1,
+                2 => changed.egid += 1,
+                3 => changed.capabilities = Some(1),
+                4 => changed.user_namespace = Some(43),
+                5 => changed.seccomp = Some(SeccompMode::Filter),
+                _ => changed.filters = Some(1),
+            }
+            assert!(matches!(
+                cache.assess(&changed, || KernelVerdict::Unknown("changed".into())),
+                KernelVerdict::Unknown(_)
+            ));
+            assert_eq!(cache.assess(&context, probe), KernelVerdict::Clean);
+        }
+        assert_eq!(calls.get(), 8);
+    }
+
+    #[test]
+    fn failed_or_unreadable_assessments_never_become_a_cached_positive() {
+        for verdict in [
+            KernelVerdict::Affected("filtered"),
+            KernelVerdict::Unknown("unreadable".into()),
+            KernelVerdict::NotPermitted("denied".into()),
+            KernelVerdict::FlavorMismatch("stale".into()),
+        ] {
+            let cache = AssessmentCache::default();
+            let context = assessment_context();
+            for _ in 0..2 {
+                assert_eq!(cache.assess(&context, || verdict.clone()), verdict);
+            }
+            assert!(cache.0.lock().unwrap().is_none());
+        }
+        for field in 0..3 {
+            let cache = AssessmentCache::default();
+            let mut context = assessment_context();
+            match field {
+                0 => context.capabilities = None,
+                1 => context.user_namespace = None,
+                _ => {
+                    context.seccomp = Some(SeccompMode::Filter);
+                    context.filters = None;
+                }
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.assess(&context, || KernelVerdict::Clean),
+                    KernelVerdict::Clean
+                );
+                assert!(cache.0.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_admission_rechecks_context_and_never_inherits_an_override() {
+        let context = assessment_context();
+        for reason in [None, Some("explicitly accepted risk".to_string())] {
+            let mut admission = Some(ReturnProbeAdmission {
+                context: context.clone(),
+                override_reason: reason.clone(),
+            });
+            ensure_admission_with(&mut admission, context.clone(), |_| panic!("retained fact"))
+                .unwrap();
+            let mut changed = context.clone();
+            changed.capabilities = Some(1);
+            let calls = std::cell::Cell::new(0);
+            let result = ensure_admission_with(&mut admission, changed, |overridden| {
+                calls.set(calls.get() + 1);
+                assert_eq!(overridden, reason.is_some());
+                Err(Action::NotPermitted("changed privilege".into()))
+            });
+            assert!(matches!(result, Err(Action::NotPermitted(_))));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(admission.unwrap().override_reason, reason);
+        }
+        let mut absent = None;
+        assert!(
+            ensure_admission_with(&mut absent, context, |overridden| {
+                assert!(
+                    !overridden,
+                    "another capture's override is not kernel evidence"
+                );
+                Err(Action::Refuse("unsafe".into()))
+            })
+            .is_err()
+        );
+        assert!(absent.is_none());
+    }
+
+    #[test]
+    fn override_guidance_names_only_commands_that_accept_the_existing_flag() {
+        let message = refusal_error(Action::Refuse("unproven kernel".into())).to_string();
+        assert!(message.contains("supported only by profile, trace and run"));
+        assert!(message.contains("p11scope doctor"));
+        assert!(message.contains("--allow-uretprobe-on-confined-target"));
+    }
+
+    #[test]
+    fn a_disabled_snapshot_still_requires_the_kernel_assessment() {
+        for kernel in [
+            KernelVerdict::Affected("filtered return"),
+            KernelVerdict::Unknown("probe unavailable".into()),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let action = evaluate_mode(Some(SeccompMode::Disabled), false, || {
+                calls.set(calls.get() + 1);
+                kernel.clone()
+            });
+            assert_eq!(calls.get(), 1, "leader status cannot bypass the probe");
+            assert!(matches!(action, Action::Refuse(_)), "{action:?}");
+            assert!(matches!(
+                decide(&kernel, Some(SeccompMode::Disabled), false),
+                Action::Refuse(_)
+            ));
+            assert!(matches!(
+                decide(&kernel, Some(SeccompMode::Disabled), true),
+                Action::ProceedUnderOverride(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn every_snapshot_keeps_assessment_failures_non_overridable() {
+        for mode in [
+            Some(SeccompMode::Disabled),
+            Some(SeccompMode::Strict),
+            Some(SeccompMode::Filter),
+            None,
+        ] {
+            for overridden in [false, true] {
+                for kernel in [
+                    KernelVerdict::NotPermitted("denied".into()),
+                    KernelVerdict::FlavorMismatch("stale object".into()),
+                ] {
+                    let action = evaluate_mode(mode, overridden, || kernel.clone());
+                    assert!(
+                        matches!(
+                            (kernel, action),
+                            (KernelVerdict::NotPermitted(_), Action::NotPermitted(_))
+                                | (KernelVerdict::FlavorMismatch(_), Action::FlavorMismatch(_))
+                        ),
+                        "{mode:?}, override={overridden}"
+                    );
+                }
+            }
+        }
+    }
+
     fn io_chain(errno: libc::c_int, context: &str) -> anyhow::Error {
         anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
             .context("map error: failed to create map `STATS`")
@@ -781,44 +1159,311 @@ mod tests {
     /// ring sizes) — so its verdict is about the same load, not a bare one.
     #[test]
     fn the_self_probe_and_the_capture_share_one_object_loader() {
-        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+        fn body<'a>(
+            source: &'a str,
+            signature: &str,
+            end: &str,
+        ) -> std::result::Result<&'a str, String> {
             source
+                .split_once(signature)
+                .ok_or_else(|| format!("{signature} not found"))?
+                .1
+                .split_once(end)
+                .map(|(body, _)| body)
+                .ok_or_else(|| format!("{signature} body end not found"))
+        }
+
+        fn require(body: &str, markers: &[&str], role: &str) -> std::result::Result<(), String> {
+            for marker in markers {
+                if !body.contains(marker) {
+                    return Err(format!("{role} lacks {marker}"));
+                }
+            }
+            if body.contains("EbpfLoader") {
+                return Err(format!("{role} configures a second loader"));
+            }
+            Ok(())
+        }
+
+        fn contract(probe_source: &str, attach: &str) -> std::result::Result<(), String> {
+            require(
+                body(
+                    probe_source,
+                    "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+                    "\n}\n",
+                )?,
+                &[
+                    "crate::attach::load_capture_object(",
+                    "Btf::from_sys_fs()",
+                    "resolve_ring_bytes(None)",
+                ],
+                "self-probe",
+            )?;
+            require(
+                body(attach, "    fn start_inner(", "\n    }\n")?,
+                &["Self::prepare_inner_unlinked("],
+                "capture preparation",
+            )?;
+            require(
+                body(attach, "    fn prepare_inner_unlinked(", "\n    }\n")?,
+                &[
+                    "Self::prepare_inner_unlinked_with_object(",
+                    "            None,",
+                ],
+                "ordinary preparation",
+            )?;
+            require(
+                body(
+                    attach,
+                    "    fn prepare_inner_unlinked_with_object(",
+                    "\n    }\n",
+                )?,
+                &[
+                    "host_btf::shared()",
+                    "let mut ebpf = load_capture_object_bytes_with_images(",
+                    "host.btf()",
+                    "crate::run::resolve_ring_bytes(ring_bytes)",
+                    "discovery_ring_bytes(scope)",
+                    "policy.wants_instance_hooks()",
+                    ".map_or(crate::EBPF_OBJECT, |prepared| prepared.object)",
+                ],
+                "shared preparation",
+            )?;
+            require(
+                body(attach, "pub(crate) fn load_capture_object(", "\n}\n")?,
+                &["load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)"],
+                "self-probe wrapper",
+            )?;
+            require(
+                body(attach, "fn load_capture_object_with_images(", "\n}\n")?,
+                &[
+                    "load_capture_object_bytes_with_images(",
+                    "        btf,\n        events_bytes,\n        discovery_bytes,\n        full_images,\n        crate::EBPF_OBJECT,",
+                ],
+                "embedded-object wrapper",
+            )?;
+            let shared = body(attach, "fn load_capture_object_bytes_with_images(", "\n}\n")?;
+            for setting in [
+                "EbpfLoader::new()",
+                ".btf(Some(btf))",
+                ".allow_unsupported_maps()",
+                ".map_max_entries(\"EVENTS\", events_bytes)",
+                ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
+                ".map_max_entries(\"IMAGE_CONTINUITY\", if full_images { 16_384 } else { 1 })",
+                ".map_max_entries(\"IMAGE_TGID_INDEX\", if full_images { 16_384 } else { 1 })",
+                ".map_max_entries(\"IMAGE_QUERY_REQUESTS\", if full_images { 1_024 } else { 1 })",
+                ".load(object)",
+            ] {
+                if !shared.contains(setting) {
+                    return Err(format!("common loader lacks {setting}"));
+                }
+            }
+            Ok(())
+        }
+
+        let probe = include_str!("uretprobe_hazard.rs");
+        let attach = include_str!("attach.rs");
+        contract(probe, attach).unwrap();
+        let bare_probe = probe.replacen(
+            "crate::attach::load_capture_object(",
+            "bare_probe_object(",
+            1,
+        );
+        assert_ne!(bare_probe, probe);
+        assert!(
+            contract(&bare_probe, attach)
+                .unwrap_err()
+                .contains("self-probe")
+        );
+        for (original, replacement, role) in [
+            (
+                "let mut ebpf = load_capture_object_bytes_with_images(",
+                "let mut ebpf = bare_capture_object(",
+                "shared preparation",
+            ),
+            (
+                "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)",
+                "bare_probe_object(btf)",
+                "self-probe wrapper",
+            ),
+            (
+                ".map_or(crate::EBPF_OBJECT, |prepared| prepared.object)",
+                ".map_or(other_object, |prepared| prepared.object)",
+                "shared preparation",
+            ),
+            (
+                ".map_max_entries(\"EVENTS\", events_bytes)",
+                ".map_max_entries(\"EVENTS\", 1)",
+                "common loader",
+            ),
+        ] {
+            let mutant = attach.replacen(original, replacement, 1);
+            assert_ne!(mutant, attach, "{role} mutation changes production source");
+            let error = contract(probe, &mutant).expect_err("the changed path must be rejected");
+            assert!(error.contains(role), "{role}: {error}");
+        }
+    }
+
+    /// The self-probe must not re-verify the capture's most expensive
+    /// program: `p11_return` (4,960 instructions) is verified again by the
+    /// session seconds later, so the probe loads a cheap production return
+    /// probe through the same shared loader instead. Both the load site
+    /// and the attach site name that one program through
+    /// `SELF_PROBE_PROGRAM`: a mismatch would attach a program the probe
+    /// never loaded. Fails while either site names `p11_return`.
+    #[test]
+    fn the_self_probe_verifies_a_cheap_return_probe_not_p11_return() {
+        let source = include_str!("uretprobe_hazard.rs");
+        for (signature, role) in [
+            (
+                "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+                "load site",
+            ),
+            ("fn probe_parent(", "attach site"),
+        ] {
+            let body = source
                 .split_once(signature)
                 .unwrap_or_else(|| panic!("{signature} not found"))
                 .1
                 .split_once("\n}\n")
-                .unwrap()
-                .0
+                .unwrap_or_else(|| panic!("{signature} body end not found"))
+                .0;
+            assert!(
+                !body.contains("\"p11_return\""),
+                "the self-probe {role} must not name p11_return"
+            );
+            assert!(
+                body.contains("SELF_PROBE_PROGRAM"),
+                "the self-probe {role} must name SELF_PROBE_PROGRAM"
+            );
         }
-        let loader = "crate::attach::load_capture_object(";
-        let probe = body(
-            include_str!("uretprobe_hazard.rs"),
-            "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
-        );
-        assert!(probe.contains(loader), "the self-probe loads bare");
-        assert!(probe.contains("Btf::from_sys_fs()"));
-        assert!(probe.contains("resolve_ring_bytes(None)"));
+    }
+
+    /// `SELF_PROBE_PROGRAM` must name a real `uretprobe`-section program
+    /// in the embedded object: aya derives return-vs-entry attach from the
+    /// ELF section, and only a real return trampoline exercises the hazard
+    /// an entry probe would miss. Parses the embedded bytes without
+    /// privilege. The negative controls keep the check honest: a present
+    /// entry program must not match, and a bogus name must be absent.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_self_probe_program_is_a_return_probe_in_the_object() {
+        let object = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("embedded object parses");
+        let program = object
+            .programs
+            .get(SELF_PROBE_PROGRAM)
+            .unwrap_or_else(|| panic!("{SELF_PROBE_PROGRAM} is present in the object"));
         assert!(
-            !probe.contains("EbpfLoader"),
-            "a second loader configuration"
+            matches!(program.section, aya_obj::ProgramSection::URetProbe { .. }),
+            "{SELF_PROBE_PROGRAM} must be a uretprobe-section program: {:?}",
+            program.section
         );
-        let attach = include_str!("attach.rs");
-        let capture = body(attach, "    fn start_inner(");
-        assert!(capture.contains("load_capture_object("));
+        let entry = object
+            .programs
+            .get("p11_entry")
+            .expect("the entry control is present in the object");
         assert!(
-            !capture.contains("EbpfLoader"),
-            "a second loader configuration"
+            !matches!(entry.section, aya_obj::ProgramSection::URetProbe { .. }),
+            "the control must stay entry-kind: {:?}",
+            entry.section
         );
-        let shared = body(attach, "pub(crate) fn load_capture_object(");
-        for setting in [
-            ".btf(Some(btf))",
-            ".allow_unsupported_maps()",
-            ".map_max_entries(\"EVENTS\", events_bytes)",
-            ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
-            ".load(crate::EBPF_OBJECT)",
+        assert!(
+            !object.programs.contains_key("no_such_probe_program"),
+            "a bogus name must be absent from the object"
+        );
+    }
+
+    /// S4: the self-probe attaches, so it holds the embedded-flavor gate
+    /// itself instead of trusting every caller to check first. A planted
+    /// mismatch refuses with the same message capture setup refuses with,
+    /// before any load — which is also what makes this twin pass
+    /// unprivileged. Fails while the gate lives only at call sites.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_self_probe_refuses_a_flavor_mismatch_before_loading() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let expected = format!(
+            "{:#}",
+            crate::attach::checked_embedded_flavor().unwrap_err()
+        );
+        assert!(expected.contains("stale or mismatched"), "{expected}");
+        let error = probe_kernel_inner().unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(
+            message, expected,
+            "the self-probe must refuse with the gate's message"
+        );
+    }
+
+    /// Positive control for the self-probe gate: agreeing flavors proceed
+    /// past it, so whatever the probe reports (a verdict, or a downstream
+    /// load failure without privilege) never names a flavor mismatch.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_self_probe_passes_the_gate_when_flavors_agree() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        match probe_kernel_inner() {
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    !message.contains("stale or mismatched"),
+                    "agreeing flavors must pass the gate: {message}"
+                );
+            }
+        }
+    }
+
+    /// A flavor mismatch refuses whatever the target confines and whatever
+    /// the override says: the build is broken, so there is no hazard to
+    /// accept. (The preflight twin failed first on the same behavior; this
+    /// pins the policy matrix directly.)
+    #[test]
+    fn a_flavor_mismatch_refuses_whatever_the_target_or_override() {
+        let mismatch =
+            KernelVerdict::FlavorMismatch("embedded BPF object flavor mismatch: test".to_string());
+        for target in [
+            Some(SeccompMode::Disabled),
+            Some(SeccompMode::Strict),
+            Some(SeccompMode::Filter),
+            None,
         ] {
-            assert!(shared.contains(setting), "{setting}");
+            for overridden in [false, true] {
+                assert!(
+                    matches!(
+                        decide(&mismatch, target, overridden),
+                        Action::FlavorMismatch(_)
+                    ),
+                    "{target:?} overridden={overridden}"
+                );
+            }
         }
+    }
+
+    /// `probe_kernel` reports a flavor mismatch as itself, not as an
+    /// unknown kernel: the load is still refused, but the verdict names
+    /// the broken build. Fails while every gate error classifies as
+    /// `Unknown`.
+    #[test]
+    fn probe_kernel_reports_a_flavor_mismatch_plainly() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let verdict = probe_kernel();
+        let text = format!("{verdict:?}");
+        assert!(text.contains("FlavorMismatch"), "{text}");
+        assert!(text.contains("stale or mismatched"), "{text}");
+        assert!(!text.contains("Unknown"), "{text}");
     }
 
     /// HIGH-1: EPERM from loading the probe's BPF, or EACCES from its uprobe
@@ -847,6 +1492,83 @@ mod tests {
         }
     }
 
+    /// A refused self-probe program load must not dump the verifier log
+    /// into the verdict: the self-probe loads a real Detailed return
+    /// probe, and the verdict reaches stderr and doctor as a plain string
+    /// no later seam can bound. The verdict routes through the same
+    /// bounded formatter the attach seam uses. Fails while the verdict
+    /// formats the whole chain (~300 KB).
+    #[test]
+    fn a_refused_self_probe_load_binds_the_verdict_to_the_shared_bound() {
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        assert_eq!(log.len(), 300 * 1024);
+        let error = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new(log),
+        })
+        .context("loading p11_return");
+        let verdict = classify_probe_error(&error);
+        let KernelVerdict::Unknown(why) = verdict else {
+            panic!("a verifier E2BIG is an unknown kernel, not a privilege fact: {verdict:?}");
+        };
+        assert!(
+            why.len() <= 1024,
+            "verdict must stay bounded: {} bytes",
+            why.len()
+        );
+        assert!(why.contains(r#"program "p11_return" refused"#), "{why}");
+        assert!(why.contains("E2BIG (os error 7)"), "{why}");
+        assert!(why.contains("TAIL-MARKER"), "{why}");
+        assert!(why.contains("307200 verifier-log bytes"), "{why}");
+        assert!(
+            !why.contains(&"f".repeat(1024)),
+            "the raw log must not survive classification"
+        );
+    }
+
+    /// The same bound on the not-permitted arm: a permission load refusal
+    /// with a long log stays a privilege fact, but a bounded one. Fails
+    /// while that arm formats the whole chain.
+    #[test]
+    fn a_forbidden_self_probe_load_binds_the_verdict_to_the_shared_bound() {
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        assert_eq!(log.len(), 300 * 1024);
+        let error = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+            verifier_log: aya_obj::VerifierLog::new(log),
+        })
+        .context("loading p11_return");
+        let verdict = classify_probe_error(&error);
+        let KernelVerdict::NotPermitted(why) = verdict else {
+            panic!("an EPERM load refusal stays not-permitted: {verdict:?}");
+        };
+        assert!(
+            why.len() <= 1024,
+            "verdict must stay bounded: {} bytes",
+            why.len()
+        );
+        assert!(why.contains(r#"program "p11_return" refused"#), "{why}");
+        assert!(why.contains("EPERM (os error 1)"), "{why}");
+        assert!(why.contains("307200 verifier-log bytes"), "{why}");
+        assert!(
+            !why.contains(&"f".repeat(1024)),
+            "the raw log must not survive classification"
+        );
+    }
+
+    /// A small non-load self-probe failure keeps its text verbatim: only a
+    /// genuine program-load refusal is summarized.
+    #[test]
+    fn a_small_self_probe_failure_keeps_its_text_verbatim() {
+        let error = io_chain(libc::EINVAL, "loading the BPF object");
+        let expected = format!("{error:#}");
+        let verdict = classify_probe_error(&error);
+        let KernelVerdict::Unknown(why) = verdict else {
+            panic!("an EINVAL load failure stays an unknown kernel: {verdict:?}");
+        };
+        assert_eq!(why, expected);
+    }
+
     /// A not-permitted self-probe is never a hazard verdict and never
     /// something the override can accept, for any target that needed it.
     #[test]
@@ -863,7 +1585,7 @@ mod tests {
         }
         assert_eq!(
             decide(&refused, Some(SeccompMode::Disabled), false),
-            Action::Proceed
+            Action::NotPermitted("Operation not permitted".to_string())
         );
     }
 
@@ -1080,14 +1802,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfined_target_is_never_refused_however_bad_the_kernel_is() {
+    fn an_unconfined_snapshot_does_not_make_a_bad_kernel_safe() {
         for kernel in [
             KernelVerdict::Affected("test"),
             KernelVerdict::Unknown("test".to_string()),
         ] {
-            assert_eq!(
-                decide(&kernel, Some(SeccompMode::Disabled), false),
-                Action::Proceed,
+            assert!(
+                matches!(
+                    decide(&kernel, Some(SeccompMode::Disabled), false),
+                    Action::Refuse(_)
+                ),
                 "{kernel:?}"
             );
         }
@@ -1121,12 +1845,10 @@ mod tests {
         ));
     }
 
-    /// An unknown verdict is not a clean one: it refuses a confined target
-    /// and anything that cannot be shown unconfined. Only a positively
-    /// unconfined target escapes it, so a failed self-probe cannot break
-    /// ordinary captures but can never silently authorize a risky one.
+    /// No current target snapshot can establish future thread/filter state.
+    /// An unknown kernel therefore refuses every snapshot by default.
     #[test]
-    fn an_unprovable_kernel_refuses_everything_but_an_unconfined_target() {
+    fn an_unprovable_kernel_refuses_every_target_snapshot() {
         let unknown = KernelVerdict::Unknown("fork failed".to_string());
         for target in [Some(SeccompMode::Strict), Some(SeccompMode::Filter), None] {
             assert!(
@@ -1134,10 +1856,10 @@ mod tests {
                 "{target:?} must be refused"
             );
         }
-        assert_eq!(
+        assert!(matches!(
             decide(&unknown, Some(SeccompMode::Disabled), false),
-            Action::Proceed
-        );
+            Action::Refuse(_)
+        ));
     }
 
     /// F-01: an Unknown kernel with an unspecified target (`--cgroup` /
@@ -1171,11 +1893,11 @@ mod tests {
             (&KernelVerdict::Clean, Some(SeccompMode::Strict), false),
             (&KernelVerdict::Clean, Some(SeccompMode::Filter), false),
             (&KernelVerdict::Clean, None, false),
-            (&affected, Some(SeccompMode::Disabled), false),
+            (&affected, Some(SeccompMode::Disabled), true),
             (&affected, Some(SeccompMode::Strict), true),
             (&affected, Some(SeccompMode::Filter), true),
             (&affected, None, true),
-            (&unknown, Some(SeccompMode::Disabled), false),
+            (&unknown, Some(SeccompMode::Disabled), true),
             (&unknown, Some(SeccompMode::Strict), true),
             (&unknown, Some(SeccompMode::Filter), true),
             (&unknown, None, true),
@@ -1223,18 +1945,6 @@ mod tests {
         );
     }
 
-    /// The ordering promise: an ordinary target never pays for the fork.
-    #[test]
-    fn only_a_confined_or_unknown_target_is_worth_probing_the_kernel_for() {
-        assert!(!needs_kernel_probe(Some(SeccompMode::Disabled)));
-        assert!(needs_kernel_probe(Some(SeccompMode::Filter)));
-        assert!(needs_kernel_probe(Some(SeccompMode::Strict)));
-        assert!(
-            needs_kernel_probe(None),
-            "a scope whose targets cannot be enumerated must still be probed"
-        );
-    }
-
     /// A pid with no readable status is not unconfined: it feeds the
     /// fail-closed `None` arm, never a guessed mode.
     #[test]
@@ -1274,18 +1984,6 @@ mod tests {
             panic!("the override must convert the refusal");
         };
         assert_eq!(refused, warned, "the override must not soften the reason");
-    }
-
-    /// The probe is only consulted when the target side needs it: an
-    /// unconfined target proceeds without forking anything.
-    #[test]
-    fn an_unconfined_target_never_pays_for_the_fork() {
-        assert_eq!(
-            evaluate_mode(Some(SeccompMode::Disabled), false, || panic!(
-                "an unconfined target must not probe the kernel"
-            )),
-            Action::Proceed
-        );
     }
 
     #[test]

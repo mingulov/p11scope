@@ -1,0 +1,1932 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Oracle mutations and genuine fd controls, never installed acceptance."""
+import copy
+import fcntl
+import hashlib
+import io
+import json
+import os
+import subprocess
+import struct
+import tempfile
+import threading
+import sys
+import time
+from pathlib import Path
+import runpy
+import select
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+ORACLE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/oracle.py'))
+HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-operator-output.py'))
+DEMOTION = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-demotion.py'))
+WRAP = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-diagnostics-wrap.py'))
+
+
+def _warm_symbol_tool(path=None):
+    """Best-effort page-cache warmup for the probe's nm; test-only.
+
+    Runs the real symbol tool once over a real ELF input so its libraries
+    are resident before any timed use. A full run over a file (not
+    --version) is required: only that loads the plugin chain. Any failure
+    is ignored: a missed warmup only leaves later runs as cold as today.
+    """
+    if path is None:
+        path = sys.executable or '/bin/true'
+    if not Path(path).is_file():
+        return
+    try:
+        subprocess.run(['nm', '--demangle=rust', '--defined-only', '--format=posix', path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+try:
+    _warm_symbol_tool()
+except Exception:
+    pass
+
+
+def fixture():
+    ledger = [dict(kind='call', pid=123, tid=123, fn='C_GenerateRandom', rv=0,
+                   phase='e17', image=0, scope='selected', t0=200 + i, t1=201 + i) for i in range(3)]
+    receipt = dict(issued_calls=3, pid=123, ready_ns=100, workload_complete_ns=300,
+                   observer_rc=0, sink='file', cancel='none', source_revision='a' * 40,
+                   cleanup_seconds=0.3, terminal_observed_alive=False,
+                   ring_requested='4K', ring_actual_bytes=4096,
+                   signals=[], cancellation_ack_ns=None, stdout_stalled=False,
+                   trace_file_error=None, watchdog=False)
+    image = dict(kind='image', image=0, pid=123, start_time=9, path='/owned/caller',
+                 dev=1, ino=2, mtime_ns=3, pid_namespace=4, time_namespace=5)
+    provider = dict(dev=[8, 1], ino=42, sha256='b' * 64,
+                    mapping=dict(dev=[8, 1], ino=42), file_identity=dict(size=4096))
+    receipt.update(image=dict(image), provider_before=copy.deepcopy(provider),
+                   provider_after=copy.deepcopy(provider))
+    ledger = [image, dict(kind='target', image=0, fn='C_GenerateRandom',
+                         dev=[8, 1], ino=42, file_offset=32),
+              dict(kind='ready', image=0, t=50), *ledger,
+              dict(kind='ack', image=0, phase='e17', t=250)]
+    evidence = dict(event_loss=0, malformed_records=0, unmatched_returns=0,
+                    scheduling=dict(sink_dropped_bytes=0, sink_timeouts=0))
+    counts = dict(stats_entered=3, stats_returned=3, raw_calls=3)
+    return ledger, receipt, evidence, counts
+
+
+def render(counts, evidence, rows=3):
+    text = ''.join('12:00:00.000001 Unknown executable (PID 123, TID 123) '
+                   'C_GenerateRandom → CKR_OK 1µs\n' for _ in range(rows))
+    return (text + (f"LOST {evidence['event_loss']} events\n" if evidence['event_loss'] else '') + 'COUNT_EVIDENCE ' + json.dumps(counts) + '\nEVIDENCE '
+            + json.dumps(evidence) + '\n').encode()
+
+
+def wait_task_sleep(pid, tid, seconds=5):
+    """Wait until a test thread is actually asleep, then let it settle."""
+    deadline = time.monotonic() + seconds
+    while True:
+        state = Path(f'/proc/{pid}/task/{tid}/status').read_text()
+        if '\nState:\tS' in state or '\nState:\tD' in state:
+            time.sleep(0.02)
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'test thread {tid} never reached sleep')
+        time.sleep(0.001)
+
+
+class OracleTests(unittest.TestCase):
+    def setUp(self):
+        self.ledger, self.receipt, self.evidence, self.counts = fixture()
+
+    def check(self, *, rows=3, stdout=None):
+        trace = render(self.counts, self.evidence, rows)
+        return ORACLE['evaluate'](trace, trace if stdout is None else stdout,
+                                  self.ledger, self.receipt)
+
+    def test_nonempty_lossless_healthy_twin(self):
+        self.assertTrue(self.check()['pass'])
+
+    def test_ring_record_loss_is_distinct_from_output_byte_loss(self):
+        self.counts['raw_calls'] = 2
+        self.evidence['event_loss'] = 1
+        result = self.check(rows=2)
+        self.assertTrue(result['pass'], result)
+        self.assertEqual(result['api_calls'], 3)
+        self.assertEqual(result['events_lost'], 1)
+        self.assertEqual(result['stdout_shed_bytes'], 0)
+
+    def test_missing_ring_loss_cannot_hide_behind_exact_aggregate(self):
+        self.counts['raw_calls'] = 2
+        self.assertFalse(self.check(rows=2)['pass'])
+
+    def test_exact_stdout_shed_includes_terminal_record_bytes(self):
+        self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_timeouts'] = 1
+        self.evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(self.counts, self.evidence)
+        self.assertTrue(self.check(stdout=trace[17:])['pass'])
+        self.assertFalse(self.check(stdout=trace[16:])['pass'])
+
+    def test_equal_size_stdout_corruption_is_rejected_without_loss(self):
+        trace = render(self.counts, self.evidence)
+        self.assertFalse(self.check(stdout=b'X' + trace[1:])['pass'])
+
+    def test_wrong_actual_ring_cannot_qualify_requested_size(self):
+        self.receipt['ring_actual_bytes'] = 4194304
+        self.assertFalse(self.check()['pass'])
+
+    def test_nonstalled_pipe_cannot_claim_stall_acceptance(self):
+        self.receipt['sink'] = 'slowpipe'
+        self.assertFalse(self.check()['pass'])
+        self.receipt['stdout_stalled'] = True
+        self.assertFalse(self.check()['pass'], 'kernel pressure alone needs actual sink timeout evidence')
+
+    def test_zero_or_unacknowledged_or_failed_provider_calls_are_rejected(self):
+        for change in ('zero', 'issued', 'failed', 'prefix', 'wrongpid', 'function'):
+            with self.subTest(change=change):
+                ledger, receipt = copy.deepcopy(self.ledger), dict(self.receipt)
+                if change == 'zero':
+                    ledger.clear()
+                elif change == 'issued':
+                    receipt['issued_calls'] += 1
+                elif change == 'failed':
+                    ledger[3]['rv'] = 1
+                elif change == 'prefix':
+                    ledger[3]['t0'] = 1
+                elif change == 'wrongpid':
+                    ledger[3]['pid'] += 1
+                else:
+                    ledger[3]['fn'] = 'C_GetInfo'
+                trace = render(self.counts, self.evidence)
+                self.assertFalse(ORACLE['evaluate'](trace, trace, ledger, receipt)['pass'])
+
+    def test_image_provider_scope_and_ack_mutations_are_rejected(self):
+        for change in ('noimage', 'image', 'targetdev', 'targetino', 'targetimage',
+                       'targetoffset', 'noack', 'foreignack', 'duplicateack',
+                       'earlyack', 'lateack', 'scope', 'callimage', 'noready', 'duplicateimage'):
+            with self.subTest(change=change):
+                ledger, receipt = copy.deepcopy(self.ledger), copy.deepcopy(self.receipt)
+                if change == 'noimage':
+                    ledger.pop(0)
+                elif change == 'image':
+                    ledger[0]['path'] = '/wrong/caller'
+                elif change == 'targetdev':
+                    ledger[1]['dev'] = [1, 2]
+                elif change == 'targetino':
+                    ledger[1]['ino'] += 1
+                elif change == 'targetimage':
+                    ledger[1]['image'] = 99
+                elif change == 'targetoffset':
+                    ledger[1]['file_offset'] = 99999
+                elif change == 'noack':
+                    ledger.pop()
+                elif change == 'foreignack':
+                    ledger[-1]['image'] = 99
+                elif change == 'duplicateack':
+                    ledger.append(dict(ledger[-1]))
+                elif change == 'earlyack':
+                    ledger[-1]['t'] = 200
+                elif change == 'lateack':
+                    ledger[-1]['t'] = 301
+                elif change == 'scope':
+                    ledger[3]['scope'] = 'outside'
+                elif change == 'callimage':
+                    ledger[3]['image'] = 99
+                elif change == 'noready':
+                    ledger.pop(2)
+                else:
+                    ledger.append(dict(ledger[0]))
+                trace = render(self.counts, self.evidence)
+                self.assertFalse(ORACLE['evaluate'](trace, trace, ledger, receipt)['pass'])
+
+    def test_lossy_same_size_corruption_and_reordering_are_rejected(self):
+        self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_timeouts'] = 1
+        self.evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(self.counts, self.evidence)
+        for damaged in (b'X' * (len(trace) - 17), trace[:-17][::-1]):
+            self.assertFalse(self.check(stdout=damaged)['pass'])
+
+    def test_lossy_stdout_terminal_may_have_only_prior_sink_totals(self):
+        self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_timeouts'] = 1
+        stdout_ev = copy.deepcopy(self.evidence)
+        stdout_ev['scheduling']['sink_dropped_bytes'] = 0
+        stdout = render(self.counts, stdout_ev)[20:]
+        # Final file counter includes both dropped ordinary bytes and its own
+        # decimal-width difference from the earlier stdout terminal snapshot.
+        self.evidence['scheduling']['sink_dropped_bytes'] = 21
+        self.assertTrue(self.check(stdout=stdout)['pass'])
+
+    def test_wrong_aggregate_raw_or_duplicate_terminal_rejected(self):
+        for field in self.counts:
+            counts = dict(self.counts)
+            counts[field] += 1
+            trace = render(counts, self.evidence)
+            self.assertFalse(ORACLE['evaluate'](trace, trace, self.ledger, self.receipt)['pass'])
+        trace = render(self.counts, self.evidence) * 2
+        self.assertFalse(ORACLE['evaluate'](trace, trace, self.ledger, self.receipt)['pass'])
+
+    def test_saved_file_failure_never_supplies_authoritative_totals(self):
+        self.receipt['trace_file_error'] = 'EFBIG'
+        self.assertFalse(self.check()['pass'])
+        self.receipt['trace_file_error'] = None
+        self.receipt['observer_rc'] = 1
+        self.assertFalse(self.check()['pass'])
+
+    def test_discard_requires_zero_shed_without_invented_delivered_byte_count(self):
+        self.receipt['sink'] = 'discard'
+        trace = render(self.counts, self.evidence)
+        result = ORACLE['evaluate'](trace, None, self.ledger, self.receipt)
+        self.assertTrue(result['pass'], result)
+        self.assertIsNone(result['stdout_delivered_bytes'])
+        self.evidence['scheduling']['sink_dropped_bytes'] = 1
+        trace = render(self.counts, self.evidence)
+        self.assertFalse(ORACLE['evaluate'](trace, None, self.ledger, self.receipt)['pass'])
+
+    def test_cancellation_ack_and_cleanup_are_separate(self):
+        self.receipt.update(cancel='midcapture', signals=[dict(t_ns=400)],
+                            cancellation_ack_ns=50_000_400, cleanup_seconds=4)
+        result = self.check()
+        self.assertTrue(result['pass'], result)
+        self.assertEqual(result['cancellation_response_seconds'], 0.05)
+        self.receipt['cancellation_ack_ns'] = 100_000_400
+        self.assertFalse(self.check()['pass'])
+        self.receipt['cancellation_ack_ns'] = None
+        self.assertFalse(self.check()['pass'])
+
+    def test_reap_over_sixty_seconds_is_not_prompt_ack(self):
+        self.receipt['cleanup_seconds'] = 60.01
+        self.assertFalse(self.check()['pass'])
+
+    def test_midfinal_requires_observed_final_phase_and_separate_ack(self):
+        self.receipt.update(cancel='midfinal', signals=[dict(t_ns=400)],
+                            cancellation_ack_ns=401)
+        result = self.check()
+        self.assertFalse(result['pass'])
+        self.assertIn('NOT_RUN', result['status'])
+        self.receipt['terminal_observed_alive'] = True
+        self.assertTrue(self.check()['pass'])
+
+    def test_watchdog_malformed_and_unmatched_are_not_accepted(self):
+        self.receipt['watchdog'] = True
+        self.assertFalse(self.check()['pass'])
+        self.receipt['watchdog'] = False
+        for field in ('malformed_records', 'unmatched_returns'):
+            self.evidence[field] = 1
+            self.assertFalse(self.check()['pass'])
+            self.evidence[field] = 0
+
+    def test_unexpected_trace_row_or_loss_marker_refuses(self):
+        trace = render(self.counts, self.evidence)
+        for prefix in (b'unexpected private data\n', b'LOST 1 events\n'):
+            self.assertFalse(ORACLE['evaluate'](prefix + trace, trace,
+                                              self.ledger, self.receipt)['pass'])
+
+
+class BoundedInputAndProviderControls(unittest.TestCase):
+    def test_file_limit_is_enforced_before_retaining_oversized_input(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / 'output'
+            path.write_bytes(b'X' * 1000000)
+            with self.assertRaisesRegex(ValueError, 'memory bound'):
+                HARNESS['bounded_read'](path, 31)
+            path.write_bytes(b'X' * 31)
+            self.assertEqual(HARNESS['bounded_read'](path, 31), b'X' * 31)
+
+    def test_stable_held_original_does_not_bind_a_replaced_loaded_path(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            path, replacement = root / 'provider', root / 'replacement'
+            path.write_bytes(b'A' * 4096)
+            replacement.write_bytes(b'B' * 4096)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                path.rename(root / 'held-original')
+                replacement.rename(path)
+                before = HARNESS['PIN_PROVIDER'](fd)
+                foreign_fd = os.open(path, os.O_RDONLY)
+                try:
+                    loaded = HARNESS['PIN_PROVIDER'](foreign_fd)
+                finally:
+                    os.close(foreign_fd)
+                self.assertEqual(before, HARNESS['PIN_PROVIDER'](fd))
+                ledger, receipt, evidence, counts = fixture()
+                receipt.update(provider_before=before, provider_after=copy.deepcopy(before))
+                ledger[1].update(dev=loaded['dev'], ino=loaded['ino'])
+                trace = render(counts, evidence)
+                result = ORACLE['evaluate'](trace, trace, ledger, receipt)
+                self.assertFalse(result['pass'])
+                self.assertTrue(any('mapped held provider' in error for error in result['errors']))
+            finally:
+                os.close(fd)
+
+
+class PrebuiltDemotionControls(unittest.TestCase):
+    def test_actual_four_file_fixture_executes_ledger_and_refuses_overwrite(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'payload'
+            result = DEMOTION['build'](directory)
+            self.assertEqual(result['topology_check'], dict(calls=10,
+                phases=dict(a=5, shared=2, fence=1, proof=2), successful_calls=6, error_calls=4))
+            self.assertEqual({row['name'] for row in result['inputs']}, set(DEMOTION['NAMES']))
+            before = {path.name: path.read_bytes() for path in directory.iterdir()}
+            with self.assertRaises(FileExistsError):
+                DEMOTION['build'](directory)
+            self.assertEqual(before, {path.name: path.read_bytes() for path in directory.iterdir()})
+            self.assertEqual(len(before), 4, 'topology control must clean its own temporary files')
+
+
+class NativeWrapControls(unittest.TestCase):
+    @staticmethod
+    def owned_schedule_inputs(directory):
+        """Small validator inputs with real file identities, not native execution."""
+        for name in WRAP['NAMES']:
+            (directory / name).write_bytes(name.encode().ljust(128, b'.'))
+        nonce, pid = '0123456789abcdef0123456789abcdef', os.getpid()
+        identity = dict(kind='identity', nonce=nonce, pid=pid, ready_ns=100,
+            exe_sha256=WRAP['digest'](directory / 'workload'),
+            common_sha256=[WRAP['digest'](directory / name) for name in WRAP['COMMON_NAMES']],
+            provider_a_sha256=[WRAP['digest'](directory / name) for name in WRAP['PROVIDER_A_NAMES']],
+            provider_b_sha256=[WRAP['digest'](directory / name) for name in WRAP['PROVIDER_B_NAMES']])
+        targets = []
+        for slot, name in enumerate(WRAP['COMMON_NAMES'], 4):
+            fd = os.open(directory / name, os.O_RDONLY)
+            try:
+                pin = WRAP['PIN'](fd)
+            finally:
+                os.close(fd)
+            targets.append(dict(kind='target', slot=slot, dev_major=pin['dev'][0],
+                                dev_minor=pin['dev'][1], ino=pin['ino'], offset=0))
+        calls, acks = [], [dict(event='prepared', round=0, calls=0, t=10),
+                           dict(event='ready', round=0, calls=0, t=100)]
+        for phase, event in [('a', 'a-done'), ('shared', 'shared-done'),
+                             ('fence', 'fence-done'), ('proof', 'final-calls')]:
+            if phase == 'shared':
+                acks.append(dict(event='b-ready', round=0, calls=len(calls), t=acks[-1]['t']))
+            elif phase == 'fence':
+                acks.append(dict(event='a-unmapped', round=0, calls=len(calls), t=acks[-1]['t']))
+            for slot in range(4, 36):
+                sequence = len(calls) + 1
+                calls.append(dict(kind='call', sequence=sequence, phase=phase, round=1,
+                    slot=slot, before_call_ns=1000 + sequence * 3,
+                    after_return_ns=1001 + sequence * 3, return_status=0))
+            acks.append(dict(event=event, round=1, calls=len(calls), t=calls[-1]['after_return_ns'] + 1))
+        acks.append(dict(event='done', round=0, calls=len(calls), t=acks[-1]['t'] + 1))
+        return dict(rows=[identity, *targets, *calls,
+                          dict(kind='complete', complete=True, calls=len(calls))],
+                    acks=acks, nonce=nonce, pid=pid)
+
+    def test_shared_schedule_rejects_missing_duplicate_foreign_and_early_ack(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            original = self.owned_schedule_inputs(directory)
+            def validate(value):
+                return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)
+            facts = validate(original)
+            self.assertEqual(facts['physical_pairs'], 32)
+            self.assertEqual(facts['phase_calls'], dict(a=32, shared=32, fence=32, proof=32))
+            for mutation in ('missing', 'duplicate_pair', 'foreign_target', 'wrong_device',
+                             'wrong_offset', 'wrong_phase', 'wrong_nonce', 'return', 'clock',
+                             'early_ack', 'late_ack', 'late_b_ready', 'late_unmapped',
+                             'wrong_control_calls'):
+                with self.subTest(mutation=mutation):
+                    value = copy.deepcopy(original)
+                    calls = [row for row in value['rows'] if row['kind'] == 'call']
+                    shared = [row for row in calls if row['phase'] == 'shared']
+                    ack = next(row for row in value['acks'] if row['event'] == 'shared-done')
+                    if mutation == 'missing':
+                        value['rows'].remove(shared[0])
+                    elif mutation == 'duplicate_pair':
+                        shared[-1]['slot'] = shared[0]['slot']
+                    elif mutation == 'foreign_target':
+                        value['rows'][1]['ino'] += 1
+                    elif mutation == 'wrong_device':
+                        value['rows'][1]['dev_major'] += 1
+                    elif mutation == 'wrong_offset':
+                        value['rows'][1]['offset'] = 10 ** 12
+                    elif mutation == 'wrong_phase':
+                        shared[0]['phase'] = 'a'
+                    elif mutation == 'wrong_nonce':
+                        value['rows'][0]['nonce'] = 'foreign'
+                    elif mutation == 'return':
+                        shared[0]['return_status'] = 1
+                    elif mutation == 'clock':
+                        shared[0]['after_return_ns'] = shared[0]['before_call_ns']
+                    elif mutation == 'early_ack':
+                        ack['t'] = shared[-1]['after_return_ns'] - 1
+                    elif mutation == 'late_ack':
+                        next_call = next(row for row in calls if row['phase'] == 'fence')
+                        ack['t'] = next_call['before_call_ns'] + 1
+                    elif mutation == 'late_b_ready':
+                        next(row for row in value['acks'] if row['event'] == 'b-ready')['t'] = shared[0]['before_call_ns'] + 1
+                    elif mutation == 'late_unmapped':
+                        first_fence = next(row for row in calls if row['phase'] == 'fence')
+                        next(row for row in value['acks'] if row['event'] == 'a-unmapped')['t'] = first_fence['before_call_ns'] + 1
+                    else:
+                        next(row for row in value['acks'] if row['event'] == 'b-ready')['calls'] += 1
+                    with self.assertRaises(ValueError):
+                        validate(value)
+
+    def test_three_round_probe_has_one_physical_pair_and_exact96_call_oracle(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'payload'
+            WRAP['build'](directory)
+            observed = WRAP['execute_fixture'](directory, counted=3, shared=1, probe=True)
+            def validate(value):
+                return WRAP['check_ledger'](**value, directory=directory,
+                                            counted=3, shared=1, probe=True)
+            facts = validate(observed)
+            self.assertEqual(facts['calls'], 96)
+            self.assertEqual(facts['physical_pairs'], 32)
+            self.assertEqual(facts['phase_calls'], {'a': 96})
+            self.assertEqual([r['round'] for r in observed['acks'] if r['event'] == 'a-done'], [1, 2, 3])
+            for mutation in ('missing_third_call', 'foreign_pair', 'shared_call', 'unacked_round', 'unexpected_b_ack'):
+                with self.subTest(mutation=mutation):
+                    changed = copy.deepcopy(observed)
+                    calls = [r for r in changed['rows'] if r['kind'] == 'call']
+                    if mutation == 'missing_third_call':
+                        changed['rows'].remove(calls[-1])
+                    elif mutation == 'foreign_pair':
+                        next(r for r in changed['rows'] if r['kind'] == 'target')['ino'] += 1
+                    elif mutation == 'shared_call':
+                        calls[-1]['phase'] = 'shared'
+                    elif mutation == 'unacked_round':
+                        changed['acks'] = [r for r in changed['acks']
+                                           if not (r['event'] == 'a-done' and r['round'] == 3)]
+                    else:
+                        changed['acks'].insert(-1, dict(event='b-ready', round=0, calls=96, t=1))
+                    with self.assertRaises(ValueError):
+                        validate(changed)
+
+    def test_actual32_body_topology_and_independent_schedule_mutations(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'payload'
+            prepared = WRAP['build'](directory)
+            self.assertEqual(prepared['topology_check'],
+                             dict(indexed_pairs=32, providers=64, distinct_provider_objects=64))
+            self.assertEqual(prepared['native_check']['calls'], 192)
+            self.assertEqual(prepared['native_check']['targets'], 32)
+            self.assertEqual(prepared['probe_check']['calls'], 96)
+            self.assertEqual(prepared['probe_check']['physical_pairs'], 32)
+            provider = directory / 'provider-A-01.so'
+            image = provider.read_bytes()
+            for tamper, reason in ((b'libdemotion-common-00.so', 'reconnects'),
+                                   (b'diagnostics_slot_4', 'foreign counted body')):
+                with self.subTest(tamper=reason):
+                    try:
+                        with provider.open('ab') as handle:
+                            handle.write(tamper)
+                        with self.assertRaises(ValueError) as raised:
+                            WRAP['check_topology'](directory)
+                        self.assertIn(reason, str(raised.exception))
+                    finally:
+                        provider.write_bytes(image)
+            observed = WRAP['execute_fixture'](directory, 1, 1)
+            def validate(value):
+                return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)
+            self.assertEqual(validate(observed)['calls'], 128)
+            for change in ('missing', 'duplicate', 'wrongslot', 'clock', 'return', 'target', 'ack', 'earlyack'):
+                with self.subTest(change=change):
+                    value = copy.deepcopy(observed)
+                    calls = [row for row in value['rows'] if row['kind'] == 'call']
+                    if change == 'missing':
+                        value['rows'].remove(calls[0])
+                    elif change == 'duplicate':
+                        value['rows'].append(dict(calls[0]))
+                    elif change == 'wrongslot':
+                        calls[0]['slot'] = 99
+                    elif change == 'clock':
+                        calls[0]['after_return_ns'] = calls[0]['before_call_ns']
+                    elif change == 'return':
+                        calls[0]['return_status'] = 7
+                    elif change == 'target':
+                        value['rows'][1]['ino'] += 1
+                    elif change == 'ack':
+                        value['acks'].append(dict(value['acks'][2]))
+                    else:
+                        value['acks'][2]['t'] = calls[0]['before_call_ns']
+                    with self.assertRaises(ValueError):
+                        validate(value)
+
+
+class LiveMetadataControls(unittest.TestCase):
+    def test_events_capacity_queries_only_owned_ring_fds_with_real_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            files = []
+            for identity, kind in ((1, 1), (2, 27), (3, 27)):
+                path = Path(temporary) / str(identity)
+                path.write_text(f'map_id:\t{identity}\nmap_type:\t{kind}\n')
+                files.append(path)
+            def answer(argv, **unused):
+                identity = int(argv[-1])
+                row = dict(name='EVENTS' if identity == 2 else 'DISCOVERY',
+                           type='ringbuf', max_entries=4194304)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(row).encode())
+            with mock.patch.object(Path, 'iterdir', return_value=iter(files)), \
+                    mock.patch.object(subprocess, 'run', side_effect=answer) as query:
+                self.assertEqual(HARNESS['events_ring_capacity'](123), 4194304)
+            self.assertEqual([call.args[0][-1] for call in query.call_args_list], ['2', '3'])
+            with mock.patch.object(Path, 'iterdir', return_value=iter(files[:1])), \
+                    mock.patch.object(subprocess, 'run', side_effect=answer) as query:
+                with self.assertRaises(ValueError):
+                    HARNESS['events_ring_capacity'](123)
+            query.assert_not_called()
+
+
+class ManifestControls(unittest.TestCase):
+    def test_explicit_manifest_uses_held_matching_provider_and_rejects_mutations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provider = root / 'provider.so'
+            provider.write_bytes(b'owned provider')
+            manifest = root / 'manifest.json'
+            provider_pin = HARNESS['NATIVE'].FilePin(provider)
+            try:
+                document = dict(schema='p11scope-manifest/5', module_path=str(provider),
+                    objects=[dict(path=str(provider), identity=dict(sha256=provider_pin.digest))])
+                manifest.write_text(json.dumps(document))
+                pin = HARNESS['NATIVE'].FilePin(manifest)
+                try:
+                    self.assertEqual(HARNESS['manifest_arguments']([pin], provider_pin),
+                                     ['--manifest', str(manifest)])
+                    replacement = root / 'replacement'
+                    replacement.write_bytes(manifest.read_bytes())
+                    replacement.replace(manifest)
+                    with self.assertRaises(ValueError):
+                        HARNESS['manifest_arguments']([pin], provider_pin)
+                finally:
+                    pin.close()
+                for mutation in ('hash', 'path', 'duplicate', 'schema', 'malformed'):
+                    value = copy.deepcopy(document)
+                    if mutation == 'hash':
+                        value['objects'][0]['identity']['sha256'] = '0' * 64
+                    elif mutation == 'path':
+                        value['module_path'] = str(root / 'other.so')
+                    elif mutation == 'duplicate':
+                        value['objects'].append(copy.deepcopy(value['objects'][0]))
+                    elif mutation == 'schema':
+                        value['schema'] = 'wrong'
+                    manifest.write_text('{' if mutation == 'malformed' else json.dumps(value))
+                    pin = HARNESS['NATIVE'].FilePin(manifest)
+                    try:
+                        with self.assertRaises(ValueError):
+                            HARNESS['manifest_arguments']([pin], provider_pin)
+                    finally:
+                        pin.close()
+            finally:
+                provider_pin.close()
+
+
+class ReporterProbeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        cls.probe = cls.root / 'reporter-probe'
+        result = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(ROOT / 'tests/fixtures/operator-output/reporter-probe.c'), '-o', str(cls.probe)],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode:
+            cls.temporary.cleanup()
+            raise AssertionError(result.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def decode(self, payload, tail=0, head=None):
+        path = self.root / 'records.bin'
+        path.write_bytes(payload)
+        return subprocess.run([str(self.probe), '--decode-fixture', '123', str(tail),
+            str(tail + len(payload) if head is None else head), str(path)],
+            capture_output=True, text=True, timeout=3)
+
+    def test_actual_c_decoder_accepts_only_one_loss_free_main_tid_sample(self):
+        sample = struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 123, 700)
+        for tail in (0, 250):
+            result = self.decode(sample, tail)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(rows[0], dict(kind='reporter', mode='decode_fixture',
+                ip=0x1234, pid=123, tid=123, t_ns=700))
+            self.assertEqual(rows[1]['samples'], 1)
+        for name, payload, head in (
+                ('duplicate', sample * 2, None),
+                ('foreign-tid', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 124, 700), None),
+                ('foreign-pid', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 124, 123, 700), None),
+                ('zero-ip', struct.pack('<IHHQIIQ', 9, 0, 32, 0, 123, 123, 700), None),
+                ('zero-time', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 123, 0), None),
+                ('lost', struct.pack('<IHHQQ', 2, 0, 24, 1, 1), None),
+                ('lost-samples', struct.pack('<IHHQ', 13, 0, 16, 1), None),
+                ('short', sample[:-1], None),
+                ('unknown', struct.pack('<IHH', 99, 0, 8), None),
+                ('overrun', sample, 300),
+                ('backward-head', sample, 0)):
+            with self.subTest(mutation=name):
+                result = self.decode(payload, 1 if name == 'backward-head' else 0, head)
+                self.assertNotEqual(result.returncode, 0, 'invalid evidence must not become an ACK')
+
+    def test_symbol_reader_streams_a_large_table_with_bounded_lines_and_extent(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        with tempfile.TemporaryFile() as output:
+            chunk = b'unrelated_symbol t 1 1\n' * 1024
+            for _ in range(800):
+                output.write(chunk)
+            output.write(b'p11scope::run::report_capture_cancel t 1234 160\n')
+            self.assertGreater(output.tell(), 16 * 1024 * 1024)
+            self.assertEqual(module['read_reporter_symbols'](output), [0x1234])
+            output.write(b'p11scope::run::report_capture_cancel t 5678 160\n')
+            with self.assertRaises(ValueError):
+                module['read_reporter_symbols'](output)
+            output.seek(0)
+            output.truncate()
+            output.write(b'x' * 65537 + b'\n')
+            with self.assertRaises(ValueError):
+                module['read_reporter_symbols'](output)
+            output.truncate(64 * 1024 * 1024 + 1)
+            with self.assertRaises(ValueError):
+                module['read_reporter_symbols'](output)
+
+    def test_actual_elf_symbol_resolution_and_offset_reject_foreign_surfaces(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        source = self.root / 'reporter.c'
+        target = self.root / 'reporter-target'
+        source.write_text('#include <unistd.h>\nvoid reporter(int) __asm__("_ZN8p11scope3run21report_capture_cancel17h0123456789abcdefE");\n'
+            '__attribute__((noinline,used)) void reporter(int x) { __asm__ volatile("" : : "r"(x)); }\n'
+            'int main(int argc, char **argv) { (void)argv; if (argc > 1) pause(); reporter(2); return 0; }\n')
+        result = subprocess.run(['cc', '-O2', '-fPIE', '-pie', str(source), '-o', str(target)],
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pin = HARNESS['NATIVE'].FilePin(target)
+        foreign = HARNESS['NATIVE'].FilePin(self.probe)
+        try:
+            resolved = module['resolve_reporter'](pin)
+            self.assertEqual(resolved['symbol'], 'p11scope::run::report_capture_cancel')
+            self.assertGreater(resolved['file_offset'], 0)
+            self.assertEqual(module['symbol_file_offset'](pin.fd, resolved['virtual_address']), resolved['file_offset'])
+            child = subprocess.Popen([str(target), 'hold'])
+            owner = None
+            try:
+                owner = HARNESS['NATIVE'].OwnedProcess(child.pid, os.getpid(), os.getuid())
+                expected = module['expected_witness'](pin, owner, resolved)
+                self.assertEqual(expected['pid'], child.pid)
+                self.assertEqual(expected['tid'], child.pid)
+                self.assertGreater(expected['ip'], 0)
+                with self.assertRaises(ValueError):
+                    module['expected_witness'](foreign, owner, resolved)
+            finally:
+                child.terminate()
+                child.wait(timeout=3)
+                if owner:
+                    owner.close()
+            with self.assertRaises(ValueError):
+                module['symbol_file_offset'](pin.fd, 0)
+            with self.assertRaises(ValueError):
+                module['resolve_reporter'](foreign)
+        finally:
+            foreign.close()
+            pin.close()
+
+    def test_symbol_tool_timeout_reports_live_owned_child_and_reaps_it(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        tools = self.root / 'hanging-symbol-tool'
+        tools.mkdir()
+        tool = tools / 'nm'
+        tool.write_text(f'#!{sys.executable}\n'
+            'import os, sys, time\nfrom pathlib import Path\n'
+            f'root = Path({str(tools)!r})\n'
+            'mode = "version" if sys.argv[1:] == ["--version"] else "symbols"\n'
+            '(root / (mode + ".pid")).write_text(str(os.getpid()))\n'
+            'if mode == "version":\n'
+            '    print("owned nm timeout diagnostic fixture")\n'
+            'else:\n'
+            '    time.sleep(60)\n')
+        tool.chmod(0o700)
+        pin = HARNESS['NATIVE'].FilePin(self.probe)
+        try:
+            with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    module['resolve_reporter'](pin)
+            error = caught.exception
+            self.assertEqual(error.cmd, ['nm', '--demangle=rust', '--defined-only',
+                                        '--format=posix', f'/proc/self/fd/{pin.fd}'])
+            self.assertEqual(error.timeout, 10)
+            self.assertEqual(error.args[0], error.cmd)
+            self.assertGreater(error.args[1], 0)
+            self.assertLessEqual(error.args[1], 10)
+            self.assertIsNone(error.output)
+            self.assertIsNone(error.stderr)
+            diagnostics = getattr(error, 'diagnostics', {})
+            self.assertEqual(diagnostics.get('resolved_command'), str(tool))
+            self.assertEqual(error.args, error.__cause__.args)
+            self.assertEqual((error.cmd, error.timeout, error.output, error.stderr),
+                             (error.__cause__.cmd, error.__cause__.timeout,
+                              error.__cause__.output, error.__cause__.stderr))
+            child = diagnostics['child']
+            child_pid = int((tools / 'symbols.pid').read_text())
+            self.assertEqual(child['pid'], child_pid)
+            self.assertEqual(child['executable'], str(Path(sys.executable).resolve()))
+            self.assertEqual(child['state'], 'S')
+            self.assertTrue(child['wchan'])
+            self.assertEqual(child['fds']['candidate'], str(pin.path))
+            self.assertNotEqual(child['fds']['stdout'], child['fds']['stderr'])
+            self.assertEqual(diagnostics['version']['status'], 'completed')
+            self.assertEqual(diagnostics['version']['returncode'], 0)
+            self.assertIn('owned nm timeout diagnostic fixture', diagnostics['version']['output'])
+            self.assertEqual(json.loads(str(error).split('; nm diagnostic: ', 1)[1]), diagnostics)
+            for mode in ('symbols', 'version'):
+                pid = int((tools / f'{mode}.pid').read_text())
+                self.assertFalse(Path(f'/proc/{pid}').exists())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+        finally:
+            pin.close()
+
+    def test_symbol_tool_version_diagnostic_bounds_output_time_and_reaps_child(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        self.assertTrue(callable(module.get('_nm_version')), 'bounded timeout diagnostic is absent')
+        for mode in ('hang', 'noisy'):
+            with self.subTest(mode=mode):
+                tool = self.root / f'version-{mode}'
+                pid_path = self.root / f'version-{mode}.pid'
+                tool.write_text(f'#!{sys.executable}\n'
+                    'import os, sys, time\nfrom pathlib import Path\n'
+                    f'Path({str(pid_path)!r}).write_text(str(os.getpid()))\n'
+                    + ('time.sleep(60)\n' if mode == 'hang' else
+                       'while True:\n    os.write(1, b"x" * 4096)\n'))
+                tool.chmod(0o700)
+                started = time.monotonic()
+                version = module['_nm_version'](str(tool))
+                elapsed = time.monotonic() - started
+                self.assertEqual(version['status'], 'timeout' if mode == 'hang' else 'output_limit')
+                self.assertLessEqual(len(version['output'].encode()), 4096)
+                if mode == 'hang':
+                    self.assertGreaterEqual(elapsed, 1)
+                else:
+                    self.assertEqual(version['output'], 'x' * 4096)
+                pid = int(pid_path.read_text())
+                self.assertFalse(Path(f'/proc/{pid}').exists())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+
+    def test_symbol_tool_warmup_runs_real_tool_over_real_file_and_tolerates_failure(self):
+        tools = self.root / 'warmup-symbol-tool'
+        tools.mkdir()
+        log = tools / 'argv.log'
+        tool = tools / 'nm'
+        tool.write_text(f'#!{sys.executable}\nimport sys\n'
+            f'open({str(log)!r}, "w").write("\\n".join(sys.argv))\n')
+        tool.chmod(0o700)
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool(str(self.probe))
+        argv = log.read_text().splitlines()
+        self.assertTrue(argv[0].endswith('/nm'), argv)
+        self.assertEqual(argv[1:], ['--demangle=rust', '--defined-only', '--format=posix', str(self.probe)])
+        log.unlink()
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool()
+        argv = log.read_text().splitlines()
+        self.assertEqual(argv[1:], ['--demangle=rust', '--defined-only', '--format=posix', sys.executable])
+        tool.write_text(f'#!{sys.executable}\nimport sys\nsys.exit(1)\n')
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool(str(self.probe))
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.dict(os.environ, {'PATH': empty}):
+                _warm_symbol_tool(str(self.probe))
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool(str(tools / 'absent-input'))
+
+    def test_symbol_tool_warmup_bounds_a_hanging_tool(self):
+        tools = self.root / 'warmup-hanging-tool'
+        tools.mkdir()
+        tool = tools / 'nm'
+        tool.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(60)\n')
+        tool.chmod(0o700)
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            started = time.monotonic()
+            _warm_symbol_tool(str(self.probe))
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 10)
+
+    def test_wire_witness_requires_actual_mode_identity_and_loss_free_causal_once(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80, ip=0x1234)
+        ready = dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                     **{key: value for key, value in expected.items() if key != 'ip'})
+        event = dict(kind='reporter', mode='perf_uprobe', pid=123, tid=123, ip=0x1234, t_ns=700)
+        final = dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)
+        records, signals = [ready, event, final], [dict(signal='SIGINT', t_ns=600)]
+        self.assertEqual(module['validate_witness'](records, expected, signals)['ack_ns'], 700)
+        for mutation in ('fixture', 'birth', 'inode', 'offset', 'thread', 'ip', 'lost',
+                         'kernel-count', 'multiplex', 'duplicate', 'pre-signal', 'slow', 'not-ready',
+                         'bool-kernel-count', 'bool-enabled', 'bool-lost'):
+            changed = copy.deepcopy(records)
+            if mutation == 'fixture': changed[1]['mode'] = 'decode_fixture'
+            elif mutation == 'birth': changed[0]['start_time'] += 1
+            elif mutation == 'inode': changed[0]['ino'] += 1
+            elif mutation == 'offset': changed[0]['file_offset'] += 1
+            elif mutation == 'thread': changed[1]['tid'] += 1
+            elif mutation == 'ip': changed[1]['ip'] += 1
+            elif mutation == 'lost': changed[2]['lost'] = 1
+            elif mutation == 'kernel-count': changed[2]['kernel_count'] = 2
+            elif mutation == 'multiplex': changed[2]['time_running'] = 499
+            elif mutation == 'duplicate': changed.insert(2, copy.deepcopy(changed[1]))
+            elif mutation == 'pre-signal': changed[1]['t_ns'] = 599
+            elif mutation == 'slow': changed[1]['t_ns'] = 100000600
+            elif mutation == 'bool-kernel-count': changed[2]['kernel_count'] = True
+            elif mutation == 'bool-enabled': changed[2].update(time_enabled=True, time_running=True)
+            elif mutation == 'bool-lost': changed[2]['lost'] = False
+            else: changed[0]['t_ns'] = 601
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['validate_witness'](changed, expected, signals)
+        with self.assertRaises(ValueError):
+            module['validate_witness'](records, expected, [])
+
+    def test_prompt_callback_delivery_is_never_reporter_acknowledgement(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        expected = dict(role='callback', pid=123, tid=123, start_time=9, dev=2,
+                        ino=3, file_offset=80, ip=0x1234)
+        rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                     **{key: value for key, value in expected.items() if key != 'ip'}),
+                dict(kind='callback', mode='perf_uprobe', pid=123, tid=123, ip=0x1234, t_ns=700),
+                dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)]
+        module['validate_callback_binding'](rows, expected)
+        for mutation in ('unchanged', 'reporter-kind', 'foreign-ip', 'foreign-role'):
+            changed = copy.deepcopy(rows)
+            if mutation == 'reporter-kind': changed[1]['kind'] = 'reporter'
+            elif mutation == 'foreign-ip': changed[1]['ip'] += 1
+            elif mutation == 'foreign-role': changed[0]['role'] = 'reporter'
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['validate_witness'](changed, expected, [dict(signal='SIGINT', t_ns=600)])
+            if mutation in ('foreign-ip', 'foreign-role'):
+                with self.assertRaises(ValueError):
+                    module['validate_callback_binding'](changed, expected)
+        with self.assertRaises(ValueError):
+            module['read_reporter_symbols'](io.BytesIO(b'p11scope::run::install_stop_flag::{closure#1} t 12 10\n'), 'callback')
+        self.assertEqual(module['read_reporter_symbols'](
+            io.BytesIO(b'p11scope::run::install_stop_flag::{closure#0} t 12 10\n'), 'callback'), [0x12])
+        with self.assertRaises(ValueError):
+            module['read_reporter_symbols'](io.BytesIO(b'arbitrary_symbol t 12 10\n'), 'arbitrary')
+
+    def test_prompt_worker_delivery_proves_delivery_without_acknowledgement(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        expected = dict(role='callback', pid=123, tid=124, start_time=10, dev=2,
+                        ino=3, file_offset=100, ip=0x1250)
+        rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                     **{key: value for key, value in expected.items() if key != 'ip'}),
+                dict(kind='callback', mode='perf_uprobe', pid=123, tid=124, ip=0x1250, t_ns=700),
+                dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)]
+        signals = [dict(signal='SIGINT', t_ns=600, delivery='tgkill_original_worker', tid=124)]
+        self.assertEqual(module['validate_worker_delivery'](rows, expected, signals)['delivery_ns'], 700)
+        for mutation in ('main-tid', 'reporter-role', 'callback-kind', 'foreign-ip', 'lost',
+                         'kernel-count', 'zero-enabled', 'multiplex', 'duplicate', 'pre-signal',
+                         'slow', 'not-ready', 'process-signal', 'wrong-signal', 'bool-enabled',
+                         'foreign-ready'):
+            changed, sent = copy.deepcopy(rows), copy.deepcopy(signals)
+            if mutation == 'main-tid':
+                changed[1]['tid'] = 123
+            elif mutation == 'reporter-role':
+                changed[1]['kind'] = 'reporter'
+            elif mutation == 'callback-kind':
+                changed[0]['role'] = 'reporter'
+            elif mutation == 'foreign-ip':
+                changed[1]['ip'] += 1
+            elif mutation == 'lost':
+                changed[2]['lost'] = 1
+            elif mutation == 'kernel-count':
+                changed[2]['kernel_count'] = 2
+            elif mutation == 'zero-enabled':
+                changed[2].update(time_enabled=0, time_running=0)
+            elif mutation == 'multiplex':
+                changed[2]['time_running'] = 499
+            elif mutation == 'duplicate':
+                changed.insert(2, copy.deepcopy(changed[1]))
+            elif mutation == 'pre-signal':
+                changed[1]['t_ns'] = 599
+            elif mutation == 'slow':
+                changed[1]['t_ns'] = 100000600
+            elif mutation == 'not-ready':
+                changed[0]['t_ns'] = 601
+            elif mutation == 'process-signal':
+                sent[0].pop('delivery')
+            elif mutation == 'wrong-signal':
+                sent[0]['signal'] = 'SIGTERM'
+            elif mutation == 'bool-enabled':
+                changed[2].update(time_enabled=True, time_running=True)
+            else:
+                changed[0]['tid'] += 1
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['validate_worker_delivery'](changed, expected, sent)
+        main_rows = copy.deepcopy(rows)
+        for row in main_rows[:2]:
+            row['tid'] = 123
+        with self.assertRaises(ValueError):
+            module['validate_worker_delivery'](main_rows, dict(expected, tid=123), signals)
+        with self.assertRaises(ValueError):
+            module['validate_witness'](rows, expected, signals)
+
+    def test_live_mode_refuses_a_foreign_executable_before_attaching(self):
+        fd = os.open(self.probe, os.O_RDONLY)
+        try:
+            result = subprocess.run([str(self.probe), '--probe', str(fd), str(os.getpid()),
+                '1', '0', '1000'], pass_fds=(fd,), capture_output=True, text=True, timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('observer executable differs', result.stderr)
+            self.assertNotIn('"kind":"ready"', result.stdout)
+        finally:
+            os.close(fd)
+
+    def test_actual_task_identity_binds_distinct_tgid_tid_birth_and_held_directory(self):
+        source = self.root / 'task-identity-fixture.c'
+        target = self.root / 'task-identity-fixture'
+        included = str(ROOT / 'tests/fixtures/operator-output/reporter-probe.c')
+        source.write_text('#define main original_probe_main\n#include "' + included + '"\n#undef main\n'
+            'int main(int argc, char **argv) { struct stat held; uint64_t fd,pid,tid,birth,task;\n'
+            'if(argc!=6 || number(argv[1],&fd) || number(argv[2],&pid) || number(argv[3],&tid) || '
+            'number(argv[4],&birth) || number(argv[5],&task)) return 3;\n'
+            'return observer_identity(fd,pid,tid,birth,task,&held) ? 2 : 0; }\n')
+        built = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(source), '-o', str(target)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        gate = threading.Event()
+        worker = threading.Thread(target=gate.wait)
+        worker.start()
+        exe = os.open('/proc/self/exe', os.O_RDONLY | os.O_CLOEXEC)
+        task = main_task = None
+        try:
+            tid = worker.native_id
+            birth = HARNESS['NATIVE'].process_identity(tid)['start_time']
+            task = os.open(f'/proc/{os.getpid()}/task/{tid}', os.O_PATH | os.O_DIRECTORY)
+            main_task = os.open(f'/proc/{os.getpid()}/task/{os.getpid()}', os.O_PATH | os.O_DIRECTORY)
+            for mutation in ('healthy', 'wrong-tgid', 'wrong-tid', 'wrong-birth', 'wrong-directory'):
+                pid_arg, tid_arg, birth_arg, task_arg = os.getpid(), tid, birth, task
+                if mutation == 'wrong-tgid': pid_arg += 1
+                elif mutation == 'wrong-tid': tid_arg = os.getpid()
+                elif mutation == 'wrong-birth': birth_arg += 1
+                elif mutation == 'wrong-directory': task_arg = main_task
+                result = subprocess.run([str(target), str(exe), str(pid_arg), str(tid_arg),
+                    str(birth_arg), str(task_arg)], pass_fds=(exe, task_arg),
+                    capture_output=True, text=True, timeout=3)
+                with self.subTest(mutation=mutation):
+                    self.assertEqual(result.returncode == 0, mutation == 'healthy', result.stderr)
+            gate.set()
+            worker.join(timeout=3)
+            stale = subprocess.run([str(target), str(exe), str(os.getpid()), str(tid),
+                str(birth), str(task)], pass_fds=(exe, task), capture_output=True, text=True, timeout=3)
+            self.assertNotEqual(stale.returncode, 0, 'exited worker must not retain live-task authority')
+        finally:
+            gate.set()
+            worker.join(timeout=3)
+            for fd in (exe, task, main_task):
+                if fd is not None:
+                    os.close(fd)
+
+
+class ReadinessGateTests(unittest.TestCase):
+    def test_actual_preload_gates_only_complete_forwarded_main_stderr_and_restores_errno_mask(self):
+        line = b'p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n'
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            preload, fixture = root / 'gate.so', root / 'fixture'
+            for source, target, flags in (
+                    ('readiness-write-gate.c', preload, ['-shared', '-fPIC']),
+                    ('readiness-gate-fixture.c', fixture, ['-pthread'])):
+                result = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                    *flags, str(ROOT / 'tests/fixtures/operator-output' / source), '-o', str(target)],
+                    capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            for mode in ('whole', 'split', 'writev', 'partial', 'wrongfd', 'wrongtid', 'prefix', 'zero'):
+                with self.subTest(mode=mode):
+                    control, release = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                    facts, notify = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                    stderr_read, stderr_write = os.pipe2(os.O_CLOEXEC)
+                    fcntl.fcntl(stderr_write, fcntl.F_SETPIPE_SZ, 4096)
+                    os.set_blocking(stderr_write, False)
+                    env = dict(os.environ, LD_PRELOAD=str(preload),
+                        P11SCOPE_TEST_GATE_CONTROL_FD=str(control), P11SCOPE_TEST_GATE_FACT_FD=str(notify))
+                    child = subprocess.Popen([str(fixture), mode], env=env, pass_fds=(control, notify),
+                        stdout=subprocess.PIPE, stderr=stderr_write)
+                    owner = None
+                    for fd in (control, notify, stderr_write):
+                        os.close(fd)
+                    stderr = bytearray()
+                    def drain():
+                        while payload := os.read(stderr_read, 4096):
+                            stderr.extend(payload)
+                    reader = threading.Thread(target=drain)
+                    reader.start()
+                    def fact():
+                        self.assertTrue(select.select([facts], [], [], 3)[0], 'bounded gate fact missing')
+                        payload = os.read(facts, 4096)
+                        self.assertTrue(payload.endswith(b'\n'), payload)
+                        row = json.loads(payload)
+                        self.assertEqual((row['pid'], row['tid'], row['clock']),
+                                         (child.pid, child.pid, 'CLOCK_MONOTONIC'))
+                        return row
+                    try:
+                        gated = mode in ('whole', 'split', 'writev', 'partial')
+                        if gated:
+                            entered = fact()
+                            self.assertEqual(entered['kind'], 'entered')
+                            owner = HARNESS['NATIVE'].OwnedProcess(child.pid, os.getpid(), os.getuid(), child)
+                            delivery = negative['send_main_sigint'](owner)
+                            sent = delivery['t_ns']
+                            self.assertEqual(delivery['delivery'], 'tgkill_original_main')
+                            interrupted = fact()
+                            self.assertEqual(interrupted['kind'], 'interrupted')
+                            self.assertLessEqual(entered['t_ns'], sent)
+                            self.assertGreaterEqual(interrupted['t_ns'], sent)
+                            self.assertIsNone(child.poll(), 'main must remain gated after handler delivery')
+                            released = time.monotonic_ns()
+                            os.write(release, b'R')
+                            consumed = fact()
+                            self.assertEqual(consumed['kind'], 'released')
+                            self.assertGreaterEqual(consumed['t_ns'], released)
+                        output, _ = child.communicate(timeout=3)
+                        self.assertEqual(child.returncode, 0, bytes(stderr))
+                        reader.join(timeout=3)
+                        self.assertFalse(reader.is_alive())
+                        if not gated:
+                            self.assertEqual(os.read(facts, 4096), b'', 'prefix/foreign write must not gate')
+                        result = json.loads(output.splitlines()[-1])
+                        self.assertEqual(result['handled'], int(gated))
+                        self.assertEqual(result['errno'], 33)
+                        self.assertEqual(result['sigint_blocked'], 0)
+                        self.assertEqual(result['gate_cloexec'], 1)
+                        expected = b'\n' * 4090 + line if mode == 'partial' else line
+                        if mode == 'wrongfd': expected = b''
+                        elif mode == 'prefix': expected = line[:20]
+                        elif mode == 'zero': expected = line.replace(b'136', b'0')
+                        self.assertEqual(bytes(stderr), expected, 'interposer must forward exact real bytes')
+                        self.assertEqual(result['first_write'], 4096 if mode == 'partial' else 0)
+                    finally:
+                        if child.poll() is None:
+                            os.write(release, b'R')
+                            child.terminate()
+                            child.wait(timeout=3)
+                        reader.join(timeout=3)
+                        if owner:
+                            owner.close()
+                        child.stdout.close()
+                        for fd in (release, facts, stderr_read):
+                            os.close(fd)
+
+
+class InventorySavedCaptureTests(unittest.TestCase):
+    def test_only_committed_owned_positive_milestones_release_calls(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/capture_inventory_pair.py'))
+        view = module['CaptureView'](123, '/owned/provider-A.so')
+        edge = dict(kind='edge_observed', event=dict(capture='armed', presence='mapped',
+            entries=dict(count=None), identity_context=dict(caller=dict(pid=123),
+            module=dict(path='/owned/provider-A.so'))))
+        self.assertFalse(view.consume([edge]))
+        self.assertIsNone(view.edge)
+        self.assertTrue(view.consume([dict(kind='pass_committed')]))
+        self.assertEqual(view.edge['capture'], 'armed')
+        for row in (dict(edge, event={**edge['event'], 'identity_context':dict(caller=dict(pid=124), module=dict(path='/owned/provider-A.so'))}),
+                    dict(edge, event={**edge['event'], 'identity_context':dict(caller=dict(pid=123), module=dict(path='/foreign/provider-A.so'))})):
+            other = module['CaptureView'](123, '/owned/provider-A.so')
+            other.consume([row, dict(kind='pass_committed')])
+            self.assertIsNone(other.edge)
+
+    def test_saved_capture_population_and_exact_primary_count_controls(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/capture_inventory_pair.py'))
+        document = dict(schema='p11scope/inventory/v1',callers=[dict(pid=123)],modules=[dict(id='m0')],
+            edges=[dict(entries=dict(count=5))],observation=dict(lane='native',retirement='closed'))
+        self.assertEqual(module['check_snapshot'](document), 5)
+        for mutation in ('empty', 'count', 'lane', 'retirement'):
+            changed = copy.deepcopy(document)
+            if mutation == 'empty': changed['edges'] = []
+            elif mutation == 'count': changed['edges'][0]['entries']['count'] = 4
+            elif mutation == 'lane': changed['observation']['lane'] = 'scan'
+            else: changed['observation']['retirement'] = 'open'
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['check_snapshot'](changed)
+
+
+class ReporterControlAdapterTests(unittest.TestCase):
+    def test_gate_pipe_acquisition_leaves_no_owned_fds_on_first_pipe_failure(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        descriptors = []
+        def fail_first(flags):
+            raise OSError('owned first-pipe failure')
+        with mock.patch.object(negative['gate_pipes'].__globals__['os'], 'pipe2', fail_first):
+            with self.assertRaisesRegex(OSError, 'first-pipe'):
+                negative['gate_pipes'](descriptors)
+        self.assertEqual(descriptors, [])
+
+    def test_partial_gate_pipe_acquisition_remains_owned_on_second_pipe_failure(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        pipe2, descriptors = os.pipe2, []
+        calls = 0
+        def fail_second(flags):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError('owned second-pipe failure')
+            return pipe2(flags)
+        try:
+            with mock.patch.object(negative['gate_pipes'].__globals__['os'], 'pipe2', fail_second):
+                with self.assertRaisesRegex(OSError, 'second-pipe'):
+                    negative['gate_pipes'](descriptors)
+            self.assertEqual(len(descriptors), 2)
+            for fd in descriptors:
+                os.fstat(fd)
+        finally:
+            for fd in descriptors:
+                os.close(fd)
+        for fd in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_negative_adapter_shares_original_entrypoint_signal_custody(self):
+        base = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'),
+                                 init_globals={'BASE': base})
+        self.assertIs(negative['BASE'], base)
+        self.assertIs(negative['NATIVE'], base['NATIVE'])
+        self.assertIs(negative['PROBE'], base['PROBE'])
+        with base['NATIVE'].signal_cleanup():
+            self.assertIsNotNone(negative['NATIVE'].cleanup_section())
+            self.assertIs(negative['NATIVE'].spawn_owned.__globals__['_active_signals'],
+                          base['NATIVE'].spawn_owned.__globals__['_active_signals'])
+
+    def test_worker_delivery_negative_requires_gated_main_prompt_delivery_and_late_entry(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2,
+                        ino=3, file_offset=80, ip=0x1234)
+        worker_expected = dict(expected, tid=124, start_time=10)
+        callback_expected = dict(worker_expected, role='callback', file_offset=100, ip=0x1250)
+        def ready(binding):
+            return dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                **{key: value for key, value in binding.items() if key != 'ip'})
+        def final(samples):
+            return dict(kind='final', mode='perf_uprobe', samples=samples, lost=0, kernel_count=samples,
+                        time_enabled=500, time_running=500)
+        callback = [ready(callback_expected), dict(kind='callback', mode='perf_uprobe',
+            pid=123, tid=124, ip=0x1250, t_ns=700), final(1)]
+        worker = [ready(worker_expected), final(0)]
+        reporter = [ready(expected), dict(kind='reporter', mode='perf_uprobe',
+            pid=123, tid=123, ip=0x1234, t_ns=160000800), final(1)]
+        gates = [dict(kind=kind, pid=123, tid=123, clock='CLOCK_MONOTONIC', t_ns=stamp)
+                 for kind, stamp in [('entered', 200), ('released', 160000700)]]
+        signals = [dict(signal='SIGINT', t_ns=600, delivery='tgkill_original_worker', tid=124)]
+        diagnostics = b'p11scope: cancel: loop exited on signal 2 after 2 ticks\n'
+        call = module['validate_worker_negative']
+        verdict = call(callback, callback_expected, worker, worker_expected, reporter,
+                       expected, gates, signals, 160000600, diagnostics)
+        self.assertEqual((verdict['worker_samples'], verdict['worker_delivery_ns'],
+                          verdict['late_main_observation_ns']), (0, 700, 160000800))
+        for mutation in ('worker-on-main', 'foreign-process', 'foreign-candidate', 'callback-wrong-task',
+                         'callback-main-kind', 'callback-role-expected', 'shared-offset', 'zero-enabled-worker',
+                         'zero-enabled-callback', 'loss-worker', 'loss-callback', 'worker-event',
+                         'slow-delivery', 'pre-signal-delivery', 'premature-main', 'prompt-main',
+                         'early-release', 'early-gate-release', 'interrupted-main', 'late-entered',
+                         'foreign-gate', 'gate-clock', 'missing-marker', 'multiplex', 'main-signal',
+                         'bool-counter', 'worker-ready-missing', 'worker-ready-post-signal',
+                         'main-ready-post-signal', 'signal-wrong-tid', 'signal-missing-tid'):
+            c, w, r, g, e, sent, release = (copy.deepcopy(callback), copy.deepcopy(worker),
+                copy.deepcopy(reporter), copy.deepcopy(gates), dict(worker_expected),
+                copy.deepcopy(signals), 160000600)
+            marker = diagnostics
+            if mutation == 'worker-on-main': e['tid'] = w[0]['tid'] = 123
+            elif mutation == 'foreign-process': e['pid'] = w[0]['pid'] = 456
+            elif mutation == 'foreign-candidate': e['ino'] = w[0]['ino'] = 999
+            elif mutation == 'callback-wrong-task': c[1]['tid'] = 125
+            elif mutation == 'callback-main-kind': c[1]['kind'] = 'reporter'
+            elif mutation == 'callback-role-expected': ce_role = 'reporter'
+            elif mutation == 'shared-offset': ce_offset = 80
+            elif mutation == 'zero-enabled-worker': w[1].update(time_enabled=0, time_running=0)
+            elif mutation == 'zero-enabled-callback': c[2].update(time_enabled=0, time_running=0)
+            elif mutation == 'loss-worker': w[1]['lost'] = 1
+            elif mutation == 'loss-callback': c[2]['lost'] = 1
+            elif mutation == 'worker-event': w[1].update(samples=1, kernel_count=1)
+            elif mutation == 'slow-delivery': c[1]['t_ns'] = 100000600
+            elif mutation == 'pre-signal-delivery': c[1]['t_ns'] = 599
+            elif mutation == 'premature-main': r[1]['t_ns'] = 160000599
+            elif mutation == 'prompt-main': r[1]['t_ns'] = 700
+            elif mutation == 'early-release': release = 149000600
+            elif mutation == 'early-gate-release': g[1]['t_ns'] = 149000700
+            elif mutation == 'interrupted-main':
+                g.insert(1, dict(kind='interrupted', pid=123, tid=123, clock='CLOCK_MONOTONIC', t_ns=800))
+            elif mutation == 'late-entered': g[0]['t_ns'] = 601
+            elif mutation == 'foreign-gate': g[1]['tid'] += 1
+            elif mutation == 'gate-clock': g[1]['clock'] = 'CLOCK_REALTIME'
+            elif mutation == 'missing-marker': marker = b''
+            elif mutation == 'multiplex': r[2]['time_running'] -= 1
+            elif mutation == 'main-signal': sent[0].pop('delivery')
+            elif mutation == 'worker-ready-missing': w[0].pop('t_ns')
+            elif mutation == 'worker-ready-post-signal': w[0]['t_ns'] = 601
+            elif mutation == 'main-ready-post-signal': r[0]['t_ns'] = 601
+            elif mutation == 'signal-wrong-tid': sent[0]['tid'] = 999
+            elif mutation == 'signal-missing-tid': sent[0].pop('tid')
+            else: w[1]['kernel_count'] = False
+            ce = dict(callback_expected)
+            if mutation == 'callback-role-expected': ce['role'] = ce_role
+            if mutation == 'shared-offset': ce['file_offset'] = ce_offset
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                call(c, ce, w, e, r, expected, g, sent, release, marker)
+
+    def test_handler_blocked_oracle_requires_actual_delivery_gate_and_late_reporter(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2,
+                        ino=3, file_offset=80, ip=0x1234)
+        callback_expected = dict(expected, role='callback', file_offset=100, ip=0x1250)
+        def rows(binding, stamp):
+            return [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=100,
+                         **{key: value for key, value in binding.items() if key != 'ip'}),
+                    dict(kind=binding['role'], mode='perf_uprobe', pid=123, tid=123,
+                         ip=binding['ip'], t_ns=stamp),
+                    dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                         time_enabled=200000000, time_running=200000000)]
+        reporter, callback = rows(expected, 160000800), rows(callback_expected, 700)
+        gates = [dict(kind=kind, pid=123, tid=123, clock='CLOCK_MONOTONIC', t_ns=stamp)
+                 for kind, stamp in [('entered', 200), ('interrupted', 800), ('released', 160000700)]]
+        signals = [dict(signal='SIGINT', t_ns=600)]
+        diagnostics = b'p11scope: cancel: loop exited on signal 2 after 2 ticks\n'
+        call = module['validate_handler_blocked']
+        self.assertTrue(call(reporter, expected, callback, callback_expected, gates,
+                             signals, 160000600, diagnostics)['late_reporter_rejected'])
+        for mutation in ('missing-callback', 'missing-eintr', 'foreign-gate', 'gate-clock',
+                         'before-delivery', 'early-release', 'reporter-before-consumption',
+                         'pre-release-reporter', 'foreign-callback-ip',
+                         'lost-callback', 'multiplex-reporter', 'callback-as-ack', 'bool-time'):
+            r, c, g, release = copy.deepcopy(reporter), copy.deepcopy(callback), copy.deepcopy(gates), 160000600
+            if mutation == 'missing-callback': c.pop(1)
+            elif mutation == 'missing-eintr': g.pop(1)
+            elif mutation == 'foreign-gate': g[1]['tid'] += 1
+            elif mutation == 'gate-clock': g[1]['clock'] = 'CLOCK_REALTIME'
+            elif mutation == 'before-delivery': g[1]['t_ns'] = 699
+            elif mutation == 'early-release': release = 149000600
+            elif mutation == 'reporter-before-consumption': r[1]['t_ns'] = 160000699
+            elif mutation == 'pre-release-reporter': r[1]['t_ns'] = 160000599
+            elif mutation == 'foreign-callback-ip': c[1]['ip'] += 1
+            elif mutation == 'lost-callback': c[2]['lost'] = 1
+            elif mutation == 'multiplex-reporter': r[2]['time_running'] -= 1
+            elif mutation == 'callback-as-ack': r = copy.deepcopy(c)
+            else: g[1]['t_ns'] = True
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                call(r, expected, c, callback_expected, g, signals, release, diagnostics)
+        with self.assertRaises(ValueError):
+            call(reporter, expected, callback, callback_expected, gates, signals, 160000600, diagnostics[:-1])
+
+    def test_parked_tripwire_pins_refusal_and_flips_loudly(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        call = negative['check_tripwire_refusal']
+        healthy = dict(tid=124, rc=2, ready_tid=124, kinds=['ready'], delta_ns=0,
+                       stderr='reporter-probe: kernel event/sample/loss/enabled counters disagree\n')
+        self.assertTrue(call(dict(healthy))['refused'])
+        for mutation in ('reconciled', 'wrong-rc', 'sampled', 'finalized', 'wrong-stderr',
+                         'scheduled', 'clock-regressed', 'wrong-task', 'unmeasured'):
+            raw = dict(healthy)
+            if mutation == 'reconciled':
+                raw.update(rc=0, kinds=['ready', 'final'])
+            elif mutation == 'wrong-rc':
+                raw['rc'] = 1
+            elif mutation == 'sampled':
+                raw['kinds'] = ['ready', 'reporter']
+            elif mutation == 'finalized':
+                raw['kinds'] = ['ready', 'final']
+            elif mutation == 'wrong-stderr':
+                raw['stderr'] = 'reporter-probe: bounded probe expired before owned stop\n'
+            elif mutation == 'scheduled':
+                raw['delta_ns'] = 12000
+            elif mutation == 'clock-regressed':
+                raw['delta_ns'] = -5
+            elif mutation == 'wrong-task':
+                raw['ready_tid'] = 125
+            else:
+                raw['delta_ns'] = None
+            with self.subTest(mutation=mutation):
+                try:
+                    call(raw)
+                except ValueError as error:
+                    self.assertIn('tripwire flipped', str(error))
+                    self.assertEqual(error.tripwire_evidence['tid'], 124)
+                else:
+                    self.fail(f'tripwire flip was not refused: {mutation}')
+
+    def test_task_runtime_reads_actual_schedstat_nanoseconds(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        main_tid = threading.get_native_id()
+        first = negative['read_task_runtime'](os.getpid(), main_tid)
+        self.assertIs(type(first), int)
+        self.assertGreaterEqual(first, 0)
+        stop = threading.Event()
+        def spin():
+            while not stop.is_set():
+                pass
+        spinner = threading.Thread(target=spin)
+        spinner.start()
+        try:
+            before = negative['read_task_runtime'](os.getpid(), spinner.native_id)
+            time.sleep(0.05)
+            after = negative['read_task_runtime'](os.getpid(), spinner.native_id)
+        finally:
+            stop.set()
+            spinner.join(timeout=5)
+        self.assertGreater(after, before)
+        with self.assertRaises(OSError):
+            negative['read_task_runtime'](os.getpid(), 1 << 30)
+
+    def test_tripwire_delta_distinguishes_parked_from_scheduled_thread(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        stop, gate, parked_ready = threading.Event(), threading.Event(), threading.Event()
+        def spin():
+            while not stop.is_set():
+                pass
+        def park():
+            parked_ready.set()
+            gate.wait(30)
+        spinner, parked = threading.Thread(target=spin), threading.Thread(target=park)
+        parked.start()
+        self.assertTrue(parked_ready.wait(5))
+        wait_task_sleep(os.getpid(), parked.native_id)
+        spinner.start()
+        try:
+            pid, main_tid = os.getpid(), threading.get_native_id()
+            before = negative['snapshot_worker_runtimes'](pid, main_tid)
+            self.assertIn(spinner.native_id, before)
+            self.assertIn(parked.native_id, before)
+            self.assertNotIn(main_tid, before)
+            time.sleep(0.05)
+            after = negative['snapshot_worker_runtimes'](pid, main_tid)
+            self.assertGreater(after[spinner.native_id] - before[spinner.native_id], 0)
+            self.assertEqual(after[parked.native_id] - before[parked.native_id], 0)
+        finally:
+            stop.set()
+            gate.set()
+            spinner.join(timeout=5)
+            parked.join(timeout=5)
+
+    def test_worker_pin_selects_lowest_unblocked_task_and_refuses_blocked_field(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        gate, ready = threading.Event(), threading.Event()
+        blocked_gate, blocked_ready = threading.Event(), threading.Event()
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sigemptyset.argtypes = (ctypes.c_void_p,)
+        libc.sigemptyset.restype = ctypes.c_int
+        libc.sigaddset.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        libc.sigaddset.restype = ctypes.c_int
+        libc.pthread_sigmask.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        libc.pthread_sigmask.restype = ctypes.c_int
+        def park():
+            ready.set()
+            gate.wait(30)
+        def park_blocked():
+            mask = (ctypes.c_ulong * 16)()
+            libc.sigemptyset(mask)
+            libc.sigaddset(mask, 2)
+            if libc.pthread_sigmask(0, mask, None):
+                raise OSError(ctypes.get_errno(), 'test pthread_sigmask failed')
+            blocked_ready.set()
+            blocked_gate.wait(30)
+        first, second = threading.Thread(target=park), threading.Thread(target=park_blocked)
+        first.start()
+        self.assertTrue(ready.wait(5))
+        wait_task_sleep(os.getpid(), first.native_id)
+        second.start()
+        worker = None
+        try:
+            self.assertTrue(blocked_ready.wait(5))
+            wait_task_sleep(os.getpid(), second.native_id)
+            pid = os.getpid()
+            blocked, caught = negative['read_sig_disposition'](pid, second.native_id)
+            self.assertTrue(blocked & 0x2, 'blocked test thread must actually block SIGINT')
+            observer = mock.Mock()
+            observer.pid = pid
+            chosen, evidence = negative['select_worker_tid'](observer)
+            self.assertEqual(chosen, first.native_id)
+            self.assertTrue(evidence['tasks'][first.native_id]['selectable'])
+            self.assertFalse(evidence['tasks'][second.native_id]['selectable'])
+            worker = negative['Worker'](observer, chosen)
+            self.assertEqual(worker.tid, first.native_id)
+            self.assertIn('blocked', worker.sigint)
+            worker.verify()
+            with self.assertRaisesRegex(ValueError, 'cannot receive targeted SIGINT'):
+                negative['Worker'](observer, second.native_id)
+        finally:
+            gate.set()
+            blocked_gate.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            if worker is not None:
+                worker.close()
+
+    def test_worker_pin_refuses_a_fully_blocked_field_with_evidence(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sigemptyset.argtypes = (ctypes.c_void_p,)
+        libc.sigemptyset.restype = ctypes.c_int
+        libc.sigaddset.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        libc.sigaddset.restype = ctypes.c_int
+        libc.pthread_sigmask.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        libc.pthread_sigmask.restype = ctypes.c_int
+        gate, ready = threading.Event(), threading.Event()
+        def park_blocked():
+            mask = (ctypes.c_ulong * 16)()
+            libc.sigemptyset(mask)
+            libc.sigaddset(mask, 2)
+            if libc.pthread_sigmask(0, mask, None):
+                raise OSError(ctypes.get_errno(), 'test pthread_sigmask failed')
+            ready.set()
+            gate.wait(30)
+        only = threading.Thread(target=park_blocked)
+        only.start()
+        try:
+            self.assertTrue(ready.wait(5))
+            wait_task_sleep(os.getpid(), only.native_id)
+            observer = mock.Mock()
+            observer.pid = os.getpid()
+            # Other test-runner threads may exist; pin the refusal to the
+            # blocked thread by presenting a one-entry task listing.
+            blocked, _ = negative['read_sig_disposition'](observer.pid, only.native_id)
+            self.assertTrue(blocked & 0x2)
+            entry = mock.Mock()
+            entry.name = str(only.native_id)
+            with mock.patch.object(negative['Path'], 'iterdir', return_value=iter([entry])):
+                try:
+                    negative['select_worker_tid'](observer)
+                except ValueError as error:
+                    self.assertIn('no live worker with unblocked SIGINT', str(error))
+                    self.assertFalse(error.disposition_evidence['tasks'][only.native_id]['selectable'])
+                else:
+                    self.fail('fully blocked field was not refused')
+        finally:
+            gate.set()
+            only.join(timeout=5)
+
+    def test_worker_bind_refuses_main_exited_and_non_task_targets(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        observer = mock.Mock()
+        observer.pid = os.getpid()
+        for bad in (observer.pid, 0, -3, True, 1 << 30):
+            with self.subTest(target=bad), self.assertRaises(ValueError):
+                negative['Worker'](observer, bad)
+
+    def test_pinned_worker_verify_fails_after_exit(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        gate, ready = threading.Event(), threading.Event()
+        def park():
+            ready.set()
+            gate.wait(30)
+        thread = threading.Thread(target=park)
+        thread.start()
+        worker = None
+        try:
+            self.assertTrue(ready.wait(5))
+            wait_task_sleep(os.getpid(), thread.native_id)
+            observer = mock.Mock()
+            observer.pid = os.getpid()
+            worker = negative['Worker'](observer, thread.native_id)
+            worker.verify()
+            gate.set()
+            thread.join(timeout=5)
+            with self.assertRaises((OSError, ValueError)):
+                worker.verify()
+        finally:
+            gate.set()
+            thread.join(timeout=5)
+            if worker is not None:
+                worker.close()
+
+    def test_no_signal_absence_waits_for_actual_delayed_reader_after_child_exit(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        gate, finish_started = threading.Event(), threading.Event()
+        result = []
+        class GatedStream:
+            def __iter__(self):
+                if not gate.wait(2):
+                    raise OSError('test reader gate never opened')
+                yield from child.stdout
+        class ObservedReader(HARNESS['NATIVE'].Reader):
+            def finish(self):
+                finish_started.set()
+                return super().finish()
+        with tempfile.TemporaryDirectory() as temporary:
+            child = subprocess.Popen([sys.executable, '-I', '-c',
+                'import os; os.write(1,b"p11scope: cancel: loop exited on signal 2 after 3 ticks\\n")'],
+                stdout=subprocess.PIPE, text=True)
+            reader = ObservedReader(GatedStream(), Path(temporary) / 'delayed-stderr')
+            collector = None
+            try:
+                self.assertEqual(child.wait(timeout=3), 0)
+                self.assertEqual(reader.lines, [], 'owned reader must still hold the late bytes')
+                def collect():
+                    try:
+                        module['observer_diagnostics'](reader, no_signal=True)
+                    except BaseException as error:
+                        result.append(error)
+                collector = threading.Thread(target=collect)
+                collector.start()
+                self.assertTrue(finish_started.wait(1), 'absence check must finish the actual reader first')
+                self.assertTrue(collector.is_alive())
+                gate.set()
+                collector.join(timeout=3)
+                self.assertFalse(collector.is_alive())
+                self.assertEqual(len(result), 1)
+                self.assertIsInstance(result[0], ValueError)
+                self.assertIn('no-signal', str(result[0]))
+                self.assertIn('p11scope: cancel:', ''.join(reader.lines))
+            finally:
+                gate.set()
+                if collector:
+                    collector.join(timeout=3)
+                reader.thread.join(timeout=3)
+                child.stdout.close()
+
+    def test_no_signal_control_cannot_accept_sample_fixture_loss_or_foreign_ready(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80)
+        rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', **expected),
+                dict(kind='final', mode='perf_uprobe', samples=0, kernel_count=0, lost=0,
+                     time_enabled=100, time_running=100)]
+        self.assertEqual(module['check_zero'](rows, expected)['no_signal_samples'], 0)
+        worker_expected = dict(expected, tid=124)
+        worker_rows = copy.deepcopy(rows)
+        worker_rows[0]['tid'] = 124
+        with self.assertRaises(ValueError):
+            module['check_zero'](worker_rows, worker_expected)
+        for mutation in ('sample', 'fixture', 'loss', 'foreign', 'multiplex', 'callback-role'):
+            changed = copy.deepcopy(rows)
+            if mutation == 'sample': changed[1]['samples'] = 1
+            elif mutation == 'fixture': changed[0]['mode'] = 'decode_fixture'
+            elif mutation == 'loss': changed[1]['lost'] = 1
+            elif mutation == 'foreign': changed[0]['ino'] += 1
+            elif mutation == 'callback-role': changed[0]['role'] = 'callback'
+            else: changed[1]['time_running'] = 99
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['check_zero'](changed, expected)
+
+
+class CancellationMarkerTests(unittest.TestCase):
+    def test_only_sent_first_signal_gets_one_conservative_arrival_timestamp(self):
+        receipt = dict(signals=[], cancellation_ack_ns=None)
+        line = b'p11scope: cancel: signal 2 observed during finalization after 3 ticks\n'
+        record = HARNESS['record_cancellation_marker']
+        with mock.patch.object(record.__globals__['time'], 'monotonic_ns', side_effect=[700, 900]):
+            record(receipt, line)
+            self.assertIsNone(receipt['cancellation_ack_ns'])
+            receipt['signals'].append(dict(signal='SIGINT', t_ns=600))
+            record(receipt, line[:-1])
+            self.assertIsNone(receipt['cancellation_ack_ns'])
+            record(receipt, line)
+            self.assertEqual(receipt['cancellation_ack_ns'], 700)
+            self.assertEqual(receipt['cancellation_ack']['phase'], 'finalization')
+            record(receipt, line)
+            self.assertEqual(receipt['cancellation_ack_ns'], 700, 'final drain must retain earlier arrival bound')
+            with self.assertRaises(ValueError):
+                record(receipt, line + line)
+
+    def test_complete_live_and_late_first_signal_markers(self):
+        for phase, line in (
+                ('capture', b'p11scope: cancel: loop exited on signal 2 after 7 ticks\n'),
+                ('finalization', b'p11scope: cancel: signal 2 observed during finalization after 7 ticks\n')):
+            with self.subTest(phase=phase):
+                self.assertEqual(HARNESS['cancellation_marker'](b'other diagnostic\n' + line, 2),
+                                 dict(signal=2, ticks=7, phase=phase, channel='readable_stderr'))
+                self.assertIsNone(HARNESS['cancellation_marker'](line[:-1], 2), 'partial line is not an ACK')
+                with self.assertRaises(ValueError):
+                    HARNESS['cancellation_marker'](line, 15)
+                with self.assertRaises(ValueError):
+                    HARNESS['cancellation_marker'](line + line, 2)
+        for phase, template in (
+                ('capture', b'p11scope: cancel: loop exited on signal 2 after %d ticks\n'),
+                ('finalization', b'p11scope: cancel: signal 2 observed during finalization after %d ticks\n')):
+            with self.subTest(phase=phase, boundary='u64-ticks'):
+                ceiling = template % (2**64 - 1)
+                self.assertEqual(HARNESS['cancellation_marker'](ceiling, 2)['ticks'], 2**64 - 1)
+                with self.assertRaises(ValueError):
+                    HARNESS['cancellation_marker'](template % 2**64, 2)
+        for data in (b'', b'noise p11scope: cancel: loop exited on signal 2 after 7 ticks\n',
+                     b'p11scope: cancel: loop exited on signal 2 after -1 ticks\n',
+                     b'p11scope: cancel: signal 2 observed in worker after 7 ticks\n'):
+            self.assertIsNone(HARNESS['cancellation_marker'](data, 2))
+
+
+class FdControls(unittest.TestCase):
+    def test_atomic_writer_stalls_before_pipe_byte_capacity_is_full(self):
+        pipe = HARNESS['OutputPipe']()
+        try:
+            os.set_blocking(pipe.write_fd, False)
+            self.assertEqual(os.write(pipe.write_fd, b'H' * 169), 169)
+            with self.assertRaises(BlockingIOError):
+                os.write(pipe.write_fd, b'X' * 4096)
+            self.assertFalse(pipe.full(), 'this regression requires occupancy below4096')
+            self.assertTrue(pipe.stalled(), 'actual atomic write returned EAGAIN')
+            self.assertEqual(pipe.drain_available(), b'H' * 169)
+            self.assertFalse(pipe.stalled(), 'empty pipe cannot qualify pressure')
+            self.assertEqual(os.write(pipe.write_fd, b'X' * 4096), 4096)
+            self.assertEqual(pipe.drain_available(), b'H' * 169 + b'X' * 4096)
+        finally:
+            pipe.close()
+
+    def test_real_writer_stalls_and_drain_counts_exact_bytes(self):
+        pipe = HARNESS['OutputPipe']()
+        child = None
+        try:
+            child = subprocess.Popen([sys.executable, '-I', '-c',
+                'import os; os.write(1, b"X" * 8192)'], stdout=pipe.write_fd)
+            pipe.close_writer()
+            deadline = time.monotonic() + 3
+            while not pipe.full() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(pipe.full(), 'actual output never filled the pipe')
+            self.assertIsNone(child.poll(), 'writer must still be blocked')
+            while child.poll() is None:
+                pipe.drain_available()
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            child.wait(timeout=1)
+            self.assertEqual(pipe.drain_available(), b'X' * 8192)
+        finally:
+            if child and child.poll() is None:
+                child.kill()
+                child.wait(timeout=1)
+            pipe.close()
+
+    def test_held_child_stdout_does_not_require_eof_for_reap_measurement(self):
+        pipe = HARNESS['OutputPipe']()
+        holder = None
+        try:
+            holder = subprocess.Popen([sys.executable, '-I', '-c',
+                'import os,time; os.write(1,b"held"); time.sleep(60)'], stdout=pipe.write_fd)
+            pipe.close_writer()
+            deadline = time.monotonic() + 3
+            while len(pipe.received) < 4:
+                pipe.read()
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            begin = time.monotonic()
+            self.assertEqual(pipe.drain_available(), b'held')
+            self.assertLess(time.monotonic() - begin, 0.1)
+            self.assertIsNone(holder.poll(), 'stdout owner should still hold its fd')
+        finally:
+            if holder:
+                holder.terminate()
+                holder.wait(timeout=1)
+            pipe.close()
+
+    def test_regular_file_limit_is_real_failed_io_not_authoritative_trace(self):
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run([sys.executable, '-I', '-c',
+                'import os; os.write(1,b"X"*65536); os.write(1,b"Y")'],
+                stdout=output, stderr=subprocess.PIPE, preexec_fn=HARNESS['file_limit'])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(os.fstat(output.fileno()).st_size, 65536)
+            self.assertIn(b'File too large', result.stderr)
+
+    def test_matrix_enumerates_exact_27_cells(self):
+        self.assertEqual(len(HARNESS['CELLS']), 27)
+        self.assertEqual(len(set(HARNESS['CELLS'])), 27)
+
+
+def blocked_fixture():
+    """A healthy blocked-stderr cell: independent ACK, pressure, custody, deps."""
+    ledger, receipt, evidence, counts = fixture()
+    receipt.update(cancel='midcapture', signals=[dict(signal='SIGINT', t_ns=400)],
+                   stderr_blocked=True, stderr_stalled=True, stderr_buffered_bytes=4096,
+                   stderr_release_ns=1_400_000_400,
+                   reporter_ack=dict(channel='owned_perf_reporter', ack_ns=50_000_400),
+                   reporter_kernel=dict(samples=1, kernel_count=1, lost=0),
+                   observer_reaped_after_probe=True,
+                   candidate_sha256='c' * 64,
+                   reporter_controls=dict(source_revision='a' * 40, candidate_sha256='c' * 64,
+                                          passed=['handlerblocked', 'none', 'wrongworker']))
+    return ledger, receipt, evidence, counts
+
+
+def blocked_summary(sha256, source='a' * 40):
+    cells = ['none', 'readable', 'repeated', 'delayed', 'wrongexe', 'wrongprocess',
+             'handlerblocked', 'wrongworker']
+    return dict(source_revision=source,
+                candidate=dict(path='/owned/p11scope', sha256=sha256),
+                controls=[dict(cell=name, control_pass=True,
+                               candidate=dict(path='/owned/p11scope', sha256=sha256))
+                          for name in cells],
+                remaining=['blocked-stderr E17 cell execution on this candidate'],
+                qualification='owned reporter controls only; no blocked-stderr or full E17 acceptance')
+
+
+class BlockedStderrOracleTests(unittest.TestCase):
+    def check(self, ledger, receipt, evidence, counts, stdout=None):
+        trace = render(counts, evidence)
+        return ORACLE['evaluate'](trace, trace if stdout is None else stdout, ledger, receipt)
+
+    def test_healthy_blocked_stderr_with_independent_ack_passes(self):
+        result = self.check(*blocked_fixture())
+        self.assertTrue(result['pass'], result)
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(result['cancellation_response_seconds'], 0.05)
+
+    def test_healthy_blocked_stderr_lossy_content_passes(self):
+        ledger, receipt, evidence, counts = blocked_fixture()
+        receipt.update(sink='slowpipe', stdout_stalled=True)
+        evidence['scheduling']['sink_timeouts'] = 1
+        evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(counts, evidence)
+        result = ORACLE['evaluate'](trace, trace[17:], ledger, receipt)
+        self.assertTrue(result['pass'], result)
+
+    def test_blocked_stderr_gates_fail_closed(self):
+        cases = {
+            # Missing measurement stays unqualified, never a pass.
+            'no-deps': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt.pop('reporter_controls')),
+            'missing-dep': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt['reporter_controls']['passed'].remove('none')),
+            'foreign-dep-source': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt['reporter_controls'].update(source_revision='0' * 40)),
+            'foreign-dep-candidate': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt['reporter_controls'].update(candidate_sha256='0' * 64)),
+            'no-ack': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt.update(reporter_ack=None)),
+            # Corrupt or late evidence is a failure, never unqualified silence.
+            'same-channel': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_ack'].update(channel='readable_stderr')),
+            'slow-ack': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_ack'].update(ack_ns=100_000_400)),
+            'pre-signal-ack': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_ack'].update(ack_ns=399)),
+            'kernel-loss': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_kernel'].update(lost=1)),
+            'kernel-count': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_kernel'].update(kernel_count=2)),
+            'no-pressure': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(stderr_stalled=False)),
+            'zero-buffered': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(stderr_buffered_bytes=0)),
+            'early-release': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(stderr_release_ns=50_000_399)),
+            'reaped-before-probe': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(observer_reaped_after_probe=False)),
+        }
+        for name, (status, mutate) in cases.items():
+            with self.subTest(gate=name):
+                ledger, receipt, evidence, counts = blocked_fixture()
+                mutate(ledger, receipt, evidence, counts)
+                result = self.check(ledger, receipt, evidence, counts)
+                self.assertFalse(result['pass'], result)
+                self.assertEqual(result['status'], status, result)
+
+    def test_blocked_stderr_does_not_waive_stdout_content(self):
+        ledger, receipt, evidence, counts = blocked_fixture()
+        trace = render(counts, evidence)
+        shed = ORACLE['evaluate'](trace, trace[1:], ledger, receipt)
+        self.assertFalse(shed['pass'])
+        self.assertEqual(shed['status'], 'FAIL', shed)
+        receipt.update(sink='slowpipe', stdout_stalled=True)
+        evidence['scheduling']['sink_timeouts'] = 1
+        evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(counts, evidence)
+        lossy = ORACLE['evaluate'](trace, b'X' * (len(trace) - 17), ledger, receipt)
+        self.assertFalse(lossy['pass'])
+        self.assertEqual(lossy['status'], 'NOT_RUN', lossy)
+
+
+class BlockedStderrDependencyTests(unittest.TestCase):
+    def test_controls_summary_binds_same_source_candidate_and_required_cells(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/blocked_stderr.py'))
+        healthy = blocked_summary('c' * 64)
+        verdict = module['check_dependencies'](healthy, source_revision='a' * 40, candidate_sha256='c' * 64)
+        self.assertEqual(verdict['passed'], ['handlerblocked', 'none', 'wrongworker'])
+        for name, mutate, source, sha in (
+                ('missing-cell', lambda summary: summary['controls'].pop(0), 'a' * 40, 'c' * 64),
+                ('failed-cell', lambda summary: summary['controls'][0].update(control_pass=False), 'a' * 40, 'c' * 64),
+                ('foreign-source', lambda summary: None, '0' * 40, 'c' * 64),
+                ('foreign-candidate', lambda summary: None, 'a' * 40, '0' * 64),
+                ('mixed-control-candidate', lambda summary: summary['controls'][0]['candidate'].update(sha256='0' * 64), 'a' * 40, 'c' * 64),
+                ('malformed-control', lambda summary: summary['controls'].__setitem__(0, 'none'), 'a' * 40, 'c' * 64)):
+            with self.subTest(gate=name):
+                summary = blocked_summary('c' * 64)
+                mutate(summary)
+                with self.assertRaises(ValueError):
+                    module['check_dependencies'](summary, source_revision=source, candidate_sha256=sha)
+
+    def test_controls_summary_loader_rejects_oversize_and_malformed_inputs(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/blocked_stderr.py'))
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / 'healthy.json').write_text(json.dumps(blocked_summary('c' * 64)))
+            self.assertEqual(module['load_controls_summary'](root / 'healthy.json')['source_revision'], 'a' * 40)
+            (root / 'malformed.json').write_text('{')
+            (root / 'wrong-shape.json').write_text(json.dumps(['none']))
+            (root / 'oversize.json').write_bytes(b'{' + b'0' * (1024 * 1024) + b'}')
+            for name in ('malformed.json', 'wrong-shape.json', 'oversize.json', 'absent.json'):
+                with self.subTest(gate=name):
+                    with self.assertRaises((ValueError, OSError)):
+                        module['load_controls_summary'](root / name)
+
+
+class BlockedStderrHarnessTests(unittest.TestCase):
+    def test_stall_witness_reports_positive_buffered_bytes(self):
+        pipe = HARNESS['OutputPipe']()
+        try:
+            os.set_blocking(pipe.write_fd, False)
+            self.assertEqual(os.write(pipe.write_fd, b'H' * 169), 169)
+            self.assertEqual(pipe.buffered(), 169)
+            with self.assertRaises(BlockingIOError):
+                os.write(pipe.write_fd, b'X' * 4096)
+            self.assertTrue(pipe.stalled())
+            self.assertEqual(pipe.buffered(), 169)
+        finally:
+            pipe.close()
+
+    def test_exit_detection_retains_unreaped_custody_only_for_blocked_cells(self):
+        observer = mock.Mock()
+        observer.wait_exit.return_value = True
+        observer.popen.poll.return_value = None
+        self.assertTrue(HARNESS['observer_exited'](observer, True))
+        observer.wait_exit.assert_called_once_with(0)
+        observer.popen.poll.assert_not_called()
+        observer.reset_mock()
+        observer.popen.poll.return_value = None
+        self.assertFalse(HARNESS['observer_exited'](observer, False))
+        observer.wait_exit.assert_not_called()
+        observer.popen.poll.assert_called_once_with()
+
+    def test_dependency_failure_returns_not_run_without_spawning(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            args = mock.Mock()
+            args.control = 'blocked-stderr'
+            args.calls = 3
+            args.source_revision = 'a' * 40
+            pin = mock.Mock()
+            with mock.patch.object(HARNESS['NATIVE'], 'spawn_owned',
+                                   side_effect=AssertionError('must not spawn without qualified dependencies')):
+                result = HARNESS['cell'](args, '4M-file-midcapture', Path(scratch), {},
+                                         pin, pin, pin, blocked={'error': 'reporter dependency none not passed'})
+        self.assertFalse(result['pass'])
+        self.assertEqual(result['status'], 'NOT_RUN')
+        self.assertTrue(any('none' in line for line in result['unqualified']))
+
+
+class BlockedStderrDryRunTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        sources = cls.root / 'reporter.c'
+        sources.write_text('#include <unistd.h>\nvoid reporter(int) __asm__("_ZN8p11scope3run21report_capture_cancel17h0123456789abcdefE");\n'
+            '__attribute__((noinline,used)) void reporter(int x) { __asm__ volatile("" : : "r"(x)); }\n'
+            'int main(void) { reporter(2); return 0; }\n')
+        cls.binary = cls.root / 'candidate'
+        built = subprocess.run(['cc', '-O2', '-fPIE', '-pie', str(sources), '-o', str(cls.binary)],
+            capture_output=True, text=True, timeout=20)
+        if built.returncode:
+            cls.temporary.cleanup()
+            raise AssertionError(built.stderr)
+        cls.helper = cls.root / 'reporter-probe'
+        helper = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(ROOT / 'tests/fixtures/operator-output/reporter-probe.c'), '-o', str(cls.helper)],
+            capture_output=True, text=True, timeout=20)
+        if helper.returncode:
+            cls.temporary.cleanup()
+            raise AssertionError(helper.stderr)
+        for name in ('provider.so', 'caller'):
+            (cls.root / name).write_bytes(b'owned dry-run input ' + name.encode())
+        digest = hashlib.sha256(cls.binary.read_bytes()).hexdigest()
+        (cls.root / 'controls.json').write_text(json.dumps(blocked_summary(digest)))
+        cls.digest = digest
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def dry_run(self, *extra):
+        out = self.root / f'plan-{time.monotonic_ns()}'
+        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/qualify-operator-output.py'),
+            '--dry-run', '--binary', str(self.binary), '--provider', str(self.root / 'provider.so'),
+            '--caller', str(self.root / 'caller'), '--reporter-probe', str(self.helper),
+            '--reporter-controls', str(self.root / 'controls.json'),
+            '--source-revision', 'a' * 40, '--uid', '1000', '--gid', '1000',
+            '--cells', '4M-file-midcapture', '--control', 'blocked-stderr',
+            '--out', str(out), *extra], capture_output=True, text=True, timeout=60)
+        return result, out
+
+    def test_dry_run_proves_blocked_stderr_wiring_without_privilege(self):
+        result, out = self.dry_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan['mode'], 'dry_run')
+        self.assertEqual(plan['cells'], ['4M-file-midcapture'])
+        self.assertGreater(plan['reporter_file_offset'], 0)
+        self.assertEqual(plan['dependencies']['passed'], ['handlerblocked', 'none', 'wrongworker'])
+        self.assertTrue(plan['pressure_selfcheck']['stalled'])
+        self.assertGreater(plan['pressure_selfcheck']['buffered_bytes'], 0)
+        self.assertFalse(out.exists(), 'a dry run must not create its output directory')
+
+    def test_dry_run_refuses_each_broken_input(self):
+        foreign = self.root / 'foreign.json'
+        foreign.write_text(json.dumps(blocked_summary('0' * 64)))
+        for name, mutate in (
+                ('missing-probe', ['--reporter-probe', '/absent/probe']),
+                ('probe-for-ordinary', ['--control', 'ordinary']),
+                ('bad-summary', ['--reporter-controls', str(self.root / 'caller')]),
+                ('foreign-source', ['--source-revision', '0' * 40]),
+                ('foreign-candidate', ['--reporter-controls', str(foreign)]),
+                ('unresolvable-symbol', ['--binary', '/bin/true']),
+                ('uncancelled-cell', ['--cells', '4M-file-none'])):
+            with self.subTest(gate=name):
+                # argparse keeps the last repeated flag, so the appended
+                # override deterministically replaces the healthy value.
+                result, _ = self.dry_run(*mutate)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -3,6 +3,26 @@
  * The raw clone worker makes no libc/TLS calls. Only that worker reads stdin
  * after THREAD; the leader waits outside the provider until killed by exec or
  * the failed-exec worker's final kernel clear_child_tid. No uretprobe unwinding.
+ * Mode argv[6]: '0' nonleader exec, '1' failed exec, '2' leader thread-exit then
+ * nonleader exec (the leader emits LEADER_EXIT, then exits; the worker owns
+ * everything after THREAD). H6-only mode '3' enters the held provider frame
+ * while the original leader is live; E permits that leader's exit, then X
+ * permits exec after the controller proves the original zombie/exact worker.
+ * Its initial W markers permit a real public readiness proof before G.
+ * Mode '2' remains the separate post-zombie worker capability protocol.
+ * The provider additionally
+ * exports a v2.40 C_GetFunctionList table (slot 0 is the real C_Initialize, the
+ * C_GetInfo is the zero-return warm-up marker, the rest distinct stubs) so public scan-only discovery can attach;
+ * the driver calls the getter once before READY. The getter itself is never a
+ * probed slot, so single-slot libtest counts are unchanged. Optional
+ * argv[7]/argv[8] set the after-image measured total (default 17) and the
+ * inter-call delay in ms (default 0); defaults preserve the exact legacy
+ * NEW_DONE counts. Opt-in argv[9]=1 (after argv[6]=1) admits real single-call
+ * W warm-up commands before P; WARM_DONE carries sequence/RV/call timestamps.
+ * H6-only argv[10..14] (after argv[7..11]) supply absolute monotonic leg/setup
+ * deadlines in ns and recovery/measurement/terminal-hold limits in ms. Every
+ * phase retains its first deadline; W heartbeats cannot renew recovery age.
+ * Without all five values the original argv and 30 s protocol stay unchanged.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -12,6 +32,12 @@
 #include <stdint.h>
 #include <sys/syscall.h>
 #include <time.h>
+
+/* Protocol tests can compress the legacy clock bound without a 30 s sleep.
+ * Normal builds and every old argv invocation retain the 30 s default. */
+#ifndef DETAILED_EXEC_LEGACY_WAIT_NS
+#define DETAILED_EXEC_LEGACY_WAIT_NS 30000000000UL
+#endif
 
 #if !defined(__x86_64__) || defined(__ILP32__)
 #error "This owned exec cell currently qualifies LP64 x86-64 only"
@@ -36,6 +62,12 @@ static unsigned long clock_ns(void) {
     struct timespec now;
     if (raw6(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&now, 0, 0, 0, 0)) fail(90);
     return (unsigned long)now.tv_sec * 1000000000UL + (unsigned long)now.tv_nsec;
+}
+
+static unsigned long bounded_phase_deadline(unsigned long milliseconds, unsigned long leg) {
+    if (!leg) return 0; /* receive_until keeps the legacy 30 s default. */
+    unsigned long deadline = clock_ns() + milliseconds * 1000000UL;
+    return deadline < leg ? deadline : leg;
 }
 
 static void write_all(int fd, const char *buffer, size_t length) {
@@ -73,8 +105,8 @@ static void emit(const char *phase, const unsigned long *fields, size_t count) {
     write_all(1, buffer, length);
 }
 
-static void receive(int fd, char expected) {
-    unsigned long deadline = clock_ns() + 30000000000UL;
+static char receive_command_until(int fd, unsigned long deadline) {
+    if (!deadline) deadline = clock_ns() + DETAILED_EXEC_LEGACY_WAIT_NS;
     for (;;) {
         unsigned long now = clock_ns();
         if (now >= deadline) fail(92);
@@ -83,11 +115,25 @@ static void receive(int fd, char expected) {
                           (long)((deadline - now + 999999UL) / 1000000UL), 0, 0, 0);
         if (ready == -EINTR || ready == 0) continue;
         if (ready < 0 || !(readiness.revents & POLLIN)) fail(93);
+        if (clock_ns() >= deadline) fail(92);
         char byte;
         long got = raw6(SYS_read, fd, (long)&byte, 1, 0, 0, 0);
         if (got == -EINTR) continue;
-        if (got != 1 || byte != expected) fail(94);
-        return;
+        if (got != 1) fail(94);
+        if (clock_ns() >= deadline) fail(92);
+        return byte;
+    }
+}
+
+static void receive(int fd, char expected) {
+    if (receive_command_until(fd, 0) != expected) fail(94);
+}
+
+static void receive_until(int fd, char expected, unsigned long deadline) {
+    if (!deadline) {
+        receive(fd, expected);
+    } else if (receive_command_until(fd, deadline) != expected) {
+        fail(94);
     }
 }
 
@@ -99,13 +145,20 @@ struct request {
     const char *exec_path;
     char *const *exec_argv;
     char *const *exec_envp;
+    unsigned long deadline_ns;
+    unsigned long leg_deadline_ns;
+    unsigned long measurement_ms;
+    unsigned long post_deadline_ns;
+    int release_leader;
+    int leader_exit_fd;
+    unsigned long leader_exit_deadline_ns;
 };
 
 #ifdef DETAILED_EXEC_PROVIDER
 
 __attribute__((noinline, visibility("default")))
 unsigned long C_Initialize(void *argument) {
-    const struct request *request = argument;
+    struct request *request = argument;
     __asm__ volatile("" ::: "memory");
     if (request->operation == 1) {
         unsigned long fields[] = {
@@ -113,23 +166,103 @@ unsigned long C_Initialize(void *argument) {
             (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0), request->token
         };
         emit("EXEC_BODY", fields, 3);
-        receive(0, 'X');
+        if (request->release_leader) {
+            /* The controller saw this physical entry while the original
+             * leader was live. Only this held frame consumes E; the leader
+             * waits on its private pipe, so no thread races for stdin. */
+            receive_until(0, 'E', request->leader_exit_deadline_ns);
+            emit("HELD_LEADER_RELEASE", fields, 3);
+            write_all(request->leader_exit_fd, "E", 1);
+        }
+        receive_until(0, 'X', request->deadline_ns);
         /* exec consumes the prepared argv/envp while this probed frame is live. */
         long result = raw6(SYS_execve, (long)request->exec_path,
                            (long)request->exec_argv, (long)request->exec_envp, 0, 0, 0);
         if (!request->expect_failure || result != -ENOENT) fail(95);
+        /* This failed-post phase owns R, the actual RV5 return and all 17
+         * remaining calls. Store its deadline in the still-live request so
+         * the worker cannot start another measurement allowance on return. */
+        request->post_deadline_ns = bounded_phase_deadline(request->measurement_ms,
+                                                         request->leg_deadline_ns);
         unsigned long failed[] = { fields[0], fields[1], (unsigned long)-result, request->token };
         emit("EXEC_FAILED", failed, 4);
-        receive(0, 'R');
+        receive_until(0, 'R', request->post_deadline_ns);
     } else if (request->operation == 2) {
         unsigned long fields[] = {
             (unsigned long)raw6(SYS_getpid, 0, 0, 0, 0, 0, 0),
             (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0), request->token
         };
         emit("POST_BODY", fields, 3);
-        receive(0, 'R');
+        receive_until(0, 'R', request->deadline_ns);
     }
     return request->rv;
+}
+
+/* v2.40 table for public-scan attachment: slot 0 is the real C_Initialize, slot 3
+ * is the real getter and slot 2 is the real warm-up marker; every other
+ * slot is an exported named stub the fixture never calls. Each stub has a
+ * distinct address and a distinct constant body so identical-code folding
+ * cannot alias the table. Slot order matches the provider the scan names. */
+#define EXEC_NAMED_STUBS \
+    Y(C_Finalize, 1) \
+    Y(C_GetSlotList, 4) Y(C_GetSlotInfo, 5) Y(C_GetTokenInfo, 6) \
+    Y(C_GetMechanismList, 7) Y(C_GetMechanismInfo, 8) \
+    Y(C_InitToken, 9) Y(C_InitPIN, 10) Y(C_SetPIN, 11) \
+    Y(C_OpenSession, 12) Y(C_CloseSession, 13) Y(C_CloseAllSessions, 14) \
+    Y(C_GetSessionInfo, 15) Y(C_GetOperationState, 16) Y(C_SetOperationState, 17) \
+    Y(C_Login, 18) Y(C_Logout, 19) \
+    Y(C_CreateObject, 20) Y(C_CopyObject, 21) Y(C_DestroyObject, 22) \
+    Y(C_GetObjectSize, 23) Y(C_GetAttributeValue, 24) Y(C_SetAttributeValue, 25) \
+    Y(C_FindObjectsInit, 26) Y(C_FindObjects, 27) Y(C_FindObjectsFinal, 28) \
+    Y(C_EncryptInit, 29) Y(C_Encrypt, 30) Y(C_EncryptUpdate, 31) Y(C_EncryptFinal, 32) \
+    Y(C_DecryptInit, 33) Y(C_Decrypt, 34) Y(C_DecryptUpdate, 35) Y(C_DecryptFinal, 36) \
+    Y(C_DigestInit, 37) Y(C_Digest, 38) Y(C_DigestUpdate, 39) Y(C_DigestKey, 40) \
+    Y(C_DigestFinal, 41) \
+    Y(C_SignInit, 42) Y(C_Sign, 43) Y(C_SignUpdate, 44) Y(C_SignFinal, 45) \
+    Y(C_SignRecoverInit, 46) Y(C_SignRecover, 47) \
+    Y(C_VerifyInit, 48) Y(C_Verify, 49) Y(C_VerifyUpdate, 50) Y(C_VerifyFinal, 51) \
+    Y(C_VerifyRecoverInit, 52) Y(C_VerifyRecover, 53) \
+    Y(C_DigestEncryptUpdate, 54) Y(C_DecryptDigestUpdate, 55) \
+    Y(C_SignEncryptUpdate, 56) Y(C_DecryptVerifyUpdate, 57) \
+    Y(C_GenerateKey, 58) Y(C_GenerateKeyPair, 59) \
+    Y(C_WrapKey, 60) Y(C_UnwrapKey, 61) Y(C_DeriveKey, 62) \
+    Y(C_SeedRandom, 63) Y(C_GenerateRandom, 64) \
+    Y(C_GetFunctionStatus, 65) Y(C_CancelFunction, 66) Y(C_WaitForSlotEvent, 67)
+#define Y(name, n) \
+    __attribute__((visibility("default"))) unsigned long name(void) { return 0x540ul + (n); }
+EXEC_NAMED_STUBS
+#undef Y
+
+__attribute__((noinline, visibility("default")))
+unsigned long C_GetInfo(void *argument) {
+    (void)argument;
+    __asm__ volatile("" ::: "memory");
+    return 0;
+}
+
+struct exec_function_list {
+    unsigned char major, minor;
+    void *functions[68];
+};
+
+static struct exec_function_list function_list;
+static int function_list_ready;
+
+__attribute__((visibility("default")))
+unsigned long C_GetFunctionList(void **list) {
+    if (!function_list_ready) {
+        function_list.major = 2;
+        function_list.minor = 40;
+        function_list.functions[0] = (void *)C_Initialize;
+        function_list.functions[2] = (void *)C_GetInfo;
+        function_list.functions[3] = (void *)C_GetFunctionList;
+#define Y(name, n) function_list.functions[n] = (void *)name;
+        EXEC_NAMED_STUBS
+#undef Y
+        function_list_ready = 1;
+    }
+    *list = &function_list;
+    return 0;
 }
 
 #else
@@ -146,6 +279,13 @@ unsigned long C_Initialize(void *argument) {
 
 typedef unsigned long (*call_fn)(void *);
 
+static unsigned long h6_leg, h6_setup, h6_recovery_ms, h6_measurement_ms, h6_hold_ms;
+static unsigned long h6_call_deadline;
+
+static unsigned long phase_deadline(unsigned long milliseconds) {
+    return bounded_phase_deadline(milliseconds, h6_leg);
+}
+
 static unsigned long positive(const char *text) {
     char *end = NULL;
     errno = 0;
@@ -154,9 +294,34 @@ static unsigned long positive(const char *text) {
     return value;
 }
 
+static unsigned long nonnegative(const char *text) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || !end || *end) fail(80);
+    return value;
+}
+
 static void calls(call_fn call, unsigned long first, unsigned long end,
-                  unsigned long *success, unsigned long *errors) {
+                  unsigned long *success, unsigned long *errors, unsigned long delay_ms) {
     for (unsigned long i = first; i < end; ++i) {
+        unsigned long deadline = h6_call_deadline ? h6_call_deadline : h6_leg;
+        if (deadline && clock_ns() >= deadline) fail(92);
+        if (delay_ms) {
+            unsigned long delay_ns = delay_ms * 1000000UL;
+            if (deadline) {
+                unsigned long now = clock_ns();
+                if (now >= deadline) fail(92);
+                if (delay_ns > deadline - now) delay_ns = deadline - now;
+            }
+            struct timespec wait = { .tv_sec = (long)(delay_ns / 1000000000UL),
+                                     .tv_nsec = (long)(delay_ns % 1000000000UL) };
+            while (nanosleep(&wait, &wait)) {
+                if (errno != EINTR) fail(105);
+                if (deadline && clock_ns() >= deadline) fail(92);
+            }
+        }
+        if (deadline && clock_ns() >= deadline) fail(92);
         struct request request = { .rv = (i & 1) ? 5 : 0 };
         unsigned long rv = call(&request);
         if (rv != request.rv) fail(96);
@@ -170,11 +335,14 @@ struct worker_args {
     call_fn call;
     int go;
     unsigned long parent;
+    int controller_gate;
     struct request exec;
 };
 
 static void kernel_join(int *child_tid) {
-    unsigned long deadline = clock_ns() + 30000000000UL;
+    /* This join spans the worker's entire protocol, including terminal F.
+     * Its independent legacy 30 s bound must not cut short an H6 stop. */
+    unsigned long deadline = h6_leg ? h6_leg : clock_ns() + DETAILED_EXEC_LEGACY_WAIT_NS;
     for (;;) {
         int observed = __atomic_load_n(child_tid, __ATOMIC_ACQUIRE);
         if (observed == 0) return;
@@ -187,30 +355,41 @@ static void kernel_join(int *child_tid) {
         };
         long result = raw6(SYS_futex, (long)child_tid, FUTEX_WAIT, observed,
                            (long)&timeout, 0, 0);
-        if (result != 0 && result != -EAGAIN && result != -EINTR) fail(99);
+        if (result != 0 && result != -EAGAIN && result != -EINTR
+            && !(h6_leg && result == -ETIMEDOUT)) fail(99);
     }
 }
 
 static int worker(void *argument) {
-    const struct worker_args *args = argument;
+    struct worker_args *args = argument;
     /* Parent-death custody is per-thread; clone does not copy the setting. */
     if (raw6(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0, 0)
         || (unsigned long)raw6(SYS_getppid, 0, 0, 0, 0, 0, 0) != args->parent) fail(100);
-    receive(args->go, 'W');
-    unsigned long success = 0, errors = 0;
-    calls(args->call, 0, 11, &success, &errors);
+    receive_until(args->go, 'W', h6_setup);
     unsigned long pid = (unsigned long)raw6(SYS_getpid, 0, 0, 0, 0, 0, 0);
     unsigned long tid = (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+    if (args->controller_gate) {
+        unsigned long waiting[] = { pid, tid };
+        emit("WORKER_WAIT", waiting, 2);
+        receive_until(0, 'B', h6_setup);
+        emit("WORKER_RELEASE", waiting, 2);
+    }
+    unsigned long success = 0, errors = 0;
+    calls(args->call, 0, 11, &success, &errors, 0);
     unsigned long completed[] = { pid, tid, 11, success, errors };
     emit("WORKER_DONE", completed, 5);
+    /* Python enters successor recovery before X. Start the fixture's finite
+     * recovery wait before EXEC_BODY publishes the frame awaiting X. */
+    args->exec.deadline_ns = phase_deadline(h6_recovery_ms);
     unsigned long actual_rv = args->call((void *)&args->exec);
     /* The successful branch cannot return; errno2 is never a PKCS#11 RV. */
     if (!args->exec.expect_failure || actual_rv != 5) fail(97);
     ++errors;
-    calls(args->call, 0, 17, &success, &errors);
+    h6_call_deadline = args->exec.post_deadline_ns;
+    calls(args->call, 0, 17, &success, &errors, 0);
     unsigned long done[] = { pid, tid, 29, success, errors, actual_rv };
     emit("DONE", done, 6);
-    receive(0, 'F');
+    receive_until(0, 'F', phase_deadline(h6_hold_ms));
     (void)raw6(SYS_exit, 0, 0, 0, 0, 0, 0);
     fail(101);
 }
@@ -218,16 +397,42 @@ static int worker(void *argument) {
 
 int main(int argc, char **argv) {
 #ifdef DETAILED_EXEC_AFTER
-    if (argc != 4) return 2;
+    if (argc < 4 || (argc > 7 && argc != 12)) return 2;
     unsigned long parent = positive(argv[2]), token = positive(argv[3]);
+    unsigned long measured = argc > 4 ? positive(argv[4]) : 17;
+    unsigned long delay_ms = argc > 5 ? nonnegative(argv[5]) : 0;
+    int opt_in = argc == 12;
+    int warm = argc > 6 && argv[6][0] == '1';
+    if (argc > 6 && ((!warm && !(opt_in && argv[6][0] == '0')) || argv[6][1])) return 3;
+    if (measured < 1 || measured > 10000 || delay_ms > 60000) return 3;
 #else
-    if (argc != 7) return 2;
+    if (argc < 7 || (argc > 10 && argc != 15)) return 2;
+    int opt_in = argc == 15;
     unsigned long parent = positive(argv[4]), token = positive(argv[5]);
     if (argv[2][0] != '/' || argv[3][0] != '/'
-        || (argv[6][0] != '0' && argv[6][0] != '1') || argv[6][1]) return 3;
+        || (argv[6][0] != '0' && argv[6][0] != '1' && argv[6][0] != '2'
+            && !(opt_in && argv[6][0] == '3')) || argv[6][1]) return 3;
+    /* Validate the after-image pacing passthrough before the worker exists. */
+    unsigned long passthrough_measured = argc > 7 ? positive(argv[7]) : 17;
+    unsigned long passthrough_delay = argc > 8 ? nonnegative(argv[8]) : 0;
+    if (passthrough_measured < 1 || passthrough_measured > 10000
+        || passthrough_delay > 60000) return 3;
+    if (argc > 9 && ((argv[9][0] != '1' && !(opt_in && argv[9][0] == '0')) || argv[9][1])) return 3;
     struct stat absent;
     if (lstat(argv[3], &absent) == 0 || errno != ENOENT) return 4;
 #endif
+    if (opt_in) {
+        int first = argc - 5;
+        h6_leg = positive(argv[first]);
+        h6_setup = positive(argv[first + 1]);
+        h6_recovery_ms = positive(argv[first + 2]);
+        h6_measurement_ms = positive(argv[first + 3]);
+        h6_hold_ms = positive(argv[first + 4]);
+        unsigned long now = clock_ns();
+        if ((h6_leg > now && h6_leg - now > 3600000000000UL)
+            || h6_setup > h6_leg || h6_recovery_ms > 3600000
+            || h6_measurement_ms > 3600000 || h6_hold_ms > 3600000) return 3;
+    }
     if (argv[1][0] != '/') return 5;
     /* Re-arm after exec before NEW_READY; check the actual parent's identity. */
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) || (unsigned long)getppid() != parent) return 6;
@@ -236,23 +441,69 @@ int main(int argc, char **argv) {
     call_fn call = (call_fn)dlsym(provider, "C_Initialize");
     struct stat physical;
     if (!call || stat(argv[1], &physical)) return 8;
+    /* Publish the table once so public scan-only discovery can attach. The
+     * getter itself is never a probed slot. */
+    typedef unsigned long (*list_fn)(void **);
+    list_fn get_list = (list_fn)dlsym(provider, "C_GetFunctionList");
+    void *table = NULL;
+    if (!get_list || get_list(&table) || !table) return 15;
     unsigned long pid = (unsigned long)getpid();
     unsigned long ready[] = { pid, (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0),
                               (unsigned long)physical.st_dev, (unsigned long)physical.st_ino, token };
 #ifdef DETAILED_EXEC_AFTER
     emit("NEW_READY", ready, 5);
-    receive(0, 'P');
-    struct request held = { .rv = 0, .token = token, .operation = 2 };
+    unsigned long recovery_deadline = phase_deadline(h6_recovery_ms);
+    if (warm) {
+        call_fn warm_call = (call_fn)dlsym(provider, "C_GetInfo");
+        if (!warm_call) return 16;
+        unsigned long sequence = 0;
+        for (;;) {
+            char command = receive_command_until(0, recovery_deadline);
+            if (command == 'P') break;
+            if (command != 'W' || ++sequence > 40) fail(106);
+            unsigned long t0 = clock_ns();
+            unsigned long warm_rv = warm_call(NULL);
+            unsigned long t1 = clock_ns();
+            if (warm_rv != 0) fail(107);
+            unsigned long warmed[] = { pid, pid, sequence, warm_rv, t0, t1 };
+            emit("WARM_DONE", warmed, 6);
+        }
+    } else {
+        receive_until(0, 'P', recovery_deadline);
+    }
+    struct request held = { .rv = 0, .token = token, .operation = 2,
+                            .deadline_ns = phase_deadline(h6_measurement_ms) };
+    h6_call_deadline = held.deadline_ns;
     unsigned long rv = call(&held);
     if (rv != 0) fail(102);
     unsigned long success = 1, errors = 0;
-    calls(call, 1, 17, &success, &errors);
-    unsigned long done[] = { pid, pid, 17, success, errors, token };
+    calls(call, 1, measured, &success, &errors, delay_ms);
+    unsigned long done[] = { pid, pid, measured, success, errors, token };
     emit("NEW_DONE", done, 6);
-    receive(0, 'F');
+    receive_until(0, 'F', phase_deadline(h6_hold_ms));
 #else
     emit("READY", ready, 5);
-    receive(0, 'G');
+    if (argv[6][0] == '3') {
+        call_fn initial_call = (call_fn)dlsym(provider, "C_GetInfo");
+        if (!initial_call) return 16;
+        unsigned long sequence = 0;
+        for (;;) {
+            char command = receive_command_until(0, h6_setup);
+            if (command == 'G') {
+                if (!sequence) fail(110);
+                break;
+            }
+            if (command != 'W' || ++sequence > 20) fail(111);
+            unsigned long t0 = clock_ns();
+            unsigned long initial_rv = initial_call(NULL);
+            unsigned long t1 = clock_ns();
+            if (initial_rv != 0) fail(107);
+            unsigned long initial[] = { pid, pid, sequence, initial_rv, t0, t1 };
+            emit("INITIAL_WARM_DONE", initial, 6);
+        }
+    } else {
+        receive_until(0, 'G', h6_setup);
+    }
     long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) return 9;
     size_t stack_size = 1024 * 1024, allocation = stack_size + 2 * (size_t)page;
@@ -260,15 +511,34 @@ int main(int argc, char **argv) {
     if (stack == MAP_FAILED || mprotect(stack + page, stack_size, PROT_READ | PROT_WRITE)) return 10;
     int go[2];
     if (pipe2(go, O_CLOEXEC)) return 11;
-    /* Everything the execing frame dereferences is prepared before clone. */
-    char *next_argv[] = { argv[2], argv[1], argv[4], argv[5], NULL };
+    int leader_exit[2] = { -1, -1 };
+    if (argv[6][0] == '3' && pipe2(leader_exit, O_CLOEXEC)) return 11;
+    /* Everything the execing frame dereferences is prepared before clone,
+     * including the optional measured-phase pacing passthrough. */
+    char *next_argv[13];
+    next_argv[0] = argv[2];
+    next_argv[1] = argv[1];
+    next_argv[2] = argv[4];
+    next_argv[3] = argv[5];
+    int next_argc = 4;
+    if (argc > 7) next_argv[next_argc++] = argv[7];
+    if (argc > 8) next_argv[next_argc++] = argv[8];
+    if (argc > 9) next_argv[next_argc++] = argv[9];
+    if (opt_in) {
+        for (int i = 10; i < 15; ++i) next_argv[next_argc++] = argv[i];
+    }
+    next_argv[next_argc] = NULL;
     char *next_envp[] = { "LC_ALL=C", NULL };
     struct worker_args args = {
         .call = call, .go = go[0], .parent = parent,
+        .controller_gate = opt_in && argv[6][0] == '2',
         .exec = { .rv = 5, .token = token, .operation = 1,
                   .expect_failure = argv[6][0] == '1',
                   .exec_path = argv[6][0] == '1' ? argv[3] : argv[2],
-                  .exec_argv = next_argv, .exec_envp = next_envp }
+                  .exec_argv = next_argv, .exec_envp = next_envp,
+                  .leg_deadline_ns = h6_leg, .measurement_ms = h6_measurement_ms,
+                  .release_leader = argv[6][0] == '3',
+                  .leader_exit_fd = leader_exit[1], .leader_exit_deadline_ns = h6_setup }
     };
     _Alignas(4) int child_tid = -1;
     int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
@@ -277,7 +547,19 @@ int main(int argc, char **argv) {
     if (tid <= 0 || __atomic_load_n(&child_tid, __ATOMIC_ACQUIRE) != tid) return 12;
     unsigned long started[] = { pid, (unsigned long)tid, (unsigned long)child_tid };
     emit("THREAD", started, 3);
-    write_all(go[1], "W", 1);
+    if (!args.controller_gate) write_all(go[1], "W", 1);
+    if (argv[6][0] == '2' || argv[6][0] == '3') {
+        if (argv[6][0] == '3') receive_until(leader_exit[0], 'E', h6_setup);
+        /* Leader thread-exit: the worker owns the rest of the protocol. */
+        unsigned long gone[] = { pid, (unsigned long)tid };
+        emit("LEADER_EXIT", gone, 2);
+        /* Opt-in worker publishes its wait only after LEADER_EXIT intent.
+         * No provider call can run until the controller proves the retained
+         * original zombie leader plus exact live worker and sends B. */
+        if (args.controller_gate) write_all(go[1], "W", 1);
+        (void)raw6(SYS_exit, 0, 0, 0, 0, 0, 0);
+        fail(104);
+    }
     /* On success this physical leader dies in de_thread. The old child_tid
      * address is never claimed as proof of the execing task's termination. */
     kernel_join(&child_tid);

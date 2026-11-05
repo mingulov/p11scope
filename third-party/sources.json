@@ -16,7 +16,7 @@
         "third-party/patches/aya-0.14.0/aya-workspace.patch",
         "third-party/patches/aya-0.14.0/aya-multi-backport.patch"
       ],
-      "expected_tree_sha256": "dfca1d26bfb2b6ebb32f418abc9c31686c3bb01e3302d4641f3b40555052c341",
+      "expected_tree_sha256": "68514bc26d1b30382b52e270799605f4651416b6c8367cb8dafe11cfa00317c2",
       "applies_to": [
         "Cargo.toml"
       ]

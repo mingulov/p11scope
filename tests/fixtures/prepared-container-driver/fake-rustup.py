@@ -3,6 +3,7 @@
 """Return only the two explicitly admitted toolchain selections."""
 
 import sys
+from pathlib import Path
 from fixture_common import CONFIG, record, refuse
 
 
@@ -18,6 +19,7 @@ if arguments == ["--version"]:
 record("rustup")
 if len(arguments) != 4 or arguments[:2] != ["which", "--toolchain"]:
     refuse("unsupported rustup arguments")
-if arguments[2] not in ("1.98.1", "nightly-2026-05-20") or arguments[3] not in ("cargo", "rustc"):
+release = Path(".release-rust-version").read_text(encoding="utf-8").strip()
+if arguments[2] not in (release, "nightly-2026-05-20") or arguments[3] not in ("cargo", "rustc"):
     refuse("unsupported toolchain or executable")
 print(CONFIG["tools"][arguments[2] + ":" + arguments[3]])

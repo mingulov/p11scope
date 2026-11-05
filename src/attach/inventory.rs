@@ -2,7 +2,8 @@
 //! Preparation-only capability for the dedicated compact Inventory object.
 use super::{
     AttachBackend, BPF_F_RDONLY_PROG, ExactMapMetadata, Scope, compare_map_metadata, freeze_map,
-    map_metadata, publish_and_freeze_tail_calls, read_map_metadata, require_empty_stack_guard,
+    freeze_map_data, map_metadata, publish_and_freeze_tail_calls, read_map_metadata,
+    require_empty_stack_guard,
 };
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::events::DiscoveryDomain;
@@ -10,7 +11,7 @@ use crate::process::PidPin;
 use anyhow::{Context as _, Result, bail, ensure};
 use aya::maps::{Array, Map, MapData, MapType};
 use aya::programs::{ProbeKind, Program, RawTracePoint, UProbe};
-use aya::{Btf, Ebpf, EbpfLoader};
+use aya::{Ebpf, EbpfLoader};
 #[cfg(not(p11scope_small_discovery_ring))]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::{
@@ -151,7 +152,11 @@ impl PreparedInventory {
                 bail!("Inventory PID custody supplied for a non-PID scope")
             }
         };
-        let btf = Btf::from_sys_fs().context("loading required vmlinux BTF for Inventory")?;
+        // The required vmlinux BTF parse populates the process-wide
+        // host_btf cache, so no budgeted job tick pays the cold sysfs
+        // re-read, parse, or selector scan.
+        let host =
+            super::host_btf::shared().context("loading required vmlinux BTF for Inventory")?;
         let state = PreparingInventory {
             ebpf: None,
             discovery_domain: None,
@@ -163,7 +168,7 @@ impl PreparedInventory {
                     // and is not a policy for growing or renewing sessions.
                     let mut loader = EbpfLoader::new();
                     loader
-                        .btf(Some(&btf))
+                        .btf(Some(host.btf()))
                         .allow_unsupported_maps()
                         .map_max_entries("USAGE", capacity.get());
                     let bytes = match flavor {
@@ -193,7 +198,10 @@ impl PreparedInventory {
                     }
                 },
                 InventoryPreparation::ValidatePrograms => {
-                    validate_runtime_inventory_programs(state.ebpf()?)?;
+                    validate_runtime_inventory_programs(
+                        state.ebpf()?,
+                        matches!(flavor, InventoryFlavor::Callers(_)),
+                    )?;
                 }
                 InventoryPreparation::PublishScope => {
                     crate::scope::publish_inventory(state.ebpf_mut()?, &scope)?;
@@ -277,7 +285,7 @@ impl PreparedInventory {
                     if name == "STACK_GUARD" {
                         require_empty_stack_guard(map)?;
                     }
-                    freeze_map(name, map)?;
+                    freeze_inventory_map(name, map)?;
                 }
                 InventoryPreparation::LoadProgram(name, mode) => {
                     let program = state
@@ -409,7 +417,7 @@ enum InventoryPreparation {
 }
 
 /// The DISCOVERY size this build's Inventory objects compiled with: the
-/// shared 2 MiB constant, or 4 KiB when `P11SCOPE_SMALL_DISCOVERY_RING=1`
+/// shared 8 MiB constant, or 4 KiB when `P11SCOPE_SMALL_DISCOVERY_RING=1`
 /// built them (the host dependency never carries that feature, so the
 /// small size is mirrored here from the build script's cfg). Both the
 /// exact-map validator and the lifecycle high-water share pin it.
@@ -543,6 +551,22 @@ fn validate_inventory_maps(
     Ok(())
 }
 
+fn freeze_inventory_map(name: &str, map: &Map) -> Result<()> {
+    if name != "THREAD_OWNER" {
+        return freeze_map(name, map);
+    }
+    let Map::Unsupported(data) = map else {
+        bail!("Inventory refuses unexpected THREAD_OWNER map variant");
+    };
+    validate_inventory_owner_freeze_metadata(read_map_metadata(name, data)?)?;
+    freeze_map_data(name, data)
+}
+
+fn validate_inventory_owner_freeze_metadata(actual: ExactMapMetadata) -> Result<()> {
+    let (_, expected) = inventory_maps(NonZeroU32::MIN)["THREAD_OWNER"];
+    compare_map_metadata("THREAD_OWNER", actual, expected)
+}
+
 fn inventory_map_data<'a>(name: &str, map: &'a Map) -> Result<(InventoryMapKind, &'a MapData)> {
     use InventoryMapKind as K;
     match map {
@@ -599,9 +623,22 @@ fn validate_inventory_programs(actual: &BTreeMap<String, InventoryProgramKind>) 
     Ok(())
 }
 
-fn validate_runtime_inventory_programs(ebpf: &Ebpf) -> Result<()> {
+fn validate_runtime_inventory_programs(ebpf: &Ebpf, callers: bool) -> Result<()> {
+    const BASELINE: &str = "p11_inventory_image_baseline";
+    if callers {
+        ensure!(
+            matches!(ebpf.program(BASELINE), Some(Program::Iter(_))),
+            "caller Inventory requires its identity-only iterator"
+        );
+    } else {
+        ensure!(
+            ebpf.program(BASELINE).is_none(),
+            "global Inventory must not contain caller identity iterator"
+        );
+    }
     let actual = ebpf
         .programs()
+        .filter(|(name, _)| *name != BASELINE)
         .map(|(name, program)| {
             let kind = match program {
                 Program::UProbe(probe) => match probe.kind() {

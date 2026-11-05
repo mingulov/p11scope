@@ -5,16 +5,23 @@ The seven recorded failure signatures from
 [`known-flakes.md`](known-flakes.md), each with its owning lane, its
 isolation, and how to triage it. Nothing here weakens a test: the main
 suite runs every flake unfiltered, and the quarantine lane
-(`scripts/run-flake-quarantine.sh`, CI `quarantine` job, gated on a
-failure of any check job)
-re-runs each exactly once, serially, as triage evidence. A green
-quarantine run never greens the workflow.
+(`scripts/run-flake-quarantine.sh`, CI `quarantine` job) runs after a failure
+in `tests`, `contracts`, `scripts` or `bpf-noninterference`. It re-runs each
+exactly once, serially, as triage evidence. Lint-only or audit-only failures
+remain red in their required gates without launching these unrelated repros.
+A green quarantine run never greens the workflow.
 
 Isolation applied to all seven: serial execution (one test at a time, no
 lane-parallel siblings), exact `--exact` filters (no neighbor tests in the
 binary run), `--test-threads=1`, and a private `CARGO_TARGET_DIR`
 (`target/quarantine`, separate from the main build, so build IO never
-contends with a running lane).
+contends with a running lane). One combined offline Cargo compilation emits
+the library and artifact-contract test executable paths as JSON. The runner
+accepts exactly those two current test executables inside the private target,
+then invokes them directly for the seven serial cases; Cargo does not run
+between cases. Missing, ambiguous or nonexecutable outputs fail the lane.
+CI reuses only the existing exact bpf-linker tool cache here; cold compilation
+and the tests' own fixture work remain.
 
 | # | Flake (filter) | Owning lane | Wall-clock isolation |
 |---|---|---|---|

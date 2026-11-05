@@ -46,16 +46,95 @@ def value(state, operand):
     return state.get(reg(operand)) if operand[0] in "rw" else ("constant", int(operand, 16))
 
 
+def number_values(fact):
+    if fact and fact[0] == "constant":
+        return frozenset({fact[1] & ((1 << 64)-1)})
+    return fact[1] if fact and fact[0] == "finite" else None
+
+
+def number_fact(numbers):
+    numbers = frozenset(numbers)
+    if not numbers or len(numbers) > 9 or any(not 0 <= n < 1 << 64 for n in numbers):
+        return None
+    return ("constant", next(iter(numbers))) if len(numbers) == 1 else ("finite", numbers)
+
+
+def number_operation(left, op, right, width):
+    lhs, rhs = number_values(left), number_values(right)
+    if lhs is None or rhs is None:
+        return None
+    if op == "+=" and right[0] == "constant" and right[1] < 0:
+        rhs = {right[1]}  # An emitted signed immediate may subtract safely.
+    mask, results = (1 << width)-1, set()
+    for a in lhs:
+        for b in rhs:
+            a &= mask
+            if op in ("<<=", ">>=") and not 0 <= b < width:
+                return None
+            if op == "+=": result = a+b
+            elif op == "*=": result = a*b
+            elif op == "<<=": result = a << b
+            elif op == ">>=": result = a >> b
+            elif op == "&=": result = a & (b & mask)
+            elif op == "|=": result = a | (b & mask)
+            elif op == "^=": result = a ^ (b & mask)
+            else: return None
+            # The proof does not turn overflow into a smaller safe index.
+            if not 0 <= result <= mask:
+                return None
+            results.add(result)
+    return number_fact(results)
+
+
+def side_pointer(owner, offsets):
+    offsets = frozenset(offsets)
+    if not offsets or len(offsets) > 9:
+        return None
+    return ("side", owner, next(iter(offsets)) if len(offsets) == 1 else offsets)
+
+
 def narrow(fact, width):
     if not fact:
         return None
     if fact[0] == "constant":
         return ("constant", fact[1] & ((1 << width) - 1))
-    if width == 64 or fact[0] == "field":
+    if fact[0] == "finite":
+        return number_fact(n & ((1 << width)-1) for n in fact[1])
+    if fact[0] == "bits":
+        return ("bits", fact[1] & ((1 << width)-1))
+    if fact[0] == "packed":
+        return ("packed", fact[1], fact[2], fact[3] & ((1 << width)-1))
+    if fact[0] == "flag_or":
+        left, right = narrow(fact[1], width), narrow(fact[2], width)
+        if left is None or right is None:
+            return None
+        for old, added in ((left, right), (right, left)):
+            if old[0] == "list_flags":
+                projection, numbers = packed_projection(added), number_values(added)
+                if projection and projection[1] == "list" and projection[2] & ~4 == 0:
+                    return (*old[:3], old[3] | {projection[0]}, old[4])
+                if numbers is not None and all(n & ~0x1f == 0 for n in numbers):
+                    bits = old[4]
+                    for n in numbers: bits |= n
+                    return (*old[:4], bits)
+        return ("flag_or", left, right) if width > 8 else None
+    if fact[0] in ("list_flags", "contribution", "side_flags") and width >= 16:
+        return fact
+    if fact[0] == "list_flags" and width == 8:
+        return fact
+    if width == 64 or fact[0] in ("field", "object_field"):
         return fact
     if width == 32:
-        if fact[0] == "scalar":
-            return ("scalar", fact[1], 32)
+        if fact[0] in ("object_index", "object_optional_index", "object_function"):
+            return fact
+        if fact[0] == "object_result":
+            return fact
+        if fact[0] == "finite":
+            return number_fact(n & 0xffffffff for n in fact[1])
+        if fact[0] in ("scalar", "retained"):
+            return (fact[0], fact[1], 32)
+        if fact[0] == "key_tail":
+            return ("low", fact[1])
         if fact[0] == "cookie":
             return ("low", fact[1])
         if fact[0] in ("low", "high", "selected"):
@@ -72,10 +151,13 @@ def address(state, base, sign, offset):
         return (fact[0], fact[1] + delta)
     if fact[0] == "descriptor":
         return ("descriptor", fact[1], delta)
+    if fact[0] == "side":
+        offsets = fact[2] if isinstance(fact[2], frozenset) else {fact[2]}
+        return side_pointer(fact[1], (n+delta for n in offsets))
     if fact[0] == "owned":
-        return ("owned", fact[1], fact[2] + delta)
-    if fact[0] == "function_value":
-        return ("function_value", fact[1], fact[2] + delta)
+        return (fact[0], fact[1], fact[2] + delta)
+    if fact[0] in ("function_value", "external_key", "object_descriptor"):
+        return (fact[0], fact[1], fact[2] + delta)
     return None
 
 
@@ -83,11 +165,31 @@ def join_fact(left, right):
     """Must-join of one register/stack fact. Different map-helper lookups can
     join at one shared counter writeback (as in SinkProof's ("result",
     "map")): the joined pointer is still a map value disjoint from the local
-    frame; only which lookup produced it is forgotten."""
+    frame; only which lookup produced it is forgotten. An unrefined original
+    owner/side pointer is nullable, so joining its base with zero retains that
+    nullable token; it never supplies a live/non-null lifetime fact."""
     if left == right:
         return left
-    if left and right and left[0] == right[0] == "result":
-        return ("result", "map")
+    if isinstance(left, tuple) and left and isinstance(right, tuple) and right:
+        lhs, rhs = number_values(left), number_values(right)
+        if lhs is not None and rhs is not None:
+            return number_fact(lhs | rhs)
+        if left[0] == right[0] == "side" and left[1] == right[1]:
+            lhs = left[2] if isinstance(left[2], frozenset) else {left[2]}
+            rhs = right[2] if isinstance(right[2], frozenset) else {right[2]}
+            return side_pointer(left[1], set(lhs) | set(rhs))
+        if left[0] == right[0] == "result":
+            return ("result", "map")
+        if left[0] == right[0] == "contribution":
+            return ("contribution", left[1] | right[1], left[2] | right[2])
+        if left[0] == right[0] == "list_flags" and left[1:3] == right[1:3]:
+            return ("list_flags", left[1], left[2], left[3] | right[3], left[4] | right[4])
+        for flags, zero in ((left, right), (right, left)):
+            if flags[0] == "contribution" and zero == ("constant", 0):
+                return flags
+        for pointer, zero in ((left, right), (right, left)):
+            if pointer[0] in ("owned", "side", "function_value") and pointer[2] == 0 and zero == ("constant", 0):
+                return pointer
     return None
 
 
@@ -132,9 +234,46 @@ def stack_read(state, pointer, size, offset=0):
     return None
 
 
+def capture_read(state, pointer, size, offset=0):
+    if pointer and pointer[0] == "owned":
+        for key, fact in state.items():
+            if (isinstance(key, tuple) and key[:3] == ("owned_word", pointer[1], pointer[2]+offset)
+                    and key[3] >= size):
+                return narrow(fact, size*8)
+        return None
+    return stack_read(state, pointer, size, offset)
+
+
+def capture_pointer(pointer, offset):
+    return ("owned", pointer[1], pointer[2]+offset) if pointer[0] == "owned" else ("stack", pointer[1]+offset)
+
+
+def forget_owned(state, owner=None, offset=0, size=0x1000):
+    for key in list(state):
+        if (isinstance(key, tuple) and key[0] == "owned_word" and (owner is None or key[1] == owner)
+                and key[2] < offset+size and offset < key[2]+key[3]):
+            del state[key]
+
+
 def sections(disassembly):
     parts = re.split(r"(?m)^Disassembly of section ([^:]+):\s*$", disassembly)
     return dict(zip(parts[1::2], parts[2::2]))
+
+
+def joined(split, *names):
+    """Section bodies with their headers, for section-aware call resolution.
+
+    sections() strips the header lines, but internal_call_targets keys PCs by
+    section: concatenated headerless bodies collide (e.g. two pc-0 function
+    starts) and legitimate calls resolve to None. Same bodies, labeled.
+    """
+    chunks = []
+    for name in names:
+        body = split[name]
+        if not body.endswith("\n"):
+            body += "\n"
+        chunks.append("Disassembly of section " + name + ":\n" + body)
+    return "".join(chunks)
 
 
 class Consumer:
@@ -149,9 +288,19 @@ class Consumer:
                      if kind == "64" for line, pc, _ in entries if line == index - 1}
         self.helper = {pc for _, pc, text in entries if text.startswith("85 00 ")}
         self.proof = None
+        self.cursor = None
 
     def label(self, pc):
         return f"{self.section}:{self.name}:{pc}"
+
+    @staticmethod
+    def merge_facts(previous, state):
+        return state.copy() if previous is None else {
+            key: joined for key, fact in previous.items()
+            if (joined := join_fact(fact, state.get(key))) is not None}
+
+    def flow_edges(self, pc, before, after):
+        return ((successor, after) for successor in self.graph[pc])
 
     def step(self, pc, incoming):
         state = self.transfer(pc, incoming)
@@ -286,6 +435,61 @@ class Consumer:
             state.pop(("event_slot",), None)
         return state
 
+    def proof_control_flow(self, start):
+        """Expand each cyclic component into at most eight proved visits.
+
+        Every backward edge within one component consumes a visit. Leaving a
+        component cannot reset it and return: the component graph is acyclic.
+        Overlapping/nested cycles share the same counter. A reachable ninth
+        visit is a refusal, not an omitted path or a successful truncation.
+        """
+        reachable = D.reachable(self.graph, [start])
+        reverse = {pc: [] for pc in reachable}
+        for pc in reachable:
+            for successor in self.graph[pc]:
+                reverse[successor].append(pc)
+        seen, order, pending = set(), [], [(start, False)]
+        while pending:
+            pc, finished = pending.pop()
+            if finished:
+                order.append(pc)
+            elif pc not in seen:
+                seen.add(pc)
+                pending.append((pc, True))
+                pending.extend((successor, False) for successor in self.graph[pc] if successor not in seen)
+        components, cyclic = {}, set()
+        for pc in reversed(order):
+            if pc in components:
+                continue
+            component, members, pending = pc, set(), [pc]
+            while pending:
+                current = pending.pop()
+                if current in components:
+                    continue
+                components[current] = component
+                members.add(current)
+                pending.extend(reverse[current])
+            if len(members) > 1 or pc in self.graph[pc]:
+                cyclic.add(component)
+        graph, edges, overflow, pending = {}, {}, set(), [(start, 0)]
+        while pending:
+            node = pending.pop()
+            if node in graph:
+                continue
+            pc, visit = node
+            graph[node], edges[node] = [], {}
+            if visit == 8:
+                overflow.add(node)
+                continue
+            for successor in self.graph[pc]:
+                same = components[successor] == components[pc]
+                next_visit = visit + int(successor <= pc) if same and components[pc] in cyclic else 0
+                edge = (successor, next_visit)
+                edges[node][successor] = edge
+                graph[node].append(edge)
+                pending.append(edge)
+        return graph, edges, overflow
+
     def facts(self, initial=None, proof=None):
         start = self.insns[0][0]
         initial = initial or {"r1": ("context", 0), "r10": ("stack", 0)}
@@ -293,30 +497,41 @@ class Consumer:
             # Topological worklist: validate only complete predecessor joins.
             # Success/lifecycle partitions belong to ONE role, never to all
             # combinations of captured arguments or machine states.
-            reachable = D.reachable(self.graph, [start])
-            degree = Counter(v for u in reachable for v in self.graph[u] if v in reachable)
-            pending = deque(pc for pc in reachable if not degree[pc])
+            graph, edges, overflow = self.proof_control_flow(start)
+            degree = Counter(v for successors in graph.values() for v in successors)
+            pending = deque(node for node in graph if not degree[node])
             order = []
             while pending:
-                pc = pending.popleft()
-                order.append(pc)
-                for successor in self.graph[pc]:
+                node = pending.popleft()
+                order.append(node)
+                for successor in graph[node]:
                     degree[successor] -= 1
                     if degree[successor] == 0:
                         pending.append(successor)
-            require(len(order) == len(reachable), self.name + ": final-sink cyclic CFG")
-            incoming = {start: {proof.partition(initial): initial}}
+            require(len(order) == len(graph), self.name + ": final-sink cyclic expansion")
+            incoming = {(start, 0): {proof.partition(initial): initial}}
             self.proof = proof
             try:
-                for pc in order:
-                    for state in incoming.get(pc, {}).values():
+                for node in order:
+                    pc, _ = node
+                    if node in overflow:
+                        require(not incoming.get(node), self.label(pc) + ": final-sink loop exceeds eight visits or lacks proved progress")
+                        continue
+                    for state in incoming.get(node, {}).values():
+                        self.cursor = node
                         after = self.step(pc, state)
                         for successor, edge in proof.edges(self, pc, state, after):
                             partition = proof.partition(edge)
-                            previous = incoming.setdefault(successor, {}).get(partition)
-                            incoming[successor][partition] = proof.join(previous, edge)
+                            destination = edges[node][successor]
+                            previous = incoming.setdefault(destination, {}).get(partition)
+                            incoming[destination][partition] = proof.join(previous, edge)
                 proof.finish(self)
-                return incoming
+                result = {}
+                for (pc, _), partitions in incoming.items():
+                    for partition, state in partitions.items():
+                        previous = result.setdefault(pc, {}).get(partition)
+                        result[pc][partition] = proof.join(previous, state)
+                return result
             finally:
                 self.proof = None
         incoming = {start: initial}
@@ -324,11 +539,9 @@ class Consumer:
         while pending:
             pc = pending.popleft()
             state = self.step(pc, incoming[pc])
-            for successor in self.graph[pc]:
+            for successor, edge in self.flow_edges(pc, incoming[pc], state):
                 previous = incoming.get(successor)
-                merged = state.copy() if previous is None else {
-                    k: joined for k, v in previous.items()
-                    if (joined := join_fact(v, state.get(k))) is not None}
+                merged = self.merge_facts(previous, edge)
                 if previous != merged:
                     incoming[successor] = merged
                     pending.append(successor)
@@ -342,38 +555,6 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 11: (0x38, 4), 8: (0x20, 8), 9: (0x30, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
-LP64_READS = {
-    6: ([1188, 1063, 1192, 1156, 1190, 1151], 1169),
-    7: ([1243, 1199, 1247, 1210, 1245, 1205], 1223),
-    10: ([1298, 1255, 1302, 1267, 1300, 1262], 1280),
-    11: ([1359, 1313, 1363, 1328, 1361, 1319], 1341),
-    8: ([1704, 1570, 1382, 1470, 1395, 1475], 1424),
-    9: ([1466, 1478, 1375, 1468, 1389, 1473], 1409),
-    16: ([1564, 1580, 1527, 1566, 1533, 1568], 1546),
-    "join": ([1686, 1591, 1692, 1619, 1689, 1606], 1633),
-    "get": ([1695, 1599, 1701, 1641, 1698, 1613], 1655),
-}
-IA32_READS = {6: 1959, 7: 2048, 10: 2070, 11: 2096,
-              8: 2142, 9: 2120, 16: 2211, "join": 2240, "get": 2262}
-LP64_DISPATCH = {6: (1057,), 7: (1194,), 10: (1249,), 11: (1308,),
-                 8: (1366, 1377), 9: (1369, 1370), 16: (1492, 1522),
-                 "join": (1586,), "get": (1594,)}
-IA32_DISPATCH = {6: (1956,), 7: (2045,), 10: (2068,), 11: (2094,),
-                 8: (2116,), 9: (2118,), 16: (2180,), "join": (2237,), "get": (2259,)}
-SCALAR_CALLS = {
-    "default": {1067: 6, 1080: 7, 1093: 10, 1109: 11, 1195: 8,
-                1228: 9, 1285: 16, 1455: "join", 1469: "get"},
-    "p11_entry_template": {2546: 6, 2559: 7, 2571: 10, 2588: 11,
-                           2604: 9, 2696: 8, 2746: 12, 2757: 13},
-    "p11_entry_template_pair": {3062: 6, 3075: 7, 3087: 10, 3104: 11,
-                                3120: 9, 3212: 8, 3262: 12, 3273: 13},
-    "p11_entry_template_types": {3729: 6, 3742: 7, 3754: 10, 3771: 11,
-                                 3787: 9, 3879: 8, 3929: 12, 3940: 13},
-    "p11_entry_template_second": {3498: 14, 3510: 15},
-}
-SEMANTIC_INSERT = {"default": 1253, "p11_entry": 1497, "p11_entry_ia32": 2185,
-                   "p11_entry_template": 2789, "p11_entry_template_pair": 3305,
-                   "p11_entry_template_types": 3972}
 BYTE_DOMAIN = frozenset(range(256))
 # TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS,
 # STACK_GUARD, or PAIR_CALLS has (always falls through).
@@ -414,9 +595,10 @@ def zero_partition(fact, op, width):
 class SinkProof:
     """Additional facts and obligations for one semantic role in Consumer.
 
-    Index domains union at joins; all other facts intersect. Only this role's
-    success and lifecycle/nonzero predicates partition a join. A successful
-    capture must survive to its final sink; initialized bytes cannot satisfy it.
+    Index domains and per-owner retirement denials union at joins; other facts
+    intersect. Only this role's success and lifecycle/nonzero predicates
+    partition a join. A successful capture must survive to its final sink;
+    initialized bytes cannot satisfy it.
     """
     def __init__(self, role, abi, present, start, *, calls=None, reads=None,
                  helpers=None, insert=None, kind="entry", mode=0):
@@ -430,19 +612,33 @@ class SinkProof:
         self.dispatches = ()
         self.decoder_required = False
         self.effect_start = None
+        self.argument_calls = {}
+        self.success_tag = 0 if kind == "result" else 1
 
     def partition(self, state):
         return tuple(state.get((key,)) for key in ("success", "nonnull", "life", "done", "inserted"))
 
     @staticmethod
     def join(previous, state):
-        if previous is None:
-            return state.copy()
-        merged = {k: v for k, v in previous.items() if state.get(k) == v}
+        merged = state.copy() if previous is None else {
+            k: joined for k, v in previous.items()
+            if (joined := join_fact(v, state.get(k))) is not None}
+        previous = previous or {}
         for key in previous.keys() & state.keys():
             if isinstance(key, tuple) and key[0] == "domain":
                 merged[key] = previous[key] | state[key]
+        for key in previous.keys() | state.keys():
+            if isinstance(key, tuple) and key[0] == "retired_owner":
+                merged[key] = True
+                merged.pop(("live", key[1]), None)
         return merged
+
+    @staticmethod
+    def retire_owner(state, owner):
+        # Aliases keep the original token across registers and spills. A later
+        # nonnull test says nothing about that original row's ended lifetime.
+        state.pop(("live", owner), None)
+        state[("retired_owner", owner)] = True
 
     def domain(self, state, field):
         return state.get(("domain", field), BYTE_DOMAIN)
@@ -479,7 +675,7 @@ class SinkProof:
         else:
             offset, size = DESTINATIONS[self.role]
             expected = ("selected", 16) if self.role == 16 else self.scalar(width=32 if size == 4 else (32 if self.abi else 64))
-            actual = stack_read(state, self.start, size, offset)
+            actual = capture_read(state, self.start, size, offset)
             require(actual == expected, self.fail(consumer, pc, f"successful capture lost at START+{offset:#x}: {actual}"))
         self.witnesses.add(pc)
 
@@ -498,7 +694,7 @@ class SinkProof:
             if self.effect_start and pointer:
                 require(pointer[0] == "stack", error("unsupported callee memory destination"))
             if self.effect_start and pointer and pointer[0] == "stack" and pointer[1] < -512:
-                allowed = {(self.effect_start[1]+0x100, 4)}
+                allowed = set() if self.kind == "result" else {(self.effect_start[1]+0x100, 4)}
                 if self.kind == "async":
                     allowed.add((self.effect_start[1]+0x104, 4))
                 else:
@@ -538,7 +734,7 @@ class SinkProof:
                 state[("domain", pointer[2])] = BYTE_DOMAIN
             elif pointer == ("context", 0x98) and width == "64":
                 state[reg(dst)] = ("rsp", 64, 0)
-            elif pointer and pointer[0] == "owned" and before.get(("live", pointer[1])):
+            elif self.kind == "return" and pointer and pointer[0] == "owned" and before.get(("live", pointer[1])):
                 state[reg(dst)] = ("retained", pointer[2], int(width))
             elif pointer and pointer[0] == "function_value" and pointer[2] == 0 and width == "32" and before.get(("live", pointer[1])):
                 state[reg(dst)] = ("selected", 16)
@@ -557,24 +753,28 @@ class SinkProof:
                 # Payload loads are unusable until the corresponding success
                 # edge promoted the helper/Option memory fact.
                 state.pop(reg(dst), None)
-        if pc not in consumer.maps and (match := re.fullmatch(r"([rw]\d+) (=|\+=|<<=|>>=|&=|\|=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
+        if pc not in consumer.maps and (match := re.fullmatch(r"([rw]\d+) (=|\+=|\*=|<<=|>>=|&=|\|=|\^=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
             dst, op, src = match.groups()
             old, rhs = before.get(reg(dst)), value(before, src)
             fact = None
             if op == "=" and rhs:
-                fact = narrow(rhs, 32) if dst.startswith("w") else rhs
+                fact = narrow(rhs, 32) if dst.startswith("w") or src.startswith("w") else rhs
             elif op == "+=" and old == ("result", "map"):
                 # Offset selection within a BPF map value cannot turn its
                 # address space into the local frame's address space.
                 fact = old
+            elif op == "+=" and old and old[0] == "side" and number_values(rhs) is not None:
+                state.pop(reg(dst), None)
+                offsets = old[2] if isinstance(old[2], frozenset) else {old[2]}
+                amounts = {rhs[1]} if rhs[0] == "constant" and rhs[1] < 0 else number_values(rhs)
+                fact = side_pointer(old[1], (a+b for a in offsets for b in amounts))
             elif old and rhs:
-                if old[0] == rhs[0] == "constant":
-                    a, b = old[1], rhs[1]
-                    fact = ("constant", {"+=": lambda: a+b, "<<=": lambda: a<<b,
-                            ">>=": lambda: a>>b, "&=": lambda: a&b, "|=": lambda: a|b}[op]() & ((1 << 64)-1))
+                if number_values(old) is not None and number_values(rhs) is not None:
+                    state.pop(reg(dst), None)
+                    fact = number_operation(old, op, rhs, 32 if dst.startswith("w") else 64)
                 elif rhs[0] == "constant":
                     amount = rhs[1]
-                    if old[0] == "field" and op == "&=" and amount == 255:
+                    if old[0] in ("field", "object_field") and op == "&=" and amount == 255:
                         fact = old
                     elif old[0] == "field" and op == "<<=":
                         fact = ("stride", old[1], 1 << amount, 0, None)
@@ -589,7 +789,7 @@ class SinkProof:
                     elif old[0] == "rsp" and op == "+=":
                         fact = ("rsp", old[1], old[2] + amount)
                     elif old[0] == "owned" and op == "+=":
-                        fact = ("owned", old[1], old[2] + amount)
+                        fact = (old[0], old[1], old[2] + amount)
                 elif old == ("rsp", 32, 0) and rhs[0] == "stride" and op == "+=":
                     fact = ("arg_address", rhs)
             if fact is not None:
@@ -611,6 +811,18 @@ class SinkProof:
                 state[("stack", pointer[1]+8, 8)] = ("candidate", pc, field, 32 if self.abi else 64)
             else:
                 state[("stack", pointer[1], 8)] = ("constant", 0)
+        if pc in self.argument_calls:
+            field = self.argument_calls[pc]
+            require(target.endswith("arg_u64") and before.get("r2") == ("context", 0)
+                    and before.get("r3") == ("field", field)
+                    and before.get("r4") == ("constant", self.abi),
+                    error("scalar-read Result context/index/layout boundary"))
+            output = before.get("r1")
+            require(output and output[0] == "stack" and -512 <= output[1] <= -16,
+                    error("scalar-read Result destination outside local frame"))
+            forget_stack(state, output[1], 16)
+            state[("stack", output[1], 8)] = ("argument_result", pc, field)
+            state[("stack", output[1]+8, 8)] = ("candidate", pc, field, 32 if self.abi else 64)
         if pc in self.helpers and target == "p11_read_ia32_arg":
             field = self.helpers[pc]
             require(self.abi == 1,
@@ -637,7 +849,7 @@ class SinkProof:
             state[("stack", output[1], size[1])] = ("candidate", pc, field, size[1]*8)
             state["r0"] = ("read_result", pc, field)
         if pc in consumer.helper and text == "call 0x1":
-            if before.get("r1", (None,))[0] == "map" and before["r1"][1] not in ("DESCRIPTORS", "ASYNC_FUNCTIONS"):
+            if before.get("r1", (None,))[0] == "map" and before["r1"][1] not in ("DESCRIPTORS", "ASYNC_FUNCTIONS", "OBJECT_DESCRIPTORS"):
                 # Different counter-map lookups join at shared writebacks;
                 # retain their common disjointness from the local frame.
                 state["r0"] = ("result", "map")
@@ -651,6 +863,12 @@ class SinkProof:
         if target == "p11_owner_start_get":
             state["r0"] = ("owned", pc, 0)
         if target == "p11_owner_start_remove":
+            owners = {fact[1] for fact in before.values()
+                      if isinstance(fact, tuple) and fact and fact[0] == "owned"}
+            if self.start[0] == "owned" and before.get(("live", self.start[1])):
+                owners.add(self.start[1])
+            for owner in owners:
+                self.retire_owner(state, owner)
             for key in list(state):
                 if isinstance(key, tuple) and key[0] == "live":
                     del state[key]
@@ -664,7 +882,8 @@ class SinkProof:
                               f"pointer={before.get('r1')} START={before.get('r2')}"))
                 # Conditional-success summary of the independently checked
                 # callee. Only its successful selection creates this obligation.
-                state[("stack", self.start[1]+0x104, 4)] = ("selected", 16)
+                state[("owned_word", self.start[1], self.start[2]+0x104, 4) if self.start[0] == "owned"
+                      else ("stack", self.start[1]+0x104, 4)] = ("selected", 16)
                 self.captured(state)
                 self.boundaries.add("async_name")
         if text == "call 0x72" and self.role == 16:
@@ -681,7 +900,7 @@ class SinkProof:
         if target == "p11_decode_params":
             require(self.kind == "entry" and self.mode != "second"
                     and before.get("r3") == ("constant", 4 if self.abi else 8)
-                    and before.get("r4") == ("stack", self.start[1]+0x40), error("layout/decoder word bytes or output"))
+                    and before.get("r4") == capture_pointer(self.start, 0x40), error("layout/decoder word bytes or output"))
             if self.role == 8:
                 require(before.get("r1") == self.scalar(8) and before.get(("nonnull",)) is True,
                         error("decoder mechanism field 8 pointer"))
@@ -689,8 +908,7 @@ class SinkProof:
         if target == "p11_walk_template" or target == "p11_walk_template_types":
             ordinary = target == "p11_walk_template"
             require((ordinary and self.mode in (1, 3, "second")) or (not ordinary and self.mode == 2), error("mode walker callee"))
-            destination = (("owned", self.start[1], 0xb0) if self.mode == "second"
-                           else ("stack", self.start[1]+0x60))
+            destination = capture_pointer(self.start, 0xb0 if self.mode == "second" else 0x60)
             require(before.get("r3") == ("constant", 4 if self.abi else 8)
                     and before.get("r4") == destination, error("mode walker word bytes/output/owned START"))
             if self.role == "template":
@@ -709,10 +927,11 @@ class SinkProof:
             # Which array each program may use is check-bpf-map-defs' rule.
             pass
         elif text == "call 0xc" and pc in consumer.helper:
-            require(self.mode == 3 and before.get(("inserted",)) is True
+            require(self.mode == 3 and (before.get(("inserted",)) is True
+                    or self.start[0] == "owned" and before.get(("live", self.start[1])))
                     and before.get("r1") == ("context", 0)
                     and before.get("r2") == ("map", "PAIR_CALLS")
-                    and before.get("r3") == ("constant", 0), error("mode pair tail needs successful insertion and slot 0"))
+                    and before.get("r3") == ("constant", 0), error("mode pair tail needs live START and slot 0"))
             self.boundaries.add("tail")
         if self.kind == "return" and pc in self.retained_sites:
             offset, lifecycle, abi = self.retained_sites[pc]
@@ -722,11 +941,12 @@ class SinkProof:
             if lifecycle is not None:
                 require(self.domain(before, 3) == {lifecycle}, error("retained lifecycle field 3"))
             self.boundaries.add(pc)
-        if self.kind == "scalar" and text == "exit":
-            expected = 1 if before.get(("success",)) else 0
-            require(stack_read(before, self.start, 8) == ("constant", expected), error("scalar-read Option discriminator"))
-            if expected:
-                require(stack_read(before, self.start, 8, 8) == self.scalar(), error("scalar-read Option success payload"))
+        if self.kind in ("scalar", "result") and text == "exit":
+            success = bool(before.get(("success",)))
+            expected = self.success_tag if success else 1 - self.success_tag
+            require(stack_read(before, self.start, 8) == ("constant", expected), error("scalar-read Option/Result discriminator"))
+            if success:
+                require(stack_read(before, self.start, 8, 8) == self.scalar(), error("scalar-read Option/Result success payload"))
                 self.witnesses.add(pc)
         elif pc == self.insert:
             self.check_sink(consumer, pc, before)
@@ -757,8 +977,10 @@ class SinkProof:
                     # to their full-register value. Option is the proved 0/1
                     # discriminator, not an unconstrained helper return value.
                     for fact in (left, right):
-                        require(not fact or fact[0] in ("constant", "field", "option", "low", "high", "selected")
+                        require(not fact or fact[0] in ("constant", "field", "object_field", "object_index", "object_function", "option", "argument_result", "low", "high", "selected")
                                 or fact[0] in ("scalar", "retained") and fact[2] == 32
+                                or fact[0] == "finite" and all(n <= 0xffffffff for n in fact[1])
+                                or fact[0] == "packed" and fact[3] <= 0xffffffff
                                 or fact == ("rsp", 32, 0),
                                 self.fail(consumer, pc, f"branch width 32 cannot refine full-width fact {fact}"))
                 taken = successor == D.relative_target(pc, text)
@@ -766,6 +988,20 @@ class SinkProof:
                 if left and right and left[0] == right[0] == "constant":
                     if compare(left[1], op, right[1], width) != taken:
                         continue
+                elif number_values(left) is not None and number_values(right) is not None:
+                    if branch[1] == branch[3] and compare(0, op, 0, width) != taken:
+                        continue
+                    pairs = {(a, b) for a in number_values(left) for b in number_values(right)
+                             if compare(a, op, b, width) == taken}
+                    if not pairs:
+                        continue
+                    # Matching abstract value sets do not establish aliases.
+                    # Without a value-identity token, refine only each tested
+                    # full-width register, never an independent register/spill.
+                    for operand, values in ((branch[1], {a for a, _ in pairs}),
+                                            (branch[3], {b for _, b in pairs})):
+                        if operand.startswith("r"):
+                            state[operand] = number_fact(values)
                 elif left and right and left[0] == "field" and right[0] == "constant":
                     domain = frozenset(n for n in self.domain(before, left[1]) if compare(n, op, right[1], width) == taken)
                     if not domain:
@@ -792,15 +1028,27 @@ class SinkProof:
                             if fact == right:
                                 state[key] = self.scalar(width=32)
                         self.captured(state)
-                elif left and right and left[0] in ("option", "read_result", "insert_result") and right[0] == "constant":
-                    require(op in ("==", "!=") and right[1] in ((0, 1) if left[0] == "option" else (0,)),
+                elif left and left[0] == "read_result" and right == ("constant", 0xffffffff) and op == ">":
+                    if not taken:
+                        domain = self.domain(before, left[2]) & frozenset(range(7))
+                        if not domain:
+                            continue
+                        state[("domain", left[2])] = domain
+                        state[("read_ok", left[1])] = True
+                        self.read_witnesses |= domain
+                        for key, fact in list(state.items()):
+                            if fact == left:
+                                state[key] = self.scalar(width=32)
+                        self.captured(state)
+                elif left and right and left[0] in ("option", "argument_result", "read_result", "insert_result") and right[0] == "constant":
+                    require(op in ("==", "!=") and right[1] in ((0, 1) if left[0] in ("option", "argument_result") else (0,)),
                             self.fail(consumer, pc, "unsupported success comparison"))
                     success_value = 1 if left[0] == "option" else 0
                     success = compare(success_value, op, right[1], width) == taken
                     # Both outcomes are possible, but their memory provenance
                     # differs. Failure never promotes a helper output.
                     if success:
-                        if left[0] == "option":
+                        if left[0] in ("option", "argument_result"):
                             domain = self.domain(before, left[2]) & frozenset(range(7))
                             if not domain:
                                 continue
@@ -820,7 +1068,7 @@ class SinkProof:
                         if left[0] == "insert_result":
                             if left[1] == self.insert:
                                 state[("inserted",)] = True
-                        elif (left[0] == "read_result" or self.role != 16 and self.calls.get(left[1]) == self.role
+                        elif (left[0] in ("read_result", "argument_result") or self.role != 16 and self.calls.get(left[1]) == self.role
                               or self.role == "template" and left[2] in (13, 15)):
                             self.captured(state)
                     else:
@@ -829,7 +1077,18 @@ class SinkProof:
                                 del state[key]
                 elif left and left[0] in ("owned", "function_value") and zero_taken is not None:
                     if taken != zero_taken:
-                        state[("live", left[1])] = True
+                        if state.get(("retired_owner", left[1])):
+                            state.pop(("live", left[1]), None)
+                        else:
+                            state[("live", left[1])] = True
+                    else:
+                        for key, fact in list(state.items()):
+                            if fact == left:
+                                state[key] = ("constant", 0)
+                elif left and left[0] == "side" and zero_taken is not None:
+                    if taken != zero_taken:
+                        if left[2] == 0:
+                            state[("side_live", left[1])] = True
                     else:
                         for key, fact in list(state.items()):
                             if fact == left:
@@ -838,6 +1097,11 @@ class SinkProof:
                     state[("nonnull",)] = taken != zero_taken
                 # Exact unsigned complete-span edges of the admitted forms.
                 if left == ("rsp", 64, 0) and right == ("constant", -16) and op == ">" and not taken:
+                    state[("span", ("rsp", 64, 8))] = True
+                if left == ("rsp", 64, 0) and right == ("constant", -9) and op == ">" and not taken:
+                    state[("address_no_wrap", 8)] = True
+                if (left == ("rsp", 64, 15) and right == ("rsp", 64, 8) and op == ">=" and taken
+                        and before.get(("address_no_wrap", 8))):
                     state[("span", ("rsp", 64, 8))] = True
                 if left and left[0] == "arg_address" and right == ("constant", 0xfffffffc) and op == ">" and not taken:
                     state[("span", left)] = True
@@ -866,7 +1130,28 @@ class SinkProof:
             require("tail" in self.boundaries, consumer.name + ": final-sink mode pair: tail boundary missing")
 
 
-def scalar_body_contract(internal_blocks, internal_calls, variant):
+def ia32_register_transfer(text, incoming):
+    """Conservative constant facts for the disassembled span proof."""
+    state = list(incoming)
+    if text.startswith("call "):
+        state[:6] = [None] * 6
+    elif "atomic" in text or "xchg" in text or text.startswith("lock "):
+        state = [None] * 11
+    elif match := re.fullmatch(r"([rw])(\d+) = (-?0x[0-9a-f]+)(?: ll)?", text):
+        state[int(match[2])] = int(match[3], 16) & ((1 << (32 if match[1] == "w" else 64)) - 1)
+    elif match := re.fullmatch(r"([rw])(\d+) = ([rw])(\d+)", text):
+        fact = incoming[int(match[4])]
+        state[int(match[2])] = (fact & 0xffffffff if fact is not None
+                               and "w" in (match[1], match[3]) else fact)
+    elif match := re.match(r"[rw](\d+)\s", text):
+        state[int(match[1])] = None
+    elif not (BRANCH.fullmatch(text) or STORE.fullmatch(text)
+              or text == "exit" or re.fullmatch(r"goto [+-]0x[0-9a-f]+", text)):
+        state = [None] * 11
+    return tuple(state)
+
+
+def ia32_reader_contract(internal_blocks, internal_calls):
     # The scalar-return summary depends on normalization of the supplied RSP,
     # independently of the index normalization also present in this body.
     require("p11_read_ia32_arg" in internal_blocks, "missing ia32 scalar reader")
@@ -882,20 +1167,120 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
     reader_consumer = Consumer(".text", "p11_read_ia32_arg", internal_blocks["p11_read_ia32_arg"],
                                internal_calls.get("p11_read_ia32_arg", {}))
     require(user_reads[0] in reader_consumer.helper, "ia32 reader span requires genuine user helper")
-    updates = {}
-    for pc, text in reader:
-        constant = re.fullmatch(r"([rw])0 = (-?0x[0-9a-f]+)(?: ll)?", text)
-        if constant:
-            updates[pc] = int(constant[2], 16) & ((1 << (32 if constant[1] == "w" else 64)) - 1)
-        elif re.match(r"[rw]0 ", text) or text.startswith("call "):
-            updates[pc] = None
+    require(reader_consumer.facts().get(span[0], {}).get("r1") == ("constant", 0xfffffffc),
+            "ia32 reader span limit must cover the complete u32")
     SPAN.validate_ia32_span_paths(reader_consumer.graph, reader[0][0], span[0],
-        D.relative_target(span[0], reader_consumer.text[span[0]]), user_reads[0], updates,
-        {pc for pc, text in reader if text == "exit"})
-    names = [name for name in internal_blocks if name.endswith("capture_scalar")]
-    require(len(names) == 1, "scalar-read callee inventory")
+        D.relative_target(span[0], reader_consumer.text[span[0]]), user_reads[0], {},
+        {pc for pc, text in reader if text == "exit"},
+        register_transfer=lambda pc, state: ia32_register_transfer(reader_consumer.text[pc], state))
+    ia32_reader_return_contract(reader_consumer)
+
+
+def ia32_reader_return_contract(consumer):
+    """Only a successful, guarded four-byte read may return a payload word.
+
+    Track the u32 input, normalized RSP, slot expression and helper result
+    independently. Rejected paths must retain the sentinel; merely finding
+    guards or a u32 load somewhere in the body supplies no success summary.
+    """
+    initial = {"r1": ("reader_rsp", False), "r2": ("reader_index", False), "r10": ("stack", 0)}
+    pending = [(consumer.insns[0][0], initial, frozenset())]
+    seen, witnessed = set(), False
+    payload = ("scalar", "ia32_reader", 32)
+    while pending:
+        pc, before, ancestors = pending.pop()
+        error = lambda message: consumer.label(pc) + ": ia32 reader " + message
+        require(pc in consumer.text and pc not in ancestors, error("payload path escapes or cycles"))
+        signature = (pc, repr(sorted(before.items(), key=lambda pair: repr(pair[0]))))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        text = consumer.text[pc]
+        after = consumer.step(pc, before)
+        if move := re.fullmatch(r"([rw]\d+) = ([rw]\d+)", text):
+            fact = value(before, move[2])
+            if "w" in (move[1][0], move[2][0]) and fact and fact[0] in ("reader_index", "reader_rsp"):
+                after[reg(move[1])] = (fact[0], True)
+        if arithmetic := re.fullmatch(r"(r\d+) (<<=|>>=|\+=) ([rw]\d+|-?0x[0-9a-f]+)", text):
+            dst, op, operand = arithmetic.groups()
+            left, right = before.get(dst), value(before, operand)
+            if left and right == ("constant", 32) and op == "<<=" and left[0] in ("reader_index", "reader_rsp", "reader_offset"):
+                after[dst] = ("reader_shift", left)
+            elif left and left[0] == "reader_shift" and right == ("constant", 32) and op == ">>=":
+                original = left[1]
+                after[dst] = original[:-1] + (True,)
+            elif left and left[0] == "reader_index" and op == "<<=" and right == ("constant", 2):
+                after[dst] = ("reader_offset", 4, 0, False)
+            elif left == ("reader_offset", 4, 0, False) and op == "+=" and right == ("constant", 4):
+                after[dst] = ("reader_offset", 4, 4, False)
+            elif left == ("reader_rsp", True) and op == "+=" and right == ("reader_offset", 4, 4, True):
+                after[dst] = ("reader_address", 4, 4)
+        if text.startswith("call "):
+            require(pc in consumer.helper and text == "call 0x70", error("helper has unknown callee footprint"))
+            output = before.get("r1")
+            require(before.get(("reader_index_ok",)) and before.get(("reader_span_ok",))
+                    and before.get("r3") == ("reader_address", 4, 4), error("index/address gate bypassed before helper"))
+            require(before.get("r2") == ("constant", 4) and output and output[0] == "stack"
+                    and -512 <= output[1] and output[1]+4 <= 0, error("helper output/width outside local frame"))
+            after["r0"] = ("reader_rc", pc)
+            after[("reader_output",)] = output
+            after[("reader_success",)] = False
+        if load := LOAD.fullmatch(text):
+            output = address(before, load[3], load[4], load[5])
+            require(load[2] == "32" and output == before.get(("reader_output",))
+                    and before.get(("reader_index_ok",)) and before.get(("reader_span_ok",))
+                    and before.get(("reader_success",)), error("payload load lacks successful index/span/helper proof"))
+            after[reg(load[1])] = payload
+        require(not STORE.fullmatch(text) and not ("atomic" in text or "xchg" in text or text.startswith("lock ")),
+                error("payload leaf has an unsupported memory write"))
+        if text == "exit":
+            result = before.get("r0")
+            require(result == ("constant", 1 << 32) or result == payload,
+                    error("payload return is neither the failure sentinel nor the read u32"))
+            witnessed |= result == payload
+            continue
+        for successor in consumer.graph[pc]:
+            state = after.copy()
+            if branch := BRANCH.fullmatch(text):
+                left, op, right = value(before, branch[1]), branch[2], value(before, branch[3])
+                taken = successor == D.relative_target(pc, text)
+                if left == ("reader_index", True):
+                    require(op == ">" and right == ("constant", 6), error("index gate must reject every value above six"))
+                    state[("reader_index_ok",)] = not taken
+                elif left == ("reader_address", 4, 4):
+                    require(branch[1].startswith("r") and op == ">" and right == ("constant", 0xfffffffc),
+                            error("payload address needs the complete four-byte span"))
+                    state[("reader_span_ok",)] = not taken
+                elif left and left[0] == "reader_rc":
+                    require(branch[1].startswith("r") and op in ("==", "!=") and right == ("constant", 0),
+                            error("helper result needs an exact full-width zero test"))
+                    state[("reader_success",)] = taken == (op == "==")
+                else:
+                    require(left and right and left[0] == right[0] == "constant",
+                            error("index/helper predicate provenance lost"))
+                    if compare(left[1], op, right[1], 32 if branch[1].startswith("w") else 64) != taken:
+                        continue
+            pending.append((successor, state, ancestors | {pc}))
+    require(witnessed, consumer.name + ": ia32 reader has no successful payload return")
+
+
+def scalar_body_contract(internal_blocks, internal_calls, variant):
+    def calls_contract(consumer, callees, helpers):
+        # These summaries preserve caller memory only for the exact checked
+        # effects. An unresolved pseudo-call has no such preservation claim.
+        for pc, text in consumer.insns:
+            if text.startswith("call "):
+                require((pc in consumer.helper and text in helpers)
+                        or (pc not in consumer.helper and consumer.calls.get(pc) in callees),
+                        consumer.label(pc) + ": scalar-read unknown callee/helper footprint")
+
+    ia32_reader_contract(internal_blocks, internal_calls)
+    names = [name for name in internal_blocks if name.endswith("arg_u64")]
+    require(len(names) == 1, "scalar-read Result callee inventory")
     name = names[0]
+    argument_name = name
     consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+    calls_contract(consumer, {"p11_read_ia32_arg"}, {"call 0x70"})
     instructions = consumer.insns
     helper_reads = [pc for pc, text in instructions if pc in consumer.helper and text == "call 0x70"]
     require(len(helper_reads) == 1, "scalar-read LP64 user-helper inventory")
@@ -910,12 +1295,28 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
                 reads[pc] = LP64_OFFSETS.index(offset)
     require(set(reads.values()) == set(range(6)), "scalar-read LP64 register-read inventory")
     for abi in (0, 1):
-        proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="scalar",
+        proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="result",
                           reads=reads if abi == 0 else {},
                           helpers={(ia32_calls[0] if abi else helper_reads[0]): 6})
         proof.effect_start = ("stack", -0x2000)
         initial = {"r1": proof.start, "r2": ("context", 0), "r3": ("field", 6),
-                   "r4": ("constant", abi), "r5": ("stack", -0x2000), "r10": ("stack", 0),
+                   "r4": ("constant", abi), "r10": ("stack", 0),
+                   ("domain", 6): BYTE_DOMAIN}
+        consumer.facts(initial, proof)
+    names = [name for name in internal_blocks if name.endswith("capture_scalar")]
+    require(len(names) == 1, "scalar-read Option callee inventory")
+    name = names[0]
+    consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+    calls_contract(consumer, {argument_name}, {"call 0x1"})
+    argument_calls = [pc for pc, target in consumer.calls.items() if target.endswith("arg_u64")]
+    require(len(argument_calls) == 1 and not any(pc in consumer.helper and text == "call 0x70"
+            for pc, text in consumer.insns), "scalar-read Result boundary inventory")
+    for abi in (0, 1):
+        proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="scalar")
+        proof.argument_calls = {argument_calls[0]: 6}
+        proof.effect_start = ("stack", -0x2000)
+        initial = {"r1": proof.start, "r2": ("context", 0), "r3": ("field", 6),
+                   "r4": ("constant", abi), "r5": proof.effect_start, "r10": ("stack", 0),
                    ("domain", 6): BYTE_DOMAIN}
         consumer.facts(initial, proof)
     names = [name for name in internal_blocks if name.endswith("capture_async_target")]
@@ -945,73 +1346,1624 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
             consumer.facts(initial, proof)
 
 
+
+def scalar_bits(fact):
+    """Possible one bits, used only for closed scalar effects, never indices."""
+    if not isinstance(fact, tuple) or not fact:
+        return None
+    values = number_values(fact)
+    if values is not None:
+        result = 0
+        for number in values:
+            result |= number
+        return result
+    return fact[1] if fact and fact[0] == "bits" else None
+
+
+class _ClosedEffectsProof(SinkProof):
+    """Check actual callees before preserving a caller's private memory.
+
+    Scalar inputs do not confer pointer authority. All memory accesses must
+    resolve to this BPF frame, the exact Result output, or the reader's two
+    readonly closure cells. Return bit bounds are a separate scalar domain;
+    they cannot authorize a frame/private-row offset or bounded-loop visit.
+    """
+    def __init__(self, summaries, allowed, *, result=False):
+        super().__init__("closed", 0, True, ("stack", -0x1000), kind="effects")
+        self.summaries, self.allowed, self.result = summaries, allowed, result
+        self.return_bits, self.exits = 0, set()
+
+    def partition(self, state):
+        return ()
+
+    @staticmethod
+    def join(previous, state):
+        merged = SinkProof.join(previous, state)
+        if previous is not None:
+            for key in previous.keys() & state.keys():
+                left, right = scalar_bits(previous[key]), scalar_bits(state[key])
+                if key not in merged and left is not None and right is not None:
+                    lhs, rhs = number_values(previous[key]), number_values(state[key])
+                    values = lhs | rhs if lhs is not None and rhs is not None else None
+                    # The local EC-parameter clearing loop has ten bytes.
+                    # This larger finite domain is confined to local effects;
+                    # it never widens the final-sink private-row index domain.
+                    merged[key] = (("finite", values) if values is not None and len(values) <= 16
+                                   else ("bits", left | right))
+                if (isinstance(previous[key], tuple) and isinstance(state[key], tuple)
+                        and previous[key] and state[key] and previous[key][0] in ("stack", "locals")
+                        and state[key][0] in ("stack", "locals")):
+                    lhs = {previous[key][1]} if previous[key][0] == "stack" else previous[key][1]
+                    rhs = {state[key][1]} if state[key][0] == "stack" else state[key][1]
+                    offsets = frozenset(lhs | rhs)
+                    if len(offsets) <= 16:
+                        merged[key] = (("stack", next(iter(offsets))) if len(offsets) == 1 else ("locals", offsets))
+        return merged
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc)
+        error = lambda reason: consumer.label(pc) + ": closed callee " + reason
+        require(pc not in consumer.maps, error("memory map relocation"))
+        require(not ("atomic" in text or "xchg" in text or text.startswith("lock ")),
+                error("memory atomic footprint"))
+        memory = LOAD.fullmatch(text) or STORE.fullmatch(text)
+        if memory:
+            load = LOAD.fullmatch(text)
+            width = int(memory[2] if load else memory[1])
+            base, sign, offset = memory.groups()[2:5] if load else memory.groups()[1:4]
+            pointer = address(before, base, sign, offset)
+            original = before.get("r"+base)
+            offsets = (original[1] if original and original[0] == "locals" else frozenset())
+            delta = int(offset, 16) * (1 if sign == "+" else -1)
+            local = pointer and pointer[0] == "stack" and -512 <= pointer[1] and pointer[1]+width//8 <= 0
+            if offsets:
+                require(all(-512 <= n+delta and n+delta+width//8 <= 0 for n in offsets),
+                        error("memory local offset bounds"))
+                local = True
+                if not load:
+                    for n in offsets:
+                        forget_stack(state, n+delta, width//8)
+            output = (self.result and pointer and pointer[0] == "stack"
+                      and (pointer[1], width) in ((-0x1000, 64), (-0xff8, 64)))
+            readonly = (self.result and load and pointer and pointer[0] == "stack"
+                        and (pointer[1], width) in ((-0x2000, 64), (-0x3000, 8)))
+            require(local or output or readonly, error("memory address/footprint"))
+            if load and state.get(reg(memory[1])) is None:
+                state[reg(memory[1])] = ("bits", (1 << width)-1)
+        elif text.startswith("call "):
+            if pc in consumer.helper:
+                require(text == "call 0x70", error("unknown helper/callee footprint"))
+                output, size = before.get("r1"), before.get("r2")
+                widths = number_values(size)
+                require(output and output[0] == "stack" and widths is not None
+                        and widths <= {1, 4, 7, 8, 10} and -512 <= output[1] and output[1]+max(widths) <= 0
+                        and scalar_bits(before.get("r3")) is not None,
+                        error("memory user-read output/source footprint"))
+                state.update((key, fact) for key, fact in before.items()
+                             if isinstance(key, tuple) and key[0] == "stack")
+                forget_stack(state, output[1], max(widths))
+                state["r0"] = ("bits", (1 << 64)-1)
+            else:
+                require(target in self.summaries and self.summaries[target]["output"] is None,
+                        error("unknown internal callee footprint"))
+                require(all(scalar_bits(before.get("r"+str(i))) is not None for i in range(1, 6)),
+                        error("private pointer/unknown scalar argument to callee"))
+                state["r0"] = ("bits", self.summaries[target]["return_bits"])
+        elif match := re.fullmatch(r"([rw]\d+) (=|\+=|\*=|<<=|>>=|&=|\|=|\^=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            dst, op, src = match.groups()
+            left, right = before.get(reg(dst)), value(before, src)
+            width = 32 if dst.startswith("w") else 64
+            wordmask = (1 << width)-1
+            if op == "=" and right and right[0] in ("stack", "locals"):
+                require(width == 64 and not src.startswith("w"), error("narrow frame pointer"))
+                state[reg(dst)] = right
+            elif op == "+=" and left and left[0] in ("stack", "locals"):
+                amounts = number_values(right)
+                require(width == 64 and amounts is not None, error("memory variable frame offset"))
+                if right[0] == "constant" and right[1] < 0:
+                    amounts = {right[1]}
+                offsets = {left[1]} if left[0] == "stack" else left[1]
+                offsets = frozenset(a+b for a in offsets for b in amounts)
+                require(len(offsets) <= 16 and all(-512 <= n <= 0 for n in offsets), error("memory frame offset bounds"))
+                state[reg(dst)] = (("stack", next(iter(offsets))) if len(offsets) == 1 else ("locals", offsets))
+            else:
+                a, b = scalar_bits(left), scalar_bits(right)
+                require(b is not None and (op == "=" or a is not None), error("unknown scalar operand"))
+                exact = (narrow(right, width) if op == "=" else number_operation(left, op, right, width))
+                if exact is None and number_values(left) is not None and number_values(right) is not None and op != "=":
+                    results = [number_operation(("constant", a), op, ("constant", b), width)
+                               for a in number_values(left) for b in number_values(right)]
+                    if all(result is not None for result in results):
+                        values = frozenset(result[1] for result in results)
+                        if len(values) <= 16:
+                            exact = ("finite", values)
+                if exact is not None:
+                    state[reg(dst)] = exact
+                else:
+                    if op == "=": bits = b
+                    elif op == "&=": bits = a & b
+                    elif op in ("|=", "^="): bits = a | b
+                    elif op in ("<<=", ">>=") and right[0] == "constant" and 0 <= right[1] < width:
+                        bits = a << right[1] if op == "<<=" else a >> right[1]
+                    elif op in ("+=", "*="):
+                        maximum = a+b if op == "+=" else a*b
+                        bits = (1 << maximum.bit_length())-1 if maximum <= wordmask else wordmask
+                    else:
+                        bits = wordmask
+                    state[reg(dst)] = ("bits", bits & wordmask)
+        elif re.fullmatch(r"[rw]\d+ = -[rw]\d+", text):
+            dst, src = text.split(" = -")
+            require(scalar_bits(before.get(reg(src))) is not None, error("unknown negated scalar"))
+            state[reg(dst)] = ("bits", (1 << (32 if dst.startswith("w") else 64))-1)
+        else:
+            require(text == "exit" or BRANCH.fullmatch(text) or re.fullmatch(r"goto [+-]0x[0-9a-f]+", text),
+                    error("unknown instruction effect"))
+        if text == "exit":
+            if not self.result:
+                bits = scalar_bits(before.get("r0"))
+                require(bits is not None and bits & ~self.allowed == 0, error("return bits outside protocol"))
+                self.return_bits |= bits
+            self.exits.add(pc)
+        return state
+
+    def finish(self, consumer):
+        require(self.exits, consumer.name + ": closed callee has no checked exit")
+
+
+class _ClosedEffectsCaller(Consumer):
+    """Fixed point for closed effects, without a loop-termination claim.
+
+    Unlike final-sink loops, these local-only bodies need no iteration bound
+    to establish disjoint writes and a return bit mask. Keep every arm unless
+    an exact numeric predicate refutes it; equality to a literal refines only
+    the tested register. No iteration ceiling truncates a reachable path.
+    """
+    merge_facts = staticmethod(_ClosedEffectsProof.join)
+
+    def transfer(self, pc, incoming):
+        return self.effect.transfer(self, pc, incoming, super().transfer(pc, incoming))
+
+    def flow_edges(self, pc, before, after):
+        branch = BRANCH.fullmatch(self.text[pc])
+        for successor in self.graph[pc]:
+            state = after.copy()
+            if branch:
+                left, right = value(before, branch[1]), value(before, branch[3])
+                lhs, rhs = number_values(left), number_values(right)
+                if lhs is not None and rhs is not None:
+                    pairs = {(a, b) for a in lhs for b in rhs
+                             if compare(a, branch[2], b, 32 if branch[1].startswith("w") else 64)
+                             == (successor == D.relative_target(pc, self.text[pc]))}
+                    if not pairs:
+                        continue
+                    # Refine only the tested registers. Equal abstract sets
+                    # do not establish identity of independent scalar values.
+                    for operand, values in ((branch[1], {a for a, _ in pairs}),
+                                            (branch[3], {b for _, b in pairs})):
+                        if operand.startswith("r"):
+                            state[operand] = (("constant", next(iter(values))) if len(values) == 1
+                                              else ("finite", frozenset(values)))
+                elif (left and left[0] == "bits" and rhs is not None and len(rhs) == 1
+                      and branch[2] in ("==", "!=") and branch[1].startswith("r")):
+                    taken = successor == D.relative_target(pc, self.text[pc])
+                    if taken == (branch[2] == "=="):
+                        state[branch[1]] = ("constant", next(iter(rhs)))
+            yield successor, state
+
+
+def closed_entry_callees_contract(internal_blocks, internal_calls):
+    """Closed effects/return bits, not target-read policy or publication proof."""
+    require(all(name in internal_blocks for name in ("p11_alias_scan", "p11_stable_cell", "p11_request_cell")),
+            "closed entry callee inventory")
+    summaries = {}
+    memset_body_contract(internal_blocks)
+    allowed = {"p11_alias_scan": 0x401,
+               "p11_stable_cell": (0x10 << 32) | 0x1ffffff,
+               "p11_request_cell": (0x14 << 40) | (4 << 32) | 0xffffffff}
+    for name, mask in allowed.items():
+        consumer = _ClosedEffectsCaller(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+        proof = _ClosedEffectsProof(summaries, mask)
+        consumer.effect = proof
+        initial = {"r"+str(i): ("bits", (1 << 64)-1) for i in range(1, 6)}
+        consumer.facts(initial | {"r10": ("stack", 0)})
+        proof.finish(consumer)
+        summaries[name] = {"return_bits": proof.return_bits, "output": None}
+    readers = [name for name in internal_blocks if "object_entry_attributes" in name and "call_mut" in name]
+    require(len(readers) == 1, "closed word-reader callee inventory")
+    name = readers[0]
+    for layout in (0, 1):
+        consumer = _ClosedEffectsCaller(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+        proof = _ClosedEffectsProof({}, 0, result=True)
+        consumer.effect = proof
+        consumer.facts({"r1": ("stack", -0x1000), "r2": ("stack", -0x2000),
+            "r3": ("bits", (1 << 64)-1), "r10": ("stack", 0),
+            ("stack", -0x2000, 8): ("stack", -0x3000),
+            ("stack", -0x3000, 1): ("constant", layout)})
+        proof.finish(consumer)
+    summaries[name] = {"return_bits": None, "output": ("r1", 16)}
+    scalar_body_contract(internal_blocks, internal_calls, "default")
+    arguments = [name for name in internal_blocks if name.endswith("arg_u64")]
+    require(len(arguments) == 1, "closed scalar Result callee inventory")
+    summaries[arguments[0]] = {"return_bits": None, "output": ("r1", 16), "argument": True}
+    return summaries
+
+
+class _SeedCaller(Consumer):
+    """Caller-only summaries for the reviewed native APIs, never a native model.
+
+    Identity writes its two-word output; a separate CFG check requires success
+    and nonzero cookie before construction. Memset's exact emitted byte loop is
+    checked below. Shadow marker facts join only proven zero/current-cookie
+    values, so initialization cannot be inferred from an unknown merged word.
+    This subclass leaves the historical checker and stop-gate Consumer unchanged.
+    """
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        text, target = self.text[pc], self.calls.get(pc, "")
+        identity = (self.section, self.name)
+        if match := STORE.fullmatch(text):
+            width, base, sign, offset, source = match.groups()
+            pointer = address(incoming, base, sign, offset)
+            if pointer and pointer[0] == "stack":
+                size = int(width) // 8
+                for key in list(state):
+                    if isinstance(key, tuple) and key[0] == "seed_marker" and key[1] < pointer[1]+size and pointer[1] < key[1]+8:
+                        del state[key]
+                fact = value(incoming, source)
+                if width == "64" and fact in (("constant", 0), ("entry_marker", identity)):
+                    state[("seed_marker", pointer[1])] = True
+            elif pointer is None and incoming.get("r"+base, (None,))[0] != "result":
+                for key in list(state):
+                    if isinstance(key, tuple) and key[0] == "seed_marker":
+                        del state[key]
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(incoming, *match.groups()[1:]) if match else None
+            disjoint = match and incoming.get("r"+match[2], (None,))[0] == "result"
+            for key in list(state):
+                if isinstance(key, tuple) and key[0] == "seed_marker" and not disjoint:
+                    if pointer is None or pointer[0] != "stack" or (key[1] < pointer[1]+int(match[1])//8 and pointer[1] < key[1]+8):
+                        del state[key]
+        if target in ("memset", "p11_link_current_identity") or target.endswith("scope_auth"):
+            pointer = incoming.get("r1")
+            size = incoming.get("r3") if target == "memset" else ("constant", 16)
+            width = size[1] if size and size[0] == "constant" else 512
+            for key in list(state):
+                if isinstance(key, tuple) and key[0] == "seed_marker":
+                    if not pointer or pointer[0] != "stack" or (key[1] < pointer[1]+width and pointer[1] < key[1]+8):
+                        del state[key]
+        if target == "memset":
+            pointer, byte, size = (incoming.get(reg) for reg in ("r1", "r2", "r3"))
+            if pointer and pointer[0] == "stack" and byte == ("constant", 0) and size and size[0] == "constant" and 0 < size[1] <= 32 and size[1] % 8 == 0:
+                for offset in range(0, size[1], 8):
+                    state[("stack", pointer[1]+offset, 8)] = ("constant", 0)
+                    state[("seed_marker", pointer[1]+offset)] = True
+        elif target == "p11_link_current_identity":
+            pointer = incoming.get("r1")
+            if pointer and pointer[0] == "stack":
+                state[("stack", pointer[1], 8)] = ("image_cookie", identity, pc)
+                state[("stack", pointer[1]+8, 8)] = ("image_exec", identity, pc)
+                state["r0"] = ("identity_result", pc)
+        elif target.endswith("object_marker_for"):
+            if incoming.get("r1") == ("cookie", identity):
+                state["r0"] = ("entry_marker", identity)
+        elif target == "p11_owner_start_begin":
+            state["r0"] = ("owned", pc, 0)
+        if match := re.fullmatch(r"([rw]\d+) (=|<<=|>>=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            dst, op, src = match.groups()
+            fact = value(incoming, src) if op == "=" else incoming.get(reg(dst))
+            if fact and fact[0] == "identity_result" and (op == "=" or src == "0x20"):
+                state[reg(dst)] = fact
+        return state
+
+
+class _OwnedCaller(_SeedCaller):
+    """Track mutable START bytes separately from every local BPF frame.
+
+    These are caller API footprints, not claims about native transaction bodies.
+    Unknown aliases and callees erase the facts they might overwrite.
+    """
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        text, target = self.text[pc], self.calls.get(pc, "")
+        if match := STORE.fullmatch(text):
+            width, base, sign, offset, src = match.groups()
+            pointer = address(incoming, base, sign, offset)
+            if pointer and pointer[0] == "owned":
+                size = int(width)//8
+                forget_owned(state, pointer[1], pointer[2], size)
+                fact = narrow(value(incoming, src), int(width))
+                if fact is not None:
+                    state[("owned_word", pointer[1], pointer[2], size)] = fact
+                    # A later adjacent u32 shape update may overlap the high
+                    # half of this initialized u64 without touching user_type.
+                    if size == 8 and fact[0] == "constant":
+                        for delta in (0, 4):
+                            state[("owned_word", pointer[1], pointer[2]+delta, 4)] = ("constant", (fact[1] >> (delta*8)) & 0xffffffff)
+            elif pointer is None and incoming.get("r"+base, (None,))[0] != "result":
+                forget_owned(state)
+        if match := LOAD.fullmatch(text):
+            pointer = address(incoming, match[3], match[4], match[5])
+            if pointer and pointer[0] == "owned":
+                fact = capture_read(incoming, pointer, int(match[2])//8)
+                state.pop(reg(match[1]), None)
+                if fact is not None:
+                    state[reg(match[1])] = fact
+            elif pointer and pointer[0] == "side":
+                if pointer[2] == 24 and match[2] == "32":
+                    state[reg(match[1])] = ("object_index", pointer[1])
+                elif pointer[2] in (385, 421) and match[2] == "8":
+                    pair = int(pointer[2] == 421)
+                    if incoming.get(("list_flags_safe", pointer[1], pair)):
+                        state[reg(match[1])] = ("list_flags", pointer[1], pair, frozenset(), 0)
+                elif pointer[2] == 428 and match[2] == "16":
+                    origins = frozenset(key[1] for key, fact in incoming.items()
+                        if isinstance(key, tuple) and key[0] == "contrib_published" and fact
+                        and incoming.get(("contrib_side", key[1])) == pointer[1])
+                    state[reg(match[1])] = ("side_flags", pointer[1], 0xfff, origins)
+            elif pointer and pointer[0] == "object_descriptor":
+                if match[2] == "8" and 4 <= pointer[2] < 16:
+                    state[reg(match[1])] = ("object_field", pointer[1], pointer[2])
+                elif match[2] == "32" and pointer[2] == 0:
+                    state[reg(match[1])] = ("object_function", pointer[1])
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(incoming, *match.groups()[1:]) if match else None
+            if pointer and pointer[0] == "owned":
+                # This row is disjoint from the caller's local frame. The
+                # base Consumer cannot identify it, so restore only those
+                # memory facts before invalidating the exact owned footprint.
+                state.update((key, fact) for key, fact in incoming.items()
+                    if isinstance(key, tuple) and key[0] in ("stack", "seed_marker"))
+                forget_owned(state, pointer[1], pointer[2], int(match[1])//8)
+            elif pointer is None and not (match and incoming.get("r"+match[2], (None,))[0] == "result"):
+                forget_owned(state)
+        if text.startswith("call "):
+            if pc in self.helper and text == "call 0x1" and incoming.get("r1") == ("map", "OBJECT_DESCRIPTORS"):
+                state["r0"] = ("object_descriptor", pc, 0)
+            if not target and pc not in self.helper:
+                forget_owned(state)
+            if pc in self.helper:
+                if text in ("call 0x70", "call 0x72"):
+                    pointer, size = incoming.get("r1"), incoming.get("r2")
+                    if pointer and pointer[0] == "owned" and size and size[0] == "constant":
+                        forget_owned(state, pointer[1], pointer[2], size[1])
+                    elif not pointer or pointer[0] not in ("stack", "result"):
+                        forget_owned(state)
+                elif text not in ("call 0x1", "call 0x5", "call 0xc", "call 0xe", "call 0xae"):
+                    forget_owned(state)
+            if target.endswith("capture_scalar"):
+                pointer = incoming.get("r5")
+                if pointer and pointer[0] == "owned":
+                    forget_owned(state, pointer[1], pointer[2]+0x100, 4)
+            elif target.endswith("capture_async_target"):
+                pointer = incoming.get("r2")
+                if pointer and pointer[0] == "owned":
+                    forget_owned(state, pointer[1], pointer[2]+0x100, 8)
+            elif target in ("p11_decode_params", "p11_walk_template", "p11_walk_template_types"):
+                pointer = incoming.get("r4")
+                if pointer and pointer[0] == "owned":
+                    forget_owned(state, pointer[1], pointer[2], 24 if target == "p11_decode_params" else 80)
+            elif target == "p11_owner_start_get":
+                state["r0"] = ("owned", pc, 0)
+            elif target == "p11_owner_start_remove":
+                forget_owned(state)
+            elif target == "p11_object_side_get":
+                state["r0"] = ("side", pc, 0)
+            elif target and not (target in ("memset", "p11_link_current_identity", "p11_instance_entry",
+                    "p11_owner_start_begin", "p11_owner_start_aggregate", "p11_object_side_get", "p11_object_fault")
+                    or any(target.endswith(suffix) for suffix in ("scope_auth", "scope_flags_word", "object_marker_for",
+                        "object_record_entry_abi", "object_fill_entry", "object_entry_derive", "object_entry_results",
+                        "object_entry_find", "object_entry_attributes"))
+                    or target in getattr(self, "closed_callees", {})):
+                forget_owned(state)
+            summary = getattr(self, "closed_callees", {}).get(target)
+            if summary and summary["output"]:
+                pointer = incoming.get(summary["output"][0])
+                if pointer and pointer[0] == "stack":
+                    forget_stack(state, pointer[1], summary["output"][1])
+        if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
+            fact = incoming.get(match[1])
+            if fact and fact[0] == "owned":
+                state[match[1]] = (fact[0], fact[1], fact[2]+int(match[2],16))
+            elif fact and fact[0] == "side":
+                offsets = fact[2] if isinstance(fact[2], frozenset) else {fact[2]}
+                state[match[1]] = side_pointer(fact[1], (n+int(match[2],16) for n in offsets))
+        if match := re.fullmatch(r"([rw]\d+) = (w\d+)", text):
+            state.pop(reg(match[1]), None)
+            fact = narrow(value(incoming, match[2]), 32)
+            if fact is not None:
+                state[reg(match[1])] = fact
+        if match := re.fullmatch(r"([rw]\d+) (\|=|&=) ([rw]\d+|-?0x[0-9a-f]+)", text):
+            left, right = incoming.get(reg(match[1])), value(incoming, match[3])
+            if left and left[0] == "object_result":
+                if match[2] == "|=" and right and right[0] == "object_result":
+                    state[reg(match[1])] = ("object_result", left[1] | right[1])
+                elif (match[2], right) in (("&=", ("constant", 1)), ("|=", ("constant", 0))):
+                    state[reg(match[1])] = left
+            if match[2] == "|=":
+                for old, added in ((left, right), (right, left)):
+                    if old and old[0] == "list_flags":
+                        projection = packed_projection(added)
+                        numbers = number_values(added)
+                        if projection and projection[1] == "list" and projection[2] & ~4 == 0:
+                            state[reg(match[1])] = (*old[:3], old[3] | {projection[0]}, old[4])
+                        elif added and added[0] == "packed" and added[2] == 32:
+                            # The caller ORs the complete upper word, then
+                            # stores u8. Retain that expression until the
+                            # actual store truncates it; never bless its high
+                            # object-flag bits as an eight-bit register value.
+                            state[reg(match[1])] = ("flag_or", old, added)
+                        elif numbers is not None and all(n & ~0x1f == 0 for n in numbers):
+                            bits = 0
+                            for n in numbers: bits |= n
+                            state[reg(match[1])] = (*old[:4], old[4] | bits)
+                        elif added and added[0] == "bits" and added[1] & ~0x1f == 0:
+                            state[reg(match[1])] = (*old[:4], old[4] | added[1])
+                    if old and old[0] == "side_flags":
+                        flags = contribution_value(added)
+                        numbers = number_values(added)
+                        if flags:
+                            state[reg(match[1])] = ("side_flags", old[1], old[2] | flags[2], old[3] | flags[1])
+                        elif numbers is not None and all(n & ~0xfff == 0 for n in numbers):
+                            bits = old[2]
+                            for n in numbers: bits |= n
+                            state[reg(match[1])] = ("side_flags", old[1], bits, old[3])
+                lhs, rhs = contribution_value(left), contribution_value(right)
+                if lhs is not None and rhs is not None and (left[0] != "constant" or right[0] != "constant"):
+                    state[reg(match[1])] = ("contribution", lhs[1] | rhs[1], lhs[2] | rhs[2])
+            elif left and left[0] == "side_flags" and right and right[0] == "constant":
+                state[reg(match[1])] = ("side_flags", left[1], left[2] & right[1],
+                                        left[3] if right[1] & 0x14 == 0x14 else frozenset())
+        if match := re.fullmatch(r"([rw]\d+) (<<=|>>=|&=) (-?0x[0-9a-f]+)", text):
+            fact = incoming.get(reg(match[1]))
+            amount = int(match[3], 16)
+            if fact and fact[0] == "packed":
+                shift, mask = fact[2:]
+                width = 32 if match[1].startswith("w") else 64
+                mask &= (1 << width)-1
+                if match[2] == "&=": mask &= amount
+                elif 0 <= amount < width:
+                    shift += amount if match[2] == ">>=" else -amount
+                    mask = mask >> amount if match[2] == ">>=" else (mask << amount) & ((1 << width)-1)
+                else:
+                    shift, mask = -1000, (1 << 64)-1
+                state[reg(match[1])] = (("packed", fact[1], shift, mask) if mask else ("constant", 0))
+            elif fact and fact[0] == "bits":
+                width = 32 if match[1].startswith("w") else 64
+                mask = fact[1] & ((1 << width)-1)
+                if match[2] == "&=": mask &= amount
+                elif 0 <= amount < (32 if match[1].startswith("w") else 64):
+                    mask = mask >> amount if match[2] == ">>=" else mask << amount
+                else: mask = (1 << 64)-1
+                state[reg(match[1])] = ("bits", mask & ((1 << width)-1))
+        return state
+
+
+PACKED_FIELDS = {"kind": (0, 8), "status": (8, 8), "value": (16, 16),
+                 "list": (32, 8), "object": (40, 8)}
+
+
+def packed_projection(fact):
+    if not fact or fact[0] != "packed":
+        return None
+    for field, (shift, width) in PACKED_FIELDS.items():
+        if fact[2] == shift and fact[3] < 1 << width:
+            return fact[1], field, fact[3]
+    return None
+
+
+def packed_domain(state, token, field):
+    key = ("packed_domain", token, field)
+    if key in state:
+        return state[key]
+    mask = state.get(("packed_mask", token))
+    require(mask is not None, "request publication missing scalar return provenance")
+    shift, width = PACKED_FIELDS[field]
+    bits = (mask >> shift) & ((1 << width)-1)
+    if field == "value":
+        return frozenset({0, 1}) if bits else frozenset({0})
+    return frozenset(n for n in range(1 << width) if n & ~bits == 0)
+
+
+def packed_complete(state, fact, token, field):
+    projection = packed_projection(fact)
+    if not projection or projection[:2] != (token, field):
+        return False
+    possible = 0
+    domain = packed_domain(state, token, field)
+    if field == "value":
+        possible = ((state[("packed_mask", token)] >> 16) & 0xffff) if 1 in domain else 0
+    else:
+        for number in domain:
+            possible |= number
+    return possible & ~projection[2] == 0
+
+
+def contribution_value(fact):
+    projection = packed_projection(fact)
+    if projection and projection[1] == "object" and projection[2] & ~0x14 == 0:
+        return ("contribution", frozenset({projection[0]}), projection[2])
+    if fact and fact[0] == "contribution":
+        return fact
+    if fact == ("constant", 0):
+        return ("contribution", frozenset(), 0)
+    return None
+
+
+def finite_intervals(intervals, op, constant, taken):
+    """Exact unsigned scalar partition; neither examples nor truncated aliases."""
+    constant &= (1 << 64)-1
+    result = []
+    for low, high in intervals:
+        cuts = sorted({low, high+1, max(low, min(high+1, constant)),
+                       max(low, min(high+1, constant+1))})
+        for begin, end in zip(cuts, cuts[1:]):
+            if begin < end and compare(begin, op, constant) == taken:
+                result.append((begin, end-1))
+    return tuple(result)
+
+
+class _OwnedSinkProof(SinkProof):
+    def partition(self, state):
+        intervals = state.get(("finite_values",))
+        finite = None
+        if intervals is not None:
+            finite = "mixed"
+            if all(high < 3 for _, high in intervals):
+                finite = "valid"
+            elif all(low >= 3 for low, _ in intervals):
+                finite = "invalid"
+        frame = state.get(("publication_frame",))
+        publication = ((state.get("r0"), packed_domain(state, frame[0], "value")) if frame else None)
+        return super().partition(state) + (state.get(("live", self.start[1])),
+            state.get(("cleanup",)), state.get(("poisoned",)), state.get(("entry_pending",)),
+            state.get(("entry_refusal",)), finite,
+            bool(state.get(("object_pair_ok", 0))), bool(state.get(("object_pair_ok", 1))), publication)
+
+    @staticmethod
+    def join(previous, state):
+        merged = SinkProof.join(previous, state)
+        if previous is not None:
+            for key in previous.keys() & state.keys():
+                for origin, other, predecessor in ((previous[key], state[key], state), (state[key], previous[key], previous)):
+                    if (isinstance(origin, tuple) and origin and origin[0] in ("object_index", "object_optional_index")
+                            and other == ("constant", 0) and predecessor.get(("side_absent", origin[1]))):
+                        merged[key] = ("object_optional_index", origin[1])
+                if isinstance(key, tuple) and key[0] == "packed_domain":
+                    merged[key] = previous[key] | state[key]
+                left, right = previous[key], state[key]
+                joined = merged.get(key)
+                if (isinstance(left, tuple) and isinstance(right, tuple) and left and right
+                        and left[0] == right[0] == "list_flags" and left[1:3] == right[1:3]):
+                    origins = _OwnedSinkProof.flag_origin_join(previous, state, left[3], right[3], "list")
+                    merged[key] = (*left[:3], origins, left[4] | right[4])
+                if isinstance(joined, tuple) and joined and joined[0] == "contribution":
+                    lhs, rhs = contribution_value(left), contribution_value(right)
+                    if lhs is not None and rhs is not None:
+                        origins = _OwnedSinkProof.flag_origin_join(previous, state, lhs[1], rhs[1])
+                        merged[key] = ("contribution", origins, lhs[2] | rhs[2])
+                if (isinstance(left, tuple) and isinstance(right, tuple) and left and right
+                        and left[0] == right[0] == "side_flags" and left[1] == right[1]):
+                    origins = _OwnedSinkProof.flag_origin_join(previous, state, left[3], right[3])
+                    merged[key] = ("side_flags", left[1], left[2] | right[2], origins)
+            expected = {key[1] for predecessor in (previous, state) for key in predecessor
+                        if isinstance(key, tuple) and key[0] == "contrib_expected"}
+            for token in expected:
+                merged[("contrib_expected", token)] = True
+                sides = {predecessor.get(("contrib_side", token)) for predecessor in (previous, state)
+                         if predecessor.get(("contrib_expected", token))}
+                if len(sides) == 1:
+                    merged[("contrib_side", token)] = next(iter(sides))
+                if all(not predecessor.get(("contrib_expected", token)) or predecessor.get(("contrib_published", token))
+                       for predecessor in (previous, state)):
+                    merged[("contrib_published", token)] = True
+                else:
+                    merged.pop(("contrib_published", token), None)
+            cells = {key for predecessor in (previous, state) for key in predecessor
+                     if isinstance(key, tuple) and key[0] == "publication_cell"}
+            for key in cells:
+                sources = [predecessor[key] for predecessor in (previous, state) if key in predecessor]
+                require(len({source[0] for source in sources}) == 1, "request publication cell owner changed at join")
+                merged[key] = (sources[0][0], frozenset().union(*(source[1] for source in sources)))
+                if all(key not in predecessor or predecessor.get(("cell_live", key[1]))
+                       for predecessor in (previous, state)):
+                    merged[("cell_live", key[1])] = True
+                else:
+                    merged.pop(("cell_live", key[1]), None)
+            for key in previous.keys() | state.keys():
+                if isinstance(key, tuple) and key[0] in ("publication_list", "publication_list_lost"):
+                    merged[key] = True
+        if previous is not None and ("finite_values",) in previous and ("finite_values",) in state:
+            merged[("finite_values",)] = tuple(sorted(set(previous[("finite_values",)]) | set(state[("finite_values",)])))
+        return merged
+
+    @staticmethod
+    def flag_origin_join(previous, state, left, right, field=None):
+        if field is not None:
+            return frozenset(token for token in left | right
+                if all(token in origins or ("packed_mask", token) in predecessor
+                       and packed_domain(predecessor, token, field) == {0}
+                       for predecessor, origins in ((previous, left), (state, right))))
+        active = {frame[0] for predecessor in (previous, state)
+                  if (frame := predecessor.get(("publication_frame",)))}
+        return frozenset(token for token in left | right
+            if all(token in origins or token not in active and not predecessor.get(("contrib_expected", token))
+                   for predecessor, origins in ((previous, left), (state, right))))
+
+    def begin_publication(self, consumer, pc, before, state, summary):
+        error = lambda message: self.fail(consumer, pc, "request publication " + message)
+        require(not before.get(("publication_frame",)), error("has a pending earlier cell"))
+        pointer, count, tags = before.get("r1"), before.get("r2"), number_values(before.get("r3"))
+        require(pointer and pointer[0] == "object_scalar" and pointer[2] in (8, 10)
+                and count == ("object_scalar", pointer[1], pointer[2]+1, 32 if self.abi else 64)
+                and pointer[3] == (32 if self.abi else 64), error("pair payload provenance"))
+        pair = (pointer[2]-8)//2
+        side = before.get(("object_table_side", pointer[1]))
+        owner = before.get(("side_owner", side))
+        require(owner is not None and before.get(("live", owner)) and before.get(("side_live", side))
+                and before.get(("object_descriptor_live", pointer[1])) and before.get(("object_pair_ok", pair)),
+                error("pair success/current owner lifetime"))
+        require(tags is not None and all(tag & ~0x307 == 0 and ((tag >> 8) & 1) == self.abi for tag in tags),
+                error("full-width tag/index/layout"))
+        peer = 1-pair
+        for tag in tags:
+            expected = (("object_scalar", pointer[1], 8+2*peer, 32 if self.abi else 64),
+                        ("object_scalar", pointer[1], 9+2*peer, 32 if self.abi else 64)) if tag & 512 else (("constant", 0), ("constant", 0))
+            require((before.get("r4"), before.get("r5")) == expected
+                    and (not tag & 512 or before.get(("object_pair_ok", peer))), error("peer pair/tag agreement"))
+        for key in list(state):
+            if isinstance(key, tuple) and key[0] in ("packed_mask", "packed_domain"):
+                del state[key]
+        token = (consumer.section, consumer.name, *(consumer.cursor or (pc, 0)))
+        mask = summary["return_bits"]
+        require(mask is not None and mask >> 48 == 0, error("closed callee return bits"))
+        state[("packed_mask", token)] = mask
+        state[("publication_frame",)] = (token, side, pair, frozenset(352+36*pair+4*(tag & 7) for tag in tags))
+        state[("publication_words",)] = frozenset()
+        state["r0"] = ("packed", token, 0, mask)
+
+    def publication_store(self, consumer, pc, before, state, pointer, size, source):
+        error = lambda message: self.fail(consumer, pc, "request publication " + message)
+        frame = before.get(("publication_frame",))
+        if pointer and pointer[0] == "side":
+            offsets = pointer[2] if isinstance(pointer[2], frozenset) else {pointer[2]}
+            overlaps = lambda base, width: any(n < base+width and base < n+size for n in offsets)
+            for key, cell in before.items():
+                if isinstance(key, tuple) and key[0] == "publication_cell" and cell[0] == pointer[1]:
+                    if any(overlaps(base, 4) for base in cell[1]):
+                        state.pop(("cell_live", key[1]), None)
+            for pair in (0, 1):
+                if overlaps(385+36*pair, 1):
+                    state.pop(("list_flags_safe", pointer[1], pair), None)
+                    # Every admitted later update uses the old byte plus the
+                    # next cell's checked flags. A separate writer cannot
+                    # manufacture an authentic snapshot of already lost bits.
+                    current = (frame and frame[1:3] == (pointer[1], pair)
+                               and offsets == {385+36*pair} and size == 1)
+                    if before.get(("publication_list", pointer[1], pair)) and not current:
+                        state[("publication_list_lost", pointer[1], pair)] = True
+            if overlaps(428, 2):
+                for key in list(state):
+                    if isinstance(key, tuple) and key[0] == "contrib_published" and state.get(("contrib_side", key[1])) == pointer[1]:
+                        state.pop(key, None)
+        if pointer and pointer[0] == "side" and pointer[2] in (385, 421) and size == 1:
+            pair = int(pointer[2] == 421)
+            values = number_values(source)
+            safe = ((values is not None and all(n & ~0x1f == 0 for n in values))
+                    or source and source[0] == "bits" and source[1] & ~0x1f == 0
+                    or source and source[0] == "list_flags" and source[1:3] == (pointer[1], pair))
+            state.pop(("list_flags_safe", pointer[1], pair), None)
+            if safe:
+                state[("list_flags_safe", pointer[1], pair)] = True
+        if pointer and pointer[0] == "side" and pointer[2] == 428 and size == 2:
+            values = number_values(source)
+            require((source and source[0] == "side_flags" and source[1] == pointer[1] and source[2] & ~0xfff == 0)
+                    or values is not None and all(n & ~0xfff == 0 for n in values),
+                    error("object/Get flags lost their bounded source"))
+            origins = source[3] if source and source[0] == "side_flags" else frozenset()
+            for key in list(state):
+                if isinstance(key, tuple) and key[0] == "contrib_expected" and state.get(("contrib_side", key[1])) == pointer[1]:
+                    state.pop(("contrib_published", key[1]), None)
+                    if key[1] in origins:
+                        state[("contrib_published", key[1])] = True
+        if not frame:
+            return
+        token, side, pair, cells = frame
+        refused = before.get("r0") == ("constant", 0)
+        words = before.get(("publication_words",), frozenset())
+        if pointer and pointer[0] == "side":
+            offsets = pointer[2] if isinstance(pointer[2], frozenset) else frozenset({pointer[2]})
+            field = next((field for field, delta, width in (("kind", 0, 1), ("status", 1, 1), ("value", 2, 2))
+                          if size == width and offsets == frozenset(n+delta for n in cells)), None)
+            if pointer[1] == side and field:
+                require(field not in words, error("duplicate cell field write"))
+                copied = packed_complete(before, source, token, field)
+                zero = source == ("constant", 0)
+                require(zero if refused else copied or zero and packed_domain(before, token, field) == {0},
+                        error("same-cell field wiring/refusal zero"))
+                state[("publication_words",)] = words | {field}
+                if state[("publication_words",)] == {"kind", "status", "value"}:
+                    state[("publication_cell", token)] = (side, cells)
+                    state[("cell_live", token)] = True
+                if state[("publication_words",)] == {"kind", "status", "value"} and not refused:
+                    kinds, statuses, values = (packed_domain(before, token, field) for field in ("kind", "status", "value"))
+                    require(kinds <= set(range(7)) and statuses <= set(range(11))
+                            and (1 not in values or 0 not in kinds and statuses == {1}),
+                            error("finite kind/status/value implication"))
+            elif pointer[1] == side and offsets == {385+36*pair} and size == 1:
+                require(words == {"kind", "status", "value"} and source and source[0] == "list_flags"
+                        and source[1:3] == (side, pair)
+                        and (source[4] & 4 if refused else token in source[3] or packed_domain(before, token, "list") == {0}),
+                        error("list flags do not preserve the old list plus this cell's finite flags"))
+                state[("publication_flags",)] = True
+                state[("publication_list", side, pair)] = True
+                if not refused and packed_domain(before, token, "object") != {0}:
+                    state[("contrib_expected", token)] = True
+                    state[("contrib_side", token)] = side
+            else:
+                require(False, error("cell/list write footprint"))
+        elif pointer and pointer[0] == "stack" and words == {"kind", "status", "value"} and before.get(("publication_flags",)):
+            flags = contribution_value(source)
+            if flags and ((token not in flags[1]) if refused else
+                          (token in flags[1] or packed_domain(before, token, "object") == {0})):
+                state[("publication_contribution",)] = True
+        self.finish_publication(state)
+
+    @staticmethod
+    def finish_publication(state):
+        if (state.get(("publication_words",)) == {"kind", "status", "value"}
+                and state.get(("publication_flags",)) and state.get(("publication_contribution",))):
+            for key in (("publication_frame",), ("publication_words",), ("publication_flags",), ("publication_contribution",)):
+                state.pop(key, None)
+
+    def captured(self, state):
+        super().captured(state)
+        if self.role == 11:
+            state[("finite_values",)] = ((0, (1 << (32 if self.abi else 64))-1),)
+
+    def check_sink(self, consumer, pc, state):
+        if state.get(("cleanup",)):
+            require(state.get(("poisoned",)), self.fail(consumer, pc, "removed START lacks terminal fault"))
+            return
+        require(not state.get(("publication_frame",)), self.fail(consumer, pc, "request publication has pending cell/flags/contribution"))
+        require(all(state.get(("cell_live", key[1])) for key in state
+                    if isinstance(key, tuple) and key[0] == "publication_cell"),
+                self.fail(consumer, pc, "request publication cell overwritten before live exit"))
+        require(not any(isinstance(key, tuple) and key[0] == "publication_list_lost" for key in state),
+                self.fail(consumer, pc, "request publication list flags overwritten before live exit"))
+        require(all(state.get(("contrib_published", key[1])) for key in state
+                    if isinstance(key, tuple) and key[0] == "contrib_expected"),
+                self.fail(consumer, pc, "request publication contribution lost before side flags"))
+        require(not state.get(("entry_pending",)) and not state.get(("entry_refusal",)),
+                self.fail(consumer, pc, "entry refusal/pending adapter bypassed terminal cleanup"))
+        if not state.get(("live", self.start[1])):
+            require(not self.required(state), self.fail(consumer, pc, "capture lost owned START lifetime"))
+            return
+        if self.role == 11:
+            actual = capture_read(state, self.start, 4, 0x38)
+            intervals = state.get(("finite_values",))
+            if not state.get(("success",)):
+                require(actual == ("constant", 0xffffffff), self.fail(consumer, pc, "None lost USER_TYPE_NONE sentinel"))
+            else:
+                valid = intervals and all(high < 3 for _, high in intervals)
+                invalid = intervals and all(low >= 3 for low, _ in intervals)
+                require((valid and actual == self.scalar(width=32)) or (invalid and actual == ("constant", 0xffffffff)),
+                        self.fail(consumer, pc, "user type full-width finite classification lost"))
+                self.witnesses.add(pc)
+            return
+        super().check_sink(consumer, pc, state)
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(before, *match.groups()[1:]) if match else None
+            require(pointer and pointer[0] in ("stack", "owned")
+                    or match and before.get("r"+match[2], (None,))[0] == "result",
+                    self.fail(consumer, pc, "request publication unknown/side atomic output footprint"))
+        frame = before.get(("publication_frame",))
+        if frame and (match := re.fullmatch(r"([rw]\d+) \|= ([rw]\d+|-?0x[0-9a-f]+)", text)):
+            token = frame[0]
+            flags = contribution_value(state.get(reg(match[1])))
+            if flags is None:
+                left, right = contribution_value(before.get(reg(match[1]))), contribution_value(value(before, match[2]))
+                if left is not None and right is not None:
+                    flags = ("contribution", left[1] | right[1], left[2] | right[2])
+            if (before.get(("publication_words",)) == {"kind", "status", "value"}
+                    and before.get(("publication_flags",)) and flags
+                    and ((token not in flags[1]) if before.get("r0") == ("constant", 0)
+                         else token in flags[1] or packed_domain(before, token, "object") == {0})):
+                state[("publication_contribution",)] = True
+                self.finish_publication(state)
+        if target in ("memset", "p11_link_current_identity"):
+            pointer = before.get("r1")
+            length = before.get("r3") if target == "memset" else ("constant", 16)
+            require(length and length[0] == "constant" and length[1] > 0
+                    and (target != "memset" or before.get("r2") == ("constant", 0)),
+                    self.fail(consumer, pc, "known output needs a bounded zero-fill/identity effect"))
+            size = length[1]
+            local = pointer and pointer[0] == "stack" and -512 <= pointer[1] and pointer[1]+size <= 0
+            side = pointer[1] if pointer and pointer[0] == "side" else None
+            owner = before.get(("side_owner", side))
+            offsets = pointer[2] if pointer and pointer[0] == "side" else frozenset()
+            offsets = offsets if isinstance(offsets, frozenset) else {offsets}
+            private = (target == "memset" and side is not None and owner is not None
+                       and before.get(("live", owner)) and before.get(("side_live", side))
+                       and all((n, size) in ((64, 16), (96, 256)) for n in offsets))
+            require(local or private, self.fail(consumer, pc,
+                    "known output footprint leaves local storage/current side lifetime or reaches START/context"))
+        summary = getattr(consumer, "closed_callees", {}).get(target)
+        if pc in consumer.helper and text == "call 0x1" and before.get("r1") == ("map", "OBJECT_DESCRIPTORS"):
+            index = stack_read(before, before.get("r2"), 4)
+            side = index[1] if index and index[0] in ("object_index", "object_optional_index") else None
+            owner = before.get(("side_owner", side))
+            # Option::None still performs the readonly row-zero lookup; it
+            # grants no row-field authority. The later side guard must refuse.
+            require(index == ("constant", 0) or (side is not None and owner is not None and before.get(("live", owner))
+                    and (index[0] == "object_optional_index" or before.get(("side_live", side)))),
+                    self.fail(consumer, pc, "object descriptor key/current side lifetime"))
+            state[("object_table_side", pc)] = side
+        if summary:
+            if summary["output"]:
+                output = before.get(summary["output"][0])
+                require(output and output[0] == "stack" and -512 <= output[1] <= -16,
+                        self.fail(consumer, pc, "closed callee Result output outside local frame"))
+                if summary.get("argument"):
+                    index = before.get("r3")
+                    side = before.get(("object_table_side", index[1])) if index and index[0] == "object_field" else None
+                    owner = before.get(("side_owner", side))
+                    require(before.get("r2") == ("context", 0) and before.get("r4") == ("constant", self.abi)
+                            and index and index[0] == "object_field" and 8 <= index[2] <= 11
+                            and before.get(("object_descriptor_live", index[1])) and before.get(("side_live", side))
+                            and owner is not None and before.get(("live", owner)),
+                            self.fail(consumer, pc, "closed scalar Result context/layout/index"))
+                    origin = (pc, index[1], index[2], 32 if self.abi else 64)
+                    state[("stack", output[1], 8)] = ("object_result", frozenset({origin}))
+                    state[("stack", output[1]+8, 8)] = ("object_candidate", origin)
+                    state[("object_pair_ok", (index[2]-8)//2)] = False
+                else:
+                    closure = before.get("r2")
+                    layout = stack_read(before, closure, 8)
+                    require(closure and closure[0] == "stack" and -512 <= closure[1] <= -8
+                            and layout and layout[0] == "stack" and -512 <= layout[1] < 0
+                            and stack_read(before, layout, 1) == ("constant", self.abi)
+                            and (output[1]+16 <= closure[1] or closure[1]+8 <= output[1])
+                            and (output[1]+16 <= layout[1] or layout[1]+1 <= output[1]),
+                            self.fail(consumer, pc, "closed word Result readonly closure/layout/overlap"))
+            else:
+                private = {"owned", "side", "stack", "context", "event", "descriptor", "external_key", "result"}
+                require(all(not before.get("r"+str(i)) or before["r"+str(i)][0] not in private for i in range(1, 6)),
+                        self.fail(consumer, pc, "closed scalar callee received a private pointer"))
+                if target == "p11_request_cell":
+                    self.begin_publication(consumer, pc, before, state, summary)
+                else:
+                    state["r0"] = ("bits", summary["return_bits"])
+        memory = LOAD.fullmatch(text) or STORE.fullmatch(text)
+        if memory:
+            base, sign, offset = memory.groups()[2:5] if LOAD.fullmatch(text) else memory.groups()[1:4]
+            pointer = address(before, base, sign, offset)
+            require(before.get("r"+base) != ("constant", 0),
+                    self.fail(consumer, pc, "side memory access requires nonnull lifetime"))
+            if STORE.fullmatch(text):
+                require(pointer and pointer[0] in ("stack", "owned", "side")
+                        or before.get("r"+base, (None,))[0] == "result",
+                        self.fail(consumer, pc, "unknown entry write footprint"))
+            if pointer and pointer[0] == "owned":
+                require(before.get(("live", pointer[1])), self.fail(consumer, pc, "START access outside owned lifetime"))
+            if pointer and pointer[0] == "side":
+                owner = before.get(("side_owner", pointer[1]))
+                require(owner is not None and before.get(("live", owner)) and before.get(("side_live", pointer[1])),
+                        self.fail(consumer, pc, "side access requires nonnull current START lifetime"))
+                size = int(memory[2] if LOAD.fullmatch(text) else memory[1])//8
+                offsets = pointer[2] if isinstance(pointer[2], frozenset) else {pointer[2]}
+                require(all(0 <= n and n+size <= 432 for n in offsets),
+                        self.fail(consumer, pc, "side memory footprint outside the 432-byte row"))
+            if pointer and pointer[0] == "object_descriptor":
+                side = before.get(("object_table_side", pointer[1]))
+                owner = before.get(("side_owner", side))
+                require(before.get(("object_descriptor_live", pointer[1])) and owner is not None
+                        and before.get(("live", owner)) and before.get(("side_live", side)),
+                        self.fail(consumer, pc, "object descriptor nonnull/current START lifetime"))
+                require(LOAD.fullmatch(text) and ((memory[2] == "32" and pointer[2] == 0)
+                        or (memory[2] == "8" and 4 <= pointer[2] < 16)),
+                        self.fail(consumer, pc, "object descriptor readonly field width"))
+            if STORE.fullmatch(text):
+                self.publication_store(consumer, pc, before, state, pointer, int(memory[1])//8,
+                                       narrow(value(before, memory[5]), int(memory[1])))
+        if target == "p11_object_side_get":
+            identity, key = (consumer.section, consumer.name), before.get("r1")
+            require(before.get(("live", self.start[1])) and key and key[0] == "stack"
+                    and stack_read(before, key, 8) == ("pid_tgid", identity)
+                    and stack_read(before, key, 4, 8) == ("low", identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0)
+                    and before.get("r3") == ("constant", 0),
+                    self.fail(consumer, pc, "side query key/required flag/START lifetime"))
+            descriptor = before.get("r2")
+            require(not descriptor or descriptor[0] not in ("owned", "side", "stack", "context", "event", "descriptor", "external_key"),
+                    self.fail(consumer, pc, "side query descriptor is a private pointer"))
+            state[("side_owner", pc)] = self.start[1]
+        if target == "p11_owner_start_remove" and before.get(("live", self.start[1])):
+            state[("cleanup",)] = True
+        if any(target.endswith(suffix) for suffix in ("object_record_entry_abi", "object_fill_entry",
+                "object_entry_derive", "object_entry_results", "object_entry_find", "object_entry_attributes")):
+            require(not before.get(("entry_pending",)), self.fail(consumer, pc, "pending entry adapter result"))
+            state["r0"] = ("entry_adapter", pc)
+            state[("entry_pending",)] = pc
+        if target == "p11_object_fault":
+            require(not before.get(("live", self.start[1])), self.fail(consumer, pc, "terminal fault bypassed START removal attempt"))
+            if before.get(("cleanup",)):
+                state[("poisoned",)] = True
+        if text == "call 0xc" and before.get("r2") == ("map", "PAIR_CALLS"):
+            self.check_sink(consumer, pc, before)
+        return super().transfer(consumer, pc, before, state)
+
+    def edges(self, consumer, pc, before, after):
+        branch = BRANCH.fullmatch(consumer.text[pc])
+        for successor, state in super().edges(consumer, pc, before, after):
+            if branch:
+                left, right = value(before, branch[1]), value(before, branch[3])
+                zero_taken = zero_partition(left, branch[2], 64) if left and right == ("constant", 0) else None
+                taken = successor == D.relative_target(pc, consumer.text[pc])
+                if left and left[0] == "object_descriptor" and zero_taken is not None:
+                    if taken != zero_taken:
+                        state[("object_descriptor_live", left[1])] = True
+                    else:
+                        state.pop(("object_descriptor_live", left[1]), None)
+                        for key, fact in list(state.items()):
+                            if fact == left:
+                                state[key] = ("constant", 0)
+                if left and left[0] == "side" and left[2] == 0 and zero_taken is not None:
+                    if taken == zero_taken:
+                        state[("side_absent", left[1])] = True
+                        state.pop(("side_live", left[1]), None)
+                    else:
+                        state.pop(("side_absent", left[1]), None)
+                if left and left[0] == "object_field" and right and right[0] == "constant":
+                    key = ("object_domain", left[1], left[2])
+                    domain = frozenset(n for n in before.get(key, BYTE_DOMAIN)
+                                       if compare(n, branch[2], right[1], 32 if branch[1].startswith("w") else 64) == taken)
+                    if not domain:
+                        continue
+                    state[key] = domain
+                if left and left[0] == "object_result" and right == ("constant", 0):
+                    require(branch[2] in ("==", "!="), self.fail(consumer, pc, "object Result success predicate"))
+                    success = taken == (branch[2] == "==")
+                    if success:
+                        possible = True
+                        for origin in left[1]:
+                            _, table, field, _ = origin
+                            key = ("object_domain", table, field)
+                            domain = before.get(key, BYTE_DOMAIN) & frozenset(range(7))
+                            if not domain:
+                                possible = False
+                                break
+                            state[key] = domain
+                        if not possible:
+                            continue
+                        for key, fact in list(state.items()):
+                            if isinstance(fact, tuple) and fact and fact[0] == "object_candidate" and fact[1] in left[1]:
+                                _, table, field, width = fact[1]
+                                state[key] = ("object_scalar", table, field, width)
+                    for pair in (0, 1):
+                        if {origin[2] for origin in left[1]} == {8+2*pair, 9+2*pair}:
+                            state[("object_pair_ok", pair)] = success
+                projection = packed_projection(left)
+                if projection and right and right[0] == "constant":
+                    token, field, mask = projection
+                    domain = packed_domain(before, token, field)
+                    if field == "value":
+                        complete = packed_complete(before, left, token, field)
+                        if complete and right[1] == 0 and branch[2] in ("==", "!=", ">", "<="):
+                            domain = frozenset(n for n in domain if compare(n, branch[2], 0) == taken)
+                    else:
+                        domain = frozenset(n for n in domain if compare(n & mask, branch[2], right[1],
+                                           32 if branch[1].startswith("w") else 64) == taken)
+                    if not domain:
+                        continue
+                    state[("packed_domain", token, field)] = domain
+                if left and left[0] == "entry_adapter" and zero_taken is not None:
+                    require(branch[1].startswith("r"), self.fail(consumer, pc, "entry adapter result width"))
+                    state.pop(("entry_pending",), None)
+                    if (successor == D.relative_target(pc, consumer.text[pc])) == zero_taken:
+                        state[("entry_refusal",)] = True
+            if self.role == 11 and branch and before.get(("finite_values",)):
+                left, op, right = value(before, branch[1]), branch[2], value(before, branch[3])
+                scalar, constant = left, right
+                if left and left[0] == "constant" and right and right[0] == "scalar" and right[1] == 11:
+                    scalar, constant = right, left
+                    op = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "==": "==", "!=": "!="}.get(op)
+                if scalar and scalar[0] == "scalar" and scalar[1] == 11 and constant and constant[0] == "constant":
+                    require(op is not None and not op.startswith("s") and (self.abi or scalar[2] == 64),
+                            self.fail(consumer, pc, "user type predicate narrowed full-width input"))
+                    width = 32 if branch[1].startswith("w") else 64
+                    boundary = constant[1] & ((1 << width)-1)
+                    intervals = finite_intervals(before[("finite_values",)], op, boundary,
+                        successor == D.relative_target(pc, consumer.text[pc]))
+                    if not intervals:
+                        continue
+                    state[("finite_values",)] = intervals
+            yield successor, state
+
+
+def scalar_scope_flags_contract(disassembly):
+    """Summarize only the actual scalar wrapper's own-stack/full-word effects.
+
+    The real authority body remains scope_auth. This finite branch-first
+    wrapper supplies its own 32-byte output, returns flags64 on Some and zero
+    on None, and cannot write a caller's seed or perform a target read.
+    """
+    split = sections(disassembly)
+    blocks = D.function_blocks(split.get(".text", ""))
+    names = [name for name in blocks if name.endswith("scope_flags_word")]
+    require(len(names) <= 1, "scalar scope flags wrapper inventory")
+    if not names:
+        return None  # Earlier objects call the already-modeled authority directly.
+    name = names[0]
+    insns = D.instructions(blocks[name])
+    require(8 <= len(insns) <= 9 and insns[0][1] == "r1 = r10"
+            and insns[1][1] == "r1 += -0x20"
+            and re.fullmatch(r"call -?0x[0-9a-f]+", insns[2][1]),
+            "scalar scope flags own-stack/call effects")
+    authority = [candidate for candidate in blocks
+                 if re.fullmatch(r"_RNv[0-9A-Za-z]+_13p11scope_ebpf10scope_auth", candidate)]
+    calls = [(pc, target) for caller, _, pc, target in D.internal_call_targets(split[".text"])
+             if caller == name and target is not None]
+    require(len(authority) == 1 and len(calls) == 1 and calls[0][0] == insns[2][0]
+            and calls[0][1] == authority[0],
+            "scalar scope flags one actual scope_auth callee")
+    roles = {"tag": [], "flags": [], "zero": [], "guard": [], "exit": [], "jump": []}
+    for pc, text in insns[3:]:
+        if text == "r1 = *(u64 *)(r10 - 0x20)": role = "tag"
+        elif text == "r0 = *(u64 *)(r10 - 0x18)": role = "flags"
+        elif text == "r0 = 0x0": role = "zero"
+        elif re.fullmatch(r"if r1 (==|!=) 0x[01] goto .*", text): role = "guard"
+        elif text == "exit": role = "exit"
+        elif re.fullmatch(r"goto .*", text): role = "jump"
+        else: raise RuntimeError("scalar scope flags unknown/full64/discriminant effect")
+        roles[role].append(pc)
+    require(all(len(roles[role]) == 1 for role in ("tag", "flags", "zero", "guard", "exit"))
+            and len(roles["jump"]) <= 1, "scalar scope flags finite effect inventory")
+    texts = dict(insns)
+    _, graph = D.instruction_graph(blocks[name])
+    entry, tag, flags, zero, guard, end = (insns[0][0], roles["tag"][0], roles["flags"][0],
+                                        roles["zero"][0], roles["guard"][0], roles["exit"][0])
+    for pc in roles["guard"] + roles["jump"]:
+        target = D.relative_target(pc, texts[pc])
+        require(target in texts and target > pc, "scalar scope flags finite forward branch")
+    require(guard not in D.reachable(graph, [entry], blocked={tag}),
+            "scalar scope flags initialized discriminant")
+    target = D.relative_target(guard, texts[guard])
+    other = next(edge for edge in graph[guard] if edge != target)
+    condition = re.fullmatch(r"if r1 (==|!=) 0x([01]) goto .*", texts[guard])
+    some_taken = (condition[2] == "1") == (condition[1] == "==")
+    some, absent = (target, other) if some_taken else (other, target)
+    require(flags in D.reachable(graph, [some]) and end in D.reachable(graph, [absent])
+            and flags not in D.reachable(graph, [entry], blocked={guard})
+            and flags not in D.reachable(graph, [absent])
+            and end not in D.reachable(graph, [some], blocked={flags}),
+            "scalar scope flags payload load before discriminant/refusal")
+    require((guard not in D.reachable(graph, [entry], blocked={zero})
+             or end not in D.reachable(graph, [absent], blocked={zero}))
+            and zero not in D.reachable(graph, [flags])
+            and end in D.reachable(graph, [flags]),
+            "scalar scope flags zero-refusal/fullword return")
+    return name
+
+
+def memset_body_contract(blocks):
+    require("memset" in blocks, "seeded START missing memset")
+    memset = D.instructions(blocks["memset"])
+    # Different objdump versions spell the same stored sub-register r2/w2.
+    patterns = (r"if r3 == 0x0 goto .*", r"r4 = 0x0", r"r5 = r1", r"r5 \+= r4",
+                r"\*\(u8 \*\)\(r5 \+ 0x0\) = (?:w2|r2)", r"r4 \+= 0x1", r"if r3 > r4 goto .*", r"exit")
+    require(len(memset) == len(patterns) and all(re.fullmatch(pattern, instruction) for (_, instruction), pattern in zip(memset, patterns)),
+            "seeded START memset byte-loop summary changed")
+    require(D.relative_target(memset[0][0], memset[0][1]) == memset[-1][0]
+            and D.relative_target(memset[-2][0], memset[-2][1]) == memset[2][0],
+            "seeded START memset loop edges changed")
+
+
+def seeded_start_contract(disassembly):
+    """Actual ordinary-entry key/immutable-seed wiring, independent of old pins.
+
+    The native transaction is exercised by the real C fixture and ELF/frame
+    contracts, not summarized as a second owner algorithm here. This proves
+    caller provenance and refusal edges; it is not kernel verifier acceptance.
+    """
+    scalar_scope = scalar_scope_flags_contract(disassembly)
+    split = sections(disassembly)
+    require(".text" in split and "uprobe" in split, "seeded START missing sections")
+    blocks = D.function_blocks(split[".text"])
+    memset_body_contract(blocks)
+    calls = D.internal_call_targets(joined(split, "uprobe", ".text"))
+    report = {}
+    for name, lines in D.function_blocks(split["uprobe"]).items():
+        if not name.startswith("p11_entry") or name == "p11_entry_template_second":
+            continue
+        # Unresolved edges stay absent, as before section-aware resolution: every
+        # gate below fails closed on a missing callee instead.
+        consumer = _SeedCaller("uprobe", name, lines, {pc: target for caller, _, pc, target in calls if caller == name and target is not None})
+        if scalar_scope is not None:
+            require(sum(target == scalar_scope for target in consumer.calls.values()) == 1,
+                    name + ": seeded START one scalar scope call")
+        begins = [pc for pc, target in consumer.calls.items() if target == "p11_owner_start_begin"]
+        require(len(begins) == 1, name + ": seeded START constructor inventory")
+        begin = begins[0]
+        facts = consumer.facts()
+        state = facts.get(begin, {})
+        identity = (consumer.section, name)
+        key, seed = state.get("r1"), state.get("r2")
+        require(key and seed and key[0] == seed[0] == "stack" and key != seed,
+                name + ": seeded START key/seed addresses")
+        require(stack_read(state, key, 8) == ("pid_tgid", identity)
+                and stack_read(state, key, 4, 8) == ("low", identity)
+                and stack_read(state, key, 4, 12) == ("constant", 0), name + ": seeded START full owner key/padding")
+        require(stack_read(state, seed, 8) == ("ktime_ns", identity), name + ": seeded START original timestamp")
+        cookie, image = stack_read(state, seed, 8, 8), stack_read(state, seed, 8, 16)
+        require(cookie and cookie[:2] == ("image_cookie", identity) and image == ("image_exec", identity, cookie[2]),
+                name + ": seeded START current image words")
+        require(sum(target == "p11_link_current_identity" for target in consumer.calls.values()) == 1,
+                name + ": seeded START current identity inventory")
+        require(state.get(("seed_marker", seed[1]+24)) is True, name + ": seeded START marker uninitialized/nonzero/unproven")
+        entry = consumer.insns[0][0]
+        before = D.reachable(consumer.graph, [entry], blocked={begin})
+        can_reach_begin = {pc for pc in before if begin in D.reachable(consumer.graph, [pc])}
+        require(sum(pc in can_reach_begin and pc in consumer.helper and text == "call 0x5" for pc, text in consumer.insns) == 1,
+                name + ": seeded START must use one original timestamp")
+        def guarded(expected, constant, success_taken):
+            matches = []
+            for pc, text in consumer.insns:
+                branch = BRANCH.fullmatch(text)
+                if branch and value(facts.get(pc, {}), branch[1]) == expected and value(facts.get(pc, {}), branch[3]) == ("constant", constant) and branch[2] in ("==", "!="):
+                    taken = D.relative_target(pc, text)
+                    success = taken if (branch[2] == "==") == success_taken else next(edge for edge in consumer.graph[pc] if edge != taken)
+                    failure = next(edge for edge in consumer.graph[pc] if edge != success)
+                    if begin in D.reachable(consumer.graph, [success]) and begin not in D.reachable(consumer.graph, [failure]) and begin not in D.reachable(consumer.graph, [entry], blocked={pc}):
+                        matches.append(pc)
+            require(len(matches) == 1, name + ": seeded START identity success/nonzero guard")
+            return matches[0]
+        identity_guard = guarded(("identity_result", cookie[2]), 1, True)
+        cookie_guard = guarded(cookie, 0, False)
+        witnesses = [pc for pc, target in consumer.calls.items() if target == "p11_instance_entry"]
+        require(len(witnesses) == 1, name + ": seeded START witness inventory")
+        witness = witnesses[0]
+        witness_state = facts.get(witness, {})
+        require(witness_state.get("r1") == key and witness_state.get("r3") == cookie and witness_state.get("r4") == image
+                and begin not in D.reachable(consumer.graph, [entry], blocked={witness}),
+                name + ": seeded START witness key/image provenance")
+        for pc in can_reach_begin:
+            target = consumer.calls.get(pc, "")
+            require(not target or target in ("memset", "p11_link_current_identity", "p11_instance_entry")
+                    or target.endswith(("scope_auth", "object_marker_for"))
+                    or (scalar_scope is not None and target == scalar_scope),
+                    name + ": seeded START unknown pre-construction callee effects")
+            require(pc not in consumer.helper or consumer.text[pc] in
+                    ("call 0x1", "call 0x5", "call 0xc", "call 0xe", "call 0xae"),
+                    name + ": seeded START private read before construction/unknown helper")
+            require(not (pc in consumer.helper and consumer.text[pc] in ("call 0x70", "call 0x72"))
+                    and not any(target.endswith(suffix) for suffix in ("capture_scalar", "capture_async_target", "object_fill_entry", "object_entry_attributes")),
+                    name + ": seeded START private read before construction")
+        captures = {pc for pc, text in consumer.insns
+                    if (pc in consumer.helper and text in ("call 0x70", "call 0x72"))
+                    or any(consumer.calls.get(pc, "").endswith(suffix) for suffix in
+                           ("capture_scalar", "capture_async_target", "object_fill_entry", "object_entry_attributes", "p11_decode_params", "p11_walk_template", "p11_walk_template_types"))}
+        require(captures, name + ": seeded START no capture boundary witness")
+        null_guards = []
+        for pc, text in consumer.insns:
+            branch = BRANCH.fullmatch(text)
+            if not branch or branch[2] not in ("==", "!=") or value(facts.get(pc, {}), branch[1]) != ("owned", begin, 0) or value(facts.get(pc, {}), branch[3]) != ("constant", 0):
+                continue
+            taken = D.relative_target(pc, text)
+            failure = taken if branch[2] == "==" else next(edge for edge in consumer.graph[pc] if edge != taken)
+            if not captures & D.reachable(consumer.graph, [failure]) and not captures & D.reachable(consumer.graph, [entry], blocked={pc}):
+                null_guards.append(pc)
+        require(len(null_guards) == 1, name + ": seeded START null refusal before private reads")
+        aggregate_calls = [pc for pc, target in consumer.calls.items() if target == "p11_owner_start_aggregate"]
+        require(len(aggregate_calls) == 1, name + ": aggregate START constructor inventory")
+        aggregate = aggregate_calls[0]
+        aggregate_state = facts.get(aggregate, {})
+        require(aggregate_state.get("r1") == key
+                and stack_read(aggregate_state, key, 8) == ("pid_tgid", identity)
+                and stack_read(aggregate_state, key, 4, 8) == ("low", identity)
+                and stack_read(aggregate_state, key, 4, 12) == ("constant", 0),
+                name + ": aggregate START full owner key/padding")
+        require(aggregate_state.get("r2") == ("ktime_ns", identity),
+                name + ": aggregate START original scalar timestamp")
+        report[name] = {"constructor": begin, "key": key[1], "seed": seed[1],
+                        "identity_guard": identity_guard, "cookie_guard": cookie_guard, "witness": witness,
+                        "null_guard": null_guards[0], "aggregate": aggregate}
+    require("p11_entry" in report, "seeded START missing ordinary entry")
+    return report
+
+
 def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_calls):
     name = consumer.name
-    key = "default" if variant == "default" else name
     if name == "p11_return":
-        return retained_contract(consumer, variant, selectors)
+        return retained_contract(consumer, variant, selectors, internal_blocks, internal_calls)
+    consumer = _OwnedCaller(consumer.section, name, consumer.lines, consumer.calls)
+    consumer.closed_callees = closed_entry_callees_contract(internal_blocks, internal_calls)
     mode = {"p11_entry_template": 1, "p11_entry_template_pair": 3,
             "p11_entry_template_types": 2, "p11_entry_template_second": "second"}.get(name, 0)
+    expected_roles = (14, 15) if mode == "second" else (6, 7, 10, 11, 9, 8) + ((16, "join", "get") if mode == 0 else (12, 13))
+    scalar_calls = sorted(pc for pc, target in consumer.calls.items() if target.endswith("capture_scalar"))
+    require(len(scalar_calls) == len(expected_roles), name + ": final-sink scalar-read inventory")
+    calls = dict(zip(scalar_calls, expected_roles))
+    constructors = [pc for pc, target in consumer.calls.items() if target == ("p11_owner_start_get" if mode == "second" else "p11_owner_start_begin")]
+    require(len(constructors) == 1, name + ": final-sink owned START constructor inventory")
+    start = ("owned", constructors[0], 0)
+    if mode == 3:
+        facts = consumer.facts()
+        tails = [pc for pc, text in consumer.insns if pc in consumer.helper
+                 and text == "call 0xc" and facts.get(pc, {}).get("r2") == ("map", "PAIR_CALLS")]
+        require(len(tails) == 1, name + ": final-sink pair tail inventory")
+        failure = D.reachable(consumer.graph, consumer.graph[tails[0]])
+        counters = [pc for pc in failure if pc in consumer.helper and consumer.text[pc] == "call 0x1"
+                    and facts.get(pc, {}).get("r1") == ("map", "EVIDENCE")
+                    and stack_read(facts[pc], facts[pc].get("r2"), 4) == ("constant", 6)]
+        require(len(counters) == 1 and D.counter_writeback_contract(consumer.lines, counters[0]),
+                name + ": pair tail failure requires atomic evidence 6")
+        exits = {pc for pc, text in consumer.insns if text == "exit"}
+        require(not exits & D.reachable(consumer.graph, consumer.graph[tails[0]], blocked=set(counters)),
+                name + ": pair tail failure bypasses evidence")
+        require(not any(pc in failure and (target.startswith("p11_owner_start_")
+                    or target.endswith(("capture_scalar", "capture_async_target"))
+                    or target in ("p11_decode_params", "p11_walk_template", "p11_walk_template_types"))
+                    for pc, target in consumer.calls.items()),
+                name + ": pair tail failure must retain START and existing captures")
     if mode == 0:
-        # Capture failure must continue through the lifecycle match and START
-        # insertion, even though it creates no successful-scalar obligation.
-        lifecycle = [pc for pc, text in consumer.insns
-                     if re.fullmatch(r"if r\d+ == 0xc goto .*", text)]
-        require(len(lifecycle) == 1, name + ": async lifecycle continuation inventory")
-        capture = (next(pc for pc, role in SCALAR_CALLS["default"].items() if role == 16)
-                   if variant == "default" else LP64_DISPATCH[16][1]
-                   if name == "p11_entry" else IA32_READS[16])
+        lifecycle = [pc for pc, text in consumer.insns if re.fullmatch(r"if r\d+ == 0xc goto .*", text)]
+        require(len(lifecycle) == 1, name + ": final-sink async lifecycle continuation inventory")
+        capture = next(pc for pc, role in calls.items() if role == 16)
         exits = {pc for pc, text in consumer.insns if text == "exit"}
         require(not exits & D.reachable(consumer.graph, [capture], blocked={lifecycle[0]}),
-                name + ": async scalar failure bypasses lifecycle continuation")
-        require(not exits & D.reachable(consumer.graph, lifecycle, blocked={SEMANTIC_INSERT[key]}),
-                name + ": async lifecycle continuation bypasses START insertion")
-    if mode == "second":
-        owner_gets = [pc for pc, target in consumer.calls.items()
-                      if target == "p11_owner_start_get"]
-        require(len(owner_gets) == 1, name + ": retained START lookup inventory")
-        start = ("owned", owner_gets[0], 0)
-    else:
-        start = ("stack", -0x168 if variant == "default" else -0x130
-                 if name == "p11_entry" else -0x128)
+                name + ": final-sink async scalar failure bypasses lifecycle continuation")
     roles = ["template"] if mode == "second" else [6, 7, 10, 11, 8, 9]
     roles += [16, "join", "get"] if mode == 0 else ([] if mode == "second" else ["template"])
     for selector in selectors:
         abi = int(selector == 0x23)
         for present in (False, True):
             for role in roles:
-                reads, helpers = {}, {}
-                if variant == "unsafe" and name == "p11_entry" and role in LP64_READS:
-                    locations, helper = LP64_READS[role]
-                    reads = {pc: index for index, pc in enumerate(locations)}
-                    helpers = {helper: field_number(role)}
-                elif name == "p11_entry_ia32" and role in IA32_READS:
-                    helpers = {IA32_READS[role]: field_number(role)}
-                proof = SinkProof(role, abi, present, start, calls=SCALAR_CALLS.get(key),
-                                  reads=reads, helpers=helpers, insert=SEMANTIC_INSERT.get(key), mode=mode)
-                proof.dispatches = (LP64_DISPATCH if name == "p11_entry" else IA32_DISPATCH).get(role, ()) if variant == "unsafe" and name in ("p11_entry", "p11_entry_ia32") else ()
+                proof = _OwnedSinkProof(role, abi, present, start, calls=calls, mode=mode)
                 proof.decoder_required = variant == "unsafe" and role == 8
                 consumer.facts(proof=proof)
     return {"roles": roles, "mode": mode, "scenarios": len(selectors)*2}
 
 
-def retained_contract(consumer, variant, selectors):
-    # Return copies these scalars while START is owned, before removal. They
-    # are retained values, never permission to reuse the removed map pointer.
-    delta = int(variant == "unsafe")
-    sites = {1447+delta: (0x30, 1, 1), 1673+delta: (0x30, 1, 0),
-             1617+delta: (0x20, None, 1), 1682+delta: (0x20, None, 0),
-             1651+delta: (0x30, 12, 1), 1692+delta: (0x30, 12, 0)}
+class _ReturnCaller(_SeedCaller):
+    """An outlined frame with explicit external key and START parameters."""
+    identity = ("uretprobe", "p11_return")
+
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        text, target = self.text[pc], self.calls.get(pc, "")
+        if pc in self.helper and text == "call 0xae" and incoming.get("r1") == ("context", 0):
+            state["r0"] = ("cookie", self.identity)
+        elif pc in self.helper and text == "call 0xe":
+            state["r0"] = ("pid_tgid", self.identity)
+        if match := LOAD.fullmatch(text):
+            pointer = address(incoming, match[3], match[4], match[5])
+            fact = None
+            if pointer and pointer[0] == "external_key":
+                fact = {0: ("pid_tgid", self.identity), 8: ("key_tail", self.identity)}.get(pointer[2]) if match[2] == "64" else None
+            elif pointer and pointer[0] == "owned":
+                fact = ("retained", pointer[2], int(match[2]))
+            if fact:
+                state[reg(match[1])] = fact
+        if match := STORE.fullmatch(text):
+            pointer = address(incoming, match[2], match[3], match[4])
+            if pointer and pointer[0] == "stack" and match[1] == "64" and value(incoming, match[5]) == ("key_tail", self.identity):
+                state[("stack", pointer[1], 4)] = ("low", self.identity)
+                state[("stack", pointer[1]+4, 4)] = ("constant", 0)
+        if match := STORE.fullmatch(text):
+            pointer = address(incoming, match[2], match[3], match[4])
+            if pointer and pointer[0] == "event":
+                size = int(match[1])//8
+                if pointer[1] < 0x74 and 0x70 < pointer[1]+size:
+                    state.pop(("event_user_type",), None)
+                if pointer[1] == 0x70 and match[1] == "32":
+                    fact = narrow(value(incoming, match[5]), 32)
+                    if fact is not None:
+                        state[("event_user_type",)] = fact
+            elif pointer is None:
+                state.pop(("event_user_type",), None)
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(incoming, *match.groups()[1:]) if match else None
+            if pointer is None or pointer[0] == "event" and pointer[1] < 0x74 and 0x70 < pointer[1]+int(match[1])//8:
+                state.pop(("event_user_type",), None)
+        if pc in self.helper and text == "call 0x83":
+            state.pop(("event_user_type",), None)
+        output = None
+        if target == "memset":
+            output = (incoming.get("r1"), incoming.get("r3"))
+        elif target == "p11_link_current_identity":
+            output = (incoming.get("r1"), ("constant", 16))
+        elif target == "p11_instance_return":
+            output = (incoming.get("r2"), ("constant", 40))
+        elif pc in self.helper and text in ("call 0x70", "call 0x72"):
+            output = (incoming.get("r1"), incoming.get("r2"))
+        if output:
+            pointer, size = output
+            if pointer and pointer[0] == "event" and (not size or size[0] != "constant"
+                    or pointer[1] < 0x74 and 0x70 < pointer[1]+size[1]):
+                state.pop(("event_user_type",), None)
+        if target == "p11_owner_start_get":
+            state["r0"] = ("owned", pc, 0)
+        elif target.endswith("scope_flags_word"):
+            state["r0"] = ("scope_flags", self.identity)
+        if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
+            fact = incoming.get(match[1])
+            if fact and fact[0] in ("owned", "side", "external_key"):
+                state[match[1]] = (fact[0], fact[1], fact[2]+int(match[2],16))
+        # A tail adapter only writes its ObjectCallWire destination. The
+        # base event and local snapshot are disjoint from that narrow region.
+        if any(target.endswith(suffix) for suffix in ("object_tail_fill", "object_emit_find", "object_emit_get_attributes")):
+            require(incoming.get("r1") == ("event", 0x170), self.label(pc)+": return tail output boundary")
+            if ("event_slot",) in incoming:
+                state[("event_slot",)] = incoming[("event_slot",)]
+        return state
+
+
+class _ReturnRootProof(SinkProof):
+    def __init__(self, abi, owner, targets):
+        super().__init__("return", abi, True, ("owned", owner, 0), kind="return")
+        self.retained_sites, self.targets = {}, targets
+
+    def partition(self, state):
+        return super().partition(state) + (state.get(("live", self.start[1])), state.get(("object_mode",)))
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        if match := LOAD.fullmatch(text):
+            pointer = address(before, match[3], match[4], match[5])
+            if pointer and pointer[0] == "owned":
+                require(before.get(("live", pointer[1])),
+                        consumer.label(pc) + ": return START read after retirement")
+        if text.startswith("call "):
+            allowed = target in ("p11_owner_start_get", "p11_owner_start_remove", "p11_object_fault") or target.endswith("scope_flags_word") or pc in self.targets
+            require(allowed if pc not in consumer.helper else text in ("call 0x1", "call 0xc", "call 0xe", "call 0xae"),
+                    consumer.label(pc)+": return unknown root callee/helper")
+        if target.startswith("p11_owner_start_"):
+            key = before.get("r1")
+            require(key and key[0] == "stack" and stack_read(before, key, 8) == ("pid_tgid", consumer.identity)
+                    and stack_read(before, key, 4, 8) == ("low", consumer.identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0),
+                    consumer.label(pc)+": return START lookup/cleanup key provenance")
+        if pc in self.targets:
+            role = self.targets[pc]
+            require(before.get("r1") == ("context", 0) and before.get("r3") == self.start
+                    and before.get(("live", self.start[1])) and before.get("r4") == ("scope_flags", consumer.identity)
+                    and before.get("r5") == ("constant", self.abi),
+                    consumer.label(pc)+": return context/START/flags/layout boundary")
+            key = before.get("r2")
+            require(key and key[0] == "stack" and stack_read(before, key, 8) == ("pid_tgid", consumer.identity)
+                    and stack_read(before, key, 4, 8) == ("low", consumer.identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0),
+                    consumer.label(pc)+": return full caller key boundary")
+            require(before.get(("object_mode",)) == (role == "object"),
+                    consumer.label(pc)+": return marker routing boundary")
+            self.boundaries.add(pc)
+            # Each checked outlined return retires this same required START
+            # on every terminal path. The caller may retain snapshots, but
+            # returning from the callee cannot revive any saved row alias.
+            self.retire_owner(state, self.start[1])
+        return super().transfer(consumer, pc, before, state)
+
+    def edges(self, consumer, pc, before, after):
+        branch = BRANCH.fullmatch(consumer.text[pc])
+        for successor, state in super().edges(consumer, pc, before, after):
+            if branch and value(before, branch[1]) == ("retained", 0x108, 64) and value(before, branch[3]) == ("constant", 0):
+                zero_taken = zero_partition(value(before, branch[1]), branch[2], 64)
+                require(zero_taken is not None and branch[1].startswith("r"), consumer.label(pc)+": return marker full-word guard")
+                state[("object_mode",)] = (successor == D.relative_target(pc, consumer.text[pc])) != zero_taken
+            yield successor, state
+
+    def finish(self, consumer):
+        require(self.boundaries == set(self.targets), consumer.name+": return outlined boundary inventory")
+
+
+class _ReturnProof(SinkProof):
+    def __init__(self, abi, present, owner, role, sites):
+        super().__init__("return", abi, present, ("owned", owner, 0), kind="return")
+        self.return_role, self.retained_sites = role, sites
+        self.submits = set()
+        self.base_outputs = set()
+        self.emission_roles = ("object_fill_return", "object_tail_fill", "object_emit_find", "object_emit_get_attributes")
+
+    def partition(self, state):
+        return super().partition(state) + tuple(state.get((key,)) for key in ("retired", "settled", "fault", "emitted", "reservation"))
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        error = lambda message: consumer.label(pc)+": return "+message
+        if target in ("memset", "p11_link_current_identity"):
+            pointer = before.get("r1")
+            length = before.get("r3") if target == "memset" else ("constant", 16)
+            require(length and length[0] == "constant" and length[1] > 0
+                    and (target != "memset" or before.get("r2") == ("constant", 0)),
+                    error("known output callee needs its bounded zero-fill/identity effect"))
+            size = length[1]
+            require(pointer and ((pointer[0] == "stack" and -512 <= pointer[1] and pointer[1]+size <= 0)
+                    or (pointer[0] == "event" and 0 <= pointer[1]
+                        and pointer[1]+size <= (608 if self.return_role == "object" else 368))),
+                    error("known output footprint reaches immutable START/key/context or leaves owned storage"))
+        if text.startswith("call "):
+            allowed = target in ("memset", "p11_link_current_identity", "p11_owner_start_remove", "p11_object_fault",
+                                 "p11_object_side_get", "p11_instance_return", "p11_root_current_tag") or any(target.endswith(role) for role in self.emission_roles)
+            require(allowed if pc not in consumer.helper else text in ("call 0x1", "call 0x2", "call 0x5", "call 0xe",
+                    "call 0x50", "call 0x70", "call 0x83", "call 0x84", "call 0x85", "call 0xae")
+                    or self.return_role == "object" and text == "call 0x82", error("unknown callee/helper footprint"))
+        if match := STORE.fullmatch(text):
+            pointer = address(before, match[2], match[3], match[4])
+            require(pointer and pointer[0] in ("stack", "event")
+                    or before.get("r"+match[2], (None,))[0] == "result", error("unknown or immutable START/key/context write"))
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(before, *match.groups()[1:]) if match else None
+            require(match and (pointer and pointer[0] in ("stack", "event")
+                    or before.get("r"+match[2], (None,))[0] == "result"), error("immutable or unknown atomic footprint"))
+        if match := LOAD.fullmatch(text):
+            pointer = address(before, match[3], match[4], match[5])
+            if pointer and pointer[0] in ("owned", "side"):
+                require(before.get(("live", self.start[1])), error("START read after retirement"))
+        if target in ("p11_owner_start_remove", "p11_object_side_get", "p11_instance_return"):
+            key = before.get("r1")
+            require(key and key[0] == "stack" and stack_read(before, key, 8) == ("pid_tgid", consumer.identity)
+                    and stack_read(before, key, 4, 8) == ("low", consumer.identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0), error("full callee key provenance"))
+        if target == "p11_owner_start_remove":
+            require(before.get("r2") == ("constant", 1) and not before.get(("retired",)), error("required single retirement attempt"))
+            state[("retired",)] = True
+            state["r0"] = ("retire_result", pc)
+        if target == "p11_object_side_get":
+            require(before.get("r2") == ("high", consumer.identity)
+                    and before.get("r3") in (("constant", 0), ("constant", 1)),
+                    error("side query descriptor/required boundary"))
+            state["r0"] = ("side", pc, 0)
+        if target == "p11_object_fault":
+            require(before.get(("retired",)), error("fault before retirement attempt"))
+            state[("fault",)] = True
+        if target == "p11_object_side_get" or any(target.endswith(suffix) for suffix in
+                ("object_fill_return", "object_tail_fill", "object_emit_find", "object_emit_get_attributes")):
+            require(self.return_role == "object" and before.get(("live", self.start[1])), error("side access after retirement"))
+        for role in self.emission_roles:
+            if target.endswith(role):
+                side = before.get("r1" if role == "object_fill_return" else "r2")
+                require(side == ("constant", 0) or side and side[0] == "side" and side[2] == 0,
+                        error("side writer/read boundary needs the keyed query's original row"))
+                state["r0"] = ("constant", 0) if side == ("constant", 0) else ("emission_result", role)
+        if target == "p11_instance_return":
+            require(before.get("r2") == ("event", 0x148), error("continuity output boundary"))
+            require(before.get(("live", self.start[1])) if self.return_role == "object" else before.get(("settled",)),
+                    error("continuity lifetime boundary"))
+        if pc in self.retained_sites:
+            require(before.get(("live", self.start[1])) if self.return_role == "object" else before.get(("settled",)),
+                    error("retained read lifetime boundary"))
+            output, size = before.get("r1"), before.get("r2")
+            require(output and output[0] == "stack" and size and size[0] == "constant"
+                    and -512 <= output[1] and output[1]+size[1] <= 0, error("retained read output outside local frame"))
+        if text == "call 0x83" and pc in consumer.helper:
+            require(before.get("r1") == ("map", "EVENTS")
+                    and before.get("r2") == ("constant", 608 if self.return_role == "object" else 368), error("record reserve size"))
+            require(before.get(("reservation",)) is None, error("reservation acquired twice"))
+            state[("reservation",)] = "unchecked"
+        if text == "call 0x82" and pc in consumer.helper:
+            # A refused object join may preserve only its initialized ordinary
+            # base. Output does not consume the original 608-byte reservation.
+            require(self.return_role == "object"
+                    and before.get("r1") == ("map", "EVENTS")
+                    and before.get("r2") == ("event", 0)
+                    and before.get("r3") == ("constant", 368)
+                    and before.get("r4") == ("constant", 0)
+                    and before.get(("reservation",)) == "live"
+                    and before.get(("retired",)) and before.get(("settled",)) and before.get(("fault",)),
+                    error("base output needs the bounded original base and checked retirement/fault"))
+            require(before.get(("event_slot",)) == ("low", consumer.identity), error("Event.slot corrupted before submit (ordinary base output)"))
+            require(before.get(("event_user_type",)) == ("retained", 0x38, 32), error("base output user_type was not copied unchanged"))
+            self.base_outputs.add(pc)
+        if text in ("call 0x84", "call 0x85") and pc in consumer.helper:
+            require(before.get("r1") == ("event", 0) and before.get("r2") == ("constant", 0)
+                    and before.get(("reservation",)) == "live", error("reservation disposal needs its original live record and zero flags"))
+            state[("reservation",)] = "disposed"
+        if text == "call 0x84" and pc in consumer.helper:
+            require(before.get("r1") == ("event", 0) and before.get(("settled",)), error("submit before successful retirement"))
+            require(before.get(("event_slot",)) == ("low", consumer.identity), error("Event.slot corrupted before submit"))
+            require(before.get(("event_user_type",)) == ("retained", 0x38, 32), error("user_type was not copied unchanged"))
+            if self.return_role == "object":
+                require(before.get(("emitted",)) == frozenset(self.emission_roles), error("submit bypassed successful emission"))
+            self.submits.add(pc)
+        if text == "exit":
+            require(before.get(("retired",)) and (before.get(("settled",)) or before.get(("fault",))),
+                    error("exit bypassed checked retirement/fault"))
+            require(before.get(("reservation",)) in (None, "disposed"), error("reservation left without disposal"))
+        return super().transfer(consumer, pc, before, state)
+
+    def edges(self, consumer, pc, before, after):
+        branch = BRANCH.fullmatch(consumer.text[pc])
+        for successor, state in super().edges(consumer, pc, before, after):
+            if branch and value(before, branch[1]) == ("event", 0):
+                require(branch[1].startswith("r") and branch[2] in ("==", "!=")
+                        and value(before, branch[3]) == ("constant", 0)
+                        and before.get(("reservation",)) == "unchecked",
+                        consumer.label(pc) + ": return reservation needs its original full-width null test")
+                absent = (successor == D.relative_target(pc, consumer.text[pc])) == (branch[2] == "==")
+                state[("reservation",)] = None if absent else "live"
+                if absent:
+                    for key, fact in list(state.items()):
+                        if fact == ("event", 0):
+                            state[key] = ("constant", 0)
+            if branch and (side := value(before, branch[1])) and side[0] == "side":
+                require(branch[1].startswith("r") and branch[2] in ("==", "!=")
+                        and value(before, branch[3]) == ("constant", 0),
+                        consumer.label(pc) + ": return side pointer needs a full-width null test")
+                if (successor == D.relative_target(pc, consumer.text[pc])) == (branch[2] == "=="):
+                    for key, fact in list(state.items()):
+                        if fact == side:
+                            state[key] = ("constant", 0)
+            if branch and (fact := value(before, branch[1])) and fact[0] == "emission_result":
+                zero_taken = zero_partition(fact, branch[2], 64) if value(before, branch[3]) == ("constant", 0) else None
+                require(zero_taken is not None, consumer.label(pc)+": return emission result guard")
+                if (successor == D.relative_target(pc, consumer.text[pc])) != zero_taken:
+                    state[("emitted",)] = before.get(("emitted",), frozenset()) | {fact[1]}
+            if branch and (fact := value(before, branch[1])) and fact[0] == "retire_result":
+                require(branch[1].startswith("r") and value(before, branch[3]) == ("constant", 0) and branch[2] in ("==", "!="),
+                        consumer.label(pc)+": return retirement result guard")
+                success = (successor == D.relative_target(pc, consumer.text[pc])) == (branch[2] == "==")
+                state[("settled",)] = success
+            yield successor, state
+
+    def finish(self, consumer):
+        require(self.submits, consumer.name+": return no positive submit witness")
+        if self.return_role == "object":
+            require(self.base_outputs, consumer.name+": return no checked refused-base output witness")
+        if self.present:
+            require(self.boundaries == {pc for pc, (_, _, abi) in self.retained_sites.items() if abi == self.abi},
+                    consumer.name+": retained read inventory/layout differs")
+
+
+def retained_contract(consumer, variant, selectors, internal_blocks, internal_calls):
+    root = _ReturnCaller(consumer.section, consumer.name, consumer.lines, consumer.calls)
+    gets = [pc for pc, target in root.calls.items() if target == "p11_owner_start_get"]
+    require(len(gets) == 1, "return START lookup inventory")
+    targets = {}
+    bodies = {}
+    for role in ("ordinary", "object"):
+        names = [name for name in internal_blocks if name.endswith(role+"_return")]
+        require(len(names) == 1, "return outlined callee inventory: "+role)
+        name = names[0]
+        sites = [pc for pc, target in root.calls.items() if target == name]
+        require(len(sites) == 1, "return outlined caller inventory: "+role)
+        targets[sites[0]] = role
+        bodies[role] = _ReturnCaller(".text", name, internal_blocks[name], internal_calls.get(name, {}))
     for selector in selectors:
-        abi = int(selector == 0x23)
-        for present in (False, True):
-            proof = SinkProof("return", abi, present, None, kind="return")
-            proof.retained_sites = sites
-            consumer.facts(proof=proof)
-            if present:
-                require(proof.boundaries == {pc for pc, (_, _, layout) in sites.items() if layout == abi},
-                        consumer.name + ": retained read inventory/layout differs")
-    return {"retained_offsets": [0x20, 0x30], "scenarios": len(selectors)*2}
+        root.facts(proof=_ReturnRootProof(int(selector == 0x23), gets[0], targets))
+    # Literal role inventories: OpenSession, mechanism and ASYNC_GET_ID each
+    # have one actual 4-byte and one 8-byte read. Provenance is checked below.
+    inventory = {
+        "ordinary": ((0x30,1,1), (0x20,None,1), (0x30,1,0), (0x30,12,1), (0x20,None,0), (0x30,12,0)),
+        "object": ((0x30,12,1), (0x20,None,1), (0x30,1,1), (0x20,None,0), (0x30,1,0), (0x30,12,0)),
+    }
+    report = {}
+    for role, body in bodies.items():
+        helpers = [pc for pc, text in body.insns if text == "call 0x70" and pc in body.helper]
+        require(len(helpers) == 6, body.name+": retained read helper inventory")
+        sites = dict(zip(helpers, inventory[role]))
+        retires = [pc for pc, target in body.calls.items() if target == "p11_owner_start_remove"]
+        # LLVM clones the unconditional final cleanup for emission outcomes;
+        # _ReturnProof still requires exactly one checked attempt per path.
+        require(len(retires) == (1 if role == "ordinary" else 8), body.name+": return retirement inventory")
+        for selector in selectors:
+            abi = int(selector == 0x23)
+            for present in (False, True):
+                initial = {"r1": ("context", 0), "r2": ("external_key", root.identity, 0),
+                           "r3": ("owned", gets[0], 0), "r4": ("scope_flags", root.identity),
+                           "r5": ("constant", abi), "r10": ("stack", 0), ("live", gets[0]): True}
+                body.facts(initial, proof=_ReturnProof(abi, present, gets[0], role, sites))
+        result = consumer_contract(body, variant, internal_blocks, initial, outlined=True)
+        result.update({"function": body.name, "retained_reads": sorted(sites), "retirements": retires})
+        report[role] = result
+    return {"retained_offsets": [0x20, 0x30], "scenarios": len(selectors)*2, "outlined": report}
 
 
 def descriptor_contract(consumer, facts, lookup):
@@ -1036,14 +2988,26 @@ def descriptor_contract(consumer, facts, lookup):
             pointer = address(nonnull, match[3], match[4], match[5])
             require(pointer and pointer[:2] == ("descriptor", lookup) and match[2] == "8", consumer.label(pc) + ": descriptor field provenance")
             loads.add(pointer[2])
+        previous = nonnull
         nonnull = consumer.step(pc, nonnull)
-    expected = ({3} if consumer.name == "p11_return" else {14, 15}
-                if consumer.name == "p11_entry_template_second" else BASE_FIELDS | ({12, 13}
-                if "template" in consumer.name else {16, 17}))
+        if bit := re.fullmatch(r"([rw]\d+) &= 0x1", text):
+            if previous.get(reg(bit[1])) == ("field", 5):
+                nonnull[reg(bit[1])] = ("field_bit", 5, 1)
+    lookups = [pc for pc, text in consumer.insns if pc in consumer.helper and text == "call 0x1"
+               and facts.get(pc, {}).get("r1") == ("map", "DESCRIPTORS")]
+    if consumer.section == ".text" and consumer.name.endswith(("ordinary_return", "object_return")):
+        groups = [{3}]
+    elif consumer.name == "p11_entry_template_second":
+        groups = [{14, 15}]
+    else:
+        require(consumer.name.startswith("p11_entry"), consumer.name+": unexpected descriptor consumer")
+        groups = [BASE_FIELDS | ({12, 13} if "template" in consumer.name else {16, 17}), {5}]
+    require(len(lookups) == len(groups) and lookup in lookups, consumer.name+": descriptor lookup inventory")
+    expected = groups[lookups.index(lookup)]
     require(loads == expected, consumer.label(lookup) + f": descriptor fields {loads}, expected {expected}")
     carried = set()
     for key, fact in nonnull.items():
-        if fact[0] != "field":
+        if not isinstance(fact, tuple) or fact[0] not in ("field", "field_bit"):
             continue
         # Ignore a register temporary killed before its first subsequent use.
         if isinstance(key, str):
@@ -1085,7 +3049,7 @@ def abi_contract(consumer, facts, variant):
         target = consumer.calls.get(pc)
         if ((pc in consumer.helper and state.get("r1", (None, None))[0] == "map"
              and state["r1"][1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"))
-                or target in ("p11_owner_start_get", "p11_owner_start_insert")
+                or target in ("p11_owner_start_get", "p11_owner_start_begin")
                 or (target == "p11_owner_start_remove" and state.get("r2") == ("constant", 1))):
             observations.add(pc)
         match = LOAD.fullmatch(text)
@@ -1099,7 +3063,7 @@ def abi_contract(consumer, facts, variant):
         accepted = {0x33}
     if consumer.name == "p11_entry_ia32":
         accepted = {0x23}
-    for selector in (0, 0x23, 0x33):
+    for selector in (0, 0x23, 0x33, 0x100000023, 0x100000033):
         state = consumer.step(start, facts[start])
         state[reg(LOAD.fullmatch(consumer.text[start])[1])] = ("selector_case", selector)
         pending = [(consumer.graph[start][0], state, False, False, frozenset())]
@@ -1114,7 +3078,7 @@ def abi_contract(consumer, facts, variant):
             visited.add(signature)
             text, target = consumer.text[pc], consumer.calls.get(pc)
             map_name = state.get("r1")
-            admission = (text == "call 0x1" and map_name == ("map", "STATS")) or target in ("p11_owner_start_get", "p11_owner_start_insert")
+            admission = (text == "call 0x1" and map_name == ("map", "STATS")) or target in ("p11_owner_start_get", "p11_owner_start_begin")
             if admission:
                 require(selector in accepted and not refused, consumer.label(pc) + ": ABI refusal reaches admission")
                 admitted = True
@@ -1126,6 +3090,8 @@ def abi_contract(consumer, facts, variant):
                 require(cleaned and stack_read(state, state.get("r2"), 4) == ("constant", 8), consumer.label(pc) + ": ABI refusal evidence key/order")
                 require(D.counter_writeback_contract(consumer.lines, pc), consumer.label(pc) + ": ABI refusal counter update")
                 refused = True
+            elif target == "p11_object_fault":
+                require(cleaned, consumer.label(pc)+": ABI fault before cleanup")
             elif text == "call 0x1" and map_name == ("map", "STOP_GATE"):
                 # The stop-gate release epilogue: admitted paths stop at
                 # admission above and never reach it, so only refusal paths
@@ -1141,12 +3107,19 @@ def abi_contract(consumer, facts, variant):
                 continue
             after = consumer.step(pc, state)
             edges = consumer.graph[pc]
-            branch = re.fullmatch(r"if (r\d+) (==|!=) (-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+", text)
-            if branch and state.get(branch[1], (None,))[0] == "selector_case":
-                immediate = int(branch[3], 16)
-                require(immediate in (0x23, 0x33), consumer.label(pc) + ": unsupported selector comparison")
-                taken = (selector == immediate) == (branch[2] == "==")
-                edges = [D.relative_target(pc, text)] if taken else [e for e in edges if e != D.relative_target(pc, text)]
+            branch = BRANCH.fullmatch(text)
+            if branch:
+                left, right = value(state, branch[1]), value(state, branch[3])
+                taken = None
+                if left and left[0] == "selector_case" and right and right[0] == "constant":
+                    require(branch[1].startswith("r") and branch[2] in ("==", "!=") and right[1] in (0x23, 0x33),
+                            consumer.label(pc)+": unsupported selector comparison")
+                    taken = compare(selector, branch[2], right[1])
+                elif left and right and left[0] == right[0] == "constant":
+                    taken = compare(left[1], branch[2], right[1], 32 if branch[1].startswith("w") else 64)
+                if taken is not None:
+                    target = D.relative_target(pc, text)
+                    edges = [target] if taken else [edge for edge in edges if edge != target]
             for successor in edges:
                 pending.append((successor, after.copy(), cleaned, refused, ancestors | {pc}))
         require(admitted == (selector in accepted), consumer.name + ": selector acceptance differs")
@@ -1180,68 +3153,128 @@ def incoming_parameter_unused(lines, parameter):
 
 def operation_contract(consumer, facts, variant, internal_blocks):
     """Require distinct, reachable operations and their complete caller keys."""
-    identity = (consumer.section, consumer.name)
+    identity = getattr(consumer, "identity", (consumer.section, consumer.name))
     reachable = D.reachable(consumer.graph, [consumer.insns[0][0]])
-    owner, maps, keys, values, records = [], Counter(), set(), set(), []
+    owner, maps, keys, values, records = Counter(), Counter(), set(), set(), []
     for pc, text in consumer.insns:
-        state = facts.get(pc, {})
-        target = consumer.calls.get(pc, "")
+        state, target = facts.get(pc, {}), consumer.calls.get(pc, "")
         if target.startswith("p11_owner_start_"):
-            require(pc in reachable, consumer.label(pc) + ": unreachable START operation")
+            require(pc in reachable, consumer.label(pc)+": unreachable START operation")
             key = state.get("r1")
-            require(key and key[0] == "stack", consumer.label(pc) + ": START key address")
-            require(stack_read(state, key, 8) == ("pid_tgid", identity), consumer.label(pc) + ": START pid_tgid provenance")
-            require(stack_read(state, key, 4, 8) == ("low", identity), consumer.label(pc) + ": START slot provenance")
-            require(stack_read(state, key, 4, 12) == ("constant", 0), consumer.label(pc) + ": START zero padding")
+            require(key and key[0] == "stack", consumer.label(pc)+": START key address")
+            require(stack_read(state, key, 8) == ("pid_tgid", identity), consumer.label(pc)+": START pid_tgid provenance")
+            require(stack_read(state, key, 4, 8) == ("low", identity), consumer.label(pc)+": START slot provenance")
+            require(stack_read(state, key, 4, 12) == ("constant", 0), consumer.label(pc)+": START zero padding")
             keys.add(key)
-            operation = target.removeprefix("p11_owner_start_")
-            argument = state.get("r2")
-            if operation == "insert":
-                require(argument and argument[0] == "stack" and argument != key, consumer.label(pc) + ": START value address")
-                require(stack_read(state, argument, 8) == ("ktime_ns", identity), consumer.label(pc) + ": START value timestamp provenance")
+            operation, argument = target.removeprefix("p11_owner_start_"), state.get("r2")
+            if operation == "begin":
+                require(argument and argument[0] == "stack" and argument != key
+                        and stack_read(state, argument, 8) == ("ktime_ns", identity), consumer.label(pc)+": START immutable seed address/timestamp")
                 values.add(argument)
-                role = "insert"
+                role = "begin"
+            elif operation == "aggregate":
+                require(argument == ("ktime_ns", identity), consumer.label(pc)+": START aggregate scalar timestamp")
+                role = "aggregate"
             elif operation == "get" and variant == "default":
                 require(incoming_parameter_unused(internal_blocks[target], 2), "default START get retains an unexpected required argument")
                 role = "get0-specialized"
             else:
-                require(argument in (("constant", 0), ("constant", 1)), consumer.label(pc) + ": START required argument")
-                role = operation + str(argument[1])
-            owner.append(role)
-            records.append((pc, "START." + role))
+                require(operation in ("get", "remove") and argument in (("constant", 0), ("constant", 1)),
+                        consumer.label(pc)+": START required argument/operation")
+                role = operation+str(argument[1])
+            owner[role] += 1
+            records.append((pc, "START."+role))
         if pc in consumer.helper:
             name = state.get("r1", (None, None))
-            if name[0] == "map" and name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"):
-                operation = (name[1], text)
-                require(pc in reachable, consumer.label(pc) + ": unreachable map operation")
-                maps[operation] += 1
-                records.append((pc, name[1] + "." + text))
-            if text == "call 0x84":
-                require(state.get("r1") == ("event", 0), consumer.label(pc) + ": submitted event address")
-                require(state.get(("event_slot",)) == ("low", identity), consumer.label(pc) + ": Event.slot corrupted before submit")
+            if text != "call 0x82" and name[0] == "map" and name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"):
+                require(pc in reachable, consumer.label(pc)+": unreachable map operation")
+                maps[(name[1], text)] += 1
+                records.append((pc, name[1]+"."+text))
+            if text == "call 0x82":
+                require(pc in reachable and consumer.section == ".text" and consumer.name.endswith("object_return")
+                        and state.get("r1") == ("map", "EVENTS") and state.get("r2") == ("event", 0)
+                        and state.get("r3") == ("constant", 368) and state.get("r4") == ("constant", 0),
+                        consumer.label(pc)+": bounded ordinary-base output arguments")
                 maps[("EVENTS", text)] += 1
-                records.append((pc, "EVENTS.submit"))
+                records.append((pc, "EVENTS.output"))
+            if text in ("call 0x84", "call 0x85"):
+                require(state.get("r1") == ("event", 0), consumer.label(pc)+": submitted/discarded event address")
+                if text == "call 0x84":
+                    require(state.get(("event_slot",)) == ("low", identity), consumer.label(pc)+": Event.slot corrupted before submit")
+                maps[("EVENTS", text)] += 1
+                records.append((pc, "EVENTS."+("submit" if text == "call 0x84" else "discard")))
     name = consumer.name
-    if name == "p11_return":
-        expected_owner = ["remove0", "remove0", "get0-specialized" if variant == "default" else "get0", "remove1"]
+    outlined = consumer.section == ".text" and name.endswith(("ordinary_return", "object_return"))
+    if outlined:
+        expected_owner = Counter({"remove1": 8 if name.endswith("object_return") else 1})
+    elif name == "p11_return":
+        expected_owner = Counter({"remove0": 2, "get0-specialized" if variant == "default" else "get0": 1})
     elif name == "p11_entry_template_second":
-        expected_owner = ["remove0", "get1"]
+        expected_owner = Counter({"remove0": 1, "get1": 1})
     else:
-        expected_owner = ["remove0", "insert", "remove0", "insert"]
-        if variant == "unsafe" and name in ("p11_entry", "p11_entry_ia32"):
-            expected_owner.insert(1, "remove0")
-    expected_maps = Counter({("DESCRIPTORS", "call 0x1"): 1})
-    if name != "p11_entry_template_second":
+        strict = variant == "unsafe" and name in ("p11_entry", "p11_entry_ia32")
+        expected_owner = Counter({"begin": 1, "aggregate": 1, "remove0": 3 if strict else 2, "remove1": 1})
+    expected_maps = Counter()
+    if name != "p11_return":
+        expected_maps[("DESCRIPTORS", "call 0x1")] = 1 if outlined or name == "p11_entry_template_second" else 2
+    if name not in ("p11_return", "p11_entry_template_second"):
         expected_maps[("STATS", "call 0x1")] = 1
-    if name == "p11_return":
-        # RV_COUNTS: in-place lookup for the atomic add, one BPF_NOEXIST
-        # create, and the create-race retry lookup (every key is the cookie).
+    if outlined:
         expected_maps.update({("RV_COUNTS", "call 0x1"): 2, ("RV_COUNTS", "call 0x2"): 1,
                               ("EVENTS", "call 0x83"): 1, ("EVENTS", "call 0x84"): 1})
-    require(owner == expected_owner, name + f": START operation inventory {owner}, expected {expected_owner}")
-    require(maps == expected_maps, name + ": distinct map operation inventory differs")
-    require(len(keys) == 1 and len(values) == (1 if "insert" in expected_owner else 0), name + ": START operation key/value wiring differs")
+        if name.endswith("object_return"):
+            expected_maps[("EVENTS", "call 0x82")] = 1
+            expected_maps[("EVENTS", "call 0x85")] = 2
+    require(owner == expected_owner, name+f": START operation inventory {owner}, expected {expected_owner}")
+    require(maps == expected_maps, name+f": distinct map operation inventory differs: {maps}")
+    require(len(keys) == 1 and len(values) == int("begin" in expected_owner), name+": START operation key/seed wiring differs")
     return records
+
+
+def consumer_contract(consumer, variant, internal_blocks, initial=None, outlined=False):
+    facts = consumer.facts(initial)
+    identity = getattr(consumer, "identity", (consumer.section, consumer.name))
+    sinks, descriptors, bounds = [], [], []
+    for pc, text in consumer.insns:
+        state, target = facts.get(pc, {}), consumer.calls.get(pc, "")
+        map_name = state.get("r1", (None, None))
+        if match := re.fullmatch(r"if ([rw]\d+) > 0x1ff goto [+-]0x[0-9a-f]+", text):
+            require(state.get(reg(match[1])) == ("low", identity), consumer.label(pc)+": slot bound uses cookie low word")
+            bounds.append(pc)
+        if pc in consumer.helper and text in ("call 0x1", "call 0x2") and map_name[0] == "map":
+            if map_name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS"):
+                word = "high" if map_name[1] == "DESCRIPTORS" else "low"
+                require(stack_read(state, state.get("r2"), 4) == (word, identity), consumer.label(pc)+": "+map_name[1]+" cookie key")
+                sinks.append((pc, map_name[1]))
+                if word == "high":
+                    descriptors.append(pc)
+        if target.startswith("p11_owner_start_"):
+            require(stack_read(state, state.get("r1"), 4, 8) == ("low", identity), consumer.label(pc)+": START slot cookie")
+            sinks.append((pc, "START"))
+        if match := STORE.fullmatch(text):
+            if address(state, match[2], match[3], match[4]) == ("event", 0x68):
+                require(match[1] == "32" and narrow(value(state, match[5]), 32) == ("low", identity), consumer.label(pc)+": Event.slot cookie")
+                sinks.append((pc, "Event.slot"))
+    required = {"START"} if consumer.name == "p11_return" else {"DESCRIPTORS", "START"}
+    if consumer.name not in ("p11_return", "p11_entry_template_second"):
+        required.add("STATS")
+    if outlined:
+        required |= {"RV_COUNTS", "Event.slot"}
+    require({sink for _, sink in sinks} == required, consumer.name+": sink inventory differs")
+    require(len(bounds) == (0 if outlined else 1), consumer.name+": slot bound inventory")
+    if bounds:
+        bound = bounds[0]
+        observation = {pc for pc, _ in sinks}
+        rejected = D.relative_target(bound, consumer.text[bound])
+        require(not observation & D.reachable(consumer.graph, [consumer.insns[0][0]], blocked={bound})
+                and not observation & D.reachable(consumer.graph, [rejected]), consumer.name+": slot bound refusal/bypass")
+    expected_descriptors = 0 if consumer.name == "p11_return" else 1 if outlined or consumer.name == "p11_entry_template_second" else 2
+    require(len(descriptors) == expected_descriptors, consumer.name+": descriptor lookup inventory")
+    fields = sorted({field for pc in descriptors for field in descriptor_contract(consumer, facts, pc)})
+    selectors = [] if outlined else abi_contract(consumer, facts, variant)
+    operations = operation_contract(consumer, facts, variant, internal_blocks)
+    return {"section": consumer.section, "sinks": sinks, "operations": operations,
+            "descriptor_fields": fields, "accepted_selectors": selectors}
 
 
 def contract(disassembly, variant):
@@ -1251,63 +3284,25 @@ def contract(disassembly, variant):
     internal_blocks = D.function_blocks(split[".text"])
     internal_calls = {}
     for caller, _, pc, target in D.internal_call_targets(split[".text"]):
-        internal_calls.setdefault(caller, {})[pc] = target
+        if target is not None:
+            internal_calls.setdefault(caller, {})[pc] = target
     scalar_body_contract(internal_blocks, internal_calls, variant)
     expected = {"p11_entry", "p11_return"}
     if variant == "unsafe":
         expected |= {"p11_entry_ia32", "p11_entry_template", "p11_entry_template_pair", "p11_entry_template_second", "p11_entry_template_types"}
+    seeded_start_contract(disassembly)
     report = {}
     for section in ("uprobe", "uretprobe"):
-        require(section in split, "missing " + section)
-        # .text comes last so equal PCs in unrelated ELF sections cannot replace
-        # the relocation target table of the shared primitive.
-        calls = D.internal_call_targets(split[section] + "\n" + split[".text"])
+        require(section in split, "missing "+section)
+        calls = D.internal_call_targets(joined(split, section, ".text"))
         for name, lines in D.function_blocks(split[section]).items():
             if not (name.startswith("p11_entry") or name == "p11_return"):
                 continue
-            consumer = Consumer(section, name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
-            facts = consumer.facts()
-            identity = (section, name)
-            sinks = []
-            descriptor = []
-            bounds = []
-            for pc, text in consumer.insns:
-                state = facts.get(pc, {})
-                target = consumer.calls.get(pc, "")
-                map_name = state.get("r1", (None, None))
-                if match := re.fullmatch(r"if (r\d+) > 0x1ff goto [+-]0x[0-9a-f]+", text):
-                    require(state.get(match[1]) == ("low", identity), consumer.label(pc) + ": slot bound uses cookie low word")
-                    bounds.append(pc)
-                if pc in consumer.helper and text in ("call 0x1", "call 0x2") and map_name[0] == "map":
-                    if map_name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS"):
-                        word = "high" if map_name[1] == "DESCRIPTORS" else "low"
-                        require(stack_read(state, state.get("r2"), 4) == (word, identity), consumer.label(pc) + ": " + map_name[1] + " cookie key")
-                        sinks.append((pc, map_name[1]))
-                        if word == "high":
-                            descriptor.append(pc)
-                if target.startswith("p11_owner_start_"):
-                    require(stack_read(state, state.get("r1"), 4, 8) == ("low", identity), consumer.label(pc) + ": START slot cookie")
-                    sinks.append((pc, "START"))
-                if match := STORE.fullmatch(text):
-                    pointer = address(state, match[2], match[3], match[4])
-                    if pointer == ("event", 0x68):
-                        require(match[1] == "32" and narrow(value(state, match[5]), 32) == ("low", identity), consumer.label(pc) + ": Event.slot cookie")
-                        sinks.append((pc, "Event.slot"))
-            required = {"DESCRIPTORS", "START"}
-            if name != "p11_entry_template_second":
-                required.add("STATS")
-            if name == "p11_return":
-                required |= {"RV_COUNTS", "Event.slot"}
-            require({sink for _, sink in sinks} == required, name + ": sink inventory differs")
-            require(len(bounds) == 1, name + ": slot bound inventory")
-            require(len(descriptor) == 1, name + ": descriptor lookup inventory")
-            fields = descriptor_contract(consumer, facts, descriptor[0])
-            selectors = abi_contract(consumer, facts, variant)
-            operations = operation_contract(consumer, facts, variant, internal_blocks)
-            final_sinks = final_sink_contract(consumer, variant, selectors, internal_blocks, internal_calls)
-            report[name] = {"section": section, "sinks": sinks, "operations": operations,
-                            "descriptor_fields": fields, "accepted_selectors": selectors,
-                            "final_sinks": final_sinks}
+            caller = _ReturnCaller if name == "p11_return" else _SeedCaller
+            consumer = caller(section, name, lines, {pc: target for caller, _, pc, target in calls if caller == name and target is not None})
+            result = consumer_contract(consumer, variant, internal_blocks)
+            result["final_sinks"] = final_sink_contract(consumer, variant, result["accepted_selectors"], internal_blocks, internal_calls)
+            report[name] = result
     require(set(report) == expected, "consumer inventory differs")
     return {
         "schema": SCHEMA,

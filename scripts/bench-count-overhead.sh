@@ -46,9 +46,12 @@
 # a pass, so endpoint probes are attached), exact workload op count +
 # shape, observer exit 0, no "attach failed", no "count refresh:"
 # failures, BPF entry-program set identical across the window with
-# monotone run-time counters, and the count-exactness gate: the on-arm
-# edge reads counted with exactly TOTAL+2*THREADS+1 (0 error), the off-arm
-# edge reads witnessed. BPF run-time deltas (kernel.bpf_stats_enabled,
+# monotone run-time counters and strictly advancing entry firings on
+# call cells (the idle map anchor may read zero), and the
+# count-exactness gate: the on-arm edge reads counted non-lossy with
+# exactly TOTAL+2*THREADS+1 (0 error), the off-arm edge reads witnessed
+# with a null lossy flag, and every map-cell edge reads zero calls.
+# BPF run-time deltas (kernel.bpf_stats_enabled,
 # set for the campaign and restored after) corroborate the workload-side
 # numbers independently; the verdict math lives in
 # scripts/bench-count-overhead-analyze.py, which also runs standalone on
@@ -71,6 +74,23 @@
 # BASE_BIN (default /var/tmp/p11scope-ws-tmp/m2-base/target/release/p11scope),
 # OBS_CPUS (default 10,11), WCPUS_T1/T4/T12, LOCK, TMPDIR (must be a disk
 # filesystem; the campaign keeps per-sample evidence under its work dir).
+#
+# Prebuilt + denominator reuse (the R-47 N5 production cost on a
+# no-build host): PREBUILT=1 skips every build (no cargo, no gcc)
+# and stages caller-provided binaries (CAND_BIN plus MT_COUNT_BIN,
+# and MAP_CHURN_BIN/GATED_BIN when unrelated-mmap is selected;
+# each recorded by sha256, a missing or non-executable input
+# refuses); ARMS=on-unobserved runs on/unobserved ABBA rounds with
+# no base binary, and the campaign analysis prints one TRACED_COST
+# line per cell (median and spread of observed-minus-unobserved
+# wall ns per total completed call, with thread count and both arms'
+# completed-call totals). The relevant-call-t1/t4 median_ns values feed
+# P11_BANK_N5_PRODUCTION_NS_1/4 in that same ns/completed_call unit;
+# apply no further thread factor. PREBUILT_COMMIT names the exported
+# commit when no VCS
+# tree is staged (provenance is the staged-input shas instead of
+# the clean-tree check). Defaults are unchanged: PREBUILT=0 with
+# ARMS=default runs the exact M2 method.
 set -eu
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -94,6 +114,12 @@ OBS_CPUS=${OBS_CPUS:-10,11}
 WCPUS_T1=${WCPUS_T1:-2}
 WCPUS_T4=${WCPUS_T4:-2-5}
 WCPUS_T12=${WCPUS_T12:-0-9}
+PREBUILT=${PREBUILT:-0}
+ARMS=${ARMS:-default}
+PREBUILT_COMMIT=${PREBUILT_COMMIT:-}
+MT_COUNT_BIN=${MT_COUNT_BIN:-}
+MAP_CHURN_BIN=${MAP_CHURN_BIN:-}
+GATED_BIN=${GATED_BIN:-}
 LANE_MARKER="p11scope: native usage lane active"
 KIND=p11scope-control-plane
 WORK=
@@ -124,6 +150,227 @@ is_positive_int() {
     [ "$1" -gt 0 ]
 }
 
+# check_counted DIR OPS THREADS: the on-arm exactness gate. inventory.json
+# must hold exactly one SoftHSM2 edge reading counted with exactly
+# OPS+2*THREADS+1, explicitly non-lossy and unsaturated — either exactly
+# on the edge (case a), or as the edge plus one honestly disclosed
+# exit-time demoted tail (case b: exactly one rejected demoted count gap
+# for the sample caller with base == edge and absolute == want, plus
+# exit-time evidence and no placed, budget or sharing gaps; controller
+# ruling 2026-11-01). Prints "<want> counted" and records one forensic
+# line in DIR/gate_case: "a pid=<sample pid>" for the exact case, "b
+# pid=<sample pid> base=<base> absolute=<absolute>" for the demoted
+# tail (pid is "unknown" when the sample caller has no catalog row).
+check_counted() {
+    python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
+import json, os, re, sys
+path = sys.argv[1]
+doc = json.load(open(path))
+ops, threads = int(sys.argv[2]), int(sys.argv[3])
+lanes = doc.get("observation", {}).get("lane", None)
+if lanes != "native":
+    sys.exit(f"lane is {lanes!r}, want native")
+soft = [m.get("id") for m in doc.get("modules", [])
+        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
+               for p in m.get("paths", []))]
+if len(soft) != 1:
+    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
+edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
+if len(edges) != 1:
+    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
+entries = edges[0].get("entries", {})
+coverage = entries.get("coverage", {})
+state = coverage.get("state")
+want = ops + 2 * threads + 1
+if state != "counted":
+    sys.exit(f"edge state is {state!r}, want counted")
+if coverage.get("lossy") is not False:
+    sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want false")
+if entries.get("saturated"):
+    sys.exit("edge saturated")
+edge = entries.get("count")
+sample_caller = edges[0].get("caller")
+sample_module = edges[0].get("module")
+gaps = doc.get("gaps") or []
+if doc.get("gaps_suppressed"):
+    sys.exit(f"gaps_suppressed is {doc.get('gaps_suppressed')}, gap counts are incomplete")
+for gap in gaps:
+    if gap.get("caller") == sample_caller and gap.get("budget") is not None:
+        sys.exit(f"budget-bearing gap for the sample caller: {gap.get('subject')!r}")
+placed = [g for g in gaps
+          if g.get("subject") == "demoted count placed" and g.get("caller") == sample_caller]
+if placed:
+    sys.exit(f"{len(placed)} demoted count placed gaps for the sample caller")
+rejected = [g for g in gaps
+            if g.get("subject") == "rejected demoted count" and g.get("caller") == sample_caller]
+
+
+sample_pid = "unknown"
+for caller in doc.get("callers") or []:
+    if caller.get("id") == sample_caller and caller.get("pid") is not None:
+        sample_pid = caller.get("pid")
+        break
+
+
+def record(case, detail=""):
+    with open(os.path.join(os.path.dirname(path), "gate_case"), "w") as handle:
+        handle.write(f"{case} pid={sample_pid}{detail}\n")
+
+
+if edge == want:
+    if rejected:
+        sys.exit(f"edge is exact but {len(rejected)} rejected demoted count gaps name the sample caller")
+    record("a")
+    print(f"{want} counted")
+    sys.exit(0)
+if len(rejected) != 1:
+    sys.exit(f"want exactly 1 rejected demoted count gap for the sample caller, have {len(rejected)}")
+reason = rejected[0].get("reason", "")
+match = re.search(r"absolute count range \((\d+), (\d+)\] \((\d+) unattributed calls\)", reason)
+if match is None:
+    sys.exit("demoted gap reason lacks an absolute count range")
+base, absolute, unattributed = int(match.group(1)), int(match.group(2)), int(match.group(3))
+if unattributed != absolute - base:
+    sys.exit(f"demoted gap unattributed {unattributed} != absolute-base {absolute - base}")
+if base != edge:
+    sys.exit(f"demoted base {base} != edge {edge}")
+if absolute != want:
+    sys.exit(f"demoted absolute {absolute} != {want} (ops={ops} threads={threads})")
+if "budget" in reason or "limit" in reason:
+    sys.exit("demoted gap line mentions budget/limit")
+leader = [g for g in gaps
+          if g.get("subject") == "leader exit status unresolved at stop"
+          and g.get("caller") == sample_caller]
+custody = [g for g in gaps
+           if g.get("subject") == "native capture scope custody unproven"
+           and "PID custody lost: the PID target exited" in g.get("reason", "")
+           and g.get("caller") in (None, sample_caller)]
+if not leader and not custody:
+    sys.exit("demoted tail lacks exit-time evidence (no leader-exit or PID-custody gap)")
+for gap in gaps:
+    rides = ((gap.get("caller") is None or gap.get("caller") == sample_caller)
+             and (gap.get("module") is None or gap.get("module") == sample_module))
+    if rides and (gap.get("subject") == "ambiguous shared endpoint"
+                  or "sharing appeared" in gap.get("reason", "")):
+        sys.exit(f"mid-life sharing gap rides the sample edge: {gap.get('subject')!r}")
+record("b", f" base={base} absolute={absolute}")
+print(f"{want} counted", file=sys.stdout)
+print(f"check_counted: case b exit-time demoted tail base={base} absolute={absolute} want={want}",
+      file=sys.stderr)
+EOF
+}
+
+# check_witnessed DIR: the off-arm gate. Exactly one SoftHSM2 edge reading
+# witnessed with a null lossy flag (witnessed carries no count feed).
+# Prints "none witnessed".
+check_witnessed() {
+    python3 -I - "$1/inventory.json" <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+lanes = doc.get("observation", {}).get("lane", None)
+if lanes != "native":
+    sys.exit(f"lane is {lanes!r}, want native")
+soft = [m.get("id") for m in doc.get("modules", [])
+        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
+               for p in m.get("paths", []))]
+if len(soft) != 1:
+    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
+edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
+if len(edges) != 1:
+    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
+entries = edges[0].get("entries", {})
+coverage = entries.get("coverage", {})
+state = coverage.get("state")
+if state != "witnessed":
+    sys.exit(f"edge state is {state!r}, want witnessed")
+if coverage.get("lossy") is not None:
+    sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want null")
+print("none witnessed")
+EOF
+}
+
+# round_arms MODE ROUND: the observed arm order for one round on
+# stdout (ABBA on odd rounds, BAAB on even). Default pairs on/off;
+# on-unobserved pairs on/unobserved for the R-47 denominator (no
+# base binary). Fails on an unknown mode.
+round_arms() {
+    case $1 in
+        default|on-unobserved) : ;;
+        *) return 1 ;;
+    esac
+    if [ $(( $2 % 2 )) -eq 1 ]; then
+        if [ "$1" = on-unobserved ]; then echo "on unobserved unobserved on";
+        else echo "on off off on"; fi
+    else
+        if [ "$1" = on-unobserved ]; then echo "unobserved on on unobserved";
+        else echo "off on on off"; fi
+    fi
+}
+
+# validate_arms MODE / validate_prebuilt_env PREBUILT
+# PREBUILT_COMMIT: mode-knob validation (0 valid, 1 usage error).
+# A commit override only makes sense with staged prebuilt inputs.
+validate_arms() {
+    case $1 in default|on-unobserved) return 0 ;; *) return 1 ;; esac
+}
+
+validate_prebuilt_env() {
+    case $1 in 0|1) : ;; *) return 1 ;; esac
+    if [ -n "$2" ] && [ "$1" != 1 ]; then return 1; fi
+    return 0
+}
+
+# stage_prebuilt_inputs DEST: PREBUILT=1 input staging. No cargo, no
+# gcc: check the caller-staged binaries, copy the fixtures into
+# DEST, and print one BINARY line per staged input with its
+# sha256. CAND_BIN and MT_COUNT_BIN are always required; the map
+# fixtures only when the selected cells use them (unrelated-mmap).
+# Any missing or non-executable input fails by name: never a
+# silent fallback to a build.
+stage_prebuilt_inputs() {
+    spi_dest=$1
+    test -x "$CAND_BIN" || { echo "bench-count-overhead: prebuilt CAND_BIN missing or not executable: $CAND_BIN" >&2; return 1; }
+    test -x "$MT_COUNT_BIN" || { echo "bench-count-overhead: prebuilt MT_COUNT_BIN missing or not executable: $MT_COUNT_BIN" >&2; return 1; }
+    spi_need_map=0
+    for spi_cell in $CELLS; do
+        if [ "$spi_cell" = unrelated-mmap ]; then spi_need_map=1; fi
+    done
+    if [ "$spi_need_map" = 1 ]; then
+        test -x "$MAP_CHURN_BIN" || { echo "bench-count-overhead: prebuilt MAP_CHURN_BIN missing or not executable: $MAP_CHURN_BIN" >&2; return 1; }
+        test -x "$GATED_BIN" || { echo "bench-count-overhead: prebuilt GATED_BIN missing or not executable: $GATED_BIN" >&2; return 1; }
+    fi
+    mkdir -p "$spi_dest" || return 1
+    chmod 0700 "$spi_dest" || return 1
+    cp "$MT_COUNT_BIN" "$spi_dest/mt_count" || return 1
+    chmod +x "$spi_dest/mt_count" || return 1
+    echo "BINARY role=mt_count path=$MT_COUNT_BIN sha256=$(sha256sum "$spi_dest/mt_count" | cut -d' ' -f1)"
+    if [ "$spi_need_map" = 1 ]; then
+        cp "$MAP_CHURN_BIN" "$spi_dest/map_churn" || return 1
+        chmod +x "$spi_dest/map_churn" || return 1
+        echo "BINARY role=map_churn path=$MAP_CHURN_BIN sha256=$(sha256sum "$spi_dest/map_churn" | cut -d' ' -f1)"
+        cp "$GATED_BIN" "$spi_dest/gated" || return 1
+        chmod +x "$spi_dest/gated" || return 1
+        echo "BINARY role=gated path=$GATED_BIN sha256=$(sha256sum "$spi_dest/gated" | cut -d' ' -f1)"
+    fi
+}
+
+# check_native_lane DIR: the unrelated-cell gate. The idle anchor makes no
+# calls, so the lane must be native and every edge must read zero calls.
+check_native_lane() {
+    python3 -I - "$1/inventory.json" <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+lanes = doc.get("observation", {}).get("lane", None)
+if lanes != "native":
+    sys.exit(f"lane is {lanes!r}, want native")
+for edge in doc.get("edges", []):
+    count = edge.get("entries", {}).get("count", 0)
+    if count != 0:
+        sys.exit(f"idle anchor edge {edge.get('module')} counted {count} calls")
+print("none none")
+EOF
+}
+
 if [ "${1-}" = "--self-test" ]; then
     [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
     # Unprivileged: fixture compiles + exact-count smokes + usage
@@ -148,9 +395,20 @@ if [ "${1-}" = "--self-test" ]; then
         for pad in 0 1; do
             ST_LINE=$("$SELF_TEST_WORK/mt_count" "$MODULE" 2 1 "$SELF_TEST_WORK/gate-open" "$pad") \
                 || { echo "self-test: mt_count pad=$pad failed" >&2; exit 1; }
-            case $ST_LINE in "READY pid="*"MT_COUNT ops="*" wall_ns="*" threads=2 pad=$pad") : ;; *)
+            case $ST_LINE in "READY pid="*"MT_COUNT ops="*" wall_ns="*" threads=2 pad=$pad"*) : ;; *)
                 echo "self-test: bad mt_count line: $ST_LINE" >&2; exit 1 ;;
             esac
+            printf '%s\n' "$ST_LINE" | python3 -I -c "
+import sys
+for line in sys.stdin:
+    if line.startswith('MT_COUNT '):
+        fields = dict(token.split('=', 1) for token in line.split()[1:])
+        assert int(fields['ops']) == int(fields['attempts']) > 0, fields
+        assert int(fields['failed']) == 0, fields
+        break
+else:
+    sys.exit('no MT_COUNT line')
+" || { echo "self-test: mt_count attempts/failed mismatch: $ST_LINE" >&2; exit 1; }
         done
         if "$SELF_TEST_WORK/mt_count" "$MODULE" 0 1 "$SELF_TEST_WORK/gate-open" 0 >/dev/null 2>&1; then
             echo "self-test: zero threads accepted" >&2; exit 1
@@ -168,6 +426,251 @@ if [ "${1-}" = "--self-test" ]; then
     case $ST_LINE in "MAP_CHURN ops=2000 wall_ns="*" mode=mmap") : ;; *)
         echo "self-test: bad mmap line: $ST_LINE" >&2; exit 1 ;;
     esac
+    # Deterministic gate controls over synthetic inventory.json
+    # fixtures: every gate passes its healthy shape and fails each
+    # corrupted one (A:DR-T3A-13 loss/BPF/map validity).
+    ST_GATE_OK=0
+    st_gate() {
+        # st_gate EXPECT NAME CMD... : EXPECT is pass or fail.
+        st_expect=$1; shift 2
+        if "$@" >"$SELF_TEST_WORK/gate.out" 2>&1; then st_rc=0; else st_rc=$?; fi
+        if { [ "$st_expect" = pass ] && [ "$st_rc" -eq 0 ]; } \
+            || { [ "$st_expect" = fail ] && [ "$st_rc" -ne 0 ]; }; then
+            ST_GATE_OK=$((ST_GATE_OK + 1))
+        else
+            echo "self-test: gate $* expected $st_expect, got rc=$st_rc:" >&2
+            cat "$SELF_TEST_WORK/gate.out" >&2; exit 1
+        fi
+    }
+    st_inventory() {
+        # st_inventory DIR STATE COUNT LOSSY LANE: one SoftHSM2 edge.
+        mkdir -p "$SELF_TEST_WORK/$1"
+        python3 -I - "$SELF_TEST_WORK/$1/inventory.json" "$2" "$3" "$4" "$5" <<'EOF'
+import json, sys
+path, state, count, lossy, lane = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+json.dump({"observation": {"lane": lane},
+           "modules": [{"id": "m0", "paths": ["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],
+           "edges": [{"module": "m0",
+                      "entries": {"count": int(count),
+                                  "saturated": False,
+                                  "coverage": {"state": state,
+                                               "lossy": {"true": True, "false": False,
+                                                         "null": None}[lossy]}}}]},
+          open(path, "w"))
+EOF
+    }
+    st_inventory_gaps() {
+        # st_inventory_gaps DIR STATE COUNT LOSSY LANE GAPS [SUPPRESSED]:
+        # one SoftHSM2 edge with caller c0 plus a gaps array (a JSON
+        # array string) for the exit-time demoted-tail gate controls.
+        # SUPPRESSED sets gaps_suppressed (default 0).
+        mkdir -p "$SELF_TEST_WORK/$1"
+        python3 -I - "$SELF_TEST_WORK/$1/inventory.json" "$2" "$3" "$4" "$5" "$6" "${7:-0}" <<'EOF'
+import json, sys
+path, state, count, lossy, lane, gaps, supp = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                        sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
+json.dump({"observation": {"lane": lane},
+           "modules": [{"id": "m0", "paths": ["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],
+           "callers": [{"id": "c0", "pid": 4242}],
+           "edges": [{"caller": "c0", "module": "m0",
+                      "entries": {"count": int(count),
+                                  "saturated": False,
+                                  "coverage": {"state": state,
+                                               "lossy": {"true": True, "false": False,
+                                                         "null": None}[lossy]}}}],
+           "gaps": json.loads(gaps),
+           "gaps_suppressed": int(supp)},
+          open(path, "w"))
+EOF
+    }
+    # check_counted: ops=100 threads=2 wants exactly 105.
+    st_inventory counted-ok counted 105 false native
+    st_gate pass counted-ok check_counted "$SELF_TEST_WORK/counted-ok" 100 2
+    ST_GATE_CASE=$(cat "$SELF_TEST_WORK/counted-ok/gate_case") \
+        || { echo "self-test: counted-ok wrote no gate_case" >&2; exit 1; }
+    [ "$ST_GATE_CASE" = "a pid=unknown" ] \
+        || { echo "self-test: counted-ok gate_case is '$ST_GATE_CASE', want 'a pid=unknown'" >&2; exit 1; }
+    for shape in "witnessed 105 false native" "counted 104 false native" \
+            "counted 105 true native" "counted 105 null native" \
+            "counted 105 false scan"; do
+        # shellcheck disable=SC2086
+        st_inventory counted-bad $shape
+        st_gate fail counted-bad check_counted "$SELF_TEST_WORK/counted-bad" 100 2
+    done
+    # check_counted exit-time demoted tail (controller ruling
+    # 2026-11-01, N5 count gate): ops=100 threads=2 wants exactly
+    # 105; the tail case carries edge=90 plus one rejected demoted
+    # gap with base=90 absolute=105 and exit-time evidence. One pass
+    # control and one failure control per mode.
+    ST_TAIL_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    ST_TAIL_LEADER='{"caller":"c0","module":null,"pid":4242,"subject":"leader exit status unresolved at stop","reason":"1 pending leader exit(s) remain unknown; first hook=1 domain=NativeDomainId(1); semantic inputs retain custody refusal","budget":null,"repeats":1}'
+    ST_TAIL_CUSTODY='{"caller":null,"module":null,"pid":null,"subject":"native capture scope custody unproven","reason":"PID custody lost: the PID target exited; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again","budget":null,"repeats":1}'
+    ST_TAIL_IMAGE='{"caller":null,"module":null,"pid":null,"subject":"exact image authority unavailable","reason":"no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection","budget":null,"repeats":1}'
+    ST_TAIL_PLACED='{"caller":"c0","module":"m0","pid":null,"subject":"demoted count placed","reason":"a demoted count placed post-demotion growth on this edge (fixture reason shortened; the gate matches the subject)","budget":null,"repeats":1}'
+    st_inventory_gaps tail-ok counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_TAIL_CUSTODY,$ST_TAIL_IMAGE]"
+    st_gate pass tail-ok check_counted "$SELF_TEST_WORK/tail-ok" 100 2
+    ST_GATE_CASE=$(cat "$SELF_TEST_WORK/tail-ok/gate_case") \
+        || { echo "self-test: tail-ok wrote no gate_case" >&2; exit 1; }
+    [ "$ST_GATE_CASE" = "b pid=4242 base=90 absolute=105" ] \
+        || { echo "self-test: tail-ok gate_case is '$ST_GATE_CASE', want 'b pid=4242 base=90 absolute=105'" >&2; exit 1; }
+    ST_BAD_ABSOLUTE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 104] (14 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-bad-absolute counted 90 false native "[$ST_BAD_ABSOLUTE,$ST_TAIL_LEADER]"
+    st_gate fail tail-bad-absolute check_counted "$SELF_TEST_WORK/tail-bad-absolute" 100 2
+    ST_BASE_NE_EDGE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (89, 105] (16 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-base-ne-edge counted 90 false native "[$ST_BASE_NE_EDGE,$ST_TAIL_LEADER]"
+    st_gate fail tail-base-ne-edge check_counted "$SELF_TEST_WORK/tail-base-ne-edge" 100 2
+    ST_SECOND_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 100] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-two-gaps counted 90 false native "[$ST_TAIL_REJECTED,$ST_SECOND_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-two-gaps check_counted "$SELF_TEST_WORK/tail-two-gaps" 100 2
+    st_inventory_gaps tail-placed counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_TAIL_PLACED]"
+    st_gate fail tail-placed check_counted "$SELF_TEST_WORK/tail-placed" 100 2
+    st_inventory_gaps tail-no-exit counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_IMAGE]"
+    st_gate fail tail-no-exit check_counted "$SELF_TEST_WORK/tail-no-exit" 100 2
+    ST_BUDGET_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":{"resource":"callers","limit":4096,"requested":4097},"repeats":1}'
+    st_inventory_gaps tail-budget counted 90 false native "[$ST_BUDGET_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-budget check_counted "$SELF_TEST_WORK/tail-budget" 100 2
+    # Overcount control: absolute above want is double counting, not an
+    # honest tail (the ruling's `absolute > want` guarantee).
+    ST_BAD_ABSOLUTE_HIGH='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 106] (16 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-bad-absolute-high counted 90 false native "[$ST_BAD_ABSOLUTE_HIGH,$ST_TAIL_LEADER]"
+    st_gate fail tail-bad-absolute-high check_counted "$SELF_TEST_WORK/tail-bad-absolute-high" 100 2
+    # Mid-life sharing controls (ruling point 4): a sharing gap riding
+    # the sample edge fails, whether by subject or by reason; a
+    # foreign-module sharing gap does not ride and passes.
+    ST_SHARING_SUBJECT='{"caller":null,"module":"m0","pid":null,"subject":"ambiguous shared endpoint","reason":"a native witness endpoint is shared by 2 admitted modules: which module was used is ambiguous, so no edge and no module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-sharing counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_SHARING_SUBJECT]"
+    st_gate fail tail-sharing check_counted "$SELF_TEST_WORK/tail-sharing" 100 2
+    ST_SHARING_REASON='{"caller":null,"module":"m0","pid":null,"subject":"rejected demoted count","reason":"a native witness endpoint is shared by 2 admitted modules (re-resolved with 5 unattributed calls after sharing appeared): which module was used is ambiguous, so no edge and no module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-sharing-reason counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_SHARING_REASON]"
+    st_gate fail tail-sharing-reason check_counted "$SELF_TEST_WORK/tail-sharing-reason" 100 2
+    ST_SHARING_FOREIGN='{"caller":null,"module":"m1","pid":null,"subject":"ambiguous shared endpoint","reason":"a native witness endpoint is shared by 2 admitted modules: which module was used is ambiguous, so no edge and no module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-sharing-foreign-ok counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_SHARING_FOREIGN]"
+    st_gate pass tail-sharing-foreign-ok check_counted "$SELF_TEST_WORK/tail-sharing-foreign-ok" 100 2
+    # Case (a) zero-gap clause: an exact edge with a caller-attributed
+    # rejected gap is not the exact case.
+    st_inventory_gaps tail-exact-with-rejected counted 105 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-exact-with-rejected check_counted "$SELF_TEST_WORK/tail-exact-with-rejected" 100 2
+    # Unattributed consistency: the claimed count must equal
+    # absolute-base (here 14 claimed for a 15-wide range).
+    ST_UNATTRIBUTED_MISMATCH='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (14 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-unattributed-mismatch counted 90 false native "[$ST_UNATTRIBUTED_MISMATCH,$ST_TAIL_LEADER]"
+    st_gate fail tail-unattributed-mismatch check_counted "$SELF_TEST_WORK/tail-unattributed-mismatch" 100 2
+    # Budget/limit word clause: each word fails on its own with a null
+    # structured budget (one control per disjunct).
+    ST_BUDGET_WORD='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded; demotion budget exhausted","budget":null,"repeats":1}'
+    st_inventory_gaps tail-budget-word counted 90 false native "[$ST_BUDGET_WORD,$ST_TAIL_LEADER]"
+    st_gate fail tail-budget-word check_counted "$SELF_TEST_WORK/tail-budget-word" 100 2
+    ST_LIMIT_WORD='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded; over the demotion limit","budget":null,"repeats":1}'
+    st_inventory_gaps tail-limit-word counted 90 false native "[$ST_LIMIT_WORD,$ST_TAIL_LEADER]"
+    st_gate fail tail-limit-word check_counted "$SELF_TEST_WORK/tail-limit-word" 100 2
+    # Suppressed gaps: an exact edge with incomplete gap counts fails.
+    st_inventory_gaps tail-suppressed counted 105 false native "[]" 1
+    st_gate fail tail-suppressed check_counted "$SELF_TEST_WORK/tail-suppressed" 100 2
+    # Missing range: a rejected gap without an absolute count range fails.
+    ST_NO_RANGE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven; historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-no-range counted 90 false native "[$ST_NO_RANGE,$ST_TAIL_LEADER]"
+    st_gate fail tail-no-range check_counted "$SELF_TEST_WORK/tail-no-range" 100 2
+    st_inventory witnessed-ok witnessed 0 null native
+    st_gate pass witnessed-ok check_witnessed "$SELF_TEST_WORK/witnessed-ok"
+    for shape in "counted 0 null native" "witnessed 0 false native" \
+            "witnessed 0 true native" "witnessed 0 null scan"; do
+        # shellcheck disable=SC2086
+        st_inventory witnessed-bad $shape
+        st_gate fail witnessed-bad check_witnessed "$SELF_TEST_WORK/witnessed-bad"
+    done
+    st_inventory anchor-ok unknown 0 null native
+    st_gate pass anchor-ok check_native_lane "$SELF_TEST_WORK/anchor-ok"
+    st_inventory anchor-bad counted 7 false native
+    st_gate fail anchor-bad check_native_lane "$SELF_TEST_WORK/anchor-bad"
+    st_inventory anchor-lane unknown 0 null scan
+    st_gate fail anchor-lane check_native_lane "$SELF_TEST_WORK/anchor-lane"
+    [ "$ST_GATE_OK" -eq 31 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 31" >&2; exit 1; }
+    # Prebuilt + denominator-mode controls: per-round arm order in
+    # each mode, ARMS/PREBUILT validation, and prebuilt input
+    # staging (a missing or non-executable input refuses by name;
+    # the map fixtures are only required when unrelated-mmap is
+    # selected). Counter pinned exactly like ST_GATE_OK.
+    ST_MODE_OK=0
+    st_mode() {
+        # st_mode RC NAME PATTERN CMD... : CMD must exit RC and its
+        # combined output must match PATTERN ("-" skips the match).
+        st_want_rc=$1; st_name=$2; st_pattern=$3; shift 3
+        if "$@" >"$SELF_TEST_WORK/mode.out" 2>&1; then st_rc=0; else st_rc=$?; fi
+        st_match=0
+        if [ "$st_pattern" = "-" ] || grep -q "$st_pattern" "$SELF_TEST_WORK/mode.out" 2>/dev/null; then
+            st_match=1
+        fi
+        if [ "$st_rc" -eq "$st_want_rc" ] && [ "$st_match" -eq 1 ]; then
+            ST_MODE_OK=$((ST_MODE_OK + 1))
+        else
+            echo "self-test: mode $st_name: want rc=$st_want_rc match=$st_pattern, got rc=$st_rc:" >&2
+            cat "$SELF_TEST_WORK/mode.out" >&2; exit 1
+        fi
+    }
+    st_arms() {
+        # st_arms MODE ROUND WANT: exact arm order for one round.
+        st_got=$(round_arms "$1" "$2" 2>/dev/null) || st_got=
+        if [ "$st_got" = "$3" ]; then
+            ST_MODE_OK=$((ST_MODE_OK + 1))
+        else
+            echo "self-test: round_arms $1 round $2: have '$st_got', want '$3'" >&2
+            exit 1
+        fi
+    }
+    st_arms default 1 "on off off on"
+    st_arms default 2 "off on on off"
+    st_arms on-unobserved 1 "on unobserved unobserved on"
+    st_arms on-unobserved 2 "unobserved on on unobserved"
+    st_mode 1 round-arms-bogus "-" round_arms bogus 1
+    st_mode 0 validate-arms-default "-" validate_arms default
+    st_mode 0 validate-arms-denominator "-" validate_arms on-unobserved
+    st_mode 1 validate-arms-bogus "-" validate_arms bogus
+    st_mode 0 validate-prebuilt-plain "-" validate_prebuilt_env 0 ""
+    st_mode 0 validate-prebuilt-commit "-" validate_prebuilt_env 1 "abc123"
+    st_mode 1 validate-prebuilt-badflag "-" validate_prebuilt_env 2 ""
+    st_mode 1 validate-prebuilt-commit-without-prebuilt "-" validate_prebuilt_env 0 "abc123"
+    ST_PRE=$SELF_TEST_WORK/prebuilt-inputs
+    mkdir -p "$ST_PRE/in" "$ST_PRE/dest"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/cand"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/mt"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/map"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/gated"
+    printf 'not an executable\n' > "$ST_PRE/in/nonexec"
+    chmod +x "$ST_PRE/in/cand" "$ST_PRE/in/mt" "$ST_PRE/in/map" "$ST_PRE/in/gated"
+    ST_PRE_MT_SHA=$(sha256sum "$ST_PRE/in/mt" | cut -d' ' -f1)
+    ST_PRE_SAVED_CAND=$CAND_BIN
+    ST_PRE_SAVED_CELLS=$CELLS
+    CAND_BIN=$ST_PRE/in/cand
+    MT_COUNT_BIN=$ST_PRE/in/mt
+    MAP_CHURN_BIN=$ST_PRE/in/map
+    GATED_BIN=$ST_PRE/in/gated
+    CELLS="relevant-call-t1"
+    st_mode 0 stage-call-cells-ok "BINARY role=mt_count .* sha256=$ST_PRE_MT_SHA" stage_prebuilt_inputs "$ST_PRE/dest"
+    if [ -x "$ST_PRE/dest/mt_count" ]; then
+        ST_MODE_OK=$((ST_MODE_OK + 1))
+    else
+        echo "self-test: staged mt_count missing or not executable" >&2; exit 1
+    fi
+    MAP_CHURN_BIN=; GATED_BIN=
+    st_mode 0 stage-map-not-required "-" stage_prebuilt_inputs "$ST_PRE/dest"
+    CELLS="unrelated-mmap"
+    st_mode 1 stage-map-required "MAP_CHURN_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MAP_CHURN_BIN=$ST_PRE/in/does-not-exist
+    st_mode 1 stage-map-missing "MAP_CHURN_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MAP_CHURN_BIN=$ST_PRE/in/map; GATED_BIN=$ST_PRE/in/gated
+    st_mode 0 stage-map-ok "BINARY role=map_churn" stage_prebuilt_inputs "$ST_PRE/dest"
+    CELLS="relevant-call-t1"
+    MT_COUNT_BIN=$ST_PRE/in/nonexec
+    st_mode 1 stage-mt-nonexec "MT_COUNT_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MT_COUNT_BIN=$ST_PRE/in/does-not-exist
+    st_mode 1 stage-mt-missing "MT_COUNT_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MT_COUNT_BIN=$ST_PRE/in/mt
+    CAND_BIN=$ST_PRE/in/does-not-exist
+    st_mode 1 stage-cand-missing "CAND_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    CAND_BIN=$ST_PRE_SAVED_CAND
+    CELLS=$ST_PRE_SAVED_CELLS
+    MT_COUNT_BIN=; MAP_CHURN_BIN=; GATED_BIN=
+    [ "$ST_MODE_OK" -eq 21 ] || { echo "self-test: ran $ST_MODE_OK mode controls, want 21" >&2; exit 1; }
     python3 -I scripts/bench-count-overhead-analyze.py --self-test \
         || { echo "self-test: analyzer self-test failed" >&2; exit 1; }
     echo "bench-count-overhead self-test: OK"
@@ -185,6 +688,9 @@ for cell in $CELLS; do
         *) echo "usage: unknown cell $cell" >&2; exit 2 ;;
     esac
 done
+validate_arms "$ARMS" || { echo "usage: unknown ARMS $ARMS (want default or on-unobserved)" >&2; exit 2; }
+validate_prebuilt_env "$PREBUILT" "$PREBUILT_COMMIT" \
+    || { echo "usage: PREBUILT is 0 or 1 and PREBUILT_COMMIT needs PREBUILT=1" >&2; exit 2; }
 
 # The observer refuses an output directory below any group- or other-writable
 # ancestor, which a checkout under a 0775 home tree has, so the campaign works
@@ -213,7 +719,7 @@ cleanup() {
 }
 . scripts/cleanup-traps.sh
 
-command -v gcc >/dev/null || die "gcc required"
+if [ "$PREBUILT" != 1 ]; then command -v gcc >/dev/null || die "gcc required"; fi
 command -v softhsm2-util >/dev/null || die "softhsm2-util required"
 command -v python3 >/dev/null || die "python3 required"
 command -v bpftool >/dev/null || die "bpftool required"
@@ -222,7 +728,7 @@ command -v taskset >/dev/null || die "taskset required"
 test -f "$MODULE" || die "SoftHSM2 not installed at $MODULE"
 [ "$(id -u)" -ne 0 ] || die "run as a non-root user with passwordless sudo"
 sudo -n true 2>/dev/null || die "passwordless sudo required"
-test -x "$BASE_BIN" || die "prebuilt base binary missing: $BASE_BIN"
+if [ "$ARMS" = default ]; then test -x "$BASE_BIN" || die "prebuilt base binary missing: $BASE_BIN"; fi
 
 # An ancestor must hold the privileged lock: a concurrent privileged test or
 # capture would charge these samples. Run under `flock "$LOCK" $0`.
@@ -260,7 +766,12 @@ fi
 if sudo -n bpftool prog show 2>/dev/null | grep -q "p11_"; then
     refuse "p11_* BPF programs are already attached"
 fi
-[ -z "$(git status --porcelain -- . ':!target')" ] || refuse "the tree is not clean"
+# A prebuilt export carries no VCS tree; its provenance is the
+# staged-input shas, so the clean-tree check only applies without
+# a commit override.
+if [ -z "$PREBUILT_COMMIT" ]; then
+    [ -z "$(git status --porcelain -- . ':!target')" ] || refuse "the tree is not clean"
+fi
 
 build_processes() {
     cat /proc/[0-9]*/comm 2>/dev/null | grep -cxE 'cargo|rustc'
@@ -322,14 +833,26 @@ lane_mechanism() {
     fi
 }
 
+# SPID is the original child from start_observer. A failed signal probe may
+# mean EPERM while sudo is still live; only reap once its proc entry is gone.
+reap_observer_if_gone() {
+    [ -n "${SPID-}" ] || return 1
+    if kill -0 "$SPID" 2>/dev/null || [ -d "/proc/$SPID" ]; then
+        return 1
+    fi
+    if wait "$SPID"; then OBSERVER_EXIT_STATUS=0; else OBSERVER_EXIT_STATUS=$?; fi
+    SPID=
+    return 0
+}
+
 wait_for_lane_active() {
     wfla_end=$(( $(date +%s) + $2 ))
     while :; do
         if grep -Fq "$LANE_MARKER" "$1" 2>/dev/null; then
             return 0
         fi
-        if [ -n "${SPID-}" ] && ! kill -0 "$SPID" 2>/dev/null; then
-            echo "observer exited before the lane went active: $1" >&2
+        if reap_observer_if_gone; then
+            echo "observer exited before the lane went active: status=$OBSERVER_EXIT_STATUS log=$1" >&2
             tail -n 20 "$1" >&2 2>/dev/null || true
             return 1
         fi
@@ -354,8 +877,8 @@ wait_for_passes() {
         if [ "$wfp_n" -ge "$2" ]; then
             return 0
         fi
-        if [ -n "${SPID-}" ] && ! kill -0 "$SPID" 2>/dev/null; then
-            echo "observer exited before $2 passes committed: $1" >&2
+        if reap_observer_if_gone; then
+            echo "observer exited before $2 passes committed: status=$OBSERVER_EXIT_STATUS log=$1" >&2
             return 1
         fi
         [ "$(date +%s)" -lt "$wfp_end" ] || {
@@ -405,15 +928,21 @@ print(f"{ns} {cnt}")
 }
 
 echo "=== build ==="
-scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --bin p11scope
-test -x "$CAND_BIN" || die "candidate observer missing: $CAND_BIN"
-mkdir -m 0700 -p "$WORK/bin"
-gcc -O2 -Wall -Wextra -Werror -pthread -o "$WORK/bin/mt_count" "$FIX/mt_count.c" -ldl \
-    || die "mt_count does not compile"
-gcc -O2 -Wall -Wextra -Werror -o "$WORK/bin/map_churn" "$FIX/map_churn.c" \
-    || die "map_churn does not compile"
-gcc -O1 -Wall -Wextra -Werror -o "$WORK/bin/gated" tests/fixtures/public-cli/gated.c -ldl \
-    || die "gated does not compile"
+if [ "$PREBUILT" = 1 ]; then
+    stage_prebuilt_inputs "$WORK/bin" > "$WORK/prebuilt.inputs" \
+        || die "prebuilt inputs incomplete (see above)"
+    while IFS= read -r prebuilt_line; do say "$prebuilt_line"; done < "$WORK/prebuilt.inputs"
+else
+    scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --bin p11scope
+    test -x "$CAND_BIN" || die "candidate observer missing: $CAND_BIN"
+    mkdir -m 0700 -p "$WORK/bin"
+    gcc -O2 -Wall -Wextra -Werror -pthread -o "$WORK/bin/mt_count" "$FIX/mt_count.c" -ldl \
+        || die "mt_count does not compile"
+    gcc -O2 -Wall -Wextra -Werror -o "$WORK/bin/map_churn" "$FIX/map_churn.c" \
+        || die "map_churn does not compile"
+    gcc -O1 -Wall -Wextra -Werror -o "$WORK/bin/gated" tests/fixtures/public-cli/gated.c -ldl \
+        || die "gated does not compile"
+fi
 head -c 8192 /dev/zero > "$WORK/unrelated.bin" || die "cannot write the unrelated file"
 
 echo "=== private softhsm token ==="
@@ -435,20 +964,28 @@ echo "=== machine ==="
 KERNEL=$(uname -r)
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
 VIRT=$(systemd-detect-virt 2>/dev/null || echo bare)
-COMMIT=$(git rev-parse HEAD)
+if [ -n "$PREBUILT_COMMIT" ]; then
+    COMMIT=$PREBUILT_COMMIT
+else
+    COMMIT=$(git rev-parse HEAD)
+fi
 CAND_SHA=$(sha256sum "$CAND_BIN" | cut -d' ' -f1)
-BASE_SHA=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)
+if [ "$ARMS" = default ]; then
+    BASE_SHA=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)
+fi
 echo "kernel: $KERNEL"
 echo "cpu: $CPU"
 echo "virt: $VIRT"
 echo "commit: $COMMIT"
 echo "candidate: $CAND_SHA"
-echo "base: $BASE_SHA"
+if [ "$ARMS" = default ]; then echo "base: $BASE_SHA"; fi
 echo "cells: $CELLS"
 echo "rounds: $ROUNDS secs: $SECS"
 say "MACHINE kernel=$KERNEL cpu=$CPU virt=$VIRT nproc=$(nproc) date=$(date -u +%FT%TZ) host=$(uname -n)"
 say "BINARY role=candidate path=$CAND_BIN sha256=$CAND_SHA commit=$COMMIT"
-say "BINARY role=base path=$BASE_BIN sha256=$BASE_SHA commit=c34b4d4605581bca8d89cb3a136cb7eb91f9e19e"
+if [ "$ARMS" = default ]; then
+    say "BINARY role=base path=$BASE_BIN sha256=$BASE_SHA commit=c34b4d4605581bca8d89cb3a136cb7eb91f9e19e"
+fi
 
 if command -v docker >/dev/null 2>&1 && docker inspect "$KIND" >/dev/null 2>&1; then
     if [ "$(docker inspect -f '{{.State.Status}}' "$KIND" 2>/dev/null)" = running ]; then
@@ -548,75 +1085,6 @@ stop_observer() {
     reclaim_root_output "$so_dir/events.jsonl"
 }
 
-# check_counted DIR OPS THREADS: the on-arm exactness gate. inventory.json
-# must hold exactly one SoftHSM2 edge reading counted with exactly
-# OPS+2*THREADS+1 and unsaturated. Prints "<count> counted".
-check_counted() {
-    python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-ops, threads = int(sys.argv[2]), int(sys.argv[3])
-lanes = doc.get("observation", {}).get("lane", None)
-if lanes != "native":
-    sys.exit(f"lane is {lanes!r}, want native")
-soft = [m.get("id") for m in doc.get("modules", [])
-        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
-               for p in m.get("paths", []))]
-if len(soft) != 1:
-    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
-edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
-if len(edges) != 1:
-    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
-entries = edges[0].get("entries", {})
-state = entries.get("coverage", {}).get("state")
-want = ops + 2 * threads + 1
-if state != "counted":
-    sys.exit(f"edge state is {state!r}, want counted")
-if entries.get("count") != want:
-    sys.exit(f"edge count {entries.get('count')} != {want} (ops={ops} threads={threads})")
-if entries.get("saturated"):
-    sys.exit("edge saturated")
-print(f"{want} counted")
-EOF
-}
-
-# check_witnessed DIR: the off-arm gate. Exactly one SoftHSM2 edge reading
-# witnessed. Prints "none witnessed".
-check_witnessed() {
-    python3 -I - "$1/inventory.json" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-lanes = doc.get("observation", {}).get("lane", None)
-if lanes != "native":
-    sys.exit(f"lane is {lanes!r}, want native")
-soft = [m.get("id") for m in doc.get("modules", [])
-        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
-               for p in m.get("paths", []))]
-if len(soft) != 1:
-    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
-edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
-if len(edges) != 1:
-    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
-state = edges[0].get("entries", {}).get("coverage", {}).get("state")
-if state != "witnessed":
-    sys.exit(f"edge state is {state!r}, want witnessed")
-print("none witnessed")
-EOF
-}
-
-# check_native_lane DIR: the unrelated-cell gate. The idle anchor makes no
-# calls, so no counted edge is owed; the lane must be native and clean.
-check_native_lane() {
-    python3 -I - "$1/inventory.json" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-lanes = doc.get("observation", {}).get("lane", None)
-if lanes != "native":
-    sys.exit(f"lane is {lanes!r}, want native")
-print("none none")
-EOF
-}
-
 # run_call_sample CELL ARM ROUND: one gated mt_count window under an
 # observed (on/off) or unobserved capture. Any gate failure fails the
 # campaign; only a persistently hot host refuses it (exit 3).
@@ -666,6 +1134,10 @@ run_call_sample() {
         rs_bns1=${rs_bpf_after% *} rs_bcnt1=${rs_bpf_after#* }
         [ "$rs_bns1" -ge "$rs_bns0" ] && [ "$rs_bcnt1" -ge "$rs_bcnt0" ] \
             || { echo "bpf counters went backwards" >&2; return 1; }
+        # A call window ran thousands of observed calls: entry firings
+        # must strictly advance, or the corroboration is vacuous.
+        [ "$rs_bcnt1" -gt "$rs_bcnt0" ] \
+            || { echo "bpf entry firings did not advance over $rs_ops calls" >&2; return 1; }
         rs_bpf_ns=$((rs_bns1 - rs_bns0)) rs_bpf_cnt=$((rs_bcnt1 - rs_bcnt0))
         stop_observer "$S" || return 1
         if [ "$rs_arm" = on ]; then
@@ -771,25 +1243,31 @@ for cell in $CELLS; do
     fi
     round=1
     while [ "$round" -le "$ROUNDS" ]; do
-        if [ $((round % 2)) -eq 1 ]; then
-            arms="on off off on"
-        else
-            arms="off on on off"
-        fi
+        arms=$(round_arms "$ARMS" "$round")
         for arm in $arms; do
             case $cell in
                 unrelated-mmap) run_map_sample "$cell" "$arm" "$round" || exit 1 ;;
                 *) run_call_sample "$cell" "$arm" "$round" || exit 1 ;;
             esac
         done
-        case $cell in
-            unrelated-mmap) run_map_sample "$cell" unobserved "$round" || exit 1 ;;
-            *) run_call_sample "$cell" unobserved "$round" || exit 1 ;;
-        esac
+        if [ "$ARMS" = default ]; then
+            case $cell in
+                unrelated-mmap) run_map_sample "$cell" unobserved "$round" || exit 1 ;;
+                *) run_call_sample "$cell" unobserved "$round" || exit 1 ;;
+            esac
+        fi
         round=$((round + 1))
     done
 done
 
 echo "=== results ==="
-python3 -I scripts/bench-count-overhead-analyze.py "$LOG" || exit 1
+if [ "$ARMS" = on-unobserved ]; then
+    # shellcheck disable=SC2086
+    traced_cells=$(printf '%s,' $CELLS)
+    python3 -I scripts/bench-count-overhead-analyze.py "$LOG" --traced-cost \
+        --cells "${traced_cells%,}" --rounds "$ROUNDS" > "$WORK/traced-cost.txt" || exit 1
+    while IFS= read -r traced_line; do say "$traced_line"; done < "$WORK/traced-cost.txt"
+else
+    python3 -I scripts/bench-count-overhead-analyze.py "$LOG" || exit 1
+fi
 echo "=== bench-count-overhead: DONE ($LOG) ==="

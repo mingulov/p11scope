@@ -145,7 +145,7 @@ Discovery and attachment:
 | `attached_probes` | Successful probe attachments; two per fully attached slot. |
 | `attach_failures` | Per-slot attachment errors. |
 | `aliased` | Name groups that share one address and therefore one count. |
-| `skipped` | Everything discovery could not use, at every granularity it works at. **Entries**: a NULL table slot, an entry whose object could not be pinned, an unresolvable manifest record. **Objects**: a mapping with no usable pathname, exports that could not be read, an object over the byte caps, an incomplete snapshot, or a provider with no decoded file-backed table. **Processes and scope**: a process or cgroup subtree that could not be scanned, and the `MAX_SCAN_PIDS` cap. Such a skip may be the only record of a provider that was never decoded. Identical internal losses are deduplicated before rendering; two different losses remain two records even if sanitization gives them the same public pair. The public `{name, reason}` is finite: `name` is an exact standard function, the gated `unknown` of a null slot in an unlinked table, or `discovery subject`; `reason` is exactly `null pointer`, `function entry unavailable`, `function table unavailable in file-backed data`, `shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved`, `physical identity is ambiguous; the collision group was not attached`, `unsupported function-table version; the scanner does not walk this layout`, or the fail-closed `discovery unavailable`. Arbitrary mapped paths, numeric PIDs, `/proc/<pid>` paths, cgroup paths, and raw error chains remain diagnostic-only. Every record still forces `PARTIAL`. |
+| `skipped` | Everything discovery could not use, at every granularity it works at. **Entries**: a NULL table slot, an entry whose object could not be pinned, an unresolvable manifest record. **Objects**: a mapping with no usable pathname, exports that could not be read, an object over the byte caps, an incomplete snapshot, or a provider with no decoded file-backed table. **Processes and scope**: a process or cgroup subtree that could not be scanned, and the `MAX_SCAN_PIDS` cap. Such a skip may be the only record of a provider that was never decoded. Identical internal losses are deduplicated before rendering; two different losses remain two records even if sanitization gives them the same public pair. The public `{name, reason}` is finite: `name` is an exact standard function, the gated `unknown` of a null slot in an unlinked table, or `discovery subject`; `reason` is exactly `null pointer`, `function entry unavailable`, `function table unavailable in file-backed data`, `shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved`, `physical identity is ambiguous; the collision group was not attached`, `unsupported function-table version; the scanner does not walk this layout`, `static probe coverage gap incomplete`, `static probes detached and exact pairs reattached`, `capture process-view capacity was exhausted; remaining generations were not scanned`, `loader context capacity 256 is exhausted`, `a deferred loader memory scan exceeded the bounded loader-context ledger`, `the bounded loader-arm catch-up ledger was full`, `manifest object unavailable`, `prearm object unavailable`, `discovery transport unavailable`, or the fail-closed `discovery unavailable`. Arbitrary mapped paths, numeric PIDs, `/proc/<pid>` paths, cgroup paths, and raw error chains remain diagnostic-only. Every record still forces `PARTIAL`. |
 | `surfaces` | Source, acquisition status, walk outcome, and function count for every surface. |
 | `vendor_interfaces` | Present but undecoded interfaces. |
 | `interface_list` | `C_GetInterfaceList` acquisition outcome. |
@@ -212,7 +212,7 @@ Kernel/event loss:
 | `rv_update_failures` | Failed `RV_COUNTS` updates. |
 | `cgroup_scope_failures` | Native cgroup-membership helper failures. |
 | `semantic_capture_failures` | Descriptor-selected argument or bounded user-memory reads that failed. |
-| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Forces `PARTIAL`. |
+| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Counts every occurrence under `allowlisted`, including any lost later (unsafe diagnostic builds keep it at 0). v3 documents also list each such 32-bit id with its counts in `mechanisms[]` rows with `registered: false` (ids above `0xFFFFFFFF` count in the total only). Forces `PARTIAL`. |
 | `template_tail_failures` | Internal second-template handoff failed; the first template may remain available, but the key-pair request is incomplete. |
 | `malformed_records` | Event records rejected for ABI size mismatch. |
 
@@ -246,8 +246,11 @@ from another.
 
 #### `evidence.loader_discovery`
 
-Six keys, always all present, every leaf an unsigned 64-bit count. Key order
-carries no meaning (a real document's object keys arrive sorted).
+Seven keys in current v3 documents (six in v2: `benign_hits` is v3-only),
+always all present, every leaf an unsigned 64-bit count. V3 documents
+written before `benign_hits` existed omit it; readers treat the absence
+as zero. Key order carries no meaning (a real document's object keys
+arrive sorted).
 
 | Field | Meaning |
 | --- | --- |
@@ -258,13 +261,21 @@ carries no meaning (a real document's object keys arrive sorted).
 | `initial_set_timing.*` | The same five classifications for the owned run's pre-exec initial-set context. |
 | `initial_set_capture.eligible` / `.none` / `.pause_protected` | Whether an owned `run` could capture its child's initial provider set before the child's first constructor ran (`eligible`), could not (`none`, forces `PARTIAL`), or had it held by its pause as above (`pause_protected`, not a gap). |
 | `hits` | Scoped BPF debug-state hit counter, incremented before ring reservation and never derived from received-record counts. A hit is not a loss: this counter alone never changes the verdict. |
+| `benign_hits` (v3 only) | Loader hits whose records resolved benignly: accepted, scan complete, no new provider module, no suspicious close — or pause-protected (the pause, not the scan, is the proof). Never above `hits`; the checker refuses the document when it is. Absent in v2 documents, where it reads as zero. |
 | `state_read_failures` | The separate BPF counter for `_r_debug.r_state` reads. There is no second public copy of it, in this object or beside it. |
 
 With the empty compiled-in timing catalog this build ships, only `unproven`,
 `none` and `pause_protected` are reachable in either timing group, and
 `initial_set_capture.eligible` is unreachable. A dlopen timing class is a gap
-only once a load happened (`hits > 0`): an armed loader that never fired cannot
-have missed a late provider's first call.
+only while a hit is unaccounted: an armed loader that never fired cannot have
+missed a late provider's first call, and (v3) a hit whose record resolved
+benignly loaded nothing the capture could have missed calls through — a failed
+or refcount `dlopen`, a close that removed only retained code, or any load
+under pause proof. What stays a gap is a hit with no benign resolution: a new
+provider (a true late window), a close nobody's mapping explains (a transient
+open-close cycle), an incomplete or skipped scan, or a lost or rejected record.
+Pause-protected timing exonerates independently of the hit accounting, as
+before.
 
 The three classification groups are one partition of the same exact bound
 context set, not three independent tallies:
@@ -284,6 +295,18 @@ counts (`docs/privacy/allowlist-v1.md`).
 
 #### The unprotected live window
 
+Current captures preserve two static probe transition categories under the
+`discovery subject` skip name. `static probe coverage gap incomplete` means
+an actual detach occurred and the final exact pairs or comparable clock remain
+incomplete. It can also describe recovered pairs whose interval is still
+clock-unknown. `static probes detached and exact pairs reattached` means all
+affected final pairs completed with known comparable clocks; the earlier
+coverage gap remains in capture history. Neither category assigns a missing
+call count, names an individual provider or supplies a per-call interval.
+Both are observation loss through `skipped`; recovery cannot erase the loss.
+They do not change the loader-window inference below or make an unknown
+`attach_gap_ms` defined.
+
 The completeness verdict consumes one more live-discovery fact: whether any
 module's first required attach key was learned from a live loader or export
 event that no confirmed pause owner protected. The v3 documents publish it as
@@ -293,15 +316,17 @@ because the value is an inference, never for privacy: both of its inputs are
 already public.
 
 It is worth stating plainly how the value is obtained: the implementation
-treats a capture as having had an unprotected live window when
-`loader_discovery.hits > 0` and `pause` is not `sigstop` — "a live window
-happened at all, and no confirmed pause owner protected it". That is a
-capture-level approximation of a per-module condition, and it is inexact in
-both directions: over-inclusive, because a hit that established no module's
-first required key still forces `PARTIAL`; and under-inclusive, because the
+treats a capture as having had an unprotected live window when a loader hit
+is unaccounted — `loader_discovery.hits` above `benign_hits` (v2: `hits > 0`,
+which reads `benign_hits` as zero) — and `pause` is not `sigstop`: "an
+unresolved live window happened at all, and no confirmed pause owner protected
+it". That is a capture-level approximation of a per-module condition, and it
+is inexact in one remaining direction: under-inclusive, because the
 export-event lane can establish a first required key without incrementing
-`hits`. It can only ever downgrade a verdict, never raise one, and it is
-expected to be replaced by a measured value.
+`hits`. The old over-inclusion — a benign load forcing `PARTIAL` — is gone:
+hits whose records resolve benignly no longer count as windows. It can only
+ever downgrade a verdict, never raise one, and it is expected to be replaced
+by a measured value.
 
 Process and semantic uncertainty:
 
@@ -355,9 +380,10 @@ them:
 - in `loader_discovery`: `strategies.dlopen_return` and `strategies.unavailable`
   are zero, every timing classification other than `qualified_pre_constructor`
   and `pause_protected` is zero in **both** timing groups (the dlopen group
-  only when `hits > 0`), `initial_set_capture.none` is zero, and
-  `state_read_failures` is zero. `hits`, `initial_set_capture.eligible` and
-  `.pause_protected` are not gaps;
+  only while a hit is unaccounted: v3 `benign_hits < hits`, v2 `hits > 0`),
+  `initial_set_capture.none` is zero, and `state_read_failures` is zero.
+  `hits`, `benign_hits`, `initial_set_capture.eligible` and `.pause_protected`
+  are not gaps;
 - no `functions[]` row is `module_unresolved`;
 - the unpublished unprotected-live-window input above is zero.
 
@@ -397,10 +423,34 @@ One item per attach slot:
 | `errors` | Nonzero returns excluding `CKR_PENDING`. |
 | `pending_returns` | Returns equal to `CKR_PENDING`; also present in `rv_counts`. |
 | `in_flight` | Entries minus returns at read time. |
-| `latency_ns` | `approximate`, bucket-lower-bound `p50`/`p95`/`p99`, and exact `total`/`max`. |
+| `latency_ns` | Timing availability: a histogram object, a timestamps object with measured `total`/`max` and unavailable percentiles, or `null` when timing was not measured. See below. |
 | `rv_counts` | Full-width `CK_RV` formatted as a 16-digit hex key to count. |
 
 Aliased slots are never split into guessed per-name counts.
+
+### Timing availability
+
+The native counter cell's measurement capability determines `latency_ns`,
+independently of semantic authorization and the numeric values:
+
+| Capability | `latency_ns` |
+| --- | --- |
+| Counts | `null`: timing was not measured. |
+| Timestamps | Object with `approximate: false`, null `p50`/`p95`/`p99`, and measured `total`/`max`. No histogram was recorded. |
+| Latency, including legacy reports | Object with `approximate: true`, bucket-lower-bound `p50`/`p95`/`p99`, and measured `total`/`max`. Percentiles are null when the histogram has no observations. |
+
+A measured zero remains zero; it is never used to infer unavailable timing.
+`approximate` describes the percentiles. It does not assert a loss-free
+capture: totals and maxima retain their source's accounting and loss limits,
+and capture evidence still determines completeness. Timing availability does
+not change the aggregate authority for `functions[]` or add semantic detail
+counts into those totals.
+
+Current v3 documents can additionally describe the accepted counter read and
+its availability in optional `evidence.counter_collection` metadata, documented
+in [the v3 schema](observed-profile-v3.md). Historical v2 documents retain
+their existing evidence shape. Timing capability alone does not prove that a
+read was fresh or that a capture was complete.
 
 ### The owner relation is exact and exclusive
 
@@ -430,10 +480,11 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 
 | Field | Meaning |
 | --- | --- |
-| `mechanism`, `mechanism_hex` | 64-bit mechanism id admitted by the capture policy; the default policy permits only finite published registry membership. |
+| `mechanism`, `mechanism_hex` | 64-bit mechanism id. Registered ids are admitted by the capture policy (finite published registry membership); v3 documents additionally list unregistered ids as bare numbers with counts (see `registered`). Historical v2 documents list registered ids only. |
+| `registered` | v3 only: `true` when the BPF return path found the id in `MECH_SHAPE`, `false` for an unregistered publication (numeric id plus call/error counts only, never decoded, never named). Absent from historical v2 documents. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
-| `latency_ns` | Same shape as function latency; async semantic latency spans pending entry to completion. |
+| `latency_ns` | Always the histogram object shape, independent of function timing availability; async semantic latency spans pending entry to completion. |
 | `params` | Always `null` under the default `allowlisted` policy. A separately enabled unsafe diagnostic capture may contain distinct decoded parameter combinations with counts. |
 | `params_omitted` | v3 only, present exactly when `params` is `null`: `policy` (the `allowlisted` policy disables parameter decoding), `no_shape` (no diagnostic shape is published for this id; decoding was not attempted) or `decode_failed` (a shape exists but every decode attempt failed). A `null` never means "no parameters were passed". |
 | `note` | Whether decoding was unavailable, failed totally, or succeeded. |
@@ -481,6 +532,10 @@ captured.
 
 Each item has numeric `cgroup_id`, best-effort `label`, calls, errors, and a
 per-mechanism breakdown. A missing label is `null`; the resolver never guesses.
+Each per-mechanism row carries the numeric id (`mechanism`,
+`mechanism_hex`), calls and errors; v3 documents additionally carry
+`registered` with the same meaning as `mechanisms[]` `registered`
+(absent from historical v2 documents).
 
 ## v1.4 → v2 migration
 
@@ -556,10 +611,13 @@ revision:
 - `capture.privacy_mode` names the kernel capture policy that produced the
   document (`allowlisted` by default, `unsafe-unvalidated-metadata` only in a
   build that opted into the feature *and* passed the flag).
-- Under `allowlisted`, pointer-derived metadata appears only when it matched
-  the finite published mechanism registry or the 104-name function catalog
-  exactly. A caller that aliases a metadata pointer elsewhere yields no
-  decoded value rather than an arbitrary read.
+- Under `allowlisted`, pointer-derived function metadata appears only when it
+  matched the 104-name function catalog exactly. A caller that aliases a
+  function-metadata pointer elsewhere yields no decoded value rather than an
+  arbitrary read. Mechanism ids are public constants and publish as numeric
+  id plus call/error counts (v3 documents list unregistered ids as bare
+  numbers with `registered: false`; historical v2 documents list registered
+  ids only) — see the allowlist-v3 unregistered-id row.
 - Mechanism parameter and template decoding beyond that finite equality is
   absent from the default eBPF object. Every emitted mechanism therefore has
   `params: null`, and `templates.operations` is always empty under `allowlisted`,

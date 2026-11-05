@@ -10,9 +10,7 @@ use p11scope_manifest::identity::{
     UnboundedProbeBudget, opened_file_matches_maps, self_mapped_fallback_key,
 };
 use p11scope_manifest::manifest::*;
-use pkcs11_module::{
-    RawInterface, Surface, TableSet, function_list, interface_list, read_fn_pointers, tables_for,
-};
+use pkcs11_module::{RawInterface, Surface, TableSet, function_list, interface_list, tables_for};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::raw::c_void;
@@ -37,6 +35,156 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
     discover_with_self_memory(module_path, ProcessMemory::open()?.0)
 }
 
+/// Upper bound on provider-directory siblings preloaded for one discovery.
+/// The Firefox snap needs five; the bound keeps a hostile DT_NEEDED closure
+/// finite. Past it the fallback gives up and the original loader diagnosis
+/// stands.
+const MAX_SIBLING_PRELOADS: usize = 64;
+
+/// A DT_NEEDED name the sibling fallback may resolve: a bare file name with
+/// no path separator, so the candidate can only name the provider's own
+/// directory. Names with a separator (absolute or relative paths the loader
+/// resolves itself), `.`/`..` and empty names are never preloaded.
+fn is_bare_library_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
+/// Whether the sibling fallback may `dlopen` `candidate`: a regular file
+/// beside the provider, or a symlink whose fully-resolved target is a
+/// regular file staying inside the provider's canonical directory
+/// (SONAME links like `libfoo.so.1 -> libfoo.so.1.2.3`). Anything else —
+/// directories, outside links, unresolvable names — stays for the normal
+/// loader search. A swap between this check and the load is outside the
+/// model: a writer in the provider's own directory already owns it.
+fn sibling_is_usable(dir_canonical: Option<&Path>, candidate: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(candidate) else {
+        return false;
+    };
+    if meta.is_file() {
+        return true;
+    }
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Some(dir) = dir_canonical else {
+        return false;
+    };
+    std::fs::canonicalize(candidate).is_ok_and(|target| target.starts_with(dir) && target.is_file())
+}
+
+/// Preload this provider's own-directory dependencies: for every DT_NEEDED
+/// bare name — transitively, the provider's needs plus every discovered
+/// sibling's needs, whether or not that sibling loaded yet — `dlopen` the
+/// same-directory file by absolute path, keeping each handle alive in the
+/// returned vector. Loads retry to a fixpoint after every success, so
+/// dependency order never matters (P → A → B loads B, then A on retry,
+/// then the provider retry). Only regular files and in-directory symlinks
+/// resolving inside the directory are loaded (see `sibling_is_usable`);
+/// directories, outside links and anything else are skipped, and names
+/// absent from the directory stay for the normal loader search. No
+/// environment is read or set: the loader environment stays sanitized. One
+/// unloadable file never aborts the whole fallback: an open, parse, or
+/// `dlopen` failure skips that sibling (its own needs are still parsed, so
+/// a dependency it names can load first), while a genuinely missing library
+/// still fails the retry with an accurate diagnosis. Only the preload cap
+/// below aborts the fallback; the caller then keeps the original loader
+/// diagnosis.
+fn preload_sibling_dependencies(module_path: &Path) -> Result<Vec<Library>, String> {
+    let dir = module_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| "--module names no directory".to_string())?;
+    let dir_canonical = std::fs::canonicalize(dir).ok();
+    let mut preloads = Vec::new();
+    // Needs are parsed once per file; loads retry until a full round
+    // loads nothing new.
+    let mut parsed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut loaded: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut failed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut to_parse = vec![module_path.to_path_buf()];
+    loop {
+        while let Some(next) = to_parse.pop() {
+            if !parsed.insert(next.clone()) {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(&next) else {
+                continue;
+            };
+            let Ok(needed) = p11scope_manifest::elf::needed_libraries(&file) else {
+                continue;
+            };
+            for name in needed {
+                if !is_bare_library_name(&name) {
+                    continue;
+                }
+                let candidate = dir.join(&name);
+                if candidate == *module_path || loaded.contains(&candidate) {
+                    continue;
+                }
+                if !sibling_is_usable(dir_canonical.as_deref(), &candidate) {
+                    continue;
+                }
+                failed.insert(candidate.clone());
+                to_parse.push(candidate);
+            }
+        }
+        // Retry every failure: a sibling unloadable for a missing
+        // same-directory dependency may load now that its dependency did.
+        // Each round that continues loads at least one new sibling, and
+        // loads are capped below, so this terminates.
+        let mut progress = false;
+        let retry: Vec<PathBuf> = failed.iter().cloned().collect();
+        failed.clear();
+        for candidate in retry {
+            if preloads.len() >= MAX_SIBLING_PRELOADS {
+                return Err(format!(
+                    "provider directory holds more than {MAX_SIBLING_PRELOADS} needed siblings"
+                ));
+            }
+            match unsafe { Library::new(&candidate) } {
+                Ok(sibling) => {
+                    preloads.push(sibling);
+                    loaded.insert(candidate);
+                    progress = true;
+                }
+                Err(_) => {
+                    failed.insert(candidate);
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    Ok(preloads)
+}
+
+/// `dlopen` the provider, resolving its own-directory siblings on failure.
+/// The first attempt is exactly today's load: when every dependency
+/// resolves through the normal search, nothing else runs and no behavior
+/// changes. Only when that fails, the sibling fallback preloads validated
+/// same-directory dependencies (see `preload_sibling_dependencies`) and
+/// retries once. With no usable sibling the original loader diagnosis is
+/// returned unchanged; after a retry the retry's diagnosis names what is
+/// still missing. Returned sibling handles must stay alive while `lib` is
+/// used.
+fn dlopen_with_sibling_fallback(module_path: &Path) -> Result<(Library, Vec<Library>), String> {
+    match unsafe { Library::new(module_path) } {
+        Ok(lib) => Ok((lib, Vec::new())),
+        Err(first) => {
+            let first = format!("cannot dlopen {}: {first}", module_path.display());
+            let preloads = match preload_sibling_dependencies(module_path) {
+                Ok(preloads) if !preloads.is_empty() => preloads,
+                _ => return Err(first),
+            };
+            match unsafe { Library::new(module_path) } {
+                Ok(lib) => Ok((lib, preloads)),
+                Err(retry) => Err(format!("cannot dlopen {}: {retry}", module_path.display())),
+            }
+        }
+    }
+}
+
 /// Discover with a retained descriptor for the helper's post-exec address
 /// space. The helper hardens itself before releasing the provider-load barrier.
 pub fn discover_with_self_memory(
@@ -56,8 +204,9 @@ pub fn discover_with_self_memory(
     let before_keys: BTreeSet<ObjectKey> =
         before_index.entries().iter().map(ObjectKey::of).collect();
 
-    let lib = unsafe { Library::new(module_path) }
-        .map_err(|e| format!("cannot dlopen {}: {e}", module_path.display()))?;
+    // Sibling handles stay alive for the whole discovery: dropping one
+    // would unload a library the provider is bound to.
+    let (lib, _sibling_preloads) = dlopen_with_sibling_fallback(module_path)?;
     let raw_exports = ExportAddresses {
         get_function_list: symbol_address(&lib, b"C_GetFunctionList\0"),
         get_interface_list: symbol_address(&lib, b"C_GetInterfaceList\0"),
@@ -148,7 +297,7 @@ pub fn discover_with_self_memory(
         module_path,
         module_file_key,
         &module_identity,
-        &objects,
+        &mut objects,
     );
     let selection_evidence = selection_records(selection_raw, &surfaces);
     let alias_groups = alias_groups(&surfaces);
@@ -166,7 +315,7 @@ pub fn discover_with_self_memory(
             module_path.display()
         ));
     }
-    let provenance_objects = provenance_objects(&final_map_index)?;
+    let provenance_objects = provenance_objects(&final_map_index, &objects)?;
 
     Ok(Manifest {
         schema: SCHEMA.to_string(),
@@ -213,93 +362,148 @@ fn validated_map_index(entries: &[maps::MapEntry]) -> Result<maps::MapIndex<'_>,
     maps::MapIndex::new(entries).map_err(|error| format!("invalid /proc maps snapshot: {error}"))
 }
 
-fn provenance_objects(index: &maps::MapIndex<'_>) -> Result<Vec<ProvenanceObject>, String> {
+/// Provider and resolved-target provenance is required. Other executable
+/// mappings are useful context, retained best effort within the same bounds.
+fn provenance_objects(
+    index: &maps::MapIndex<'_>,
+    objects: &ObjectTable,
+) -> Result<Vec<ProvenanceObject>, String> {
+    const MAX_OPTIONAL_DIAGNOSTICS: u64 = 8;
+    const MAX_DIAGNOSTIC_CHARS: usize = 256;
+    let mut required = BTreeMap::new();
+    for (key, id) in &objects.ids {
+        let record = objects
+            .records
+            .get(*id as usize)
+            .filter(|record| record.id == *id)
+            .ok_or_else(|| "resolved object has no identity record".to_string())?;
+        required.insert(*key, &record.identity);
+    }
     let mut by_key: BTreeMap<ObjectKey, ProvenanceObject> = BTreeMap::new();
     let mut opened_paths = BTreeMap::new();
     let mut total_bytes = 0u64;
+    let mut omitted = 0u64;
 
-    for mapping in index
-        .entries()
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-    {
-        let raw_path = mapping
-            .raw_path
-            .as_deref()
-            .ok_or_else(|| "file-backed executable mapping has no pathname".to_string())?;
-        let path = match index.resolve(mapping.start) {
-            maps::Resolved::File {
-                path: MappedPath::Usable(path),
-                ..
-            } => path,
-            maps::Resolved::File {
-                path: MappedPath::Unusable { reason },
-                ..
-            } => {
-                return Err(format!(
-                    "executable mapping {} is unusable: {reason}",
-                    identity::hex(raw_path)
-                ));
+    // Optional runtime mappings cannot consume the object/byte budget before
+    // the provider and every individually resolved target have been checked.
+    for required_pass in [true, false] {
+        for mapping in index.entries().iter().filter(|mapping| {
+            mapping.permissions[2] == b'x'
+                && mapping.inode != 0
+                && required.contains_key(&ObjectKey::of(mapping)) == required_pass
+        }) {
+            let result = (|| -> Result<(), String> {
+                let raw_path = mapping
+                    .raw_path
+                    .as_deref()
+                    .ok_or_else(|| "file-backed executable mapping has no pathname".to_string())?;
+                let path = match index.resolve(mapping.start) {
+                    maps::Resolved::File {
+                        path: MappedPath::Usable(path),
+                        ..
+                    } => path,
+                    maps::Resolved::File {
+                        path: MappedPath::Unusable { reason },
+                        ..
+                    } => {
+                        return Err(format!(
+                            "executable mapping {} is unusable: {reason}",
+                            identity::hex(raw_path)
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "file-backed executable mapping {} has no usable absolute path",
+                            identity::hex(raw_path)
+                        ));
+                    }
+                };
+                let key = ObjectKey::of(mapping);
+                if let Some(previous) = opened_paths.insert(path.clone(), key) {
+                    if previous != key {
+                        return Err(format!(
+                            "executable mapping path {} changed device/inode within one pass",
+                            path.display()
+                        ));
+                    }
+                    return Ok(());
+                }
+                if !by_key.contains_key(&key) && by_key.len() >= MAX_OBJECTS {
+                    return Err(format!(
+                        "executable provenance object cap {MAX_OBJECTS} reached"
+                    ));
+                }
+                let file = identity::open_object(&path).map_err(|error| {
+                    format!("cannot open executable mapping {}: {error}", path.display())
+                })?;
+                let len = file
+                    .metadata()
+                    .map_err(|error| format!("metadata for {} failed: {error}", path.display()))?
+                    .len();
+                let next_bytes = total_bytes
+                    .checked_add(len)
+                    .ok_or_else(|| "executable provenance size overflowed u64".to_string())?;
+                if next_bytes > MAX_TOTAL_OBJECT_BYTES {
+                    return Err(format!(
+                        "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                    ));
+                }
+                // Charge before hashing, including unsuccessful inspections
+                // and different pathname aliases, so best effort stays bounded.
+                total_bytes = next_bytes;
+                let object_identity = validated_file_identity(&path, &file, key)?;
+                if required
+                    .get(&key)
+                    .is_some_and(|expected| **expected != object_identity)
+                {
+                    return Err(format!(
+                        "required executable provenance identity changed for {}",
+                        path.display()
+                    ));
+                }
+                if let Some(previous) = by_key.get(&key) {
+                    if previous.identity != object_identity {
+                        return Err(format!(
+                            "executable mapping aliases for {key:?} disagree on whole-file identity"
+                        ));
+                    }
+                    return Ok(());
+                }
+                by_key.insert(
+                    key,
+                    ProvenanceObject {
+                        path: path.display().to_string(),
+                        device_major: key.device.major,
+                        device_minor: key.device.minor,
+                        inode: key.inode,
+                        identity: object_identity,
+                    },
+                );
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if required_pass {
+                    return Err(error);
+                }
+                omitted = omitted.saturating_add(1);
+                if omitted <= MAX_OPTIONAL_DIAGNOSTICS {
+                    let detail: String = error.chars().take(MAX_DIAGNOSTIC_CHARS).collect();
+                    eprintln!(
+                        "p11scope-discover: optional executable provenance omitted: {detail}"
+                    );
+                }
             }
-            _ => {
-                return Err(format!(
-                    "file-backed executable mapping {} has no usable absolute path",
-                    identity::hex(raw_path)
-                ));
-            }
-        };
-        let key = ObjectKey::of(mapping);
-        if let Some(previous) = opened_paths.insert(path.clone(), key) {
-            if previous != key {
-                return Err(format!(
-                    "executable mapping path {} changed device/inode within one pass",
-                    path.display()
-                ));
-            }
-            continue;
         }
-
-        let file = identity::open_object(&path).map_err(|error| {
-            format!("cannot open executable mapping {}: {error}", path.display())
-        })?;
-        let object_identity = validated_file_identity(&path, &file, key)?;
-        if let Some(previous) = by_key.get(&key) {
-            if previous.identity != object_identity {
-                return Err(format!(
-                    "executable mapping aliases for {key:?} disagree on whole-file identity"
-                ));
-            }
-            continue;
+        if required_pass && required.keys().any(|key| !by_key.contains_key(key)) {
+            return Err("required executable provenance has no validated mapping".into());
         }
-        if by_key.len() >= MAX_OBJECTS {
-            return Err(format!(
-                "executable provenance object cap {MAX_OBJECTS} reached"
-            ));
-        }
-        let len = file
-            .metadata()
-            .map_err(|error| format!("metadata for {} failed: {error}", path.display()))?
-            .len();
-        total_bytes = total_bytes
-            .checked_add(len)
-            .ok_or_else(|| "executable provenance size overflowed u64".to_string())?;
-        if total_bytes > MAX_TOTAL_OBJECT_BYTES {
-            return Err(format!(
-                "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-            ));
-        }
-        by_key.insert(
-            key,
-            ProvenanceObject {
-                path: path.display().to_string(),
-                device_major: key.device.major,
-                device_minor: key.device.minor,
-                inode: key.inode,
-                identity: object_identity,
-            },
+    }
+    if omitted > MAX_OPTIONAL_DIAGNOSTICS {
+        eprintln!(
+            "p11scope-discover: optional executable provenance: {} further omissions",
+            omitted - MAX_OPTIONAL_DIAGNOSTICS
         );
     }
-
     if by_key.is_empty() {
         return Err("discovery found no file-backed executable mappings".into());
     }
@@ -353,9 +557,13 @@ fn loaded_module_key_with_probe(
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
 ) -> Result<ObjectKey, String> {
-    for address in [exports.get_function_list, exports.get_interface_list]
-        .into_iter()
-        .flatten()
+    for address in [
+        exports.get_function_list,
+        exports.get_interface_list,
+        exports.get_interface,
+    ]
+    .into_iter()
+    .flatten()
     {
         if let maps::Resolved::File {
             path,
@@ -592,41 +800,93 @@ fn snapshot_table(memory: &ProcessMemory, base: usize, set: TableSet) -> TableSn
         }
     };
     let width = std::mem::size_of::<usize>();
-    let Some(len) = spans
-        .iter()
-        .flat_map(|span| span.fields())
-        .filter_map(|field| field.offset.checked_add(width))
-        .max()
-    else {
-        return TableSnapshot {
-            walk: WalkOutcome::Unreadable {
-                detail: "selected table has no fields".into(),
-            },
-            values: vec![],
-        };
-    };
-    let bytes = match memory.read_exact(base, len) {
-        Ok(bytes) => bytes,
-        Err(detail) => {
-            return TableSnapshot {
-                walk: WalkOutcome::Unreadable { detail },
-                values: vec![],
-            };
-        }
-    };
     let mut values = Vec::new();
-    for span in spans {
-        match read_fn_pointers(&bytes, span.fields()) {
-            Ok(mut span_values) => values.append(&mut span_values),
+    for field in spans.iter().flat_map(|span| span.fields()) {
+        // A failed word ends the contiguous inventory. Earlier complete words,
+        // including observed NULLs and unusable targets, retain their ordinals.
+        let bytes = base
+            .checked_add(field.offset)
+            .ok_or_else(|| "provider pointer arithmetic overflow".to_string())
+            .and_then(|address| memory.read_exact(address, width));
+        match bytes {
+            Ok(bytes) => {
+                let mut raw = [0u8; std::mem::size_of::<usize>()];
+                raw.copy_from_slice(&bytes);
+                values.push((field.name, usize::from_ne_bytes(raw)));
+            }
             Err(detail) => {
                 return TableSnapshot {
-                    walk: WalkOutcome::Unreadable { detail },
-                    values: vec![],
+                    walk: WalkOutcome::Unreadable {
+                        detail: format!(
+                            "{} after {} complete function words: {detail}",
+                            field.name,
+                            values.len()
+                        ),
+                    },
+                    values,
                 };
             }
         }
     }
     TableSnapshot { walk, values }
+}
+
+fn inventory_tables(source: Surface) -> TableSet {
+    // The typed getter supplies all 68 bounded legacy positions independently
+    // of its label. An unrecognized interface label retains this common ABI.
+    let TableSet::Walk(spans) = tables_for(Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        },
+    }) else {
+        unreachable!("the legacy ABI has a bounded field catalogue");
+    };
+    match (source, tables_for(source)) {
+        (Surface::LegacyFunctionList { .. }, TableSet::Walk(_)) => TableSet::Walk(spans),
+        (Surface::LegacyFunctionList { .. }, _) | (_, TableSet::Refuse) => {
+            TableSet::WalkKnownPrefix(spans)
+        }
+        (_, selected) => selected,
+    }
+}
+
+fn inventory_snapshot(
+    memory: &ProcessMemory,
+    base: usize,
+    source: Result<Surface, &str>,
+) -> TableSnapshot {
+    match source {
+        Ok(source) => snapshot_table(memory, base, inventory_tables(source)),
+        Err(header_error) => {
+            // An unavailable header gives no extension evidence, but does not
+            // prevent bounded reads of the independently acquired common ABI.
+            let mut snapshot = snapshot_table(
+                memory,
+                base,
+                inventory_tables(Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }),
+            );
+            let detail = match &snapshot.walk {
+                WalkOutcome::Unreadable { detail } => {
+                    format!("version header unreadable: {header_error}; functions: {detail}")
+                }
+                _ => format!("version header unreadable: {header_error}"),
+            };
+            snapshot.walk = WalkOutcome::Unreadable { detail };
+            snapshot
+        }
+    }
+}
+
+fn selection_inventory_usable(source: Surface, walk: &WalkOutcome) -> bool {
+    // Common-prefix recovery does not widen the fixed selection contract.
+    !matches!(tables_for(source), TableSet::Refuse)
+        && matches!(walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
 }
 
 fn legacy_surface(
@@ -682,40 +942,36 @@ fn legacy_surface(
             );
         }
     };
-    let version = match read_version(memory, base) {
-        Ok(version) => version,
-        Err(detail) => {
-            return (
-                SurfaceRecord {
-                    source,
-                    acquisition: Acquisition::Ok,
-                    version: None,
-                    walk: WalkOutcome::Unreadable { detail },
-                    functions: vec![],
-                },
-                None,
-                None,
-            );
-        }
-    };
-    let snapshot = snapshot_table(
+    let version = read_version(memory, base);
+    let snapshot = inventory_snapshot(
         memory,
         base,
-        tables_for(Surface::LegacyFunctionList { version }),
+        version
+            .as_ref()
+            .map(|version| Surface::LegacyFunctionList { version: *version })
+            .map_err(String::as_str),
     );
-    let legacy_240 = (version.major == 2
-        && version.minor == 40
+    let legacy_240 = (version
+        .as_ref()
+        .is_ok_and(|version| version.major == 2 && version.minor == 40)
         && matches!(&snapshot.walk, WalkOutcome::Full)
         && snapshot.values.len() == 68)
         .then(|| snapshot.values.iter().map(|(_, value)| *value).collect());
-    let inventory_pointer =
-        matches!(snapshot.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix).then_some(base);
+    let inventory_pointer = version
+        .as_ref()
+        .is_ok_and(|version| {
+            selection_inventory_usable(
+                Surface::LegacyFunctionList { version: *version },
+                &snapshot.walk,
+            )
+        })
+        .then_some(base);
     let functions = resolve_values(snapshot.values, maps, objects);
     (
         SurfaceRecord {
             source,
             acquisition: Acquisition::Ok,
-            version: Some(manifest_version(version)),
+            version: version.ok().map(manifest_version),
             walk: snapshot.walk,
             functions,
         },
@@ -778,7 +1034,19 @@ fn interface_records(
                 objects,
             );
             table_ptrs.push(
-                matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+                surface
+                    .version
+                    .is_some_and(|version| {
+                        selection_inventory_usable(
+                            Surface::StandardInterface {
+                                version: cryptoki_sys::CK_VERSION {
+                                    major: version.major,
+                                    minor: version.minor,
+                                },
+                            },
+                            &surface.walk,
+                        )
+                    })
                     .then_some(entry.func_list as usize),
             );
             surfaces.push(surface);
@@ -789,7 +1057,7 @@ fn interface_records(
             let snapshot = snapshot_table(
                 memory,
                 entry.func_list as usize,
-                tables_for(Surface::StandardInterface {
+                inventory_tables(Surface::StandardInterface {
                     version: version_value,
                 }),
             );
@@ -798,7 +1066,7 @@ fn interface_records(
                     index,
                     &entry,
                     name,
-                    version_value,
+                    Some(version_value),
                     InterfaceClassification::CorroboratedStandardPrefix,
                     snapshot,
                     true,
@@ -806,8 +1074,13 @@ fn interface_records(
                     objects,
                 );
                 table_ptrs.push(
-                    matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
-                        .then_some(entry.func_list as usize),
+                    selection_inventory_usable(
+                        Surface::StandardInterface {
+                            version: version_value,
+                        },
+                        &surface.walk,
+                    )
+                    .then_some(entry.func_list as usize),
                 );
                 surfaces.push(surface);
                 continue;
@@ -839,9 +1112,10 @@ fn native_ulong_u64(value: cryptoki_sys::CK_ULONG) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TableOrigin {
-    object: ObjectKey,
-    file_offset: u64,
+enum TableOrigin {
+    File { object: ObjectKey, file_offset: u64 },
+    // Used only within this helper invocation; never serialized.
+    ProcessLocal(usize),
 }
 
 struct RawSelectionResult {
@@ -930,14 +1204,60 @@ fn selection_inventory_indices(inventory_tables: &[Option<usize>], pointer: usiz
         .collect()
 }
 
-fn selection_table_incomplete(
-    version: SelectionVersionClass,
-    snapshot: Option<&TableSnapshot>,
-) -> bool {
-    matches!(
-        version,
-        SelectionVersionClass::V3_0 | SelectionVersionClass::V3_1 | SelectionVersionClass::V3_2
-    ) && !snapshot.is_some_and(|snapshot| matches!(snapshot.walk, WalkOutcome::Full))
+fn selection_table_incomplete(table: &SelectionTable, metadata_uncertain: bool) -> bool {
+    let expected = match inventory_tables(Surface::StandardInterface {
+        version: cryptoki_sys::CK_VERSION {
+            major: table.version.major,
+            minor: table.version.minor,
+        },
+    }) {
+        TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => {
+            spans.iter().map(|span| span.fields().len()).sum()
+        }
+        TableSet::Refuse => unreachable!("inventory always retains the common ABI"),
+    };
+    table.functions.len() != expected
+        || (matches!(table.walk, WalkOutcome::Unreadable { .. }) && !metadata_uncertain)
+        || table.functions.iter().any(|function| {
+            !matches!(
+                function.resolution,
+                Resolution::Resolved { .. } | Resolution::NullPointer
+            )
+        })
+}
+
+fn confirm_selection_snapshot(
+    memory: &ProcessMemory,
+    pointer: usize,
+    snapshot: &TableSnapshot,
+    version: Option<(u8, u8)>,
+) -> Result<Option<String>, SelectionFailure> {
+    let width = std::mem::size_of::<usize>();
+    let start = pointer
+        .checked_add(pkcs11_module::FUNCTION_LIST_FIELDS[0].offset)
+        .ok_or(SelectionFailure::ProviderChanged)?;
+    let bytes = snapshot
+        .values
+        .len()
+        .checked_mul(width)
+        .and_then(|length| memory.read_exact(start, length).ok())
+        .ok_or(SelectionFailure::ProviderChanged)?;
+    if !bytes
+        .chunks_exact(width)
+        .zip(&snapshot.values)
+        .all(|(word, (_, expected))| usize::from_ne_bytes(word.try_into().unwrap()) == *expected)
+    {
+        return Err(SelectionFailure::ProviderChanged);
+    }
+    let confirmed_version = read_version(memory, pointer)
+        .ok()
+        .map(|version| (version.major, version.minor));
+    Ok((confirmed_version != version).then(|| {
+        format!(
+            "version metadata changed: {} complete function words retained",
+            snapshot.values.len()
+        )
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -950,7 +1270,7 @@ fn selection_acquisition(
     module_path: &Path,
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
-    objects: &ObjectTable,
+    objects: &mut ObjectTable,
 ) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
     if raw_export.is_none() {
         return (SelectionAcquisition::ExportAbsent, Vec::new());
@@ -997,6 +1317,7 @@ fn selection_acquisition(
                 (None, Some(SelectionFailure::NullOutput))
             } else {
                 let mut captured = None;
+                let mut candidate_objects = objects.clone();
                 let bracket = selection_bracket(
                     || stable_selection_maps(module_path, module_file_key, module_identity),
                     |maps_a| {
@@ -1008,65 +1329,92 @@ fn selection_acquisition(
                         let name = read_name(memory, name_pointer);
                         let version_read = read_version(memory, table_pointer);
                         let name_class = selection_name_class(&name, name_pointer);
-                        let version_class = selection_version_class(&version_read, table_pointer);
-                        let table_snapshot = match version_class {
-                            SelectionVersionClass::V3_0
-                            | SelectionVersionClass::V3_1
-                            | SelectionVersionClass::V3_2 => Some(snapshot_table(
-                                memory,
-                                table_pointer,
-                                tables_for(Surface::StandardInterface {
-                                    version: cryptoki_sys::CK_VERSION {
-                                        major: 3,
-                                        minor: match version_class {
-                                            SelectionVersionClass::V3_0 => 0,
-                                            SelectionVersionClass::V3_1 => 1,
-                                            SelectionVersionClass::V3_2 => 2,
-                                            _ => unreachable!(),
-                                        },
-                                    },
-                                }),
-                            )),
-                            _ => None,
-                        };
-                        let mut helper_failure = if name_pointer == 0 || name.error.is_some() {
-                            Some(SelectionFailure::UnreadableName)
-                        } else if table_pointer == 0 {
+                        let mut version_class =
+                            selection_version_class(&version_read, table_pointer);
+                        let source = version_read
+                            .as_ref()
+                            .map(|version| Surface::StandardInterface { version: *version })
+                            .map_err(String::as_str);
+                        let table_snapshot = (table_pointer != 0)
+                            .then(|| inventory_snapshot(memory, table_pointer, source));
+                        let mut helper_failure = if table_pointer == 0 {
                             Some(SelectionFailure::UnreadableTable)
                         } else if version_read.is_err() {
                             Some(SelectionFailure::UnreadableVersion)
-                        } else if selection_table_incomplete(version_class, table_snapshot.as_ref())
-                        {
+                        } else if name_pointer == 0 || name.error.is_some() {
+                            Some(SelectionFailure::UnreadableName)
+                        } else if table_snapshot.as_ref().is_some_and(|snapshot| {
+                            matches!(snapshot.walk, WalkOutcome::Unreadable { .. })
+                        }) {
                             Some(SelectionFailure::UnreadableTable)
                         } else {
                             None
                         };
                         let mut selection_table = None;
-                        if helper_failure.is_none()
-                            && request.name == SelectionNameClass::ExactStandard
-                            && inventory_matches.is_empty()
-                            && name_class == SelectionNameClass::ExactStandard
-                            && matches!(
-                                version_class,
-                                SelectionVersionClass::V3_0
-                                    | SelectionVersionClass::V3_1
-                                    | SelectionVersionClass::V3_2
-                            )
-                            && matches!(returned_flags, 0 | 1)
+                        if inventory_matches.is_empty()
+                            && let Some(snapshot) = &table_snapshot
                         {
-                            match selection_table_for(
+                            let (table, origin) = selection_table_for(
                                 table_pointer,
-                                version_class,
-                                table_snapshot.as_ref(),
+                                version_read
+                                    .as_ref()
+                                    .ok()
+                                    .map_or(Version { major: 0, minor: 0 }, |version| {
+                                        manifest_version(*version)
+                                    }),
+                                snapshot,
                                 maps_a,
-                                objects,
-                            ) {
-                                Ok((table, origin)) => {
-                                    selection_table = Some((table, origin));
-                                }
-                                Err(failure) => {
-                                    helper_failure = Some(failure);
-                                }
+                                &mut candidate_objects,
+                            );
+                            if helper_failure.is_none()
+                                && selection_table_incomplete(&table, version_read.is_err())
+                            {
+                                helper_failure = Some(SelectionFailure::UnresolvedFunction);
+                            }
+                            selection_table = Some((table, origin));
+                        }
+                        // Compare every captured word, including invalid targets,
+                        // and metadata again before accepting a heap or file view.
+                        let confirmed_interface = read_interface(memory, output as usize)
+                            .map_err(|_| SelectionFailure::ProviderChanged)?;
+                        let confirmed_name = read_name(memory, name_pointer);
+                        if confirmed_interface != (name_pointer, table_pointer, returned_flags)
+                            || confirmed_name.raw != name.raw
+                            || confirmed_name.error != name.error
+                        {
+                            return Err(SelectionFailure::ProviderChanged);
+                        }
+                        if let Some(snapshot) = &table_snapshot
+                            && let Some(diagnostic) = confirm_selection_snapshot(
+                                memory,
+                                table_pointer,
+                                snapshot,
+                                version_read
+                                    .as_ref()
+                                    .ok()
+                                    .map(|version| (version.major, version.minor)),
+                            )?
+                        {
+                            helper_failure = Some(SelectionFailure::UnreadableVersion);
+                            if let Some((table, _)) = &mut selection_table {
+                                table.walk = WalkOutcome::Unreadable {
+                                    detail: match &snapshot.walk {
+                                        WalkOutcome::Unreadable { .. } if version_read.is_err() => {
+                                            format!(
+                                                "version header unreadable: metadata unavailable; {diagnostic}"
+                                            )
+                                        }
+                                        WalkOutcome::Unreadable { .. } => {
+                                            format!("{diagnostic}; function tail unavailable")
+                                        }
+                                        _ => diagnostic,
+                                    },
+                                };
+                            } else {
+                                // Ordinary inventory retains its observed version;
+                                // the unstable query gets no agreement authority.
+                                version_class = SelectionVersionClass::Unreadable;
+                                eprintln!("warning: {diagnostic}");
                             }
                         }
                         captured = Some((
@@ -1084,9 +1432,12 @@ fn selection_acquisition(
                     || stable_selection_maps(module_path, module_file_key, module_identity),
                 );
                 match bracket {
-                    Ok(()) => captured
-                        .map(|(result, helper_failure)| (Some(result), helper_failure))
-                        .unwrap_or((None, Some(SelectionFailure::UnreadableInterface))),
+                    Ok(()) => {
+                        *objects = candidate_objects;
+                        captured
+                            .map(|(result, helper_failure)| (Some(result), helper_failure))
+                            .unwrap_or((None, Some(SelectionFailure::UnreadableInterface)))
+                    }
                     Err(SelectionFailure::ProviderChanged) => captured
                         .map(|(mut result, _)| {
                             result.table = None;
@@ -1212,93 +1563,52 @@ fn inventory_version_class(surface: &SurfaceRecord) -> SelectionVersionClass {
     }
 }
 
-fn selection_resolve_values(
-    values: Vec<(&'static str, usize)>,
-    maps: &maps::MapIndex<'_>,
-    objects: &ObjectTable,
-) -> Result<Vec<FunctionRecord>, SelectionFailure> {
-    values
-        .into_iter()
-        .map(|(name, value)| {
-            let resolution = if value == 0 {
-                Resolution::NullPointer
-            } else {
-                match maps.resolve(value as u64) {
-                    maps::Resolved::File {
-                        file_offset,
-                        device,
-                        inode,
-                        permissions,
-                        ..
-                    } if ObjectKey { device, inode } == objects.module_key
-                        && permissions[2] == b'x' =>
-                    {
-                        Resolution::Resolved {
-                            object: 0,
-                            file_offset,
-                        }
-                    }
-                    maps::Resolved::File { .. } => {
-                        return Err(SelectionFailure::UnresolvedFunction);
-                    }
-                    maps::Resolved::Anonymous | maps::Resolved::Unmapped => {
-                        return Err(SelectionFailure::UnresolvedFunction);
-                    }
-                }
-            };
-            Ok(FunctionRecord {
-                name: name.to_string(),
-                resolution,
-            })
-        })
-        .collect()
-}
-
 fn selection_table_for(
     pointer: usize,
-    version: SelectionVersionClass,
-    snapshot: Option<&TableSnapshot>,
+    version: Version,
+    snapshot: &TableSnapshot,
     maps: &maps::MapIndex<'_>,
-    objects: &ObjectTable,
-) -> Result<(SelectionTable, TableOrigin), SelectionFailure> {
-    let version = match version {
-        SelectionVersionClass::V3_0 => Version { major: 3, minor: 0 },
-        SelectionVersionClass::V3_1 => Version { major: 3, minor: 1 },
-        SelectionVersionClass::V3_2 => Version { major: 3, minor: 2 },
-        _ => return Err(SelectionFailure::UnreadableTable),
-    };
-    let maps::Resolved::File {
-        device,
-        inode,
-        file_offset,
-        ..
-    } = maps.resolve(pointer as u64)
-    else {
-        return Err(SelectionFailure::OutsideProvider);
-    };
-    if (ObjectKey { device, inode }) != objects.module_key {
-        return Err(SelectionFailure::OutsideProvider);
-    }
-    let Some(snapshot) = snapshot else {
-        return Err(SelectionFailure::UnreadableTable);
-    };
-    if !matches!(snapshot.walk, WalkOutcome::Full) {
-        return Err(SelectionFailure::UnreadableTable);
-    }
-    let functions = selection_resolve_values(snapshot.values.clone(), maps, objects)?;
-    Ok((
-        SelectionTable {
-            id: 0,
-            version,
-            walk: WalkOutcome::Full,
-            functions,
-            semantic_authorized: false,
-        },
-        TableOrigin {
+    objects: &mut ObjectTable,
+) -> (SelectionTable, TableOrigin) {
+    let origin = match maps.resolve(pointer as u64) {
+        maps::Resolved::File {
+            device,
+            inode,
+            file_offset,
+            ..
+        } => TableOrigin::File {
             object: ObjectKey { device, inode },
             file_offset,
         },
-    ))
+        maps::Resolved::Anonymous | maps::Resolved::Unmapped => TableOrigin::ProcessLocal(pointer),
+    };
+    let functions = resolve_values(snapshot.values.clone(), maps, objects);
+    (
+        SelectionTable {
+            id: 0,
+            version,
+            walk: match &snapshot.walk {
+                WalkOutcome::Unreadable { detail } => WalkOutcome::Unreadable {
+                    detail: if detail.starts_with("version header unreadable:") {
+                        format!(
+                            "version header unreadable: metadata unavailable; {} complete function words",
+                            snapshot.values.len()
+                        )
+                    } else {
+                        format!(
+                            "function word {} unreadable after {} complete function words",
+                            snapshot.values.len(),
+                            snapshot.values.len()
+                        )
+                    },
+                },
+                walk => walk.clone(),
+            },
+            functions,
+            semantic_authorized: false,
+        },
+        origin,
+    )
 }
 
 fn stable_selection_maps(
@@ -1364,8 +1674,8 @@ fn selection_records(
         };
     }
     let mut tables = Vec::<SelectionTable>::new();
-    let mut pair_tables = BTreeMap::<(SelectionVersionClass, u64), (TableOrigin, u8)>::new();
-    let mut table_pointers = BTreeMap::<(TableOrigin, SelectionVersionClass), u8>::new();
+    let mut pair_tables = BTreeMap::<(SelectionVersionClass, u64), u8>::new();
+    let mut table_observations = Vec::<(TableOrigin, SelectionTable)>::new();
     let mut selection_truncated = false;
     let mut queries = Vec::with_capacity(raw_queries.len());
     for raw in raw_queries {
@@ -1436,42 +1746,36 @@ fn selection_records(
         }
         let mut selection_table = None;
         let mut authority = SelectionAuthority::None;
-        if raw.helper_failure.is_none()
-            && raw.request.name == SelectionNameClass::ExactStandard
-            && let Some((mut table, origin)) = raw_result.table
+        if let Some((mut table, origin)) = raw_result.table
             && matches.is_empty()
-            && result.name == SelectionNameClass::ExactStandard
-            && matches!(
-                result.version,
-                SelectionVersionClass::V3_0
-                    | SelectionVersionClass::V3_1
-                    | SelectionVersionClass::V3_2
-            )
-            && matches!(result.flags, 0 | 1)
         {
-            let key = (origin, result.version);
+            selection_truncated |= selection_table_incomplete(
+                &table,
+                raw.helper_failure == Some(SelectionFailure::UnreadableVersion),
+            );
             let pair = (result.version, result.flags);
-            if let Some((known_origin, table_id)) = pair_tables.get(&pair).copied() {
-                if known_origin != origin {
-                    selection_truncated = true;
-                } else {
-                    selection_table = Some(table_id);
-                    authority = SelectionAuthority::SelectionCountOnly;
-                }
+            let table_id = if let Some((_, known)) =
+                table_observations.iter().find(|(known_origin, known)| {
+                    *known_origin == origin
+                        && known.version == table.version
+                        && known.walk == table.walk
+                        && known.functions == table.functions
+                }) {
+                known.id
             } else {
-                let table_id = if let Some(table_id) = table_pointers.get(&key).copied() {
-                    table_id
-                } else {
-                    let table_id = tables.len() as u8;
-                    table.id = table_id;
-                    tables.push(table);
-                    table_pointers.insert(key, table_id);
-                    table_id
-                };
-                pair_tables.insert(pair, (origin, table_id));
-                selection_table = Some(table_id);
-                authority = SelectionAuthority::SelectionCountOnly;
+                let table_id = tables.len() as u8;
+                table.id = table_id;
+                table_observations.push((origin, table.clone()));
+                tables.push(table);
+                table_id
+            };
+            if let Some(known_id) = pair_tables.insert(pair, table_id)
+                && known_id != table_id
+            {
+                selection_truncated = true;
             }
+            selection_table = Some(table_id);
+            authority = SelectionAuthority::SelectionCountOnly;
         }
         if !matches.is_empty() && raw.helper_failure.is_none() && selection_result_readable(&result)
         {
@@ -1508,31 +1812,28 @@ fn interface_surface(
     maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> SurfaceRecord {
-    let Ok(version) = version else {
+    if entry.func_list.is_null() {
         return SurfaceRecord {
             source: interface_source(index, native_ulong_u64(entry.flags), name, classification),
             acquisition: Acquisition::Ok,
             version: None,
-            walk: if entry.func_list.is_null() {
-                WalkOutcome::NotWalked
-            } else {
-                WalkOutcome::Unreadable {
-                    detail: version.unwrap_err(),
-                }
-            },
+            walk: WalkOutcome::NotWalked,
             functions: vec![],
         };
-    };
-    let snapshot = snapshot_table(
+    }
+    let snapshot = inventory_snapshot(
         memory,
         entry.func_list as usize,
-        tables_for(Surface::StandardInterface { version }),
+        version
+            .as_ref()
+            .map(|version| Surface::StandardInterface { version: *version })
+            .map_err(String::as_str),
     );
     interface_surface_from_snapshot(
         index,
         entry,
         name,
-        version,
+        version.ok(),
         classification,
         snapshot,
         force_prefix,
@@ -1546,7 +1847,7 @@ fn interface_surface_from_snapshot(
     index: usize,
     entry: &RawInterface,
     name: NameRead,
-    version: cryptoki_sys::CK_VERSION,
+    version: Option<cryptoki_sys::CK_VERSION>,
     classification: InterfaceClassification,
     snapshot: TableSnapshot,
     force_prefix: bool,
@@ -1561,7 +1862,7 @@ fn interface_surface_from_snapshot(
     SurfaceRecord {
         source: interface_source(index, native_ulong_u64(entry.flags), name, classification),
         acquisition: Acquisition::Ok,
-        version: Some(manifest_version(version)),
+        version: version.map(manifest_version),
         walk,
         functions: resolve_values(snapshot.values, maps, objects),
     }
@@ -1678,6 +1979,7 @@ fn resolve_values(
         .collect()
 }
 
+#[derive(Clone)]
 struct ObjectTable {
     module_key: ObjectKey,
     approved: BTreeSet<ObjectKey>,
@@ -1899,7 +2201,7 @@ mod tests {
 
     #[test]
     fn mapped_path_identity_requires_device_and_inode() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let key = identity_and_key(&exe).unwrap().0;
         assert!(validated_identity(&exe, key).unwrap().reusable);
 
@@ -1917,9 +2219,7 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode: 7,
         };
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let provider = maps::MapEntry {
             start: 0x1000,
             end: 0x2000,
@@ -1929,7 +2229,7 @@ mod tests {
             inode: module_key.inode,
             raw_path: Some(b"/definitely-not-reachable/provider.so".to_vec()),
         };
-        let module_file = identity::open_object(&std::env::current_exe().unwrap()).unwrap();
+        let module_file = identity::open_object(&small_owned_elf()).unwrap();
         let valid = vec![provider];
         let load = |exports, entries: &[maps::MapEntry]| {
             let index = validated_map_index(entries)?;
@@ -2101,6 +2401,61 @@ mod tests {
         }
     }
 
+    /// A small owned ELF for tests that need a real pinnable object.
+    /// The test binary itself pins only while thin, and pinning it trips
+    /// the coverage self-pin guard, so these tests pin this instead: a
+    /// gcc-built shared object that is never instrumented, built once per
+    /// process and shared, and asserted far below the object limit so it
+    /// stays pinnable under any test profile. Uses the process temp dir
+    /// so the repo's `TMPDIR` lane override applies.
+    fn small_owned_elf() -> PathBuf {
+        static ELF: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ELF.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("p11scope-discover-owned-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("small-owned-elf.c");
+            let path = dir.join("small-owned-elf.so");
+            std::fs::write(
+                &source,
+                "const char p11scope_discover_small_owned_marker[] = \"SMALL-OWNED-0001\";\n\
+                 int p11scope_discover_small_owned_entry(void) { return 0; }\n",
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-shared", "-fPIC", "-o"])
+                    .arg(&path)
+                    .arg(&source)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "the small owned fixture must compile"
+            );
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert!(
+                len < identity::MAX_OBJECT_BYTES,
+                "the small owned fixture must stay pinnable: {len} bytes"
+            );
+            path
+        })
+        .clone()
+    }
+
+    #[test]
+    fn small_owned_elf_stays_pinnable_under_the_object_limit() {
+        let path = small_owned_elf();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len < identity::MAX_OBJECT_BYTES,
+            "the fixture must stay pinnable under any profile: {len} bytes"
+        );
+        assert_eq!(path, small_owned_elf());
+        let file = identity::open_object(&path).unwrap();
+        let inspected = identity::inspect_file(&file).unwrap();
+        assert!(inspected.identity.reusable);
+    }
+
     /// A real non-empty file for probe fixtures. Uses the process temp dir
     /// so the repo's `TMPDIR` lane override applies.
     fn probe_tempfile(name: &str) -> (PathBuf, File) {
@@ -2140,9 +2495,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_equal_keys_accept_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-equal");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_fd_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2166,9 +2519,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_match_accepts_the_maps_key() {
         let (_dir, module_file) = probe_tempfile("loaded-match");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
@@ -2191,9 +2542,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_mismatch_refuses_with_todays_message() {
         let (_dir, module_file) = probe_tempfile("loaded-mismatch");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(wrong_key()));
@@ -2216,9 +2565,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_non_overlay_mismatch_refuses_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-non-overlay");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(false, Some(split_maps_key()));
@@ -2243,9 +2590,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_error_refuses() {
         let (_dir, module_file) = probe_tempfile("loaded-error");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2267,7 +2612,7 @@ mod tests {
 
     #[test]
     fn validated_split_probe_equal_keys_accept_without_probing() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2283,7 +2628,7 @@ mod tests {
 
     #[test]
     fn validated_split_probe_overlay_match_accepts_a_split_maps_key() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let file = identity::open_object(&exe).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
         let mut budget = UnboundedProbeBudget;
@@ -2299,7 +2644,7 @@ mod tests {
 
     #[test]
     fn validated_split_probe_mismatch_keeps_todays_message() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let file = identity::open_object(&exe).unwrap();
         for probe in [
             FakeSelfMappingProbe::new(true, Some(wrong_key())),
@@ -2321,7 +2666,10 @@ mod tests {
 
     #[test]
     fn stable_maps_live_module_accepts_without_probing() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
+        // The module must be live-mapped in this process: dlopen the
+        // fixture instead of relying on the test binary's own mapping.
+        let _live = unsafe { Library::new(&exe) }.expect("dlopen the owned fixture");
         let (key, identity) = identity_and_key(&exe).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
         let mut budget = UnboundedProbeBudget;
@@ -2333,7 +2681,7 @@ mod tests {
 
     #[test]
     fn stable_maps_changed_key_refuses() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let (key, identity) = identity_and_key(&exe).unwrap();
         let wrong = ObjectKey {
             inode: key.inode.wrapping_add(1),
@@ -2354,7 +2702,7 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         let link = dir.join("provider.so");
-        let original = std::env::current_exe().unwrap();
+        let original = small_owned_elf();
         let replacement = Path::new("/bin/true");
         std::os::unix::fs::symlink(&original, &link).unwrap();
         let file = identity::open_object(&link).unwrap();
@@ -2493,7 +2841,7 @@ mod tests {
                 ..anonymous
             },
         ];
-        let objects = ObjectTable {
+        let mut objects = ObjectTable {
             module_key,
             approved: BTreeSet::new(),
             ids: BTreeMap::new(),
@@ -2502,37 +2850,43 @@ mod tests {
 
         let valid_table_absence = selection_bracket(
             || Ok(valid.clone()),
-            |index| {
-                selection_table_for(0x9000, SelectionVersionClass::V3_0, None, index, &objects)
-                    .map(|_| ())
-            },
+            |_| Err::<(), _>(SelectionFailure::UnreadableTable),
             || Ok(valid.clone()),
         );
-        assert_eq!(valid_table_absence, Err(SelectionFailure::OutsideProvider));
+        assert_eq!(valid_table_absence, Err(SelectionFailure::UnreadableTable));
 
         let invalid_b_table = selection_bracket(
             || Ok(valid.clone()),
-            |index| {
-                selection_table_for(0x9000, SelectionVersionClass::V3_0, None, index, &objects)
-                    .map(|_| ())
-            },
+            |_| Err::<(), _>(SelectionFailure::UnreadableTable),
             || Ok(invalid.clone()),
         );
         assert_eq!(invalid_b_table, Err(SelectionFailure::ProviderChanged));
 
         let valid_function_absence = selection_bracket(
             || Ok(valid.clone()),
-            |index| selection_resolve_values(vec![("C_Test", 0x9000)], index, &objects).map(|_| ()),
+            |index| {
+                Ok(resolve_values(
+                    vec![("C_Test", 0x9000)],
+                    index,
+                    &mut objects,
+                ))
+            },
             || Ok(valid.clone()),
         );
-        assert_eq!(
-            valid_function_absence,
-            Err(SelectionFailure::UnresolvedFunction)
-        );
+        assert!(matches!(
+            valid_function_absence.unwrap()[0].resolution,
+            Resolution::Unmapped
+        ));
 
         let invalid_b_function = selection_bracket(
             || Ok(valid.clone()),
-            |index| selection_resolve_values(vec![("C_Test", 0x9000)], index, &objects).map(|_| ()),
+            |index| {
+                Ok(resolve_values(
+                    vec![("C_Test", 0x9000)],
+                    index,
+                    &mut objects,
+                ))
+            },
             || Ok(invalid.clone()),
         );
         assert_eq!(invalid_b_function, Err(SelectionFailure::ProviderChanged));
@@ -2600,20 +2954,91 @@ mod tests {
 
     #[test]
     fn known_incomplete_selection_table_is_unreadable() {
-        let snapshot = TableSnapshot {
+        let table = SelectionTable {
+            id: 0,
+            version: Version { major: 3, minor: 0 },
             walk: WalkOutcome::Unreadable {
                 detail: "short table".into(),
             },
-            values: vec![],
+            functions: vec![],
+            semantic_authorized: false,
         };
-        assert!(selection_table_incomplete(
-            SelectionVersionClass::V3_0,
-            Some(&snapshot)
-        ));
+        assert!(selection_table_incomplete(&table, false));
     }
 
     #[test]
-    fn selector_zero_never_gets_selection_count_only_authority() {
+    fn selection_metadata_drift_preserves_real_words_but_changed_word_refuses() {
+        #[repr(C)]
+        struct Table {
+            version: cryptoki_sys::CK_VERSION,
+            functions: [usize; 104],
+        }
+        let mut table = Box::new(Table {
+            version: cryptoki_sys::CK_VERSION { major: 3, minor: 2 },
+            functions: [0; 104],
+        });
+        table.functions[0] = selection_metadata_drift_preserves_real_words_but_changed_word_refuses
+            as *const () as usize;
+        table.functions[103] = table.functions[0];
+        let pointer = (&*table) as *const Table as usize;
+        let memory = ProcessMemory::open().unwrap();
+        let source = Ok(Surface::StandardInterface {
+            version: table.version,
+        });
+        let snapshot = inventory_snapshot(&memory, pointer, source);
+        assert_eq!(snapshot.values.len(), 104);
+        table.version = cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        };
+        let diagnostic = confirm_selection_snapshot(&memory, pointer, &snapshot, Some((3, 2)))
+            .expect("metadata drift does not invalidate identical function words")
+            .unwrap();
+        assert!(diagnostic.starts_with("version metadata changed:"));
+        let mapping_entries = read_self_maps().unwrap();
+        let mappings = validated_map_index(&mapping_entries).unwrap();
+        let maps::Resolved::File { device, inode, .. } =
+            mappings.resolve(table.functions[0] as u64)
+        else {
+            panic!("test code must be file-backed");
+        };
+        let module_key = ObjectKey { device, inode };
+        let executable = small_owned_elf();
+        let identity = identity_and_key(&executable).unwrap().1;
+        let mut objects = ObjectTable::new(
+            executable,
+            module_key,
+            identity,
+            BTreeSet::from([module_key]),
+        );
+        let (observed, _) = selection_table_for(
+            pointer,
+            Version { major: 3, minor: 2 },
+            &snapshot,
+            &mappings,
+            &mut objects,
+        );
+        assert_eq!(observed.functions.len(), 104);
+        assert!(matches!(
+            observed.functions[103].resolution,
+            Resolution::Resolved { .. }
+        ));
+        table.functions[5] = 1;
+        assert_eq!(
+            confirm_selection_snapshot(&memory, pointer, &snapshot, Some((3, 2))),
+            Err(SelectionFailure::ProviderChanged)
+        );
+        let invalid_snapshot = inventory_snapshot(&memory, pointer, source);
+        table.functions[5] = 2;
+        assert_eq!(
+            confirm_selection_snapshot(&memory, pointer, &invalid_snapshot, Some((2, 40))),
+            Err(SelectionFailure::ProviderChanged),
+            "invalid observed words participate in coherence too"
+        );
+    }
+
+    #[test]
+    fn selector_zero_retains_a_selected_count_only_observation() {
         let evidence = selection_records(
             (
                 SelectionAcquisition::Queried,
@@ -2633,7 +3058,7 @@ mod tests {
                                 functions: vec![],
                                 semantic_authorized: false,
                             },
-                            TableOrigin {
+                            TableOrigin::File {
                                 object: ObjectKey {
                                     device: Device { major: 1, minor: 1 },
                                     inode: 1,
@@ -2648,9 +3073,12 @@ mod tests {
             ),
             &[],
         );
-        assert_eq!(evidence.queries[0].authority, SelectionAuthority::None);
-        assert!(evidence.queries[0].selection_table.is_none());
-        assert!(evidence.tables.is_empty());
+        assert_eq!(
+            evidence.queries[0].authority,
+            SelectionAuthority::SelectionCountOnly
+        );
+        assert_eq!(evidence.queries[0].selection_table, Some(0));
+        assert_eq!(evidence.tables.len(), 1);
     }
 
     #[test]
@@ -2695,6 +3123,23 @@ mod tests {
             (0..16).collect::<Vec<_>>()
         );
         assert!(evidence.selection_truncated);
+    }
+
+    #[test]
+    fn only_bare_names_resolve_inside_the_provider_directory() {
+        for name in ["libmozsqlite3.so", "libnspr4.so", "a", "x.y"] {
+            assert!(is_bare_library_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "sub/dir.so",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "a\0b",
+        ] {
+            assert!(!is_bare_library_name(name), "{name:?}");
+        }
     }
 
     #[test]

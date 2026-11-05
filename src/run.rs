@@ -12,7 +12,9 @@
 use crate::attach::{CapturePolicy, Scope, Session};
 use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
 use crate::discovery::attribution;
-use crate::discovery::engine::Engine;
+use crate::discovery::caller_registry::OsProcessSource;
+use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+use crate::discovery::engine::{Engine, EngineSession};
 use crate::discovery::pause::{
     ArmResult, PauseCoordinator, PauseError, PauseIo, PauseStatus, SessionPauseIo,
 };
@@ -21,6 +23,7 @@ use crate::process::{PidPin, ProcessView, ProcessViewId};
 use crate::{metrics, process, render, scope, semantics, trace, uretprobe_hazard};
 use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -34,6 +37,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod cancellation;
+use cancellation::CaptureCancellation;
+mod diagnostics;
+use diagnostics::terminal_diagnostics;
 
 #[cfg(test)]
 mod root_fence_runtime;
@@ -384,15 +392,43 @@ impl PreparedExecutable {
 }
 
 fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
+    resolve_program_in_path(program, std::env::var_os("PATH").as_deref())
+}
+
+/// PATH search over an injectable search path (production passes
+/// `$PATH`), so the search loop is testable without mutating the
+/// process environment. Like `execvp`, an earlier directory's readable
+/// but non-executable shadow is skipped for a later executable
+/// candidate (Sol-full F8). Descriptor pinning stays with the callers —
+/// they open the returned path and exec through the pinned fd — and the
+/// ELF guard stays in [`check_launch_file`]. When candidates exist but
+/// none is executable, the refusal keeps `PermissionDenied` (again like
+/// `execvp`); a name found nowhere is `NotFound`.
+fn resolve_program_in_path(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
     if program.as_bytes().contains(&b'/') {
         return std::fs::canonicalize(program);
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for directory in std::env::split_paths(&path) {
+    let mut refused_for_mode = false;
+    for directory in std::env::split_paths(path.unwrap_or_default()) {
         let candidate = directory.join(program);
-        if candidate.is_file() {
-            return std::fs::canonicalize(candidate);
+        let metadata = match std::fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
         }
+        if metadata.mode() & 0o111 == 0 {
+            refused_for_mode = true;
+            continue;
+        }
+        return std::fs::canonicalize(candidate);
+    }
+    if refused_for_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "owned command must be a regular executable file",
+        ));
     }
     Err(io::Error::from(io::ErrorKind::NotFound))
 }
@@ -420,13 +456,357 @@ fn check_launch_file(launch_file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Where snapd installs its command launchers: symlinks to `/usr/bin/snap`,
+/// which starts the application through `snap-confine`.
+const SNAP_LAUNCHER_DIR: &str = "/snap/bin";
+/// The system launcher directory snapd manages on some installations:
+/// the same launchers, the same confined start.
+const SNAP_SYSTEM_LAUNCHER_DIR: &str = "/var/lib/snapd/snap/bin";
+/// The snap binary every launcher resolves to.
+const SNAP_BINARY: &str = "/usr/bin/snap";
+
+/// The attach alternative named by the launcher refusals: a process that
+/// is already running is observed by PID or by provider, never launched.
+const ATTACH_HINT: &str = "start the application normally and attach to it: find it with \
+    `p11scope inspect --system`, then `p11scope profile --pid <pid>` or `p11scope profile \
+    --system --module <provider.so>`";
+
+/// A PATH candidate the real exec path would run: `metadata` (which follows
+/// symlinks) succeeds, it is a regular file, and it has an execute bit.
+/// Mirrors [`resolve_program_in_path`]'s skip rule (Sol-full F8), so the snap
+/// pre-check refuses exactly when resolution would land in `/snap/bin`: a
+/// dangling, non-executable or non-file shadow is skipped for the later
+/// runnable candidate.
+fn snap_path_candidate_is_runnable(candidate: &Path) -> bool {
+    std::fs::metadata(candidate)
+        .map(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Filesystem probes for the snap pre-check, injectable for tests:
+/// `exists` is lstat existence, `is_runnable` is stat + file + exec
+/// (mirroring resolution), `resolve` follows the whole chain
+/// (production: `canonicalize`).
+struct SnapProbes<'a> {
+    exists: &'a dyn Fn(&Path) -> bool,
+    is_runnable: &'a dyn Fn(&Path) -> bool,
+    resolve: &'a dyn Fn(&Path) -> Option<PathBuf>,
+}
+
+/// `candidate` absolutized against `cwd` with `.` and `..` collapsed
+/// lexically, without touching the filesystem: the launcher itself is a
+/// symlink, so canonicalization would lose its directory.
+fn snap_spelling_absolute(candidate: &Path, cwd: &Path) -> PathBuf {
+    use std::path::Component;
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        cwd.join(candidate)
+    };
+    let mut parts: Vec<Component> = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(Component::Normal(_))) {
+                    parts.pop();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
+}
+
+/// Whether `candidate` names a file directly inside a snap launcher
+/// directory, after lexical normalization — so `..` and relative
+/// spellings match, and a `..` escape does not.
+fn snap_launcher_dir_contains(candidate: &Path, cwd: &Path) -> bool {
+    let parent = snap_spelling_absolute(candidate, cwd)
+        .parent()
+        .map(Path::to_path_buf);
+    parent.is_some_and(|parent| {
+        parent == Path::new(SNAP_LAUNCHER_DIR) || parent == Path::new(SNAP_SYSTEM_LAUNCHER_DIR)
+    })
+}
+
+/// The shared tail of every snap refusal: why the launch cannot work,
+/// the recommended attach path first, the in-snap binary second with
+/// its confinement cost. The example names Firefox's binary only for
+/// Firefox; every other snap gets the generic in-snap path.
+fn snap_refusal_tail(name: &str) -> String {
+    let example = if name == "firefox" {
+        "`p11scope run -- /snap/firefox/current/usr/lib/firefox/firefox`"
+    } else {
+        "`p11scope run -- /snap/<snap>/current/<program>`"
+    };
+    format!(
+        "snap starts it through snap-confine, whose file capabilities the owned child's \
+         no_new_privs withholds, so it cannot start under `p11scope run`. Recommended: \
+         {ATTACH_HINT}. Alternatively, name the program inside the snap directly ({example}), \
+         but that runs outside snap confinement; browser sandboxes are weaker under \
+         no_new_privs, so use a throwaway profile."
+    )
+}
+
+/// A snap launcher (or any name resolving to the snap binary) refused by name.
+fn snap_refusal_error(name: &str, launcher: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{name} is a snap application ({launcher}): {}",
+            snap_refusal_tail(name)
+        ),
+    )
+}
+
+/// `snap run` refused by name: `app` is the snap application when the
+/// arguments name one.
+fn snap_run_refusal_error(app: Option<&str>, resolved: &str) -> io::Error {
+    let (head, name) = match app {
+        Some(app) => (
+            format!("{app} is a snap application (`snap run {app}`)"),
+            app,
+        ),
+        None => (
+            format!("`snap run` starts a snap application ({resolved})"),
+            "snap run",
+        ),
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{head}: {}", snap_refusal_tail(name)),
+    )
+}
+
+/// Refuses a snap command before the fork. snapd starts every snap
+/// application through `snap-confine`, which needs its file capabilities;
+/// the owned child runs with no_new_privs, which withholds them, so the
+/// launch can only fail later inside snap-confine. Three rules: a
+/// launcher inside a snap bin directory (named directly or found first
+/// on `path`), any other spelling resolving to the snap binary, and
+/// `snap run` itself (`snap` with other subcommands is not a confined
+/// launch). The filesystem probes are injectable for tests; `cwd`
+/// anchors relative spellings.
+fn snap_launcher_refusal(
+    program: &OsStr,
+    args: &[OsString],
+    path: Option<&OsStr>,
+    cwd: &Path,
+    probes: &SnapProbes,
+) -> Option<io::Error> {
+    let direct = program.as_bytes().contains(&b'/');
+    // The candidate the shell would run: the direct spelling, or the
+    // first runnable PATH hit (mirroring resolution's skip rule).
+    let candidate = if direct {
+        Path::new(program).to_path_buf()
+    } else {
+        std::env::split_paths(path.unwrap_or_default())
+            .map(|directory| directory.join(program))
+            .find(|candidate| (probes.is_runnable)(candidate))?
+    };
+    if snap_launcher_dir_contains(&candidate, cwd) && (!direct || (probes.exists)(&candidate)) {
+        let name = candidate.file_name()?.to_string_lossy().into_owned();
+        return Some(snap_refusal_error(&name, &candidate.display().to_string()));
+    }
+    let resolved = (probes.resolve)(&candidate)?;
+    let snap = (probes.resolve)(Path::new(SNAP_BINARY))?;
+    if resolved != snap {
+        return None;
+    }
+    let file_name = candidate.file_name()?.to_string_lossy();
+    if file_name != "snap" {
+        return Some(snap_refusal_error(
+            &file_name,
+            &candidate.display().to_string(),
+        ));
+    }
+    if !args.first().is_some_and(|arg| arg == "run") {
+        return None;
+    }
+    let app = args
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.as_bytes().starts_with(b"-"))
+        .map(|app| app.to_string_lossy().into_owned());
+    Some(snap_run_refusal_error(
+        app.as_deref(),
+        &candidate.display().to_string(),
+    ))
+}
+
+/// The `#!` interpreter of a script launch file, when it has one.
+fn script_interpreter(launch_file: &File) -> Option<String> {
+    use std::os::unix::fs::FileExt as _;
+    let mut head = [0u8; 256];
+    let read = launch_file.read_at(&mut head, 0).ok()?;
+    let line = head[..read].strip_prefix(b"#!")?;
+    let line = line.split(|byte| *byte == b'\n').next()?;
+    let interpreter = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|word| !word.is_empty())?;
+    Some(String::from_utf8_lossy(interpreter).into_owned())
+}
+
+/// Whether the mode bits grant (`uid`, `gid`) read access to a file
+/// owned by (`meta_uid`, `meta_gid`): owner bits, else the primary
+/// group's, else other's. Supplementary groups are ignored (fail-closed:
+/// the `#!` token stays hidden when the check cannot prove the invoker
+/// could read it). Root reads anything.
+fn invoker_can_read_file(meta_uid: u32, meta_gid: u32, mode: u32, uid: u32, gid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    if uid == meta_uid {
+        mode & 0o400 != 0
+    } else if gid == meta_gid {
+        mode & 0o040 != 0
+    } else {
+        mode & 0o004 != 0
+    }
+}
+
+/// A script launch file refused with its interpreter and the attach
+/// alternative. `token` is `None` when the invoker could not read the
+/// file: the refusal then names no interpreter. Control bytes in the
+/// token and the path render escaped: the refusal is printed to a
+/// terminal.
+fn script_refusal_error(resolved: &Path, token: Option<&str>, error: &io::Error) -> io::Error {
+    let resolved_text = resolved.display().to_string();
+    let resolved = crate::render::escape_controls(&resolved_text);
+    let message = match token {
+        Some(token) => {
+            let token = crate::render::escape_controls(token);
+            format!(
+                "{error}. {resolved} is a script for {token}: run `p11scope run -- {token} \
+                 {resolved}` (a script that starts a snap application still cannot run here), \
+                 or {ATTACH_HINT}"
+            )
+        }
+        None => format!(
+            "{error}. {resolved} is a script: run `p11scope run -- <interpreter> {resolved}` \
+             with its interpreter (the `#!` line is not shown because the invoking user \
+             cannot read this file; a script that starts a snap application still cannot run \
+             here), or {ATTACH_HINT}"
+        ),
+    };
+    io::Error::new(error.kind(), message)
+}
+
+/// A script that starts a snap application, refused with the snap reason.
+/// The token is dropped (and every interpolated field escaped) exactly
+/// like [`script_refusal_error`].
+fn script_snap_refusal_error(
+    resolved: &Path,
+    token: Option<&str>,
+    name: &str,
+    launcher: &Path,
+) -> io::Error {
+    let resolved_text = resolved.display().to_string();
+    let resolved = crate::render::escape_controls(&resolved_text);
+    let name = crate::render::escape_controls(name);
+    let launcher_text = launcher.display().to_string();
+    let launcher = crate::render::escape_controls(&launcher_text);
+    let head = match token {
+        Some(token) => {
+            let token = crate::render::escape_controls(token);
+            format!(
+                "{resolved} is a script for {token} that starts the snap application {name} \
+                 ({launcher})"
+            )
+        }
+        None => {
+            format!("{resolved} is a script that starts the snap application {name} ({launcher})")
+        }
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{head}: {}", snap_refusal_tail(&name)),
+    )
+}
+
 /// Refuses a command that cannot run as an owned target by name, before
 /// anything is forked. Name errors precede hazard errors: a script is
 /// told about its interpreter before any kernel verdict is consulted.
-fn check_owned_target_runnable(program: &OsStr) -> io::Result<()> {
-    let resolved = resolve_program(program)?;
+fn check_owned_target_runnable(program: &OsStr, args: &[OsString]) -> io::Result<()> {
+    let probes = SnapProbes {
+        exists: &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
+        is_runnable: &snap_path_candidate_is_runnable,
+        resolve: &|candidate: &Path| std::fs::canonicalize(candidate).ok(),
+    };
+    check_owned_target_runnable_with(
+        program,
+        args,
+        std::env::var_os("PATH").as_deref(),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        ChildIdentity::for_invoker()
+            .ok()
+            .map(|identity| (identity.uid, identity.gid)),
+        &probes,
+    )
+}
+
+/// [`check_owned_target_runnable`] with injectable environment (search
+/// path, working directory, invoker identity) and filesystem probes, so
+/// tests pin the refusal without touching `/snap/bin` or the process
+/// environment. Production passes the real values; behavior is identical.
+fn check_owned_target_runnable_with(
+    program: &OsStr,
+    args: &[OsString],
+    path: Option<&OsStr>,
+    cwd: &Path,
+    invoker: Option<(u32, u32)>,
+    probes: &SnapProbes,
+) -> io::Result<()> {
+    if let Some(refusal) = snap_launcher_refusal(program, args, path, cwd, probes) {
+        return Err(refusal);
+    }
+    let resolved = resolve_program_in_path(program, path)?;
     let launch_file = File::open(&resolved)?;
-    check_launch_file(&launch_file)
+    let error = match check_launch_file(&launch_file) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let token = if error.kind() == io::ErrorKind::InvalidInput {
+        script_interpreter(&launch_file)
+    } else {
+        None
+    };
+    let Some(token) = token else {
+        return Err(error);
+    };
+    // The refusal runs as the observer (possibly root via sudo): the
+    // token is only shown when the invoker could read the file itself.
+    // An unknown invoker or unreadable metadata hides it (fail-closed).
+    let visible = launch_file
+        .metadata()
+        .ok()
+        .and_then(|meta| {
+            let (uid, gid) = invoker?;
+            Some(invoker_can_read_file(
+                meta.uid(),
+                meta.gid(),
+                meta.mode(),
+                uid,
+                gid,
+            ))
+        })
+        .unwrap_or(false);
+    let token = visible.then_some(token.as_str());
+    // A script that starts a snap application (Ubuntu's /usr/bin/firefox
+    // wrapper): the snap reason, not the interpreter detour that would
+    // fail later inside snap-confine. Lstat only: the launcher is a
+    // symlink, and its target's state is irrelevant to the refusal.
+    if let Some(file_name) = resolved.file_name() {
+        let launcher = Path::new(SNAP_LAUNCHER_DIR).join(file_name);
+        if (probes.exists)(&launcher) {
+            let name = file_name.to_string_lossy();
+            return Err(script_snap_refusal_error(
+                &resolved, token, &name, &launcher,
+            ));
+        }
+    }
+    Err(script_refusal_error(&resolved, token, &error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1076,6 +1456,13 @@ pub(crate) struct OwnedChild {
     exec_reader: Option<OwnedFd>,
     prepared: Option<PreparedExecutable>,
     released: bool,
+    /// `CLOCK_MONOTONIC` instant the barrier release completed (exec EOF
+    /// observed), bounding pre-release attach stamps for the pre-arm
+    /// exactness proof. `None` until a proven release, or when the clock
+    /// read failed: unboundable, never exact. No attach runs while the
+    /// release blocks, so a stamp at or before this instant predates the
+    /// child's first free userspace.
+    release_ns: Option<u64>,
     /// The CLOEXEC exec pipe reached EOF with no errno frame, so the child
     /// has left this process's pre-exec image (it exec'd, or it died) and can
     /// no longer take a release byte and start the command late. Only such a
@@ -1259,6 +1646,7 @@ impl OwnedChild {
             exec_reader: Some(exec_reader),
             prepared,
             released: false,
+            release_ns: None,
             exec_confirmed: false,
             reaped: false,
             reaped_exit_code: None,
@@ -1270,6 +1658,10 @@ impl OwnedChild {
 
     pub(crate) fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub(crate) fn release_ns(&self) -> Option<u64> {
+        self.release_ns
     }
 
     pub(crate) fn seed_pin(&self) -> std::sync::Arc<PidPin> {
@@ -1392,6 +1784,7 @@ impl OwnedChild {
                         return Err(ExecHandoffError::Cancelled(signal));
                     }
                     self.released = true;
+                    self.release_ns = crate::attach::monotonic_ns();
                     return Ok(());
                 }
                 ExecDrain::Pending => pending(),
@@ -1757,7 +2150,7 @@ impl Drop for OwnedChild {
 
 fn allocate_generation() -> io::Result<NonZeroU64> {
     let generation = NEXT_GENERATION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1).filter(|next| *next != 0)
         })
         .map_err(|_| io::Error::other("owned pause generation space exhausted"))?;
@@ -1875,6 +2268,198 @@ impl CaptureEnd {
             Self::Error => render::LOOP_END_ERROR,
         }
     }
+
+    /// Maps the capture end onto the pre-arm watch end cause (packet 6.13,
+    /// R2-D1-7): the scope's lifetime ending normally closes watches with
+    /// `scope_end`; an operator signal or capture error stops them.
+    fn prearm_end_cause(self) -> crate::render::PrearmWatchEnd {
+        match self {
+            Self::DurationExpired | Self::TargetExit | Self::LimitReached => {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            }
+            Self::Signal | Self::Error => crate::render::PrearmWatchEnd::Stop,
+        }
+    }
+}
+
+/// Modules with observed use at capture end (packet 6.13, R2-D1-4): any
+/// report with completed, error or in-flight calls counts for its
+/// attributed module. Ambiguous use (a shared target with no sole owner)
+/// counts for every owner the target resolves to; truly unresolvable use
+/// counts for every module — a quiet claim needs proven no-use, and
+/// unknown association never proves it (physical counts are still
+/// preserved in the reports themselves).
+fn prearm_used_modules(
+    reports: &[crate::metrics::SlotReport],
+    plan: &crate::plan::AttachPlan,
+    pinned: &crate::discovery::identity::PinnedObjects,
+) -> BTreeSet<crate::plan::ModuleId> {
+    let mut used = BTreeSet::new();
+    let mut unattributable = false;
+    for report in reports {
+        if report.calls == 0 && report.errors == 0 && report.in_flight == 0 {
+            continue;
+        }
+        match report.module {
+            Some(module) => {
+                used.insert(module);
+            }
+            None => {
+                let owners = prearm_report_owners(report, plan, pinned);
+                if owners.is_empty() {
+                    unattributable = true;
+                } else {
+                    used.extend(owners);
+                }
+            }
+        }
+    }
+    if unattributable {
+        used.extend(plan.modules.iter().map(|module| module.id));
+    }
+    used
+}
+
+/// Owner modules of one ownerless report, resolved through its recorded
+/// target identity and offset back into the plan's slots.
+fn prearm_report_owners(
+    report: &crate::metrics::SlotReport,
+    plan: &crate::plan::AttachPlan,
+    pinned: &crate::discovery::identity::PinnedObjects,
+) -> BTreeSet<crate::plan::ModuleId> {
+    let Some(target) = report.target_object.as_ref() else {
+        return BTreeSet::new();
+    };
+    let mut owners = BTreeSet::new();
+    for slot in &plan.slots {
+        let Some(pin) = pinned.summary(slot.object) else {
+            continue;
+        };
+        if (pin.key.device.major, pin.key.device.minor) == (target.dev.0, target.dev.1)
+            && pin.key.inode == target.ino
+            && slot.file_offset == report.file_offset
+        {
+            owners.extend(slot.module_ids.iter().copied());
+        }
+    }
+    owners
+}
+
+/// The terminal watch-close boundary (packet 6.13 round-2, F3): the first
+/// effective STOP when the gate recorded one, else the loop-end stamp. The
+/// minimum wins, so a later publication sample never extends the published
+/// interval past the earliest stop. A stop requested at an unknown instant
+/// stays unknown (round-3 re-audit finding 2): the blind tail is never
+/// backfilled with a later request or the loop-end sample.
+fn prearm_stop_ns(first_stop: crate::attach::FirstStop, loop_end_ns: Option<u64>) -> Option<u64> {
+    use crate::attach::FirstStop;
+    match (first_stop, loop_end_ns) {
+        (FirstStop::Known(first), Some(loop_end)) => Some(first.min(loop_end)),
+        (FirstStop::Known(first), None) => Some(first),
+        (FirstStop::NotRequested, loop_end) => loop_end,
+        (FirstStop::Unknown, _) => None,
+    }
+}
+
+/// Terminal kernel health for pre-arm watch close (packet 6.13): sampled
+/// beside the reports, before the watches close on it. This feeds watch
+/// health only — the trace publication sample stays after
+/// `settle_terminal_drain` (trace terminal-order contract, round-4
+/// re-audit finding 2).
+fn prearm_terminal_kernel(session: &Session) -> Result<metrics::KernelEvidence> {
+    metrics::kernel_evidence(session)
+}
+
+/// The pre-arm hold claim for the terminal proofs builder: whether this
+/// capture owns its child (the only scope whose pre-spawn start, barrier,
+/// and pause segment compose the from-start claim), plus the run's own
+/// pre-spawn scope start composed with the coordinator's proven end and gap
+/// flag when the pause gate proved a hold, and the barrier-release instant
+/// bounding pre-release attach stamps. Captures without an owned child
+/// thread `(None, false, None)`, so their windows stay disclosed.
+fn owned_prearm_hold(
+    owned: Option<&Owned>,
+) -> (
+    Option<crate::discovery::pause::PauseGateHold>,
+    bool,
+    Option<u64>,
+) {
+    let (hold, scope_start_ns, release_ns) = match owned {
+        None => (None, None, None),
+        Some(owned) => (
+            owned.coordinator.pause_hold(),
+            owned.prearm_scope_start_ns,
+            owned.prearm_release_ns,
+        ),
+    };
+    compose_prearm_hold(hold, scope_start_ns, release_ns, owned.is_some())
+}
+
+/// Pure composition for the terminal hold claim (pinned below): only an
+/// owned run forwards a hold, and the forwarded hold always carries the
+/// run's pre-spawn scope start — which bridges the barrier-held prefix
+/// before the pause segment — in place of the coordinator's arm bound.
+/// The barrier-release bound travels alongside: the builder requires every
+/// declared first-stamp at or before it, since the child may run its
+/// command before the first *verified* pause stop.
+fn compose_prearm_hold(
+    hold: Option<crate::discovery::pause::PauseGateHold>,
+    scope_start_ns: Option<u64>,
+    release_ns: Option<u64>,
+    owned_run: bool,
+) -> (
+    Option<crate::discovery::pause::PauseGateHold>,
+    bool,
+    Option<u64>,
+) {
+    if !owned_run {
+        return (None, false, None);
+    }
+    let Some(mut hold) = hold else {
+        return (None, true, release_ns);
+    };
+    hold.start_ns = scope_start_ns;
+    (Some(hold), true, release_ns)
+}
+
+/// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
+/// idle qualification over observed use and terminal health, the end for
+/// the capture end, and the attach-key assembly merge onto the discovery
+/// records — all before the evidence seals. Watches close at the frozen
+/// first-stop boundary `stop_ns`, never at a later publication read, so the
+/// published interval excludes the blind tail. Generic captures without
+/// watches still assemble their attach/window keys.
+#[allow(clippy::too_many_arguments)]
+fn finish_prearm_terminal(
+    engine: &mut Engine,
+    session: &impl EngineSession,
+    attach_failures: &[(u32, String)],
+    end: CaptureEnd,
+    reports: &[metrics::SlotReport],
+    kernel: &metrics::KernelEvidence,
+    malformed_records: u64,
+    stop_ns: Option<u64>,
+    hold: Option<crate::discovery::pause::PauseGateHold>,
+    owned_run: bool,
+    release_ns: Option<u64>,
+) {
+    let used = if engine.has_prearm_watches() {
+        prearm_used_modules(reports, engine.plan(), engine.pinned())
+    } else {
+        BTreeSet::new()
+    };
+    engine.finish_prearm_capture(
+        session,
+        end.prearm_end_cause(),
+        &used,
+        attach_failures,
+        stop_ns,
+        kernel,
+        malformed_records,
+        hold,
+        owned_run,
+        release_ns,
+    );
 }
 
 /// All three operator stop signals end a capture the same clean way. SIGTERM
@@ -1955,7 +2540,7 @@ impl SignalState {
         }
         let _ = self
             .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 let first = state & 0xff;
                 let count = (state >> 8) & 3;
                 let first = if first == 0 { signal as u64 } else { first };
@@ -1972,7 +2557,7 @@ impl SignalState {
     fn record_first(&self, signal: libc::c_int) {
         let _ = self
             .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 (state & 0xff == 0).then_some(state | signal as u64)
             });
     }
@@ -2156,34 +2741,59 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
 /// discover and pin what is in scope, install the stop flag, then run the same
 /// loop `run` runs — with no owned child, so no pause is ever possible.
 pub fn capture(a: &CaptureArgs) -> Result<()> {
+    capture_with_host(a, &crate::attach::require_multi_capable_host)
+}
+
+fn capture_with_host(
+    a: &CaptureArgs,
+    host: &dyn Fn() -> crate::attach::MultiHostVerdict,
+) -> Result<()> {
     let kind = a.kind;
-    let policy = capture_policy(kind, a.metrics, a.unsafe_requested)?;
+    let policy = capture_policy(
+        kind,
+        a.metrics,
+        a.unsafe_requested,
+        a.counter_mode,
+        a.track_short_lived,
+        a.select_endpoint.as_deref(),
+    )?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
-        eprintln!("{warning}");
+        emit_capture_diagnostic(&warning);
     }
     let (scope, named_view) = match &a.scope {
         ScopeArg::Pid(p) => {
-            let view = ProcessView::open(ProcessViewId(0), *p)
-                .map_err(|error| anyhow!("--pid {p}: {error}"))?;
-            (Scope::Pid(*p), Some(view))
+            // Never-stop: a named pid that exits before the view opens
+            // reports an empty PARTIAL plan via discovery (which gaps the
+            // race like a cgroup member) instead of aborting with no report.
+            match ProcessView::open(ProcessViewId(0), *p) {
+                Ok(view) => (Scope::Pid(*p), Some(view)),
+                Err(error) => {
+                    emit_capture_diagnostic(&format!(
+                        "p11scope: --pid {p}: {error}; reporting an empty partial capture"
+                    ));
+                    (Scope::Pid(*p), None)
+                }
+            }
         }
         ScopeArg::Cgroup(c) => (scope::capture_cgroup(c)?, None),
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
+    let _host = host()?;
     match (kind, a.duration) {
-        (Kind::Trace, None) => eprintln!("{}", no_duration_notice()),
-        (Kind::Profile, None) => eprintln!("{}", no_profile_duration_notice()),
+        (Kind::Trace, None) => emit_capture_diagnostic(&no_duration_notice()),
+        (Kind::Profile, None) => emit_capture_diagnostic(&no_profile_duration_notice()),
         _ => {}
     }
     warn_unsafe_policy(policy);
-    let accepted = preflight_uretprobe_hazard(
+    let return_admission = preflight_uretprobe_hazard(
         match &a.scope {
             ScopeArg::Pid(pid) => Some(*pid),
             ScopeArg::Cgroup(_) | ScopeArg::System => None,
         },
         a.allow_confined_uretprobe,
     )?;
+    let accepted = return_admission.override_reason().map(str::to_owned);
     let accepted_uretprobe_risk = accepted.is_some();
     // Durable, not just stderr (SYSPLAN residual F-01): the override flag +
     // hazard reason travel with the evidence this capture renders.
@@ -2208,10 +2818,22 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     let discovered = Engine::discover(a, &scope, named_view);
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
+    engine.retain_return_probe_admission(return_admission);
+    // 6.14 Option B: arm extensive mode before the session publishes
+    // its CONFIG bit; inventory never reaches this flow. Counter
+    // policies never arm (the CLI combination already refused), and
+    // neither do captures that cannot publish hints (614b P1).
+    engine.arm_extensive(extensive_effective(
+        a.track_short_lived,
+        kind,
+        a.metrics,
+        &scope,
+        policy,
+    ));
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
-        eprintln!("{}", no_modules_hint(&a.scope));
+        emit_capture_diagnostic(&no_modules_hint(&a.scope));
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
@@ -2231,18 +2853,16 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         a.ring_bytes,
         uretprobe_override,
         resource_start,
+        a.select_endpoint.as_deref(),
     )?;
-    // `--pid` cannot read a non-child's exit status, so the honest report is
-    // the pairing of two facts we do have: the target went away, and this
-    // capture knowingly attached uretprobes a measured-affected kernel kills
-    // confined targets for. Saying nothing here would leave the operator with
-    // a capture whose calls are all in flight and no reason given.
+    // A non-child's exit and explicit risk acceptance are observable facts.
+    // Neither establishes its seccomp state, an affected kernel, or causation.
     if accepted_uretprobe_risk && engine.expected_target_exit() {
-        eprintln!(
-            "p11scope: WARNING: the target exited during this capture, which attached uretprobes \
-             to a syscall-confined target on a kernel measured to kill one for exactly that. \
-             p11scope cannot read a non-child's exit status, so this is not proof — but calls \
-             left in flight with no returns are that death's fingerprint"
+        emit_capture_diagnostic(
+            "p11scope: WARNING: the target exited during this capture after return-probe \
+             risk was explicitly accepted. A non-child's exit status is unavailable; this \
+             does not establish whether return probes caused the exit. See the recorded \
+             override reason for the assessed risk",
         );
     }
     Ok(())
@@ -2284,17 +2904,91 @@ fn no_profile_duration_notice() -> String {
         .to_string()
 }
 
-fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
+/// 614b P1 narrow authorization: whether `--track-short-lived`
+/// actually arms the kernel exe-identity read for this capture. The
+/// read is granted only where the resulting STATIC HINT split can
+/// publish: a Detailed (non-counter) profile-kind, non-metrics
+/// capture over a generation-admitting scope (cgroup/system), the
+/// only shape that classifies descendant gaps. Everywhere else the
+/// flag stays accepted but records nothing — no exe identity is
+/// captured for a counter, trace, metrics, exact-PID or owned-`run`
+/// capture, where no hint could ever be published.
+pub(crate) fn extensive_effective(
+    track_short_lived: bool,
+    kind: Kind,
+    metrics: bool,
+    scope: &Scope,
+    policy: CapturePolicy,
+) -> bool {
+    track_short_lived
+        && policy.allows_track_short_lived()
+        && kind == Kind::Profile
+        && !metrics
+        && matches!(scope, Scope::Cgroup { .. } | Scope::System)
+}
+
+pub(crate) fn capture_policy(
+    kind: Kind,
+    metrics: bool,
+    unsafe_requested: bool,
+    counter_mode: Option<p11scope_ebpf_common::CounterMode>,
+    track_short_lived: bool,
+    select_endpoint: Option<&str>,
+) -> Result<CapturePolicy> {
+    // 6.15: endpoint selection details a counter broad only. The CLI
+    // refuses this first; the policy re-checks so no programmatic
+    // caller can arm a selection the driver cannot resolve.
+    if select_endpoint.is_some() && counter_mode.is_none() {
+        anyhow::bail!(
+            "--select-endpoint requires --counter-mode counts|timestamps|latency on --mode metrics"
+        );
+    }
+    if let Some(mode) = counter_mode {
+        if kind != Kind::Profile || !metrics {
+            anyhow::bail!(
+                "--counter-mode {} requires --mode metrics on profile or run",
+                mode.name()
+            );
+        }
+        if unsafe_requested {
+            anyhow::bail!("--counter-mode cannot be combined with --unsafe-unvalidated-metadata");
+        }
+        // 6.14 Option B: extensive mode arms Detailed captures only.
+        // Refused by name before build/flavor checks so no counter
+        // session can ever arm the exe-identity read.
+        if track_short_lived {
+            anyhow::bail!(
+                "--track-short-lived cannot be combined with --counter-mode {}: \
+                 extensive mode arms Detailed captures only",
+                mode.name()
+            );
+        }
+        // Builds without counter objects (WIDE, SMALL) refuse here by
+        // name: the statics are empty there, and preparation never runs
+        // to refuse instead.
+        if let Err(refusal) = crate::attach::counter_banks::check_counter_build(
+            env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+        ) {
+            anyhow::bail!("{refusal}");
+        }
+        // The bytes rule before discovery: the counter object's own flavor,
+        // so stale bytes refuse before any scan or attach.
+        crate::attach::checked_counter_flavor(
+            mode,
+            crate::attach::counter_banks::counter_object_for_mode(mode),
+        )?;
+        return Ok(CapturePolicy::Counter(mode));
+    }
     let mode = match (kind, metrics) {
         (Kind::Trace, _) => "trace",
         (Kind::Profile, true) => "metrics",
         (Kind::Profile, false) => "profile",
     };
-    CapturePolicy::from_cli(
-        mode,
-        unsafe_requested,
-        cfg!(feature = "unsafe-unvalidated-metadata"),
-    )
+    // The bytes rule before anything else runs: a stale or mismatched
+    // embedded object refuses here with both values named.
+    let flavor = crate::attach::checked_embedded_flavor()?;
+    CapturePolicy::from_cli(mode, unsafe_requested, flavor.unsafe_present)
 }
 
 /// The `-o` sink, opened by the caller *before* the attach so a bad path fails
@@ -2323,6 +3017,26 @@ impl OutputSink {
     }
 }
 
+/// Counter read inputs for this capture: counter policies with a Counters
+/// plan read through bounded inputs (rows from the endpoint budget, RV
+/// keys from the shared pool, charges on the Engine's counter pool).
+/// Anything else reads the legacy path exactly as before.
+fn counter_inputs_for_capture(
+    policy: CapturePolicy,
+    engine: &Engine,
+) -> Option<metrics::CounterCaptureInputs> {
+    let mode = policy.counter_mode()?;
+    let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy() else {
+        return None;
+    };
+    Some(metrics::CounterCaptureInputs::new(
+        mode,
+        budget.endpoint_limit() as usize,
+        crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
+        engine.counter_reserver(),
+    ))
+}
+
 /// Picks the loop `kind` selects. The only place either loop is entered, so
 /// there is exactly one profile loop and one trace loop in this binary.
 #[allow(clippy::too_many_arguments)]
@@ -2341,6 +3055,7 @@ fn run_loop(
     ring_bytes: Option<u32>,
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
+    select_endpoint: Option<&str>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     // Authoritative attach stamp (T2, G-14): the session is fully attached
@@ -2357,6 +3072,7 @@ fn run_loop(
                 OutputSink::Profile(file) => Some(*file),
                 _ => None,
             };
+            let counter_inputs = counter_inputs_for_capture(policy, engine);
             capture_profile(
                 engine,
                 session,
@@ -2370,6 +3086,8 @@ fn run_loop(
                 ring_bytes,
                 uretprobe_override,
                 resource_start,
+                counter_inputs,
+                select_endpoint,
             )
         }
         Kind::Trace => {
@@ -2397,6 +3115,43 @@ fn run_loop(
     // or second-signal-abandoned capture included, before its error returns.
     engine.report_discovery_noise();
     evidence
+}
+
+/// Test-only profile loop over an already-started Engine/Session: the
+/// privileged CLI cells inject discovery (the counter fixture exports no
+/// PKCS#11 surface for real discovery), then run this real loop to `-o`
+/// JSON. Production `capture()` runs the same `run_loop` after real
+/// discovery.
+#[cfg(test)]
+pub(crate) fn run_profile_loop_for_test(
+    engine: &mut Engine,
+    session: &mut Session,
+    scope: &Scope,
+    policy: CapturePolicy,
+    duration: Duration,
+    out_path: &std::path::Path,
+    select_endpoint: Option<&str>,
+) -> Result<render::Evidence> {
+    let stop = SignalState::new();
+    let out = OutputSink::open(Kind::Profile, Some(out_path))?;
+    let resource_start = crate::timing::read_resource_sample();
+    run_loop(
+        engine,
+        session,
+        scope,
+        Kind::Profile,
+        policy,
+        Some(duration),
+        None,
+        out,
+        &stop,
+        None,
+        None,
+        None,
+        None,
+        resource_start,
+        select_endpoint,
+    )
 }
 
 /// What `run` reports back to its caller. `evidence` is the exact finalized
@@ -2427,6 +3182,14 @@ struct Owned {
     pid: u32,
     exit_code: Option<i32>,
     still_running: bool,
+    /// The run's own pre-spawn scope start: the claim start the terminal
+    /// pre-arm hold composes with the coordinator's proven segment.
+    prearm_scope_start_ns: Option<u64>,
+    /// Barrier-release instant bounding pre-release attach stamps: the
+    /// terminal proof requires every declared first-stamp at or before it.
+    /// Copied from the child after a proven release; `None` (unreleased or
+    /// clock failure) withholds every proof.
+    prearm_release_ns: Option<u64>,
 }
 
 /// Non-cloneable terminal authority: exact original reap AND that owner's
@@ -2478,6 +3241,18 @@ fn pause_failure(error: PauseError) -> anyhow::Error {
     anyhow!("pause: {error}")
 }
 
+/// Whether the finished capture ended with its owned target naturally
+/// exited: only a proven exit (`Ok(true)`) counts. An unreadable pin —
+/// notably `Interrupted` when a second signal lands in the readiness
+/// poll — proves nothing and stays `false`, the same fail-closed reading
+/// the engine uses for poll failures (`Engine::original_exited`); the
+/// selection coverage invalidates instead of the error vetoing
+/// settlement and publication, so teardown still publishes the report
+/// it owes (SG-I7).
+fn finish_observation_natural_exit(end: CaptureEnd, observation: Result<bool, String>) -> bool {
+    end == CaptureEnd::TargetExit && matches!(observation, Ok(true))
+}
+
 impl Owned {
     /// Closes the pause epoch and settles the child, *before* any terminal
     /// evidence is built: `child_still_running` is a fact the final document
@@ -2493,10 +3268,8 @@ impl Owned {
         let Some(child) = self.child.as_ref() else {
             return Ok(());
         };
-        let observation = child.pin().original_exited().map_err(anyhow::Error::msg);
-        engine.finish_owned_selection_coverage(
-            end == CaptureEnd::TargetExit && matches!(observation, Ok(true)),
-        );
+        let natural_exit = finish_observation_natural_exit(end, child.pin().original_exited());
+        engine.finish_owned_selection_coverage(natural_exit);
         // Request the stop gate before pause cleanup instead of detaching
         // there: the links move to the background cleanup worker after
         // publication, once the held child is resumed.
@@ -2517,12 +3290,19 @@ impl Owned {
             &mut self.exit_code,
             &mut self.still_running,
         );
+        // A reaped child is an expected target exit: without the mark, a
+        // terminal pass that runs after the release bails on the empty
+        // PID scope instead of sealing the report. A handed-back (living)
+        // child keeps no mark — it is still running.
+        if self.exit_code.is_some() {
+            engine.note_owned_target_reaped();
+        }
         // Both outcomes are retained: a cleanup failure must not be lost
         // behind a reap failure, or the other way round (design §10.3).
-        combine_finish_errors(
-            observation.map(|_| ()),
-            combine_finish_errors(cleanup.map_err(pause_failure), settled),
-        )
+        // The exit observation is not combined here: an unreadable pin
+        // already invalidated the coverage above, and must not veto the
+        // settlement — or the report the settlement publishes — behind it.
+        combine_finish_errors(cleanup.map_err(pause_failure), settled)
     }
 }
 
@@ -2870,8 +3650,10 @@ fn finish_capture_error(
         Some(owned) => owned.finish(engine, session, CaptureEnd::Error, signals),
         None => Ok(()),
     };
-    let detach = session
-        .detach_producers_driven(|| signals.sigint_deliveries() >= 2, &mut std::io::stderr());
+    let detach = session.detach_producers_driven(
+        || signals.sigint_deliveries() >= 2,
+        terminal_diagnostics().as_mut(),
+    );
     combine_capture_failure(error, finish, detach)
 }
 
@@ -2901,18 +3683,51 @@ fn finish_capture_loop(
 /// — quiesce, loop, settlement, detach — is retained. Settlement and
 /// detach run through context callbacks (like `finish_capture_with`) so
 /// ordinary tests drive the real combiner without an attach session.
+/// Combines a quiesce failure with the settlement, publication and detach
+/// outcomes behind it, in that order. A detached-abandon keeps its typed
+/// outer layer through `also_failed`, so the exit stays 130.
+fn combine_quiesce_failure(
+    quiesce: anyhow::Error,
+    finish: Result<()>,
+    published: Option<Result<()>>,
+    detach: Result<()>,
+) -> anyhow::Error {
+    let mut capture = quiesce;
+    if let Err(error) = finish {
+        capture = also_failed(capture, error, "owned cleanup/settlement");
+    }
+    if let Some(Err(error)) = published {
+        capture = also_failed(capture, error, "terminal publication");
+    }
+    if let Err(error) = detach {
+        capture = also_failed(capture, error, "detaching capture producers");
+    }
+    capture
+}
+
 fn finish_quiesce_error<C>(
     error: anyhow::Error,
     loop_result: Result<CaptureEnd>,
     context: &mut C,
     settle: impl FnOnce(&mut C, CaptureEnd) -> Result<()>,
+    publish: impl FnOnce(&mut C) -> Result<()>,
     detach: impl FnOnce(&mut C) -> Result<()>,
 ) -> anyhow::Error {
     match loop_result {
         Ok(end) => {
             let finish = settle(context, end);
+            // A quiesce failure after a clean loop end still publishes: the
+            // report seals from partial state (drain unproven) so a second
+            // signal during teardown keeps the "report already written"
+            // contract. Settlement must succeed first: the child's
+            // disposition is a fact the document reports, never a guess. A
+            // failed loop keeps today's settle-and-detach without a report.
+            let published = match &finish {
+                Ok(()) => Some(publish(context)),
+                Err(_) => None,
+            };
             let detach = detach(context);
-            combine_capture_failure(error, finish, detach)
+            combine_quiesce_failure(error, finish, published, detach)
         }
         Err(loop_error) => {
             let combined = also_failed(loop_error, error, "terminal quiescence");
@@ -2975,7 +3790,22 @@ fn stop_signal_name(signal: libc::c_int) -> String {
 }
 
 fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
-    let policy = capture_policy(args.kind, args.metrics, args.unsafe_requested)?;
+    run_owned_inner_with_host(args, stop, &crate::attach::require_multi_capable_host)
+}
+
+fn run_owned_inner_with_host(
+    args: &RunArgs,
+    stop: Arc<SignalState>,
+    host: &dyn Fn() -> crate::attach::MultiHostVerdict,
+) -> Result<OwnedRunOutcome> {
+    let policy = capture_policy(
+        args.kind,
+        args.metrics,
+        args.unsafe_requested,
+        args.counter_mode,
+        args.track_short_lived,
+        args.select_endpoint.as_deref(),
+    )?;
     // DR-K8S-1: `run` is a PID scope over its own child, numbered in this
     // observer's namespace; refuse before anything is forked.
     crate::pidns::require_numbering_agrees(crate::pidns::numbering(), "run")?;
@@ -2992,20 +3822,25 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // Name errors precede hazard errors: a script (or a non-executable)
     // is refused with its interpreter fix before any kernel verdict is
     // consulted, exactly as `spawn` would refuse it at the fork.
-    check_owned_target_runnable(&program)
+    check_owned_target_runnable(&program, &args.command[1..])
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
+    let _host = host()?;
     // Before the fork: the owned child can install a seccomp filter after
     // attach, so no startup /proc reading can qualify it — only a kernel
     // proven to exempt the trampoline proceeds by default (F-01). An
     // initial unconfined status cannot qualify that future state.
+    let return_admission = preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?;
     let uretprobe_override =
-        preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?.map(|reason| {
-            render::UretprobeOverride {
+        return_admission
+            .override_reason()
+            .map(|reason| render::UretprobeOverride {
                 flag: "--allow-uretprobe-on-confined-target",
-                reason,
-            }
-        });
+                reason: reason.to_owned(),
+            });
 
+    // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
+    // unobserved outer bound cannot understate the spawn-to-attach gap.
+    let scope_start_ns = crate::attach::monotonic_ns();
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
@@ -3014,12 +3849,17 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     })?;
     let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
+        track_short_lived: args.track_short_lived,
         kind: args.kind,
         modules: args.modules.clone(),
+        exclude_modules: args.exclude_modules.clone(),
         manifests: args.manifests.clone(),
+        prearm_modules: args.prearm_modules.clone(),
         hooks: args.hooks.clone(),
         scope: ScopeArg::Pid(pid),
         metrics: args.metrics,
+        counter_mode: args.counter_mode,
+        select_endpoint: args.select_endpoint.clone(),
         duration: args.duration,
         out: args.out.clone(),
         max_events: args.max_events,
@@ -3035,6 +3875,8 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     let resource_start = crate::timing::read_resource_sample();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
+    engine.set_scope_start_ns(scope_start_ns);
+    engine.retain_return_probe_admission(return_admission);
     // The stop flag arrives from `run_owned`, which keeps its own clone so a
     // signalled `always` failure can be named an interruption, not a refusal.
     // Before the attach, and before the child crosses its barrier: a bad `-o`
@@ -3042,6 +3884,18 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     let out = OutputSink::open(args.kind, args.out.as_deref())
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
+    // 6.14 Option B: arm extensive mode before the session publishes
+    // its CONFIG bit. Counter policies never arm (the CLI
+    // combination already refused), and neither do captures that
+    // cannot publish hints (614b P1): an owned `run` is an exact-PID
+    // scope, which never classifies descendant gaps.
+    engine.arm_extensive(extensive_effective(
+        args.track_short_lived,
+        args.kind,
+        args.metrics,
+        &scope,
+        policy,
+    ));
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
@@ -3064,7 +3918,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
                 || {
                     session.detach_producers_driven(
                         || stop.sigint_deliveries() >= 2,
-                        &mut std::io::stderr(),
+                        terminal_diagnostics().as_mut(),
                     )
                 },
                 || {
@@ -3085,6 +3939,8 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         pid,
         exit_code: None,
         still_running: false,
+        prearm_scope_start_ns: scope_start_ns,
+        prearm_release_ns: None,
     };
 
     // Arm before the barrier: the owned window has to be protected from the
@@ -3099,13 +3955,25 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
             .expect("owned child is present before arm");
         let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
         if let Err(error) = owned.coordinator.arm(&mut io) {
-            return Err(finish_capture_error(
-                pause_failure(error),
-                &mut engine,
-                &mut session,
-                Some(&mut owned),
-                &stop,
-            ));
+            // Never-stop: an Always arm failure that is not lifecycle
+            // collects unpaused with a pause_unavailable gap instead of
+            // aborting before the capture. Lifecycle still aborts.
+            if error.lifecycle() {
+                return Err(finish_capture_error(
+                    pause_failure(error),
+                    &mut engine,
+                    &mut session,
+                    Some(&mut owned),
+                    &stop,
+                ));
+            }
+            let always = error.required();
+            retire_pause_policy(error).map_err(|error| {
+                finish_capture_error(error, &mut engine, &mut session, Some(&mut owned), &stop)
+            })?;
+            if always {
+                owned.coordinator.note_unavailable();
+            }
         }
     }
 
@@ -3126,6 +3994,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
             &stop,
         ));
     }
+    owned.prearm_release_ns = owned.child.as_ref().and_then(|child| child.release_ns());
     {
         let marker = marker_never_seen();
         let cancelled = cancelled_by(&stop);
@@ -3135,7 +4004,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
             .expect("owned child is present after release");
         let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
         if let Err(error) = owned.coordinator.revalidate_after_release(&mut io) {
-            if error.required() || error.lifecycle() {
+            if error.lifecycle() {
                 return Err(finish_capture_error(
                     pause_failure(error),
                     &mut engine,
@@ -3144,7 +4013,13 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
                     &stop,
                 ));
             }
-            retire_pause_policy(error)?;
+            let always = error.required();
+            retire_pause_policy(error).map_err(|error| {
+                finish_capture_error(error, &mut engine, &mut session, Some(&mut owned), &stop)
+            })?;
+            if always {
+                owned.coordinator.note_unavailable();
+            }
         }
     }
 
@@ -3163,6 +4038,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         args.ring_bytes,
         uretprobe_override,
         resource_start,
+        args.select_endpoint.as_deref(),
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -3180,14 +4056,14 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         && let Some(explanation) =
             uretprobe_hazard::describe_owned_child_death(code, evidence.attached_probes)
     {
-        eprintln!("p11scope: {explanation}");
+        emit_capture_diagnostic(&format!("p11scope: {explanation}"));
     }
     // A handed-back child is named on the terminal path (SYSPLAN residual
     // F-15): the evidence already carries `handoff_child_pid`, and the
     // operator reading stderr gets the same PID plus the handoff state.
     // Still exit 0 — a deliberate handoff is observer success.
     if owned.still_running {
-        eprintln!("{}", format_handoff_note(owned.pid));
+        emit_capture_diagnostic(&format_handoff_note(owned.pid));
     }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
@@ -3207,30 +4083,19 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
 /// filter after exec, which is after attach, so there is nothing to read
 /// yet and only a proven-clean kernel proceeds. The death report stays as
 /// the second layer for override runs.
-fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<Option<String>> {
-    match uretprobe_hazard::evaluate(target, overridden) {
-        uretprobe_hazard::Action::Proceed => Ok(None),
-        uretprobe_hazard::Action::ProceedUnderOverride(reason) => {
-            eprintln!(
-                "p11scope: WARNING: {reason}. Continuing because \
-                 --allow-uretprobe-on-confined-target was given"
-            );
-            Ok(Some(reason.to_string()))
-        }
-        uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
-            "refusing to attach: {reason}. Re-run with \
-             --allow-uretprobe-on-confined-target to accept that risk, or capture on a kernel \
-             that exempts the trampoline (`p11scope doctor` shows this kernel's `uretprobe vs \
-             seccomp` verdict)"
-        )),
-        // HIGH-1: missing privilege is not a hazard; the override is not offered.
-        uretprobe_hazard::Action::NotPermitted(why) => {
-            Err(anyhow!(uretprobe_hazard::not_permitted_message(
-                &why,
-                uretprobe_hazard::PrivilegeFacts::current()
-            )))
-        }
+fn preflight_uretprobe_hazard(
+    target: Option<u32>,
+    overridden: bool,
+) -> Result<uretprobe_hazard::ReturnProbeAdmission> {
+    let admission =
+        uretprobe_hazard::admit(target, overridden).map_err(uretprobe_hazard::refusal_error)?;
+    if let Some(reason) = admission.override_reason() {
+        emit_capture_diagnostic(&format!(
+            "p11scope: WARNING: {reason}. Continuing because \
+             --allow-uretprobe-on-confined-target was given"
+        ));
     }
+    Ok(admission)
 }
 
 /// DR-K8S-1: a PID scope is refused unless `/proc` PIDs are proven to be the
@@ -3275,6 +4140,45 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
     }
 }
 
+/// Best-effort capture diagnostic on stderr through the bounded
+/// transport: a full pipe or stalled terminal never parks the capture
+/// thread, and a failed write is dropped, never panicked — diagnostic
+/// delivery never determines the exit status (Sol-full F3).
+/// Target-controlled bytes stay escaped by the caller at this
+/// terminal boundary, exactly as before.
+fn emit_capture_diagnostic(line: &str) {
+    let _ = crate::sink::try_stderr_line(line);
+}
+
+/// One non-wire K0 debug line (T-2): selection-time comparable losses
+/// plus close-time truncation, exit-only total and per-route exit-only
+/// counts, and comparable losses. Space-free arrays: the live cells
+/// split the line on whitespace. Shared by the normal close and the
+/// terminal-failure arm so both print the same shape.
+fn format_k0_debug_line(
+    before: &[u64; 4],
+    facts: &render::CaptureFacts,
+    after: &[u64; 4],
+) -> String {
+    let routes = facts.exit_ended_by_route();
+    format!(
+        "k0-debug: before_comparable=[{},{},{},{}] after_truncated={} after_exit={} after_exit_routes=[{},{},{}] after_comparable=[{},{},{},{}]",
+        before[0],
+        before[1],
+        before[2],
+        before[3],
+        facts.discovery_losses()[3],
+        facts.exit_ended_truncations(),
+        routes[0],
+        routes[1],
+        routes[2],
+        after[0],
+        after[1],
+        after[2],
+        after[3],
+    )
+}
+
 /// Prints every attach failure — shared by `profile` and `trace`, which
 /// each attach the same way. A capture that attached at least one probe
 /// still gets each per-slot failure printed (it is real evidence of a
@@ -3290,19 +4194,16 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
 /// blocked by `perf_event_paranoid`).
 fn report_attach_failures(session: &Session) {
     for (idx, msg) in session.attach_failures() {
-        eprintln!("{}", format_attach_failure(*idx, msg));
+        emit_capture_diagnostic(&format_attach_failure(*idx, msg));
     }
     if session.attached_probes() == 0
         && let Some((_, first)) = session.attach_failures().first()
     {
-        eprintln!(
-            "{}",
-            format_total_attach_refusal(
-                session.attach_failures().len(),
-                session.attached_probes() + session.attach_failures().len(),
-                first
-            )
-        );
+        emit_capture_diagnostic(&format_total_attach_refusal(
+            session.attach_failures().len(),
+            session.attached_probes() + session.attach_failures().len(),
+            first,
+        ));
     }
 }
 
@@ -3342,17 +4243,20 @@ fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> 
 /// Gives unsafe rendering the same diagnostic shape expectations that
 /// `Session::start` published to `MECH_SHAPE`.
 fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
-    let registry = pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
+    let registry = crate::vendor_mechanisms::load_registry()
         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
-    state.set_mech_shapes(crate::shapes::expected_shapes(&registry));
+    // Render may only claim a published shape for ids the publication
+    // actually fit: approved-but-unpublished ids read "no diagnostic
+    // shape", never "decode failed".
+    state.set_mech_shapes(crate::shapes::published_expected_shapes(&registry));
     Ok(())
 }
 
 fn warn_unsafe_policy(policy: CapturePolicy) {
     if policy.uses_unsafe_decoders() {
-        eprintln!(
+        emit_capture_diagnostic(
             "p11scope: WARNING: unsafe-unvalidated-metadata follows caller-supplied pointer \
-             topology and is only for trusted, ABI-valid workloads"
+             topology and is only for trusted, ABI-valid workloads",
         );
     }
 }
@@ -3597,6 +4501,72 @@ enum DiscoveryPass {
     /// Between frames, the pause service alone, for a stop the helper has
     /// already requested: `service_pending_stop` (F-T4-2).
     PendingStop,
+    /// Between frames, one bounded retained-FIFO quantum — at most 256
+    /// ordinary dispatches or one selected pressure-service transaction —
+    /// then yield: `service_backlog_quantum` (H5 Decision 3). Never rearms
+    /// or claims an owned pause, never changes the frame clock/counter,
+    /// never reads aggregate maps or renders.
+    Backlog,
+}
+
+// Proof service follows the existing discovery cadence. Both sides of the
+// complete tick share the actual frame's ticket and ordinary discovery budget.
+fn with_trace_identity_frame<S: crate::attach::detailed_identity::TraceIo, T>(
+    engine: &mut Engine,
+    session: &mut S,
+    pass: Option<DiscoveryPass>,
+    identities: &mut Option<crate::trace_identity::TraceIdentityStore>,
+    tick: impl FnOnce(
+        &mut Engine,
+        &mut S,
+        &mut Option<crate::trace_identity::TraceIdentityStore>,
+    ) -> Result<T>,
+) -> Result<T> {
+    if !matches!(pass, Some(DiscoveryPass::Frame)) || identities.is_none() {
+        return tick(engine, session, identities);
+    }
+    engine.with_trace_frame(session, |engine, session, work| {
+        if let Some(store) = identities.as_mut() {
+            engine.service_trace_images(session, work, |receipt| {
+                let _ = store.admit(receipt);
+            });
+        }
+        let result = tick(engine, session, identities);
+        if let Some(store) = identities.as_mut() {
+            // The scheduler refuses expired/exhausted/closed work. This second
+            // service cannot create a new allowance or repair an earlier row.
+            engine.service_trace_images(session, work, |receipt| {
+                let _ = store.admit(receipt);
+            });
+        }
+        result
+    })
+}
+
+fn begin_trace_identity_stop<S: crate::attach::detailed_identity::TraceIo>(
+    engine: &mut Engine,
+    session: &S,
+    identities: &mut Option<crate::trace_identity::TraceIdentityStore>,
+    terminal: &mut Option<crate::attach::detailed_identity::TraceWorkTicket>,
+    remaining: Duration,
+) {
+    if identities.is_some() && terminal.is_none() {
+        *terminal = Some(engine.begin_trace_terminal_work(remaining));
+    }
+    service_trace_identity_terminal(engine, session, identities, terminal);
+}
+
+fn service_trace_identity_terminal<S: crate::attach::detailed_identity::TraceIo>(
+    engine: &mut Engine,
+    session: &S,
+    identities: &mut Option<crate::trace_identity::TraceIdentityStore>,
+    terminal: &mut Option<crate::attach::detailed_identity::TraceWorkTicket>,
+) {
+    if let (Some(store), Some(work)) = (identities.as_mut(), terminal.as_mut()) {
+        engine.service_trace_images(session, work, |receipt| {
+            let _ = store.admit(receipt);
+        });
+    }
 }
 
 /// The capture tick's discovery gate.
@@ -3615,11 +4585,14 @@ fn discovery_due(
     since_frame: Duration,
     drain: Duration,
     stop_pending: impl FnOnce() -> bool,
+    backlog_pending: impl FnOnce() -> bool,
 ) -> Option<DiscoveryPass> {
     if since_frame >= drain {
         Some(DiscoveryPass::Frame)
     } else if stop_pending() {
         Some(DiscoveryPass::PendingStop)
+    } else if backlog_pending() {
+        Some(DiscoveryPass::Backlog)
     } else {
         None
     }
@@ -3658,6 +4631,19 @@ fn profile_frame_decisions(
         since_frame,
         fresh_snapshot: frame_due,
         render: frame_due,
+    }
+}
+
+/// Request one ordinary frame after loss or native-retirement settlement. Preserve
+/// the render's clock and avoid another clock read on the ordinary cadence.
+fn request_profile_recovery_frame(
+    frame_clock: &mut Instant,
+    drain: Duration,
+    immediate: bool,
+    now: impl FnOnce() -> Instant,
+) {
+    if immediate {
+        *frame_clock = now() - drain;
     }
 }
 
@@ -3772,7 +4758,11 @@ fn drain_discovery_tick(
         Ok(Some(changed)) => Ok((changed, true)),
         Ok(None) => Ok((engine.drain_discovery(session)?, false)),
         Err(error) => {
+            let always = error.required() && !error.lifecycle();
             retire_pause_policy(error)?;
+            if always {
+                owned.coordinator.note_unavailable();
+            }
             Ok((engine.drain_discovery(session)?, false))
         }
     }
@@ -3796,9 +4786,9 @@ impl TickPauseIo for SessionPauseIo<'_> {
 /// run the same code. It runs the frame pass's own pause entry,
 /// `service_pause`, without the frame's ordinary discovery, so a disabled or
 /// retired policy leaves discovery to the next frame. An error is retired
-/// exactly as a frame retires it (`retire_pause_policy`: `always` or a
-/// lifecycle failure ends the capture). The tick's `(plan_changed, paused)`
-/// reports whatever the call applied either way.
+/// exactly as a frame retires it (`retire_pause_policy`: lifecycle ends the
+/// capture, `always` degrades to unpaused with a gap). The tick's
+/// `(plan_changed, paused)` reports whatever the call applied either way.
 fn pending_stop_pass(
     coordinator: &mut PauseCoordinator,
     io: &mut impl TickPauseIo,
@@ -3806,7 +4796,11 @@ fn pending_stop_pass(
     let paused = match service_pause(coordinator, io) {
         Ok(serviced) => serviced,
         Err(error) => {
+            let always = error.required() && !error.lifecycle();
             retire_pause_policy(error)?;
+            if always {
+                coordinator.note_unavailable();
+            }
             false
         }
     };
@@ -3836,18 +4830,28 @@ fn service_pending_stop(
 /// `auto` is explicit best effort: a nonfatal coordinator failure has already
 /// retired the policy and accounted itself as one partial attempt, so the
 /// capture continues on the ordinary cadence and renders `pause: partial`
-/// rather than failing. A required (`always`) or lifecycle failure is never
-/// downgraded that way — it stops the command after safe cleanup (§10.3).
+/// rather than failing. A lifecycle failure is never downgraded that way —
+/// it stops the command after safe cleanup (§10.3). A required (`always`)
+/// non-lifecycle failure degrades to unpaused with a named
+/// `pause_unavailable` gap (never-stop): the caller records one
+/// unavailable attempt and the capture continues, reporting `PARTIAL`.
 fn retire_pause_policy(error: PauseError) -> Result<()> {
-    if error.required() || error.lifecycle() {
+    if error.lifecycle() {
         return Err(pause_failure(error));
     }
     // The pause error chain can quote discovery-batch application failures,
     // which handle target-named records; escape at this terminal boundary too.
-    eprintln!(
+    if error.required() {
+        emit_capture_diagnostic(&format!(
+            "p11scope: pause unavailable: {}; collecting unpaused and reporting pause_unavailable",
+            render::escape_controls(&error.to_string())
+        ));
+        return Ok(());
+    }
+    emit_capture_diagnostic(&format!(
         "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
         render::escape_controls(&error.to_string())
-    );
+    ));
     Ok(())
 }
 
@@ -3930,8 +4934,8 @@ fn advance_trace_frame_clock(frame_clock: &mut Instant, pass: DiscoveryPass, now
 }
 
 /// Counts one gated discovery pass: only a frame pass counts a frame, and
-/// its forced-sweep verdict travels with it, so a pending-stop pass
-/// neither shifts the cadence nor forces a sweep.
+/// its forced-sweep verdict travels with it, so a pending-stop or backlog
+/// pass neither shifts the cadence nor forces a sweep.
 fn count_discovery_pass(frame_tick: &mut u64, pass: DiscoveryPass) -> CountedPass {
     match pass {
         DiscoveryPass::Frame => {
@@ -3942,6 +4946,10 @@ fn count_discovery_pass(frame_tick: &mut u64, pass: DiscoveryPass) -> CountedPas
             }
         }
         DiscoveryPass::PendingStop => CountedPass {
+            pass,
+            force_full: false,
+        },
+        DiscoveryPass::Backlog => CountedPass {
             pass,
             force_full: false,
         },
@@ -4040,6 +5048,56 @@ fn split_staged_discovery(
     (records, malformed)
 }
 
+/// One tick's discovery staging allowance (H5): the drain quantum, bounded
+/// by the shared discovery allowance minus what the session already staged
+/// and what the Engine still holds. Staging stops instead of over-admitting;
+/// excess records stay in the kernel ring with producer-side overflow.
+fn discovery_stage_quantum(staged_len: usize, engine_held: usize) -> usize {
+    crate::discovery::engine::DISCOVERY_HELD_CAP
+        .saturating_sub(staged_len)
+        .saturating_sub(engine_held)
+        .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)
+}
+
+/// Stages one quiescence poll's discovery items up to the shared allowance.
+/// Stops at the cap instead of growing past it; the first unstaged record
+/// stays unread in the ring, and the caller stops draining discovery on
+/// later polls once `overflow` is set. At the cap the transport positions
+/// decide: a proven-empty transport is the exact-N lossless positive and
+/// trips nothing, while anything still unread trips `overflow`. Staged
+/// malformed items hold credits like staged records until the quiesced
+/// batch accounts them.
+fn stage_quiesced_discovery_items<D>(
+    transport: &mut D,
+    mut next: impl FnMut(&mut D) -> Option<crate::events::DiscoveryItem>,
+    mut transport_empty: impl FnMut(&D) -> bool,
+    staged_records: &mut Vec<p11scope_ebpf_common::DiscoveryRecord>,
+    staged_malformed: &mut u64,
+    cap: usize,
+    overflow: &mut bool,
+) {
+    for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
+        if staged_records
+            .len()
+            .saturating_add(*staged_malformed as usize)
+            >= cap
+        {
+            if transport_empty(transport) {
+                return;
+            }
+            *overflow = true;
+            return;
+        }
+        match next(transport) {
+            Some(crate::events::DiscoveryItem::Record(record)) => staged_records.push(record),
+            Some(crate::events::DiscoveryItem::Malformed) => {
+                *staged_malformed = staged_malformed.saturating_add(1);
+            }
+            None => break,
+        }
+    }
+}
+
 /// The control-latency signal printed on stderr the moment a signalled
 /// loop exits, before detach work: the harness timestamps its arrival.
 fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
@@ -4047,6 +5105,37 @@ fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
         "p11scope: cancel: loop exited on signal {} after {ticks} ticks",
         signal.unwrap_or(-1)
     )
+}
+
+#[derive(Clone, Copy)]
+enum CancellationPhase {
+    Capture,
+    Finalization,
+}
+
+/// The real main-thread acknowledgement seam. Keep it outlined so an
+/// independently owned probe can observe entry even when stderr is blocked.
+/// Signal handlers only set atomics; a capture poll calls this once.
+#[inline(never)]
+fn report_capture_cancel(signal: libc::c_int, ticks: u64, phase: CancellationPhase) {
+    let marker = match phase {
+        CancellationPhase::Capture => cancel_marker(Some(signal), ticks),
+        CancellationPhase::Finalization => format!(
+            "p11scope: cancel: signal {signal} observed during finalization after {ticks} ticks"
+        ),
+    };
+    let _ = crate::sink::try_stderr_line(&marker);
+}
+
+fn observe_capture_cancel(
+    interrupted: &SignalState,
+    cancellation: &CaptureCancellation,
+    ticks: u64,
+    phase: CancellationPhase,
+) {
+    if let Some(signal) = cancellation.observe(interrupted.first_signal()) {
+        report_capture_cancel(signal, ticks, phase);
+    }
 }
 
 /// The loop-end marker for a target that exited mid-capture: the
@@ -4059,6 +5148,10 @@ pub(crate) fn capture_ready_line(attached_probes: usize) -> String {
     format!("p11scope: capturing: {attached_probes} probe(s) attached; stop with Ctrl-C")
 }
 
+fn loader_readiness_line(active_hooks: usize) -> String {
+    format!("p11scope: loader readiness: {active_hooks} active hook(s)")
+}
+
 /// The disclosure line, printed on stderr before the readiness line, when
 /// an `auto` session runs per-offset links instead of uprobe-multi
 /// (DR-CLASSIC-PID0): the reason is also `evidence.attach_backend.fallback`.
@@ -4068,6 +5161,18 @@ pub(crate) fn attach_fallback_line(fallback: Option<&str>) -> Option<String> {
 
 fn target_exit_marker(ticks: u64) -> String {
     format!("p11scope: capture ended: target exited after {ticks} ticks")
+}
+
+/// The plain-words stderr line emitted beside the target-exit marker when
+/// the expected-target-exit wait tripped its no-progress bound: the target
+/// exited but its cleanup never drained, so the capture ends with the
+/// calls collected so far. `None` on the ordinary all-clear path.
+fn target_exit_cleanup_pending_line(tripped: bool) -> Option<String> {
+    tripped.then(|| {
+        "p11scope: the target exited but its cleanup was still pending with no progress for 6 s; \
+         the capture ends with the calls collected so far"
+            .to_string()
+    })
 }
 
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
@@ -4087,6 +5192,13 @@ fn resolve_drain_cadence(kind: Kind, drain_interval: Option<Duration>) -> Durati
 
 pub(crate) fn resolve_ring_bytes(ring_bytes: Option<u32>) -> u32 {
     ring_bytes.unwrap_or(p11scope_ebpf_common::RING_BYTES)
+}
+
+/// A journal (Joint key-operations) capture loads the larger EVENTS ring
+/// unless `--ring-bytes` names a size; every other capture keeps
+/// [`resolve_ring_bytes`].
+pub(crate) fn resolve_journal_ring_bytes(ring_bytes: Option<u32>) -> u32 {
+    ring_bytes.unwrap_or(p11scope_ebpf_common::JOINT_RING_BYTES)
 }
 
 struct CaptureConsumers<'state> {
@@ -4114,6 +5226,7 @@ type ProfileTerminalContext<
     'stdout_ref,
     'stdout_open,
     'output,
+    'collection,
 > = (
     &'engine mut Engine,
     &'session mut Session,
@@ -4121,6 +5234,7 @@ type ProfileTerminalContext<
     &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'output mut Option<AtomicFile>,
+    &'collection mut metrics::CaptureCollection,
 );
 
 type TraceTickContext<
@@ -4133,6 +5247,7 @@ type TraceTickContext<
     'stdout_ref,
     'stdout_open,
     'out_file,
+    'identities,
 > = (
     &'engine mut Engine,
     &'session mut Session,
@@ -4142,6 +5257,7 @@ type TraceTickContext<
     &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
+    &'identities mut Option<crate::trace_identity::TraceIdentityStore>,
 );
 
 #[derive(Debug)]
@@ -4271,7 +5387,9 @@ pub(crate) const POST_Q_RECORD_REASON: &str =
 /// named reason. The terminal evidence is already PARTIAL via the kept
 /// unproven marker; the reason says which ring broke quiescence.
 fn report_post_q_record(ring: &str) {
-    eprintln!("p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}");
+    let _ = crate::sink::try_stderr_line(&format!(
+        "p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}"
+    ));
 }
 
 /// Routes one ring's post-Q result into the terminal evidence: the named
@@ -4317,7 +5435,7 @@ fn quiescence_unproven_line(waited: Duration, in_flight: u64) -> String {
 /// report-schema change: a `stop_quiescence` report field belongs to a
 /// later task.
 fn report_quiescence_unproven(waited: Duration, in_flight: u64) {
-    eprintln!("{}", quiescence_unproven_line(waited, in_flight));
+    let _ = crate::sink::try_stderr_line(&quiescence_unproven_line(waited, in_flight));
 }
 
 fn finish_capture_with<C, T>(
@@ -4395,16 +5513,54 @@ fn capture_profile(
     ring_bytes: Option<u32>,
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
+    counter_inputs: Option<metrics::CounterCaptureInputs>,
+    select_endpoint: Option<&str>,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
+    // 6.15: resolve the CLI endpoint selection once, against the live
+    // broad plan, before the loop, and open the K0 detail window over
+    // a resolution with the selection-time broad read. The attempt —
+    // resolved slot or named refusal — records into the additive
+    // ledger the report composes; aggregate capture is untouched on
+    // every path.
+    let mut selection_ledger = metrics::selected_detail_driver::SelectionLedger::new();
+    let mut k0_window: Option<metrics::selected_detail_driver::K0Window> = None;
+    if let Some(name) = select_endpoint
+        && let Some(resolved) = metrics::selected_detail_driver::run_metrics_selection_stage(
+            name,
+            engine.plan(),
+            scope,
+            &mut selection_ledger,
+        )
+    {
+        let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy()
+        else {
+            unreachable!("resolve_selection admits Counters plans only");
+        };
+        k0_window = metrics::selected_detail_driver::open_k0_production(
+            resolved,
+            budget.endpoint_limit() as usize,
+            crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
+            engine.counter_reserver(),
+            session,
+            engine.plan(),
+            engine.pinned(),
+            session.pid_lifecycle_facts(),
+            metrics::selected_detail_driver::k0_comparable_losses(&engine.capture_facts()),
+            owned.is_some(),
+            &mut selection_ledger,
+        );
+    }
+    let cancellation = CaptureCancellation::default();
     let live_display = LiveDisplay::for_stdout();
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
+    let mut collection = metrics::CaptureCollection::new(counter_inputs);
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
@@ -4507,20 +5663,22 @@ fn capture_profile(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
-    let mut last_snapshot: Option<(Vec<metrics::SlotReport>, metrics::KernelEvidence)> = None;
+    let mut last_snapshot: Option<metrics::CaptureSnapshot> = None;
     #[cfg(test)]
     crate::first_use_probe::discovery_loss(
         crate::first_use_probe::DiscoveryStage::BeforeLoop,
         session,
     );
+    let active_loader_hooks = engine.active_loader_hook_count(session);
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
-        eprintln!("{line}");
+        emit_capture_diagnostic(&line);
     }
-    eprintln!("{}", capture_ready_line(session.attached_probes()));
+    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
@@ -4530,6 +5688,11 @@ fn capture_profile(
         ticks += 1;
         let tick_start = Instant::now();
         let elapsed = clock.elapsed();
+        if interrupted.interrupted() {
+            session.stop_gate().request_stop();
+            observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+            break Ok(CaptureEnd::Signal);
+        }
         // One frame-clock read decides this tick's whole frame (F-T8-1).
         let tick_frame = profile_frame_decisions(|| last_frame.elapsed(), drain);
         let tick = {
@@ -4548,9 +5711,18 @@ fn capture_profile(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
+                    // Fresh every tick: only this tick's backlog pass may
+                    // schedule a zero sleep below.
+                    consumers.scheduling.note_discovery_backlog(false);
+                    // Eager, not lazy: a second gate closure would fight the
+                    // stop closure for the context borrow, and this reads no
+                    // clock — the tick's one frame read stays the gate's.
+                    let discovery_pending = context
+                        .0
+                        .discovery_backlog_pending(context.1.staged_discovery_len());
                     let Some(pass) = discovery_due(tick_frame.since_frame, drain, || {
                         owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
-                    }) else {
+                    }, || discovery_pending) else {
                         return Ok((false, false, context.0.plan()));
                     };
                     #[cfg(test)]
@@ -4574,6 +5746,19 @@ fn capture_profile(
                             context.2.as_deref_mut(),
                             interrupted,
                         )?,
+                        DiscoveryPass::Backlog => {
+                            // One bounded retained quantum, then yield: the
+                            // outcome's dispatch flag is the same resync
+                            // signal a frame carries. Only a pass that both
+                            // progressed and left more work schedules a zero
+                            // sleep; a stuck pass returns to the wait.
+                            let outcome =
+                                context.0.service_backlog_quantum(context.1)?;
+                            consumers
+                                .scheduling
+                                .note_discovery_backlog(outcome.pending && outcome.progressed);
+                            (outcome.changed, false)
+                        }
                     };
                     consumers
                         .scheduling
@@ -4585,13 +5770,20 @@ fn capture_profile(
                     );
                     Ok((plan_changed, paused, context.0.plan()))
                 },
-                |context| capture_end(
-                    context.0,
-                    context.2.as_deref(),
-                    interrupted,
-                    elapsed,
-                    duration,
-                ),
+                |context| {
+                    let end = capture_end(
+                        context.0,
+                        context.2.as_deref(),
+                        interrupted,
+                        elapsed,
+                        duration,
+                    )?;
+                    if end == Some(CaptureEnd::Signal) {
+                        context.1.stop_gate().request_stop();
+                        observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+                    }
+                    Ok(end)
+                },
                 |context, consumers| {
                     if profile {
                         *consumers.malformed_records += drain_events(
@@ -4619,15 +5811,13 @@ fn capture_profile(
                 |context, consumers| {
                     profile_tick_snapshot(tick_frame, snapshot_cache, || {
                         let phase_start = Instant::now();
-                        let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
-                        if !profile {
-                            kernel_evidence.ring_loss = 0;
-                        }
-                        let reports = metrics::read(context.1, context.0.plan())?;
+                        let snapshot = collection.fresh(
+                            context.1, context.0.plan(), context.0.pinned(), profile,
+                        )?;
                         consumers
                             .scheduling
                             .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
-                        Ok((reports, kernel_evidence))
+                        Ok(snapshot)
                     })
                 },
                 |context| {
@@ -4643,10 +5833,12 @@ fn capture_profile(
                 },
             )?
         };
-        let (paused, (reports, kernel_evidence)) = match tick {
+        let (paused, snapshot) = match tick {
             CaptureTick::Continue { paused, snapshot } => (paused, snapshot),
             CaptureTick::End(end) => break Ok(end),
         };
+        let reports = snapshot.reports();
+        let kernel_evidence = snapshot.kernel_evidence();
 
         if tick_frame.render {
             last_frame = Instant::now();
@@ -4655,15 +5847,16 @@ fn capture_profile(
             scheduling.sync_engine_stages(engine);
             scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
             scheduling.sync_tail_stats(engine);
-            let ev = evidence_for(
+            let mut ev = evidence_for(
                 engine,
                 engine.capture_facts(),
                 session.attached_probes(),
                 session.dynamic_per_offset_attached(),
                 session.static_multi_attached(),
                 session.attach_backend_evidence(),
+                session.object_capture_evidence(),
                 session.attach_failures(),
-                &reports,
+                reports,
                 kernel_evidence,
                 process_tracker.evidence(),
                 malformed_records,
@@ -4678,14 +5871,19 @@ fn capture_profile(
                 owned
                     .as_deref()
                     .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                None,
+                session.unpublished_mechanisms(),
             );
-            let frame = render::live(
-                &reports,
+            render::apply_counter_snapshot(&mut ev, &snapshot);
+            let frame = render::live_snapshot_scoped(
+                &snapshot,
                 &ev,
                 elapsed,
                 &engine.capture_facts().heading(),
                 mode,
                 policy,
+                scope.kind(),
+                state.mechanisms(),
             );
             if let Some(bytes) = live_display.frame_bytes(&frame, false) {
                 write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
@@ -4696,6 +5894,12 @@ fn capture_profile(
                 break Ok(CaptureEnd::Error);
             }
         }
+        request_profile_recovery_frame(
+            &mut last_frame,
+            drain,
+            engine.take_immediate_exec_recovery_frame(),
+            Instant::now,
+        );
         collect_sink_drops(
             stdout,
             &mut scheduling,
@@ -4706,13 +5910,22 @@ fn capture_profile(
         scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
-        // (RB-2). Staging applies nothing.
-        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+        // (RB-2). Staging applies nothing. The quantum and the readiness
+        // poll share one allowance with what the Engine still holds (H5).
+        // The session enforces the shared allowance structurally from
+        // the same Engine-held count the quantum was sized from.
+        session.stage_discovery(
+            discovery_stage_quantum(
+                session.staged_discovery_len(),
+                engine.discovery_held_len(),
+            ),
+            engine.discovery_held_len(),
+        )?;
         wait_until_ready(
-            &session.readiness_fds(),
+            &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
                 paused,
-                scheduling.last_drain_had_backlog(),
+                scheduling.last_drain_had_backlog() || scheduling.last_discovery_backlog(),
                 drain.saturating_sub(last_frame.elapsed()),
             ),
         );
@@ -4722,16 +5935,38 @@ fn capture_profile(
     // waits, drains and snapshots) and emit the existing stop marker as
     // the acknowledgement, adjacent to the request.
     session.stop_gate().request_stop();
-    if matches!(loop_result, Ok(CaptureEnd::Signal)) {
-        eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
-    }
+    observe_capture_cancel(
+        interrupted,
+        &cancellation,
+        ticks,
+        if matches!(loop_result, Ok(CaptureEnd::Signal)) {
+            CancellationPhase::Capture
+        } else {
+            CancellationPhase::Finalization
+        },
+    );
+    let poll_terminal_cancellation = || {
+        observe_capture_cancel(
+            interrupted,
+            &cancellation,
+            ticks,
+            CancellationPhase::Finalization,
+        );
+    };
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        eprintln!("{}", target_exit_marker(ticks));
+        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
+        {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
     // loss sampling, with the loop's real ending (an Err result is an
     // error ending — the loop still ended).
     let loop_end_ns = crate::attach::monotonic_ns();
+    // F3: watches close at the first effective STOP, not at this later
+    // loop-end sample.
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -4755,6 +5990,18 @@ fn capture_profile(
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // K0: snapshot the exec witness while the tap is still live.
+    // Quiescence invalidates the PID lifecycle tap (and the later
+    // terminal drain would too), so a snapshot past this point always
+    // reads terminal and would void every window as caller-changed.
+    // The close compares this against the selection-time facts.
+    let mut k0_close_facts = k0_window.as_ref().map(|_| session.pid_lifecycle_facts());
+    // K0 shutdown tail: discovery records drained after the snapshot —
+    // quiescence-staged and terminal-drained — bypass the terminal tap,
+    // so the close scans them PID-matched for exec/exit/fault.
+    let k0_tail_records =
+        std::cell::RefCell::<Vec<p11scope_ebpf_common::DiscoveryRecord>>::new(Vec::new());
+    let k0_tail_malformed = std::cell::Cell::new(0u64);
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -4762,14 +6009,27 @@ fn capture_profile(
     // loop's real end, then detach): a bare `?` here would skip both and
     // SIGKILL a child `--duration` should hand back alive.
     let quiesce_outcome = match (|| -> Result<QuiesceOutcome> {
+        poll_terminal_cancellation();
         let mut service_error: Option<anyhow::Error> = None;
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
             split_staged_discovery(session.take_staged_discovery());
+        // K0 tail starts past the pre-snapshot staged prefix: those items
+        // left the ring before the snapshot and already feed the witness.
+        let k0_prefix_records = staged_records.len();
+        let k0_prefix_malformed = staged_malformed;
+        let k0_active = k0_window.is_some();
+        // Quiescence staging shares one allowance with what the Engine still
+        // holds (H5); the first record past the cap stays unread and later
+        // polls stop draining discovery.
+        let quiesce_cap = crate::discovery::engine::DISCOVERY_HELD_CAP
+            .saturating_sub(engine.discovery_held_len());
+        let mut quiesce_overflow = false;
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             if profile {
                 Some(|events_drain: &mut crate::events::OwnedDrain| {
+                    poll_terminal_cancellation();
                     if service_error.is_some() {
                         return;
                     }
@@ -4792,20 +6052,26 @@ fn capture_profile(
                 None
             },
             |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
-                for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-                    match discovery_drain.dequeue() {
-                        Some(crate::events::DiscoveryItem::Record(record)) => {
-                            staged_records.push(record);
-                        }
-                        Some(crate::events::DiscoveryItem::Malformed) => {
-                            staged_malformed = staged_malformed.saturating_add(1);
-                        }
-                        None => break,
-                    }
+                poll_terminal_cancellation();
+                if quiesce_overflow {
+                    return;
                 }
+                stage_quiesced_discovery_items(
+                    &mut *discovery_drain,
+                    |drain| drain.dequeue(),
+                    |drain| {
+                        let positions = crate::events::discovery_drain_positions(drain);
+                        positions.producer == positions.consumer
+                    },
+                    &mut staged_records,
+                    &mut staged_malformed,
+                    quiesce_cap,
+                    &mut quiesce_overflow,
+                );
             },
             Instant::now,
         )?;
+        poll_terminal_cancellation();
         if let Some(error) = service_error {
             return Err(error);
         }
@@ -4825,7 +6091,37 @@ fn capture_profile(
             StopState::Running | StopState::StopRequested => None,
         };
         let stop_quiescence = stop_quiescence_for(stop_state);
-        if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+        if quiesce_overflow {
+            engine.note_quiesced_discovery_overflow();
+        }
+        poll_terminal_cancellation();
+        if k0_active {
+            k0_tail_records
+                .borrow_mut()
+                .extend_from_slice(&staged_records[k0_prefix_records..]);
+            k0_tail_malformed.set(
+                k0_tail_malformed
+                    .get()
+                    .saturating_add(staged_malformed.saturating_sub(k0_prefix_malformed)),
+            );
+        }
+        let discovery_result = if k0_active {
+            engine.apply_quiesced_discovery_observed(
+                session,
+                staged_records,
+                staged_malformed,
+                &mut |record: &p11scope_ebpf_common::DiscoveryRecord| {
+                    k0_tail_records.borrow_mut().push(*record);
+                },
+                &mut |count: u64| {
+                    k0_tail_malformed.set(k0_tail_malformed.get().saturating_add(count));
+                },
+            )
+        } else {
+            engine.apply_quiesced_discovery(session, staged_records, staged_malformed)
+        };
+        poll_terminal_cancellation();
+        if discovery_result? {
             let plan = engine.plan();
             state.sync_plan(plan);
         }
@@ -4833,6 +6129,7 @@ fn capture_profile(
     })() {
         Ok(outcome) => outcome,
         Err(error) => {
+            poll_terminal_cancellation();
             let mut settle_context = (&mut *engine, &mut *session, &mut owned);
             return Err(finish_quiesce_error(
                 error,
@@ -4843,20 +6140,90 @@ fn capture_profile(
                     None => Ok(()),
                 },
                 |context| {
-                    context.1.detach_producers_driven(
-                        || interrupted.sigint_deliveries() >= 2,
-                        &mut std::io::stderr(),
+                    // No Q positions exist: seal from partial state with
+                    // quiescence unproven. NotReached would claim the
+                    // stop gate never ran; Unproven names the
+                    // attempted-but-unestablished Q.
+                    let mut terminal_context = (
+                        &mut *context.0,
+                        &mut *context.1,
+                        &mut *context.2,
+                        &mut *stdout,
+                        &mut stdout_open,
+                        &mut output,
+                        &mut collection,
+                    );
+                    let mut consumers = CaptureConsumers {
+                        state: &mut state,
+                        tracker: &mut process_tracker,
+                        tracer: None,
+                        malformed_records: &mut malformed_records,
+                        scheduling: &mut scheduling,
+                        stop_quiescence: render::StopQuiescence {
+                            state: render::QuiescenceState::Unproven,
+                            post_q_events: false,
+                            post_q_discovery: false,
+                        },
+                    };
+                    // K0 on the quiesce-error path: no provable close
+                    // boundary, so the shared close voids the window as
+                    // broad-stopping.
+                    let k0 =
+                        k0_window
+                            .take()
+                            .map(|window| metrics::selected_detail_driver::K0Close {
+                                window,
+                                facts: terminal_context.1.pid_lifecycle_facts(),
+                                clean: false,
+                                tail_records: Vec::new(),
+                                tail_malformed: 0,
+                            });
+                    run_terminal(
+                        &mut terminal_context,
+                        &mut consumers,
+                        scope,
+                        profile,
+                        policy,
+                        mode,
+                        ring_bytes,
+                        clock,
+                        wall_start,
+                        drain,
+                        &live_display,
+                        &uretprobe_override,
+                        capture_tracking_degraded,
+                        &poll_terminal_cancellation,
+                        // Sealing during a quiesce failure: the watches end
+                        // stopped, never as a clean scope end.
+                        CaptureEnd::Error,
+                        watch_stop_ns,
+                        k0,
+                        select_endpoint.map(|_| &mut selection_ledger),
                     )
+                    .map(|_| ())
+                },
+                |context| {
+                    let result = context.1.detach_producers_driven(
+                        || {
+                            poll_terminal_cancellation();
+                            interrupted.sigint_deliveries() >= 2
+                        },
+                        terminal_diagnostics().as_mut(),
+                    );
+                    poll_terminal_cancellation();
+                    result
                 },
             ));
         }
     };
     let (quiesced, stop_quiescence) = quiesce_outcome;
+    let k0_terminal_active = k0_window.is_some();
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
-    finish_capture_with(
+    let outcome = finish_capture_with(
         &mut finish_context,
         loop_result,
         |context, result| {
+            poll_terminal_cancellation();
             finish_capture_loop(
                 result,
                 context.0,
@@ -4866,12 +6233,18 @@ fn capture_profile(
             )
         },
         |context| {
-            context.1.detach_producers_driven(
-                || interrupted.sigint_deliveries() >= 2,
-                &mut std::io::stderr(),
-            )
+            poll_terminal_cancellation();
+            let result = context.1.detach_producers_driven(
+                || {
+                    poll_terminal_cancellation();
+                    interrupted.sigint_deliveries() >= 2
+                },
+                terminal_diagnostics().as_mut(),
+            );
+            poll_terminal_cancellation();
+            result
         },
-        |context, _end, _detached| {
+        |context, end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -4879,6 +6252,7 @@ fn capture_profile(
                 &mut *stdout,
                 &mut stdout_open,
                 &mut output,
+                &mut collection,
             );
             let mut consumers = CaptureConsumers {
                 state: &mut state,
@@ -4892,13 +6266,28 @@ fn capture_profile(
                 &mut terminal_context,
                 &mut consumers,
                 quiesced,
-                &mut std::io::stderr(),
-                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
+                terminal_diagnostics().as_mut(),
+                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
+                    poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
                     let plan_changed = match quiesced {
+                        Some(q) if k0_terminal_active => {
+                            context.0.drain_discovery_terminal_to_position_observed(
+                                context.1,
+                                q.discovery_q,
+                                &mut post_q_discovery,
+                                &mut |record: &p11scope_ebpf_common::DiscoveryRecord| {
+                                    k0_tail_records.borrow_mut().push(*record);
+                                },
+                                &mut |count: u64| {
+                                    k0_tail_malformed
+                                        .set(k0_tail_malformed.get().saturating_add(count));
+                                },
+                            )?
+                        }
                         Some(q) => context.0.drain_discovery_terminal_to_position(
                             context.1,
                             q.discovery_q,
@@ -4920,6 +6309,7 @@ fn capture_profile(
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     if profile {
                         (
                             drain_original_root_events(
@@ -4943,6 +6333,7 @@ fn capture_profile(
                     }
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
                     if profile {
@@ -4969,141 +6360,303 @@ fn capture_profile(
                     Ok(())
                 },
                 |context, consumers| {
-                    context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
-                    let maps_start = Instant::now();
-                    let reports = metrics::read(context.1, context.0.plan())?;
-                    let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
-                    if !profile {
-                        kernel_evidence.ring_loss = 0;
-                    }
-                    consumers
-                        .scheduling
-                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
-                    context
-                        .0
-                        .pinned()
-                        .check_unchanged()
-                        .map_err(anyhow::Error::msg)?;
-                    let settle_start = crate::attach::monotonic_ns();
-                    context.0.settle_terminal_drain();
-                    consumers.scheduling.span_stage(
-                        crate::timing::StageKind::Cleanup,
-                        "settle_terminal_drain",
-                        settle_start,
-                        crate::attach::monotonic_ns(),
-                    );
-                    consumers.scheduling.note_terminal(
-                        kernel_evidence.ring_loss,
-                        context.0.capture_facts().discovery_losses()[0],
-                    );
-                    // Pre-publication detach work only: the terminal
-                    // callback publishes before the producers detach, so
-                    // this reads 0 in every Detailed report and the
-                    // post-publication teardown stays explicitly unmeasured.
-                    consumers.scheduling.add_phase(
-                        SchedulingPhase::Detach,
-                        Duration::from_millis(context.1.detach_wall_ms()),
-                    );
-                    let render_start = Instant::now();
-                    consumers.scheduling.sync_discovery_deferrals(context.0);
-                    consumers.scheduling.sync_engine_stages(context.0);
-                    consumers
-                        .scheduling
-                        .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
-                    consumers.scheduling.sync_tail_stats(context.0);
-                    let mut ev = evidence_for(
-                        context.0,
-                        context.0.capture_facts(),
-                        context.1.attached_probes(),
-                        context.1.dynamic_per_offset_attached(),
-                        context.1.static_multi_attached(),
-                        context.1.attach_backend_evidence(),
-                        context.1.attach_failures(),
-                        &reports,
-                        kernel_evidence,
-                        consumers.tracker.evidence(),
-                        *consumers.malformed_records,
-                        consumers.state,
-                        context.0.pinned().provider_changed(),
+                    poll_terminal_cancellation();
+                    // K0: the close boundary is clean only with proven
+                    // quiescence and no blind post-quiescence tail. The
+                    // tail records drained after the snapshot ride into
+                    // the close for their PID-matched scan.
+                    let k0 = k0_window.take().map(|window| {
+                        let facts = k0_close_facts
+                            .take()
+                            .expect("K0 close facts snapshot with the window");
+                        metrics::selected_detail_driver::K0Close {
+                            window,
+                            facts,
+                            clean: quiesced.is_some()
+                                && !consumers.stop_quiescence.post_q_discovery,
+                            tail_records: k0_tail_records.take(),
+                            tail_malformed: k0_tail_malformed.take(),
+                        }
+                    });
+                    run_terminal(
+                        context,
+                        consumers,
+                        scope,
                         profile,
-                        context
-                            .2
-                            .as_deref()
-                            .map_or_else(Default::default, |owned| owned.coordinator.counters()),
-                        context.2.as_deref().map(|owned| owned.still_running),
-                        capture_tracking_degraded,
-                        consumers
-                            .scheduling
-                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
-                        uretprobe_override.clone(),
-                        context
-                            .2
-                            .as_deref()
-                            .and_then(|owned| owned.still_running.then_some(owned.pid)),
-                    );
-                    ev.apply_stop_quiescence(consumers.stop_quiescence);
-                    ev.settle_terminal(profile);
-                    let facts = context.0.capture_facts();
-                    let frame = render::live(
-                        &reports,
-                        &ev,
-                        clock.elapsed(),
-                        &facts.heading(),
-                        mode,
                         policy,
-                    );
-                    if let Some(bytes) = live_display.frame_bytes(&frame, true) {
-                        write_stdout(context.3, context.4, bytes.as_bytes())?;
-                        flush_stdout(context.3, context.4)?;
-                    }
-                    consumers
-                        .scheduling
-                        .add_phase(SchedulingPhase::Render, render_start.elapsed());
-                    collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
-                    settle_terminal_scheduling(
-                        &mut ev,
-                        consumers
-                            .scheduling
-                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
-                        profile,
-                    );
-                    let summary = timing_summary_line(&ev.scheduling);
-                    eprintln!("{summary}");
-
-                    if let Some(mut out_file) = context.5.take() {
-                        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
-                        let started = fmt_rfc3339(wall_start);
-                        let ended = fmt_rfc3339(SystemTime::now());
-                        let capture = render::CaptureMeta {
-                            started: &started,
-                            ended: &ended,
-                            kernel: &kernel,
-                            policy,
-                            scope: scope.kind(),
-                            ring_bytes: resolve_ring_bytes(ring_bytes),
-                            drain_interval_ms: drain.as_millis() as u64,
-                        };
-                        let j = if profile {
-                            render::profile_json(
-                                &reports,
-                                render::VersionedEvidence::wrap(&ev),
-                                consumers.state,
-                                &capture,
-                            )
-                        } else {
-                            render::json(&reports, &ev, &capture)
-                        };
-                        write_json_report(out_file.file(), &j)?;
-                        out_file.commit().map_err(anyhow::Error::msg)?;
-                    }
-                    Ok(ev)
+                        mode,
+                        ring_bytes,
+                        clock,
+                        wall_start,
+                        drain,
+                        &live_display,
+                        &uretprobe_override,
+                        capture_tracking_degraded,
+                        &poll_terminal_cancellation,
+                        end,
+                        watch_stop_ns,
+                        k0,
+                        select_endpoint.map(|_| &mut selection_ledger),
+                    )
                 },
             )
         },
-    )
+    );
+
+    /// Seals the terminal profile evidence and publishes the `-o` report:
+    /// the snapshot half of quiesce-then-publish, shared by the terminal
+    /// callback and the quiesce-error path so a second signal during
+    /// teardown keeps the "report already written" contract. Drains stay
+    /// with the terminal callback; the error path seals from partial state
+    /// with quiescence unproven, never reusing Q positions it never reached.
+    #[allow(clippy::too_many_arguments)]
+    fn run_terminal(
+        context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>,
+        consumers: &mut CaptureConsumers<'_>,
+        scope: &Scope,
+        profile: bool,
+        policy: CapturePolicy,
+        mode: &str,
+        ring_bytes: Option<u32>,
+        clock: Instant,
+        wall_start: SystemTime,
+        drain: Duration,
+        live_display: &LiveDisplay,
+        uretprobe_override: &Option<render::UretprobeOverride>,
+        capture_tracking_degraded: bool,
+        poll_terminal_cancellation: &impl Fn(),
+        end: CaptureEnd,
+        stop_ns: Option<u64>,
+        k0: Option<metrics::selected_detail_driver::K0Close>,
+        mut selection_ledger: Option<&mut metrics::selected_detail_driver::SelectionLedger>,
+    ) -> Result<render::Evidence> {
+        poll_terminal_cancellation();
+        context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        let maps_start = Instant::now();
+        let snapshot =
+            match context
+                .6
+                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // K0 on the terminal-failure path (m5): the close
+                    // boundary is unprovable and no report seals, but the
+                    // opted-in debug line still prints, so a quiesce-error
+                    // void shows its counts instead of failing the live
+                    // cells with a parse error. Best-effort facts: the
+                    // terminal read never landed.
+                    if let Some(close) = &k0
+                        && std::env::var_os("P11SCOPE_K0_DEBUG").is_some()
+                    {
+                        let failed_facts = context.0.capture_facts();
+                        let failed_losses =
+                            metrics::selected_detail_driver::k0_comparable_losses(&failed_facts);
+                        emit_capture_diagnostic(&format_k0_debug_line(
+                            &close.window.before_losses(),
+                            &failed_facts,
+                            &failed_losses,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+        let reports = snapshot.reports();
+        let kernel_evidence = snapshot.kernel_evidence();
+        // K0: close the detail window after the broad terminal read,
+        // while the banks are still live (detach is post-publication).
+        // The loss snapshot lands after the terminal drain, so growth
+        // inside the window voids the detail.
+        if let Some(k0) = k0 {
+            let ledger = selection_ledger
+                .as_mut()
+                .expect("a K0 window implies a staged selection");
+            let after_facts = context.0.capture_facts();
+            let after_losses = metrics::selected_detail_driver::k0_comparable_losses(&after_facts);
+            // Non-wire K0 debug line (T-2): the live cells set
+            // `P11SCOPE_K0_DEBUG` to check comparable/exit-only counts.
+            // Never in the JSON report; operators never see it unless
+            // they opt in.
+            if std::env::var_os("P11SCOPE_K0_DEBUG").is_some() {
+                // Bounded transport, like every capture diagnostic: a
+                // blocking stderr write would park the capture thread.
+                emit_capture_diagnostic(&format_k0_debug_line(
+                    &k0.window.before_losses(),
+                    &after_facts,
+                    &after_losses,
+                ));
+            }
+            metrics::selected_detail_driver::close_k0_production(
+                k0,
+                context.1,
+                context.0.plan(),
+                context.0.pinned(),
+                after_losses,
+                ledger,
+            );
+        }
+        poll_terminal_cancellation();
+        consumers
+            .scheduling
+            .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
+        context
+            .0
+            .pinned()
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?;
+        let (prearm_hold, prearm_owned_run, prearm_release_ns) =
+            owned_prearm_hold(context.2.as_deref());
+        finish_prearm_terminal(
+            context.0,
+            &*context.1,
+            context.1.attach_failures(),
+            end,
+            reports,
+            &kernel_evidence,
+            *consumers.malformed_records,
+            stop_ns,
+            prearm_hold,
+            prearm_owned_run,
+            prearm_release_ns,
+        );
+        let settle_start = crate::attach::monotonic_ns();
+        context.0.settle_terminal_drain();
+        consumers.scheduling.span_stage(
+            crate::timing::StageKind::Cleanup,
+            "settle_terminal_drain",
+            settle_start,
+            crate::attach::monotonic_ns(),
+        );
+        consumers.scheduling.note_terminal(
+            kernel_evidence.ring_loss,
+            context.0.capture_facts().discovery_losses()[0],
+        );
+        // Pre-publication detach work only: the terminal
+        // callback publishes before the producers detach, so
+        // this reads 0 in every Detailed report and the
+        // post-publication teardown stays explicitly unmeasured.
+        consumers.scheduling.add_phase(
+            SchedulingPhase::Detach,
+            Duration::from_millis(context.1.detach_wall_ms()),
+        );
+        let render_start = Instant::now();
+        consumers.scheduling.sync_discovery_deferrals(context.0);
+        consumers.scheduling.sync_engine_stages(context.0);
+        consumers
+            .scheduling
+            .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
+        consumers.scheduling.sync_tail_stats(context.0);
+        let mut ev = evidence_for(
+            context.0,
+            context.0.capture_facts(),
+            context.1.attached_probes(),
+            context.1.dynamic_per_offset_attached(),
+            context.1.static_multi_attached(),
+            context.1.attach_backend_evidence(),
+            context.1.object_capture_evidence(),
+            context.1.attach_failures(),
+            reports,
+            kernel_evidence,
+            consumers.tracker.evidence(),
+            *consumers.malformed_records,
+            consumers.state,
+            context.0.pinned().provider_changed(),
+            profile,
+            context
+                .2
+                .as_deref()
+                .map_or_else(Default::default, |owned| owned.coordinator.counters()),
+            context.2.as_deref().map(|owned| owned.still_running),
+            capture_tracking_degraded,
+            consumers
+                .scheduling
+                .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+            uretprobe_override.clone(),
+            context
+                .2
+                .as_deref()
+                .and_then(|owned| owned.still_running.then_some(owned.pid)),
+            None,
+            context.1.unpublished_mechanisms(),
+        );
+        ev.apply_stop_quiescence(consumers.stop_quiescence);
+        ev.settle_terminal(profile);
+        render::apply_counter_snapshot(&mut ev, &snapshot);
+        let facts = context.0.capture_facts();
+        let frame = render::live_snapshot_scoped(
+            &snapshot,
+            &ev,
+            clock.elapsed(),
+            &facts.heading(),
+            mode,
+            policy,
+            scope.kind(),
+            consumers.state.mechanisms(),
+        );
+        if let Some(bytes) = live_display.frame_bytes(&frame, true) {
+            write_stdout(context.3, context.4, bytes.as_bytes())?;
+            flush_stdout(context.3, context.4)?;
+        }
+        consumers
+            .scheduling
+            .add_phase(SchedulingPhase::Render, render_start.elapsed());
+        collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
+        settle_terminal_scheduling(
+            &mut ev,
+            consumers
+                .scheduling
+                .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+            profile,
+        );
+        render::apply_counter_snapshot(&mut ev, &snapshot);
+        let summaries = timing_summary_lines(&ev.scheduling);
+        poll_terminal_cancellation();
+        for summary in &summaries {
+            let _ = crate::sink::try_stderr_line(summary);
+        }
+
+        poll_terminal_cancellation();
+        if let Some(mut out_file) = context.5.take() {
+            let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let started = fmt_rfc3339(wall_start);
+            let ended = fmt_rfc3339(SystemTime::now());
+            let capture = render::CaptureMeta {
+                started: &started,
+                ended: &ended,
+                kernel: &kernel,
+                policy,
+                scope: scope.kind(),
+                ring_bytes: resolve_ring_bytes(ring_bytes),
+                drain_interval_ms: drain.as_millis() as u64,
+            };
+            let j = if profile {
+                render::profile_json(
+                    reports,
+                    render::VersionedEvidence::wrap(&ev),
+                    consumers.state,
+                    &capture,
+                )
+            } else {
+                render::json(reports, &ev, &capture)
+            };
+            let j = render::with_counter_snapshot(j, &snapshot);
+            let j = match selection_ledger {
+                Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
+                None => j,
+            };
+            poll_terminal_cancellation();
+            write_json_report(out_file.file(), &j)?;
+            poll_terminal_cancellation();
+            out_file.commit().map_err(anyhow::Error::msg)?;
+            poll_terminal_cancellation();
+        }
+        Ok(ev)
+    }
+
+    outcome
 }
 
 /// Writes the `-o` report — the same call whether the loop above it
@@ -5140,6 +6693,7 @@ fn capture_trace(
     resource_start: crate::timing::ResourceSample,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
+    let cancellation = CaptureCancellation::default();
     let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
     // attach, then appended to as lines arrive. Only now, with the session
@@ -5163,6 +6717,15 @@ fn capture_trace(
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
 
+    // Refusal disables naming only; the existing capture/count path continues.
+    let mut identities = if session.enable_trace_proof().is_ok() {
+        session
+            .trace_proof()
+            .cloned()
+            .map(crate::trace_identity::TraceIdentityStore::new)
+    } else {
+        None
+    };
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
     let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
@@ -5178,6 +6741,8 @@ fn capture_trace(
         ));
     }
     let mut tracer = trace::Tracer::new(engine.plan());
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    let reexec_diagnostic = session.reexec_diagnostic();
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
@@ -5196,7 +6761,11 @@ fn capture_trace(
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
     if let Err(error) = emit_trace_line(
-        &trace::capture_line(policy),
+        &format!(
+            "{}\n{}",
+            trace::capture_line(policy),
+            trace::identity_note()
+        ),
         stdout,
         &mut stdout_open,
         out_file,
@@ -5210,14 +6779,16 @@ fn capture_trace(
         ));
     }
     let clock = Instant::now();
+    let active_loader_hooks = engine.active_loader_hook_count(session);
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
-        eprintln!("{line}");
+        emit_capture_diagnostic(&line);
     }
-    eprintln!("{}", capture_ready_line(session.attached_probes()));
+    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -5225,7 +6796,21 @@ fn capture_trace(
         ticks += 1;
         let tick_start = Instant::now();
         let elapsed = clock.elapsed();
-        let tick = {
+        if interrupted.interrupted() {
+            session.stop_gate().request_stop();
+            observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+            break Ok(CaptureEnd::Signal);
+        }
+        // Fresh every tick: only this tick's backlog pass may
+        // schedule a zero sleep below.
+        scheduling.note_discovery_backlog(false);
+        // Eager, not lazy: a second gate closure would fight the stop
+        // closure for the engine/session borrow, and this reads no clock.
+        let discovery_pending = engine.discovery_backlog_pending(session.staged_discovery_len());
+        let pass = discovery_due(last_frame.elapsed(), drain, || {
+            owned_stop_pending(engine, session, owned.as_deref(), interrupted)
+        }, || discovery_pending);
+        let tick = with_trace_identity_frame(engine, session, pass, &mut identities, |engine, session, identities| {
             let mut context = (
                 &mut *engine,
                 &mut *session,
@@ -5235,6 +6820,7 @@ fn capture_trace(
                 &mut *stdout,
                 &mut stdout_open,
                 &mut *out_file,
+                identities,
             );
             let mut consumers = CaptureConsumers {
                 state: &mut state,
@@ -5259,12 +6845,11 @@ fn capture_trace(
                     '_,
                     '_,
                     '_,
+                    '_,
                 >,
                     consumers: &mut CaptureConsumers<'_>,
                 | {
-                    let Some(pass) = discovery_due(frame_clock.elapsed(), drain, || {
-                        owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
-                    }) else {
+                    let Some(pass) = pass else {
                         return Ok((false, false, context.0.plan()));
                     };
                     advance_trace_frame_clock(frame_clock, pass, Instant::now());
@@ -5284,19 +6869,39 @@ fn capture_trace(
                             context.2.as_deref_mut(),
                             interrupted,
                         )?,
+                        DiscoveryPass::Backlog => {
+                            // One bounded retained quantum, then yield: the
+                            // outcome's dispatch flag is the same resync
+                            // signal a frame carries. Only a pass that both
+                            // progressed and left more work schedules a zero
+                            // sleep; a stuck pass returns to the wait.
+                            let outcome =
+                                context.0.service_backlog_quantum(context.1)?;
+                            consumers
+                                .scheduling
+                                .note_discovery_backlog(outcome.pending && outcome.progressed);
+                            (outcome.changed, false)
+                        }
                     };
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
                     Ok((plan_changed, paused, context.0.plan()))
                 },
-                |context| capture_end(
-                    context.0,
-                    context.2.as_deref(),
-                    interrupted,
-                    elapsed,
-                    duration,
-                ),
+                |context| {
+                    let end = capture_end(
+                        context.0,
+                        context.2.as_deref(),
+                        interrupted,
+                        elapsed,
+                        duration,
+                    )?;
+                    if end == Some(CaptureEnd::Signal) {
+                        context.1.stop_gate().request_stop();
+                        observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+                    }
+                    Ok(end)
+                },
                 |context, consumers| {
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
@@ -5305,6 +6910,7 @@ fn capture_trace(
                         consumers.tracker,
                         scope,
                         consumers.tracer.as_deref_mut().expect("trace consumer"),
+                        context.8.as_ref(),
                         context.5,
                         context.6,
                         context.7,
@@ -5349,12 +6955,18 @@ fn capture_trace(
                         Ok(())
                     }
                 },
-            )?
-        };
+            )
+        })?;
         let paused = match tick {
             CaptureTick::Continue { paused, snapshot: () } => paused,
             CaptureTick::End(end) => break Ok(end),
         };
+        request_profile_recovery_frame(
+            &mut last_frame,
+            drain,
+            engine.take_immediate_exec_recovery_frame(),
+            Instant::now,
+        );
         flush_stdout(stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
             f.flush().context("flushing trace output file")?;
@@ -5372,13 +6984,22 @@ fn capture_trace(
         scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
-        // (RB-2). Staging applies nothing.
-        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+        // (RB-2). Staging applies nothing. The quantum and the readiness
+        // poll share one allowance with what the Engine still holds (H5).
+        // The session enforces the shared allowance structurally from
+        // the same Engine-held count the quantum was sized from.
+        session.stage_discovery(
+            discovery_stage_quantum(
+                session.staged_discovery_len(),
+                engine.discovery_held_len(),
+            ),
+            engine.discovery_held_len(),
+        )?;
         wait_until_ready(
-            &session.readiness_fds(),
+            &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
                 paused,
-                scheduling.last_drain_had_backlog(),
+                scheduling.last_drain_had_backlog() || scheduling.last_discovery_backlog(),
                 drain.saturating_sub(last_frame.elapsed()),
             ),
         );
@@ -5387,17 +7008,48 @@ fn capture_trace(
     // First stop observation: request the stop immediately (before child
     // waits, drains and snapshots) and emit the existing stop marker as
     // the acknowledgement, adjacent to the request.
+    let stop_started = Instant::now();
     session.stop_gate().request_stop();
-    if matches!(loop_result, Ok(CaptureEnd::Signal)) {
-        eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
-    }
+    observe_capture_cancel(
+        interrupted,
+        &cancellation,
+        ticks,
+        if matches!(loop_result, Ok(CaptureEnd::Signal)) {
+            CancellationPhase::Capture
+        } else {
+            CancellationPhase::Finalization
+        },
+    );
+    let poll_terminal_cancellation = || {
+        observe_capture_cancel(
+            interrupted,
+            &cancellation,
+            ticks,
+            CancellationPhase::Finalization,
+        );
+    };
+    let mut terminal = None;
+    begin_trace_identity_stop(
+        engine,
+        session,
+        &mut identities,
+        &mut terminal,
+        STOP_QUIESCE_BUDGET.saturating_sub(stop_started.elapsed()),
+    );
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        eprintln!("{}", target_exit_marker(ticks));
+        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
+        {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
 
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
     // loss sampling, with the loop's real ending.
     let loop_end_ns = crate::attach::monotonic_ns();
+    // F3: watches close at the first effective STOP, not at this later
+    // loop-end sample (which follows the identity stop).
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -5423,28 +7075,39 @@ fn capture_trace(
     // loop's real end, then detach): a bare `?` here would skip both and
     // SIGKILL a child `--duration` should hand back alive.
     let quiesce_outcome = match (|| -> Result<QuiesceOutcome> {
+        poll_terminal_cancellation();
         let mut service_error: Option<anyhow::Error> = None;
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
             split_staged_discovery(session.take_staged_discovery());
+        // Quiescence staging shares one allowance with what the Engine still
+        // holds (H5); the first record past the cap stays unread and later
+        // polls stop draining discovery.
+        let quiesce_cap = crate::discovery::engine::DISCOVERY_HELD_CAP
+            .saturating_sub(engine.discovery_held_len());
+        let mut quiesce_overflow = false;
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             Some(|events_drain: &mut crate::events::OwnedDrain| {
+                poll_terminal_cancellation();
                 if service_error.is_some() {
                     return;
                 }
                 stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
                 let phase_start = Instant::now();
-                match drain_trace_events_from(
+                match drain_trace_events_from_with_identities(
                     events_drain,
-                    &mut remaining,
-                    &mut state,
-                    &mut process_tracker,
-                    scope,
-                    &mut tracer,
-                    stdout,
-                    &mut stdout_open,
-                    out_file,
+                    (
+                        &mut remaining,
+                        &mut state,
+                        &mut process_tracker,
+                        scope,
+                        &mut tracer,
+                    ),
+                    identities.as_ref(),
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    reexec_diagnostic.as_ref(),
+                    (&mut *(stdout), &mut stdout_open, &mut *(out_file)),
                     Some(crate::events::LIVE_POLL_QUANTUM),
                 ) {
                     Ok((malformed, _)) => {
@@ -5456,20 +7119,26 @@ fn capture_trace(
                 collect_sink_drops(stdout, &mut scheduling, &mut None, Instant::now());
             }),
             |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
-                for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-                    match discovery_drain.dequeue() {
-                        Some(crate::events::DiscoveryItem::Record(record)) => {
-                            staged_records.push(record);
-                        }
-                        Some(crate::events::DiscoveryItem::Malformed) => {
-                            staged_malformed = staged_malformed.saturating_add(1);
-                        }
-                        None => break,
-                    }
+                poll_terminal_cancellation();
+                if quiesce_overflow {
+                    return;
                 }
+                stage_quiesced_discovery_items(
+                    &mut *discovery_drain,
+                    |drain| drain.dequeue(),
+                    |drain| {
+                        let positions = crate::events::discovery_drain_positions(drain);
+                        positions.producer == positions.consumer
+                    },
+                    &mut staged_records,
+                    &mut staged_malformed,
+                    quiesce_cap,
+                    &mut quiesce_overflow,
+                );
             },
             Instant::now,
         )?;
+        poll_terminal_cancellation();
         if let Some(error) = service_error {
             return Err(error);
         }
@@ -5485,15 +7154,24 @@ fn capture_trace(
             StopState::Running | StopState::StopRequested => None,
         };
         let stop_quiescence = stop_quiescence_for(stop_state);
-        if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+        if quiesce_overflow {
+            engine.note_quiesced_discovery_overflow();
+        }
+        poll_terminal_cancellation();
+        let discovery_result =
+            engine.apply_quiesced_discovery(session, staged_records, staged_malformed);
+        poll_terminal_cancellation();
+        if discovery_result? {
             let plan = engine.plan();
             state.sync_plan(plan);
             tracer.sync_plan(plan);
         }
+        service_trace_identity_terminal(engine, session, &mut identities, &mut terminal);
         Ok((quiesced, stop_quiescence))
     })() {
         Ok(outcome) => outcome,
         Err(error) => {
+            poll_terminal_cancellation();
             let mut settle_context = (&mut *engine, &mut *session, &mut owned);
             return Err(finish_quiesce_error(
                 error,
@@ -5503,11 +7181,20 @@ fn capture_trace(
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
                     None => Ok(()),
                 },
+                // Trace `-o` is a live stream, not a sealed report:
+                // quiesce-error publication stays profile-only until a
+                // trace abandon contract asks for its own terminal line.
+                |_| Ok(()),
                 |context| {
-                    context.1.detach_producers_driven(
-                        || interrupted.sigint_deliveries() >= 2,
-                        &mut std::io::stderr(),
-                    )
+                    let result = context.1.detach_producers_driven(
+                        || {
+                            poll_terminal_cancellation();
+                            interrupted.sigint_deliveries() >= 2
+                        },
+                        terminal_diagnostics().as_mut(),
+                    );
+                    poll_terminal_cancellation();
+                    result
                 },
             ));
         }
@@ -5518,6 +7205,7 @@ fn capture_trace(
         &mut finish_context,
         loop_result,
         |context, result| {
+            poll_terminal_cancellation();
             finish_capture_loop(
                 result,
                 context.0,
@@ -5527,12 +7215,19 @@ fn capture_trace(
             )
         },
         |context| {
-            context.1.detach_producers_driven(
-                || interrupted.sigint_deliveries() >= 2,
-                &mut std::io::stderr(),
-            )
+            poll_terminal_cancellation();
+            let result = context.1.detach_producers_driven(
+                || {
+                    poll_terminal_cancellation();
+                    interrupted.sigint_deliveries() >= 2
+                },
+                terminal_diagnostics().as_mut(),
+            );
+            poll_terminal_cancellation();
+            result
         },
         |context, end, _detached| {
+            poll_terminal_cancellation();
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -5542,6 +7237,7 @@ fn capture_trace(
                 &mut *stdout,
                 &mut stdout_open,
                 &mut *out_file,
+                &mut identities,
             );
             let mut consumers = CaptureConsumers {
                 state: &mut state,
@@ -5555,10 +7251,11 @@ fn capture_trace(
                 &mut terminal_context,
                 &mut consumers,
                 quiesced,
-                &mut std::io::stderr(),
-                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_>,
+                terminal_diagnostics().as_mut(),
+                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
+                    poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
                     let plan_changed = match quiesced {
@@ -5580,9 +7277,11 @@ fn capture_trace(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::DiscoveryTerminal, phase_start.elapsed());
+                    service_trace_identity_terminal(context.0, context.1, context.8, &mut terminal);
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut root_write_error = None;
                     let root_result = drain_original_root_events(
@@ -5590,16 +7289,22 @@ fn capture_trace(
                         context.2.as_deref_mut(),
                         interrupted,
                         |domain, event| {
-                            reduce_trace_event(
+                            reduce_trace_event_with_identities(
                                 domain,
-                                context.3,
-                                consumers.state,
-                                consumers.tracker,
-                                scope,
-                                consumers.tracer.as_deref_mut().expect("trace consumer"),
-                                context.5,
-                                context.6,
-                                context.7,
+                                (
+                                    &mut *(context.3),
+                                    &mut *(consumers.state),
+                                    &mut *(consumers.tracker),
+                                    scope,
+                                    &mut *(consumers
+                                        .tracer
+                                        .as_deref_mut()
+                                        .expect("trace consumer")),
+                                ),
+                                context.8.as_ref(),
+                                #[cfg(feature = "h6-reexec-diagnostic")]
+                                reexec_diagnostic.as_ref(),
+                                (&mut *(context.5), &mut *(context.6), &mut *(context.7)),
                                 &mut root_write_error,
                                 event,
                             )
@@ -5609,6 +7314,7 @@ fn capture_trace(
                     (root_result, root_write_error)
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
                     *consumers.malformed_records += drain_trace_events(
@@ -5618,6 +7324,7 @@ fn capture_trace(
                         consumers.tracker,
                         scope,
                         consumers.tracer.as_deref_mut().expect("trace consumer"),
+                        context.8.as_ref(),
                         context.5,
                         context.6,
                         context.7,
@@ -5640,6 +7347,7 @@ fn capture_trace(
                     Ok(())
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     context
                         .0
@@ -5657,6 +7365,26 @@ fn capture_trace(
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
+                    // Terminal observation health is sampled beside the
+                    // reports, before the watches close on it. This feeds
+                    // watch health only; the publication sample stays after
+                    // `settle_terminal_drain` (trace terminal-order contract).
+                    let watch_kernel = prearm_terminal_kernel(context.1)?;
+                    let (prearm_hold, prearm_owned_run, prearm_release_ns) =
+                        owned_prearm_hold(context.2.as_deref());
+                    finish_prearm_terminal(
+                        context.0,
+                        &*context.1,
+                        context.1.attach_failures(),
+                        end,
+                        &reports,
+                        &watch_kernel,
+                        *consumers.malformed_records,
+                        watch_stop_ns,
+                        prearm_hold,
+                        prearm_owned_run,
+                        prearm_release_ns,
+                    );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
                     consumers.scheduling.span_stage(
@@ -5702,6 +7430,7 @@ fn capture_trace(
                         context.1.dynamic_per_offset_attached(),
                         context.1.static_multi_attached(),
                         context.1.attach_backend_evidence(),
+                        context.1.object_capture_evidence(),
                         context.1.attach_failures(),
                         &reports,
                         terminal_kernel,
@@ -5724,6 +7453,8 @@ fn capture_trace(
                             .2
                             .as_deref()
                             .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                        None,
+                        context.1.unpublished_mechanisms(),
                     );
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
@@ -5735,10 +7466,10 @@ fn capture_trace(
                     evidence.apply_stop_quiescence(consumers.stop_quiescence);
                     evidence.settle_terminal(true);
                     if *consumers.malformed_records > 0 {
-                        eprintln!(
+                        let _ = crate::sink::try_stderr_line(&format!(
                             "p11scope: {} malformed ring-buffer records discarded this capture",
                             *consumers.malformed_records
-                        );
+                        ));
                     }
                     emit_trace_terminal_accounted(
                         &mut evidence,
@@ -5752,8 +7483,34 @@ fn capture_trace(
                         context.6,
                         context.7,
                     )?;
-                    let summary = timing_summary_line(&evidence.scheduling);
-                    eprintln!("{summary}");
+                    crate::attach::reexec_diagnostic::terminal!(context.1, |diag| {
+                        let gap = context.1.physical_gap_summary();
+                        diag.finish(
+                            crate::attach::reexec_diagnostic::canary_counts(&reports),
+                            consumers
+                                .tracer
+                                .as_deref()
+                                .expect("trace consumer")
+                                .raw_calls(),
+                            [
+                                evidence.scheduling.sink_dropped_bytes,
+                                evidence.scheduling.sink_timeouts,
+                                evidence.scheduling.sink_stall_ms,
+                                u64::from(*context.6),
+                            ],
+                            [
+                                Some(gap.episodes),
+                                Some(u64::from(gap.open)),
+                                Some(u64::from(gap.unknown)),
+                                gap.max_gap_ns.map(|n| n / 1_000_000),
+                            ],
+                        );
+                    });
+                    let summaries = timing_summary_lines(&evidence.scheduling);
+                    poll_terminal_cancellation();
+                    for summary in &summaries {
+                        let _ = crate::sink::try_stderr_line(summary);
+                    }
                     Ok(evidence)
                 },
             )
@@ -5987,12 +7744,12 @@ fn collect_sink_drops(
     acc.note_sink_drops(&drops);
     if sink_note_due(&drops, *last_note, now) {
         *last_note = Some(now);
-        eprintln!(
+        let _ = crate::sink::try_stderr_line(&format!(
             "p11scope: stdout stalled; dropped {} bytes in {} flush timeouts (policy {})",
             drops.dropped_bytes,
             drops.timeouts,
             crate::render::SINK_POLICY_BOUNDED_WAIT_DROP,
-        );
+        ));
     }
 }
 
@@ -6144,6 +7901,10 @@ pub(crate) struct SchedulingAccumulator {
     drain_repolls: u64,
     drain_budget_exhaustions: u64,
     last_backlog: bool,
+    /// This tick's discovery-backlog pass both progressed and left more
+    /// retained work: the tick sleeps nothing, like a drain backlog. Reset
+    /// at every gate decision; only the tick's own backlog pass sets it.
+    last_discovery_backlog: bool,
     last_drain_end: Option<Instant>,
     loop_ended: bool,
     max_inter_drain_gap_ms: u64,
@@ -6193,6 +7954,7 @@ impl Default for SchedulingAccumulator {
             drain_repolls: 0,
             drain_budget_exhaustions: 0,
             last_backlog: false,
+            last_discovery_backlog: false,
             last_drain_end: None,
             loop_ended: false,
             max_inter_drain_gap_ms: 0,
@@ -6289,6 +8051,14 @@ impl SchedulingAccumulator {
     pub(crate) fn note_terminal_drain(&mut self, may_remain: bool) {
         self.terminal_drain_truncated = may_remain;
         self.last_backlog = false;
+    }
+
+    /// Records this tick's discovery-backlog outcome for the idle wait:
+    /// `more` is true only when the pass both progressed and left retained
+    /// work, which sleeps nothing like a drain backlog. A stuck pass
+    /// reports false and returns to the normal readiness wait.
+    pub(crate) fn note_discovery_backlog(&mut self, more: bool) {
+        self.last_discovery_backlog = more;
     }
 
     /// Carries the engine's live-discovery frame-deferral count (F4) into
@@ -6428,6 +8198,10 @@ impl SchedulingAccumulator {
         self.last_backlog
     }
 
+    pub(crate) fn last_discovery_backlog(&self) -> bool {
+        self.last_discovery_backlog
+    }
+
     pub(crate) fn snapshot(&self, terminal_bound: u64) -> render::SchedulingEvidence {
         // The run-side spans (drain) plus the last-synced engine spans
         // (scan..cleanup): one merged view per snapshot.
@@ -6559,10 +8333,15 @@ fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::R
 /// The concise operator-visible timing summary (Phase 2): stage totals,
 /// the longest indivisible operation, the inter-drain gap distribution,
 /// newcomer queue ages, and capture-process resources. Missing samples
-/// render as `n/a`, never as zero.
-pub(crate) fn timing_summary_line(scheduling: &render::SchedulingEvidence) -> String {
+/// render as `n/a`, never as zero. One short `p11scope: timing:` stderr
+/// line per group, so a terminal never wraps a 400-column line; the
+/// newcomer-queue ages stay on one line for the stop-race oracle.
+pub(crate) fn timing_summary_lines(scheduling: &render::SchedulingEvidence) -> Vec<String> {
     fn ms(value: Option<u64>) -> String {
         value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"))
+    }
+    fn kb(value: Option<u64>) -> String {
+        value.map_or_else(|| "n/a".to_string(), |kb| kb.to_string())
     }
     let stages = &scheduling.stage_ms;
     let longest = &scheduling.longest_op;
@@ -6573,51 +8352,46 @@ pub(crate) fn timing_summary_line(scheduling: &render::SchedulingEvidence) -> St
     let gap = &scheduling.inter_drain_gap;
     let queue = &scheduling.newcomer_queue;
     let resource = &scheduling.resource;
-    format!(
-        "p11scope: timing: stages scan={}ms pin={}ms bind={}ms plan={}ms merge={}ms projection={}ms attach={}ms drain={}ms cleanup={}ms (unknown-clock spans: {}); longest op: {}; inter-drain gap p50/p99/max: {}/{}/{} ({} samples); newcomer queue: admitted {} (max/mean age {}/{}), pending {} (oldest {}), dropped {} (max age {}); tails: {} published, {} skipped; rss start/readiness/end/max: {}/{}/{}/{} kB",
-        stages.scan,
-        stages.pin,
-        stages.bind,
-        stages.plan,
-        stages.merge,
-        stages.projection,
-        stages.attach,
-        stages.drain,
-        stages.cleanup,
-        scheduling.stage_unknown_clock,
-        longest_text,
-        ms(gap.p50_ms),
-        ms(gap.p99_ms),
-        ms(gap.max_ms),
-        gap.samples,
-        queue.admitted,
-        ms(queue.max_admitted_age_ms),
-        ms(queue.mean_admitted_age_ms),
-        queue.pending,
-        ms(queue.oldest_pending_age_ms),
-        queue.dropped,
-        ms(queue.max_dropped_age_ms),
-        scheduling.tail_publishes,
-        scheduling.tail_skips,
-        scheduling
-            .resource
-            .start
-            .rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-        scheduling
-            .resource
-            .readiness
-            .rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-        scheduling
-            .resource
-            .end
-            .rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-        resource
-            .max_rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-    )
+    vec![
+        format!(
+            "p11scope: timing: stages scan={}ms pin={}ms bind={}ms plan={}ms merge={}ms projection={}ms",
+            stages.scan, stages.pin, stages.bind, stages.plan, stages.merge, stages.projection,
+        ),
+        format!(
+            "p11scope: timing: stages attach={}ms drain={}ms cleanup={}ms (unknown-clock spans: {}); longest op: {}",
+            stages.attach,
+            stages.drain,
+            stages.cleanup,
+            scheduling.stage_unknown_clock,
+            longest_text,
+        ),
+        format!(
+            "p11scope: timing: inter-drain gap p50/p99/max: {}/{}/{} ({} samples)",
+            ms(gap.p50_ms),
+            ms(gap.p99_ms),
+            ms(gap.max_ms),
+            gap.samples,
+        ),
+        format!(
+            "p11scope: timing: newcomer queue: admitted {} (max/mean age {}/{}), pending {} (oldest {}), dropped {} (max age {})",
+            queue.admitted,
+            ms(queue.max_admitted_age_ms),
+            ms(queue.mean_admitted_age_ms),
+            queue.pending,
+            ms(queue.oldest_pending_age_ms),
+            queue.dropped,
+            ms(queue.max_dropped_age_ms),
+        ),
+        format!(
+            "p11scope: timing: tails: {} published, {} skipped; rss start/readiness/end/max: {}/{}/{}/{} kB",
+            scheduling.tail_publishes,
+            scheduling.tail_skips,
+            kb(resource.start.rss_kb),
+            kb(resource.readiness.rss_kb),
+            kb(resource.end.rss_kb),
+            kb(resource.max_rss_kb),
+        ),
+    ]
 }
 
 fn reduce_profile_event(
@@ -6713,6 +8487,10 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
     tracker: &mut process::Tracker,
     scope: &Scope,
     tracer: &mut trace::Tracer,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    #[cfg(feature = "h6-reexec-diagnostic")] diagnostic: Option<
+        &crate::attach::reexec_diagnostic::Diagnostic,
+    >,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
@@ -6727,16 +8505,19 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
             stop,
             Some(crate::events::TERMINAL_DRAIN_BOUND),
             |ev| {
-                if let Err(error) = reduce_trace_event(
+                if let Err(error) = reduce_trace_event_with_identities(
                     domain,
-                    remaining,
-                    state,
-                    tracker,
-                    scope,
-                    tracer,
-                    stdout,
-                    stdout_open,
-                    out_file,
+                    (
+                        &mut *(remaining),
+                        &mut *(state),
+                        &mut *(tracker),
+                        scope,
+                        &mut *(tracer),
+                    ),
+                    identities,
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    diagnostic,
+                    (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
                     &mut write_error,
                     ev,
                 ) {
@@ -6767,6 +8548,7 @@ fn drain_trace_events<W: Write>(
     tracker: &mut process::Tracker,
     scope: &Scope,
     tracer: &mut trace::Tracer,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
@@ -6782,6 +8564,8 @@ fn drain_trace_events<W: Write>(
             post_q_record,
         } => (true, Some((events_q, post_q_record))),
     };
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    let reexec_diagnostic = session.reexec_diagnostic();
     let drain = session.event_drain()?;
     if let Some((events_q, post_q_record)) = quiesced {
         let phase_start = Instant::now();
@@ -6794,6 +8578,9 @@ fn drain_trace_events<W: Write>(
             tracker,
             scope,
             tracer,
+            identities,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            reexec_diagnostic.as_ref(),
             stdout,
             stdout_open,
             out_file,
@@ -6824,16 +8611,19 @@ fn drain_trace_events<W: Write>(
                 &mut *drain,
                 |_: &crate::events::OwnedDrain| crate::events::poll_quantum(terminal),
                 |drain, quantum| {
-                    drain_trace_events_from(
+                    drain_trace_events_from_with_identities(
                         drain,
-                        remaining,
-                        state,
-                        tracker,
-                        scope,
-                        tracer,
-                        stdout,
-                        stdout_open,
-                        out_file,
+                        (
+                            &mut *(remaining),
+                            &mut *(state),
+                            &mut *(tracker),
+                            scope,
+                            &mut *(tracer),
+                        ),
+                        identities,
+                        #[cfg(feature = "h6-reexec-diagnostic")]
+                        reexec_diagnostic.as_ref(),
+                        (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
                         quantum,
                     )
                 },
@@ -6871,6 +8661,22 @@ fn combine_trace_errors(reduction: Result<()>, write_error: Option<anyhow::Error
     }
 }
 
+// Existing cfg(test) history/root-fence drivers have no identity store. Keep
+// their conservative entrypoints forwarding to the same actual reducer.
+type TraceEventConsumers<'remaining, 'state, 'tracker, 'scope, 'tracer> = (
+    &'remaining mut Option<u64>,
+    &'state mut semantics::State,
+    &'tracker mut process::Tracker,
+    &'scope Scope,
+    &'tracer mut trace::Tracer,
+);
+type TraceEventOutputs<'stdout, 'open, 'file, W> = (
+    &'stdout mut dyn Write,
+    &'open mut bool,
+    &'file mut Option<W>,
+);
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn reduce_trace_event<W: Write>(
     domain: u64,
@@ -6885,35 +8691,25 @@ fn reduce_trace_event<W: Write>(
     write_error: &mut Option<anyhow::Error>,
     ev: p11scope_ebpf_common::Event,
 ) -> Result<()> {
-    tracker.check_root_event(domain, ev.root_affiliation)?;
-    tracer.count_raw_call(&ev);
-    if observe_fork(domain, tracker, state, scope, &ev) {
-        return Ok(());
-    }
-    let process = identify_tracked(domain, tracker, state, &ev);
-    if write_error.is_some() {
-        if let Some(process) = process {
-            state.observe_process(process, &ev);
-        }
-    } else {
-        let (emitted, error) = emit_bounded_trace_event(
-            remaining,
-            || match process {
-                Some(process) => tracer.on_event_process(&ev, process, state),
-                None => tracer.on_rejected_history(&ev),
-            },
-            stdout,
-            stdout_open,
-            out_file,
-        );
-        *write_error = error;
-        if !emitted && let Some(process) = process {
-            state.observe_process(process, &ev);
-        }
-    }
-    Ok(())
+    reduce_trace_event_with_identities(
+        domain,
+        (
+            &mut *(remaining),
+            &mut *(state),
+            &mut *(tracker),
+            scope,
+            &mut *(tracer),
+        ),
+        None,
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        None,
+        (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
+        write_error,
+        ev,
+    )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     drain: &mut crate::events::EventDrain<S>,
@@ -6927,20 +8723,117 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     out_file: &mut Option<W>,
     quantum: Option<usize>,
 ) -> Result<(u64, bool)> {
+    drain_trace_events_from_with_identities(
+        drain,
+        (
+            &mut *(remaining),
+            &mut *(state),
+            &mut *(tracker),
+            scope,
+            &mut *(tracer),
+        ),
+        None,
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        None,
+        (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
+        quantum,
+    )
+}
+
+fn reduce_trace_event_with_identities<W: Write>(
+    domain: u64,
+    (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    #[cfg(feature = "h6-reexec-diagnostic")] diagnostic: Option<
+        &crate::attach::reexec_diagnostic::Diagnostic,
+    >,
+    (stdout, stdout_open, out_file): TraceEventOutputs<'_, '_, '_, W>,
+    write_error: &mut Option<anyhow::Error>,
+    ev: p11scope_ebpf_common::Event,
+) -> Result<()> {
+    tracker.check_root_event(domain, ev.root_affiliation)?;
+    tracer.count_raw_call(&ev);
+    if observe_fork(domain, tracker, state, scope, &ev) {
+        return Ok(());
+    }
+    let process = identify_tracked(domain, tracker, state, &ev);
+    if write_error.is_some() {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if ev.event_type == p11scope_ebpf_common::event_type::CALL
+            && let Some(diag) = diagnostic
+        {
+            diag.trace_observation(process.is_some(), false, true, false, *stdout_open);
+        }
+        if let Some(process) = process {
+            state.observe_process(process, &ev);
+        }
+    } else {
+        let (attempted, error) = emit_bounded_trace_event(
+            remaining,
+            || match process {
+                Some(process) => {
+                    let executable = identities
+                        .map(|store| store.lookup(process, ev.ts_ns))
+                        .unwrap_or_else(|| {
+                            crate::trace_identity::TraceExecutableView::unknown(
+                                crate::trace_identity::TraceIdentityUnknown::NotSeeded,
+                            )
+                        });
+                    tracer.on_event_process_with_executable(&ev, process, state, executable)
+                }
+                None => tracer.on_rejected_history(&ev),
+            },
+            stdout,
+            stdout_open,
+            out_file,
+        );
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if ev.event_type == p11scope_ebpf_common::event_type::CALL
+            && let Some(diag) = diagnostic
+        {
+            diag.trace_observation(
+                process.is_some(),
+                attempted,
+                false,
+                error.is_some(),
+                *stdout_open,
+            );
+        }
+        *write_error = error;
+        if !attempted && let Some(process) = process {
+            state.observe_process(process, &ev);
+        }
+    }
+    Ok(())
+}
+
+fn drain_trace_events_from_with_identities<S: crate::events::RecordSource, W: Write>(
+    drain: &mut crate::events::EventDrain<S>,
+    (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    #[cfg(feature = "h6-reexec-diagnostic")] diagnostic: Option<
+        &crate::attach::reexec_diagnostic::Diagnostic,
+    >,
+    (stdout, stdout_open, out_file): TraceEventOutputs<'_, '_, '_, W>,
+    quantum: Option<usize>,
+) -> Result<(u64, bool)> {
     let mut write_error = None;
     let mut reduction_error = None;
     let domain = drain.domain_id();
     let may_remain = drain.poll(quantum, |ev| {
-        if let Err(error) = reduce_trace_event(
+        if let Err(error) = reduce_trace_event_with_identities(
             domain,
-            remaining,
-            state,
-            tracker,
-            scope,
-            tracer,
-            stdout,
-            stdout_open,
-            out_file,
+            (
+                &mut *(remaining),
+                &mut *(state),
+                &mut *(tracker),
+                scope,
+                &mut *(tracer),
+            ),
+            identities,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            diagnostic,
+            (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
             &mut write_error,
             ev,
         ) {
@@ -6984,18 +8877,22 @@ fn report_trace_loss<W: Write>(
 }
 
 /// Evidence built from the plan (skips, aliases, surface/vendor gaps), the
-/// session (attach failures), the current reports (in-flight count), and
-/// (profile mode only — always 0 in metrics mode) the ring-buffer/semantic
-/// gap counters. Calls `.verdict()` itself before returning, so callers
-/// must not call it again.
+/// session (attach failures, object-capture status), the current reports
+/// (in-flight count), and (profile mode only — always 0 in metrics mode)
+/// the ring-buffer/semantic gap counters. Calls `.verdict()` itself before
+/// returning, so callers must not call it again. `reload_ledger` hands over
+/// the capture's staged disclosure ledger for the B17 projection (`None`
+/// without a producer — the profile loops stage no semantic lane, so the
+/// key stays absent there).
 #[allow(clippy::too_many_arguments)]
-fn evidence_for(
+pub(crate) fn evidence_for(
     engine: &Engine,
     facts: render::CaptureFacts,
     attached_probes: usize,
     dynamic_per_offset_attached: bool,
     static_multi_attached: bool,
     attach_backend: render::AttachBackendEvidence,
+    object_capture: render::ObjectCaptureEvidence,
     attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
     kernel_evidence: metrics::KernelEvidence,
@@ -7010,6 +8907,8 @@ fn evidence_for(
     scheduling: render::SchedulingEvidence,
     uretprobe_override: Option<render::UretprobeOverride>,
     handoff_child_pid: Option<u32>,
+    reload_ledger: Option<&InventoryCoordinator<OsProcessSource>>,
+    unpublished_mechanisms: u64,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     // The frozen consumer map (plan Task 8 Step 2), in one place:
@@ -7082,6 +8981,7 @@ fn evidence_for(
         semantic_capture_failures: kernel_evidence.semantic_capture_failures
             + semantic.semantic_capture_failures,
         unregistered_mechanisms: kernel_evidence.unregistered_mechanisms,
+        unpublished_mechanisms,
         template_tail_failures: kernel_evidence.template_tail_failures,
         process_tracking_fallbacks: tracking_evidence.fallbacks,
         process_tracking_failures: tracking_evidence
@@ -7117,6 +9017,7 @@ fn evidence_for(
         pause_attempts: pause.attempts,
         pause_confirmed: pause.confirmed,
         pause_partial: pause.partial,
+        pause_unavailable: pause.unavailable,
         child_still_running,
         discovery_ring_loss,
         discovery_state_failures,
@@ -7136,14 +9037,24 @@ fn evidence_for(
             Vec::new()
         },
         attach_backend,
+        object_capture,
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
+        // 6.14 Option B: `None` unless extensive mode armed; the JSON
+        // key is then omitted, never null.
+        gap_exe_hints: engine.gap_exe_hints().copied(),
+        // B17: the staged disclosure ledger projects post-hoc below;
+        // captures without one keep the key absent, never zero.
+        instance_reload_not_excluded: None,
         // Design §5.7: a live-learned attach key is protected only inside a
-        // confirmed pause owner's window. A nonzero debug-state hit counter is
-        // what says a live window happened at all; the design forbids
-        // publishing a count, so this only gates the verdict.
+        // confirmed pause owner's window. An unaccounted debug-state hit is
+        // what says a live window happened at all: hits whose records
+        // resolved benignly loaded nothing the capture could have missed
+        // calls through. The design forbids publishing a count, so this
+        // only gates the verdict.
         unprotected_live_windows: usize::from(
-            facts.loader_discovery().hits > 0 && pause_status != PauseStatus::Sigstop,
+            facts.loader_discovery().hits > facts.loader_discovery().benign_hits
+                && pause_status != PauseStatus::Sigstop,
         ),
         module_unresolved_slots: reports
             .iter()
@@ -7163,8 +9074,71 @@ fn evidence_for(
         p11scope_env: render::snapshot_process_env(),
         completeness: "UNKNOWN",
     };
+    // B17 lane-backed producer: project the staged disclosure ledger
+    // the capture handed over (`None` without a producer — the
+    // profile loops stage no semantic lane, so the key stays absent
+    // there). Profile-lane only: shares and verdicts never read it.
+    ev.instance_reload_not_excluded =
+        reload_ledger.and_then(|ledger| ledger.reload_not_excluded_evidence());
     ev.verdict_with_selection(include_selection);
     ev
+}
+
+/// Exercise the real capture projection from a retained Engine test route.
+/// The route owns discovery, links and gap history; this adapter adds no gap fact.
+#[cfg(test)]
+pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_json::Value; 3] {
+    let state = semantics::State::new(engine.plan());
+    let evidence = evidence_for(
+        engine,
+        engine.capture_facts(),
+        0,
+        false,
+        false,
+        Default::default(),
+        render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+        &[],
+        &[],
+        metrics::KernelEvidence::default(),
+        process::TrackingEvidence::default(),
+        0,
+        &state,
+        false,
+        true,
+        Default::default(),
+        None,
+        false,
+        render::SchedulingEvidence::default(),
+        None,
+        None,
+        None,
+        0,
+    );
+    let mut capture = render::CaptureMeta {
+        started: "t0",
+        ended: "t1",
+        kernel: "test",
+        policy: CapturePolicy::Allowlisted,
+        scope: "pid",
+        ring_bytes: p11scope_ebpf_common::RING_BYTES,
+        drain_interval_ms: 1000,
+    };
+    let profile = render::profile_json(
+        &[],
+        render::VersionedEvidence::wrap(&evidence),
+        &state,
+        &capture,
+    )["evidence"]
+        .clone();
+    capture.policy = CapturePolicy::AggregateOnly;
+    let metrics = render::json(&[], &evidence, &capture)["evidence"].clone();
+    let trace = serde_json::from_str(
+        trace::evidence_line(&evidence, CapturePolicy::Allowlisted)
+            .strip_prefix("EVIDENCE ")
+            .expect("public terminal evidence"),
+    )
+    .expect("valid public terminal evidence");
+    [profile, metrics, trace]
 }
 
 fn attach_mechanisms(
@@ -7212,9 +9186,15 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 mod capture_loop_tests;
 
 #[cfg(test)]
+#[path = "run/cancellation_tests.rs"]
+mod cancellation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attach::BackendSelection;
+    use crate::discovery::engine::tests::copy_executable_via_waited_child;
+    use crate::fixture_guard::DieWithParent as _;
     use std::ffi::OsString;
     use std::os::fd::{AsFd as _, BorrowedFd};
     use std::os::unix::fs::PermissionsExt as _;
@@ -7222,6 +9202,93 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    /// The timing summary wraps to short prefixed stderr lines: every line
+    /// stays greppable under `p11scope: timing:`, every token of the old
+    /// single line survives, and the oracle's `pending N (oldest X)`
+    /// substring stays on one physical line.
+    #[test]
+    fn timing_summary_wraps_to_short_prefixed_lines() {
+        let rss = |kb: u64| render::ResourceSampleEvidence {
+            rss_kb: Some(kb),
+            ..Default::default()
+        };
+        let scheduling = render::SchedulingEvidence {
+            stage_ms: render::StageMs {
+                scan: 6,
+                pin: 1,
+                bind: 0,
+                plan: 0,
+                merge: 0,
+                projection: 0,
+                attach: 7,
+                drain: 1,
+                cleanup: 0,
+            },
+            stage_unknown_clock: 0,
+            longest_op: render::LongestOpEvidence {
+                stage: Some("attach"),
+                op: Some("attach_dynamic_loader"),
+                duration_ms: Some(7),
+            },
+            inter_drain_gap: render::InterDrainGapEvidence {
+                samples: 6693,
+                p50_ms: Some(2),
+                p99_ms: Some(2),
+                max_ms: Some(2),
+            },
+            newcomer_queue: render::NewcomerQueueEvidence {
+                admitted: 0,
+                max_admitted_age_ms: None,
+                mean_admitted_age_ms: None,
+                pending: 3,
+                oldest_pending_age_ms: Some(12),
+                dropped: 0,
+                max_dropped_age_ms: None,
+                ..Default::default()
+            },
+            tail_publishes: 0,
+            tail_skips: 14,
+            resource: render::ResourceEvidence {
+                start: rss(32524),
+                readiness: rss(65684),
+                end: rss(74068),
+                max_rss_kb: Some(74068),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = timing_summary_lines(&scheduling);
+        assert!(lines.len() >= 3, "one long line became several: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.starts_with("p11scope: timing: "),
+                "every line stays prefixed: {line:?}"
+            );
+            assert!(
+                line.len() <= 160,
+                "every line stays short enough to read: {line:?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("pending 3 (oldest 12ms)")),
+            "the oracle substring stays on one physical line: {lines:?}"
+        );
+        let joined = lines.join("\n");
+        for token in [
+            "scan=6ms",
+            "cleanup=0ms",
+            "unknown-clock spans: 0",
+            "longest op: attach/attach_dynamic_loader@7ms",
+            "2ms/2ms/2ms (6693 samples)",
+            "tails: 0 published, 14 skipped",
+            "rss start/readiness/end/max: 32524/65684/74068/74068 kB",
+        ] {
+            assert!(joined.contains(token), "token survives the wrap: {token}");
+        }
+    }
 
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {
         OwnedChild::spawn(
@@ -7946,6 +10013,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &failures,
             &[],
             metrics::KernelEvidence::default(),
@@ -7960,6 +10028,8 @@ mod tests {
             scheduling,
             None,
             None,
+            None,
+            0,
         );
         assert_eq!(
             evidence.attach_failures,
@@ -8157,8 +10227,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let command = directory.path().join("command");
         let replacement = directory.path().join("replacement");
-        std::fs::copy("/bin/true", &command).unwrap();
-        std::fs::copy("/bin/false", &replacement).unwrap();
+        // Waited-child copies: this test execs `command`, and an in-process
+        // copy would hold it open for writing across concurrent forks.
+        // (`set_permissions` only calls chmod, which opens no fd.)
+        copy_executable_via_waited_child(std::path::Path::new("/bin/true"), &command);
+        copy_executable_via_waited_child(std::path::Path::new("/bin/false"), &replacement);
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -8863,7 +10936,12 @@ mod tests {
                 } else {
                     last_errno()
                 };
-                let mut report = [0i32; 66];
+                // The report fits the whole scan range (2 header slots plus
+                // every number 3..8192), so a crowded inherited table cannot
+                // truncate the listing and frame a live descriptor as closed.
+                const SCAN_FIRST: i32 = 3;
+                const SCAN_END: i32 = 8192;
+                let mut report = [0i32; 2 + (SCAN_END - SCAN_FIRST) as usize];
                 report[0] = install_errno;
                 let mut used = 2;
                 if install_errno == 0 {
@@ -8873,7 +10951,7 @@ mod tests {
                         Ok(()) => 0,
                         Err(errno) => errno,
                     };
-                    for fd in 3..8192 {
+                    for fd in SCAN_FIRST..SCAN_END {
                         let flags = libc::fcntl(fd, libc::F_GETFD);
                         if flags >= 0 && used < report.len() {
                             report[used] = fd * 2 + i32::from(flags & libc::FD_CLOEXEC != 0);
@@ -8990,6 +11068,26 @@ mod tests {
         }
     }
 
+    /// The same negative arm under a crowded inherited table: hosted
+    /// runners hand the test dozens of descriptors, so the child report
+    /// must fit the whole scan range and still show every sample number.
+    #[test]
+    fn a_close_range_error_closes_nothing_under_a_crowded_table() {
+        let _crowd: Vec<File> = (0..128).map(|_| File::open("/dev/null").unwrap()).collect();
+        let outcome = closer_with_refused_close_range(libc::EINVAL);
+        if !close_range_refusal_available(outcome.install) {
+            return;
+        }
+        assert_eq!(outcome.closer, libc::EINVAL);
+        for fd in outcome.sample {
+            assert!(
+                outcome.left.iter().any(|(open, _)| *open == fd),
+                "fd {fd} was closed without the fallback: {:?}",
+                outcome.left
+            );
+        }
+    }
+
     /// The pre-exec child keeps exactly its two handoff pipe ends and the
     /// launch file; every other inherited descriptor is closed before it
     /// waits, and the command itself still starts with stdio only.
@@ -9070,6 +11168,27 @@ mod tests {
     }
 
     #[test]
+    fn release_clocks_the_barrier_instant_for_prearm_proofs() {
+        // The barrier-release bound for the pre-arm exactness proof: `None`
+        // behind the barrier, a comparable monotonic instant after.
+        let mut child = spawn("/bin/true", &[]);
+        assert_eq!(child.release_ns(), None);
+        child.release().unwrap();
+        let release = child
+            .release_ns()
+            .expect("a proven release clocks its instant");
+        let later = crate::attach::monotonic_ns().expect("monotonic clock reads");
+        assert!(
+            release <= later,
+            "release {release} precedes a later read {later}"
+        );
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+    }
+
+    #[test]
     fn owned_child_launch_errors_preserve_elf_reason_and_script_guidance() {
         let directory = tempfile::tempdir().unwrap();
         let x32 = [
@@ -9109,7 +11228,9 @@ mod tests {
     fn release_error_defers_settlement_for_owned_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let command = directory.path().join("command");
-        std::fs::copy("/bin/true", &command).unwrap();
+        // Waited-child copy: this test execs `command`, and an in-process
+        // copy would hold it open for writing across concurrent forks.
+        copy_executable_via_waited_child(std::path::Path::new("/bin/true"), &command);
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut child = OwnedChild::spawn(command.clone().into_os_string(), Vec::new()).unwrap();
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -9332,6 +11453,45 @@ mod tests {
         );
     }
 
+    /// An unreadable exit observation at finish invalidates the selection
+    /// coverage instead of failing the run: only a proven exit after a
+    /// target end closes coverage naturally, and an `Interrupted` poll
+    /// from a second signal must not veto the report teardown owes.
+    #[test]
+    fn finish_observation_failure_invalidates_coverage_without_vetoing_finish() {
+        assert!(finish_observation_natural_exit(
+            CaptureEnd::TargetExit,
+            Ok(true)
+        ));
+        for end in [
+            CaptureEnd::Signal,
+            CaptureEnd::DurationExpired,
+            CaptureEnd::LimitReached,
+            CaptureEnd::Error,
+        ] {
+            assert!(
+                !finish_observation_natural_exit(end, Ok(true)),
+                "only a target end closes coverage naturally: {end:?}"
+            );
+        }
+        assert!(!finish_observation_natural_exit(
+            CaptureEnd::TargetExit,
+            Ok(false)
+        ));
+        for observation in [
+            "cannot check whether original pid 7 exited: Interrupted system call (os error 4)",
+            "original pidfd poll failed: revents=0x18",
+        ] {
+            assert!(
+                !finish_observation_natural_exit(
+                    CaptureEnd::TargetExit,
+                    Err(observation.to_string())
+                ),
+                "an unreadable pin proves no exit: {observation}"
+            );
+        }
+    }
+
     #[test]
     fn owned_disposition_records_every_capture_end_state() {
         let cases = [
@@ -9460,6 +11620,7 @@ mod tests {
             let mut exit_code = None;
             let mut still_running = false;
             let mut detached = false;
+            let published = std::cell::Cell::new(false);
             let loop_result: Result<CaptureEnd> = if loop_failed {
                 Err(anyhow::anyhow!("loop failure"))
             } else {
@@ -9482,11 +11643,18 @@ mod tests {
                     )
                 },
                 |_| {
+                    published.set(true);
+                    Ok(())
+                },
+                |_| {
                     detached = true;
                     Ok(())
                 },
             );
             assert!(detached, "loop_failed={loop_failed}");
+            // A clean loop end publishes from partial state; a failed loop
+            // keeps settle-and-detach without a report.
+            assert_eq!(published.get(), !loop_failed, "loop_failed={loop_failed}");
             let message = format!("{error:#}");
             if loop_failed {
                 assert!(
@@ -10062,6 +12230,7 @@ mod tests {
         resumed_at: Vec<u64>,
         authorization_reads: usize,
         dequeues: usize,
+        arm_error: Option<String>,
     }
 
     /// The helper's stop, as the kernel performs it: a loader hook in the
@@ -10110,6 +12279,24 @@ mod tests {
             crate::discovery::pause::read_task_states(pid)
         }
 
+        fn task_samples(
+            &mut self,
+            pid: u32,
+        ) -> std::result::Result<
+            std::collections::BTreeMap<u32, crate::discovery::pause::TaskSample>,
+            String,
+        > {
+            crate::discovery::pause::read_task_samples(pid)
+        }
+
+        fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+            crate::discovery::pause::last_hook_attach_boot_ns()
+        }
+
+        fn boot_now_ns(&mut self) -> Option<u64> {
+            crate::discovery::pause::boot_ns()
+        }
+
         fn dequeue(
             &mut self,
         ) -> std::result::Result<Option<crate::discovery::pause::DiscoveryItem>, String> {
@@ -10118,6 +12305,9 @@ mod tests {
         }
 
         fn arm(&mut self) -> std::result::Result<(), String> {
+            if let Some(error) = self.held.arm_error.clone() {
+                return Err(error);
+            }
             self.held.authorization = Some(p11scope_ebpf_common::PAUSE_ARMED);
             Ok(())
         }
@@ -10302,6 +12492,7 @@ mod tests {
                             attempts: 1,
                             confirmed: 0,
                             partial: 1,
+                            unavailable: 0,
                         },
                         "{case}: the stop that never confirmed must be reported as partial"
                     );
@@ -10377,7 +12568,12 @@ mod tests {
         coordinator: &mut PauseCoordinator,
         io: &mut HeldPauseIo<'_>,
     ) -> (Option<DiscoveryPass>, Result<(bool, bool)>) {
-        let pass = discovery_due(since_frame, drain, || pause_stop_due(coordinator, io));
+        let pass = discovery_due(
+            since_frame,
+            drain,
+            || pause_stop_due(coordinator, io),
+            || false,
+        );
         let handed = match pass {
             None => Ok((false, false)),
             Some(DiscoveryPass::PendingStop) => pending_stop_pass(coordinator, io),
@@ -10386,6 +12582,11 @@ mod tests {
                     .unwrap_or_else(|error| panic!("a frame pass failed: {error}"));
                 assert!(serviced, "a frame pass must service an armed pause");
                 Ok((io.plan_changed(), true))
+            }
+            // The held-child harness never stages discovery backlog: the
+            // gate above always reports none, so this arm is unreachable.
+            Some(DiscoveryPass::Backlog) => {
+                unreachable!("held harness admits no backlog pass")
             }
         };
         (pass, handed)
@@ -10445,8 +12646,9 @@ mod tests {
     /// Afterwards an idle tick costs one authorization read while the
     /// successor stays armed, and nothing once the pause is disarmed. The
     /// semantics around it hold. A genuinely failed cycle still resumes the
-    /// child and goes partial under `auto`, and ends the capture under
-    /// `always`. A pending operator stop wins: the tick services nothing, and
+    /// child and goes partial under `auto`, and collects unpaused with an
+    /// unavailable gap under `always`. A pending operator stop wins: the tick
+    /// services nothing, and
     /// cleanup resumes the child and reports the stop (`auto` partial, `always`
     /// refused). Under the frame-only gate every stop stayed held through all
     /// the ticks and cleanup reported it unconfirmed.
@@ -10591,11 +12793,19 @@ mod tests {
             attempts: stops,
             confirmed: stops,
             partial: 0,
+            unavailable: 0,
         };
         let unconfirmed = |partial| PauseCounters {
             attempts: 1,
             confirmed: 0,
             partial,
+            unavailable: 0,
+        };
+        let unavailable = || PauseCounters {
+            attempts: 1,
+            confirmed: 0,
+            partial: 0,
+            unavailable: 1,
         };
         let serviced =
             |case, policy, first_ticks, stops, idle_authorization_reads| HeldStopOutcome {
@@ -10660,16 +12870,16 @@ mod tests {
                 1,
                 ticks - 2,
             ),
-            // The failed cycle resumes the child, and its required failure
-            // ends the capture on that tick.
+            // The failed cycle resumes the child, counts one unavailable
+            // attempt and collects unpaused; the capture continues.
             HeldStopOutcome {
                 case: HeldStop::Failed,
                 policy: Always,
-                first_ticks: [(Some(DiscoveryPass::PendingStop), false, false), idle],
-                ended_by_pause_failure: true,
+                first_ticks: [(Some(DiscoveryPass::PendingStop), true, false), idle],
+                ended_by_pause_failure: false,
                 held_after_ticks: false,
-                counters_after_ticks: unconfirmed(0),
-                counters_after_cleanup: unconfirmed(0),
+                counters_after_ticks: unavailable(),
+                counters_after_cleanup: unavailable(),
                 cleanup_refused: false,
                 resumes: 1,
                 idle_authorization_reads: 0,
@@ -10753,6 +12963,15 @@ mod tests {
             Ok(CaptureEnd::Signal),
             &mut (),
             |_, _| Ok(()),
+            |_| Ok(()),
+            |_| Err(interrupted()),
+        );
+        let quiesce_publish_failed = finish_quiesce_error(
+            anyhow!("terminal quiescence failed"),
+            Ok(CaptureEnd::Signal),
+            &mut (),
+            |_, _| Ok(()),
+            |_| Err(anyhow!("seal failed")),
             |_| Err(interrupted()),
         );
         let preflight = combine_preflight_failure_with(
@@ -10779,6 +12998,7 @@ mod tests {
                 ),
             ),
             ("quiesce failure", quiesce),
+            ("quiesce + publish failure", quiesce_publish_failed),
             ("preflight failure", preflight),
             (
                 "run --pause always",
@@ -10953,23 +13173,1237 @@ mod tests {
         let script = dir.path().join("hello.sh");
         std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = check_owned_target_runnable(script.as_os_str()).unwrap_err();
+        let error = check_owned_target_runnable(script.as_os_str(), &[]).unwrap_err();
         let text = format!("{error}");
         assert!(text.contains("must be an ELF executable"), "{text}");
         assert!(
             text.contains("invoke scripts through an interpreter"),
             "{text}"
         );
-        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true")).is_ok());
+        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true"), &[]).is_ok());
+    }
+
+    /// A `#!` launcher (Ubuntu's `/usr/bin/firefox`) is named as a script,
+    /// with its interpreter and the attach alternative, not just "unknown
+    /// file magic".
+    #[test]
+    fn script_refusal_names_the_interpreter_and_the_attach_alternative() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("browser");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let text = check_owned_target_runnable(script.as_os_str(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("invoke scripts through an interpreter"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{} is a script for /bin/sh: run `p11scope run -- /bin/sh {}`",
+                script.display(),
+                script.display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
+    }
+
+    fn snap_probes<'a>(
+        exists: &'a dyn Fn(&Path) -> bool,
+        is_runnable: &'a dyn Fn(&Path) -> bool,
+        resolve: &'a dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> SnapProbes<'a> {
+        SnapProbes {
+            exists,
+            is_runnable,
+            resolve,
+        }
+    }
+
+    /// Snap commands start through snap-confine, whose file capabilities
+    /// no_new_privs withholds: refuse by name before the fork with the
+    /// working alternatives instead of letting snap-confine fail later.
+    /// The attach path is recommended first; naming the in-snap binary
+    /// comes second with its confinement cost, since it weakens the
+    /// application's own sandbox under no_new_privs.
+    #[test]
+    fn snap_launchers_are_refused_by_name_with_the_attach_alternative() {
+        for (program, path) in [
+            ("/snap/bin/firefox", None),
+            ("firefox", Some("/nonexistent-dir:/snap/bin")),
+        ] {
+            let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+            let is_runnable = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+            let resolve_none = |_: &Path| None;
+            let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+            let error = snap_launcher_refusal(
+                std::ffi::OsStr::new(program),
+                &[],
+                path.map(std::ffi::OsStr::new),
+                Path::new("/"),
+                &probes,
+            )
+            .unwrap_or_else(|| panic!("{program} must be refused"));
+            let text = error.to_string();
+            assert!(text.contains("firefox is a snap application"), "{text}");
+            assert!(text.contains("no_new_privs"), "{text}");
+            assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
+            assert!(text.contains("p11scope inspect --system"), "{text}");
+            let attach = text.find("Recommended:").expect("attach first: {text}");
+            let direct = text
+                .find("Alternatively, name the program inside the snap directly")
+                .expect("direct binary second: {text}");
+            assert!(attach < direct, "{text}");
+            assert!(text.contains("outside snap confinement"), "{text}");
+            assert!(
+                text.contains("browser sandboxes are weaker under no_new_privs"),
+                "{text}"
+            );
+            assert!(text.contains("throwaway profile"), "{text}");
+            assert!(
+                text.contains("/snap/firefox/current/usr/lib/firefox/firefox"),
+                "{text}"
+            );
+        }
+        // Not a snap: an ordinary binary, a PATH hit before /snap/bin, a
+        // /snap/bin name that does not exist, or an ELF binary that merely
+        // lives under /snap (the refusal is for /snap/bin launchers only,
+        // never a /snap prefix).
+        for (program, path) in [
+            ("/usr/bin/true", None),
+            ("firefox", Some("/usr/bin:/snap/bin")),
+            ("/snap/bin/absent", None),
+            ("/snap/firefox/current/usr/lib/firefox/firefox", None),
+        ] {
+            let exists = |candidate: &Path| {
+                candidate == Path::new("/snap/bin/firefox")
+                    || candidate == Path::new("/usr/bin/firefox")
+                    || candidate == Path::new("/usr/bin/true")
+                    || candidate == Path::new("/snap/firefox/current/usr/lib/firefox/firefox")
+            };
+            let is_runnable = |candidate: &Path| {
+                candidate == Path::new("/snap/bin/firefox")
+                    || candidate == Path::new("/usr/bin/firefox")
+                    || candidate == Path::new("/usr/bin/true")
+                    || candidate == Path::new("/snap/firefox/current/usr/lib/firefox/firefox")
+            };
+            let resolve_none = |_: &Path| None;
+            let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+            assert!(
+                snap_launcher_refusal(
+                    std::ffi::OsStr::new(program),
+                    &[],
+                    path.map(std::ffi::OsStr::new),
+                    Path::new("/"),
+                    &probes,
+                )
+                .is_none(),
+                "{program} {path:?}"
+            );
+        }
+    }
+
+    /// Other snaps get the generic in-snap path; only Firefox names its
+    /// exact binary.
+    #[test]
+    fn snap_refusal_uses_a_generic_example_for_other_snaps() {
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/spotify");
+        let is_runnable = |candidate: &Path| candidate == Path::new("/snap/bin/spotify");
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = snap_launcher_refusal(
+            std::ffi::OsStr::new("/snap/bin/spotify"),
+            &[],
+            None,
+            Path::new("/"),
+            &probes,
+        )
+        .expect("spotify must be refused")
+        .to_string();
+        assert!(text.contains("spotify is a snap application"), "{text}");
+        assert!(text.contains("/snap/<snap>/current/<program>"), "{text}");
+        assert!(!text.contains("/snap/firefox/"), "{text}");
+    }
+
+    /// The pre-check is not fooled by the system launcher directory or
+    /// by `.`/`..`/relative spellings of a launcher path.
+    #[test]
+    fn snap_precheck_covers_system_dir_and_dotdot_and_relative_spellings() {
+        let exists = |candidate: &Path| {
+            [
+                "/var/lib/snapd/snap/bin/firefox",
+                "/snap/bin/../bin/firefox",
+                "/snap/./bin/firefox",
+                "bin/firefox",
+            ]
+            .iter()
+            .any(|hit| candidate == Path::new(hit))
+        };
+        let is_runnable = |candidate: &Path| candidate == Path::new("bin/firefox");
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        for (program, path, cwd) in [
+            ("/var/lib/snapd/snap/bin/firefox", None, "/"),
+            ("/snap/bin/../bin/firefox", None, "/"),
+            ("/snap/./bin/firefox", None, "/"),
+            ("bin/firefox", None, "/snap"),
+            ("firefox", Some("bin"), "/snap"),
+        ] {
+            assert!(
+                snap_launcher_refusal(
+                    std::ffi::OsStr::new(program),
+                    &[],
+                    path.map(std::ffi::OsStr::new),
+                    Path::new(cwd),
+                    &probes,
+                )
+                .is_some(),
+                "{program} {path:?} from {cwd} must be refused"
+            );
+        }
+        // A `..` spelling that escapes the launcher directory is not a
+        // launcher.
+        assert!(
+            snap_launcher_refusal(
+                std::ffi::OsStr::new("/snap/bin/../usr/bin/firefox"),
+                &[],
+                None,
+                Path::new("/"),
+                &probes,
+            )
+            .is_none(),
+            "a spelling outside the launcher directories must not refuse"
+        );
+    }
+
+    /// Whatever the spelling, a target resolving to the snap binary is a
+    /// snap launch — except `snap` itself, which only `snap run` turns
+    /// into a confined launch.
+    #[test]
+    fn snap_precheck_follows_resolution_to_the_snap_binary_and_snap_run() {
+        let exists = |_: &Path| false;
+        let is_runnable = |candidate: &Path| {
+            candidate == Path::new("/usr/bin/snap") || candidate == Path::new("/opt/alias/spotify")
+        };
+        let resolve = |candidate: &Path| -> Option<PathBuf> {
+            if candidate == Path::new("/opt/alias/spotify")
+                || candidate == Path::new("/usr/bin/snap")
+            {
+                Some(PathBuf::from("/usr/bin/snap"))
+            } else if candidate == Path::new("/opt/alias/tool") {
+                Some(PathBuf::from("/opt/alias/tool"))
+            } else {
+                None
+            }
+        };
+        let probes = snap_probes(&exists, &is_runnable, &resolve);
+        let run_firefox = [OsString::from("run"), OsString::from("firefox")];
+        let text = snap_launcher_refusal(
+            std::ffi::OsStr::new("/opt/alias/spotify"),
+            &[],
+            None,
+            Path::new("/"),
+            &probes,
+        )
+        .expect("a name resolving to the snap binary must be refused")
+        .to_string();
+        assert!(text.contains("spotify is a snap application"), "{text}");
+        let text = snap_launcher_refusal(
+            std::ffi::OsStr::new("snap"),
+            &run_firefox,
+            Some(std::ffi::OsStr::new("/usr/bin")),
+            Path::new("/"),
+            &probes,
+        )
+        .expect("snap run must be refused")
+        .to_string();
+        assert!(text.contains("firefox is a snap application"), "{text}");
+        assert!(text.contains("`snap run firefox`"), "{text}");
+        // `snap` without `run` is not a confined launch.
+        for args in [
+            vec![OsString::from("list")],
+            vec![],
+            vec![OsString::from("run"), OsString::from("--help")],
+        ] {
+            // `snap run --help` names no application: still a snap
+            // invocation, refused without an application name.
+            let refusal = snap_launcher_refusal(
+                std::ffi::OsStr::new("snap"),
+                &args,
+                Some(std::ffi::OsStr::new("/usr/bin")),
+                Path::new("/"),
+                &probes,
+            );
+            if args.first().is_some_and(|arg| arg == "run") {
+                let text = refusal.expect("snap run must be refused").to_string();
+                assert!(
+                    text.contains("`snap run` starts a snap application"),
+                    "{text}"
+                );
+            } else {
+                assert!(refusal.is_none(), "snap {args:?} must not be refused");
+            }
+        }
+        // A name resolving to itself is not a snap launch.
+        assert!(
+            snap_launcher_refusal(
+                std::ffi::OsStr::new("/opt/alias/tool"),
+                &[],
+                None,
+                Path::new("/"),
+                &probes,
+            )
+            .is_none(),
+            "a name resolving to itself must not be refused"
+        );
+    }
+
+    /// Ubuntu's `/usr/bin/firefox` wrapper shape: a script whose basename
+    /// is a snap launcher gets the snap reason, not the interpreter
+    /// detour that would fail later inside snap-confine.
+    #[test]
+    fn script_starting_a_snap_application_gets_the_snap_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("firefox");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/firefox \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invoker = ChildIdentity::for_invoker()
+            .ok()
+            .map(|identity| (identity.uid, identity.gid));
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains(
+                "is a script for /bin/sh that starts the snap application firefox \
+                 (/snap/bin/firefox)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("snap-confine"), "{text}");
+        assert!(text.contains("Recommended:"), "{text}");
+        assert!(
+            !text.contains("p11scope run -- /bin/sh"),
+            "the failing interpreter detour must not be suggested: {text}"
+        );
+    }
+
+    /// The refusal is printed to a terminal: control bytes in the `#!`
+    /// token and in the resolved path render escaped, never raw.
+    #[test]
+    fn script_refusal_escapes_control_bytes_in_token_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("we\x11ird");
+        std::fs::write(&script, "#!bad\x07interp --flag\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invoker = ChildIdentity::for_invoker()
+            .ok()
+            .map(|identity| (identity.uid, identity.gid));
+        let exists = |_: &Path| false;
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains("bad\\u{7}interp"),
+            "the token must render escaped: {text}"
+        );
+        assert!(
+            !text.contains("bad\x07interp"),
+            "no raw control byte from the token: {text}"
+        );
+        assert!(
+            text.contains("we\\u{11}ird"),
+            "the path must render escaped: {text}"
+        );
+        assert!(
+            !text.contains("we\x11ird"),
+            "no raw control byte from the path: {text}"
+        );
+    }
+
+    /// The refusal runs as the observer (possibly root via sudo) but the
+    /// `#!` token is only shown when the invoker could read the file
+    /// itself: owner, primary group, or other read bits decide.
+    #[test]
+    fn script_token_is_hidden_from_an_invoker_who_cannot_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("guarded.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&script).unwrap();
+        let (owner, group) = (meta.uid(), meta.gid());
+        let other = owner.wrapping_add(1);
+        let other_group = group.wrapping_add(1);
+        assert_ne!(other, owner);
+        assert_ne!(other_group, group);
+        let exists = |_: &Path| false;
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let refusal = |invoker: Option<(u32, u32)>| {
+            check_owned_target_runnable_with(
+                script.as_os_str(),
+                &[],
+                Some(std::ffi::OsStr::new("")),
+                Path::new("/"),
+                invoker,
+                &probes,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        // Owner-readable: the owner sees the token, anyone else does not.
+        let text = refusal(Some((owner, group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+        let text = refusal(Some((other, other_group)));
+        assert!(
+            text.contains("is not shown because the invoking user cannot read this file"),
+            "{text}"
+        );
+        assert!(!text.contains("is a script for"), "{text}");
+        // Group-readable: the primary group sees the token.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let text = refusal(Some((other, group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+        let text = refusal(Some((other, other_group)));
+        assert!(
+            text.contains("is not shown because the invoking user cannot read this file"),
+            "{text}"
+        );
+        // Other-readable: everyone sees the token.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o705)).unwrap();
+        let text = refusal(Some((other, other_group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+    }
+
+    /// The readability check behind the token drop: owner bits, else
+    /// the primary group's, else other's; root reads anything. Write
+    /// and execute bits never grant a read.
+    #[test]
+    fn invoker_read_check_follows_owner_group_other_bits() {
+        for (meta_uid, meta_gid, mode, uid, gid, expected) in [
+            (1000, 100, 0o600, 1000, 100, true),
+            (1000, 100, 0o000, 1000, 100, false),
+            (1000, 100, 0o100, 1000, 100, false),
+            (1000, 100, 0o040, 2000, 100, true),
+            (1000, 100, 0o040, 2000, 200, false),
+            (1000, 100, 0o400, 2000, 100, false),
+            (1000, 100, 0o004, 2000, 200, true),
+            (1000, 100, 0o006, 2000, 200, true),
+            (1000, 100, 0o002, 2000, 200, false),
+            (1000, 100, 0o000, 0, 0, true),
+        ] {
+            assert_eq!(
+                invoker_can_read_file(meta_uid, meta_gid, mode, uid, gid),
+                expected,
+                "meta {meta_uid}:{meta_gid} {mode:o} invoker {uid}:{gid}"
+            );
+        }
+    }
+
+    /// The snap-starting script refusal hides the token the same way when
+    /// the invoker could not read the file.
+    #[test]
+    fn snap_script_refusal_hides_an_unreadable_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("firefox");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/firefox \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&script).unwrap();
+        let invoker = Some((meta.uid().wrapping_add(1), meta.gid().wrapping_add(1)));
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains(
+                "is a script that starts the snap application firefox (/snap/bin/firefox)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("is a script for"), "{text}");
+        assert!(text.contains("snap-confine"), "{text}");
+    }
+
+    /// Over-refusal: a dangling `/snap/bin/tool` (lstat hit, not runnable)
+    /// with a later runnable `/usr/bin/tool` must not refuse — resolution
+    /// runs the later binary. `exists` simulates lstat (true for the
+    /// dangling link), `is_runnable` simulates stat+file+exec (false for
+    /// it), mirroring production.
+    #[test]
+    fn snap_precheck_skips_a_dangling_snap_shadow_for_the_later_runnable() {
+        let exists = |candidate: &Path| {
+            candidate == Path::new("/snap/bin/tool") || candidate == Path::new("/usr/bin/tool")
+        };
+        let is_runnable = |candidate: &Path| candidate == Path::new("/usr/bin/tool");
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        assert!(
+            snap_launcher_refusal(
+                std::ffi::OsStr::new("tool"),
+                &[],
+                Some(std::ffi::OsStr::new("/snap/bin:/usr/bin")),
+                Path::new("/"),
+                &probes,
+            )
+            .is_none(),
+            "a dangling /snap/bin shadow must be skipped for the later runnable"
+        );
+    }
+
+    /// Under-refusal: a non-executable earlier shadow (lstat hit, not
+    /// runnable) with a real `/snap/bin/tool` must refuse — resolution
+    /// lands on the snap launcher.
+    #[test]
+    fn snap_precheck_skips_an_earlier_shadow_for_the_snap_launcher() {
+        let exists = |candidate: &Path| {
+            candidate == Path::new("/tmp/shadow/tool") || candidate == Path::new("/snap/bin/tool")
+        };
+        let is_runnable = |candidate: &Path| candidate == Path::new("/snap/bin/tool");
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        assert!(
+            snap_launcher_refusal(
+                std::ffi::OsStr::new("tool"),
+                &[],
+                Some(std::ffi::OsStr::new("/tmp/shadow:/snap/bin")),
+                Path::new("/"),
+                &probes,
+            )
+            .is_some(),
+            "a non-runnable earlier shadow must be skipped for /snap/bin"
+        );
+    }
+
+    /// The PATH predicate uses stat semantics (follows symlinks) plus
+    /// file+exec, exactly like [`resolve_program_in_path`]: a dangling
+    /// symlink (lstat hit, stat miss), a non-executable file and a
+    /// directory are not runnable; an executable file and a symlink to one
+    /// are. No `/snap/bin` writes needed.
+    #[test]
+    fn snap_path_candidate_uses_stat_file_and_exec_semantics() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("absent-target"), &dangling).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling).is_ok(),
+            "the dangling link is an lstat hit"
+        );
+        assert!(
+            !snap_path_candidate_is_runnable(&dangling),
+            "a dangling symlink is not runnable (stat miss)"
+        );
+        let shadow = dir.path().join("shadow");
+        std::fs::write(&shadow, "not executable\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!snap_path_candidate_is_runnable(&shadow));
+        assert!(!snap_path_candidate_is_runnable(dir.path()));
+        let tool = dir.path().join("tool");
+        std::fs::copy("/bin/true", &tool).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(snap_path_candidate_is_runnable(&tool));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        assert!(snap_path_candidate_is_runnable(&link));
+    }
+
+    /// Sol-full F8: an earlier PATH directory's readable but
+    /// non-executable shadow must not stop the search — resolution finds
+    /// the later executable (`execvp` semantics), and the ELF guard still
+    /// applies to the found candidate.
+    #[test]
+    fn path_search_skips_a_non_executable_shadow_for_the_later_executable() {
+        let shadow_dir = tempfile::tempdir().unwrap();
+        let shadow = shadow_dir.path().join("p11scope-shadowed-tool");
+        std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let tool = bin_dir.path().join("p11scope-shadowed-tool");
+        std::fs::copy("/bin/true", &tool).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([shadow_dir.path(), bin_dir.path()]).unwrap();
+        let resolved =
+            resolve_program_in_path(shadow.file_name().unwrap(), Some(path.as_os_str())).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&tool).unwrap());
+        // Descriptor pinning and the ELF guard are unchanged: the found
+        // candidate still opens and passes the launch-file checks.
+        check_launch_file(&std::fs::File::open(&resolved).unwrap()).unwrap();
+    }
+
+    /// Sol-full F8 twin: with no executable candidate anywhere, a
+    /// shadowed name keeps the permission refusal (`execvp` reports
+    /// EACCES, not ENOENT), while a name found nowhere is `NotFound`.
+    #[test]
+    fn path_search_without_an_executable_candidate_keeps_the_permission_refusal() {
+        let shadow_dir = tempfile::tempdir().unwrap();
+        let shadow = shadow_dir.path().join("p11scope-shadow-only-tool");
+        std::fs::write(&shadow, "not executable\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([shadow_dir.path()]).unwrap();
+        let error = resolve_program_in_path(shadow.file_name().unwrap(), Some(path.as_os_str()))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let error = resolve_program_in_path(
+            std::ffi::OsStr::new("p11scope-definitely-absent-tool"),
+            Some(path.as_os_str()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn prearm_end_cause_maps_ends() {
+        use render::PrearmWatchEnd;
+        assert_eq!(
+            CaptureEnd::DurationExpired.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(
+            CaptureEnd::TargetExit.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(
+            CaptureEnd::LimitReached.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(CaptureEnd::Signal.prearm_end_cause(), PrearmWatchEnd::Stop);
+        assert_eq!(CaptureEnd::Error.prearm_end_cause(), PrearmWatchEnd::Stop);
+    }
+
+    fn prearm_test_report(
+        module: Option<crate::plan::ModuleId>,
+        calls: u64,
+        errors: u64,
+        in_flight: u64,
+    ) -> metrics::SlotReport {
+        metrics::SlotReport {
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantic_authorized: true,
+            module,
+            module_ambiguous: false,
+            module_unresolved: module.is_none(),
+            mode: p11scope_ebpf_common::CounterMode::Latency,
+            calls,
+            errors,
+            in_flight,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+            rv_counts: std::collections::BTreeMap::new(),
+            file_offset: 0x1000,
+            target_object: None,
+            ordinals: Vec::new(),
+        }
+    }
+
+    fn prearm_test_plan(modules: &[u32]) -> crate::plan::AttachPlan {
+        let mut plan = crate::plan::AttachPlan::from_slots(Vec::new());
+        plan.modules = modules
+            .iter()
+            .map(|id| crate::plan::ModuleSummary {
+                id: crate::plan::ModuleId(*id),
+                object: crate::discovery::identity::PinnedObjectId(*id),
+                key: crate::plan::TEST_OBJECT,
+                path: format!("/prearm/{id}.so"),
+                tables: Vec::new(),
+                interfaces: 0,
+                source: "prearm",
+                corroborated: false,
+                skipped: Vec::new(),
+            })
+            .collect();
+        plan
+    }
+
+    #[test]
+    fn prearm_used_modules_counts_attributed_and_inflight() {
+        use crate::plan::ModuleId;
+        let plan = prearm_test_plan(&[3, 7]);
+        let pins = crate::discovery::identity::PinnedObjects::empty();
+        let reports = vec![
+            prearm_test_report(Some(ModuleId(3)), 5, 0, 0),
+            // All-zero rows are silence, not use.
+            prearm_test_report(Some(ModuleId(7)), 0, 0, 0),
+        ];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(3)]),
+        );
+        // Entered-but-unreturned calls still count as observed use.
+        let reports = vec![prearm_test_report(Some(ModuleId(7)), 0, 0, 2)];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(7)]),
+        );
+        // Error rows count too: the endpoint was reached.
+        let reports = vec![prearm_test_report(Some(ModuleId(7)), 0, 1, 0)];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(7)]),
+        );
+    }
+
+    #[test]
+    fn prearm_used_modules_fails_closed_on_unattributable() {
+        use crate::plan::ModuleId;
+        let plan = prearm_test_plan(&[3, 7]);
+        let pins = crate::discovery::identity::PinnedObjects::empty();
+        // An ownerless report no pin resolves marks every module used: a
+        // quiet claim needs proven no-use, and unknown association never
+        // proves it.
+        let mut report = prearm_test_report(None, 4, 0, 0);
+        report.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 42,
+            sha256: None,
+        });
+        assert_eq!(
+            prearm_used_modules(&[report], &plan, &pins),
+            BTreeSet::from([ModuleId(3), ModuleId(7)]),
+        );
+        let report = prearm_test_report(None, 4, 0, 0);
+        assert_eq!(
+            prearm_used_modules(&[report], &plan, &pins),
+            BTreeSet::from([ModuleId(3), ModuleId(7)]),
+        );
+        assert!(prearm_report_owners(&prearm_test_report(None, 4, 0, 0), &plan, &pins).is_empty());
+    }
+
+    #[test]
+    fn prearm_terminal_freezes_watches_at_stop_not_publication() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // A trivial provider with no standard exports: the watch waits
+        // unarmed — the close boundary is what this test pins, not coverage.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("stop-freeze.c");
+        std::fs::write(&src, "int stop_freeze_marker;\n").unwrap();
+        let provider = dir.path().join("stop-freeze.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        // Stop long ago, publication now: duration, signal and error ends
+        // all close at the frozen stop, excluding the blind tail.
+        for (end, cause) in [
+            (
+                CaptureEnd::DurationExpired,
+                crate::render::PrearmWatchEnd::ScopeEnd,
+            ),
+            (CaptureEnd::Signal, crate::render::PrearmWatchEnd::Stop),
+            (CaptureEnd::Error, crate::render::PrearmWatchEnd::Stop),
+        ] {
+            let args = CaptureArgs {
+                kind: Kind::Profile,
+                modules: Vec::new(),
+                exclude_modules: vec![],
+                manifests: Vec::new(),
+                prearm_modules: vec![provider.clone()],
+                hooks: HookRegistry::builtin(),
+                scope: ScopeArg::Pid(pid),
+                metrics: false,
+                counter_mode: None,
+                select_endpoint: None,
+                track_short_lived: false,
+                duration: None,
+                out: None,
+                max_events: None,
+                max_scan_pids: None,
+                ring_bytes: None,
+                drain_interval: None,
+                unsafe_requested: false,
+                allow_confined_uretprobe: false,
+                attach_backend: BackendSelection::default(),
+            };
+            let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+            let mut engine =
+                Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+            assert!(engine.has_prearm_watches());
+            let session = ScriptedSession::default();
+            let reports: Vec<metrics::SlotReport> = Vec::new();
+            finish_prearm_terminal(
+                &mut engine,
+                &session,
+                &[],
+                end,
+                &reports,
+                &metrics::KernelEvidence::default(),
+                0,
+                Some(1000),
+                None,
+                false,
+                None,
+            );
+            let watch = engine.discovery().modules[0]
+                .watch
+                .as_ref()
+                .expect("finish renders every watch");
+            assert_eq!(watch.until_ns, Some(1000));
+            assert_eq!(watch.ended_by, Some(cause));
+        }
+    }
+
+    #[test]
+    fn owned_prearm_hold_without_owned_child_threads_no_claim() {
+        // A non-`run` scope has no owned child: no hold and no owned-run
+        // claim, so the terminal builder keeps every window.
+        assert_eq!(owned_prearm_hold(None), (None, false, None));
+    }
+
+    #[test]
+    fn compose_prearm_hold_pins_every_claim_shape() {
+        use crate::discovery::pause::PauseGateHold;
+
+        let held = || PauseGateHold {
+            start_ns: Some(5),
+            end_ns: Some(900),
+            continuous: true,
+        };
+        // Owned run with a proven hold: the run's pre-spawn scope start
+        // replaces the coordinator's arm bound, and the release bound
+        // travels alongside for the builder's pre-release check.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), Some(50), Some(1000), true),
+            (
+                Some(PauseGateHold {
+                    start_ns: Some(50),
+                    end_ns: Some(900),
+                    continuous: true,
+                }),
+                true,
+                Some(1000),
+            )
+        );
+        // Owned run without a scope start: the unboundable claim start
+        // fails closed downstream, never silently armed.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), None, Some(1000), true),
+            (
+                Some(PauseGateHold {
+                    start_ns: None,
+                    end_ns: Some(900),
+                    continuous: true,
+                }),
+                true,
+                Some(1000),
+            )
+        );
+        // Owned run without a release bound: the builder withholds every
+        // proof, never silently barrier-covered.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), Some(50), None, true),
+            (
+                Some(PauseGateHold {
+                    start_ns: Some(50),
+                    end_ns: Some(900),
+                    continuous: true,
+                }),
+                true,
+                None,
+            )
+        );
+        // Passive owned run: no hold, but the owned-run scope and release
+        // bound stand.
+        assert_eq!(
+            compose_prearm_hold(None, Some(50), Some(1000), true),
+            (None, true, Some(1000))
+        );
+        // Non-`run` scope: any hold-shaped input is dropped entirely.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), Some(50), Some(1000), false),
+            (None, false, None)
+        );
+    }
+
+    /// The owned-run startup wires the barrier-release bound into
+    /// `owned.prearm_release_ns` after the barrier release resolves and
+    /// before the post-release pause revalidation runs: the bound must be
+    /// the release the child actually crossed, and the revalidation must
+    /// see the wired claim. The startup needs a live child, so the order
+    /// is pinned statically (same `split_once` precedent as
+    /// `run_loop_reports_discovery_noise_before_returning_a_capture_error`).
+    #[test]
+    fn prearm_release_wiring_sits_between_release_and_revalidate() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("fn run_owned_inner_with_host(")
+            .unwrap()
+            .1
+            .split_once("fn preflight_uretprobe_hazard(")
+            .unwrap()
+            .0;
+        let released = body
+            .find(".release_until(")
+            .expect("owned startup releases the child barrier");
+        let wired = body
+            .find("owned.prearm_release_ns = ")
+            .expect("owned startup wires the pre-arm release bound");
+        let revalidated = body
+            .find("revalidate_after_release(")
+            .expect("owned startup revalidates after the release");
+        assert!(
+            released < wired && wired < revalidated,
+            "prearm_release_ns is wired after release_until and before revalidate_after_release"
+        );
+        assert_eq!(
+            body.matches("owned.prearm_release_ns = ").count(),
+            1,
+            "one wiring site feeds the terminal claim"
+        );
+    }
+
+    #[test]
+    fn prearm_terminal_pause_hold_empties_windows() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // A real provider shape (proved exports, so plan slots exist),
+        // never mapped here: the hold alone carries the exactness.
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("hold-provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-shared",
+                    "-fPIC",
+                    "-DDISCOVERY_LIFECYCLE_PROVIDER",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&provider)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            exclude_modules: vec![],
+            manifests: Vec::new(),
+            prearm_modules: vec![provider],
+            hooks: HookRegistry::builtin(),
+            scope: ScopeArg::Pid(pid),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            track_short_lived: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+        let mut engine =
+            Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+        assert!(engine.has_prearm_watches());
+        assert!(
+            !engine.plan().slots.is_empty(),
+            "bare pre-arm must plan its proved exports"
+        );
+        engine.set_scope_start_ns(Some(50));
+        let mut session = ScriptedSession::default();
+        for slot in engine.plan().slots.iter() {
+            session.scripted_links.insert(slot.index);
+            session.scripted_stamps.insert(slot.index, 900);
+        }
+        let reports: Vec<metrics::SlotReport> = Vec::new();
+        finish_prearm_terminal(
+            &mut engine,
+            &session,
+            &[],
+            CaptureEnd::DurationExpired,
+            &reports,
+            &metrics::KernelEvidence::default(),
+            0,
+            Some(5000),
+            Some(crate::discovery::pause::PauseGateHold {
+                start_ns: Some(50),
+                end_ns: Some(900),
+                continuous: true,
+            }),
+            true,
+            Some(1000),
+        );
+        let record = &engine.discovery().modules[0];
+        assert_eq!(record.attached_at_ns, Some(Some(900)));
+        assert_eq!(record.unobserved_windows, Some(Vec::new()));
+    }
+
+    #[test]
+    fn prearm_terminal_pause_hold_post_release_stamp_withholds_proof() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // Twin of the emptying terminal above with the declared stamps dated
+        // after the barrier release (800): the child ran free before its
+        // first pause stop, so no proof is emitted. This bare fixture never
+        // maps the provider, so a withheld proof leaves the windows
+        // undisclosed (`None`) rather than an explicit window — the
+        // regression is that it is not `Some([])`.
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("hold-provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-shared",
+                    "-fPIC",
+                    "-DDISCOVERY_LIFECYCLE_PROVIDER",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&provider)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            exclude_modules: vec![],
+            manifests: Vec::new(),
+            prearm_modules: vec![provider],
+            hooks: HookRegistry::builtin(),
+            scope: ScopeArg::Pid(pid),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            track_short_lived: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+        let mut engine =
+            Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+        assert!(engine.has_prearm_watches());
+        engine.set_scope_start_ns(Some(50));
+        let mut session = ScriptedSession::default();
+        for slot in engine.plan().slots.iter() {
+            session.scripted_links.insert(slot.index);
+            session.scripted_stamps.insert(slot.index, 900);
+        }
+        let reports: Vec<metrics::SlotReport> = Vec::new();
+        finish_prearm_terminal(
+            &mut engine,
+            &session,
+            &[],
+            CaptureEnd::DurationExpired,
+            &reports,
+            &metrics::KernelEvidence::default(),
+            0,
+            Some(5000),
+            Some(crate::discovery::pause::PauseGateHold {
+                start_ns: Some(50),
+                end_ns: Some(900),
+                continuous: true,
+            }),
+            true,
+            Some(800),
+        );
+        let record = &engine.discovery().modules[0];
+        assert_eq!(record.attached_at_ns, Some(Some(900)));
+        assert_eq!(record.unobserved_windows, None);
+    }
+
+    #[test]
+    fn prearm_terminal_pause_hold_missing_release_withholds_proof() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // Unboundable release (clock failure): the terminal forwards `None`
+        // and the builder withholds every proof. Bare fixture, so the
+        // withheld proof leaves windows undisclosed (`None`).
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("hold-provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-shared",
+                    "-fPIC",
+                    "-DDISCOVERY_LIFECYCLE_PROVIDER",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&provider)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            exclude_modules: vec![],
+            manifests: Vec::new(),
+            prearm_modules: vec![provider],
+            hooks: HookRegistry::builtin(),
+            scope: ScopeArg::Pid(pid),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            track_short_lived: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+        let mut engine =
+            Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+        assert!(engine.has_prearm_watches());
+        engine.set_scope_start_ns(Some(50));
+        let mut session = ScriptedSession::default();
+        for slot in engine.plan().slots.iter() {
+            session.scripted_links.insert(slot.index);
+            session.scripted_stamps.insert(slot.index, 900);
+        }
+        let reports: Vec<metrics::SlotReport> = Vec::new();
+        finish_prearm_terminal(
+            &mut engine,
+            &session,
+            &[],
+            CaptureEnd::DurationExpired,
+            &reports,
+            &metrics::KernelEvidence::default(),
+            0,
+            Some(5000),
+            Some(crate::discovery::pause::PauseGateHold {
+                start_ns: Some(50),
+                end_ns: Some(900),
+                continuous: true,
+            }),
+            true,
+            None,
+        );
+        let record = &engine.discovery().modules[0];
+        assert_eq!(record.attached_at_ns, Some(Some(900)));
+        assert_eq!(record.unobserved_windows, None);
+    }
+
+    #[test]
+    fn prearm_stop_uses_first_stop_not_later_loop_end() {
+        use crate::attach::FirstStop;
+        // The earliest stop wins; a later loop-end sample never extends it.
+        assert_eq!(
+            prearm_stop_ns(FirstStop::Known(1000), Some(5000)),
+            Some(1000)
+        );
+        assert_eq!(
+            prearm_stop_ns(FirstStop::Known(5000), Some(1000)),
+            Some(1000)
+        );
+        assert_eq!(prearm_stop_ns(FirstStop::Known(1000), None), Some(1000));
+        assert_eq!(
+            prearm_stop_ns(FirstStop::NotRequested, Some(5000)),
+            Some(5000)
+        );
+        assert_eq!(prearm_stop_ns(FirstStop::NotRequested, None), None);
+        // Round-3 (re-audit finding 2): a stop requested at an unknown
+        // instant stays unknown — never backfilled with a later value.
+        assert_eq!(prearm_stop_ns(FirstStop::Unknown, Some(5000)), None);
+        assert_eq!(prearm_stop_ns(FirstStop::Unknown, None), None);
     }
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
+            track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
+            prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
             duration: None,
             out: None,
             max_events: None,
@@ -11012,12 +14446,17 @@ mod tests {
 
     fn capture_args(scope: ScopeArg) -> CaptureArgs {
         CaptureArgs {
+            track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
+            prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             scope,
             metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
             duration: None,
             out: None,
             max_events: None,
@@ -11028,6 +14467,682 @@ mod tests {
             allow_confined_uretprobe: false,
             attach_backend: BackendSelection::default(),
         }
+    }
+
+    #[test]
+    fn refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing-trace.jsonl");
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                std::fs::write(&output, b"keep existing output\n").unwrap();
+                let mut args = capture_args(ScopeArg::System);
+                args.kind = Kind::Trace;
+                args.duration = Some(Duration::from_millis(1));
+                args.out = Some(output.clone());
+                args.attach_backend = selection;
+                args.allow_confined_uretprobe = true;
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = capture_with_host(&args, &|| Err(refusal)).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(&output).unwrap(), b"keep existing output\n");
+                assert_eq!(
+                    std::fs::read_dir(dir.path()).unwrap().count(),
+                    1,
+                    "no sink temp or discovery artifact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refused_multi_host_precedes_owned_workload_and_output() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("workload-ran");
+        let output = dir.path().join("existing-profile.json");
+        let script = format!("printf ran > '{}'", sentinel.display());
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                std::fs::write(&output, b"keep existing report\n").unwrap();
+                let mut args = run_args(cli::PausePolicy::Never, &["/bin/sh", "-c", &script]);
+                args.duration = Some(Duration::from_millis(1));
+                args.out = Some(output.clone());
+                args.attach_backend = selection;
+                args.allow_confined_uretprobe = true;
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
+                    // Include an unreleased fork child; do not merely wait
+                    // for its sentinel command to execute. Other test
+                    // threads' children are excluded and none is reaped.
+                    // SAFETY: siginfo_t is a zeroable C output structure.
+                    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid output pointer; WNOWAIT is read-only.
+                    let waited = unsafe {
+                        libc::waitid(
+                            libc::P_ALL,
+                            0,
+                            &mut status,
+                            libc::WEXITED
+                                | libc::WSTOPPED
+                                | libc::WNOHANG
+                                | libc::WNOWAIT
+                                | libc::__WNOTHREAD,
+                        )
+                    };
+                    assert_eq!(
+                        (waited, io::Error::last_os_error().raw_os_error()),
+                        (-1, Some(libc::ECHILD)),
+                        "user workload was forked before host admission",
+                    );
+                    Err(refusal)
+                })
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+                assert!(!sentinel.exists(), "the user workload must not execute");
+                assert_eq!(std::fs::read(&output).unwrap(), b"keep existing report\n");
+            }
+        }
+    }
+
+    #[test]
+    fn counter_capture_and_run_require_host_after_build_policy_validation() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        use p11scope_ebpf_common::CounterMode;
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            for backend in [
+                BackendSelection::Auto,
+                BackendSelection::Multi,
+                BackendSelection::Singles,
+            ] {
+                for owned in [false, true] {
+                    let probes = std::cell::Cell::new(0);
+                    let refusal =
+                        MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+                    let host = || {
+                        probes.set(probes.get() + 1);
+                        Err(refusal)
+                    };
+                    let error = if owned {
+                        let mut args = run_args(cli::PausePolicy::Never, &["/bin/true"]);
+                        args.metrics = true;
+                        args.counter_mode = Some(mode);
+                        args.attach_backend = backend;
+                        run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &host)
+                            .err()
+                            .unwrap()
+                    } else {
+                        let mut args = capture_args(ScopeArg::System);
+                        args.metrics = true;
+                        args.counter_mode = Some(mode);
+                        args.attach_backend = backend;
+                        capture_with_host(&args, &host).unwrap_err()
+                    };
+                    if cfg!(p11scope_counter_objects) {
+                        assert_eq!(
+                            error.downcast_ref::<MultiHostRefusal>(),
+                            Some(&refusal),
+                            "{error:#}"
+                        );
+                        assert_eq!(probes.get(), 1);
+                    } else {
+                        assert!(
+                            error
+                                .to_string()
+                                .starts_with("counter-mode-unavailable-in-build:"),
+                            "{error:#}"
+                        );
+                        assert_eq!(probes.get(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counter_modes_pass_the_cli_gate_into_capture_setup() {
+        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // by name at the policy gate instead of reaching setup.
+        let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let mut args = capture_args(ScopeArg::Pid(i32::MAX as u32));
+            args.metrics = true;
+            args.counter_mode = Some(mode);
+            // The blanket counter refusal is gone: the next refusal is the
+            // nested-namespace poison inside real capture setup (still no
+            // target or BPF work). Reaching it proves the mode passed CLI
+            // selection.
+            let error = nested(|| capture(&args)).expect_err("counter mode must reach real setup");
+            let text = format!("{error:#}");
+            assert!(!text.contains("counter-mode-unwired"), "{mode:?}: {text}");
+            if objects {
+                assert!(
+                    text.starts_with("pid-namespace-mismatch:"),
+                    "{mode:?}: {text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("counter-mode-unavailable-in-build:"),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counter_modes_pass_the_cli_gate_into_owned_run_setup() {
+        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // by name at the policy gate instead of reaching setup.
+        let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let mut args = run_args(
+                cli::PausePolicy::Never,
+                &["/definitely/missing/p11scope-counter-cli-gate"],
+            );
+            args.metrics = true;
+            args.counter_mode = Some(mode);
+            // Same gate proof on the run path: the poison fires before
+            // anything is resolved or forked.
+            let error =
+                nested(|| run_owned(&args)).expect_err("counter mode must reach real setup");
+            let text = format!("{error:#}");
+            assert!(!text.contains("counter-mode-unwired"), "{mode:?}: {text}");
+            if objects {
+                assert!(
+                    text.starts_with("pid-namespace-mismatch:"),
+                    "{mode:?}: {text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("counter-mode-unavailable-in-build:"),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counter_modes_select_counter_policies_through_capture_policy() {
+        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // by name instead of selecting it.
+        let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            // Metrics profile/run select the counter policy for every mode.
+            if objects {
+                assert_eq!(
+                    capture_policy(Kind::Profile, true, false, Some(mode), false, None).unwrap(),
+                    CapturePolicy::Counter(mode),
+                    "{mode:?}"
+                );
+            } else {
+                let error = capture_policy(Kind::Profile, true, false, Some(mode), false, None)
+                    .unwrap_err();
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("counter-mode-unavailable-in-build"),
+                    "{mode:?}: {text}"
+                );
+                assert!(!text.contains("counter-mode-unwired"), "{text}");
+            }
+            // Every other combination refuses by name, never with the
+            // removed blanket token.
+            let requires_metrics = format!(
+                "--counter-mode {} requires --mode metrics on profile or run",
+                mode.name()
+            );
+            for (kind, metrics, unsafe_requested, expected) in [
+                (Kind::Trace, false, false, requires_metrics.as_str()),
+                (Kind::Trace, true, false, requires_metrics.as_str()),
+                (Kind::Profile, false, false, requires_metrics.as_str()),
+                (
+                    Kind::Profile,
+                    true,
+                    true,
+                    "--counter-mode cannot be combined with --unsafe-unvalidated-metadata",
+                ),
+            ] {
+                let error =
+                    capture_policy(kind, metrics, unsafe_requested, Some(mode), false, None)
+                        .unwrap_err();
+                let text = format!("{error:#}");
+                assert_eq!(
+                    text, expected,
+                    "{mode:?} metrics={metrics} unsafe={unsafe_requested}"
+                );
+                assert!(!text.contains("counter-mode-unwired"), "{text}");
+            }
+        }
+        // Omission keeps every legacy selection.
+        assert_eq!(
+            capture_policy(Kind::Profile, false, false, None, false, None).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            capture_policy(Kind::Profile, true, false, None, false, None).unwrap(),
+            CapturePolicy::AggregateOnly
+        );
+        assert_eq!(
+            capture_policy(Kind::Trace, false, false, None, false, None).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+    }
+
+    // 614b P2#2: `--track-short-lived` refuses beside every counter
+    // mode at policy selection, before build/flavor checks, so a
+    // counter session can never arm the exe-identity read. Detailed
+    // selections keep accepting the flag.
+    #[test]
+    fn counter_modes_refuse_track_short_lived_through_capture_policy() {
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let error =
+                capture_policy(Kind::Profile, true, false, Some(mode), true, None).unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "--track-short-lived cannot be combined with --counter-mode {}: \
+                     extensive mode arms Detailed captures only",
+                    mode.name()
+                ),
+                "{mode:?}"
+            );
+        }
+        // Detailed positives: the flag alone changes no selection.
+        assert_eq!(
+            capture_policy(Kind::Profile, false, false, None, true, None).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            capture_policy(Kind::Profile, true, false, None, true, None).unwrap(),
+            CapturePolicy::AggregateOnly
+        );
+        assert_eq!(
+            capture_policy(Kind::Trace, false, false, None, true, None).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+    }
+
+    // 6.15: endpoint selection details a counter broad only. The CLI
+    // refuses this first; the policy re-checks so no programmatic
+    // caller can arm a selection the driver cannot resolve. A
+    // selection beside a counter mode changes no policy by itself.
+    #[test]
+    fn select_endpoint_requires_counter_policy_through_capture_policy() {
+        for (kind, metrics) in [
+            (Kind::Profile, true),
+            (Kind::Profile, false),
+            (Kind::Trace, false),
+        ] {
+            let error =
+                capture_policy(kind, metrics, false, None, false, Some("C_Sign")).unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                "--select-endpoint requires --counter-mode counts|timestamps|latency \
+                 on --mode metrics",
+                "{kind:?}/{metrics}"
+            );
+        }
+        // Beside a counter mode the selection rides along unchanged.
+        // Builds without counter objects refuse by name instead.
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1" {
+            let mode = p11scope_ebpf_common::CounterMode::Counts;
+            assert_eq!(
+                capture_policy(
+                    Kind::Profile,
+                    true,
+                    false,
+                    Some(mode),
+                    false,
+                    Some("C_Sign")
+                )
+                .unwrap(),
+                CapturePolicy::Counter(mode),
+            );
+        }
+    }
+
+    // 614b P1 narrow authorization: the exe-identity read arms only
+    // where the STATIC HINT split can publish — Detailed profile-kind,
+    // non-metrics captures over generation-admitting scopes. Trace,
+    // metrics, exact-PID and counter captures accept the flag but must
+    // record no exe identity: capture without a possible consumer is
+    // outside the grant.
+    #[test]
+    fn extensive_arms_only_on_hint_publishing_captures() {
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+        };
+        let detailed = CapturePolicy::Allowlisted;
+        // The publishing shape arms, on either admitting scope.
+        assert!(extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &cgroup,
+            detailed
+        ));
+        assert!(extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &Scope::System,
+            detailed
+        ));
+        // Default off stays off everywhere.
+        assert!(!extensive_effective(
+            false,
+            Kind::Profile,
+            false,
+            &cgroup,
+            detailed
+        ));
+        // Trace publishes no profile evidence: never arm.
+        assert!(!extensive_effective(
+            true,
+            Kind::Trace,
+            false,
+            &cgroup,
+            detailed
+        ));
+        // Metrics renders no hint split: never arm.
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            true,
+            &cgroup,
+            CapturePolicy::AggregateOnly
+        ));
+        // Exact-PID scope classifies no descendant gaps: never arm.
+        // (An owned `run` is this shape.)
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &Scope::Pid(41),
+            detailed
+        ));
+        // P2#2 confinement still holds inside the helper: a counter
+        // policy never arms, whatever the other inputs.
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &cgroup,
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts)
+        ));
+    }
+
+    #[test]
+    fn run_loop_forwards_built_counter_inputs_to_capture_profile() {
+        // The profile loop builds real CounterCaptureInputs from the active
+        // policy instead of passing None. The privileged collection cell
+        // proves it behaviorally; this pins the wiring in source.
+        let source = include_str!("run.rs");
+        let profile_arm = source
+            .split_once("fn run_loop(")
+            .expect("run loop")
+            .1
+            .split_once("Kind::Trace =>")
+            .expect("profile arm")
+            .0;
+        assert!(
+            profile_arm.contains("counter_inputs_for_capture(policy, engine)"),
+            "run_loop must build counter inputs from the active policy"
+        );
+        let call = profile_arm
+            .split_once("capture_profile(")
+            .expect("profile call")
+            .1
+            .split_once(')')
+            .expect("call end")
+            .0;
+        assert!(
+            call.contains("counter_inputs,"),
+            "forward built inputs, not None"
+        );
+        assert!(
+            !call.contains("None"),
+            "no None literal in the inputs position"
+        );
+    }
+
+    #[test]
+    fn run_loop_forwards_endpoint_selection_to_capture_profile() {
+        // 6.15: the CLI selection rides run_loop into capture_profile
+        // as the operator's variable (never a None literal), where the
+        // metrics selection stage resolves it and the composer adds
+        // the additive ledger. The stage/composer behavior is proven
+        // by the driver twins; this pins the wiring in source.
+        let source = include_str!("run.rs");
+        let profile_arm = source
+            .split_once("fn run_loop(")
+            .expect("run loop")
+            .1
+            .split_once("Kind::Trace =>")
+            .expect("profile arm")
+            .0;
+        let call = profile_arm
+            .split_once("capture_profile(")
+            .expect("profile call")
+            .1
+            .split_once(')')
+            .expect("call end")
+            .0;
+        assert!(
+            call.contains("select_endpoint,"),
+            "forward the operator selection, not None"
+        );
+        assert!(
+            !call.contains("None"),
+            "no None literal in the forwarded positions"
+        );
+        let profile = source
+            .split_once("fn capture_profile(")
+            .expect("profile loop")
+            .1
+            .split_once("fn write_json_report")
+            .expect("report site")
+            .0;
+        assert!(
+            profile.contains("run_metrics_selection_stage("),
+            "capture_profile must resolve the selection before the loop"
+        );
+        assert!(
+            profile.contains("with_selected_detail(j, ledger)"),
+            "capture_profile must compose the additive ledger"
+        );
+        // K0: the close witness snapshot precedes quiescence, which
+        // invalidates the PID lifecycle tap; a snapshot past it would
+        // always read terminal and void every window as caller-changed.
+        let snapshot = profile
+            .find("k0_close_facts = k0_window.as_ref()")
+            .expect("K0 close snapshot");
+        let quiesce = profile.find("quiesce_terminal(").expect("quiescence");
+        assert!(
+            snapshot < quiesce,
+            "capture_profile must snapshot the K0 close witness before quiescence"
+        );
+        // K0 tail: the shutdown-tail split collects exactly the records
+        // the pre-quiescence snapshot cannot see — the quiescence-staged
+        // suffix plus the terminal drain — and hands them to the close.
+        // All four sites must survive in order: the staged-suffix slice,
+        // the observed quiescence apply, the guarded terminal branch,
+        // and the take into the close.
+        let suffix = profile
+            .find("staged_records[k0_prefix_records..]")
+            .expect("K0 tail staged suffix");
+        let observed = profile
+            .find("apply_quiesced_discovery_observed(")
+            .expect("K0 tail observed quiescence");
+        let terminal = profile
+            .find("drain_discovery_terminal_to_position_observed(")
+            .expect("K0 tail observed terminal");
+        let take = profile
+            .find("tail_records: k0_tail_records.take()")
+            .expect("K0 tail take");
+        assert!(
+            suffix < observed && observed < terminal && terminal < take,
+            "capture_profile must collect the K0 tail in order"
+        );
+        // K0 loss snapshots: the open passes the comparable discovery
+        // losses (the live total minus exit-only truncations) and whether
+        // the capture is owned before the loop, and the close reads them
+        // again after the terminal drain, inside `run_terminal`, so
+        // growth inside the window voids the detail.
+        let open = profile.find("open_k0_production(").expect("K0 open");
+        let open_call = &profile[open..];
+        let open_losses = open_call
+            .find("k0_comparable_losses(&engine.capture_facts())")
+            .expect("K0 open losses");
+        let open_owned = open_call.find("owned.is_some(),").expect("K0 open owned");
+        let open_end = open_call.find(");").expect("K0 open call end");
+        assert!(
+            open_losses < open_end && open_owned < open_end,
+            "the K0 open passes its losses and owned flag"
+        );
+        let terminal_fn = source
+            .split_once("fn run_terminal(")
+            .expect("run_terminal")
+            .1;
+        // The close snapshots facts, then comparable losses from them
+        // (production precedes the tests module, so the first match is
+        // the production site, not this string).
+        let facts_binding = terminal_fn
+            .find("let after_facts = context.0.capture_facts()")
+            .expect("K0 close facts");
+        let close_binding = terminal_fn
+            .find("let after_losses =")
+            .expect("K0 close binding");
+        assert!(
+            facts_binding < close_binding,
+            "the K0 close snapshots facts before losses"
+        );
+        let close_call = &terminal_fn[close_binding..];
+        let close_losses = close_call
+            .find("k0_comparable_losses(&after_facts)")
+            .expect("K0 close losses");
+        let close_end = close_call.find(';').expect("K0 close binding end");
+        assert!(
+            close_losses < close_end,
+            "the K0 close snapshots its comparable losses"
+        );
+        let close = terminal_fn.find("close_k0_production(").expect("K0 close");
+        let terminal_read = terminal_fn.find(".terminal(").expect("broad terminal read");
+        assert!(
+            terminal_read < close_binding && close_binding < close,
+            "run_terminal must snapshot the K0 close losses after the terminal read and before the close"
+        );
+    }
+
+    /// m5: the K0 debug line prints on the terminal-failure path too,
+    /// so a quiesce-error void shows its counts instead of failing the
+    /// live cells with a parse error. Both arms gate on the same
+    /// variable and share the format helper.
+    #[test]
+    fn k0_debug_line_prints_on_the_terminal_failure_path() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let terminal_fn = production.split_once("fn run_terminal(").unwrap().1;
+        assert_eq!(
+            terminal_fn.matches("var_os(\"P11SCOPE_K0_DEBUG\")").count(),
+            2,
+            "the normal close and the terminal-failure arm both gate the line"
+        );
+        assert_eq!(
+            production.matches("format_k0_debug_line(").count(),
+            3,
+            "one format helper plus its two call sites"
+        );
+    }
+
+    #[test]
+    fn counter_inputs_come_from_policy_and_counters_plan() {
+        use crate::attach::CapturePolicy;
+        use crate::discovery::engine::Engine;
+        let mut engine = Engine::empty_for_test();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            vec![],
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(512).unwrap(),
+            ),
+        )
+        .unwrap();
+        engine.inject_counter_start_state_for_test(
+            crate::attach::Scope::Pid(1),
+            Vec::new(),
+            plan,
+            crate::discovery::identity::PinnedObjects::empty(),
+            Vec::new(),
+        );
+        // Counter policy + Counters plan -> bounded inputs from the budget.
+        let inputs = counter_inputs_for_capture(
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts),
+            &engine,
+        )
+        .expect("counter plan builds inputs");
+        assert_eq!(inputs.rows(), 512);
+        assert_eq!(inputs.rv_keys(), 65536);
+        // Non-counter policies never build inputs.
+        for policy in [CapturePolicy::AggregateOnly, CapturePolicy::Allowlisted] {
+            assert!(
+                counter_inputs_for_capture(policy, &engine).is_none(),
+                "{policy:?} builds no counter inputs"
+            );
+        }
+        // Counter policy without a Counters plan builds nothing.
+        let mut detailed = Engine::empty_for_test();
+        detailed.inject_counter_start_state_for_test(
+            crate::attach::Scope::Pid(1),
+            Vec::new(),
+            crate::plan::AttachPlan::from_slots(vec![]),
+            crate::discovery::identity::PinnedObjects::empty(),
+            Vec::new(),
+        );
+        assert!(
+            counter_inputs_for_capture(
+                CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts),
+                &detailed
+            )
+            .is_none()
+        );
     }
 
     /// Review P2: a PID-scoped capture refuses by name before its target is
@@ -11140,9 +15255,8 @@ mod tests {
         // it never replaces it, and it never attaches to an unrelated failure.
         let capture_available = crate::doctor::verdict(&crate::doctor::probe(None, None)) == 0;
         if !capture_available {
-            // The hazard preflight refuses first: without BPF the kernel
-            // cannot be proven to exempt the trampoline, so an owned
-            // child is refused before anything is forked (F-01).
+            // Required host admission now precedes the hazard preflight.
+            // Both are finite environment refusals before a child is forked.
             let never = format!(
                 "{:#}",
                 run_owned(&run_args(cli::PausePolicy::Never, &["/bin/true"]))
@@ -11154,6 +15268,7 @@ mod tests {
             let environment = |text: &str| {
                 text.contains("refusing to attach")
                     || text.contains("cannot load p11scope's BPF programs")
+                    || text.contains("uprobe-multi-required:")
             };
             assert!(environment(&never), "{never}");
             assert!(
@@ -11170,7 +15285,8 @@ mod tests {
             );
             assert!(
                 behind_override.contains("attach session")
-                    || behind_override.contains("cannot load p11scope's BPF programs"),
+                    || behind_override.contains("cannot load p11scope's BPF programs")
+                    || behind_override.contains("uprobe-multi-required:"),
                 "{behind_override}"
             );
             assert!(
@@ -11429,16 +15545,19 @@ mod tests {
         let events = (0..5).map(|_| call_event());
         let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, 2), 1);
 
-        let (malformed, may_remain) = drain_trace_events_from(
+        let (malformed, may_remain) = drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             Some(LIVE_POLL_QUANTUM),
         )
         .unwrap();
@@ -11470,16 +15589,19 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, LIVE_POLL_QUANTUM), 1);
 
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             Some(LIVE_POLL_QUANTUM),
         )
         .unwrap();
@@ -11898,10 +16020,15 @@ mod tests {
             loop {
                 since_frame += READY_IDLE_POLL;
                 let mut asked = false;
-                let pass = discovery_due(since_frame, drain, || {
-                    asked = true;
-                    hook.is_some_and(|hook| since_frame >= hook)
-                });
+                let pass = discovery_due(
+                    since_frame,
+                    drain,
+                    || {
+                        asked = true;
+                        hook.is_some_and(|hook| since_frame >= hook)
+                    },
+                    || false,
+                );
                 if let Some(pass) = pass {
                     return (since_frame, pass, asked && pass == DiscoveryPass::Frame);
                 }
@@ -12023,12 +16150,22 @@ mod tests {
                 1,
                 "{function} must gate discovery once per tick"
             );
+            let pending_stop_check = if function == "capture_trace" {
+                "owned_stop_pending(engine, session, owned.as_deref(), interrupted)"
+            } else {
+                "owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)"
+            };
             assert!(
-                tick.contains(
-                    "owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)"
-                ),
+                tick.contains(pending_stop_check),
                 "{function} must ask the gate for a pending pause stop"
             );
+            if function == "capture_trace" {
+                assert!(
+                    tick.find(pending_stop_check).unwrap()
+                        < tick.find("with_trace_identity_frame(").unwrap(),
+                    "trace must decide the pending-stop pass before granting frame proof work"
+                );
+            }
             assert_eq!(
                 tick.matches("count_discovery_pass(frame_tick, pass)")
                     .count(),
@@ -12097,8 +16234,8 @@ mod tests {
             let mut reads = reads.into_iter();
             let frame =
                 profile_frame_decisions(|| reads.next().expect("at most three reads"), drain);
-            let discovery =
-                discovery_due(frame.since_frame, drain, || false) == Some(DiscoveryPass::Frame);
+            let discovery = discovery_due(frame.since_frame, drain, || false, || false)
+                == Some(DiscoveryPass::Frame);
             (discovery, frame.fresh_snapshot, frame.render)
         };
         let crossing = drain + Duration::from_millis(29);
@@ -12113,6 +16250,67 @@ mod tests {
             (true, true, true),
             "the next tick does all of it"
         );
+    }
+
+    #[test]
+    fn immediate_exec_recovery_request_schedules_a_whole_profile_frame_once() {
+        let drain = PROFILE_CADENCE;
+        let rendered = Instant::now();
+        let mut last_frame = rendered;
+        let after_long_tick = rendered + Duration::from_millis(500);
+        request_profile_recovery_frame(&mut last_frame, drain, true, || after_long_tick);
+        let mut reads = 0;
+        let frame = profile_frame_decisions(
+            || {
+                reads += 1;
+                after_long_tick.duration_since(last_frame)
+            },
+            drain,
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(
+            discovery_due(frame.since_frame, drain, || false, || false),
+            Some(DiscoveryPass::Frame)
+        );
+        assert!(frame.fresh_snapshot && frame.render);
+        let mut cache = Some(7);
+        assert_eq!(
+            profile_tick_snapshot(frame, &mut cache, || Ok(11)).unwrap(),
+            11
+        );
+
+        // The next completed render takes over the ordinary cadence. A
+        // consumed signal cannot keep requesting frames or read another clock.
+        last_frame = after_long_tick;
+        request_profile_recovery_frame(&mut last_frame, drain, false, || {
+            panic!("ordinary cadence needs no recovery clock read")
+        });
+        let next = profile_frame_decisions(
+            || (after_long_tick + Duration::from_millis(1)).duration_since(last_frame),
+            drain,
+        );
+        assert_eq!(
+            discovery_due(next.since_frame, drain, || false, || false),
+            None
+        );
+        assert!(!next.fresh_snapshot && !next.render);
+    }
+
+    #[test]
+    fn no_exec_recovery_request_preserves_profile_cadence_and_pending_stop() {
+        let drain = PROFILE_CADENCE;
+        let rendered = Instant::now();
+        let mut last_frame = rendered;
+        request_profile_recovery_frame(&mut last_frame, drain, false, || {
+            panic!("ordinary cadence reads no recovery clock")
+        });
+        assert_eq!(last_frame, rendered);
+        let frame = profile_frame_decisions(|| Duration::from_millis(1), drain);
+        assert_eq!(
+            discovery_due(frame.since_frame, drain, || true, || false),
+            Some(DiscoveryPass::PendingStop)
+        );
+        assert!(!frame.fresh_snapshot && !frame.render);
     }
 
     /// One scripted profile tick, offset from the loop's first tick.
@@ -12151,7 +16349,7 @@ mod tests {
                     },
                     drain,
                 );
-                let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending);
+                let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending, || false);
                 if frame.render {
                     last_frame = start + tick.work;
                 }
@@ -12291,7 +16489,7 @@ mod tests {
                 },
                 drain,
             );
-            let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending);
+            let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending, || false);
             let mut force_full = false;
             if let Some(pass) = pass {
                 let counted = count_discovery_pass(&mut frames, pass);
@@ -12304,6 +16502,10 @@ mod tests {
                     }
                     DiscoveryPass::PendingStop => {
                         totals.pending_stops += 1;
+                    }
+                    // This harness gates with no backlog, so no pass here.
+                    DiscoveryPass::Backlog => {
+                        unreachable!("profile cadence harness admits no backlog pass")
                     }
                 }
             }
@@ -12377,7 +16579,12 @@ mod tests {
         let mut effects = Vec::new();
         for tick in ticks {
             let now = start + drain + tick.start;
-            let pass = discovery_due(now.duration_since(last_frame), drain, || tick.stop_pending);
+            let pass = discovery_due(
+                now.duration_since(last_frame),
+                drain,
+                || tick.stop_pending,
+                || false,
+            );
             let mut force_full = false;
             if let Some(pass) = pass {
                 advance_trace_frame_clock(&mut last_frame, pass, now);
@@ -12391,6 +16598,10 @@ mod tests {
                     }
                     DiscoveryPass::PendingStop => {
                         totals.pending_stops += 1;
+                    }
+                    // This harness gates with no backlog, so no pass here.
+                    DiscoveryPass::Backlog => {
+                        unreachable!("trace cadence harness admits no backlog pass")
                     }
                 }
             }
@@ -12907,6 +17118,22 @@ mod tests {
             capture_ready_line(136),
             "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"
         );
+        assert_eq!(
+            capture_ready_line(0),
+            "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"
+        );
+    }
+
+    #[test]
+    fn loader_readiness_line_exposes_only_the_active_hook_count() {
+        for (count, expected) in [
+            (0, "p11scope: loader readiness: 0 active hook(s)"),
+            (1, "p11scope: loader readiness: 1 active hook(s)"),
+            (2, "p11scope: loader readiness: 2 active hook(s)"),
+            (256, "p11scope: loader readiness: 256 active hook(s)"),
+        ] {
+            assert_eq!(loader_readiness_line(count), expected);
+        }
     }
 
     #[test]
@@ -12915,6 +17142,18 @@ mod tests {
             target_exit_marker(12),
             "p11scope: capture ended: target exited after 12 ticks"
         );
+    }
+
+    #[test]
+    fn target_exit_cleanup_pending_line_shows_only_on_trip() {
+        assert_eq!(
+            target_exit_cleanup_pending_line(true).as_deref(),
+            Some(
+                "p11scope: the target exited but its cleanup was still pending with no progress for 6 s; \
+                 the capture ends with the calls collected so far"
+            )
+        );
+        assert_eq!(target_exit_cleanup_pending_line(false), None);
     }
 
     /// The sink watches the same observation the loop polls: the first
@@ -12975,16 +17214,19 @@ mod tests {
         let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
 
         let outcome = poll_ready(false, &budget, LIVE_POLL_QUANTUM, &mut || false, || {
-            drain_trace_events_from(
+            drain_trace_events_from_with_identities(
                 &mut drain,
-                &mut remaining,
-                &mut state,
-                &mut tracker,
-                &Scope::Pid(std::process::id()),
-                &mut tracer,
-                &mut stdout,
-                &mut stdout_open,
-                &mut out_file,
+                (
+                    &mut remaining,
+                    &mut state,
+                    &mut tracker,
+                    &Scope::Pid(std::process::id()),
+                    &mut tracer,
+                ),
+                None,
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                None,
+                (&mut stdout, &mut stdout_open, &mut out_file),
                 Some(LIVE_POLL_QUANTUM),
             )
         })
@@ -13009,16 +17251,19 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
 
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             None,
         )
         .unwrap();
@@ -13042,6 +17287,7 @@ mod tests {
             module: None,
             module_ambiguous: false,
             module_unresolved: false,
+            mode: p11scope_ebpf_common::CounterMode::Latency,
             calls: 5,
             errors: 0,
             in_flight: 2,
@@ -13070,20 +17316,23 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
 
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Cgroup {
-                id: 0,
-                path: PathBuf::from("/"),
-                dir: Arc::new(File::open("/").unwrap()),
-            },
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Cgroup {
+                    id: 0,
+                    path: PathBuf::from("/"),
+                    dir: Arc::new(File::open("/").unwrap()),
+                },
+                &mut tracer,
+            ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             None,
         )
         .unwrap();
@@ -13120,6 +17369,7 @@ mod tests {
             module: None,
             module_ambiguous: false,
             module_unresolved: false,
+            mode: p11scope_ebpf_common::CounterMode::Latency,
             calls: 5,
             errors: 0,
             in_flight: 2,
@@ -13136,16 +17386,19 @@ mod tests {
             crate::events::ScriptedRecords::events([call_event()], usize::MAX),
             1,
         );
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut Vec::new(),
-            &mut true,
-            &mut None::<Vec<u8>>,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (&mut Vec::new(), &mut true, &mut None::<Vec<u8>>),
             None,
         )
         .unwrap();
@@ -13255,6 +17508,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -13269,6 +17523,8 @@ mod tests {
             scheduling,
             None,
             None,
+            None,
+            0,
         );
         evidence.mark_terminal_drain_unproven();
         evidence
@@ -13308,13 +17564,20 @@ mod tests {
     #[test]
     fn terminal_trace_evidence_accounts_every_terminal_drop_byte_exact() {
         let (reader, writer) = pipe_pair();
+        // Make every phase encounter real backpressure, independently of
+        // the host's default pipe capacity. A 64 KiB pipe can now accept
+        // the bounded sink's first exact 64 KiB batch without any drop.
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
         let mut sink =
             crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
         let mut stdout_open = true;
         let mut file = Some(Vec::new());
         let mut scheduling = SchedulingAccumulator::default();
         sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
-        // 100KB past a 64KB pipe with no reader yet: the mid-write
+        // 100KB past a 4KB pipe with no reader yet: the mid-write
         // auto-flush delivers a pipeful and drops the rest.
         emit_pre_terminal_lines(&mut sink, &mut stdout_open, &mut file, 100, 1000);
         let parked = Arc::new(AtomicBool::new(false));
@@ -13604,16 +17867,19 @@ mod tests {
                     |context, quantum| {
                         assert_eq!(selected.get(), if detached { 2 } else { 1 });
                         if trace {
-                            drain_trace_events_from(
+                            drain_trace_events_from_with_identities(
                                 &mut context.1,
-                                &mut None,
-                                &mut state,
-                                &mut tracker,
-                                &Scope::Pid(7),
-                                &mut tracer,
-                                &mut Vec::new(),
-                                &mut true,
-                                &mut None::<Vec<u8>>,
+                                (
+                                    &mut None,
+                                    &mut state,
+                                    &mut tracker,
+                                    &Scope::Pid(7),
+                                    &mut tracer,
+                                ),
+                                None,
+                                #[cfg(feature = "h6-reexec-diagnostic")]
+                                None,
+                                (&mut Vec::new(), &mut true, &mut None::<Vec<u8>>),
                                 quantum,
                             )
                         } else {
@@ -13939,6 +18205,84 @@ mod tests {
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         assert_eq!(production.matches("\\x1b[2J").count(), 1);
         assert_eq!(production.matches("live_display.frame_bytes(").count(), 2);
+    }
+
+    /// Sol-full F3: no production capture/discovery diagnostic may use a
+    /// blocking stderr write — a full pipe or stalled terminal would park
+    /// the capture thread while producers remain active. Every emission
+    /// routes through the bounded `emit_capture_diagnostic` helper, whose
+    /// transport the sink tests pin (shed-a-stalled-sink, closed-sink);
+    /// the delivery-independent exit status is covered end to end by
+    /// `tests/capture_stderr_delivery.rs`. The collection-spawn fallback
+    /// in `inventory/capture.rs` (whose tests live in another file and
+    /// cannot pin it) is pinned here too.
+    #[test]
+    fn capture_diagnostics_never_use_blocking_stderr_writes() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            !production.contains("eprintln!"),
+            "production run.rs still has blocking stderr writes"
+        );
+        for (region, start, end) in [
+            (
+                "capture",
+                "pub fn capture(a: &CaptureArgs)",
+                "\nfn no_duration_notice",
+            ),
+            (
+                "run_owned_inner",
+                "fn run_owned_inner(",
+                "fn preflight_uretprobe_hazard(",
+            ),
+            (
+                "preflight_uretprobe_hazard",
+                "fn preflight_uretprobe_hazard(",
+                "fn pid_namespace_preflight(",
+            ),
+            (
+                "report_attach_failures",
+                "fn report_attach_failures(",
+                "fn format_attach_failure(",
+            ),
+            (
+                "warn_unsafe_policy",
+                "fn warn_unsafe_policy(",
+                "fn identify_tracked(",
+            ),
+            (
+                "retire_pause_policy",
+                "fn retire_pause_policy(",
+                "fn capture_end(",
+            ),
+            (
+                "capture_profile",
+                "fn capture_profile(",
+                "fn write_json_report",
+            ),
+            (
+                "capture_trace",
+                "fn capture_trace(",
+                "fn terminal_trace_count_line",
+            ),
+        ] {
+            let body = production
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{region} moved"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{region} end moved"))
+                .0;
+            assert!(
+                body.contains("emit_capture_diagnostic("),
+                "{region} lost its bounded diagnostic emission"
+            );
+        }
+        let inventory = include_str!("inventory/capture.rs");
+        assert!(
+            !inventory.contains("eprintln!"),
+            "inventory/capture.rs still has a blocking stderr write"
+        );
     }
 
     #[test]
@@ -14856,6 +19200,7 @@ mod tests {
                 .env(G7_SLEEPER_ENV, &sleeper)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .expect("spawning the fresh-registry observer run");
             // Bounded wait mirroring the fork-child reap: a wedged run
@@ -15139,6 +19484,11 @@ mod tests {
     fn ring_bytes_default_is_the_bpf_constant() {
         assert_eq!(resolve_ring_bytes(None), p11scope_ebpf_common::RING_BYTES);
         assert_eq!(resolve_ring_bytes(Some(1 << 20)), 1 << 20);
+        assert_eq!(
+            resolve_journal_ring_bytes(None),
+            p11scope_ebpf_common::JOINT_RING_BYTES
+        );
+        assert_eq!(resolve_journal_ring_bytes(Some(1 << 20)), 1 << 20);
     }
 
     /// DR-CLASSIC-PID0: an `auto` fallback is disclosed on stderr before the
@@ -15186,6 +19536,7 @@ mod tests {
                 false,
                 false,
                 Default::default(),
+                render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
                 &[],
                 &[],
                 metrics::KernelEvidence::default(),
@@ -15200,6 +19551,8 @@ mod tests {
                 render::SchedulingEvidence::default(),
                 None,
                 None,
+                None,
+                0,
             )
         };
 
@@ -15261,6 +19614,7 @@ mod tests {
                     attempts: 5,
                     confirmed: 5,
                     partial: 0,
+                    unavailable: 0,
                 },
                 "sigstop",
                 0,
@@ -15270,6 +19624,7 @@ mod tests {
                     attempts: 5,
                     confirmed: 2,
                     partial: 3,
+                    unavailable: 0,
                 },
                 "partial",
                 1,
@@ -15283,6 +19638,9 @@ mod tests {
                     false,
                     false,
                     Default::default(),
+                    render::ObjectCaptureEvidence::for_build(cfg!(
+                        feature = "stub-object-attributes"
+                    )),
                     &[],
                     &[],
                     metrics::KernelEvidence::default(),
@@ -15297,6 +19655,8 @@ mod tests {
                     render::SchedulingEvidence::default(),
                     None,
                     None,
+                    None,
+                    0,
                 );
                 assert_eq!(evidence.pause, status);
                 assert_eq!(evidence.unprotected_live_windows, unprotected);
@@ -15339,6 +19699,48 @@ mod tests {
     }
 
     #[test]
+    fn evidence_for_exonerates_benign_loader_hits_from_unprotected_windows() {
+        use crate::discovery::pause::PauseCounters;
+
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        for (hits, benign_hits, unprotected) in [(1, 1, 0), (2, 1, 1), (2, 0, 1)] {
+            let mut facts = engine.capture_facts();
+            facts.loader_discovery.hits = hits;
+            facts.loader_discovery.benign_hits = benign_hits;
+            let evidence = evidence_for(
+                &engine,
+                facts,
+                0,
+                false,
+                false,
+                Default::default(),
+                render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+                &[],
+                &[],
+                metrics::KernelEvidence::default(),
+                process::TrackingEvidence::default(),
+                0,
+                &state,
+                false,
+                true,
+                PauseCounters::default(),
+                None,
+                false,
+                render::SchedulingEvidence::default(),
+                None,
+                None,
+                None,
+                0,
+            );
+            assert_eq!(
+                evidence.unprotected_live_windows, unprotected,
+                "hits={hits} benign={benign_hits}"
+            );
+        }
+    }
+
+    #[test]
     fn evidence_for_keeps_distinct_discovery_losses_across_all_renderers() {
         let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
         let state = semantics::State::new(engine.plan());
@@ -15355,6 +19757,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -15369,6 +19772,8 @@ mod tests {
             render::SchedulingEvidence::default(),
             None,
             None,
+            None,
+            0,
         );
         let capture = render::CaptureMeta {
             started: "t0",
@@ -15408,6 +19813,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -15422,6 +19828,8 @@ mod tests {
             render::SchedulingEvidence::default(),
             None,
             None,
+            None,
+            0,
         );
 
         assert_eq!(evidence.pid_descendant_gaps, 0);
@@ -15747,6 +20155,7 @@ mod tests {
         let error = crate::inspect::run(
             crate::cli::InspectScope::Pid(0x7fff_fff0),
             &[],
+            &[],
             &crate::discovery::hooks::HookRegistry::builtin(),
             false,
             None,
@@ -15806,6 +20215,122 @@ mod tests {
         assert!(!rendered.contains("reading manifest"), "{rendered}");
     }
 
+    /// A planted flavor mismatch refuses capture policy before anything
+    /// else runs. Fails while policy derives the flavor from the feature.
+    #[test]
+    fn capture_policy_refuses_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let error = capture_policy(Kind::Profile, false, false, None, false, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+    }
+
+    /// Capture policy follows the probed unsafe presence, not the feature:
+    /// a planted presence disagreement refuses as a mismatch in both
+    /// directions, naming the unsafe decoders. Fails while policy passes
+    /// the feature through.
+    #[test]
+    fn capture_policy_uses_probed_unsafe_presence() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let error = capture_policy(Kind::Profile, false, true, None, false, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            assert!(message.contains("lack"), "{message}");
+        } else {
+            assert!(message.contains("contain"), "{message}");
+        }
+    }
+
+    /// Extract one top-level function body from this file's source for the
+    /// wiring pin below (the uretprobe loader-contract shape).
+    fn pin_body<'a>(
+        source: &'a str,
+        signature: &str,
+        end: &str,
+    ) -> std::result::Result<&'a str, String> {
+        source
+            .split_once(signature)
+            .ok_or_else(|| format!("{signature} not found"))?
+            .1
+            .split_once(end)
+            .map(|(body, _)| body)
+            .ok_or_else(|| format!("{signature} body end not found"))
+    }
+
+    /// Output evidence carries the session's object-capture status: the
+    /// evidence builder takes it as a parameter instead of re-reading the
+    /// global cache. (The production call sites are pinned from the render
+    /// side.) Fails while the builder re-reads the cache.
+    #[test]
+    fn evidence_for_carries_the_session_object_capture() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            let built = pin_body(source, "fn evidence_for(", "\n}\n")?;
+            if !built.contains("object_capture,") {
+                return Err("evidence_for must take the session's object capture".to_string());
+            }
+            if built.contains("object_capture_evidence") {
+                return Err("evidence_for must not re-read the global cache".to_string());
+            }
+            Ok(())
+        }
+
+        let source = include_str!("run.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            "object_capture,",
+            "object_capture: render::ObjectCaptureEvidence::for_build(crate::attach::embedded_flavor().map(|flavor| flavor.stubbed).unwrap_or(false)),",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant reverts the builder");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// The uretprobe preflight refuses a flavor mismatch with the plain
+    /// gate message: no capture lane can work, so the override is not
+    /// offered. Fails while the mismatch classifies as an unknown kernel.
+    #[test]
+    fn uretprobe_preflight_reports_a_flavor_mismatch_without_an_override_hint() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        for overridden in [false, true] {
+            let error = preflight_uretprobe_hazard(None, overridden)
+                .expect_err("a flavor mismatch must refuse the preflight");
+            let message = format!("{error:#}");
+            assert!(message.contains("stale or mismatched"), "{message}");
+            assert!(!message.contains("allow-uretprobe"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_override_exit_warning_does_not_invent_target_or_kernel_facts() {
+        let source = include_str!("run.rs");
+        let warning = source
+            .split_once("    if accepted_uretprobe_risk && engine.expected_target_exit() {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(warning.contains("risk was explicitly accepted"));
+        assert!(warning.contains("does not establish whether"));
+        assert!(!warning.contains("syscall-confined"));
+        assert!(!warning.contains("kernel measured to kill"));
+        assert!(!warning.contains("death's fingerprint"));
+    }
+
     #[test]
     fn broken_stdout_closes_only_that_sink_and_file_continues() {
         let mut stdout = FailingWriter {
@@ -15836,11 +20361,2123 @@ mod tests {
         let mut open = true;
         assert!(flush_stdout(&mut flush, &mut open).is_err());
     }
+
+    #[test]
+    fn discovery_stage_quantum_bounds_ticks_by_shared_allowance() {
+        use crate::discovery::engine::{DISCOVERY_HELD_CAP, LIVE_DISCOVERY_DRAIN_QUANTUM};
+        assert_eq!(discovery_stage_quantum(0, 0), LIVE_DISCOVERY_DRAIN_QUANTUM);
+        assert_eq!(
+            discovery_stage_quantum(100, 100),
+            LIVE_DISCOVERY_DRAIN_QUANTUM
+        );
+        assert_eq!(
+            discovery_stage_quantum(DISCOVERY_HELD_CAP - 96, 0),
+            96,
+            "the last room stages a partial quantum"
+        );
+        assert_eq!(
+            discovery_stage_quantum(0, DISCOVERY_HELD_CAP - 96),
+            96,
+            "Engine-held records count against the same allowance"
+        );
+        assert_eq!(discovery_stage_quantum(DISCOVERY_HELD_CAP, 0), 0);
+        assert_eq!(discovery_stage_quantum(0, DISCOVERY_HELD_CAP), 0);
+        assert_eq!(
+            discovery_stage_quantum(DISCOVERY_HELD_CAP, DISCOVERY_HELD_CAP),
+            0,
+            "saturation never underflows"
+        );
+        assert_eq!(
+            discovery_stage_quantum(DISCOVERY_HELD_CAP + 1, 0),
+            0,
+            "over full still stages nothing"
+        );
+    }
+
+    #[test]
+    fn stage_quiesced_discovery_items_stops_at_cap_with_overflow() {
+        fn record(pid: u32) -> p11scope_ebpf_common::DiscoveryRecord {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = (u64::from(pid)) << 32;
+            record
+        }
+        use crate::events::DiscoveryItem;
+        // Under the cap everything stages in order, malformed items count
+        // without consuming room, and an empty read ends the poll.
+        let script = vec![
+            Some(DiscoveryItem::Record(record(1))),
+            Some(DiscoveryItem::Malformed),
+            Some(DiscoveryItem::Record(record(2))),
+            None,
+            Some(DiscoveryItem::Record(record(3))),
+        ];
+        let mut script = script.into_iter();
+        let mut staged = Vec::new();
+        let mut malformed = 0u64;
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| panic!("the probe runs only at the cap"),
+            &mut staged,
+            &mut malformed,
+            4096,
+            &mut overflow,
+        );
+        assert_eq!(
+            staged
+                .iter()
+                .map(|record| record.pid_tgid)
+                .collect::<Vec<_>>(),
+            vec![1u64 << 32, 2u64 << 32]
+        );
+        assert_eq!(malformed, 1);
+        assert!(!overflow);
+        // At the cap the poll stops before dequeuing anything further: the
+        // next record stays unread and the overflow flag trips exactly once.
+        let script = vec![
+            Some(DiscoveryItem::Record(record(10))),
+            Some(DiscoveryItem::Record(record(11))),
+        ];
+        let mut script = script.into_iter();
+        let mut staged = vec![record(9)];
+        let mut malformed = 0u64;
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged,
+            &mut malformed,
+            1,
+            &mut overflow,
+        );
+        assert_eq!(staged.len(), 1, "nothing past the cap is staged");
+        assert_eq!(malformed, 0);
+        assert!(overflow);
+        assert_eq!(script.len(), 2, "the next record stays unread in the ring");
+        // A zero cap overflows immediately without consuming anything.
+        let script = vec![Some(DiscoveryItem::Record(record(20)))];
+        let mut script = script.into_iter();
+        let mut staged = Vec::new();
+        let mut malformed = 0u64;
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged,
+            &mut malformed,
+            0,
+            &mut overflow,
+        );
+        assert!(staged.is_empty() && malformed == 0 && overflow);
+        assert_eq!(script.len(), 1);
+    }
+
+    /// H5 Decision 3: backlog service between frames keeps frame cadence.
+    /// The gate prioritizes a due frame, then a pending owned stop, then
+    /// backlog; a backlog pass counts no frame, forces no sweep and moves
+    /// no frame clock. Live: 600 staged renewals behind a long frame
+    /// interval drain in bounded 256-item quanta with a quiet end, pure
+    /// renewals report no plan change, and nothing is truncated. Both
+    /// loop arms service through the shared quantum and hand its dispatch
+    /// flag to the existing resync branch, without touching maps, the
+    /// snapshot, the render or the frame counter.
+    #[test]
+    fn discovery_backlog_service_keeps_frame_cadence() {
+        use crate::discovery::engine::EngineSession as _;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+
+        // Due priority over one read: a due frame wins over everything, a
+        // pending owned stop wins over backlog, backlog wins over idleness.
+        let drain = Duration::from_secs(1);
+        assert_eq!(
+            discovery_due(drain, drain, || true, || true),
+            Some(DiscoveryPass::Frame)
+        );
+        assert_eq!(
+            discovery_due(Duration::ZERO, drain, || true, || true),
+            Some(DiscoveryPass::PendingStop)
+        );
+        assert_eq!(
+            discovery_due(Duration::ZERO, drain, || false, || true),
+            Some(DiscoveryPass::Backlog)
+        );
+        assert_eq!(
+            discovery_due(Duration::ZERO, drain, || false, || false),
+            None
+        );
+
+        // A backlog pass is cadence-free: no frame counted, no forced
+        // sweep, no frame-clock move.
+        let mut frames = 41u64;
+        let counted = count_discovery_pass(&mut frames, DiscoveryPass::Backlog);
+        assert_eq!((frames, counted.force_full), (41, false));
+        let tick = Instant::now();
+        let mut frame_clock = tick;
+        advance_trace_frame_clock(&mut frame_clock, DiscoveryPass::Backlog, tick + drain);
+        assert_eq!(frame_clock, tick);
+
+        // Live backlog behind a long frame interval: 600 staged EXEC
+        // renewals over 200 pids stay under the 256-entry request map, so
+        // every quantum is ordinary FIFO dispatch with no pressure episode.
+        let mut engine = Engine::empty_for_test();
+        let records = (0..600u32).map(|offset| {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            record.pid_tgid = u64::from(5_000_000 + offset % 200) << 32;
+            record.hook_ts_ns = u64::MAX;
+            record
+        });
+        let mut session = ScriptedSession::with_records(records, 0);
+        session
+            .stage_discovery(600, engine.discovery_held_len())
+            .unwrap();
+        assert_eq!(session.staged_discovery_len(), 600);
+        assert!(
+            engine.discovery_backlog_pending(session.staged_discovery_len()),
+            "staged transfers are schedulable backlog"
+        );
+        assert_eq!(
+            discovery_due(
+                Duration::ZERO,
+                drain,
+                || false,
+                || engine.discovery_backlog_pending(session.staged_discovery_len())
+            ),
+            Some(DiscoveryPass::Backlog)
+        );
+
+        // One bounded quantum per opportunity: 256, then 256, then the 88
+        // remainder. Each service returns with work outstanding instead of
+        // draining internally, so the loop keeps its EVENTS/cancellation
+        // turn between quanta.
+        for (pass, expected) in [(1, 344), (2, 88), (3, 0)] {
+            let outcome = engine.service_backlog_quantum(&mut session).unwrap();
+            assert!(outcome.progressed, "pass {pass} moves retained work");
+            assert_eq!(
+                outcome.pending,
+                expected != 0,
+                "pass {pass} reports its remainder"
+            );
+            assert!(
+                !outcome.changed,
+                "pass {pass}: pure renewals change no plan, so no consumer resync"
+            );
+            assert_eq!(session.staged_discovery_len(), expected);
+            assert_eq!(
+                engine.pending_discovery_records_for_test(),
+                0,
+                "pass {pass} sheds nothing back"
+            );
+        }
+        // The quiet end: nothing pending, no work, no signal.
+        let quiet = engine.service_backlog_quantum(&mut session).unwrap();
+        assert_eq!(
+            (quiet.changed, quiet.progressed, quiet.pending),
+            (false, false, false)
+        );
+        assert_eq!(
+            engine.unvalidated_discovery_for_test(),
+            0,
+            "the staged drain loses nothing"
+        );
+
+        // Both loop arms share the contract: service through the bounded
+        // quantum, schedule a zero sleep only on progressed remainder, hand
+        // the dispatch flag to the existing resync branch, and touch no
+        // maps, snapshot, render or frame count.
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, tick) in [("capture_profile", profile), ("capture_trace", trace)] {
+            let arm = tick
+                .split_once("DiscoveryPass::Backlog =>")
+                .unwrap_or_else(|| panic!("{function} must match a backlog pass"))
+                .1
+                .split_once(".add_phase(SchedulingPhase::Discovery")
+                .unwrap_or_else(|| {
+                    panic!("{function}: backlog arm ends at the shared phase charge")
+                })
+                .0;
+            assert!(
+                arm.contains("service_backlog_quantum("),
+                "{function}: the backlog arm services through the shared quantum"
+            );
+            assert!(
+                arm.contains("note_discovery_backlog(outcome.pending && outcome.progressed)"),
+                "{function}: only progressed remainder schedules a zero sleep"
+            );
+            assert!(
+                arm.contains("(outcome.changed, false)"),
+                "{function}: the dispatch flag reaches the existing resync branch"
+            );
+            for forbidden in [
+                "metrics::read",
+                "collection.fresh",
+                "profile_tick_snapshot",
+                "live_display",
+                "frame_tick",
+                "render",
+                "drain_discovery_tick",
+            ] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "{function}: the backlog arm touches no {forbidden}"
+                );
+            }
+            assert_eq!(
+                tick.matches("discovery_backlog_pending(").count(),
+                1,
+                "{function} reads the backlog predicate once per tick"
+            );
+            assert!(
+                tick.contains("note_discovery_backlog(false)"),
+                "{function} resets the backlog sleep flag every tick"
+            );
+        }
+        // The cadence survived the whole scenario: counting the backlog
+        // passes above moved nothing.
+        assert_eq!(frames, 41);
+    }
+
+    /// H5 storage: quiescence staging is bounded in both modes. The
+    /// production splitter stages a live tick prefix, then repeated
+    /// production polls stage N+1 input up to the shared cap: peak
+    /// occupancy never exceeds it, the first unstaged record stays
+    /// unread, malformed items hold credits like records, and the owned
+    /// prefix drains in order. Unresolved N+1 reports truncation failure;
+    /// an empty quiescence stages nothing and reports nothing, and a
+    /// staged-at-cap poll over a proven-empty transport is the lossless
+    /// positive, never overflow. Both capture loops stage through the
+    /// shared helper — never a test-only
+    /// duplicate — and skip discovery polling once overflow trips while
+    /// EVENTS/stop polling continues.
+    #[test]
+    fn quiescence_discovery_storage_is_bounded_in_both_modes() {
+        use crate::discovery::engine::DISCOVERY_HELD_CAP;
+        use crate::events::DiscoveryItem;
+
+        fn record(pid: u32) -> p11scope_ebpf_common::DiscoveryRecord {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = (u64::from(pid)) << 32;
+            record
+        }
+
+        // A live tick prefix through the production splitter: 4,095
+        // staged records as if the ticks staged them, with the engine
+        // holding nothing else, so the quiescence cap is the full 4,096.
+        let engine = Engine::empty_for_test();
+        let quiesce_cap = DISCOVERY_HELD_CAP.saturating_sub(engine.discovery_held_len());
+        assert_eq!(quiesce_cap, 4_096);
+        let prefix: Vec<DiscoveryItem> = (0..4_095u32)
+            .map(|pid| DiscoveryItem::Record(record(pid)))
+            .collect();
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(prefix);
+        assert_eq!((staged_records.len(), staged_malformed), (4_095, 0));
+
+        // N+1 across repeated polls: room for exactly one more unit. The
+        // first poll stages it; the second record stays unread and the
+        // overflow trips; a third poll stages nothing further.
+        let mut script = vec![
+            Some(DiscoveryItem::Record(record(4_095))),
+            Some(DiscoveryItem::Record(record(4_096))),
+        ]
+        .into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096, "peak occupancy is the cap");
+        assert_eq!(staged_malformed, 0);
+        assert!(overflow, "N+1 trips overflow");
+        assert_eq!(script.len(), 1, "the first unstaged record stays unread");
+        let mut script = vec![Some(DiscoveryItem::Record(record(4_097)))].into_iter();
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096, "no poll grows past the cap");
+        assert_eq!(script.len(), 1, "a full poll consumes nothing");
+        // The owned prefix drains in order: tick-staged items first, then
+        // the quiesced item in arrival order.
+        let order: Vec<u32> = staged_records
+            .iter()
+            .map(|record| (record.pid_tgid >> 32) as u32)
+            .collect();
+        assert_eq!(order, (0..4_096u32).collect::<Vec<_>>());
+
+        // Malformed N+1 holds a credit like a record: it stages, trips
+        // overflow, and the record behind it stays unread.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_095u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![
+            Some(DiscoveryItem::Malformed),
+            Some(DiscoveryItem::Record(record(4_200))),
+        ]
+        .into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!((staged_records.len(), staged_malformed), (4_095, 1));
+        assert!(overflow);
+        assert_eq!(script.len(), 1, "the record behind malformed stays unread");
+
+        // A simulated 96-item engine hold shrinks the same cap: the helper
+        // bounds prefix plus polls against 4,000, not 4,096.
+        let held_cap = DISCOVERY_HELD_CAP.saturating_sub(96);
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..3_999u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![
+            Some(DiscoveryItem::Record(record(3_999))),
+            Some(DiscoveryItem::Record(record(4_000))),
+        ]
+        .into_iter();
+        let mut overflow = false;
+        for _ in 0..3 {
+            stage_quiesced_discovery_items(
+                &mut script,
+                |script| script.next().unwrap(),
+                |_| false,
+                &mut staged_records,
+                &mut staged_malformed,
+                held_cap,
+                &mut overflow,
+            );
+        }
+        assert_eq!(staged_records.len(), 4_000);
+        assert!(overflow);
+        assert_eq!(script.len(), 1);
+
+        // Unresolved N+1 reports failure through the production note: the
+        // sticky truncation fails a strict lossless verdict.
+        let mut engine = Engine::empty_for_test();
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+        engine.note_quiesced_discovery_overflow();
+        assert_eq!(engine.unvalidated_discovery_for_test(), 1);
+        engine.note_quiesced_discovery_overflow();
+        assert_eq!(
+            engine.unvalidated_discovery_for_test(),
+            2,
+            "each unresolved quiescence is sticky evidence"
+        );
+
+        // The empty-Q positive: empty polls stage nothing, trip nothing,
+        // and report nothing.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(Vec::new());
+        let mut overflow = false;
+        for _ in 0..3 {
+            stage_quiesced_discovery_items(
+                &mut (),
+                |_| None,
+                |_| panic!("the probe runs only at the cap"),
+                &mut staged_records,
+                &mut staged_malformed,
+                quiesce_cap,
+                &mut overflow,
+            );
+        }
+        assert!(staged_records.is_empty() && staged_malformed == 0 && !overflow);
+        let engine = Engine::empty_for_test();
+        assert_eq!(
+            engine.unvalidated_discovery_for_test(),
+            0,
+            "no overflow means no failure to report"
+        );
+
+        // The exact-N empty positive: staged at the cap with a
+        // proven-empty transport stages nothing, trips nothing, and
+        // consumes nothing — full occupancy alone is never loss.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![None].into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| true,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(!overflow, "a proven-empty transport is lossless");
+        assert_eq!(script.len(), 1, "the probe dequeues nothing");
+
+        // The N+1 twin: staged at the cap with anything still unread
+        // trips overflow and leaves the record unread.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![Some(DiscoveryItem::Record(record(4_096)))].into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(overflow, "an unread record past the cap trips overflow");
+        assert_eq!(script.len(), 1, "the N+1 record stays unread");
+
+        // Both modes stage through the shared helper: exactly one call per
+        // loop, the per-poll overflow guard plus the report guard, exactly
+        // one failure report, and the shared-allowance cap computation.
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, tick) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                tick.matches("stage_quiesced_discovery_items(").count(),
+                1,
+                "{function} stages quiescence through the shared helper"
+            );
+            assert_eq!(
+                tick.matches("if quiesce_overflow {").count(),
+                2,
+                "{function} guards both the poll and the report on overflow"
+            );
+            assert_eq!(
+                tick.matches("note_quiesced_discovery_overflow()").count(),
+                1,
+                "{function} reports unresolved N+1 exactly once"
+            );
+            assert!(
+                tick.contains("DISCOVERY_HELD_CAP"),
+                "{function} caps quiescence against the shared allowance"
+            );
+        }
+    }
+
+    /// The exact-N/N+1 twins through the production quiescence
+    /// callback: a real discovery drain over scripted records, the
+    /// production dequeue closure, and the production position probe
+    /// (`producer == consumer` proves empty). At the cap over an empty
+    /// drain the probe returns lossless without dequeuing; with one
+    /// record still queued it trips overflow and the record stays
+    /// unread, decoding back intact afterwards.
+    #[test]
+    fn quiescence_exact_n_probes_production_drain_positions() {
+        use crate::discovery::engine::DISCOVERY_HELD_CAP;
+        use crate::events::{
+            DiscoveryDrain, DiscoveryItem, ScriptedRecords, discovery_drain_positions,
+        };
+
+        fn record(pid: u32) -> p11scope_ebpf_common::DiscoveryRecord {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = (u64::from(pid)) << 32;
+            record
+        }
+        fn discovery_bytes(record: &p11scope_ebpf_common::DiscoveryRecord) -> Vec<u8> {
+            // SAFETY: the shared repr(C) record is transported as these
+            // exact raw bytes by the kernel ring buffer.
+            unsafe {
+                std::slice::from_raw_parts(
+                    (record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+                    size_of::<p11scope_ebpf_common::DiscoveryRecord>(),
+                )
+                .to_vec()
+            }
+        }
+        // One production quiescence poll: the overflow guard plus the
+        // shared helper with the production closures, verbatim.
+        fn poll(
+            drain: &mut DiscoveryDrain<ScriptedRecords>,
+            staged_records: &mut Vec<p11scope_ebpf_common::DiscoveryRecord>,
+            staged_malformed: &mut u64,
+            quiesce_cap: usize,
+            quiesce_overflow: &mut bool,
+        ) {
+            if *quiesce_overflow {
+                return;
+            }
+            stage_quiesced_discovery_items(
+                drain,
+                |drain| drain.dequeue(),
+                |drain| {
+                    let positions = discovery_drain_positions(drain);
+                    positions.producer == positions.consumer
+                },
+                staged_records,
+                staged_malformed,
+                quiesce_cap,
+                quiesce_overflow,
+            );
+        }
+
+        let engine = Engine::empty_for_test();
+        let quiesce_cap = DISCOVERY_HELD_CAP.saturating_sub(engine.discovery_held_len());
+        assert_eq!(quiesce_cap, 4_096);
+
+        // Exact-N over a proven-empty drain: lossless, and the probe
+        // dequeues nothing.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut drain = DiscoveryDrain::over(ScriptedRecords::records([], 0));
+        let mut overflow = false;
+        poll(
+            &mut drain,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(!overflow, "a proven-empty transport is lossless");
+        let positions = discovery_drain_positions(&drain);
+        assert_eq!(
+            (positions.producer, positions.consumer),
+            (0, 0),
+            "the probe dequeues nothing"
+        );
+
+        // N+1 over a drain with one record still queued: overflow trips
+        // and the record stays unread, decoding back intact afterwards.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut queued = record(4_096);
+        queued.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        let mut drain =
+            DiscoveryDrain::over(ScriptedRecords::records([discovery_bytes(&queued)], 1));
+        let mut overflow = false;
+        poll(
+            &mut drain,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(overflow, "an unread record past the cap trips overflow");
+        let positions = discovery_drain_positions(&drain);
+        assert_eq!(
+            (positions.producer, positions.consumer),
+            (8, 0),
+            "the N+1 record stays unread"
+        );
+        let Some(DiscoveryItem::Record(back)) = drain.dequeue() else {
+            panic!("the queued record reads back as a record");
+        };
+        assert_eq!(
+            back.pid_tgid, queued.pid_tgid,
+            "the unread record decodes back intact"
+        );
+    }
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_actual_trace_branches_preserve_results() {
+        use crate::attach::reexec_diagnostic::{Diagnostic, TraceCounts};
+        struct Writer {
+            error: Option<std::io::ErrorKind>,
+            writes: usize,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                match self.error {
+                    Some(kind) => Err(kind.into()),
+                    None => Ok(bytes.len()),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let expected = [
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                rejected: 1,
+                attempted: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                limit_skipped: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                prior_error_skipped: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                write_errors: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                stdout_closed: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                stdout_closed: 1,
+                ..Default::default()
+            },
+        ];
+        for (mode, want) in expected.into_iter().enumerate() {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            diag.matched_exec();
+            let run = |diagnostic: Option<&Diagnostic>| {
+                let plan = crate::plan::AttachPlan::from_slots(vec![]);
+                let anchor = crate::events::EventsDomain::test_standin(901);
+                let mut state = semantics::State::for_capture(
+                    &plan,
+                    CapturePolicy::Allowlisted,
+                    anchor.clone(),
+                );
+                let mut tracker = process::Tracker::for_producer(anchor, 16);
+                let mut tracer = trace::Tracer::new(&plan);
+                let mut event = call_event();
+                event.image.task_cookie = if mode == 1 { 0 } else { 37 };
+                let pid = u64::from(std::process::id());
+                event.pid_tgid = (pid << 32) | pid;
+                let domain = tracker.producer_domain();
+                let mut remaining = Some(if mode == 2 { 0 } else { 2 });
+                let mut writer = Writer {
+                    error: match mode {
+                        4 => Some(std::io::ErrorKind::Other),
+                        6 => Some(std::io::ErrorKind::BrokenPipe),
+                        _ => None,
+                    },
+                    writes: 0,
+                };
+                let mut open = mode != 5;
+                let mut file: Option<Vec<u8>> = None;
+                let mut error = if mode == 3 {
+                    Some(anyhow::anyhow!("prior error"))
+                } else {
+                    None
+                };
+                let result = reduce_trace_event_with_identities(
+                    domain,
+                    (
+                        &mut remaining,
+                        &mut state,
+                        &mut tracker,
+                        &Scope::Pid(std::process::id()),
+                        &mut tracer,
+                    ),
+                    None,
+                    diagnostic,
+                    (&mut writer, &mut open, &mut file),
+                    &mut error,
+                    event,
+                );
+                (
+                    result.is_ok(),
+                    remaining,
+                    open,
+                    error.is_some(),
+                    writer.writes,
+                    tracer.raw_calls(),
+                    state.semantic_evidence(),
+                    tracker.evidence(),
+                )
+            };
+            let control = run(None);
+            let observed = run(Some(&diag));
+            assert_eq!(
+                control.6.semantic_history_drops,
+                u64::from(mode == 1),
+                "fixture must reach the intended history branch {mode}"
+            );
+            assert_eq!(
+                observed, control,
+                "diagnostics changed actual branch {mode}"
+            );
+            assert_eq!(diag.trace_counts(), want, "actual reducer branch {mode}");
+        }
+    }
+
+    #[test]
+    fn pause_always_arm_failure_degrades_to_unpaused_with_gap() {
+        // Never-stop: --pause always that fails to arm collects unpaused
+        // with a named pause_unavailable gap (PARTIAL), not an abort.
+        // RED: currently Err, aborting the capture.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let child = spawn(sleeper.to_str().unwrap(), &[]);
+        let signals = SignalState::new();
+        let mut held = HeldPause::default();
+        let mut coordinator = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            PauseCoordinator::preflight(crate::cli::PausePolicy::Always, &child, &mut io).unwrap()
+        };
+        held.arm_error = Some("scripted arm failure".into());
+        let error = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            coordinator
+                .arm(&mut io)
+                .expect_err("scripted arm must fail")
+        };
+        assert!(error.required());
+        assert!(!error.lifecycle());
+        retire_pause_policy(error).expect("always arm failure gaps, not aborts");
+        // The caller records one unavailable attempt (as the production
+        // tick paths do); the status is partial and the verdict is PARTIAL.
+        coordinator.note_unavailable();
+        assert_eq!(coordinator.counters().unavailable, 1);
+        assert_eq!(
+            coordinator.counters().status(),
+            crate::discovery::pause::PauseStatus::Partial
+        );
+    }
+
+    #[test]
+    fn pause_always_successful_arm_needs_no_gap() {
+        // Healthy twin: a successful --pause always arm needs no gap.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let child = spawn(sleeper.to_str().unwrap(), &[]);
+        let signals = SignalState::new();
+        let mut held = HeldPause::default();
+        let mut coordinator = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            PauseCoordinator::preflight(crate::cli::PausePolicy::Always, &child, &mut io).unwrap()
+        };
+        let outcome = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            coordinator.arm(&mut io).expect("arm succeeds")
+        };
+        assert_eq!(outcome, ArmResult::Armed);
+        assert_eq!(coordinator.counters().unavailable, 0);
+    }
 }
 
 #[cfg(test)]
 #[path = "history_tests.rs"]
 mod history_tests;
+
+#[cfg(test)]
+mod trace_identity_consumer_tests {
+    use super::*;
+    use crate::attach::detailed_identity::ProofSession;
+    use crate::discovery::engine::tests::copy_executable_via_waited_child;
+    use crate::discovery::engine::tests::detailed_proof_driver as driver;
+    use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+    use crate::fixture_guard::DieWithParent as _;
+    use crate::trace_identity::TraceIdentityStore;
+    use p11scope_ebpf_common::{Event, ImageIdentity, capture, event_type};
+
+    fn counts(io: &driver::Io) -> (usize, usize, usize) {
+        (
+            io.samples.get(),
+            io.cookie_reads.get(),
+            io.health_reads.get(),
+        )
+    }
+
+    fn frame(
+        engine: &mut Engine,
+        io: &mut driver::Io,
+        identities: &mut Option<TraceIdentityStore>,
+    ) {
+        with_trace_identity_frame(
+            engine,
+            io,
+            Some(DiscoveryPass::Frame),
+            identities,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    }
+
+    // Catches renewed post-tick allowance allowing a lower witness to sample
+    // after ordinary discovery already consumed the actual frame's ticket.
+    #[test]
+    fn cgroup_trace_bracket_frame_only_grants_one_ticket() {
+        let (mut engine, mut io) = driver::cgroup_fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let mut exhausted = with_trace_identity_frame(
+            &mut engine,
+            &mut io,
+            Some(DiscoveryPass::Frame),
+            &mut identities,
+            |engine, io, _| {
+                assert_eq!(io.proof.usage(), (1, 0));
+                assert_eq!(counts(io), (0, 0, 0));
+                driver::calls(io, 101, 11, 0);
+                io.cookie.set(Some(11));
+                engine.with_trace_frame(io, |_, io, work| {
+                    let mut reads = 0;
+                    while work.external_read(&io.proof).is_ok() {
+                        reads += 1;
+                    }
+                    assert_eq!(reads, 32);
+                    Ok(work.clone())
+                })
+            },
+        )
+        .unwrap();
+        // The driver counts entry to the health adapter before it checks the
+        // ticket. That denied attempt must produce neither a baseline nor S0.
+        assert_eq!(counts(&io), (0, 0, 1));
+        assert_eq!(io.proof.test_health_interval(), None);
+        assert_eq!(io.proof.usage(), (1, 0));
+        assert_eq!(
+            exhausted.external_read(&io.proof),
+            Err(crate::attach::detailed_identity::TraceWorkError::Deferred),
+            "post-tick service must not replenish the shared read allowance"
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(io.samples.get(), 1, "only the next actual frame may sample");
+        assert_eq!(io.health_reads.get(), 2);
+        assert!(io.proof.test_health_interval().is_some());
+    }
+
+    // Catches readiness/stop ticks registering or reading before a real Frame.
+    #[test]
+    fn cgroup_trace_bracket_pending_stop_grants_no_ticket() {
+        let (mut engine, mut io) = driver::cgroup_fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        for pass in [None, Some(DiscoveryPass::PendingStop)] {
+            with_trace_identity_frame(
+                &mut engine,
+                &mut io,
+                pass,
+                &mut identities,
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        }
+        assert_eq!(counts(&io), (0, 0, 0));
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    // Catches stop wrappers sampling an incomplete candidate, failing to publish
+    // an already complete bracket, or renewing its terminal ticket after expiry.
+    #[test]
+    fn cgroup_trace_bracket_terminal_store_settlement_never_samples_or_renews() {
+        for sampled in [false, true] {
+            let (mut engine, mut io) = if sampled {
+                let (engine, io, _) = driver::cgroup_sampled();
+                (engine, io)
+            } else {
+                driver::cgroup_fixture()
+            };
+            let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+            if !sampled {
+                frame(&mut engine, &mut io, &mut identities);
+            }
+            let ts = io.proof.test_time() + 10;
+            driver::calls(&io, ts, 11, 0);
+            io.cookie.set(Some(11));
+            let key = semantics::ProcessKey::history(
+                io.proof.test_events_domain().id(),
+                11,
+                0,
+                std::process::id(),
+            );
+            let samples = io.samples.get();
+            let mut terminal = None;
+            begin_trace_identity_stop(
+                &mut engine,
+                &io,
+                &mut identities,
+                &mut terminal,
+                Duration::from_millis(1),
+            );
+            io.proof.test_tick();
+            driver::empty(&io);
+            service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+            assert_eq!(io.samples.get(), samples);
+            assert_eq!(
+                identities.as_ref().unwrap().lookup(key, ts).path(),
+                sampled.then_some("/owned/fixture")
+            );
+            let before = counts(&io);
+            io.proof.test_set_time(2_000_000);
+            for _ in 0..3 {
+                begin_trace_identity_stop(
+                    &mut engine,
+                    &io,
+                    &mut identities,
+                    &mut terminal,
+                    Duration::from_secs(100),
+                );
+                service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+            }
+            assert_eq!(counts(&io), before);
+            assert_eq!(
+                identities.as_ref().unwrap().lookup(key, ts).path(),
+                sampled.then_some("/owned/fixture")
+            );
+        }
+    }
+
+    #[test]
+    fn trace_identity_frame_only_grants_one_ticket() {
+        let (mut engine, mut io) = driver::fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let before_post = with_trace_identity_frame(
+            &mut engine,
+            &mut io,
+            Some(DiscoveryPass::Frame),
+            &mut identities,
+            |engine, io, _| {
+                assert_eq!(
+                    io.samples.get(),
+                    1,
+                    "the Frame service must preseed before its tick"
+                );
+                driver::exhaust_consumer_frame(engine, io);
+                Ok(counts(io))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            counts(&io),
+            before_post,
+            "post-tick service must share the exhausted ticket"
+        );
+        assert_eq!(
+            io.health_reads.get(),
+            1,
+            "one actual frame has one baseline read"
+        );
+    }
+
+    #[test]
+    fn trace_identity_pending_stop_grants_no_ticket() {
+        let (mut engine, mut io) = driver::fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let mut ticks = 0;
+        for pass in [None, Some(DiscoveryPass::PendingStop)]
+            .into_iter()
+            .cycle()
+            .take(100)
+        {
+            with_trace_identity_frame(&mut engine, &mut io, pass, &mut identities, |_, _, _| {
+                ticks += 1;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(ticks, 100);
+        assert_eq!(
+            counts(&io),
+            (0, 0, 0),
+            "readiness and stop-service ticks do no proof I/O"
+        );
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    #[test]
+    fn trace_identity_terminal_ticket_starts_once_and_never_renews() {
+        let (mut engine, mut io) = driver::fixture();
+        driver::seed(&mut engine, &mut io);
+        assert_eq!(driver::calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        let key = semantics::ProcessKey::history(
+            io.proof.test_events_domain().id(),
+            11,
+            0,
+            std::process::id(),
+        );
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let mut terminal = None;
+        begin_trace_identity_stop(
+            &mut engine,
+            &io,
+            &mut identities,
+            &mut terminal,
+            Duration::from_millis(1),
+        );
+        assert!(
+            terminal.is_some(),
+            "the first stop must own its sole ticket"
+        );
+        driver::empty(&io);
+        service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+        assert_eq!(
+            identities.as_ref().unwrap().lookup(key, 20).path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "terminal work must not seed another view"
+        );
+        let before = counts(&io);
+        io.proof.test_set_time(2_000_021);
+        for _ in 0..100 {
+            begin_trace_identity_stop(
+                &mut engine,
+                &io,
+                &mut identities,
+                &mut terminal,
+                Duration::from_secs(100),
+            );
+            service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+        }
+        assert_eq!(
+            counts(&io),
+            before,
+            "waits, Q and repeated service cannot renew the stop ticket"
+        );
+        assert_eq!(
+            identities.as_ref().unwrap().lookup(key, 20).path(),
+            Some("/owned/fixture")
+        );
+    }
+
+    fn plan() -> crate::plan::AttachPlan {
+        crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0,
+            names: vec!["C_OpenSession".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }])
+    }
+
+    fn event(key: semantics::ProcessKey, ts_ns: u64, session: u64) -> Event {
+        Event {
+            image: ImageIdentity {
+                task_cookie: key.generation,
+                exec_id: key.exec_id,
+            },
+            event_type: event_type::CALL,
+            pid_tgid: (u64::from(key.pid) << 32) | u64::from(key.pid),
+            ts_ns,
+            duration_ns: 3_000,
+            session,
+            slot_id: 3,
+            capture: capture::OUTPUT_NON_NULL,
+            ..Event::default()
+        }
+    }
+
+    fn fixture() -> (ProofSession, semantics::ProcessKey, TraceIdentityStore) {
+        let (proof, receipt) = driver::verified_fixture();
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof.clone());
+        store.admit(receipt).unwrap();
+        (proof, key, store)
+    }
+
+    fn cgroup_store_fixture() -> (ProofSession, semantics::ProcessKey, TraceIdentityStore) {
+        let (proof, receipt) = driver::cgroup_verified_fixture();
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof.clone());
+        store.admit(receipt).unwrap();
+        (proof, key, store)
+    }
+
+    struct Consumer {
+        state: semantics::State,
+        tracker: process::Tracker,
+        tracer: trace::Tracer,
+        scope: Scope,
+        remaining: Option<u64>,
+        stdout: Vec<u8>,
+        stdout_open: bool,
+        file: Option<Vec<u8>>,
+    }
+    impl Consumer {
+        fn new(proof: &ProofSession) -> Self {
+            let plan = plan();
+            let domain = proof.test_events_domain();
+            Self {
+                state: semantics::State::for_capture(
+                    &plan,
+                    CapturePolicy::Allowlisted,
+                    domain.clone(),
+                ),
+                tracker: process::Tracker::for_producer(domain, 16_384),
+                tracer: trace::Tracer::new(&plan),
+                scope: if proof.is_cgroup() {
+                    Scope::Cgroup {
+                        id: 1,
+                        path: "/retained-only".into(),
+                        dir: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+                    }
+                } else {
+                    Scope::System
+                },
+                remaining: None,
+                stdout: Vec::new(),
+                stdout_open: true,
+                file: Some(Vec::new()),
+            }
+        }
+        fn feed(
+            &mut self,
+            domain: EventsDomain,
+            records: impl IntoIterator<Item = Event>,
+            identities: &TraceIdentityStore,
+            quantum: Option<usize>,
+        ) {
+            self.feed_with_tap(domain, records, identities, quantum, None);
+        }
+        fn feed_with_tap(
+            &mut self,
+            domain: EventsDomain,
+            records: impl IntoIterator<Item = Event>,
+            identities: &TraceIdentityStore,
+            quantum: Option<usize>,
+            proof: Option<&ProofSession>,
+        ) {
+            let mut drain =
+                EventDrain::over_domain(ScriptedRecords::events(records, usize::MAX), domain);
+            if let Some(proof) = proof {
+                drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            }
+            drain_trace_events_from_with_identities(
+                &mut drain,
+                (
+                    &mut self.remaining,
+                    &mut self.state,
+                    &mut self.tracker,
+                    &self.scope,
+                    &mut self.tracer,
+                ),
+                Some(identities),
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                None,
+                (&mut self.stdout, &mut self.stdout_open, &mut self.file),
+                quantum,
+            )
+            .unwrap();
+        }
+        fn lines(&self) -> Vec<&str> {
+            std::str::from_utf8(&self.stdout).unwrap().lines().collect()
+        }
+        fn assert_named(&self, expected: usize) {
+            assert_eq!(
+                self.stdout,
+                *self.file.as_ref().unwrap(),
+                "stdout/file bytes must agree"
+            );
+            let lines = self.lines();
+            assert_eq!(lines.len(), expected);
+            for line in lines {
+                assert!(line.contains("\"fixture\" (PID "), "{line}");
+                assert!(line.contains("exe=\"/owned/fixture\" sess#"), "{line}");
+                assert!(line.contains(" C_OpenSession "), "{line}");
+            }
+        }
+    }
+
+    struct ExecChild {
+        child: std::process::Child,
+        input: std::process::ChildStdin,
+        output: std::process::ChildStdout,
+    }
+    impl ExecChild {
+        fn start(path: &Path, successor: &Path) -> Self {
+            let mut child = std::process::Command::new(path)
+                .args([std::ffi::OsStr::new("old"), successor.as_os_str()])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .die_with_parent()
+                .spawn()
+                .unwrap();
+            let mut owned = Self {
+                input: child.stdin.take().unwrap(),
+                output: child.stdout.take().unwrap(),
+                child,
+            };
+            owned.ack(b'O');
+            owned
+        }
+        fn ack(&mut self, expected: u8) {
+            use std::io::Read as _;
+            use std::os::fd::AsRawFd as _;
+            let mut fd = libc::pollfd {
+                fd: self.output.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "child acknowledgement timed out");
+                let timeout = i32::try_from(remaining.as_millis())
+                    .unwrap_or(i32::MAX)
+                    .max(1);
+                // SAFETY: one valid pollfd, bounded wait, no borrowed buffer survives.
+                let result = unsafe { libc::poll(&mut fd, 1, timeout) };
+                if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                assert_eq!(result, 1, "child acknowledgement absent");
+                break;
+            }
+            let mut byte = [0];
+            self.output.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], expected);
+        }
+        fn command(&mut self, command: u8, expected: u8) {
+            self.input.write_all(&[command]).unwrap();
+            self.ack(expected);
+        }
+    }
+    impl Drop for ExecChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn exec_child_binaries(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let source = dir.join("exec.c");
+        let old = dir.join("old");
+        let successor = dir.join("successor");
+        std::fs::write(
+            &source,
+            r#"#include <unistd.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    char stage = argc > 1 && strcmp(argv[1], "next") == 0 ? 'N' : 'O';
+    if (write(1, &stage, 1) != 1) return 2;
+    char command;
+    while (read(0, &command, 1) == 1) {
+        if (command == 'f') {
+            char *args[] = {"/proc/p11scope-missing-exec", 0};
+            execv(args[0], args);
+            if (write(1, "F", 1) != 1) return 3;
+        } else if (command == 's' || command == 'c') {
+            char *path = command == 's' ? argv[0] : argv[2];
+            char *args[] = {path, "next", 0};
+            execv(path, args);
+            return 4;
+        }
+    }
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-o"])
+                .arg(&old)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Waited-child copy: the child execs the successor on command 'c',
+        // and an in-process copy would hold it open for writing across
+        // concurrent forks.
+        copy_executable_via_waited_child(&old, &successor);
+        (old, successor)
+    }
+
+    fn runtime_call(
+        c: &mut Consumer,
+        io: &driver::Io,
+        identities: &Option<TraceIdentityStore>,
+        key: semantics::ProcessKey,
+        session: u64,
+    ) -> u64 {
+        let ts = io.proof.test_time() + 1;
+        io.proof.test_set_time(ts + 1);
+        c.feed_with_tap(
+            io.proof.test_events_domain(),
+            [event(key, ts, session)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&io.proof),
+        );
+        ts
+    }
+
+    // Catches successor renewal/publication bypassing the original view or
+    // waiting forever after an invalidated seed. The actual child exec and OS
+    // executable reads drive the production proof service and trace reducer;
+    // only native transport records/cookie/health reads use the existing seam.
+    #[test]
+    fn automatic_exec_retained_child_publishes_successor_trace_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old_path, successor_path) = exec_child_binaries(dir.path());
+        for command in *b"csf" {
+            let mut child = ExecChild::start(&old_path, &successor_path);
+            let pid = child.child.id();
+            let scope = Scope::Pid(pid);
+            let (mut engine, mut io, admission) = driver::os_pid_fixture(pid);
+            io.cookie.set(Some(11));
+            let proof = io.proof.clone();
+            let old_key =
+                semantics::ProcessKey::history(proof.test_events_domain().id(), 11, 0, pid);
+            let mut identities = Some(TraceIdentityStore::new(proof.clone()));
+            let mut c = Consumer::new(&proof);
+            c.scope = scope;
+            frame(&mut engine, &mut io, &mut identities);
+            runtime_call(&mut c, &io, &identities, old_key, 1);
+            frame(&mut engine, &mut io, &mut identities);
+            driver::empty(&io);
+            frame(&mut engine, &mut io, &mut identities);
+            let old_ts = runtime_call(&mut c, &io, &identities, old_key, 2);
+            let old_named = format!("exe=\"{}\" sess#", old_path.display());
+            assert!(c.lines().last().unwrap().contains(&old_named));
+            child.command(command, if command == b'f' { b'F' } else { b'N' });
+            let next_path = if command == b'c' {
+                &successor_path
+            } else {
+                &old_path
+            };
+            assert_eq!(
+                std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+                *next_path
+            );
+            if command == b'f' {
+                runtime_call(&mut c, &io, &identities, old_key, 3);
+                assert!(c.lines().last().unwrap().contains(&old_named));
+                assert!(driver::retains_view(&engine, &admission));
+                assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+                assert_eq!(c.tracer.raw_calls(), 3);
+                assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+                driver::retire_original_view(&mut engine);
+                frame(&mut engine, &mut io, &mut identities);
+                drop(identities);
+                assert_eq!(proof.usage(), (0, 0), "failed exec releases reservations");
+                continue;
+            }
+            let exec_ts = proof.test_time() + 1;
+            proof.test_set_time(exec_ts + 1);
+            driver::exec_pid(&io, pid, exec_ts, pid);
+            let successor_key = semantics::ProcessKey {
+                exec_id: 1,
+                ..old_key
+            };
+            let early = runtime_call(&mut c, &io, &identities, successor_key, 3);
+            assert!(!c.lines().last().unwrap().contains("exe=\""));
+            let emitted = c.stdout.clone();
+            frame(&mut engine, &mut io, &mut identities);
+            assert_eq!(
+                identities
+                    .as_ref()
+                    .unwrap()
+                    .lookup(successor_key, early)
+                    .path(),
+                None,
+                "old receipt cannot name the successor, including same-path exec"
+            );
+            runtime_call(&mut c, &io, &identities, successor_key, 4);
+            frame(&mut engine, &mut io, &mut identities);
+            driver::empty(&io);
+            frame(&mut engine, &mut io, &mut identities);
+            let useful = runtime_call(&mut c, &io, &identities, successor_key, 5);
+            let named = format!("exe=\"{}\" sess#", next_path.display());
+            let line = c.lines().last().unwrap().to_string();
+            assert!(line.contains(&named), "{line}");
+            assert!(line.contains(" C_OpenSession "), "{line}");
+            assert_eq!(
+                identities.as_ref().unwrap().lookup(old_key, useful).path(),
+                old_path.to_str(),
+                "historical proof keeps its original executable"
+            );
+            assert_eq!(
+                identities
+                    .as_ref()
+                    .unwrap()
+                    .lookup(successor_key, early)
+                    .path(),
+                None,
+                "a fresh receipt cannot retroactively name the early call"
+            );
+            assert!(c.stdout.starts_with(&emitted));
+            c.feed_with_tap(
+                proof.test_events_domain(),
+                [event(old_key, old_ts + 1, 6)],
+                identities.as_ref().unwrap(),
+                None,
+                Some(&proof),
+            );
+            // The history gate rejects an older exec after observing the
+            // successor, even while the immutable old receipt remains stored.
+            let delayed = c.lines().last().unwrap().to_string();
+            assert!(delayed.contains("Unknown executable"), "{delayed}");
+            assert!(!delayed.contains(&named), "{delayed}");
+            assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+            assert!(driver::retains_view(&engine, &admission));
+            assert_eq!(c.tracer.raw_calls(), 6);
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+            driver::retire_original_view(&mut engine);
+            frame(&mut engine, &mut io, &mut identities);
+            drop(identities);
+            assert_eq!(proof.usage(), (0, 0), "all reservations return once");
+        }
+    }
+
+    // Catches retroactive repair of emitted warm-up rows, inclusive S1 lookup,
+    // or naming before the producer actually transfers the verified receipt.
+    #[test]
+    fn cgroup_trace_bracket_warmup_rows_and_event_boundary_are_immutable() {
+        let (mut engine, mut io) = driver::cgroup_fixture();
+        let proof = io.proof.clone();
+        let key = semantics::ProcessKey::history(
+            proof.test_events_domain().id(),
+            11,
+            0,
+            std::process::id(),
+        );
+        let mut identities = Some(TraceIdentityStore::new(proof.clone()));
+        let mut c = Consumer::new(&proof);
+        frame(&mut engine, &mut io, &mut identities);
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 99, 7)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(counts(&io), (0, 0, 0), "an old CALL is no lower witness");
+
+        proof.test_set_time(102);
+        io.cookie.set(Some(11));
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 101, 8)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(io.samples.get(), 1);
+        assert_eq!(proof.test_time(), 106);
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 106, 9)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(identities.as_ref().unwrap().lookup(key, 107).path(), None);
+
+        proof.test_set_time(115);
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 114, 10)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        let warmup = c.stdout.clone();
+        assert_eq!(c.lines().len(), 4);
+        assert!(
+            c.lines()
+                .iter()
+                .all(|line| line.contains("Unknown executable"))
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(identities.as_ref().unwrap().lookup(key, 115).path(), None);
+        proof.test_tick();
+        driver::empty(&io);
+        frame(&mut engine, &mut io, &mut identities);
+        let store = identities.as_ref().unwrap();
+        assert_eq!(store.lookup(key, 107).path(), Some("/owned/fixture"));
+        assert_eq!(c.stdout, warmup, "publication emits and rewrites no row");
+
+        c.feed(
+            proof.test_events_domain(),
+            [
+                event(key, 101, 11),
+                event(key, 106, 12),
+                event(key, 107, 13),
+                event(key, 116, 14),
+            ],
+            store,
+            None,
+        );
+        assert!(c.stdout.starts_with(&warmup));
+        assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+        assert_eq!(c.lines().len(), 8);
+        assert_eq!(
+            c.lines()
+                .iter()
+                .filter(|line| line.contains("Unknown executable"))
+                .count(),
+            6
+        );
+        assert_eq!(
+            c.lines()
+                .iter()
+                .filter(|line| line.contains("exe=\"/owned/fixture\""))
+                .count(),
+            2
+        );
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (8, 8));
+        assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+    }
+
+    // Catches a store-owned receipt losing accepted-key suppression or a full
+    // shared pool discarding the newer-key request rather than deferring it.
+    #[test]
+    fn cgroup_trace_bracket_store_ownership_defers_new_key_at_shared_capacity() {
+        let (mut engine, mut io, receipt) = driver::cgroup_verified_engine();
+        let key = receipt.key();
+        let boundary = receipt.eligible_after_ns();
+        let mut store = TraceIdentityStore::new(io.proof.clone());
+        store.admit(receipt).unwrap();
+        let mut identities = Some(store);
+        let before = counts(&io);
+        for _ in 0..3 {
+            driver::calls(&io, io.proof.test_time() + 1, 11, 0);
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(counts(&io), before, "stored same-key calls never resample");
+        let full: Vec<_> = (0..16_383).map(|_| io.proof.reserve(0).unwrap()).collect();
+        let request = io.proof.test_time() + 1;
+        driver::calls(&io, request, 11, 1);
+        io.proof.test_tick();
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        let newer = semantics::ProcessKey { exec_id: 1, ..key };
+        assert_eq!(counts(&io), before);
+        assert_eq!(io.proof.usage(), (16_384, 14));
+        assert_eq!(
+            identities.as_ref().unwrap().lookup(newer, request).path(),
+            None
+        );
+        drop(full);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "the request cannot witness its later registration"
+        );
+        assert_eq!(io.proof.usage(), (2, 14));
+        driver::calls(&io, io.proof.test_time() + 1, 11, 1);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(io.samples.get(), 2);
+        driver::calls(&io, io.proof.test_time() + 10, 11, 1);
+        frame(&mut engine, &mut io, &mut identities);
+        io.proof.test_tick();
+        driver::empty(&io);
+        frame(&mut engine, &mut io, &mut identities);
+        let store = identities.as_ref().unwrap();
+        assert_eq!(
+            store.lookup(newer, io.proof.test_time()).path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(store.lookup(key, boundary).path(), None);
+        assert_eq!(
+            store.lookup(key, boundary + 1).path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(io.proof.usage(), (2, 28));
+        drop(identities);
+        assert_eq!(
+            io.proof.usage(),
+            (0, 0),
+            "the store owns both accepted charges"
+        );
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    // Catches a retired/reused view inheriting old sampling authority, or store
+    // teardown leaving a charged alias after a real redundant-key transfer.
+    #[test]
+    fn cgroup_trace_bracket_store_drop_after_retirement_and_alias_transfer() {
+        let (mut engine, mut io, receipt) = driver::cgroup_verified_engine();
+        let key = receipt.key();
+        let boundary = receipt.eligible_after_ns();
+        let mut store = TraceIdentityStore::new(io.proof.clone());
+        store.admit(receipt).unwrap();
+        let mut identities = Some(store);
+        driver::retire_original_view(&mut engine);
+        let before = counts(&io);
+        driver::calls(&io, io.proof.test_time() + 1, 11, 1);
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(counts(&io), before);
+        assert_eq!(io.proof.usage(), (1, 14));
+        assert_eq!(
+            identities
+                .as_ref()
+                .unwrap()
+                .lookup(key, boundary + 1)
+                .path(),
+            Some("/owned/fixture")
+        );
+
+        driver::reopen_original_view(&mut engine);
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(io.proof.usage(), (2, 14));
+        driver::calls(&io, io.proof.test_time() + 1, 11, 0);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            counts(&io),
+            before,
+            "a known key transfers interest without sample I/O"
+        );
+        assert_eq!(io.proof.usage(), (1, 14));
+        drop(identities);
+        assert_eq!(io.proof.usage(), (0, 0));
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            io.proof.usage(),
+            (1, 0),
+            "drop removes accepted-key suppression"
+        );
+        let stale = io.proof.test_time();
+        driver::calls(&io, stale, 11, 0);
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(
+            counts(&io),
+            before,
+            "an old CALL cannot reuse admission authority"
+        );
+        driver::calls(&io, io.proof.test_time() + 1, 11, 0);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            io.samples.get(),
+            2,
+            "a fresh lower CALL can start a new proof"
+        );
+        driver::retire_original_view(&mut engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    #[test]
+    fn trace_identity_all_reduction_routes_use_same_store() {
+        assert_reduction_routes(fixture(), 20);
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_all_reduction_routes_use_same_store() {
+        assert_reduction_routes(cgroup_store_fixture(), 115);
+    }
+
+    fn assert_reduction_routes(
+        (proof, key, identities): (ProofSession, semantics::ProcessKey, TraceIdentityStore),
+        ts: u64,
+    ) {
+        // These are the actual ordinary/direct-quiesce/terminal poll helper,
+        // the bounded Q helper, and the original-root-tail callback/reducer.
+        for route in 0..5 {
+            let mut c = Consumer::new(&proof);
+            let ev = event(key, ts, 7);
+            match route {
+                0..=2 => c.feed(
+                    proof.test_events_domain(),
+                    [ev],
+                    &identities,
+                    match route {
+                        0 => Some(1),
+                        1 => Some(crate::events::LIVE_POLL_QUANTUM),
+                        _ => None,
+                    },
+                ),
+                3 => {
+                    let mut drain = EventDrain::over_domain(
+                        crate::events::root_fence_tests::source([ev]),
+                        proof.test_events_domain(),
+                    );
+                    let stop = crate::events::event_drain_positions(&drain).producer;
+                    assert_eq!(
+                        drain_trace_events_to_position(
+                            &mut drain,
+                            stop,
+                            &mut c.remaining,
+                            &mut c.state,
+                            &mut c.tracker,
+                            &c.scope,
+                            &mut c.tracer,
+                            Some(&identities),
+                            #[cfg(feature = "h6-reexec-diagnostic")]
+                            None,
+                            &mut c.stdout,
+                            &mut c.stdout_open,
+                            &mut c.file
+                        )
+                        .unwrap(),
+                        (0, false)
+                    );
+                }
+                4 => {
+                    let domain = proof.test_events_domain();
+                    let exit = OriginalRootExit::test_reaped(domain.clone());
+                    let mut tail = crate::events::OwnedRootTail::new(
+                        exit,
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    let mut drain = EventDrain::over_domain(
+                        crate::events::root_fence_tests::source([ev]),
+                        domain,
+                    );
+                    let mut write_error = None;
+                    drain.begin_root_tail(&mut tail).unwrap();
+                    drain
+                        .poll_root_tail(&mut tail, 2, |ev| {
+                            reduce_trace_event_with_identities(
+                                key.domain,
+                                (
+                                    &mut c.remaining,
+                                    &mut c.state,
+                                    &mut c.tracker,
+                                    &c.scope,
+                                    &mut c.tracer,
+                                ),
+                                Some(&identities),
+                                #[cfg(feature = "h6-reexec-diagnostic")]
+                                None,
+                                (&mut c.stdout, &mut c.stdout_open, &mut c.file),
+                                &mut write_error,
+                                ev,
+                            )
+                        })
+                        .unwrap();
+                    assert!(write_error.is_none());
+                    tail.complete().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(c.tracer.raw_calls(), 1, "route {route}");
+            assert_eq!(c.state.sessions().opened, 1, "route {route}");
+            assert_eq!(
+                c.state.semantic_evidence().semantic_history_drops,
+                0,
+                "route {route}"
+            );
+            c.assert_named(1);
+        }
+    }
+
+    #[test]
+    fn trace_identity_closed_older_foreign_history_stays_unknown() {
+        assert_rejected_history(fixture(), 20);
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_closed_older_foreign_history_stays_unknown() {
+        assert_rejected_history(cgroup_store_fixture(), 115);
+    }
+
+    // Catches receipt admission reopening closed history or accepting an older
+    // exec after that image was already rejected by the real reducer.
+    #[test]
+    fn cgroup_trace_bracket_receipt_cannot_repair_prior_history_rejection() {
+        for closed in [false, true] {
+            let (proof, receipt) = driver::cgroup_verified_fixture();
+            let key = receipt.key();
+            let mut identities = TraceIdentityStore::new(proof.clone());
+            let mut c = Consumer::new(&proof);
+            let first = if closed {
+                key
+            } else {
+                semantics::ProcessKey { exec_id: 1, ..key }
+            };
+            c.feed(
+                proof.test_events_domain(),
+                [event(first, 115, 7)],
+                &identities,
+                None,
+            );
+            if closed {
+                apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            }
+            c.feed(
+                proof.test_events_domain(),
+                [event(key, 116, 8)],
+                &identities,
+                None,
+            );
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+            let rejected = c.stdout.clone();
+            identities.admit(receipt).unwrap();
+            assert_eq!(identities.lookup(key, 117).path(), Some("/owned/fixture"));
+            c.feed(
+                proof.test_events_domain(),
+                [event(key, 117, 9)],
+                &identities,
+                None,
+            );
+            assert!(c.stdout.starts_with(&rejected));
+            assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 2);
+            assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 1));
+            assert_eq!(c.lines().len(), 3);
+            assert!(
+                c.lines()
+                    .iter()
+                    .all(|line| line.contains("Unknown executable"))
+            );
+        }
+    }
+
+    fn assert_rejected_history(
+        (proof, key, identities): (ProofSession, semantics::ProcessKey, TraceIdentityStore),
+        ts: u64,
+    ) {
+        for case in 0..4 {
+            let mut c = Consumer::new(&proof);
+            c.feed(
+                proof.test_events_domain(),
+                [event(key, ts, 7)],
+                &identities,
+                None,
+            );
+            c.assert_named(1);
+            let mut ev = event(key, ts + 2, 8);
+            let mut domain = proof.test_events_domain();
+            match case {
+                0 => apply_confirmed_retirement(&mut c.tracker, &mut c.state, key),
+                1 => {
+                    let mut newer = ev;
+                    newer.image.exec_id += 1;
+                    c.feed(domain.clone(), [newer], &identities, None);
+                }
+                2 => domain = EventsDomain::test_standin(key.domain + 1),
+                3 => ev.image.task_cookie = 0,
+                _ => unreachable!(),
+            }
+            c.feed(domain, [ev], &identities, None);
+            assert!(
+                c.lines().last().unwrap().contains("Unknown executable"),
+                "case {case}"
+            );
+            assert_eq!(
+                c.state.semantic_evidence().semantic_history_drops,
+                1,
+                "case {case}"
+            );
+            assert_eq!(
+                identities.lookup(key, ts + 2).path(),
+                Some("/owned/fixture"),
+                "store alone never authorizes history"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_identity_verified_exit_preserves_admissible_delayed_name() {
+        let (proof, receipt) = driver::verified_exited_fixture();
+        let key = receipt.key();
+        let mut identities = TraceIdentityStore::new(proof.clone());
+        identities.admit(receipt).unwrap();
+        let mut c = Consumer::new(&proof);
+        c.feed(
+            proof.test_events_domain(),
+            [event(key, 22, 7)],
+            &identities,
+            None,
+        );
+        assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+        assert_eq!(c.tracer.raw_calls(), 1);
+        c.assert_named(1);
+    }
+
+    struct BrokenWriter(std::io::ErrorKind);
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trace_identity_output_failure_and_limit_preserve_counts() {
+        assert_output_failure_and_limit(fixture(), 20);
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_output_failure_and_limit_preserve_counts() {
+        assert_output_failure_and_limit(cgroup_store_fixture(), 115);
+    }
+
+    fn assert_output_failure_and_limit(
+        (proof, key, identities): (ProofSession, semantics::ProcessKey, TraceIdentityStore),
+        ts: u64,
+    ) {
+        let records = || (7..10).map(|s| event(key, ts + s, s));
+        let mut c = Consumer::new(&proof);
+        c.remaining = Some(1);
+        c.feed(proof.test_events_domain(), records(), &identities, None);
+        assert_eq!(c.remaining, Some(0));
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 3));
+        c.assert_named(1);
+
+        let mut c = Consumer::new(&proof);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::events(records(), usize::MAX),
+            proof.test_events_domain(),
+        );
+        drain_trace_events_from_with_identities(
+            &mut drain,
+            (
+                &mut c.remaining,
+                &mut c.state,
+                &mut c.tracker,
+                &c.scope,
+                &mut c.tracer,
+            ),
+            Some(&identities),
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (
+                &mut BrokenWriter(io::ErrorKind::BrokenPipe),
+                &mut c.stdout_open,
+                &mut c.file,
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(!c.stdout_open);
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 3));
+        assert_eq!(
+            std::str::from_utf8(c.file.as_ref().unwrap())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+
+        let mut c = Consumer::new(&proof);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::events(records(), usize::MAX),
+            proof.test_events_domain(),
+        );
+        let error = drain_trace_events_from_with_identities(
+            &mut drain,
+            (
+                &mut c.remaining,
+                &mut c.state,
+                &mut c.tracker,
+                &c.scope,
+                &mut c.tracer,
+            ),
+            Some(&identities),
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
+            (
+                &mut c.stdout,
+                &mut c.stdout_open,
+                &mut Some(BrokenWriter(io::ErrorKind::Other)),
+            ),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("trace output"));
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 3));
+        assert_eq!(drain.source().remaining(), 0);
+    }
+}
 
 #[cfg(test)]
 mod correction1_tests {
@@ -15964,16 +22601,19 @@ mod correction1_tests {
                 dir: Arc::new(File::open("/").unwrap()),
             };
             if self.trace {
-                drain_trace_events_from(
+                drain_trace_events_from_with_identities(
                     &mut drain,
-                    &mut None,
-                    &mut self.state,
-                    &mut self.tracker,
-                    &scope,
-                    &mut self.tracer,
-                    &mut self.output,
-                    &mut true,
-                    &mut None::<Vec<u8>>,
+                    (
+                        &mut None,
+                        &mut self.state,
+                        &mut self.tracker,
+                        &scope,
+                        &mut self.tracer,
+                    ),
+                    None,
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    None,
+                    (&mut self.output, &mut true, &mut None::<Vec<u8>>),
                     Some(crate::events::LIVE_POLL_QUANTUM),
                 )
                 .unwrap();

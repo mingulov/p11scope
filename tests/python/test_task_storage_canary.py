@@ -262,7 +262,7 @@ def probe_case(directory, name):
         for case, summary in document['cases'].items():
             assert summary['terminal_eof']['records'] == 3, summary
             assert [row['id'] for row in summary['maps']] == list(IDS), summary
-            assert [row['value_bytes'] for row in summary['maps']] == [8, 544, 8], summary
+            assert [row['value_bytes'] for row in summary['maps']] == [8, 560, 8], summary
             assert summary['cleanup'] == 'map ids absent with ENOENT', summary
         assert len(surfaces) == 9 and len(seeds) == 3, (surfaces, seeds)
         assert receipt.stat().st_mode & 0o777 == 0o600
@@ -420,8 +420,8 @@ class TaskStorageCanaryTests(unittest.TestCase):
             unreadable.write_bytes(qualifier.seed_bytes('baseline'))
             os.chmod(unreadable, 0)
             cases = (('missing', root / 'absent-seed', 'cannot open SEED'),
-                     ('short', root / 'short', 'shorter than the fixed 560-byte layout'),
-                     ('long', root / 'long', 'longer than the fixed 560-byte layout'),
+                     ('short', root / 'short', 'shorter than the fixed 576-byte layout'),
+                     ('long', root / 'long', 'longer than the fixed 576-byte layout'),
                      ('directory', root / 'directory', 'SEED is not a regular file'),
                      ('fifo', root / 'fifo', 'SEED is not a regular file'),
                      ('symlink', root / 'link', 'cannot open SEED'))
@@ -455,19 +455,19 @@ class TaskStorageCanaryTests(unittest.TestCase):
 
     # ---- the frozen seed layout and the three controls ---------------------
 
-    def test_seed_is_exactly_560_bytes_in_the_frozen_split(self):
+    def test_seed_is_exactly_576_bytes_in_the_frozen_split(self):
         for case in qualifier.CASES:
             with self.subTest(case=case):
                 raw = qualifier.seed_bytes(case)
-                self.assertEqual(len(raw), 560)
+                self.assertEqual(len(raw), 576)
                 values = qualifier.control_values(case)
                 self.assertEqual([len(values[name]) for name, _, _ in qualifier.MAP_LAYOUT],
-                                 [8, 544, 8])
+                                 [8, 560, 8])
                 for name, offset, size in qualifier.MAP_LAYOUT:
                     self.assertEqual(raw[offset:offset + size], values[name])
                 self.assertNotEqual(values['TASK_COOKIE'], values['ROOT_AFFILIATION'])
                 self.assertTrue(any(values['TASK_COOKIE']) and any(values['ROOT_AFFILIATION']))
-        self.assertEqual([offset for _, offset, _ in qualifier.MAP_LAYOUT], [0, 8, 552])
+        self.assertEqual([offset for _, offset, _ in qualifier.MAP_LAYOUT], [0, 8, 568])
 
     def test_early_and_late_controls_sit_at_the_frozen_owner_offsets(self):
         self.assertEqual(len(LEGACY), 9)
@@ -477,23 +477,23 @@ class TaskStorageCanaryTests(unittest.TestCase):
         self.assertNotIn(LEGACY, baseline)
         self.assertEqual(early[0:9], LEGACY)
         self.assertEqual(early.count(LEGACY), 1)
-        self.assertEqual(late[535:544], LEGACY)
+        self.assertEqual(late[551:560], LEGACY)
         self.assertEqual(late.count(LEGACY), 1)
-        self.assertEqual(535 + len(LEGACY), 544)
+        self.assertEqual(551 + len(LEGACY), 560)
         self.assertNotEqual(late[0:9], LEGACY)
-        self.assertNotIn(LEGACY, late[:535])
+        self.assertNotIn(LEGACY, late[:551])
 
     def test_controls_differ_from_the_baseline_only_where_specified(self):
         baseline = qualifier.control_values('baseline')
-        for case, span in (('early', range(0, 9)), ('late', range(535, 544))):
+        for case, span in (('early', range(0, 9)), ('late', range(551, 560))):
             with self.subTest(case=case):
                 values = qualifier.control_values(case)
                 self.assertEqual(values['TASK_COOKIE'], baseline['TASK_COOKIE'])
                 self.assertEqual(values['ROOT_AFFILIATION'], baseline['ROOT_AFFILIATION'])
-                differing = [index for index in range(544)
+                differing = [index for index in range(560)
                              if values['THREAD_OWNER'][index] != baseline['THREAD_OWNER'][index]]
                 self.assertTrue(set(differing).issubset(set(span)), differing)
-                self.assertEqual(len(values['THREAD_OWNER']), 544)
+                self.assertEqual(len(values['THREAD_OWNER']), 560)
 
     # ---- the real shared scanner as the only control oracle ----------------
 
@@ -852,7 +852,7 @@ class TaskStorageCanaryTests(unittest.TestCase):
         rows = seeded_rows('baseline', pid)
         surfaces, proof = qualifier.read_records(stream(rows), maps, pid, values)
         self.assertEqual([len(surfaces[name]) for name, _, _ in qualifier.MAP_LAYOUT],
-                         [8, 544, 8])
+                         [8, 560, 8])
         self.assertEqual(proof['records'], 3)
         problems = {
             'two-records': stream(rows[:2]),
@@ -879,7 +879,7 @@ class TaskStorageCanaryTests(unittest.TestCase):
                 with self.assertRaises((coordinator.CaptureError, RuntimeError)):
                     qualifier.read_records(data, maps, pid, values)
 
-    def test_owner_mismatch_only_past_offset_535_is_refused_injected(self):
+    def test_owner_mismatch_only_past_offset_551_is_refused_injected(self):
         """No truncated-prefix compare: a late-region-only difference must refuse."""
         pid, maps = 606, ready_maps()
         expected = qualifier.control_values('baseline')
@@ -887,7 +887,7 @@ class TaskStorageCanaryTests(unittest.TestCase):
         differing = [index for index in range(qualifier.OWNER_SIZE)
                      if substitute[index] != expected['THREAD_OWNER'][index]]
         # Every differing byte is at or past the late offset, so a comparison
-        # truncated to [0, 535) could not tell these two values apart.
+        # truncated to [0, 551) could not tell these two values apart.
         self.assertEqual(differing, list(range(qualifier.LATE_OFFSET, qualifier.OWNER_SIZE)))
         self.assertEqual(substitute[:qualifier.LATE_OFFSET],
                          expected['THREAD_OWNER'][:qualifier.LATE_OFFSET])
@@ -908,8 +908,8 @@ class TaskStorageCanaryTests(unittest.TestCase):
         self.assertEqual(proof['terminal_frame_offset'], len(data) - header)
         self.assertEqual(proof['records'], 3)
         self.assertEqual(proof['proved_by'], 'dump-owned-bpf-maps.parse_task_storage_frames')
-        self.assertEqual(len(data), 560 + 4 * header)
-        records = dumper.parse_task_storage_frames(data, maps, max_records=3, max_bytes=560)
+        self.assertEqual(len(data), 576 + 4 * header)
+        records = dumper.parse_task_storage_frames(data, maps, max_records=3, max_bytes=576)
         for label, mutated in (
                 ('trailing-byte', data + b'\x00'),
                 ('leading-frame', frame(dumper.TASK_STORAGE_EOF, 0, 0, 0) + data),

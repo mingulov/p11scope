@@ -8,9 +8,19 @@
 use anyhow::{Context as _, Result};
 use aya::Ebpf;
 use aya::maps::{Map, MapData};
-use p11scope_ebpf_common::{DiscoveryRecord, Event, EventRecord, valid_discovery_record};
+use p11scope_ebpf_common::object_journal::{
+    JournalRecord, ValidatedJournalEnd, decode_journal_record,
+};
+use p11scope_ebpf_common::object_wire::{
+    OBJECT_TAIL_BYTES, ObjectDescriptorWire, ValidatedObjectCall,
+};
+use p11scope_ebpf_common::{
+    DiscoveryRecord, Event, EventRecord, MAX_DESCRIPTORS, event_type, valid_discovery_record,
+};
 use std::mem::size_of;
 use std::ops::{ControlFlow, Deref};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     num::NonZeroU64,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
@@ -36,6 +46,9 @@ impl EventsDomain {
             .try_clone_to_owned()
             .context("retaining EVENTS map descriptor")?;
         Ok(Self(Arc::new(RetainedEvents { id, _fd: fd })))
+    }
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
     pub(crate) fn id(&self) -> u64 {
         self.0.id.get()
@@ -63,8 +76,21 @@ impl DiscoveryDomain {
             .context("retaining DISCOVERY map descriptor")?;
         Ok(Self(Arc::new(RetainedDiscovery { id, _fd: fd })))
     }
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub(crate) fn id(&self) -> u64 {
         self.0.id.get()
+    }
+}
+
+#[cfg(test)]
+impl DiscoveryDomain {
+    pub(crate) fn test_standin(id: u64) -> Self {
+        Self(Arc::new(RetainedDiscovery {
+            id: NonZeroU64::new(id).unwrap(),
+            _fd: std::fs::File::open("/dev/null").unwrap().into(),
+        }))
     }
 }
 
@@ -154,6 +180,183 @@ pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
     valid_discovery_record(&record).then_some(record)
 }
 
+/// One decoded EVENTS record with its optional validated object tail.
+/// Slice D wires this envelope through the H3 drain, collection, pending
+/// queue and routed call on the attested allowlisted lane only. Like the
+/// base record it wraps, it is a plain validated value; move-only
+/// discipline lives one level up in the owned routed call and evidence.
+#[derive(Clone, Copy)]
+pub(crate) struct DecodedEventRecord {
+    pub(crate) base: EventRecord,
+    pub(crate) object: Option<ValidatedObjectCall>,
+    /// Resource-only lineage from the same original journal END. Ordinary
+    /// decoding never constructs it, and routing grants it no authority.
+    pub(crate) joint_resource:
+        Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
+}
+
+impl DecodedEventRecord {
+    /// Compare the complete constructor-decoded payload, private continuity
+    /// and object tail without allocating a wire copy or reading padding.
+    /// Resource lineage is checked separately by the original owner.
+    pub(crate) fn same_decoded_payload(&self, other: &Self) -> bool {
+        let a = &self.base.event;
+        let b = &other.base.event;
+        (
+            a.ts_ns,
+            a.duration_ns,
+            a.pid_tgid,
+            a.cgroup_id,
+            a.session,
+            a.slot_id,
+            a.mechanism,
+            a.flags,
+            a.rv,
+            a.p0,
+            a.p1,
+            a.p2,
+        ) == (
+            b.ts_ns,
+            b.duration_ns,
+            b.pid_tgid,
+            b.cgroup_id,
+            b.session,
+            b.slot_id,
+            b.mechanism,
+            b.flags,
+            b.rv,
+            b.p0,
+            b.p1,
+            b.p2,
+        ) && (
+            a.async_value,
+            a.slot,
+            a.target_function,
+            a.user_type,
+            a.shape,
+            a.capture,
+            a.event_type,
+            a.image,
+            a.child_image,
+            a.root_affiliation,
+        ) == (
+            b.async_value,
+            b.slot,
+            b.target_function,
+            b.user_type,
+            b.shape,
+            b.capture,
+            b.event_type,
+            b.image,
+            b.child_image,
+            b.root_affiliation,
+        ) && (
+            a.attr_count,
+            a.attr_total,
+            a.attr_bools,
+            a.attr_bools_seen,
+            a.attr_count1,
+            a.attr_total1,
+            a.attr_bools1,
+            a.attr_bools_seen1,
+        ) == (
+            b.attr_count,
+            b.attr_total,
+            b.attr_bools,
+            b.attr_bools_seen,
+            b.attr_count1,
+            b.attr_total1,
+            b.attr_bools1,
+            b.attr_bools_seen1,
+        ) && a.attr_types == b.attr_types
+            && a.attr_types1 == b.attr_types1
+            && self.base.continuity.entry_ip == other.base.continuity.entry_ip
+            && self.base.continuity.entry_stamp == other.base.continuity.entry_stamp
+            && self.base.continuity.return_stamp == other.base.continuity.return_stamp
+            && self.object.as_ref().map(|object| object.tail_bytes())
+                == other.object.as_ref().map(|object| object.tail_bytes())
+    }
+}
+
+/// Decode the exact 368/608-byte forms atomically; the extended form is
+/// CALL-only and returns the validated tail intact. The prefix alone
+/// never validates: a malformed tail refuses the whole record even when
+/// its Event prefix looks valid. Bare `decode_record` stays 368-only.
+pub(crate) fn decode_object_record(
+    bytes: &[u8],
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+) -> Option<DecodedEventRecord> {
+    if bytes.len() == size_of::<EventRecord>() {
+        return decode_record(bytes).map(|base| DecodedEventRecord {
+            base,
+            object: None,
+            joint_resource: None,
+        });
+    }
+    if bytes.len() != size_of::<EventRecord>() + OBJECT_TAIL_BYTES {
+        return None;
+    }
+    let base = decode_record(&bytes[..size_of::<EventRecord>()])?;
+    if base.event.event_type != event_type::CALL {
+        return None;
+    }
+    let index = u32::from_le_bytes(bytes[372..376].try_into().ok()?);
+    if index == 0 || index >= MAX_DESCRIPTORS {
+        return None;
+    }
+    let object = ValidatedObjectCall::validate(
+        &bytes[size_of::<EventRecord>()..],
+        &descriptors[index as usize],
+    )?;
+    Some(DecodedEventRecord {
+        base,
+        object: Some(object),
+        joint_resource: None,
+    })
+}
+
+type ObjectTransportRows = Arc<[ObjectDescriptorWire; MAX_DESCRIPTORS as usize]>;
+
+/// Ordinary consumers receive the base only after the entire producer record
+/// validates. Transport rows authorize its wire form, never semantic admission.
+fn decode_transport_record(
+    bytes: &[u8],
+    descriptors: Option<&[ObjectDescriptorWire; MAX_DESCRIPTORS as usize]>,
+) -> Option<EventRecord> {
+    match descriptors {
+        Some(rows) => decode_object_record(bytes, rows).map(|record| record.base),
+        None => decode_record(bytes),
+    }
+}
+
+/// Reconstruct the exact completed payload already validated inside one END.
+/// This is plain transport decoding, not routing/admission authority. An absent
+/// object tail keeps the existing base-only semantics; full and compact ENDs
+/// validate their reconstructed tail against the same frozen descriptor rows.
+pub(crate) fn project_journal_end_payload(
+    end: &ValidatedJournalEnd,
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+) -> Option<DecodedEventRecord> {
+    let payload = end.payload_bytes();
+    if end.tail_absent() {
+        decode_record(&payload[..size_of::<EventRecord>()]).map(|base| DecodedEventRecord {
+            base,
+            object: None,
+            joint_resource: None,
+        })
+    } else {
+        decode_object_record(&payload, descriptors)
+    }
+}
+
+/// Work is consumed before decoding: malformed records spend the same budget
+/// as successfully dispatched records. `backlog` also covers callback stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DispatchPoll {
+    pub(crate) attempted: usize,
+    pub(crate) backlog: bool,
+}
+
 #[derive(Clone, Copy)]
 #[allow(clippy::large_enum_variant)] // The fixed 920-byte ring ABI stays allocation-free per dequeue.
 pub(crate) enum DiscoveryItem {
@@ -166,11 +369,22 @@ pub(crate) enum DiscoveryItem {
 /// than an `Iterator`; the scripted test source hands out owned bytes.
 pub trait RecordSource {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_>;
+
+    /// Kernel-discarded reservations this source's reader has consumed
+    /// so far. The retained Aya reader counts them; scripted sources
+    /// report none unless a test says otherwise.
+    fn discarded(&self) -> u64 {
+        0
+    }
 }
 
 impl RecordSource for aya::maps::RingBuf<MapData> {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
         self.next()
+    }
+
+    fn discarded(&self) -> u64 {
+        self.discarded()
     }
 }
 
@@ -385,9 +599,21 @@ impl<S: RecordSource> EventDrain<S> {
             for _ in 0..quantum {
                 let progress = match self.source.bounded_record(p.producer)? {
                     BoundedRecord::Item(item) => {
-                        match decode(&item) {
-                            Some(event) => reduce(event)?,
-                            None => self.malformed += 1,
+                        match decode_transport_record(&item, self.object_transport.as_deref())
+                            .map(|record| record.event)
+                        {
+                            Some(event) => {
+                                if let Some(tap) = &self.trace_tap {
+                                    tap.observe_call(&event);
+                                }
+                                reduce(event)?;
+                            }
+                            None => {
+                                self.malformed += 1;
+                                if let Some(tap) = &self.trace_tap {
+                                    tap.observe_failure();
+                                }
+                            }
                         }
                         drop(item);
                         RootTailProgress::Yielded
@@ -423,6 +649,9 @@ impl<S: RecordSource> EventDrain<S> {
         })();
         if result.is_err() {
             tail.failed = true;
+            if let Some(tap) = &self.trace_tap {
+                tap.observe_failure();
+            }
         }
         result.context("root_tail_incomplete: bounded reduction")
     }
@@ -435,6 +664,126 @@ pub struct EventDrain<S> {
     malformed: u64,
     malformed_reported: u64,
     domain: Option<EventsDomain>,
+    trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
+    object_transport: Option<ObjectTransportRows>,
+    cut_lineage: OnceLock<Option<u64>>,
+}
+
+static NEXT_EVENTS_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// A snapshot of this retained consumer, never a timestamp or record count.
+/// Cloning retains the same EVENTS allocation and original cursor lineage.
+#[derive(Clone)]
+pub(crate) struct EventsConsumptionCut {
+    events: EventsDomain,
+    cursor: u64,
+    consumer: usize,
+    producer: usize,
+    malformed: u64,
+    discarded: u64,
+}
+
+impl std::fmt::Debug for EventsConsumptionCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventsConsumptionCut(<private>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventsCutRefusal {
+    Untracked,
+    Exhausted,
+    Positions,
+}
+
+impl EventsConsumptionCut {
+    pub(crate) fn producer_bound(&self) -> usize {
+        self.producer
+    }
+
+    /// Only byte/cursor containment. Earlier originals may end before Q,
+    /// and malformed/discarded history remains the audit's responsibility.
+    pub(crate) fn within_producer_bound(&self, bound: &Self) -> bool {
+        self.same_cursor(bound)
+            && self.consumer <= bound.producer
+            && self.producer <= bound.producer
+    }
+
+    pub(crate) fn at_producer_bound(&self, bound: &Self) -> bool {
+        self.within_producer_bound(bound) && self.consumer == bound.producer
+    }
+
+    pub(crate) fn same_boundary(&self, other: &Self) -> bool {
+        self.same_cursor(other)
+            && self.consumer == other.consumer
+            && self.malformed == other.malformed
+            && self.discarded == other.discarded
+    }
+    fn same_cursor(&self, other: &Self) -> bool {
+        self.events.same_allocation(&other.events) && self.cursor == other.cursor
+    }
+    pub(crate) fn clean_successor_of(&self, before: &Self) -> bool {
+        self.same_cursor(before)
+            && self.consumer >= before.consumer
+            && self.malformed == before.malformed
+            && self.discarded == before.discarded
+    }
+    pub(crate) fn is_initial(&self) -> bool {
+        self.consumer == 0 && self.malformed == 0 && self.discarded == 0
+    }
+    pub(crate) fn is_drained(&self) -> bool {
+        self.consumer == self.producer
+    }
+    pub(crate) fn events(&self) -> &EventsDomain {
+        &self.events
+    }
+    pub(crate) fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+#[allow(private_bounds)] // Only crate-private cut methods use this private reader seam.
+impl<S: BoundedRecordSource> EventDrain<S> {
+    pub(crate) fn consumption_cut(&self) -> Result<EventsConsumptionCut, EventsCutRefusal> {
+        let events = self.domain.as_ref().ok_or(EventsCutRefusal::Untracked)?;
+        let positions = self.source.positions();
+        if positions.consumer != self.source.consumer()
+            || !positions.consumer.is_multiple_of(8)
+            || !positions.producer.is_multiple_of(8)
+            || positions.capacity == 0
+            || !positions.capacity.is_power_of_two()
+            || positions
+                .producer
+                .checked_sub(positions.consumer)
+                .is_none_or(|unread| unread > positions.capacity)
+            || positions.consumer == usize::MAX
+            || positions.producer == usize::MAX
+        {
+            return Err(EventsCutRefusal::Positions);
+        }
+        if self.malformed == u64::MAX || self.source.discarded() == u64::MAX {
+            return Err(EventsCutRefusal::Exhausted);
+        }
+        let cursor = self
+            .cut_lineage
+            .get_or_init(|| {
+                NEXT_EVENTS_CURSOR
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                        last.checked_add(1)
+                    })
+                    .ok()
+                    .map(|last| last + 1)
+            })
+            .ok_or(EventsCutRefusal::Exhausted)?;
+        Ok(EventsConsumptionCut {
+            events: events.clone(),
+            cursor,
+            consumer: positions.consumer,
+            producer: positions.producer,
+            malformed: self.malformed,
+            discarded: self.source.discarded(),
+        })
+    }
 }
 
 impl OwnedDrain {
@@ -468,11 +817,40 @@ impl OwnedDrain {
             malformed: 0,
             malformed_reported: 0,
             domain: Some(domain.clone()),
+            trace_tap: None,
+            object_transport: None,
+            cut_lineage: OnceLock::new(),
         })
+    }
+
+    /// The same retained cursor with the producer's verified transport rows.
+    /// This does not expose object facts or enable attested semantic admission.
+    pub(crate) fn for_session_with_transport(
+        ebpf: &Ebpf,
+        domain: &EventsDomain,
+        descriptors: Option<ObjectTransportRows>,
+    ) -> Result<Self> {
+        let mut drain = Self::for_session(ebpf, domain)?;
+        drain.object_transport = descriptors;
+        Ok(drain)
     }
 }
 
 impl<S: RecordSource> EventDrain<S> {
+    pub(crate) fn attach_trace_tap(
+        &mut self,
+        tap: crate::attach::detailed_identity::ProofTap,
+    ) -> Result<(), crate::attach::detailed_identity::TraceProofUnknown> {
+        if !self
+            .domain
+            .as_ref()
+            .is_some_and(|domain| tap.matches_events(domain))
+        {
+            return Err(crate::attach::detailed_identity::TraceProofUnknown::DomainMismatch);
+        }
+        self.trace_tap = Some(tap);
+        Ok(())
+    }
     #[cfg(test)]
     pub(crate) fn over(source: S) -> Self {
         Self {
@@ -480,12 +858,19 @@ impl<S: RecordSource> EventDrain<S> {
             malformed: 0,
             malformed_reported: 0,
             domain: None,
+            trace_tap: None,
+            object_transport: None,
+            cut_lineage: OnceLock::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn source(&self) -> &S {
         &self.source
+    }
+    #[cfg(test)]
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        &mut self.source
     }
 
     #[cfg(test)]
@@ -495,6 +880,9 @@ impl<S: RecordSource> EventDrain<S> {
             malformed: 0,
             malformed_reported: 0,
             domain: Some(domain),
+            trace_tap: None,
+            object_transport: None,
+            cut_lineage: OnceLock::new(),
         }
     }
     #[cfg(test)]
@@ -531,13 +919,23 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
-            match decode(&item) {
+            match decode_transport_record(&item, self.object_transport.as_deref())
+                .map(|record| record.event)
+            {
                 Some(event) => {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&event);
+                    }
                     if f(event).is_break() {
                         return true;
                     }
                 }
-                None => self.malformed = self.malformed.saturating_add(1),
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
             }
         }
     }
@@ -562,13 +960,158 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
-            match decode_record(&item) {
+            match decode_transport_record(&item, self.object_transport.as_deref()) {
                 Some(record) => {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&record.event);
+                    }
                     if f(record).is_break() {
                         return true;
                     }
                 }
-                None => self.malformed = self.malformed.saturating_add(1),
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
+            }
+        }
+    }
+
+    /// `poll_records` delivering whole records with the optional
+    /// validated object tail intact (slice D transport). The caller
+    /// supplies the frozen receipt-bound descriptor table: only the
+    /// reviewed allowlisted attested lane decodes 608-byte records;
+    /// malformed tails and lengths count exactly like before, through
+    /// this same single cursor. Bare consumers keep `poll_records`.
+    pub(crate) fn poll_object_records(
+        &mut self,
+        quantum: Option<usize>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        mut f: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+    ) -> bool {
+        let mut left = quantum;
+        loop {
+            if left == Some(0) {
+                return true;
+            }
+            let Some(item) = self.source.next_record() else {
+                return false;
+            };
+            if let Some(left) = left.as_mut() {
+                *left -= 1;
+            }
+            match decode_object_record(&item, descriptors) {
+                Some(record) => {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&record.base.event);
+                    }
+                    if f(record).is_break() {
+                        return true;
+                    }
+                }
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
+            }
+        }
+    }
+
+    /// One-cursor dispatch poll (H8): each consumed record goes to exactly
+    /// one consumer by length — 368/608-byte forms through the existing
+    /// object decoder to `ordinary`, journal forms through the frozen
+    /// journal validators, with UNJOURNALED ENDs normalized to `ordinary`
+    /// and tracked forms sent to `journal` — with the same quantum, malformed
+    /// counting and stop semantics as the single-consumer polls. No second
+    /// cursor and no decoded-count inference: consumption order is
+    /// reservation order for every form. Activation-gated: production H0/H3
+    /// call sites keep their polls until the producer wires.
+    #[allow(dead_code)]
+    pub(crate) fn poll_dispatched_records(
+        &mut self,
+        quantum: Option<usize>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        ordinary: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+        journal: impl FnMut(JournalRecord) -> ControlFlow<()>,
+    ) -> bool {
+        self.poll_dispatched_quantum(quantum, descriptors, ordinary, journal)
+            .backlog
+    }
+
+    pub(crate) fn poll_dispatched_quantum(
+        &mut self,
+        quantum: Option<usize>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        mut ordinary: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+        mut journal: impl FnMut(JournalRecord) -> ControlFlow<()>,
+    ) -> DispatchPoll {
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_ABANDON_BYTES, JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES,
+            JOURNAL_END_FULL_BYTES,
+        };
+        let mut left = quantum;
+        let mut attempted = 0usize;
+        loop {
+            if left == Some(0) {
+                return DispatchPoll {
+                    attempted,
+                    backlog: true,
+                };
+            }
+            let Some(item) = self.source.next_record() else {
+                return DispatchPoll {
+                    attempted,
+                    backlog: false,
+                };
+            };
+            if let Some(left) = left.as_mut() {
+                *left -= 1;
+            }
+            attempted = attempted.saturating_add(1);
+            let delivered = match item.len() {
+                JOURNAL_BEGIN_BYTES
+                | JOURNAL_END_FULL_BYTES
+                | JOURNAL_END_COMPACT_BYTES
+                | JOURNAL_ABANDON_BYTES => {
+                    decode_journal_record(&item, descriptors).and_then(|record| {
+                        if let JournalRecord::End(end) = &record {
+                            let completed = project_journal_end_payload(end, descriptors)?;
+                            if let Some(tap) = &self.trace_tap {
+                                tap.observe_call(&completed.base.event);
+                            }
+                            if end.unjournaled() {
+                                return Some(ordinary(completed));
+                            }
+                        }
+                        Some(journal(record))
+                    })
+                }
+                _ => decode_object_record(&item, descriptors).map(|record| {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&record.base.event);
+                    }
+                    ordinary(record)
+                }),
+            };
+            match delivered {
+                Some(flow) => {
+                    if flow.is_break() {
+                        return DispatchPoll {
+                            attempted,
+                            backlog: true,
+                        };
+                    }
+                }
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
             }
         }
     }
@@ -576,6 +1119,13 @@ impl<S: RecordSource> EventDrain<S> {
     /// Records rejected by the size or affiliation check so far.
     pub fn malformed(&self) -> u64 {
         self.malformed
+    }
+
+    /// Kernel-discarded reservations the retained reader consumed so
+    /// far. Drains audit the per-collection delta and refuse seals
+    /// that span unaccounted discards.
+    pub fn discarded(&self) -> u64 {
+        self.source.discarded()
     }
 
     /// Malformed records since the last delta was taken, advancing the
@@ -611,6 +1161,19 @@ pub(crate) fn event_drain_positions<S: BoundedRecordSource>(
     drain.source.positions()
 }
 
+/// The EVENTS ring still holds unconsumed bytes. Read after an unbounded
+/// poll came back empty, it means the head is reserved but not committed,
+/// and records committed behind it stay invisible: that empty read did
+/// not drain the ring. Only the drain advances `consumer` and `producer`
+/// only grows, so `consumer == producer` proves the ring was empty at the
+/// read. (The completion mint's backlog verdict; DISCOVERY's counterpart
+/// is `discovery_head_pending`.)
+#[allow(dead_code)] // Only the unwired completion mint consumes it so far.
+pub(crate) fn events_head_pending<S: BoundedRecordSource>(drain: &EventDrain<S>) -> bool {
+    let positions = drain.source.positions();
+    positions.producer != positions.consumer
+}
+
 /// Drains one bounded EVENTS quantum up to the producer `stop` position
 /// read at Q, never consuming past it. Returns `(post_q_record, backlog)`:
 /// `post_q_record` when the producer has moved past `stop` — under a
@@ -635,11 +1198,19 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
         // blocking the post-Reached positions read below.
         let record: BoundedRecord<Option<Event>> = match drain.source.bounded_record(stop) {
             Ok(bounded) => match bounded {
-                BoundedRecord::Item(item) => BoundedRecord::Item(decode(&item)),
+                BoundedRecord::Item(item) => BoundedRecord::Item(
+                    decode_transport_record(&item, drain.object_transport.as_deref())
+                        .map(|record| record.event),
+                ),
                 BoundedRecord::Reached => BoundedRecord::Reached,
                 BoundedRecord::Pending => BoundedRecord::Pending,
             },
-            Err(error) => return Ok((map_bounded_error(error)?, false)),
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
         };
         match record {
             BoundedRecord::Item(event) => {
@@ -648,11 +1219,19 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
                 }
                 match event {
                     Some(event) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&event);
+                        }
                         if f(event).is_break() {
                             return Ok((false, true));
                         }
                     }
-                    None => drain.malformed = drain.malformed.saturating_add(1),
+                    None => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
                 }
             }
             BoundedRecord::Reached => {
@@ -675,14 +1254,281 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
     }
 }
 
+/// The full-`EventRecord` counterpart of [`poll_events_to_position`]:
+/// the same proven-Q bounded drain over the same owned consumer, but
+/// delivering whole records with the private continuity tail intact
+/// instead of decoding it away to `Event`. The Detailed lane's
+/// terminal drain consumes its own cursor through here, in bounded
+/// quanta, never creating another consumer. Same contract:
+/// `(post_q_record, backlog)`, same `UngatedWriterBeforeQ` failure,
+/// same malformed accounting.
+pub(crate) fn poll_records_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    mut f: impl FnMut(EventRecord) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned record first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        let record: BoundedRecord<Option<EventRecord>> = match drain.source.bounded_record(stop) {
+            Ok(bounded) => match bounded {
+                BoundedRecord::Item(item) => BoundedRecord::Item(decode_transport_record(
+                    &item,
+                    drain.object_transport.as_deref(),
+                )),
+                BoundedRecord::Reached => BoundedRecord::Reached,
+                BoundedRecord::Pending => BoundedRecord::Pending,
+            },
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
+        };
+        match record {
+            BoundedRecord::Item(record) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match record {
+                    Some(record) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&record.event);
+                        }
+                        if f(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    None => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => {
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
+        }
+    }
+}
+
+/// `poll_records_to_position` delivering whole records with the
+/// optional validated object tail intact (slice D stop-time transport).
+/// Same proven-Q contract, same malformed accounting, same single
+/// cursor; the frozen receipt-bound table gates 608-byte records.
+pub(crate) fn poll_object_records_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+    mut f: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned record first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        let record: BoundedRecord<Option<DecodedEventRecord>> =
+            match drain.source.bounded_record(stop) {
+                Ok(bounded) => match bounded {
+                    BoundedRecord::Item(item) => {
+                        BoundedRecord::Item(decode_object_record(&item, descriptors))
+                    }
+                    BoundedRecord::Reached => BoundedRecord::Reached,
+                    BoundedRecord::Pending => BoundedRecord::Pending,
+                },
+                Err(error) => {
+                    if let Some(tap) = &drain.trace_tap {
+                        tap.observe_failure();
+                    }
+                    return Ok((map_bounded_error(error)?, false));
+                }
+            };
+        match record {
+            BoundedRecord::Item(record) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match record {
+                    Some(record) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&record.base.event);
+                        }
+                        if f(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    None => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => {
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
+        }
+    }
+}
+
+/// `poll_object_records_to_position` dispatching journal forms (H8): the
+/// same proven-Q bounded drain over the same owned consumer, but each
+/// record goes to exactly one consumer by length — 368/608-byte forms
+/// through the existing object decoder to `ordinary`, journal forms
+/// through the frozen journal validators, with UNJOURNALED ENDs normalized
+/// to `ordinary` and tracked forms sent to `journal`. Same proven-Q
+/// contract, same malformed accounting, same single cursor. In
+/// particular a BUSY (Pending) record below no admitted writer stops the
+/// drain with the cursor held: the journal frontier cannot pass it.
+/// Activation-gated alongside the dispatch poll.
+#[allow(dead_code)]
+pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+    mut ordinary: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+    mut journal: impl FnMut(JournalRecord) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_ABANDON_BYTES, JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES,
+        JOURNAL_END_FULL_BYTES,
+    };
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned outcome first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        enum Delivered {
+            Ordinary(DecodedEventRecord),
+            Journal(JournalRecord),
+            Malformed,
+        }
+        let record: BoundedRecord<Delivered> = match drain.source.bounded_record(stop) {
+            Ok(bounded) => match bounded {
+                BoundedRecord::Item(item) => BoundedRecord::Item(match item.len() {
+                    JOURNAL_BEGIN_BYTES
+                    | JOURNAL_END_FULL_BYTES
+                    | JOURNAL_END_COMPACT_BYTES
+                    | JOURNAL_ABANDON_BYTES => match decode_journal_record(&item, descriptors) {
+                        Some(JournalRecord::End(end)) if end.unjournaled() => {
+                            project_journal_end_payload(&end, descriptors)
+                                .map_or(Delivered::Malformed, Delivered::Ordinary)
+                        }
+                        Some(record) => Delivered::Journal(record),
+                        None => Delivered::Malformed,
+                    },
+                    _ => decode_object_record(&item, descriptors)
+                        .map_or(Delivered::Malformed, Delivered::Ordinary),
+                }),
+                BoundedRecord::Reached => BoundedRecord::Reached,
+                BoundedRecord::Pending => BoundedRecord::Pending,
+            },
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
+        };
+        match record {
+            BoundedRecord::Item(delivered) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match delivered {
+                    Delivered::Ordinary(record) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&record.base.event);
+                        }
+                        if ordinary(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    Delivered::Journal(record) => {
+                        if let JournalRecord::End(end) = &record {
+                            let Some(completed) = project_journal_end_payload(end, descriptors)
+                            else {
+                                drain.malformed = drain.malformed.saturating_add(1);
+                                if let Some(tap) = &drain.trace_tap {
+                                    tap.observe_failure();
+                                }
+                                continue;
+                            };
+                            if let Some(tap) = &drain.trace_tap {
+                                tap.observe_call(&completed.base.event);
+                            }
+                        }
+                        if journal(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    Delivered::Malformed => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => {
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
+        }
+    }
+}
+
 /// A ring standing in for the live one: it hands out the scripted records
 /// and fails the test outright once a poll takes one more than `bound`, so a
 /// missing quantum is a panic on a finite script, never a hang.
 #[cfg(test)]
 pub(crate) struct ScriptedRecords {
-    queue: std::collections::VecDeque<Vec<u8>>,
+    queue: std::collections::VecDeque<Option<Vec<u8>>>,
     pub(crate) bound: usize,
     taken: usize,
+    front_busy: bool,
+    discarded: u64,
 }
 
 #[cfg(test)]
@@ -693,29 +1539,55 @@ impl ScriptedRecords {
 
     pub(crate) fn records(records: impl IntoIterator<Item = Vec<u8>>, bound: usize) -> Self {
         Self {
-            queue: records.into_iter().collect(),
+            queue: records.into_iter().map(Some).collect(),
             bound,
             taken: 0,
+            front_busy: false,
+            discarded: 0,
         }
     }
 
     pub(crate) fn remaining(&self) -> usize {
         self.queue.len()
     }
+
+    pub(crate) fn block_front(&mut self) {
+        assert!(
+            !self.queue.is_empty(),
+            "BUSY needs an owned queued reservation"
+        );
+        self.front_busy = true;
+    }
+
+    pub(crate) fn release_front(&mut self) {
+        assert!(self.front_busy && !self.queue.is_empty());
+        self.front_busy = false;
+    }
 }
 
 #[cfg(test)]
 impl RecordSource for ScriptedRecords {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
-        let item = self.queue.pop_front()?;
-        self.taken += 1;
-        assert!(
-            self.taken <= self.bound,
-            "the poll took record {} past its bound of {}",
-            self.taken,
-            self.bound
-        );
-        Some(item)
+        if self.front_busy {
+            return None;
+        }
+        loop {
+            let item = self.queue.pop_front()?;
+            self.taken += 1;
+            assert!(
+                self.taken <= self.bound,
+                "the poll took record {} past its bound of {}",
+                self.taken,
+                self.bound
+            );
+            if let Some(item) = item {
+                return Some(item);
+            }
+            self.discarded += 1;
+        }
+    }
+    fn discarded(&self) -> u64 {
+        self.discarded
     }
 }
 
@@ -724,7 +1596,19 @@ impl ScriptedRecords {
     /// A record committed after the script was fixed: advances the producer
     /// past any position observed before the push, like a post-Q write.
     pub(crate) fn push_event(&mut self, event: &Event) {
-        self.queue.push_back(event_bytes(event));
+        self.queue.push_back(Some(event_bytes(event)));
+    }
+    pub(crate) fn push_record(&mut self, record: Vec<u8>) {
+        self.queue.push_back(Some(record));
+    }
+    /// Records still on the scripted wire, not yet taken by a poll.
+    pub(crate) fn pending_records(&self) -> usize {
+        self.queue.len()
+    }
+    /// One kernel-discarded reservation: advances the owned cursor without
+    /// delivering a record, while retaining the reader's loss accounting.
+    pub(crate) fn push_discard(&mut self) {
+        self.queue.push_back(None);
     }
 }
 
@@ -744,22 +1628,71 @@ impl BoundedRecordSource for ScriptedRecords {
         &mut self,
         stop: usize,
     ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
-        if self.taken * 8 == stop {
-            return Ok(BoundedRecord::Reached);
-        }
-        match self.queue.pop_front() {
-            Some(item) => {
-                self.taken += 1;
-                assert!(
-                    self.taken <= self.bound,
-                    "the poll took record {} past its bound of {}",
-                    self.taken,
-                    self.bound
-                );
-                Ok(BoundedRecord::Item(item))
+        loop {
+            if self.taken * 8 == stop {
+                return Ok(BoundedRecord::Reached);
             }
-            None => Ok(BoundedRecord::Pending),
+            if self.front_busy {
+                return Ok(BoundedRecord::Pending);
+            }
+            match self.queue.pop_front() {
+                Some(item) => {
+                    self.taken += 1;
+                    assert!(
+                        self.taken <= self.bound,
+                        "the poll took record {} past its bound of {}",
+                        self.taken,
+                        self.bound
+                    );
+                    if let Some(item) = item {
+                        return Ok(BoundedRecord::Item(item));
+                    }
+                    self.discarded += 1;
+                }
+                None => return Ok(BoundedRecord::Pending),
+            }
         }
+    }
+}
+
+/// A ring whose head is reserved but uncommitted: the unbounded read sees
+/// nothing (Aya maps a Pending head to `None`), while positions still
+/// show unread bytes. Pins the false-empty the terminal mint must refuse
+/// via positions, and the `UngatedWriterBeforeQ` the bounded drain
+/// reports for the same head below its stop.
+#[cfg(test)]
+pub(crate) struct PendingHeadRecords {
+    pub(crate) consumer: usize,
+    pub(crate) producer: usize,
+}
+
+#[cfg(test)]
+impl RecordSource for PendingHeadRecords {
+    fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+        None::<Vec<u8>>
+    }
+}
+
+#[cfg(test)]
+impl BoundedRecordSource for PendingHeadRecords {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        aya::maps::ring_buf::RingBufPositions {
+            consumer: self.consumer,
+            producer: self.producer,
+            capacity: 4096,
+        }
+    }
+    fn consumer(&self) -> usize {
+        self.consumer
+    }
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+        if self.consumer == stop {
+            return Ok(BoundedRecord::<Vec<u8>>::Reached);
+        }
+        Ok(BoundedRecord::<Vec<u8>>::Pending)
     }
 }
 
@@ -795,6 +1728,8 @@ pub(crate) type OwnedDiscoveryDrain = DiscoveryDrain<aya::maps::RingBuf<MapData>
 pub(crate) struct DiscoveryDrain<S> {
     source: S,
     _domain: Option<DiscoveryDomain>,
+    trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
+    pid_lifecycle_tap: Option<crate::attach::PidLifecycleTap>,
 }
 
 impl OwnedDiscoveryDrain {
@@ -819,16 +1754,73 @@ impl OwnedDiscoveryDrain {
         Ok(Self {
             source: ring,
             _domain: Some(domain.clone()),
+            trace_tap: None,
+            pid_lifecycle_tap: None,
         })
     }
 }
 
 impl<S: RecordSource> DiscoveryDrain<S> {
     #[cfg(test)]
+    pub(crate) fn same_domain(&self, expected: &DiscoveryDomain) -> bool {
+        self._domain
+            .as_ref()
+            .is_some_and(|held| held.same_allocation(expected))
+    }
+    pub(crate) fn attach_pid_lifecycle_tap(
+        &mut self,
+        tap: crate::attach::PidLifecycleTap,
+    ) -> Result<(), crate::attach::PidContinuityRefusal> {
+        if !self
+            ._domain
+            .as_ref()
+            .is_some_and(|domain| tap.matches_domain(domain))
+            || self
+                .pid_lifecycle_tap
+                .as_ref()
+                .is_some_and(|installed| !installed.same_observer(&tap))
+        {
+            tap.observe_failure();
+            if let Some(installed) = &self.pid_lifecycle_tap {
+                installed.observe_failure();
+            }
+            return Err(crate::attach::PidContinuityRefusal::Domain);
+        }
+        self.pid_lifecycle_tap = Some(tap);
+        Ok(())
+    }
+
+    pub(crate) fn attach_trace_tap(
+        &mut self,
+        tap: crate::attach::detailed_identity::ProofTap,
+    ) -> Result<(), crate::attach::detailed_identity::TraceProofUnknown> {
+        if !self
+            ._domain
+            .as_ref()
+            .is_some_and(|domain| tap.matches_discovery(domain))
+        {
+            return Err(crate::attach::detailed_identity::TraceProofUnknown::DomainMismatch);
+        }
+        self.trace_tap = Some(tap);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn over_domain(source: S, domain: DiscoveryDomain) -> Self {
+        Self {
+            source,
+            _domain: Some(domain),
+            trace_tap: None,
+            pid_lifecycle_tap: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn over(source: S) -> Self {
         Self {
             source,
             _domain: None,
+            trace_tap: None,
+            pid_lifecycle_tap: None,
         }
     }
 
@@ -842,11 +1834,63 @@ impl<S: RecordSource> DiscoveryDrain<S> {
         self._domain.as_ref().map_or(0, DiscoveryDomain::id)
     }
 
-    pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem> {
-        let item = self.source.next_record()?;
-        match decode_discovery(&item) {
-            Some(record) => Some(DiscoveryItem::Record(record)),
-            None => Some(DiscoveryItem::Malformed),
+    pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem>
+    where
+        S: BoundedRecordSource,
+    {
+        self.dequeue_with_clock(crate::attach::monotonic_ns)
+    }
+
+    fn dequeue_with_clock(&mut self, clock: impl FnOnce() -> Option<u64>) -> Option<DiscoveryItem>
+    where
+        S: BoundedRecordSource,
+    {
+        let pid_started = self
+            .pid_lifecycle_tap
+            .as_ref()
+            .and_then(|tap| tap.begin_read(clock()));
+        let started = self.trace_tap.as_ref().and_then(|tap| tap.read_started());
+        let decoded = self
+            .source
+            .next_record()
+            .map(|item| match decode_discovery(&item) {
+                Some(record) => DiscoveryItem::Record(record),
+                None => DiscoveryItem::Malformed,
+            });
+        let empty_positions = if decoded.is_none()
+            && (self.pid_lifecycle_tap.is_some() || self.trace_tap.is_some())
+        {
+            Some(self.source.positions())
+        } else {
+            None
+        };
+        // Observe the first raw consumption before any caller can stage or hold it.
+        if let Some(tap) = &self.pid_lifecycle_tap {
+            match &decoded {
+                Some(DiscoveryItem::Record(record)) => tap.observe_record(record),
+                Some(DiscoveryItem::Malformed) => tap.observe_malformed(),
+                None => {
+                    let positions = empty_positions.expect("empty observed cursor");
+                    tap.observe_empty(pid_started, positions.producer, positions.consumer);
+                }
+            }
+        }
+        if let Some(tap) = &self.trace_tap {
+            match &decoded {
+                Some(DiscoveryItem::Record(record)) => tap.observe_discovery(record),
+                Some(DiscoveryItem::Malformed) => tap.observe_failure(),
+                None => {
+                    let positions = empty_positions.expect("empty observed cursor");
+                    tap.observe_empty(started, positions.producer == positions.consumer);
+                }
+            }
+        }
+        decoded
+    }
+
+    pub(crate) fn invalidate_pid_lifecycle_terminal(&self) {
+        if let Some(tap) = &self.pid_lifecycle_tap {
+            tap.invalidate_terminal();
         }
     }
 }
@@ -887,6 +1931,7 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
     quantum: Option<usize>,
     mut f: impl FnMut(DiscoveryItem) -> ControlFlow<()>,
 ) -> Result<(bool, bool)> {
+    drain.invalidate_pid_lifecycle_terminal();
     let mut left = quantum;
     loop {
         if left == Some(0) {
@@ -895,6 +1940,7 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
         // Decode to an owned item first: matching the borrowed item
         // directly keeps the source borrow alive across the match,
         // blocking the post-Reached positions read below.
+        let started = drain.trace_tap.as_ref().and_then(|tap| tap.read_started());
         let record: BoundedRecord<DiscoveryItem> = match drain.source.bounded_record(stop) {
             Ok(bounded) => match bounded {
                 BoundedRecord::Item(item) => BoundedRecord::Item(match decode_discovery(&item) {
@@ -904,19 +1950,37 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
                 BoundedRecord::Reached => BoundedRecord::Reached,
                 BoundedRecord::Pending => BoundedRecord::Pending,
             },
-            Err(error) => return Ok((map_bounded_error(error)?, false)),
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
         };
         match record {
             BoundedRecord::Item(item) => {
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                if let Some(tap) = &drain.trace_tap {
+                    match &item {
+                        DiscoveryItem::Record(record) => tap.observe_discovery(record),
+                        DiscoveryItem::Malformed => tap.observe_failure(),
+                    }
+                }
                 if f(item).is_break() {
                     return Ok((false, true));
                 }
             }
             BoundedRecord::Reached => {
-                let post_q_record = drain.source.positions().producer != stop;
+                let positions = drain.source.positions();
+                let post_q_record = positions.producer != stop;
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_empty(
+                        started,
+                        !post_q_record && positions.producer == positions.consumer,
+                    );
+                }
                 return Ok((post_q_record, false));
             }
             BoundedRecord::Pending => {
@@ -927,6 +1991,9 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
                 // boundary is reached and clean.
                 let consumer = drain.source.consumer();
                 if consumer != stop {
+                    if let Some(tap) = &drain.trace_tap {
+                        tap.observe_failure();
+                    }
                     return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
                 }
                 return Ok((false, false));
@@ -942,6 +2009,433 @@ mod runtime_tests;
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn discovery_drain_keeps_original_domain_allocation() {
+        let retained = DiscoveryDomain::test_standin(0xf105);
+        let original =
+            DiscoveryDrain::over_domain(ScriptedRecords::records([], 0), retained.clone());
+        assert!(original.same_domain(&retained.clone()));
+        let same_id = DiscoveryDomain::test_standin(0xf105);
+        assert_eq!(retained.id(), same_id.id());
+        assert!(!original.same_domain(&same_id));
+        assert!(!DiscoveryDrain::over(ScriptedRecords::records([], 0)).same_domain(&retained));
+    }
+
+    #[test]
+    fn joint_consumption_cut_keeps_original_cursor_identity() {
+        let events = EventsDomain::test_standin(0xb110);
+        let mut first =
+            EventDrain::over_domain(ScriptedRecords::records([vec![0]], 1), events.clone());
+        let second = EventDrain::over_domain(ScriptedRecords::records([], 0), events);
+        let before = first.consumption_cut().unwrap();
+        let foreign = second.consumption_cut().unwrap();
+        assert!(!before.same_boundary(&foreign), "one map is not one cursor");
+        assert!(before.is_initial());
+        first.poll(Some(1), |_| panic!("malformed bytes"));
+        let after = first.consumption_cut().unwrap();
+        assert!(!before.same_boundary(&after));
+        assert!(
+            !after.clean_successor_of(&before),
+            "malformed movement is a gap"
+        );
+        assert!(matches!(
+            EventDrain::over(ScriptedRecords::records([], 0)).consumption_cut(),
+            Err(EventsCutRefusal::Untracked)
+        ));
+    }
+
+    #[test]
+    fn joint_consumption_cut_refuses_invalid_and_exhausted_snapshots() {
+        for (consumer, producer) in [(16, 8), (0, 4097), (1, 8), (0, usize::MAX)] {
+            let drain =
+                EventDrain::over_test_domain(PendingHeadRecords { consumer, producer }, 0xb111);
+            assert!(matches!(
+                drain.consumption_cut(),
+                Err(EventsCutRefusal::Positions)
+            ));
+        }
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::records([], 0), 0xb112);
+        drain.malformed = u64::MAX;
+        assert!(matches!(
+            drain.consumption_cut(),
+            Err(EventsCutRefusal::Exhausted)
+        ));
+    }
+
+    #[test]
+    fn object_producer_decoded_envelope_carries_validated_tail() {
+        use p11scope_ebpf_common::object_wire::{
+            OBJECT_ACTION_CREATE, OBJECT_CALL_BYTES, OBJECT_CALL_VERSION, OBJECT_LAYOUT_LP64,
+            OBJECT_TAIL_BYTES, publish_object_descriptors,
+        };
+        let table = publish_object_descriptors();
+        let base_record = |kind: u32, root_affiliation: u64| EventRecord {
+            event: Event {
+                event_type: kind,
+                root_affiliation,
+                ..Default::default()
+            },
+            continuity: Default::default(),
+        };
+        fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
+            buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+        // Valid Create tail, encoded byte by byte: version 1, 240 bytes,
+        // index 21 (C_CreateObject), LP64, one value result.
+        let mut tail = [0u8; OBJECT_TAIL_BYTES];
+        put(&mut tail, 0, &OBJECT_CALL_VERSION.to_le_bytes());
+        put(&mut tail, 2, &OBJECT_CALL_BYTES.to_le_bytes());
+        put(&mut tail, 4, &21u32.to_le_bytes());
+        tail[12] = OBJECT_LAYOUT_LP64;
+        tail[13] = OBJECT_ACTION_CREATE;
+        put(&mut tail, 32, &0x1234u64.to_le_bytes());
+        tail[114] = 1;
+
+        // Ordinary form: CALL and lifecycle decode without a tail.
+        let call = record_bytes(&base_record(event_type::CALL, 0));
+        let decoded = decode_object_record(&call, &table).expect("ordinary CALL decodes");
+        assert_eq!(decoded.base.event.event_type, event_type::CALL);
+        assert!(decoded.object.is_none());
+        let fork = record_bytes(&base_record(event_type::FORK, 1));
+        let decoded = decode_object_record(&fork, &table).expect("lifecycle decodes");
+        assert!(decoded.object.is_none());
+        assert!(
+            decode_object_record(&record_bytes(&base_record(event_type::CALL, 2)), &table)
+                .is_none()
+        );
+        assert!(decode_object_record(&[0u8; 367], &table).is_none());
+        assert!(decode_object_record(&[0u8; 369], &table).is_none());
+
+        // Extended form is CALL-only and returns the exact tail.
+        let mut extended = record_bytes(&base_record(event_type::CALL, 0));
+        extended.extend_from_slice(&tail);
+        let decoded = decode_object_record(&extended, &table).expect("extended CALL decodes");
+        assert_eq!(decoded.base.event.event_type, event_type::CALL);
+        let object = decoded.object.expect("validated tail rides along");
+        assert_eq!(object.tail_bytes(), &tail);
+        assert_eq!(object.descriptor_index(), 21);
+        assert_eq!(object.action(), OBJECT_ACTION_CREATE);
+        assert_eq!(object.layout(), OBJECT_LAYOUT_LP64);
+
+        let mut forked = record_bytes(&base_record(event_type::FORK, 0));
+        forked.extend_from_slice(&tail);
+        assert!(decode_object_record(&forked, &table).is_none());
+        let mut zeroed = record_bytes(&base_record(event_type::CALL, 0));
+        zeroed.extend_from_slice(&[0u8; OBJECT_TAIL_BYTES]);
+        assert!(decode_object_record(&zeroed, &table).is_none());
+        let mut unaffiliated = record_bytes(&base_record(event_type::CALL, 2));
+        unaffiliated.extend_from_slice(&tail);
+        assert!(decode_object_record(&unaffiliated, &table).is_none());
+        assert!(decode_object_record(&[0u8; 607], &table).is_none());
+        assert!(decode_object_record(&[0u8; 609], &table).is_none());
+
+        // Production decoding stays 368-only until the transport handoff.
+        assert!(decode_record(&extended).is_none());
+        assert!(decode(&extended).is_none());
+    }
+
+    fn ordinary_object_transport_record(slot: u32) -> Vec<u8> {
+        let mut bytes = event_bytes(&Event {
+            event_type: event_type::CALL,
+            slot,
+            rv: 7,
+            duration_ns: 91,
+            ..Default::default()
+        });
+        let mut tail = [0u8; 240];
+        tail[..2].copy_from_slice(&1u16.to_le_bytes());
+        tail[2..4].copy_from_slice(&240u16.to_le_bytes());
+        tail[4..8].copy_from_slice(&21u32.to_le_bytes());
+        tail[12] = 1; // LP64
+        tail[13] = 1; // C_CreateObject
+        tail[32..40].copy_from_slice(&0x1234u64.to_le_bytes());
+        tail[114] = 1; // result handle VALUE
+        bytes.extend_from_slice(&tail);
+        bytes
+    }
+
+    #[test]
+    fn refused_object_base_output_keeps_one_exact_ordinary_record() {
+        use p11scope_ebpf_common::object_flow::{
+            RefusedBaseOutcome, continuity_joins, preserve_refused_base,
+        };
+        use p11scope_ebpf_common::{InstanceContinuity, InstanceStamp, instance};
+        use std::cell::Cell;
+        let rows = p11scope_ebpf_common::object_wire::publish_object_descriptors();
+        let stamp = InstanceStamp {
+            epoch: 7,
+            global: 9,
+            fault: 11,
+            file_slot_plus1: 3,
+            flags: instance::STAMP_VALID,
+        };
+        let mut straddled = stamp;
+        straddled.epoch += 1;
+        let mut faulted = stamp;
+        faulted.flags |= instance::STAMP_LOCAL_FAULT;
+        for (entry_stamp, return_stamp) in [
+            (InstanceStamp::default(), stamp),
+            (stamp, straddled),
+            (faulted, faulted),
+        ] {
+            let base = EventRecord {
+                event: Event {
+                    event_type: event_type::CALL,
+                    slot: 12,
+                    ts_ns: 800,
+                    duration_ns: 91,
+                    rv: 7,
+                    ..Default::default()
+                },
+                continuity: InstanceContinuity {
+                    entry_ip: 0x1234,
+                    entry_stamp,
+                    return_stamp,
+                },
+            };
+            assert!(!continuity_joins(&base.continuity));
+            let original_prefix = record_bytes(&base);
+            for (retired, output_ok, expected) in [
+                (true, true, RefusedBaseOutcome::Emitted),
+                (true, false, RefusedBaseOutcome::OutputFailed),
+                (false, true, RefusedBaseOutcome::RetirementFailed),
+                (false, false, RefusedBaseOutcome::RetirementFailed),
+            ] {
+                let stage = Cell::new(0);
+                let mut delivered = Vec::new();
+                let outcome = preserve_refused_base(
+                    || {
+                        assert_eq!(stage.replace(1), 0);
+                        retired
+                    },
+                    || assert_eq!(stage.replace(2), 1),
+                    || {
+                        assert_eq!(stage.replace(3), 2);
+                        if output_ok {
+                            // Aya output copies the exact borrowed EventRecord,
+                            // never the uninitialized 240-byte object suffix.
+                            delivered.push(record_bytes(&base));
+                        }
+                        output_ok
+                    },
+                );
+                assert_eq!(outcome, expected);
+                assert_eq!(stage.get(), if retired { 3 } else { 2 });
+                assert_eq!(delivered.len(), usize::from(retired && output_ok));
+                for bytes in delivered {
+                    assert_eq!(bytes.len(), 368);
+                    assert_eq!(bytes, original_prefix);
+                    let decoded = decode_object_record(&bytes, &rows).unwrap();
+                    assert_eq!(record_bytes(&decoded.base), original_prefix);
+                    assert!(!continuity_joins(&decoded.base.continuity));
+                    assert!(decoded.object.is_none());
+                    assert!(decoded.joint_resource.is_none());
+                }
+            }
+            let mut unfilled_object = original_prefix;
+            unfilled_object.extend_from_slice(&[0u8; OBJECT_TAIL_BYTES]);
+            assert_eq!(unfilled_object.len(), 608);
+            assert!(decode_object_record(&unfilled_object, &rows).is_none());
+        }
+        // Healthy extended transport still carries a validated tail once;
+        // preserving refused bases never changes the atomic 608-byte decoder.
+        let mut healthy = ordinary_object_transport_record(12);
+        let healthy_base = EventRecord {
+            event: Event {
+                event_type: event_type::CALL,
+                slot: 12,
+                ..Default::default()
+            },
+            continuity: InstanceContinuity {
+                entry_ip: 0x1234,
+                entry_stamp: stamp,
+                return_stamp: stamp,
+            },
+        };
+        healthy[..368].copy_from_slice(&record_bytes(&healthy_base));
+        let decoded = decode_object_record(&healthy, &rows).unwrap();
+        assert!(continuity_joins(&decoded.base.continuity));
+        assert!(decoded.object.is_some());
+        assert!(decoded.joint_resource.is_none());
+        assert_eq!(healthy.len(), 608);
+    }
+
+    // A drift back to the strict 368-byte decoder loses the first call;
+    // accepting only a valid prefix of the 608-byte envelope admits slot 99.
+    fn check_ordinary_object_transport_route(route: u8) {
+        let good = ordinary_object_transport_record(12);
+        let mut malformed_tail = ordinary_object_transport_record(99);
+        malformed_tail[368] = 2; // unsupported tail version
+        let ordinary = event_bytes(&Event {
+            event_type: event_type::CALL,
+            slot: 13,
+            rv: 7,
+            duration_ns: 91,
+            ..Default::default()
+        });
+        let domain = EventsDomain::test_standin(811);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([good, malformed_tail, ordinary], 3),
+            domain.clone(),
+        );
+        let command = if route.is_multiple_of(2) {
+            "profile"
+        } else {
+            "trace"
+        };
+        let policy = crate::attach::CapturePolicy::from_cli(command, false, false).unwrap();
+        drain.object_transport = crate::attach::object_transport_rows_with(policy, None, || {
+            Ok(Arc::new(
+                p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            ))
+        })
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut observe = |event: Event| {
+            seen.push((event.slot, event.rv, event.duration_ns));
+            ControlFlow::Continue(())
+        };
+        match route {
+            0 => assert!(!drain.poll(Some(4), &mut observe)),
+            1 => assert!(!drain.poll_records(Some(4), |record| observe(record.event))),
+            2 => assert_eq!(
+                poll_events_to_position(&mut drain, 24, Some(4), &mut observe).unwrap(),
+                (false, false)
+            ),
+            3 => assert_eq!(
+                poll_records_to_position(&mut drain, 24, Some(4), |record| observe(record.event))
+                    .unwrap(),
+                (false, false)
+            ),
+            4 => {
+                let mut tail = OwnedRootTail::new(
+                    crate::run::OriginalRootExit::test_reaped(domain),
+                    Instant::now() + Duration::from_secs(1),
+                );
+                drain.begin_root_tail(&mut tail).unwrap();
+                assert_eq!(
+                    drain
+                        .poll_root_tail(&mut tail, 4, |event| {
+                            let _ = observe(event);
+                            Ok(())
+                        })
+                        .unwrap(),
+                    RootTailProgress::Reached
+                );
+                tail.complete().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(seen, [(12, 7, 91), (13, 7, 91)], "route {route}");
+        assert_eq!(drain.malformed(), 1, "route {route}");
+        assert_eq!(drain.take_malformed_delta(), 1);
+        assert_eq!(drain.take_malformed_delta(), 0);
+        assert_eq!(drain.source.consumer(), 24);
+    }
+
+    #[test]
+    fn ordinary_object_transport_live_poll_preserves_call() {
+        check_ordinary_object_transport_route(0);
+    }
+
+    #[test]
+    fn ordinary_object_transport_record_poll_preserves_call() {
+        check_ordinary_object_transport_route(1);
+    }
+
+    #[test]
+    fn ordinary_object_transport_terminal_poll_preserves_call() {
+        check_ordinary_object_transport_route(2);
+    }
+
+    #[test]
+    fn ordinary_object_transport_terminal_record_poll_preserves_call() {
+        check_ordinary_object_transport_route(3);
+    }
+
+    #[test]
+    fn ordinary_object_transport_root_tail_preserves_call() {
+        check_ordinary_object_transport_route(4);
+    }
+
+    #[test]
+    fn ordinary_object_transport_without_capability_stays_strict() {
+        let extended = ordinary_object_transport_record(12);
+        let ordinary = event_bytes(&Event {
+            slot: 13,
+            ..Default::default()
+        });
+        let mut drain = EventDrain::over(ScriptedRecords::records([extended, ordinary], 2));
+        let mut slots = Vec::new();
+        assert!(!drain.poll(Some(3), |event| {
+            slots.push(event.slot);
+            ControlFlow::Continue(())
+        }));
+        assert_eq!(slots, [13]);
+        assert_eq!(drain.malformed(), 1);
+    }
+
+    #[test]
+    fn poll_records_to_position_delivers_whole_records_to_q() {
+        use p11scope_ebpf_common::{InstanceContinuity, InstanceStamp};
+        let record = |slot: u32, entry_ip: u64| EventRecord {
+            event: Event {
+                slot,
+                ..Default::default()
+            },
+            continuity: InstanceContinuity {
+                entry_ip,
+                entry_stamp: InstanceStamp {
+                    epoch: 9,
+                    ..Default::default()
+                },
+                return_stamp: InstanceStamp::default(),
+            },
+        };
+        let bytes = [record(3, 0x1111), record(4, 0x2222)]
+            .into_iter()
+            .map(|record| record_bytes(&record));
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::records(bytes, 8), 7);
+        // The Q stop stands after both records (8 bytes each in the
+        // scripted positions); a quantum of one drains in two calls.
+        let mut seen = Vec::new();
+        let (post_q, backlog) = poll_records_to_position(&mut drain, 16, Some(1), |record| {
+            seen.push((record.event.slot, record.continuity.entry_ip));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((post_q, backlog), (false, true));
+        let (post_q, backlog) = poll_records_to_position(&mut drain, 16, Some(8), |record| {
+            seen.push((record.event.slot, record.continuity.entry_ip));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((post_q, backlog), (false, false));
+        assert_eq!(seen, vec![(3, 0x1111), (4, 0x2222)]);
+        // A third record past Q is the post-Q signature at Reached:
+        // reported, never silently consumed.
+        let bytes = [record(3, 0x1111), record(4, 0x2222), record(5, 0x3333)]
+            .into_iter()
+            .map(|record| record_bytes(&record));
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::records(bytes, 8), 7);
+        let mut seen = 0;
+        let (post_q, backlog) = poll_records_to_position(&mut drain, 16, Some(8), |_| {
+            seen += 1;
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((post_q, backlog), (true, false));
+        assert_eq!(seen, 2);
+        // Malformed bytes count without yielding a record.
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::records([vec![7u8; 3]], 8), 7);
+        let (post_q, backlog) =
+            poll_records_to_position(&mut drain, 8, Some(8), |_| ControlFlow::Continue(()))
+                .unwrap();
+        assert_eq!((post_q, backlog), (false, false));
+        assert_eq!(drain.malformed(), 1);
+    }
 
     #[test]
     fn pending_bytes_is_producer_minus_consumer() {
@@ -1007,7 +2501,8 @@ mod tests {
             weak.upgrade().is_some(),
             "State retains the map after Tracker and Session"
         );
-        assert!(peer.write(&[1]).is_ok());
+        let written = peer.write(&[1]);
+        assert!(written.is_ok(), "retained socket write: {written:?}");
         drop(state);
         assert!(weak.upgrade().is_none());
         // Closing the last descriptor is visible at its actual peer.
@@ -1089,6 +2584,7 @@ mod tests {
     /// snapshots it, and the terminal poll observes it — exactly the
     /// one-cursor sequence the retained production consumer must keep.
     struct CursorScript {
+        positions_reads: std::cell::Cell<usize>,
         cursor: std::rc::Rc<std::cell::Cell<usize>>,
         producer: usize,
         capacity: usize,
@@ -1117,6 +2613,7 @@ mod tests {
         fn scripted(records: impl IntoIterator<Item = Vec<u8>>) -> Self {
             let queue: std::collections::VecDeque<_> = records.into_iter().collect();
             Self {
+                positions_reads: std::cell::Cell::new(0),
                 cursor: std::rc::Rc::new(std::cell::Cell::new(0)),
                 producer: queue.len() * 8,
                 capacity: 4096,
@@ -1140,6 +2637,7 @@ mod tests {
 
     impl BoundedRecordSource for CursorScript {
         fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            self.positions_reads.set(self.positions_reads.get() + 1);
             aya::maps::ring_buf::RingBufPositions {
                 consumer: self.cursor.get(),
                 producer: self.producer,
@@ -1163,6 +2661,365 @@ mod tests {
                 })),
                 None => Ok(BoundedRecord::Pending),
             }
+        }
+    }
+
+    #[test]
+    fn pid_continuity_raw_cursor_observes_startup_lazy_metrics_once() {
+        use crate::attach::{DiscoveryStage, PidLifecycleTap, ensure_pid_discovery_consumer_with};
+        use p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE;
+        for route in 0..3 {
+            let domain = DiscoveryDomain::test_standin(701);
+            let tap = PidLifecycleTap::test_for(7, domain.clone());
+            let mut exec = proof_lifecycle(7, 100, DISCOVERY_KIND_EXEC);
+            exec.case_id = DISCOVERY_EXEC_SAME_TASK_CANDIDATE;
+            let mut consumer = None;
+            let create = || {
+                Ok(DiscoveryDrain::over_domain(
+                    CursorScript::scripted([discovery_bytes(&exec)]),
+                    domain,
+                ))
+            };
+            assert!(ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), create).unwrap());
+            let drain = consumer.as_mut().unwrap();
+            assert!(
+                drain.trace_tap.is_none(),
+                "metrics and startup do not require trace proof"
+            );
+            let mut stage = DiscoveryStage::default();
+            let item = if route == 1 {
+                let item = drain.dequeue_with_clock(|| Some(200)).unwrap();
+                assert_eq!(
+                    tap.test_facts().unwrap().observation_serial,
+                    1,
+                    "first raw dequeue must observe before direct delivery"
+                );
+                item
+            } else {
+                let outcome = stage.stage(1, DiscoveryStage::CAPACITY, || {
+                    let item = drain.dequeue_with_clock(|| Some(200));
+                    assert_eq!(
+                        tap.test_facts().unwrap().observation_serial,
+                        1,
+                        "first raw dequeue must observe before startup or lazy staging"
+                    );
+                    item
+                });
+                assert_eq!(outcome.staged, 1);
+                stage.pop().unwrap()
+            };
+            let first = tap.test_facts().unwrap();
+            assert_eq!(first.latest_exec.unwrap().hook_ts_ns, 100);
+            let held = item;
+            assert!(matches!(held, DiscoveryItem::Record(_)));
+            assert_eq!(
+                tap.test_facts().unwrap(),
+                first,
+                "staged and held replay cannot acquire another observation key"
+            );
+            assert!(
+                !ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || panic!(
+                    "reuse the original cursor"
+                ))
+                .unwrap()
+            );
+        }
+    }
+
+    fn pid_lifecycle_record(ts: u64, class: u8) -> DiscoveryRecord {
+        let mut record = proof_lifecycle(7, ts, DISCOVERY_KIND_EXEC);
+        record.case_id = class;
+        record
+    }
+
+    fn pid_cursor(
+        records: impl IntoIterator<Item = Vec<u8>>,
+    ) -> (DiscoveryDrain<CursorScript>, crate::attach::PidLifecycleTap) {
+        let domain = DiscoveryDomain::test_standin(702);
+        let tap = crate::attach::PidLifecycleTap::test_for(7, domain.clone());
+        let mut drain = DiscoveryDrain::over_domain(CursorScript::scripted(records), domain);
+        drain.attach_pid_lifecycle_tap(tap.clone()).unwrap();
+        (drain, tap)
+    }
+
+    #[test]
+    fn pid_continuity_frontier_requires_genuine_empty_cursor() {
+        use p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE as SAME;
+        let (mut drain, tap) = pid_cursor([]);
+        assert!(drain.dequeue_with_clock(|| Some(200)).is_none());
+        let empty = tap.test_facts().unwrap().empty.unwrap();
+        assert_eq!(
+            (
+                empty.read_started_ns,
+                empty.producer_position,
+                empty.observation_serial
+            ),
+            (200, 0, 0)
+        );
+        drain.source.producer = 8;
+        assert_eq!(
+            discovery_drain_positions(&drain).producer,
+            8,
+            "a saved empty never conceals a later producer advance"
+        );
+        assert!(drain.dequeue_with_clock(|| Some(210)).is_none());
+        assert!(
+            tap.test_facts().unwrap().empty.is_none(),
+            "BUSY is not a genuine empty"
+        );
+        let (mut drain, tap) = pid_cursor([
+            discovery_bytes(&pid_lifecycle_record(100, SAME)),
+            discovery_bytes(&pid_lifecycle_record(101, SAME)),
+        ]);
+        let mut staged = crate::attach::DiscoveryStage::default();
+        assert_eq!(
+            staged
+                .stage(1, 1, || drain.dequeue_with_clock(|| Some(200)))
+                .staged,
+            1
+        );
+        assert!(
+            tap.test_facts().unwrap().empty.is_none(),
+            "quantum exhaustion cannot create an empty frontier"
+        );
+        let before = tap.test_facts().unwrap();
+        assert!(
+            staged
+                .stage(10, 1, || panic!("capacity stop must not read the ring"))
+                .capacity_blocked
+        );
+        assert_eq!(tap.test_facts().unwrap(), before);
+        assert!(discovery_head_pending(&drain));
+        staged.pop();
+        assert_eq!(
+            staged
+                .stage(1, 1, || drain.dequeue_with_clock(|| Some(210)))
+                .staged,
+            1
+        );
+        assert!(tap.test_facts().unwrap().empty.is_none());
+        assert!(drain.dequeue_with_clock(|| Some(220)).is_none());
+        let empty = tap.test_facts().unwrap().empty.unwrap();
+        assert_eq!(
+            (
+                empty.read_started_ns,
+                empty.producer_position,
+                empty.observation_serial
+            ),
+            (220, 16, 2)
+        );
+        for second in [0, 99, 100] {
+            let (mut drain, tap) = pid_cursor([
+                discovery_bytes(&pid_lifecycle_record(100, SAME)),
+                discovery_bytes(&pid_lifecycle_record(second, SAME)),
+            ]);
+            assert!(drain.dequeue_with_clock(|| Some(200)).is_some());
+            assert!(drain.dequeue_with_clock(|| Some(210)).is_some());
+            let facts = tap.test_facts().unwrap();
+            assert_eq!(facts.observation_serial, 2);
+            assert_eq!(facts.fault_serial, 1);
+            assert!(
+                facts.latest_exec.is_none(),
+                "zero, backward and equal lifecycle times refuse an ambiguous key"
+            );
+        }
+        for clock in [None, Some(0), Some(199)] {
+            let (mut drain, tap) = pid_cursor([]);
+            assert!(drain.dequeue_with_clock(|| Some(200)).is_none());
+            assert!(drain.dequeue_with_clock(|| clock).is_none());
+            assert!(tap.test_facts().unwrap().empty.is_none());
+            assert_eq!(tap.test_facts().unwrap().fault_serial, 1);
+        }
+    }
+
+    #[test]
+    fn pid_continuity_preserves_breaks_and_transport_faults() {
+        use crate::attach::{
+            PidContinuityRefusal, PidLifecycleTap, ensure_pid_discovery_consumer_with,
+        };
+        use p11scope_ebpf_common::{
+            DISCOVERY_EXEC_SAME_TASK_CANDIDATE as SAME, DISCOVERY_EXEC_TASK_REPLACED as REPLACED,
+            DISCOVERY_EXEC_UNKNOWN as UNKNOWN,
+        };
+        let exit = proof_lifecycle(7, 120, p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT);
+        let (mut drain, tap) = pid_cursor([
+            discovery_bytes(&pid_lifecycle_record(100, REPLACED)),
+            discovery_bytes(&pid_lifecycle_record(110, UNKNOWN)),
+            discovery_bytes(&exit),
+            discovery_bytes(&pid_lifecycle_record(130, SAME)),
+            discovery_bytes(&pid_lifecycle_record(140, SAME)),
+            vec![0],
+        ]);
+        let mut held = None;
+        for index in 0..5 {
+            let item = drain.dequeue_with_clock(|| Some(200 + index)).unwrap();
+            if index == 3 {
+                held = Some(item);
+            }
+        }
+        let latest = tap.test_facts().unwrap();
+        assert_eq!(latest.greatest_break_ns, Some(120));
+        let latest_exec = latest.latest_exec.unwrap();
+        assert_eq!(
+            (latest_exec.hook_ts_ns, latest_exec.observation_serial),
+            (140, 5)
+        );
+        let Some(DiscoveryItem::Record(old)) = held else {
+            panic!("held EXEC");
+        };
+        assert_eq!(old.hook_ts_ns, 130);
+        assert_ne!(
+            old.hook_ts_ns, latest_exec.hook_ts_ns,
+            "held replay cannot borrow the newer EXEC key"
+        );
+        assert_eq!(tap.test_facts().unwrap(), latest);
+        assert!(matches!(
+            drain.dequeue_with_clock(|| Some(210)),
+            Some(DiscoveryItem::Malformed)
+        ));
+        let failed = tap.test_facts().unwrap();
+        assert_eq!((failed.observation_serial, failed.fault_serial), (6, 1));
+        assert!(failed.latest_exec.is_none());
+        assert_eq!(failed.greatest_break_ns, Some(120));
+        assert!(drain.dequeue_with_clock(|| Some(220)).is_none());
+        assert_eq!(
+            tap.test_facts().unwrap().fault_serial,
+            1,
+            "a later empty never erases the transport fault"
+        );
+        let domain = DiscoveryDomain::test_standin(703);
+        let tap = PidLifecycleTap::test_for(7, domain.clone());
+        let mut consumer: Option<DiscoveryDrain<CursorScript>> = None;
+        assert!(
+            ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || Err(anyhow::anyhow!(
+                "consumer construction failed"
+            )))
+            .is_err()
+        );
+        assert_eq!(tap.test_facts().unwrap().fault_serial, 1);
+        assert!(consumer.is_none());
+        assert!(
+            ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || Ok(
+                DiscoveryDrain::over_domain(
+                    CursorScript::scripted([]),
+                    DiscoveryDomain::test_standin(703)
+                )
+            ))
+            .is_err(),
+            "the same map number cannot replace the retained allocation"
+        );
+        assert_eq!(tap.test_facts().unwrap().fault_serial, 2);
+        assert!(consumer.is_none());
+        assert!(
+            ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || Ok(
+                DiscoveryDrain::over_domain(CursorScript::scripted([]), domain.clone())
+            ))
+            .unwrap()
+        );
+        assert!(
+            consumer
+                .as_mut()
+                .unwrap()
+                .dequeue_with_clock(|| Some(300))
+                .is_none()
+        );
+        let before = tap.test_facts().unwrap().fault_serial;
+        let replacement = PidLifecycleTap::test_for(7, domain);
+        assert_eq!(
+            consumer
+                .as_mut()
+                .unwrap()
+                .attach_pid_lifecycle_tap(replacement),
+            Err(PidContinuityRefusal::Domain)
+        );
+        assert_eq!(tap.test_facts().unwrap().fault_serial, before + 1);
+        assert!(tap.test_facts().unwrap().empty.is_none());
+        let (mut drain, tap) = pid_cursor([
+            discovery_bytes(&pid_lifecycle_record(150, SAME)),
+            discovery_bytes(&pid_lifecycle_record(145, REPLACED)),
+            discovery_bytes(&pid_lifecycle_record(160, SAME)),
+        ]);
+        for now in [200, 210, 220] {
+            drain.dequeue_with_clock(|| Some(now));
+        }
+        assert_eq!(tap.test_facts().unwrap().greatest_break_ns, Some(145));
+        assert_eq!(
+            tap.test_facts().unwrap().fault_serial,
+            1,
+            "an out-of-order breaking record is retained and faults continuity"
+        );
+    }
+
+    #[test]
+    fn pid_continuity_terminal_bypass_is_irreversible() {
+        use crate::attach::{
+            DiscoveryStage, PidContinuityRefusal, collect_staged_discovery_to_position,
+        };
+        use p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE as SAME;
+        for route in 0..7 {
+            let records = match route {
+                3 | 4 => vec![discovery_bytes(&pid_lifecycle_record(100, SAME))],
+                5 => vec![vec![0]],
+                _ => vec![],
+            };
+            let (mut drain, tap) = pid_cursor([]);
+            assert!(drain.dequeue_with_clock(|| Some(200)).is_none());
+            assert!(tap.test_facts().unwrap().empty.is_some());
+            drain.source.producer = records.len() * 8;
+            drain.source.queue.extend(records);
+            if route == 2 {
+                drain.source.producer = 8;
+            } // BUSY below the terminal stop
+            let mut count = 0;
+            let mut malformed = 0;
+            let result = match route {
+                0 => poll_discovery_to_position(&mut drain, 0, Some(0), |_| panic!("zero quantum")),
+                1 => poll_discovery_to_position(&mut drain, 0, Some(1), |_| panic!("Reached")),
+                2 => poll_discovery_to_position(&mut drain, 8, Some(1), |_| panic!("BUSY")),
+                3 | 5 => poll_discovery_to_position(&mut drain, 8, Some(2), |item| {
+                    match item {
+                        DiscoveryItem::Record(_) => count += 1,
+                        DiscoveryItem::Malformed => malformed += 1,
+                    }
+                    ControlFlow::Continue(())
+                }),
+                4 => poll_discovery_to_position(&mut drain, 8, Some(1), |_| {
+                    count += 1;
+                    ControlFlow::Break(())
+                }),
+                _ => {
+                    let mut staged = DiscoveryStage::default();
+                    staged.stage(1, 1, || {
+                        Some(DiscoveryItem::Record(pid_lifecycle_record(100, SAME)))
+                    });
+                    let (records, bad, post, backlog) =
+                        collect_staged_discovery_to_position(&mut staged, &mut drain, 0, 1)
+                            .unwrap();
+                    count = records.len();
+                    malformed = bad;
+                    assert!(staged.len() == 0 && !post && backlog);
+                    Ok((post, backlog))
+                }
+            };
+            if route == 2 {
+                assert!(result.is_err());
+                drain.source.producer = 0;
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(count, usize::from(matches!(route, 3 | 4 | 6)));
+            assert_eq!(malformed, u64::from(route == 5));
+            assert_eq!(
+                tap.test_facts(),
+                Err(PidContinuityRefusal::Terminal),
+                "every terminal route invalidates before returning"
+            );
+            assert!(drain.dequeue_with_clock(|| Some(300)).is_none());
+            assert_eq!(
+                tap.test_facts(),
+                Err(PidContinuityRefusal::Terminal),
+                "ordinary reads cannot restore terminal authority"
+            );
         }
     }
 
@@ -1341,6 +3198,42 @@ mod tests {
         assert_eq!(drain.malformed(), u64::MAX);
     }
 
+    #[test]
+    fn dispatched_raw_malformed_saturation_is_counter_unprovable() {
+        struct Fault;
+        impl crate::semantics_objects::journal::FaultEpoch for Fault {
+            fn fault_epoch(
+                &self,
+            ) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+                Ok(7)
+            }
+        }
+        let events = EventsDomain::test_standin(46);
+        let producers = crate::attach::SessionDrainProducers::test_pair(
+            crate::attach::capture::NativeDomainId::mint(),
+            events.clone(),
+        );
+        let mut drain = EventDrain::over_domain(ScriptedRecords::records([], 0), events);
+        drain.malformed = u64::MAX;
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let quantum = crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect(
+            &mut drain,
+            &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            4,
+            &Fault,
+            &producers,
+            |bytes| pool.reserve(bytes),
+        )
+        .unwrap();
+        let (records, failed) = quantum.h0_input(producers.native_domain(), 1_024).unwrap();
+        assert!(records.is_empty());
+        assert!(
+            failed,
+            "a saturated malformed counter cannot certify an empty clean poll"
+        );
+        assert_eq!(drain.malformed(), u64::MAX);
+    }
+
     /// One record past the quantum, then a record the poll must never take.
     #[test]
     fn poll_stops_at_its_quantum_and_reports_the_backlog() {
@@ -1432,6 +3325,969 @@ mod tests {
         assert!(decode(&[]).is_none());
     }
 
+    use crate::attach::detailed_identity::{ProofSession, TraceProofUnknown};
+    use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+    use std::time::{Duration, Instant};
+    fn proof_call(pid: u32, ts: u64, cookie: u64, exec: u64) -> Event {
+        Event {
+            pid_tgid: u64::from(pid) << 32,
+            ts_ns: ts,
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: cookie,
+                exec_id: exec,
+            },
+            ..Event::default()
+        }
+    }
+    fn proof_lifecycle(pid: u32, ts: u64, kind: u8) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.hook_ts_ns = ts;
+        record.kind = kind;
+        record
+    }
+    fn cgroup_proof_cursor_fixture() -> (
+        ProofSession,
+        crate::process::ProcessView,
+        crate::attach::detailed_identity::CgroupCandidate,
+    ) {
+        let scope = crate::attach::Scope::Cgroup {
+            id: 1,
+            path: "/retained-only".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+        };
+        let proof = ProofSession::test_scope(&scope, true);
+        proof.test_set_time(100);
+        let view =
+            crate::process::ProcessView::open(crate::process::ProcessViewId(0), std::process::id())
+                .unwrap();
+        let mut work = crate::attach::detailed_identity::TraceWorkTicket::test_new(
+            proof.clone(),
+            100,
+            5_000_100,
+        );
+        let candidate = proof.register_cgroup(&view, &mut work).unwrap();
+        proof.test_set_time(200);
+        (proof, view, candidate)
+    }
+    fn projected_end_wire(event: &Event, compact: bool) -> Vec<u8> {
+        use p11scope_ebpf_common::object_journal::*;
+        let mut wire = vec![0u8; JOURNAL_END_FULL_BYTES];
+        wire[..2].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
+        wire[2..4].copy_from_slice(&(JOURNAL_END_FULL_BYTES as u16).to_le_bytes());
+        wire[4] = JOURNAL_KIND_END;
+        wire[5] = JOURNAL_END_TAIL_ABSENT;
+        wire[8..16].copy_from_slice(&1u64.to_le_bytes());
+        wire[16..24].copy_from_slice(&1u64.to_le_bytes());
+        wire[24..24 + 368].copy_from_slice(&event_bytes(event));
+        if compact {
+            pack_compact_end(1, 1, JOURNAL_END_TAIL_ABSENT, &wire[24..])
+                .expect("small source payload is compact eligible")
+                .to_vec()
+        } else {
+            wire
+        }
+    }
+
+    // Authored future-producer wire only: obtain the exact existing completed
+    // payload first, then mark it ordinary and clear the journal identity.
+    // This exercises transport decoding without activating a producer.
+    fn unjournaled_end_fixture(absent: bool, compact: bool) -> (Vec<u8>, DecodedEventRecord) {
+        use crate::semantics_objects::journal::tests;
+        use p11scope_ebpf_common::object_journal::{JOURNAL_END_UNJOURNALED, pack_compact_end};
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, publish_object_descriptors};
+        let rows = publish_object_descriptors();
+        let function = tests::function_id(if absent { "C_Sign" } else { "C_CreateObject" });
+        let begin = tests::begin_bytes(1, 1, function, 0);
+        let full = if absent {
+            tests::end_bytes_absent(&begin, 0, tests::ENTRY_NS + 100)
+        } else {
+            tests::end_bytes(&begin, OBJECT_ACTION_CREATE, 0, tests::ENTRY_NS + 100)
+        };
+        let JournalRecord::End(end) = decode_journal_record(&full, &rows).unwrap() else {
+            panic!("existing completed payload fixture")
+        };
+        let expected = project_journal_end_payload(&end, &rows).unwrap();
+        let mut wire = if compact {
+            pack_compact_end(1, 1, full[5], &full[24..])
+                .unwrap()
+                .to_vec()
+        } else {
+            full.to_vec()
+        };
+        wire[5] |= JOURNAL_END_UNJOURNALED;
+        wire[8..24].fill(0);
+        (wire, expected)
+    }
+
+    #[test]
+    fn unjournaled_end_is_exact_ordinary_once_before_live_and_q_callbacks() {
+        use crate::semantics_objects::journal::JournalIngestItem;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for absent in [false, true] {
+            for compact in [false, true] {
+                let (wire, expected) = unjournaled_end_fixture(absent, compact);
+                for bounded in [false, true] {
+                    let source = CursorScript::scripted([wire.clone()]);
+                    let cursor = source.cursor.clone();
+                    let mut drain = EventDrain::over(source);
+                    let mut staged = Vec::new();
+                    let mut ordinary = |decoded: DecodedEventRecord| {
+                        assert!(decoded.same_decoded_payload(&expected));
+                        assert!(decoded.joint_resource.is_none());
+                        assert_eq!(cursor.get(), if bounded { 8 } else { 0 });
+                        staged.push(JournalIngestItem::Ordinary(decoded));
+                        ControlFlow::Continue(())
+                    };
+                    if bounded {
+                        assert_eq!(
+                            poll_dispatched_records_to_position(
+                                &mut drain,
+                                8,
+                                Some(2),
+                                &rows,
+                                &mut ordinary,
+                                |_| panic!("unjournaled END cannot acquire a journal key"),
+                            )
+                            .unwrap(),
+                            (false, false)
+                        );
+                    } else {
+                        assert_eq!(
+                            drain.poll_dispatched_quantum(
+                                Some(2),
+                                &rows,
+                                &mut ordinary,
+                                |_| panic!("unjournaled END cannot enter journal sightings"),
+                            ),
+                            DispatchPoll {
+                                attempted: 1,
+                                backlog: false
+                            }
+                        );
+                    }
+                    assert_eq!(staged.len(), 1);
+                    assert!(matches!(staged[0], JournalIngestItem::Ordinary(_)));
+                    assert_eq!(cursor.get(), 8);
+                    assert_eq!(drain.malformed(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unjournaled_end_identity_flags_and_tail_refusals_are_atomic() {
+        use crate::semantics_objects::journal::tests;
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED,
+        };
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for compact in [false, true] {
+            let (good, _) = unjournaled_end_fixture(false, compact);
+            // Positive control rejects a decoder that simply refuses all
+            // new flags while making every malformed-input twin pass.
+            assert!(matches!(
+                decode_journal_record(&good, &rows),
+                Some(JournalRecord::End(_))
+            ));
+            let mut cases = Vec::new();
+            for (thread, sequence) in [(1u64, 0u64), (0, 1), (1, 1)] {
+                let mut bad = good.clone();
+                bad[8..16].copy_from_slice(&thread.to_le_bytes());
+                bad[16..24].copy_from_slice(&sequence.to_le_bytes());
+                cases.push(bad);
+            }
+            let mut unknown_flag = good.clone();
+            unknown_flag[5] |= 0x08;
+            cases.push(unknown_flag);
+            let mut absent_with_tail = good.clone();
+            absent_with_tail[5] |= JOURNAL_END_TAIL_ABSENT;
+            cases.push(absent_with_tail);
+            let mut bad_tail = good.clone();
+            let tail = if compact { 24 + 368 - 160 } else { 24 + 368 };
+            bad_tail[tail] = 0xff;
+            cases.push(bad_tail);
+            let mut flagged_begin =
+                tests::begin_bytes(1, 1, tests::function_id("C_CreateObject"), 0);
+            flagged_begin[5] = JOURNAL_END_UNJOURNALED;
+            cases.push(flagged_begin.to_vec());
+            for bad in cases {
+                assert!(decode_journal_record(&bad, &rows).is_none());
+                for bounded in [false, true] {
+                    let source = CursorScript::scripted([bad.clone()]);
+                    let cursor = source.cursor.clone();
+                    let mut drain = EventDrain::over(source);
+                    if bounded {
+                        assert_eq!(
+                            poll_dispatched_records_to_position(
+                                &mut drain,
+                                8,
+                                Some(1),
+                                &rows,
+                                |_| panic!("malformed envelope cannot leak an ordinary prefix"),
+                                |_| panic!("malformed envelope cannot acquire journal authority"),
+                            )
+                            .unwrap(),
+                            (false, true)
+                        );
+                    } else {
+                        assert_eq!(
+                            drain.poll_dispatched_quantum(
+                                Some(1),
+                                &rows,
+                                |_| panic!("malformed envelope cannot leak an ordinary prefix"),
+                                |_| panic!("malformed envelope cannot acquire journal authority"),
+                            ),
+                            DispatchPoll {
+                                attempted: 1,
+                                backlog: true
+                            }
+                        );
+                    }
+                    assert_eq!(cursor.get(), 8);
+                    assert_eq!(drain.malformed(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unjournaled_break_and_quantum_preserve_wire_order() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_END_UNJOURNALED;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for compact in [false, true] {
+            let (unjournaled, expected) = unjournaled_end_fixture(false, compact);
+            let mut tracked = unjournaled.clone();
+            tracked[5] &= !JOURNAL_END_UNJOURNALED;
+            tracked[8..16].copy_from_slice(&1u64.to_le_bytes());
+            tracked[16..24].copy_from_slice(&1u64.to_le_bytes());
+            let ordinary = record_bytes(&expected.base);
+            for bounded in [false, true] {
+                let source = CursorScript::scripted([
+                    unjournaled.clone(),
+                    tracked.clone(),
+                    ordinary.clone(),
+                ]);
+                let cursor = source.cursor.clone();
+                let mut drain = EventDrain::over(source);
+                let delivered = std::cell::RefCell::new(Vec::new());
+                for (index, quantum) in [4, 1, 2].into_iter().enumerate() {
+                    let mut on_ordinary = |record: DecodedEventRecord| {
+                        assert_ne!(index, 1);
+                        assert_eq!(record_bytes(&record.base), record_bytes(&expected.base));
+                        assert_eq!(record.object.is_some(), index == 0);
+                        assert!(record.joint_resource.is_none());
+                        assert_eq!(cursor.get(), (index + usize::from(bounded)) * 8);
+                        delivered.borrow_mut().push("ordinary");
+                        if index == 0 {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    };
+                    let mut on_journal = |record| {
+                        assert_eq!(index, 1);
+                        assert!(matches!(record, JournalRecord::End(_)));
+                        assert_eq!(cursor.get(), (index + usize::from(bounded)) * 8);
+                        delivered.borrow_mut().push("journal");
+                        ControlFlow::Continue(())
+                    };
+                    if bounded {
+                        assert_eq!(
+                            poll_dispatched_records_to_position(
+                                &mut drain,
+                                24,
+                                Some(quantum),
+                                &rows,
+                                &mut on_ordinary,
+                                &mut on_journal,
+                            )
+                            .unwrap(),
+                            (false, index < 2)
+                        );
+                    } else {
+                        assert_eq!(
+                            drain.poll_dispatched_quantum(
+                                Some(quantum),
+                                &rows,
+                                &mut on_ordinary,
+                                &mut on_journal,
+                            ),
+                            DispatchPoll {
+                                attempted: 1,
+                                backlog: index < 2
+                            }
+                        );
+                    }
+                    assert_eq!(cursor.get(), (index + 1) * 8);
+                }
+                assert_eq!(delivered.into_inner(), ["ordinary", "journal", "ordinary"]);
+                assert_eq!(drain.malformed(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn dispatched_end_payload_full_compact_and_absent_are_exact() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes, end_bytes_absent, function_id,
+        };
+        use p11scope_ebpf_common::object_journal::pack_compact_end;
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, publish_object_descriptors};
+        let rows = publish_object_descriptors();
+        for absent in [false, true] {
+            let function = function_id(if absent { "C_Sign" } else { "C_CreateObject" });
+            let begin = begin_bytes(1, 1, function, 0);
+            let full = if absent {
+                end_bytes_absent(&begin, 0, ENTRY_NS + 100)
+            } else {
+                end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100)
+            };
+            for compact in [false, true] {
+                let wire = if compact {
+                    pack_compact_end(1, 1, full[5], &full[24..])
+                        .expect("fixed input has zero compact span")
+                        .to_vec()
+                } else {
+                    full.to_vec()
+                };
+                let JournalRecord::End(end) = decode_journal_record(&wire, &rows).unwrap() else {
+                    panic!("actual END transport")
+                };
+                let projected = project_journal_end_payload(&end, &rows).unwrap();
+                assert_eq!(record_bytes(&projected.base), full[24..24 + 368]);
+                if absent {
+                    assert!(projected.object.is_none());
+                } else {
+                    assert_eq!(projected.object.unwrap().tail_bytes(), &full[24 + 368..]);
+                }
+                let mut drain = EventDrain::over(ScriptedRecords::records([wire], 1));
+                let mut calls = 0;
+                let poll = drain.poll_dispatched_quantum(
+                    Some(1),
+                    &rows,
+                    |_| panic!("END must not be delivered again as ordinary wire"),
+                    |record| {
+                        assert!(matches!(record, JournalRecord::End(_)));
+                        calls += 1;
+                        ControlFlow::Continue(())
+                    },
+                );
+                assert_eq!(
+                    poll,
+                    DispatchPoll {
+                        attempted: 1,
+                        backlog: true
+                    }
+                );
+                assert_eq!(calls, 1);
+                assert_eq!(drain.malformed(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn dispatched_attempts_include_malformed_and_keep_wire_callbacks_disjoint() {
+        use crate::semantics_objects::journal::tests::{
+            COOKIE, ENTRY_NS, EXEC, abandon_bytes, begin_bytes, end_bytes_absent, function_id,
+        };
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+        let second = begin_bytes(2, 1, function_id("C_Sign"), 0);
+        let abandon = abandon_bytes(2, 1, 1, (COOKIE, EXEC));
+        let lifecycle = Event {
+            event_type: event_type::FORK,
+            ..Event::default()
+        };
+        let records = [
+            begin.to_vec(),
+            vec![0xff; 3],
+            event_bytes(&lifecycle),
+            end.to_vec(),
+            second.to_vec(),
+            abandon.to_vec(),
+        ];
+        let mut drain = EventDrain::over(ScriptedRecords::records(records, 6));
+        let ordinary = std::cell::Cell::new(0usize);
+        let journal = std::cell::Cell::new(0usize);
+        let completed = std::cell::Cell::new(0usize);
+        for expected_journal in [1, 4] {
+            let poll = drain.poll_dispatched_quantum(
+                Some(3),
+                &rows,
+                |record| {
+                    assert_eq!(record.base.event.event_type, event_type::FORK);
+                    ordinary.set(ordinary.get() + 1);
+                    ControlFlow::Continue(())
+                },
+                |record| {
+                    journal.set(journal.get() + 1);
+                    if let JournalRecord::End(end) = record {
+                        assert_eq!(
+                            project_journal_end_payload(&end, &rows)
+                                .unwrap()
+                                .base
+                                .event
+                                .event_type,
+                            event_type::CALL
+                        );
+                        completed.set(completed.get() + 1);
+                    }
+                    ControlFlow::Continue(())
+                },
+            );
+            assert_eq!(
+                poll,
+                DispatchPoll {
+                    attempted: 3,
+                    backlog: true
+                }
+            );
+            assert_eq!(journal.get(), expected_journal);
+            assert_eq!(ordinary.get(), 1);
+            assert_eq!(drain.malformed(), 1);
+        }
+        assert_eq!(completed.get(), 1);
+        assert_eq!(drain.source().remaining(), 0);
+    }
+
+    #[test]
+    fn dispatched_noncall_end_is_atomic_malformed_before_either_callback() {
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let event = Event {
+            event_type: event_type::FORK,
+            ..Event::default()
+        };
+        let wire = projected_end_wire(&event, false);
+        let mut drain = EventDrain::over(ScriptedRecords::records([wire], 1));
+        let poll = drain.poll_dispatched_quantum(
+            Some(1),
+            &publish_object_descriptors(),
+            |_| panic!("non-CALL END cannot leak ordinary data"),
+            |_| panic!("non-CALL END cannot leak journal authority"),
+        );
+        assert_eq!(poll.attempted, 1);
+        assert_eq!(drain.malformed(), 1);
+    }
+
+    #[test]
+    fn dispatched_end_trace_precedes_original_live_and_bounded_callback() {
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        for bounded in [false, true] {
+            for compact in [false, true] {
+                let (proof, view, pending) = cgroup_proof_cursor_fixture();
+                let mut event = proof_call(view.pid(), 101, 11, 0);
+                event.event_type = event_type::CALL;
+                let source = CursorScript::scripted([projected_end_wire(&event, compact)]);
+                let cursor = source.cursor.clone();
+                let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+                drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+                assert_eq!(proof.test_witness(pending.id()), None);
+                let rows = publish_object_descriptors();
+                let mut seen = 0;
+                let mut journal = |record| {
+                    assert!(matches!(record, JournalRecord::End(_)));
+                    assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 101)));
+                    assert_eq!(cursor.get(), if bounded { 8 } else { 0 });
+                    seen += 1;
+                    ControlFlow::Continue(())
+                };
+                if bounded {
+                    assert_eq!(
+                        poll_dispatched_records_to_position(
+                            &mut drain,
+                            8,
+                            Some(2),
+                            &rows,
+                            |_| panic!("END has one original journal delivery"),
+                            &mut journal,
+                        )
+                        .unwrap(),
+                        (false, false)
+                    );
+                } else {
+                    assert!(
+                        !drain
+                            .poll_dispatched_quantum(
+                                Some(2),
+                                &rows,
+                                |_| panic!("END has one original journal delivery"),
+                                &mut journal,
+                            )
+                            .backlog
+                    );
+                }
+                assert_eq!(seen, 1);
+                assert_eq!(cursor.get(), 8);
+                assert_eq!(drain.malformed(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unjournaled_trace_precedes_the_original_ordinary_callback_at_live_and_q_boundaries() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_END_UNJOURNALED;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        for bounded in [false, true] {
+            for compact in [false, true] {
+                let (proof, view, pending) = cgroup_proof_cursor_fixture();
+                let mut event = proof_call(view.pid(), 101, 11, 0);
+                event.event_type = event_type::CALL;
+                let mut wire = projected_end_wire(&event, compact);
+                wire[5] |= JOURNAL_END_UNJOURNALED;
+                wire[8..24].fill(0);
+                let source = CursorScript::scripted([wire]);
+                let cursor = source.cursor.clone();
+                let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+                drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+                assert_eq!(proof.test_witness(pending.id()), None);
+                let rows = publish_object_descriptors();
+                let mut seen = 0;
+                let mut ordinary = |record: DecodedEventRecord| {
+                    assert_eq!(record.base.event.event_type, event_type::CALL);
+                    assert!(record.object.is_none());
+                    assert!(record.joint_resource.is_none());
+                    assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 101)));
+                    assert_eq!(cursor.get(), if bounded { 8 } else { 0 });
+                    seen += 1;
+                    ControlFlow::Continue(())
+                };
+                if bounded {
+                    assert_eq!(
+                        poll_dispatched_records_to_position(
+                            &mut drain,
+                            8,
+                            Some(2),
+                            &rows,
+                            &mut ordinary,
+                            |_| panic!("unjournaled return has no original journal delivery"),
+                        )
+                        .unwrap(),
+                        (false, false)
+                    );
+                } else {
+                    assert!(
+                        !drain
+                            .poll_dispatched_quantum(Some(2), &rows, &mut ordinary, |_| panic!(
+                                "unjournaled return has no journal delivery"
+                            ),)
+                            .backlog
+                    );
+                }
+                assert_eq!(seen, 1);
+                assert_eq!(cursor.get(), 8);
+                assert_eq!(drain.malformed(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_all_actual_event_routes_preserve_delivery() {
+        for route in 0..6 {
+            let (proof, view, pending) = cgroup_proof_cursor_fixture();
+            let source = CursorScript::scripted([event_bytes(&proof_call(view.pid(), 101, 11, 0))]);
+            let cursor = source.cursor.clone();
+            let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            let mut seen = 0;
+            let mut callback = || {
+                seen += 1;
+                assert_eq!(
+                    cursor.get(),
+                    if route == 2 { 8 } else { 0 },
+                    "retain each route's existing item release boundary"
+                );
+                assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 101)));
+                assert_eq!(proof.usage(), (1, 0), "tap only mutates charged metadata");
+            };
+            match route {
+                0 => {
+                    drain.poll(Some(2), |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    });
+                }
+                1 => {
+                    drain.poll_records(Some(2), |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    });
+                }
+                2 => {
+                    poll_events_to_position(&mut drain, 8, Some(2), |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    })
+                    .unwrap();
+                }
+                3 => {
+                    let mut tail = OwnedRootTail::new(
+                        crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    drain.begin_root_tail(&mut tail).unwrap();
+                    drain
+                        .poll_root_tail(&mut tail, 2, |_| {
+                            callback();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                4 => {
+                    let descriptors = [ObjectDescriptorWire::default(); MAX_DESCRIPTORS as usize];
+                    drain.poll_object_records(Some(2), &descriptors, |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    });
+                }
+                _ => {
+                    let descriptors = [ObjectDescriptorWire::default(); MAX_DESCRIPTORS as usize];
+                    drain.poll_dispatched_records(
+                        Some(2),
+                        &descriptors,
+                        |_| {
+                            callback();
+                            ControlFlow::Continue(())
+                        },
+                        |_| panic!("ordinary input must not reach the journal callback"),
+                    );
+                }
+            }
+            assert_eq!(seen, 1);
+            assert_eq!(cursor.get(), 8);
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_actual_discovery_routes_apply_once() {
+        for route in 0..3 {
+            let (proof, view, pending) = cgroup_proof_cursor_fixture();
+            let mut events = EventDrain::over_domain(
+                ScriptedRecords::events([proof_call(view.pid(), 101, 11, 0)], 1),
+                proof.test_events_domain(),
+            );
+            events.attach_trace_tap(proof.test_events_tap()).unwrap();
+            events.poll(None, |_| ControlFlow::Continue(()));
+            let source = CursorScript::scripted([discovery_bytes(&proof_lifecycle(
+                view.pid(),
+                150,
+                DISCOVERY_KIND_EXEC,
+            ))]);
+            let mut drain = DiscoveryDrain::over_domain(source, proof.test_discovery_domain());
+            drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+            match route {
+                0 => assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Record(_)))),
+                1 => {
+                    let mut staged = ProofSession::test_stage_once(&mut drain);
+                    let stamps = proof.test_clock_calls();
+                    assert!(matches!(staged.pop(), Some(DiscoveryItem::Record(_))));
+                    assert_eq!(
+                        proof.test_clock_calls(),
+                        stamps,
+                        "FIFO replay is not a second observation"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        poll_discovery_to_position(&mut drain, 8, Some(1), |_| {
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap(),
+                        (false, true)
+                    );
+                }
+            }
+            assert_eq!(
+                proof
+                    .test_cgroup_snapshot(pending.id())
+                    .unwrap()
+                    .contradiction,
+                Some(150)
+            );
+            assert_eq!(proof.test_horizon(), None);
+            assert!(drain.dequeue().is_none());
+            assert_eq!(proof.test_horizon(), Some(200));
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_root_tail_error_releases_and_invalidates() {
+        let (proof, view, pending) = cgroup_proof_cursor_fixture();
+        let source = CursorScript::scripted([event_bytes(&proof_call(view.pid(), 101, 11, 0))]);
+        let cursor = source.cursor.clone();
+        let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+        drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+        let mut tail = OwnedRootTail::new(
+            crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+            Instant::now() + Duration::from_secs(1),
+        );
+        drain.begin_root_tail(&mut tail).unwrap();
+        assert!(
+            drain
+                .poll_root_tail(&mut tail, 1, |_| {
+                    assert_eq!(cursor.get(), 0);
+                    anyhow::bail!("ordinary callback error")
+                })
+                .is_err()
+        );
+        assert_eq!(cursor.get(), 8);
+        assert_eq!(
+            proof.test_problem(pending.id()),
+            Some(TraceProofUnknown::LifecycleLoss)
+        );
+    }
+    // Preparation only: intended insertion into leased events.rs after shared core RED.
+    // Every test calls retained production decoder entrypoints; pure decode cannot witness.
+    #[test]
+    fn detailed_proof_all_event_decoders_stamp_witness() {
+        for route in 0..4 {
+            let proof = ProofSession::test_session();
+            let pending = proof.test_pending(7, 9, 10);
+            let event = proof_call(7, 20, 11, 0);
+            let mut drain = EventDrain::over_domain(
+                ScriptedRecords::events([event], 1),
+                proof.test_events_domain(),
+            );
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            let mut seen = 0;
+            match route {
+                0 => {
+                    drain.poll(Some(2), |_| {
+                        seen += 1;
+                        ControlFlow::Continue(())
+                    });
+                }
+                1 => {
+                    drain.poll_records(Some(2), |_| {
+                        seen += 1;
+                        ControlFlow::Continue(())
+                    });
+                }
+                2 => {
+                    poll_events_to_position(&mut drain, 8, Some(2), |_| {
+                        seen += 1;
+                        ControlFlow::Continue(())
+                    })
+                    .unwrap();
+                }
+                _ => {
+                    let mut tail = OwnedRootTail::new(
+                        crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    drain.begin_root_tail(&mut tail).unwrap();
+                    drain
+                        .poll_root_tail(&mut tail, 2, |_| {
+                            seen += 1;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            assert_eq!(seen, 1);
+            assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 20)));
+        }
+    }
+
+    #[test]
+    fn detailed_proof_busy_head_is_not_empty() {
+        let proof = ProofSession::test_session();
+        let _pending = proof.test_pending(7, 9, 10);
+        let mut source = CursorScript::scripted([]);
+        source.producer = 8;
+        let mut drain = DiscoveryDrain::over_domain(source, proof.test_discovery_domain());
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        assert!(drain.dequeue().is_none());
+        assert!(discovery_head_pending(&drain));
+        assert_eq!(proof.test_horizon(), None);
+        drain.source.producer = 0;
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_horizon(), Some(100));
+    }
+
+    #[test]
+    fn detailed_proof_quantum_and_q_boundary_do_not_grant_horizon() {
+        for post_q in [false, true] {
+            let proof = ProofSession::test_session();
+            let _pending = proof.test_pending(7, 9, 10);
+            let record = proof_lifecycle(8, 20, DISCOVERY_KIND_EXEC);
+            let mut drain = DiscoveryDrain::over_domain(
+                CursorScript::scripted([discovery_bytes(&record)]),
+                proof.test_discovery_domain(),
+            );
+            drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+            assert_eq!(
+                poll_discovery_to_position(&mut drain, 8, Some(1), |_| ControlFlow::Continue(()))
+                    .unwrap(),
+                (false, true)
+            );
+            assert_eq!(proof.test_horizon(), None);
+            if post_q {
+                drain.source.producer = 16;
+            }
+            assert_eq!(
+                poll_discovery_to_position(&mut drain, 8, Some(1), |_| ControlFlow::Continue(()))
+                    .unwrap(),
+                (post_q, false)
+            );
+            assert_eq!(proof.test_horizon(), if post_q { None } else { Some(100) });
+        }
+    }
+
+    #[test]
+    fn detailed_proof_quiesce_direct_dequeue_invalidates() {
+        let proof = ProofSession::test_session();
+        let pending = proof.test_pending(7, 9, 10);
+        let record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([discovery_bytes(&record)], 1),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Record(_))));
+        assert_eq!(
+            proof.test_problem(pending.id()),
+            Some(TraceProofUnknown::ExecChanged)
+        );
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_horizon(), Some(100));
+    }
+
+    #[test]
+    fn detailed_proof_stage_and_replay_observe_lifecycle_once() {
+        let proof = ProofSession::test_session();
+        let _pending = proof.test_pending(7, 9, 10);
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([vec![0]], 1),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        let mut fifo = ProofSession::test_stage_once(&mut drain);
+        assert_eq!(proof.test_epoch(), 1);
+        assert!(matches!(fifo.pop(), Some(DiscoveryItem::Malformed)));
+        assert_eq!(
+            proof.test_epoch(),
+            1,
+            "replay cannot apply malformed loss twice"
+        );
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_horizon(), Some(100));
+    }
+
+    #[test]
+    fn detailed_proof_disabled_tap_has_no_extra_operations() {
+        let source = CursorScript::scripted([event_bytes(&Event::default())]);
+        let cursor = source.cursor.clone();
+        let mut drain = EventDrain::over(source);
+        let mut seen = 0;
+        drain.poll(Some(2), |_| {
+            assert_eq!(cursor.get(), 0);
+            seen += 1;
+            ControlFlow::Continue(())
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(drain.malformed(), 0);
+        // A counting proof clock/source is never installed and performs zero new operations.
+    }
+    #[test]
+    fn detailed_proof_enabled_root_tail_preserves_callback_cursor_and_error() {
+        for failed_clock in [false, true] {
+            let proof = ProofSession::test_session();
+            let pending = proof.test_pending(7, 9, 10);
+            if failed_clock {
+                proof.test_set_time(u64::MAX);
+            }
+            let source = CursorScript::scripted([event_bytes(&proof_call(7, 20, 11, 0))]);
+            let cursor = source.cursor.clone();
+            let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            let mut tail = OwnedRootTail::new(
+                crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+                Instant::now() + Duration::from_secs(1),
+            );
+            drain.begin_root_tail(&mut tail).unwrap();
+            assert!(
+                drain
+                    .poll_root_tail(&mut tail, 1, |_| {
+                        assert_eq!(cursor.get(), 0);
+                        anyhow::bail!("ordinary callback error")
+                    })
+                    .is_err()
+            );
+            assert_eq!(cursor.get(), 8);
+            assert_eq!(proof.test_horizon(), None);
+            assert_eq!(
+                proof.test_problem(pending.id()),
+                Some(TraceProofUnknown::LifecycleLoss)
+            );
+        }
+    }
+    #[test]
+    fn detailed_proof_disabled_discovery_does_no_new_clock_or_positions() {
+        let proof = ProofSession::test_session();
+        let before = proof.test_clock_calls();
+        let mut drain = DiscoveryDrain::over(CursorScript::scripted([vec![0]]));
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Malformed)));
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_clock_calls(), before);
+        assert_eq!(drain.source.positions_reads.get(), 0);
+        let mut enabled = DiscoveryDrain::over_domain(
+            CursorScript::scripted([vec![0]]),
+            proof.test_discovery_domain(),
+        );
+        enabled
+            .attach_trace_tap(proof.test_discovery_tap())
+            .unwrap();
+        assert!(matches!(enabled.dequeue(), Some(DiscoveryItem::Malformed)));
+        assert!(enabled.dequeue().is_none());
+        assert_eq!(proof.test_clock_calls(), before + 2);
+        assert_eq!(enabled.source.positions_reads.get(), 1);
+    }
+    #[test]
+    fn detailed_proof_bounded_discovery_break_and_busy_never_complete() {
+        let proof = ProofSession::test_session();
+        let seed = proof.test_pending(7, 9, 10);
+        let mut drain = DiscoveryDrain::over_domain(
+            CursorScript::scripted([discovery_bytes(&proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC))]),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        let mut callbacks = 0;
+        assert_eq!(
+            poll_discovery_to_position(&mut drain, 8, None, |_| {
+                callbacks += 1;
+                assert_eq!(
+                    proof.test_problem(seed.id()),
+                    Some(TraceProofUnknown::ExecChanged)
+                );
+                ControlFlow::Break(())
+            })
+            .unwrap(),
+            (false, true)
+        );
+        assert_eq!(callbacks, 1);
+        assert_eq!(proof.test_horizon(), None);
+        assert_eq!(
+            poll_discovery_to_position(&mut drain, 8, None, |_| panic!("already consumed"))
+                .unwrap(),
+            (false, false)
+        );
+        assert_eq!(proof.test_horizon(), Some(100));
+        let other = ProofSession::test_session();
+        let _seed = other.test_pending(7, 9, 10);
+        let mut source = CursorScript::scripted([]);
+        source.producer = 8;
+        let mut busy = DiscoveryDrain::over_domain(source, other.test_discovery_domain());
+        busy.attach_trace_tap(other.test_discovery_tap()).unwrap();
+        assert!(
+            poll_discovery_to_position(&mut busy, 8, None, |_| panic!("reserved head")).is_err()
+        );
+        assert_eq!(other.test_horizon(), None);
+        assert_eq!(other.test_epoch(), 1);
+    }
     fn discovery_bytes(record: &DiscoveryRecord) -> Vec<u8> {
         // SAFETY: the shared repr(C) record is transported as these exact raw
         // bytes by the kernel ring buffer.
@@ -1461,6 +4317,332 @@ mod tests {
         let mut malformed = record;
         malformed.reserved_tail_zero[0] = 1;
         assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
+    }
+
+    /// Version metadata must not filter an acquired legacy prefix or compact
+    /// sparse entries into different ordinals.
+    #[test]
+    fn discovery_decode_keeps_legacy_labels_and_sparse_ordinals() {
+        use p11scope_ebpf_common::DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+
+        for (major, minor) in [(3, 0), (3, 1), (3, 2), (0, 0), (4, 0), (255, 255)] {
+            for populated in [None, Some(0), Some(27), Some(67)] {
+                let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+                record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+                record.pid_tgid = (7u64 << 32) | 7;
+                record.symbol_id = 1;
+                record.table_ptr = 0x1000;
+                record.version_major = major;
+                record.version_minor = minor;
+                record.usable_n = 68;
+                record.completed_prefix = 68;
+                record.pointers_attempted = 68;
+                if let Some(ordinal) = populated {
+                    record.pointers[ordinal] = 0x2000;
+                }
+                let bytes = discovery_bytes(&record);
+                assert_eq!(bytes.len(), 920);
+                let decoded = decode_discovery(&bytes).expect("an acquired legacy prefix");
+                assert_eq!(
+                    (decoded.version_major, decoded.version_minor),
+                    (major, minor)
+                );
+                if let Some(ordinal) = populated {
+                    assert_eq!(decoded.pointers[ordinal], 0x2000);
+                }
+                assert_eq!(
+                    decoded.pointers.iter().filter(|word| **word != 0).count(),
+                    usize::from(populated.is_some())
+                );
+                assert_eq!(decoded.usable_n, 68);
+            }
+        }
+    }
+
+    /// The wire's global capacity does not authorize a legacy getter to emit
+    /// wider snapshots than its own bounded acquisition.
+    #[test]
+    fn discovery_decode_bounds_prefix_by_acquisition_origin() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_KIND_INTERFACE_RETURN, DISCOVERY_NAME_EXACT_STANDARD,
+            DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_V3_2,
+        };
+
+        for (kind, words, expected) in [
+            (DISCOVERY_KIND_FUNCTION_LIST_RETURN, 68, true),
+            (DISCOVERY_KIND_FUNCTION_LIST_RETURN, 69, false),
+            (DISCOVERY_KIND_FUNCTION_LIST_RETURN, 104, false),
+            (DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, 104, true),
+            (DISCOVERY_KIND_INTERFACE_RETURN, 104, true),
+        ] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = kind;
+            record.table_ptr = 0x1000;
+            record.usable_n = words;
+            record.completed_prefix = words;
+            record.pointers_attempted = words;
+            record.pointers[usize::from(words) - 1] = 0x2000;
+            if kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                record.binding_id = 9;
+                record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+                record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                record.selection_version_class = DISCOVERY_VERSION_V3_2;
+            } else {
+                record.symbol_id = 1;
+                record.version_major = 3;
+                record.version_minor = 2;
+                if kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN {
+                    record.symbol_id = 2;
+                    record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                    record.announced_count = 1;
+                }
+            }
+            assert_eq!(
+                decode_discovery(&discovery_bytes(&record)).is_some(),
+                expected,
+                "origin={kind} words={words}"
+            );
+            if kind != DISCOVERY_KIND_FUNCTION_LIST_RETURN {
+                record.pointers_attempted = 105;
+                assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+            }
+        }
+
+        for attempted in [69, 104] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+            record.symbol_id = 1;
+            record.table_ptr = 0x1000;
+            record.usable_n = 68;
+            record.completed_prefix = 68;
+            record.pointers_attempted = attempted;
+            record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+            record.pointers[67] = 0x2000;
+            assert!(
+                decode_discovery(&discovery_bytes(&record)).is_none(),
+                "legacy attempted={attempted} completed=68"
+            );
+        }
+    }
+
+    /// Raw ring decoding must keep a nonempty read-failed prefix and its loss
+    /// flag together instead of rejecting all the successfully acquired words.
+    #[test]
+    fn discovery_decode_keeps_nonempty_failed_read_prefix() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_STATUS_READ_FAILURE,
+        };
+
+        for completed in [1, 3, 67] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+            record.pid_tgid = (7u64 << 32) | 7;
+            record.symbol_id = 1;
+            record.table_ptr = 0x1000;
+            record.version_major = 3;
+            record.version_minor = 2;
+            record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+            record.usable_n = completed;
+            record.completed_prefix = completed;
+            record.pointers_attempted = completed + 1;
+            record.pointers[usize::from(completed) - 1] = 0x2000;
+            let decoded = decode_discovery(&discovery_bytes(&record))
+                .expect("successfully read words survive a failed next-word read");
+            assert_eq!(decoded.status_flags, DISCOVERY_STATUS_READ_FAILURE);
+            assert_eq!(decoded.usable_n, completed);
+            assert_eq!(decoded.completed_prefix, completed);
+            assert_eq!(decoded.pointers_attempted, completed + 1);
+            assert_eq!(decoded.pointers[usize::from(completed) - 1], 0x2000);
+            assert!(
+                decoded.pointers[usize::from(completed)..]
+                    .iter()
+                    .all(|word| *word == 0)
+            );
+
+            record.status_flags = 0;
+            record.pointers_attempted = completed;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_some());
+
+            record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+            record.pointers_attempted = completed + 1;
+            record.usable_n = 0;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+            record.usable_n = completed;
+            record.pointers[usize::from(completed)] = 0x3000;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+    }
+
+    /// A reported 3.2 interface may end after the common 68 words or the
+    /// 3.0-sized 92 words; neither failed extension erases that prefix.
+    #[test]
+    fn discovery_decode_keeps_failed_interface_extensions() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+            DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_V3_2,
+        };
+
+        for kind in [
+            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_KIND_INTERFACE_RETURN,
+        ] {
+            for completed in [68, 92] {
+                let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+                record.kind = kind;
+                record.pid_tgid = (7u64 << 32) | 7;
+                record.table_ptr = 0x1000;
+                record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+                record.usable_n = completed;
+                record.completed_prefix = completed;
+                record.pointers_attempted = completed + 1;
+                record.pointers[usize::from(completed) - 1] = 0x2000;
+                if kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                    record.binding_id = 9;
+                    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+                    record.selection_version_class = DISCOVERY_VERSION_V3_2;
+                } else {
+                    record.symbol_id = 2;
+                    record.announced_count = 1;
+                    record.version_major = 3;
+                    record.version_minor = 2;
+                }
+                let decoded = decode_discovery(&discovery_bytes(&record))
+                    .expect("a readable prefix survives an unreadable interface extension");
+                assert_eq!(decoded.usable_n, completed);
+                assert_eq!(decoded.pointers[usize::from(completed) - 1], 0x2000);
+                assert_eq!(decoded.status_flags, DISCOVERY_STATUS_READ_FAILURE);
+            }
+        }
+    }
+
+    /// A usable prefix does not relabel unknown interface metadata as a known
+    /// version that could qualify for selection authority downstream.
+    #[test]
+    fn discovery_decode_keeps_unknown_interface_version_class() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_INTERFACE_RETURN, DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_VERSION_OTHER,
+        };
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.binding_id = 9;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_OTHER;
+        record.table_ptr = 0x1000;
+        record.usable_n = 68;
+        record.completed_prefix = 68;
+        record.pointers_attempted = 68;
+        record.pointers[67] = 0x2000;
+        let decoded = decode_discovery(&discovery_bytes(&record))
+            .expect("unknown metadata retains the acquired common prefix");
+        assert_eq!(decoded.selection_version_class, DISCOVERY_VERSION_OTHER);
+        assert_eq!(decoded.usable_n, 68);
+        assert_eq!(decoded.pointers[67], 0x2000);
+    }
+
+    /// Partial prefixes do not relax private-hook, field ownership, or raw
+    /// buffer bounds when records cross the actual events decoder.
+    #[test]
+    fn discovery_decode_rejects_malformed_partial_prefix_twins() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_NAME_OTHER, DISCOVERY_STATUS_READ_FAILURE,
+        };
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+        record.symbol_id = 1;
+        record.table_ptr = 0x1000;
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.pointers_attempted = 4;
+        record.completed_prefix = 3;
+        record.usable_n = 3;
+        record.pointers[2] = 0x2000;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_some());
+
+        for mutate in [
+            |value: &mut DiscoveryRecord| value.symbol_id = 0,
+            |value: &mut DiscoveryRecord| value.usable_n = 2,
+            |value: &mut DiscoveryRecord| value.usable_n = 4,
+            |value: &mut DiscoveryRecord| value.pointers_attempted = 2,
+            |value: &mut DiscoveryRecord| value.pointers_attempted = 105,
+            |value: &mut DiscoveryRecord| value.pointers[3] = 0x3000,
+            |value: &mut DiscoveryRecord| value.reserved_zero[0] = 1,
+        ] {
+            let mut malformed = record;
+            mutate(&mut malformed);
+            assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
+        }
+        let bytes = discovery_bytes(&record);
+        assert!(decode_discovery(&bytes[..919]).is_none());
+        let mut oversized = bytes;
+        oversized.push(0);
+        assert!(decode_discovery(&oversized).is_none());
+
+        record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        record.symbol_id = 2;
+        record.name_class = DISCOVERY_NAME_OTHER;
+        record.announced_count = 1;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+    }
+
+    #[test]
+    fn exec_task_decode_keeps_920_byte_transport_and_private_finite_class() {
+        let mut record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);
+        for class in 0..=2 {
+            record.case_id = class;
+            let bytes = discovery_bytes(&record);
+            assert_eq!(bytes.len(), 920);
+            assert_eq!(bytes[865], class);
+            assert_eq!(decode_discovery(&bytes).unwrap().case_id, class);
+            assert!(decode_discovery(&bytes[..919]).is_none());
+            let mut long = bytes;
+            long.push(0);
+            assert!(decode_discovery(&long).is_none());
+        }
+        for class in 3..=u8::MAX {
+            record.case_id = class;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+        record.case_id = 1;
+        for pid_tgid in [0, 7 << 32, (7 << 32) | 8, (1 << 63) | (1 << 31)] {
+            record.pid_tgid = pid_tgid;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+        record.pid_tgid = (7 << 32) | 7;
+        record.reserved_tail_zero[0] = 1;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        record.reserved_tail_zero[0] = 0;
+        record.announced_count = 1;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+    }
+
+    #[test]
+    fn exec_generation_decode_retains_only_the_bounded_private_ticket() {
+        let mut record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);
+        for ticket in [0, 1, p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT] {
+            record.binding_id = ticket;
+            let bytes = discovery_bytes(&record);
+            assert_eq!(bytes.len(), 920);
+            assert_eq!(&bytes[912..920], &ticket.to_ne_bytes());
+            assert_eq!(decode_discovery(&bytes).unwrap().binding_id, ticket);
+            let mut reserved = record;
+            reserved.reserved_zero[0] = 1;
+            assert!(decode_discovery(&discovery_bytes(&reserved)).is_none());
+        }
+        for ticket in [
+            p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT + 1,
+            u64::MAX,
+        ] {
+            record.binding_id = ticket;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+        record.binding_id = 1;
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
     }
 
     /// Regression: one retained reader advances through backlog once, rejects

@@ -22,36 +22,71 @@
 //! inventory facts publish through the same batch boundary the Phase 2
 //! ordering test pins.
 
+use super::inventory::image_guard::{FreshImageGuard, ImageAcquisition};
 use super::inventory::{
-    ExecProof, ImageGuard, InventoryCommit, InventoryDiscoveryConfig, InventoryOwnerLimits,
-    RefreshCause, ScanReceipt,
+    ExecProof, ImageCheck, ImageGuard, InventoryCommit, InventoryDiscoveryConfig,
+    InventoryOwnerLimits, PreflightedReconciliation, RefreshCause, ScanLease, ScanReceipt,
 };
 use super::*;
+#[cfg(test)]
+use crate::attach::capture::ScopeIncarnation;
 use crate::attach::capture::{
-    CallerCountUpdate, DiscoveryBatch, DomainCookie, ExtendReceipt, LifecycleLoss, NativeDomainId,
-    ScopeCustody, ScopeIncarnation, WitnessBatch, WitnessRow,
+    BindingObservation, CallerCountUpdate, CallerImageObservation, CaptureScopeCoverage,
+    CookieQuery, DiscoveryBatch, DomainCookie, ExtendReceipt, LifecycleLoss, NativeDomainId,
+    ReadWindow, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
-    AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleInfo, ModuleKey,
-    PendingCountOutcome, ProcessSource, RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
+    AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
+    CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ImageAuthority,
+    MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection,
+    ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
-    AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
+    AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
-    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
+    BinderLimits, Binding, BoundImage, CurrentBindingCheck, CurrentBindingRequest,
+    CurrentBindingSighting, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
+use crate::inspect_system::inventory_cgroup::{
+    CgroupAdmissionPermit, CgroupCollectRequest, CgroupCollection, CgroupFence,
+    ScopedCollectionOutcome, SharedCollectionWork,
+};
+use crate::inventory_diagnostics::{
+    Decision as DiagnosticDecision, DiagnosticConfig, DiagnosticKind, DiagnosticOutcome,
+    DiagnosticReason, DiagnosticRecord, Eligibility, FinishedDiagnostics, InitError, NativePairKey,
+    ReadOrigin, Recorder,
+};
+use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
+use crate::process::PidPin;
+use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
+use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[path = "inventory_count_eligibility.rs"]
+mod count_eligibility;
+use count_eligibility::{
+    CountOwnership, CurrentCandidates, OwnershipEpoch, OwnershipScan, ReceiptDisposition,
+    ReceiptView, ReceiptWork, RecoveryWorkBudget,
+};
+
+#[path = "inventory_coordinator/leader_exit.rs"]
+mod leader_exit;
+#[path = "inventory_coordinator/metadata.rs"]
+mod metadata;
+#[path = "inventory_coordinator/semantics.rs"]
+pub(crate) mod semantics;
 
 /// What one inventory pass scans: one named process, or the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +125,43 @@ pub(crate) struct BatchReceipt {
     pub registry_applied: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointCommitProgress {
+    Pending,
+    Published(BatchReceipt),
+}
+
+/// Move the existing commit locals intact. Cgroup membership pins, work
+/// charges, event allocation and completion counters survive every Pending
+/// slice; collection.finish runs only at the actual publication boundary.
+struct PublicationCompletion {
+    cgroup: Option<(CgroupCollection, u64)>,
+    events: Vec<CallerEvent>,
+    admitted: usize,
+    scan_callers: usize,
+}
+
+struct PendingJointPublication {
+    completion: PublicationCompletion,
+    cut_barrier: Option<u64>,
+    finish: Option<crate::semantics_objects::journal::joint_driver::CollectedFinishAssociation>,
+    // Moved cgroup allocations keep their original collection/work bounds.
+    // Charge this additional retained inline wrapper before preparation.
+    _storage: crate::semantics_edge::resources::ResourceLease,
+}
+
+/// Delivered after the actual publication boundary. Cg4 must service its
+/// newly available target delta and emit these delayed admission events.
+#[cfg_attr(not(test), allow(dead_code))] // Cg4 consumes completion after commit.
+pub(crate) struct CgroupCompletion {
+    pub(crate) state: CgroupWalkState,
+    pub(crate) outcome: ScopedCollectionOutcome,
+    pub(crate) events: Vec<CallerEvent>,
+    pub(crate) admitted: usize,
+    /// Validated callers in this pass, including already-published same images.
+    pub(crate) scan_callers: usize,
+}
+
 /// Static reason carried when a scan defers past its deadline. The
 /// refresh request stays pending (no commit ran), so the next pass with
 /// a fresh deadline retries the same owner.
@@ -113,21 +185,16 @@ struct AuthorityResolver<'a, Pin> {
 
 impl<Pin> AuthorityResolver<'_, Pin> {
     fn resolve(&mut self, pid: u32) -> ImageAuthority {
-        match self
-            .identity
-            .owner_image(pid)
-            .filter(|image| image.task_cookie != 0)
-        {
+        // An invalid expected image cannot be manufactured, so no numeric
+        // filter remains: `Some` is a genuine open attempt.
+        match self.identity.owner_image(pid) {
             Some(image) => match self
                 .engine
                 .open_inventory_owner(pid, image, &mut *self.guard)
             {
                 Ok(owner) => {
                     self.pending.insert(pid, owner);
-                    ImageAuthority::NativeExact {
-                        task_cookie: image.task_cookie,
-                        exec_id: image.exec_id,
-                    }
+                    ImageAuthority::NativeExact { image }
                 }
                 Err(error) => {
                     self.native_failures.push((pid, format!("{error:#}")));
@@ -146,11 +213,117 @@ impl<Pin> AuthorityResolver<'_, Pin> {
     }
 }
 
+/// One held exec handoff (H6 slice 2): the ended incarnation's identity
+/// and revision, its original held custody, and the native transition
+/// evidence. Minted only by the coordinator's ended-incarnation path
+/// (`apply_exec_transition` via `mint_pending_successor`); committed by
+/// `commit_pending_successor` (or the scoped collection commit) or released
+/// on refusal/stop. Holds no borrowed cgroup permit across async work:
+/// scope proof is borrowed fresh at commit. Move-only: private fields, no
+/// public scalar constructor, `Clone`, `Default`, serialization, or
+/// authority booleans.
+struct PendingExecSuccessor<Pin> {
+    old: CallerId,
+    old_incarnation: u32,
+    pid: u32,
+    custody: crate::discovery::caller_registry::SharedCallerPin<Pin>,
+    /// The exact H0 Arc, when the ended incarnation had accepted Detailed
+    /// custody. It moves with the physical handoff and grants nothing alone.
+    semantic: Option<semantics::SemanticHandoffCustody>,
+    /// Current generation/image reads at mint: commit refuses when they
+    /// moved (a newer image or generation arrived before commit).
+    mint_start: Option<u64>,
+    mint_exe: Option<ExeIdentity>,
+    transition: ExecTransition,
+}
+
+/// Subject of the scope gap staged per unpinnable `--prearm-module`
+/// path (never-stop): the path resolved to no retained object, so it
+/// carries no `prearm[]` row; the gap's reason names it as
+/// `{operator path}: {pin cause}`. Inventory has no PARTIAL verdict —
+/// `gaps[]` is the incompleteness signal.
+pub(crate) const PREARM_UNAVAILABLE_SUBJECT: &str = "inventory prearm input unavailable";
+
+/// One `--prearm-module` input's assembled report row: operator spelling
+/// plus file identity, whether any scope member maps it, and the 6.13
+/// interval keys (`watch`, `attached_at_ns`, `unobserved_windows`) merged
+/// from this lane's own attach stamps. The presentation builder renders one
+/// JSON row per input from these, in flag order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PrearmReportRow {
+    /// Normalized operator spelling: messages and the module path only,
+    /// never identity.
+    pub path: String,
+    pub dev: (u64, u64),
+    pub ino: u64,
+    /// Whole-file digest of the retained pin, `None` when unproven.
+    pub sha256: Option<String>,
+    /// Whether any registry module record names this object (observed mapped
+    /// by a scope member during the capture; records are never removed).
+    pub mapped: bool,
+    /// The watch interval; `None` only when the input resolved to no
+    /// retained object (defensive: retained pins always resolve).
+    pub watch: Option<crate::render::PrearmWatch>,
+    /// Declared-set attach instant (`None` renders null): the max over the
+    /// declared set's real stamps, only when every member carries one.
+    pub attached_at_ns: Option<u64>,
+    /// Explicit unobserved intervals; absent when undisclosed (never-mapped
+    /// pre-arm, unattached modules). An explicitly empty list reads as
+    /// exact only with an R2-D1-6 proof (no producer in this packet, so
+    /// attached modules always disclose their window).
+    pub unobserved_windows: Option<Vec<crate::render::UnobservedWindow>>,
+}
+
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
 /// catalog's Inventory lowering feeds every pass.
 pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     engine: Engine,
+    /// Whether the last collected-Finish service call progressed the
+    /// Engine. The Joint discovery loop reads it to distinguish graph
+    /// progress without records from an idle credit.
+    collected_finish_progressed: bool,
+    /// Promotion Finish (OD-11): drain and discard instead of servicing the
+    /// shared Engine. Set for exactly one coordinator before its Finish.
+    promotion_finish: bool,
+    /// Records discarded by the promotion route (diagnostics).
+    promotion_records_discarded: u64,
+    /// Calls into `service_collected_finish_records_with` (test count).
+    #[cfg(test)]
+    engine_collected_finish_calls: u64,
+    /// Semantic preparation remains independent of broad count admission.
+    semantic_inputs: semantics::SemanticInputs,
+    /// Explicit count inputs enter the catalog's one plan before admission.
+    count_manifests: Vec<PathBuf>,
+    /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
+    /// validation, pin and held-FD custody for supported auto/native
+    /// Inventory capture. Proved offsets lower into the run's attach set
+    /// through [`Self::absorb_prearm_plan`].
+    prearm: Option<crate::discovery::identity::PrearmPinning>,
+    /// The retained pre-arm pins' object/byte usage (packet 6.13 round-3,
+    /// finding 3): manifests pin after pre-arm in inventory, so both the
+    /// semantic and the count readers charge this usage against the one
+    /// shared capture-level manifest+pre-arm budget.
+    prearm_prior: (usize, u64),
+    /// Pre-arm watch state: one watch per pre-armed object over its frozen
+    /// declared proved set, armed from the lane's own attach receipts.
+    /// Reuses `PrearmState`, never a forked machine.
+    prearm_state: crate::prearm_module::PrearmState,
+    /// The capture's scope start for pre-arm window bounds: the run start,
+    /// never absorb time (which would understate the unobserved outer
+    /// bound). Set by [`Self::absorb_prearm_plan`].
+    prearm_scope_start_ns: Option<u64>,
+    /// Declared pre-arm keys (prearm-pin id space) to the attach-set
+    /// endpoint ids their absorb minted: how receipt stamps address
+    /// watches. Populated by [`Self::absorb_prearm_plan`].
+    prearm_endpoints: BTreeMap<crate::plan::AttachKey, EndpointId>,
+    /// Frozen pre-arm stop boundary: set once, first wins, by
+    /// `end_capture_coverage` (native lane) or `freeze_prearm_stop`
+    /// (scan/no-lane path). `None` means not yet frozen (the terminal
+    /// close uses its passed instant); `Some(bound)` is frozen, with a
+    /// `None` bound meaning the stop instant is unknown (the blind tail
+    /// is never backfilled).
+    prearm_stop: Option<Option<u64>>,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -164,11 +337,51 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
+    /// Accepted semantic caller bindings (H3 Task 3): one stable custody
+    /// Arc per accepted caller, owned by the coordinator semantic child.
+    semantic_bindings: semantics::SemanticBindingSet,
+    /// Every H0-position-bearing finalizer field belongs to one Session.
+    /// A different live lane cannot consume, overwrite or acknowledge it.
+    semantic_finalizer: Option<semantics::SessionFinalizerState>,
+    /// The capture's joint owner: the one journal adapter (with its
+    /// move-only reservation ledger) plus the one object model (with its
+    /// retained history). Every ledger-bearing publication below borrows
+    /// the adapter's ledger. Parked/active transfer moves the whole
+    /// owner by value.
+    /// Deviation record (F3): the progress note says "Session-owned
+    /// adapter", but the owner lives here because commit_batch_inner
+    /// has no Session handle (precedents: CallerAdapter, the binder,
+    /// the semantic finalizer). The parked/active transfer design must
+    /// define owner replace/reset semantics; no transfer runs here.
+    joint_capture: crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    joint_publication: Option<PendingJointPublication>,
+    #[cfg(test)]
+    refuse_joint_finish_publication_once: bool,
+    /// Optional hints retain only their own identity-qualified source state.
+    /// They do not supply Inventory, H0 or Detailed admission authority.
+    caller_metadata: Option<crate::caller_metadata::runtime::job::MetadataLane>,
+    /// Detailed domains whose semantic authority ended permanently
+    /// (cut/writeback/counter failure): new batches refuse, broad
+    /// Inventory continues.
+    refused_semantic_domains: HashSet<NativeDomainId>,
+    /// Pending physical adjudication (H3 Task 3): one marker per live
+    /// caller whose unscanned placeholder waits for the commit tail.
+    /// Bounded by the caller budget; drained every commit.
+    pending_adjudication: BTreeMap<CallerId, u32>,
+    /// Callers with genuine physical uncertainty this publication
+    /// (unscanned members, incomplete absences): the tail-gap source.
+    tail_uncertain: BTreeSet<CallerId>,
+    /// Callers with complete same-custody caller/provider/full-image
+    /// proof this publication: the suppression source.
+    complete_scanned: BTreeSet<CallerId>,
+    /// Latest observed exec per Detailed ticket: H0-association proof
+    /// for gap minting, keyed conservatively for refusal.
+    proven_images: HashMap<(NativeDomainId, u64), u64>,
     /// The latest known count per witnessed pair (C7 C4): first-sight
     /// and refresh counts merge here (the maximum wins, with its
     /// observing read) and stage to the edge once the pair binds. One
     /// entry per CALLER_USE row at most.
-    pair_counts: HashMap<PairKey, PairCount>,
+    pair_counts: HashMap<PairKey, HeldPairCount>,
     /// Decided pairs (C7 C4): bound pairs stage their counts to one
     /// edge, dropped pairs (binder-unbound, ambiguous, or edgeless)
     /// never publish — DR-C51-PREADMIT stays out. One entry per
@@ -177,11 +390,56 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Outstanding publication-time count placements (P3): each staged
     /// pending count's opaque handle back to its pair. Drained with the
     /// publication's decisions; one entry per staged pending count.
-    pending_ids: HashMap<u64, PairKey>,
+    pending_ids: HashMap<u64, PendingCountObservation>,
+    placement_generations: HashMap<PairKey, Option<u64>>,
+    count_ownership: CountOwnership,
+    recoveries: HashMap<PairKey, PairRecovery>,
+    recovery_order: Vec<PairKey>,
+    recovery_cursor: usize,
     /// The next pending-count handle (P3): minted in staging order.
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
+    /// Held exec handoffs (H6 slice 2): at most one per ended caller, keyed
+    /// by it — no new unbounded table, one entry per retired caller
+    /// reservation at most. Unscoped handoffs commit immediately; scoped
+    /// ones wait for a fresh collection transaction.
+    pending_successors: BTreeMap<CallerId, PendingExecSuccessor<Source::Pin>>,
+    /// Leader exits already recorded as link loss (H6 slice 2): one entry
+    /// per incarnation at most, never cleared (IDs never reuse).
+    leader_link_loss_noted: BTreeSet<CallerId>,
+    pending_leader_exits: BTreeMap<CallerId, leader_exit::PendingLeaderExit<Source::Pin>>,
+    leader_exit_cursor: Option<CallerId>,
+    /// Whether BPF hook timestamps and observer admission stamps share
+    /// a clock (F7): `bpf_ktime_get_ns` is never time-namespace
+    /// offset, while the observer's `CLOCK_MONOTONIC` is. The stale
+    /// exit guard only orders the two when this holds; otherwise exits
+    /// record unfiltered and one gap says so. Read once per
+    /// coordinator: the decision is immutable for the process.
+    exit_clocks_comparable: bool,
+    /// The unvalidated-clocks gap was already noted once.
+    exit_clock_gap_noted: bool,
+    /// Retirements already staged in the registry (H6 slice 2): held
+    /// handoffs report the old incarnation at mint and again at commit;
+    /// the second report binds owners without restaging the retirement.
+    /// One entry per retired caller at most, never cleared.
+    staged_retirements: BTreeSet<CallerId>,
+    /// Coordinator stop (H6 slice 2): set once, never cleared. No new scan,
+    /// attach, successor/name admission, or retry starts afterwards; staged
+    /// facts still drain through `commit_batch`.
+    stopped: bool,
+    /// Distinct pids with EXEC hooks that drained since the last
+    /// completed scan pass (`apply_catalog` clears): the post-pass
+    /// newcomers the terminal disclosure names. Arrival order, not hook
+    /// stamps, so no clock comparison is needed. Cgroup scope never
+    /// inserts (transaction coverage, not scan passes).
+    post_pass_exec_newcomers: BTreeSet<u32>,
+    /// At least one scan pass completed: the terminal disclosure reads
+    /// against the last completed scan, never a zero-pass run.
+    completed_scan_pass: bool,
+    cgroup_fence: CgroupFence,
+    pending_cgroup: Option<(CgroupCollection, u64)>,
+    completed_cgroup: Option<CgroupCompletion>,
     scanned_owners: BTreeSet<ProcessViewId>,
     churned_owners: BTreeSet<ProcessViewId>,
     next_window: u64,
@@ -191,15 +449,17 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// drain reported. Timings telemetry only (the stage-timings pass
     /// lines), never schema.
     lifecycle_high_water_bytes: Option<u64>,
+    diagnostics: Option<Recorder>,
+    diagnostic_health: Option<u16>,
+    diagnostic_refresh_loss: bool,
+    diagnostic_native_unavailable: bool,
+    /// A capture failure was staged (`inventory capture failed` gap): the
+    /// pre-arm terminal cause reads `Stop` (6.13 maps errors to stop), never
+    /// a deadline `ScopeEnd`. Set by `note_scope_gap` on that pinned subject.
+    capture_failed: bool,
 }
 
-/// The capture-lifetime Inventory endpoint budget: the engine's admission
-/// policy and the attach set's bound are this one value.
-fn default_inventory_budget() -> Result<InventoryBudget> {
-    InventoryBudget::new(4096, 4096 * 8).map_err(anyhow::Error::msg)
-}
-
-fn default_inventory_config() -> Result<InventoryDiscoveryConfig> {
+fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscoveryConfig> {
     let window = InventoryWindowLimits::new(16 << 20, 1 << 20, 4096, 32768, 4096)
         .map_err(anyhow::Error::msg)?;
     let retained = InventoryRetainedLimits::new(8192, 32768, 8192, 128, 128, 16 << 20)
@@ -209,42 +469,341 @@ fn default_inventory_config() -> Result<InventoryDiscoveryConfig> {
     Ok(InventoryDiscoveryConfig::new(
         work,
         InventoryOwnerLimits::new(1024, 8, 32768).map_err(anyhow::Error::msg)?,
-        default_inventory_budget()?,
+        endpoint_budget,
     ))
 }
 
+/// Whether BPF `hook_ts_ns` (kernel ktime, never time-namespace
+/// offset) and the observer's admission stamps (`CLOCK_MONOTONIC`,
+/// offset under a time namespace) share a clock (F7). The observer
+/// can run under a time namespace in practice: the privileged
+/// operator can launch it via `unshare --time`, and a container can
+/// opt into one — in both cases a nonzero offset breaks direct
+/// comparison, and a positive offset would suppress genuine exits.
+/// The exact condition is a zero monotonic offset in this process's
+/// ACTIVE time namespace, whatever namespace that is (comparing
+/// against PID 1 would miss a container-wide offset and fails under
+/// restricted `/proc` views). `/proc/self/timens_offsets` exposes
+/// `time_ns_for_children` (see `proc_timens_show_offsets` in
+/// kernel/time/namespace.c), while the observer's clock uses its
+/// active namespace; when `/proc/self/ns/time` and
+/// `/proc/self/ns/time_for_children` differ, the offsets do not
+/// describe the active namespace and the clocks are incomparable
+/// (man time_namespaces). Anything unreadable or unparseable is an
+/// unknown offset, never comparable: the stale-exit guard then stays
+/// off and exits record unfiltered, so genuine exits are never
+/// silently suppressed.
+fn exit_clocks_comparable() -> bool {
+    crate::attach::clock_origins_comparable()
+}
+
+#[cfg(test)]
+fn exit_clocks_comparable_with(
+    active: Option<&std::path::PathBuf>,
+    children: Option<&std::path::PathBuf>,
+    offsets: Option<&str>,
+) -> bool {
+    crate::attach::clock_origins_comparable_with(active, children, offsets)
+}
+
+/// One staged native owner: all preparation I/O (fresh observation,
+/// warm view, guarded scan, prepared reconciliation, pin preflight)
+/// complete before the final membership sample, awaiting the
+/// permit-backed commit. Owns its evidence; the commit judges it
+/// through the real invoked paths and either activates or releases
+/// everything.
+struct StagedNativeOwner {
+    caller: CallerId,
+    pid: u32,
+    generation: crate::inspect_system::MemberGeneration,
+    expected: BoundImage,
+    observation: CallerImageObservation,
+    original: Arc<PidPin>,
+    owner: ProcessViewId,
+    lease: ScanLease,
+    preflighted: PreflightedReconciliation,
+}
+
+/// Pure commit-time image guard: replays the preparation's stored
+/// observation through the real binding comparison. No new I/O — the
+/// commit stays bounded pure work — and no copied bools: authority is
+/// computed here from evidence on every invocation.
+struct ReplayImageGuard {
+    original: Arc<PidPin>,
+    observation: CallerImageObservation,
+}
+
+impl ImageGuard for ReplayImageGuard {
+    fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
+        if !view.still_the_same() {
+            return ImageCheck::Unavailable;
+        }
+        if !Arc::ptr_eq(view.retained_pin_arc(), &self.original) {
+            return ImageCheck::Unavailable;
+        }
+        match expected.compare_observation(&self.original, &self.observation) {
+            BindingObservation::Match => ImageCheck::Exact,
+            BindingObservation::DifferentImage => ImageCheck::Changed,
+            BindingObservation::Unavailable => ImageCheck::Unavailable,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod scoped_commit_gate_test {
+    //! Observer for the scoped owner commit's decision points: the
+    //! transaction-outcome gate sample and the later per-member
+    //! permit/proof checks. Twins install a closure that lands an
+    //! external event (member death, operator stop) at one exact
+    //! phase, deterministically reproducing interleavings that
+    //! otherwise need a debugger. Notifications fire only where
+    //! `notify` is called under `cfg(test)`; production builds
+    //! contain neither the module nor the calls.
+
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Phase {
+        /// The pre-loop transaction outcome was just sampled.
+        GateSampled,
+        /// One staged refresh's final-sample permit was just polled.
+        RefreshPermitPolled,
+        /// One staged refresh's permit proof just validated.
+        RefreshProofValidated,
+    }
+
+    type Observer = Box<dyn FnMut(Phase)>;
+
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+    }
+
+    struct Restore(Option<Observer>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| *observer.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Run `action` with `observer(phase)` notified at every
+    /// scoped-commit decision point.
+    pub(crate) fn observe<T>(
+        observer: impl FnMut(Phase) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+        action()
+    }
+
+    pub(super) fn notify(phase: Phase) {
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(phase);
+            }
+        });
+    }
+}
+
+/// At most four staged owner preparations per publication (mirrors the
+/// semantic-preparation bound): activation stays bounded work.
+const SCOPED_OWNER_PREPARATION_ATTEMPTS: usize = 4;
+
+/// Interim one-owner-per-transaction gate: preparations share one
+/// committed snapshot and each commit replaces the whole engine
+/// state, so at most one staged owner may commit per transaction;
+/// further permitted members defer deterministically to a later
+/// pass with their staged state released. Activations and refreshes
+/// share this budget, activations first.
+const SCOPED_OWNER_COMMITS_PER_TRANSACTION: usize = 1;
+
+/// Standing handle-less disclosure: emitted on every cgroup pass
+/// committed without an active image-acquisition handle, with no
+/// caller, module, pid, or budget. The installed consumer
+/// recognizes exactly this subject and reason under its controlled
+/// scope/event proof; the superseded deferral subject remains
+/// recognized for old reports only and never emits here.
+const NATIVE_OWNER_UNAVAILABLE_SUBJECT: &str = "native owner activation unavailable";
+const NATIVE_OWNER_UNAVAILABLE_REASON: &str =
+    "no image acquisition handle is installed; scan-pinned fallback retained";
+
+/// Suspend disposition for a live caller absent from the complete
+/// transaction: authority cancelled, owner released.
+const NATIVE_OWNER_SUSPENDED_ABSENT_REASON: &str = "the caller was absent from the complete cgroup transaction; its native owner was released and scan-pinned fallback retained";
+/// Suspend disposition for a retired caller: no authority step, the
+/// owner simply releases.
+const NATIVE_OWNER_SUSPENDED_RETIRED_REASON: &str =
+    "the caller retired; its native owner was released";
+/// Suspend disposition for a live caller whose image changed:
+/// authority cancelled ahead of the release.
+const NATIVE_OWNER_SUSPENDED_EXEC_REASON: &str = "the caller's image changed; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
+/// Suspend disposition for a caller admitted by the transaction
+/// whose later permit/proof check failed while the transaction
+/// stayed complete: its admission standing is withdrawn and the
+/// owner releases in the same pass.
+const NATIVE_OWNER_SUSPENDED_LOST_REASON: &str = "the caller failed its final permit proof after admission; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
+
+/// Collapse per-view `--module` hint-miss notes into per-pass scope misses.
+///
+/// Every deep-scanned view reports each hint it does not map, so hints by
+/// views notes reach the registry: at system scale (121 hints, ~475 views)
+/// that drowns the gap store (~49k suppressed gaps) and hides real loss. A
+/// hint the scan matched in any hint-examining view — or that maps identity
+/// attributed to a catalog object — is mapped: its miss notes are noise and
+/// drop. A hint missed everywhere is owed one pid-less scope answer. Match
+/// state comes from this pass's own notes and statuses, never from
+/// re-statting hints (fd and maps device domains must not be compared).
+/// Silence is a match only for views that evaluated hints: kernel threads
+/// and refused-initial scans are inventoried but hint-silent, so they
+/// never appear in `examining`.
+fn collapse_hint_misses(
+    examining: &BTreeSet<u32>,
+    object_paths: &BTreeSet<&str>,
+    notes: &[crate::inspect_system::PidGap],
+) -> Vec<crate::inspect_system::PidGap> {
+    let mut missed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+    let mut kept: Vec<crate::inspect_system::PidGap> = Vec::with_capacity(notes.len());
+    for note in notes {
+        if note.reason == crate::discovery::scan::HINT_NOT_MAPPED_REASON
+            && let Some(pid) = note.pid
+        {
+            missed.entry(note.subject.as_str()).or_default().insert(pid);
+        } else {
+            kept.push(note.clone());
+        }
+    }
+    for (subject, pids) in missed {
+        let matched =
+            object_paths.contains(subject) || examining.iter().any(|pid| !pids.contains(pid));
+        if !matched {
+            kept.push(crate::inspect_system::PidGap {
+                pid: None,
+                subject: subject.into(),
+                reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.into(),
+                generic: false,
+            });
+        }
+    }
+    kept
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    // Retain the default constructor for existing internal harness callers;
+    // the public runtime always supplies its already-resolved budget.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         scope: Scope,
         hooks: HookRegistry,
         hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
         source: Source,
         registry_limits: RegistryLimits,
     ) -> Result<Self> {
-        let mut adapter = CallerAdapter::new(source);
+        Self::new_with_budget(
+            scope,
+            hooks,
+            hints,
+            excludes,
+            source,
+            registry_limits,
+            crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
+        )
+    }
+
+    /// One immutable endpoint policy for engine admission, catalog lowering,
+    /// the append-only attach set, and subsequent native preparation.
+    pub(crate) fn new_with_budget(
+        scope: Scope,
+        hooks: HookRegistry,
+        hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
+        source: Source,
+        registry_limits: RegistryLimits,
+        endpoint_budget: InventoryBudget,
+    ) -> Result<Self> {
+        let registry = CallerRegistry::new(registry_limits);
+        let joint_capture = crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
+            crate::semantics_objects::journal::JournalLimits::policy(),
+            registry.semantic_storage_reserver(),
+        );
+        let mut adapter = CallerAdapter::new(source, registry.semantic_storage_reserver());
         // One caller budget, enforced where incarnations are minted; the
         // registry's caller cap stands behind it as a backstop.
         adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
-            engine: Engine::inventory(default_inventory_config()?, scope, hooks, hints)?,
+            engine: Engine::inventory(
+                inventory_config(endpoint_budget)?,
+                scope,
+                hooks,
+                hints,
+                excludes,
+            )?,
+            collected_finish_progressed: false,
+            promotion_finish: false,
+            promotion_records_discarded: 0,
+            #[cfg(test)]
+            engine_collected_finish_calls: 0,
+            semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
+            count_manifests: Vec::new(),
+            prearm: None,
+            prearm_prior: (0, 0),
+            prearm_state: crate::prearm_module::PrearmState::empty(),
+            prearm_scope_start_ns: None,
+            prearm_endpoints: BTreeMap::new(),
+            prearm_stop: None,
             adapter,
-            registry: CallerRegistry::new(registry_limits),
-            attach_set: InventoryAttachSet::new(default_inventory_budget()?),
+            registry,
+            attach_set: InventoryAttachSet::new(endpoint_budget),
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
+            semantic_bindings: semantics::SemanticBindingSet::new(),
+            semantic_finalizer: None,
+            joint_capture,
+            joint_publication: None,
+            #[cfg(test)]
+            refuse_joint_finish_publication_once: false,
+            caller_metadata: None,
+            refused_semantic_domains: HashSet::new(),
+            pending_adjudication: BTreeMap::new(),
+            tail_uncertain: BTreeSet::new(),
+            complete_scanned: BTreeSet::new(),
+            proven_images: HashMap::new(),
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             pending_ids: HashMap::new(),
+            placement_generations: HashMap::new(),
+            count_ownership: CountOwnership::new(registry_limits),
+            recoveries: HashMap::new(),
+            recovery_order: Vec::new(),
+            recovery_cursor: 0,
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
+            pending_successors: BTreeMap::new(),
+            leader_link_loss_noted: BTreeSet::new(),
+            pending_leader_exits: BTreeMap::new(),
+            leader_exit_cursor: None,
+            exit_clocks_comparable: exit_clocks_comparable(),
+            exit_clock_gap_noted: false,
+            staged_retirements: BTreeSet::new(),
+            stopped: false,
+            post_pass_exec_newcomers: BTreeSet::new(),
+            completed_scan_pass: false,
+            cgroup_fence: CgroupFence::default(),
+            pending_cgroup: None,
+            completed_cgroup: None,
             scanned_owners: BTreeSet::new(),
             churned_owners: BTreeSet::new(),
             next_window: 0,
             passes: 0,
             authority_gap_recorded: false,
             lifecycle_high_water_bytes: None,
+            diagnostics: None,
+            diagnostic_health: None,
+            diagnostic_refresh_loss: false,
+            diagnostic_native_unavailable: false,
+            capture_failed: false,
         })
     }
 
@@ -252,6 +811,1140 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// pass lines. `None` until a native drain stages (the scan lane).
     pub(crate) fn lifecycle_high_water_bytes(&self) -> Option<u64> {
         self.lifecycle_high_water_bytes
+    }
+
+    pub(crate) fn set_manifests(&mut self, manifests: Vec<PathBuf>) {
+        self.count_manifests = manifests.clone();
+        self.semantic_inputs = semantics::SemanticInputs::new(manifests);
+        // A fresh input set keeps the retained pre-arm charge whatever the
+        // setter order is.
+        let (objects, bytes) = self.prearm_prior;
+        self.semantic_inputs.set_prearm_prior(objects, bytes);
+    }
+
+    /// Retains an already-validated `--prearm-module` pinning for the run's
+    /// lifetime (F5). The pins hold their FDs until the coordinator drops.
+    /// Their object/byte usage is also the manifest-side prior (packet 6.13
+    /// round-3, finding 3): semantic and count readers charge it against
+    /// the one shared capture-level budget.
+    pub(crate) fn set_prearm_pinning(
+        &mut self,
+        pinning: crate::discovery::identity::PrearmPinning,
+    ) {
+        let usage = (
+            pinning.pins.pinned().count(),
+            pinning.pins.pinned_object_bytes(),
+        );
+        self.prearm_prior = usage;
+        self.semantic_inputs.set_prearm_prior(usage.0, usage.1);
+        // Never-stop: each unpinnable path publishes one scope gap while
+        // good pins continue. Staged at retention, before the first
+        // commit, so the first pass already carries it (like the plan
+        // refusals `absorb_prearm_plan` stages below).
+        for skip in &pinning.skipped {
+            self.note_scope_gap(
+                PREARM_UNAVAILABLE_SUBJECT.to_string(),
+                format!("{}: {}", skip.subject, skip.reason),
+            );
+        }
+        self.prearm = Some(pinning);
+    }
+
+    /// Lowers the retained `--prearm-module` pinning into the run's attach
+    /// set: resolves proved-offset pieces fresh against the
+    /// retained pins (never a stale id), builds a prearm-only plan under
+    /// the run's own Inventory budget through the shared merge, and absorbs
+    /// it. Called before passes, so operator intent wins budget ties; the
+    /// budget itself is unchanged and refusals name it as today. Creates
+    /// one watch per pre-armed object over its frozen declared set and
+    /// records the scope start for window bounds. No-op without retained
+    /// pinning. Entry-only, retained-FD, count-only: capture attaches the
+    /// absorbed delta through the existing facade like every other delta.
+    pub(crate) fn absorb_prearm_plan(&mut self, scope_start_ns: u64) {
+        let Some(prearm) = self.prearm.as_ref() else {
+            return;
+        };
+        let pins = prearm.pins.clone();
+        let pieces: Vec<crate::plan::PrearmPlanPiece> = prearm
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                pins.id_for_prearm(input.key, &input.path).map(|object| {
+                    crate::plan::PrearmPlanPiece {
+                        object,
+                        key: input.key,
+                        path: input.path.clone(),
+                        proved: input.proved.clone(),
+                        non_executable: input.non_executable.clone(),
+                    }
+                })
+            })
+            .collect();
+        let declared = crate::plan::operator_target_keys(&[], &pieces, &pins);
+        let plan = crate::plan::build_from_sources_for_policy_scoped_with_prearm(
+            &[],
+            &[],
+            &pieces,
+            &pins,
+            crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget()),
+            crate::plan::AdmissionScope::Shared,
+        );
+        let absorbed = self.attach_set.absorb(&plan, &pins);
+        // Declared-key → endpoint-id map, before the delta joins the pending
+        // targets: match the fresh endpoints by (retained identity, offset),
+        // indexed by offset so the per-endpoint scan stays small.
+        let mut by_offset: BTreeMap<u64, Vec<crate::plan::AttachKey>> = BTreeMap::new();
+        for key in declared.values().flatten() {
+            by_offset.entry(key.file_offset).or_default().push(*key);
+        }
+        for endpoint in &absorbed.delta.endpoints {
+            let (Some(target), Some(keys)) = (
+                self.attach_set.target(endpoint.object),
+                by_offset.get(&endpoint.file_offset),
+            ) else {
+                continue;
+            };
+            for key in keys {
+                if target.same_object_as(&pins, key.object) {
+                    self.prearm_endpoints.insert(*key, endpoint.id);
+                }
+            }
+        }
+        self.record_absorbed(absorbed);
+        self.prearm_scope_start_ns = Some(scope_start_ns);
+        // Plan-level refusals never reach the attach set as modules (the
+        // set still verdicts them refused), but the operator declaration
+        // stands: disclose each by name with the run's refusal vocabulary
+        // and keep its declared watch over zero linked endpoints. The
+        // synthetic summaries below carry only the refused objects through
+        // `create_watches`, which reads just `.object`; the sentinel id is
+        // never rendered.
+        let mut refused_watches: Vec<crate::plan::ModuleSummary> = Vec::new();
+        for (object, skipped) in plan.refused_modules() {
+            let piece = pieces.iter().find(|piece| piece.object == object);
+            let path = piece.map_or("<unresolved pre-arm object>", |piece| piece.path.as_str());
+            let proved = piece.map_or(0, |piece| piece.proved.len());
+            self.note_scope_gap(
+                crate::discovery::inventory_attach_set::REFUSED_SUBJECT.to_string(),
+                format!(
+                    "{path}: the inventory plan refused {proved} proved offsets ({})",
+                    skipped.reason
+                ),
+            );
+            if let Some(piece) = piece {
+                refused_watches.push(crate::plan::ModuleSummary {
+                    id: crate::plan::ModuleId(u32::MAX),
+                    object,
+                    key: piece.key,
+                    path: piece.path.clone(),
+                    tables: Vec::new(),
+                    interfaces: 0,
+                    source: "prearm",
+                    corroborated: false,
+                    skipped: Vec::new(),
+                });
+            }
+        }
+        let mut watched = plan.modules.clone();
+        watched.extend(refused_watches);
+        self.prearm_state.create_watches(&watched, &declared, &pins);
+    }
+
+    /// Freezes the pre-arm stop boundary for runs without native coverage
+    /// (scan lane, failed startup): the terminal close uses this instead of
+    /// a later publication read. First wins: a native `end_capture_coverage`
+    /// freeze (if any) stands. A `None` bound means the stop instant is
+    /// unknown: the blind tail is never backfilled.
+    pub(crate) fn freeze_prearm_stop(&mut self, stop_ns: Option<u64>) {
+        self.prearm_stop.get_or_insert(stop_ns);
+    }
+
+    /// Re-runs per-object held-fd checks on pre-arm watched objects and
+    /// publishes fresh `pinned_object_changed` brackets (R2-D1-8). Returns
+    /// the newly changed object ids (sticky: already-reported objects are
+    /// not returned again). A newly detected change also stages the run's
+    /// changed-identity gap: the global disclosure beside the per-module
+    /// bracket. An `fstat` failure records nothing here — the attach path's
+    /// global check is the backstop that surfaces it. Tests only: production
+    /// closes through `finish_prearm_watches`, which threads the unknown-stop
+    /// flag.
+    #[cfg(test)]
+    pub(crate) fn refresh_prearm_object_changes(
+        &mut self,
+    ) -> Vec<crate::discovery::identity::PinnedObjectId> {
+        self.refresh_prearm_object_changes_inner(false)
+    }
+
+    /// Terminal refresh under a possibly unknown stop: when `unknown_stop`
+    /// the detection ran in the blind tail after the stop, so the bracket
+    /// stays exact but the coverage end stays unknown.
+    fn refresh_prearm_object_changes_inner(
+        &mut self,
+        unknown_stop: bool,
+    ) -> Vec<crate::discovery::identity::PinnedObjectId> {
+        let Some(prearm) = self.prearm.as_ref() else {
+            return Vec::new();
+        };
+        let ids: Vec<crate::discovery::identity::PinnedObjectId> =
+            self.prearm_state.watches().keys().copied().collect();
+        let mut newly = Vec::new();
+        let mut gap_reasons = Vec::new();
+        for id in ids {
+            match prearm.pins.check_object_unchanged(id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let bracket = prearm.pins.change_bracket(id);
+                    if let Some(watch) = self.prearm_state.get_mut(id) {
+                        let was_ended = watch.is_ended();
+                        match bracket {
+                            Some(bracket) if unknown_stop => {
+                                watch.note_object_changed_unknown_stop(bracket)
+                            }
+                            Some(bracket) => watch.note_object_changed(bracket),
+                            // Detected but the clock never yielded the
+                            // bounds: the end is still disclosed, only its
+                            // instants are not. Under an unknown stop the
+                            // terminal detection ran in the blind tail:
+                            // disclose the end, never a bound past it.
+                            None => watch.end(
+                                crate::render::PrearmWatchEnd::ObjectChanged,
+                                if unknown_stop {
+                                    None
+                                } else {
+                                    crate::attach::monotonic_ns()
+                                },
+                            ),
+                        }
+                        if !was_ended {
+                            newly.push(id);
+                            gap_reasons.push(Self::changed_prearm_gap_reason(&prearm.pins, id));
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        for reason in gap_reasons {
+            self.note_scope_gap(
+                crate::discovery::inventory_attach_set::CHANGED_SUBJECT.to_string(),
+                reason,
+            );
+        }
+        newly
+    }
+
+    /// Current declared-link facts per pre-armed object from the lane's own
+    /// attach stamps: how the terminal close re-evaluates arming and link
+    /// liveness. A missing stamp reads unlinked (partial attachment stays
+    /// unarmed; a lost link truncates).
+    fn prearm_links_by_object(
+        &self,
+    ) -> BTreeMap<crate::discovery::identity::PinnedObjectId, Vec<crate::prearm_module::DeclaredLink>>
+    {
+        let mut links_by_object: BTreeMap<
+            crate::discovery::identity::PinnedObjectId,
+            Vec<crate::prearm_module::DeclaredLink>,
+        > = BTreeMap::new();
+        let Some(capture) = self.capture.as_ref() else {
+            return links_by_object;
+        };
+        for (key, id) in &self.prearm_endpoints {
+            let stamped = capture.attached_at.get(id).copied();
+            links_by_object.entry(key.object).or_default().push(
+                crate::prearm_module::DeclaredLink {
+                    key: *key,
+                    linked: stamped.is_some(),
+                    stamped_at: stamped,
+                },
+            );
+        }
+        links_by_object
+    }
+
+    /// Terminal pre-arm close: final link evaluation, a last held-fd refresh
+    /// (a change detected here ends its watch with the exact bracket),
+    /// health truncation at the last proven-clean bound, then every watch
+    /// ends for `cause` exactly once, clamped to the frozen first stop. The
+    /// frozen boundary (`end_capture_coverage` or `freeze_prearm_stop`) wins
+    /// over the passed instant, so the published interval excludes the blind
+    /// tail past the detach. A `None` boundary means the stop instant is
+    /// unknown: coverage ends stay unknown. The run loop stages this before
+    /// its final commit; the final view reads the rows directly.
+    pub(crate) fn finish_prearm_watches(
+        &mut self,
+        cause: crate::render::PrearmWatchEnd,
+        now: Option<u64>,
+    ) {
+        if self.prearm_state.is_empty() {
+            return;
+        }
+        // The frozen first-stop boundary wins over any later read.
+        let stop = self.prearm_stop.unwrap_or(now);
+        let unknown_stop = stop.is_none();
+        // Health state before any link verification: a final link-only
+        // snapshot must not advance the proven-clean bound when the
+        // counters already show loss. The sticky first loss counts too: a
+        // mid-run counter rise or unreadable health truncates even when a
+        // later sweep reads clean.
+        let (health_dirty, loss_cause) = match self.capture.as_ref() {
+            Some(capture) if capture.unproven.is_some() => {
+                (true, crate::render::PrearmWatchEnd::ScopeUncertain)
+            }
+            Some(capture)
+                if capture.prearm_first_loss.as_ref().is_some_and(|loss| {
+                    loss.cause == crate::render::PrearmWatchEnd::ScopeUncertain
+                }) =>
+            {
+                (true, crate::render::PrearmWatchEnd::ScopeUncertain)
+            }
+            Some(capture)
+                if capture.health_unproven.is_some()
+                    || capture.pairs_unproven.is_some()
+                    || capture.pairs_uncounted.is_some()
+                    || capture.prearm_first_loss.is_some() =>
+            {
+                (true, crate::render::PrearmWatchEnd::HealthLoss)
+            }
+            _ => (false, cause),
+        };
+        // Final link evaluation: unarmed watches arm from the landed
+        // stamps; armed watches verify their links stay up. A dirty
+        // terminal verifies presence without advancing the bound.
+        let links_by_object = self.prearm_links_by_object();
+        for (object, links) in &links_by_object {
+            if let Some(watch) = self.prearm_state.get_mut(*object) {
+                watch.evaluate_arm(links);
+                watch.verify_links(links, if health_dirty { None } else { stop });
+            }
+        }
+        let _ = self.refresh_prearm_object_changes_inner(unknown_stop);
+        // A health-dirty armed watch truncates at the last proven-clean
+        // bound instead of riding to the natural end. When a mid-run loss
+        // latched the sticky first loss, the bound is the earlier of that
+        // first loss (`min(clean_before, baseline)`) and the terminal clean
+        // read, so a later clean sweep cannot extend past the loss. The
+        // bound never falls below the arm instant: no clean proof after
+        // arming caps the claim to the arm itself, never to an end before
+        // its start.
+        if health_dirty {
+            let (clean, first_loss) = self
+                .capture
+                .as_ref()
+                .map(|capture| (capture.last_clean_ns, capture.prearm_first_loss))
+                .unwrap_or((None, None));
+            let ids: Vec<crate::discovery::identity::PinnedObjectId> =
+                self.prearm_state.watches().keys().copied().collect();
+            for id in ids {
+                let armed_since = self.prearm_state.get(id).and_then(|watch| {
+                    (watch.render().state == crate::render::PrearmWatchState::Armed)
+                        .then(|| watch.render().since_ns)
+                        .flatten()
+                });
+                let Some(since) = armed_since else {
+                    continue;
+                };
+                let first_bound = first_loss.map(|loss| {
+                    let base = loss
+                        .clean_before_ns
+                        .map_or(loss.baseline_ns, |clean| clean.min(loss.baseline_ns));
+                    base.max(since)
+                });
+                let current_bound = clean.map(|proven| proven.max(since));
+                let bound = match (first_bound, current_bound) {
+                    (Some(first), Some(current)) => Some(first.min(current)),
+                    (Some(first), None) => Some(first),
+                    (None, Some(current)) => Some(current),
+                    (None, None) => None,
+                };
+                if let Some(watch) = self.prearm_state.get_mut(id) {
+                    watch.cap_verified_to(bound);
+                    watch.end(loss_cause, stop);
+                }
+            }
+        }
+        self.prearm_state.end_all(cause, stop);
+        self.prearm_state.clamp_all_to_stop(stop);
+    }
+
+    /// Assembled pre-arm report rows: one row per retained input
+    /// in flag order, merging the watch interval with the lane's real attach
+    /// stamps (R2-D1-5 inventory assembly). Pure over coordinator state; the
+    /// presentation builder reads it for pass and final views.
+    ///
+    /// * `attached_at_ns` is the declared set's maximum over the lane's
+    ///   per-endpoint stamps, only when every member carries one (any
+    ///   missing stamp leaves the instant unknown); `None` renders null.
+    /// * The base `[scope_start_ns, attached_at_ns]` window emits for every
+    ///   attached mapped module without an R2-D1-6 proof (no producer in
+    ///   this packet, so attached modules always disclose); never-mapped
+    ///   pre-arm carries no window (its watch speaks). The reason reads
+    ///   `pre_attach`: a conservative outer bound whatever the mapping
+    ///   instant was (late-discovery precision is deferred to a later
+    ///   packet with initial-membership tracking).
+    /// * Attached endpoints of the object outside the declared set disclose
+    ///   one `mapped_unattached` window to their max attach instant.
+    /// * Anything unboundable (no stamps, no scope start) stays undisclosed:
+    ///   absence claims nothing.
+    pub(crate) fn prearm_rows(&self) -> Vec<PrearmReportRow> {
+        let Some(prearm) = self.prearm.as_ref() else {
+            return Vec::new();
+        };
+        let undeclared_max = self.prearm_undeclared_max_all();
+        let mut rows = Vec::with_capacity(prearm.inputs.len());
+        for input in &prearm.inputs {
+            let object = prearm.pins.id_for_prearm(input.key, &input.path);
+            let watch = object
+                .and_then(|id| self.prearm_state.get(id))
+                .map(|watch| watch.render());
+            let attached_at = object.and_then(|id| self.prearm_attached_at(id));
+            let mapped = object.is_some_and(|id| self.prearm_object_mapped(&prearm.pins, id));
+            let mut windows = Vec::new();
+            if mapped && let (Some(start), Some(end)) = (self.prearm_scope_start_ns, attached_at) {
+                windows.push(crate::render::UnobservedWindow {
+                    start_ns: start,
+                    end_ns: end,
+                    reason: crate::render::UnobservedReason::PreAttach,
+                });
+                if let Some(end) = object.and_then(|id| undeclared_max.get(&id).copied()) {
+                    windows.push(crate::render::UnobservedWindow {
+                        start_ns: start,
+                        end_ns: end,
+                        reason: crate::render::UnobservedReason::MappedUnattached,
+                    });
+                }
+            }
+            let summary = object.and_then(|id| {
+                prearm
+                    .pins
+                    .pinned()
+                    .find(|pin| pin.id == id)
+                    .map(|pin| (pin.key, pin.sha256.to_string()))
+            });
+            let (dev, ino, sha256) = match summary {
+                Some((key, sha)) => (
+                    (key.device.major, key.device.minor),
+                    key.inode,
+                    (!sha.is_empty()).then_some(sha),
+                ),
+                None => (
+                    (input.key.device.major, input.key.device.minor),
+                    input.key.inode,
+                    None,
+                ),
+            };
+            rows.push(PrearmReportRow {
+                path: input.path.clone(),
+                dev,
+                ino,
+                sha256,
+                mapped,
+                watch,
+                attached_at_ns: attached_at,
+                unobserved_windows: (!windows.is_empty()).then_some(windows),
+            });
+        }
+        rows
+    }
+
+    /// The declared set's attach instant: the max over its members' real
+    /// stamps — only when every member carries one. A subset maximum is not
+    /// declared-set readiness.
+    fn prearm_attached_at(
+        &self,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> Option<u64> {
+        let watch = self.prearm_state.get(object)?;
+        let capture = self.capture.as_ref()?;
+        let mut latest: Option<u64> = None;
+        for key in watch.declared().iter() {
+            let stamped = self
+                .prearm_endpoints
+                .get(key)
+                .and_then(|id| capture.attached_at.get(id).copied())?;
+            latest = Some(latest.map_or(stamped, |known| known.max(stamped)));
+        }
+        latest
+    }
+
+    /// Max attach stamp per pre-armed object over its attached endpoints
+    /// outside its declared set (scan-corroborated unproved offsets):
+    /// same-object endpoints matched by retained identity, skipping keys the
+    /// declared set already owns. One pass over the dense id range for all
+    /// inputs (not one scan per input per view).
+    fn prearm_undeclared_max_all(
+        &self,
+    ) -> BTreeMap<crate::discovery::identity::PinnedObjectId, u64> {
+        let mut max_by_object: BTreeMap<crate::discovery::identity::PinnedObjectId, u64> =
+            BTreeMap::new();
+        let (Some(capture), Some(prearm)) = (self.capture.as_ref(), self.prearm.as_ref()) else {
+            return max_by_object;
+        };
+        let pins = &prearm.pins;
+        // Attach-object → pinned-object index from the declared endpoints
+        // (one target per pre-armed file; undeclared same-object endpoints
+        // share it), so each endpoint resolves without scanning all inputs.
+        let mut attach_to_pin: BTreeMap<
+            AttachObjectId,
+            crate::discovery::identity::PinnedObjectId,
+        > = BTreeMap::new();
+        for (key, endpoint_id) in &self.prearm_endpoints {
+            if let Some(endpoint) = self.attach_set.endpoint(*endpoint_id) {
+                attach_to_pin.insert(endpoint.object, key.object);
+            }
+        }
+        // Endpoints whose target predates the declared index (absorbed
+        // without a declared endpoint, e.g. scan-only same-object offsets)
+        // still resolve by retained identity, one lookup per endpoint.
+        for raw in 0..self.attach_set.len() {
+            let id = EndpointId(raw as u32);
+            let Some(endpoint) = self.attach_set.endpoint(id) else {
+                continue;
+            };
+            let pin = match attach_to_pin.get(&endpoint.object).copied() {
+                Some(pin) => pin,
+                None => {
+                    let Some(target) = self.attach_set.target(endpoint.object) else {
+                        continue;
+                    };
+                    let Some(pin) = self
+                        .prearm_state
+                        .watches()
+                        .keys()
+                        .copied()
+                        .find(|pin| target.same_object_as(pins, *pin))
+                    else {
+                        continue;
+                    };
+                    pin
+                }
+            };
+            let Some(watch) = self.prearm_state.get(pin) else {
+                continue;
+            };
+            let key = crate::plan::AttachKey {
+                object: pin,
+                file_offset: endpoint.file_offset,
+            };
+            if watch.declared().contains(&key) || self.prearm_endpoints.contains_key(&key) {
+                continue;
+            }
+            if let Some(stamped) = capture.attached_at.get(&id).copied() {
+                max_by_object
+                    .entry(pin)
+                    .and_modify(|max| *max = (*max).max(stamped))
+                    .or_insert(stamped);
+            }
+        }
+        max_by_object
+    }
+
+    /// Whether any registry module record names this retained object: the
+    /// physical-key join through the single `object_matches_key` predicate
+    /// (including the entry-carried maps rendering on a pre-6.8 overlay
+    /// split), plus the retained whole-file digest when the record carries
+    /// one.
+    fn prearm_object_mapped(
+        &self,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> bool {
+        let pin_sha = pins
+            .pinned()
+            .find(|pin| pin.id == object)
+            .map(|pin| pin.sha256.to_string())
+            .unwrap_or_default();
+        self.registry.modules().any(|module| {
+            let crate::discovery::caller_registry::ModuleKey::Physical {
+                dev_major,
+                dev_minor,
+                ino,
+                sha256,
+            } = &module.key
+            else {
+                return false;
+            };
+            if !pins.object_matches_key(object, *dev_major, *dev_minor, *ino) {
+                return false;
+            }
+            sha256
+                .as_deref()
+                .is_none_or(|digest| !pin_sha.is_empty() && digest == pin_sha)
+        })
+    }
+
+    /// Evaluates pre-arm arming from the lane's current attach stamps:
+    /// every declared key with a live link and a real stamp feeds its watch;
+    /// partial attachment stays unarmed for the declared set. Called after
+    /// each receipt's stamps land. In this lane attach always carries its
+    /// stamp (the facade stamps every attach), so a fully attached declared
+    /// set always arms with a known instant.
+    fn note_prearm_receipt(&mut self) {
+        if self.prearm_state.is_empty() {
+            return;
+        }
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        let mut links_by_object: BTreeMap<
+            crate::discovery::identity::PinnedObjectId,
+            Vec<crate::prearm_module::DeclaredLink>,
+        > = BTreeMap::new();
+        for (key, id) in &self.prearm_endpoints {
+            let stamped = capture.attached_at.get(id).copied();
+            links_by_object.entry(key.object).or_default().push(
+                crate::prearm_module::DeclaredLink {
+                    key: *key,
+                    linked: stamped.is_some(),
+                    stamped_at: stamped,
+                },
+            );
+        }
+        for (object, links) in &links_by_object {
+            if let Some(watch) = self.prearm_state.get_mut(*object) {
+                watch.evaluate_arm(links);
+            }
+        }
+    }
+
+    /// Changed-identity gap reason for a pre-armed object, mirroring the
+    /// attach set's own vocabulary: same subject, same sentence. The facade
+    /// refuses to (re-)extend a changed object through its per-entry
+    /// unchanged checks, so the sentence holds here too.
+    fn changed_prearm_gap_reason(
+        pins: &crate::discovery::identity::PinnedObjects,
+        id: crate::discovery::identity::PinnedObjectId,
+    ) -> String {
+        let summary = pins.pinned().find(|pin| pin.id == id);
+        let (path, major, minor, ino) =
+            summary.map_or(("<unresolved pre-arm object>", 0, 0, 0), |pin| {
+                (
+                    pin.path,
+                    pin.key.device.major,
+                    pin.key.device.minor,
+                    pin.key.inode,
+                )
+            });
+        format!(
+            "{path} (device {major}:{minor}, inode {ino}) changed identity since its endpoints were \
+             retained: its digest or (inode, size, ctime) pin differs, and the attach \
+             set never extends a changed object"
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prearm_declared_endpoints(
+        &self,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> Option<BTreeSet<crate::plan::AttachKey>> {
+        self.prearm_state
+            .get(object)
+            .map(|watch| watch.declared().clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prearm_prior(&self) -> (usize, u64) {
+        self.prearm_prior
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_prearm_prior(&self) -> (usize, u64) {
+        self.semantic_inputs.prearm_prior()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_semantic_manifests(&mut self, manifests: Vec<PathBuf>) {
+        self.set_manifests(manifests);
+    }
+
+    pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
+        self.semantic_inputs.prepare(&self.engine)
+    }
+
+    pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {
+        self.diagnostics = Some(Recorder::try_new(config)?);
+        Ok(())
+    }
+
+    pub(crate) fn take_diagnostics(
+        &mut self,
+        outcome: DiagnosticOutcome,
+    ) -> Option<FinishedDiagnostics> {
+        self.diagnostics
+            .take()
+            .map(|recorder| recorder.finish(outcome))
+    }
+
+    pub(crate) fn note_diagnostics_native_unavailable(&mut self) {
+        if let Some(recorder) = &mut self.diagnostics
+            && !self.diagnostic_native_unavailable
+        {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+            record.reason = Some(DiagnosticReason::NativeUnavailable);
+            recorder.record(record);
+            self.diagnostic_native_unavailable = true;
+        }
+    }
+
+    fn diagnostic_identity(&self, record: &mut DiagnosticRecord, caller: CallerId) {
+        record.caller = Some(caller.0);
+        if let Some(caller) = self.adapter.record(caller) {
+            record.pid = Some(caller.pid);
+            record.incarnation = Some(u64::from(caller.incarnation));
+        } else {
+            record.context_unavailable = true;
+        }
+    }
+
+    fn diagnostic_count_record(
+        &self,
+        key: PairKey,
+        caller: CallerId,
+        observation: PairCount,
+        base: u64,
+        staged: u64,
+        since: u64,
+    ) -> DiagnosticRecord {
+        let recovery = self.recoveries.get(&key);
+        let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(
+                None,
+                recovery.and_then(|recovery| recovery.epoch.map(|epoch| epoch.0)),
+                None,
+            );
+        self.diagnostic_identity(&mut record, caller);
+        record.absolute = Some(observation.count);
+        record.base = Some(base);
+        record.staged = Some(staged);
+        record.after = Some(base);
+        record.through = Some(observation.count);
+        record.pre = Some(observation.anchor_ns);
+        record.post = Some(observation.last_ns);
+        record.baseline_pre = (base != 0).then_some(since);
+        record.fence = recovery.and_then(|recovery| recovery.fence.map(|read| read.count));
+        record.observation_ref = nonzero_ref(observation.diagnostic_observation);
+        record.transition_ref = recovery
+            .and_then(|recovery| nonzero_ref(recovery.diagnostic.transition_ref))
+            .or_else(|| nonzero_ref(observation.diagnostic_transition));
+        // Ordinary targets retain PRE only; a matching immutable recovery fence
+        // also retains the genuine read POST. Never infer it from newer counts.
+        if let Some(fence) = recovery.and_then(|recovery| recovery.fence)
+            && fence.count == base
+            && fence.anchor_ns == since
+        {
+            record.baseline_pre = Some(fence.anchor_ns);
+            record.baseline_post = Some(fence.last_ns);
+        }
+        record.context_unavailable = record.pid.is_none()
+            || record.observation_ref.is_none()
+            || base != 0 && record.baseline_post.is_none();
+        record
+    }
+
+    fn diagnostic_raw_count(
+        &mut self,
+        key: PairKey,
+        pid: Option<u32>,
+        origin: ReadOrigin,
+        count: u64,
+        interval: (u64, u64),
+        valid: bool,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let previous = self.pair_counts.get(&key).copied();
+        let reason = if previous.is_some_and(|held| count < held.count) {
+            Some(DiagnosticReason::StaleObservation)
+        } else if !valid {
+            Some(DiagnosticReason::CountInvalid)
+        } else {
+            None
+        };
+        if previous.is_some_and(|held| held.diagnostic_last_raw == Some(count)) {
+            if let Some(reason) = reason {
+                self.diagnostics
+                    .as_mut()
+                    .expect("enabled recorder")
+                    .note_reason(reason);
+            }
+            return;
+        }
+        let caller = match self.pair_targets.get(&key) {
+            Some(
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. },
+            ) => Some(*caller),
+            _ => None,
+        };
+        let mut record =
+            DiagnosticRecord::new(DiagnosticKind::CountObservation).with_pair(key.diagnostic_key());
+        record.pid = pid;
+        if let Some(caller) = caller {
+            self.diagnostic_identity(&mut record, caller);
+        }
+        record.origin = Some(origin);
+        record.absolute = Some(count);
+        let (pre, post) = interval;
+        record.pre = Some(pre);
+        record.post = Some(post);
+        record.reason = reason;
+        let seq = self
+            .diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record_changed(previous.and_then(|held| held.diagnostic_last_raw), record)
+            .unwrap_or(0);
+        if let Some(held) = self.pair_counts.get_mut(&key) {
+            held.diagnostic_last_raw = Some(count);
+            if count > held.count {
+                held.diagnostic_observation = seq;
+            }
+        }
+    }
+
+    fn diagnostic_recovery_decision(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        reason: DiagnosticReason,
+        held: Option<PairCount>,
+        decision: DiagnosticDecision,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let state = (
+            reason,
+            decision,
+            held.map_or(0, |held| held.diagnostic_observation),
+            recovery.watermark,
+            recovery.fence.map_or(0, |read| read.count),
+        );
+        if recovery.diagnostic.wait == Some(state) {
+            self.diagnostics
+                .as_mut()
+                .expect("enabled recorder")
+                .note_reason(reason);
+            return;
+        }
+        let mut record = if let Some(held) = held {
+            self.diagnostic_count_record(
+                key,
+                recovery.caller,
+                held,
+                recovery.watermark,
+                recovery.watermark,
+                recovery.fence.map_or(0, |read| read.anchor_ns),
+            )
+        } else {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+                .with_pair(key.diagnostic_key());
+            self.diagnostic_identity(&mut record, recovery.caller);
+            record.context_unavailable = true;
+            record
+        };
+        record = record.with_private_ids(None, recovery.epoch.map(|epoch| epoch.0), None);
+        record.fence = recovery.fence.map(|read| read.count);
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        record.decision = Some(decision);
+        record.reason = Some(reason);
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
+        recovery.diagnostic.wait = Some(state);
+    }
+
+    fn diagnostic_recovery_wait(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        reason: DiagnosticReason,
+        held: Option<PairCount>,
+    ) {
+        self.diagnostic_recovery_decision(key, recovery, reason, held, DiagnosticDecision::Pending);
+    }
+
+    fn diagnostic_ownership(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        candidate: &CurrentCandidates,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let (eligibility, module, epoch, interval, reason) = match candidate {
+            CurrentCandidates::Unknown => (
+                Eligibility::Unknown,
+                None,
+                None,
+                None,
+                DiagnosticReason::OwnershipUnknown,
+            ),
+            CurrentCandidates::Shared => (
+                Eligibility::SharedOwner,
+                None,
+                None,
+                None,
+                DiagnosticReason::SharedOwner,
+            ),
+            CurrentCandidates::Sole {
+                module,
+                epoch,
+                scan,
+            } => (
+                Eligibility::SoleOwner,
+                self.registry.module_id_for(module),
+                Some(epoch.0),
+                Some((scan.started_ns(), scan.finished_ns())),
+                DiagnosticReason::SoleOwner,
+            ),
+        };
+        let state = (eligibility, module, epoch);
+        if recovery.diagnostic.ownership == Some(state) {
+            return;
+        }
+        let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(None, epoch, None);
+        self.diagnostic_identity(&mut record, recovery.caller);
+        record.reason = Some(reason);
+        record.prior_eligibility = recovery.diagnostic.ownership.map(|state| state.0);
+        record.new_eligibility = Some(eligibility);
+        record.module = module.map(|module| module.0);
+        record.base = Some(recovery.watermark);
+        record.fence = recovery.fence.map(|read| read.count);
+        if recovery.epoch.map(|epoch| epoch.0) != epoch {
+            record.fence = None;
+            record.context_unavailable = true;
+        }
+        if let Some((pre, post)) = interval {
+            record.baseline_pre = Some(pre);
+            record.baseline_post = Some(post);
+        }
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        recovery.diagnostic.transition_ref = self
+            .diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record)
+            .unwrap_or(0);
+        recovery.diagnostic.ownership = Some(state);
+        recovery.diagnostic.wait = None;
+    }
+
+    fn diagnostic_recovery_selection(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        proven: bool,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let state = (
+            recovery.epoch.map(|epoch| epoch.0),
+            recovery.fence.map_or(0, |read| read.count),
+            proven,
+        );
+        if recovery.diagnostic.selection == Some(state) {
+            return;
+        }
+        let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(None, state.0, None);
+        self.diagnostic_identity(&mut record, recovery.caller);
+        record.reason = Some(if proven {
+            DiagnosticReason::SoleOwner
+        } else {
+            DiagnosticReason::OwnershipTransition
+        });
+        record.prior_eligibility = recovery.diagnostic.selection.map(|state| {
+            if state.2 {
+                Eligibility::SoleOwner
+            } else {
+                Eligibility::Unproven
+            }
+        });
+        record.new_eligibility = Some(if proven {
+            Eligibility::SoleOwner
+        } else {
+            Eligibility::Unproven
+        });
+        record.base = Some(recovery.watermark);
+        record.fence = nonzero_ref(state.1);
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        if let Some(scan) = &recovery.scan {
+            record.baseline_pre = Some(scan.started_ns());
+            record.baseline_post = Some(scan.finished_ns());
+        }
+        if let Some(read) = recovery.fence {
+            record.absolute = Some(read.count);
+            record.pre = Some(read.anchor_ns);
+            record.post = Some(read.last_ns);
+            record.observation_ref = nonzero_ref(read.diagnostic_observation);
+        } else {
+            record.context_unavailable = true;
+        }
+        recovery.diagnostic.transition_ref = self
+            .diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record)
+            .unwrap_or(0);
+        recovery.diagnostic.selection = Some(state);
+    }
+
+    fn diagnostic_pending_refusal(
+        &mut self,
+        key: PairKey,
+        caller: CallerId,
+        observation: PairCount,
+        base: u64,
+        since: u64,
+        reason: DiagnosticReason,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let state = (reason, observation.count, base);
+        if self
+            .pair_counts
+            .get(&key)
+            .is_some_and(|held| held.diagnostic_refusal == Some(state))
+        {
+            self.diagnostics
+                .as_mut()
+                .expect("enabled recorder")
+                .note_reason(reason);
+            return;
+        }
+        let mut record = self.diagnostic_count_record(key, caller, observation, base, base, since);
+        record.decision = Some(DiagnosticDecision::Rejected);
+        record.reason = Some(reason);
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
+        if let Some(held) = self.pair_counts.get_mut(&key) {
+            held.diagnostic_refusal = Some(state);
+        }
+    }
+
+    fn diagnostic_pending_result(
+        &mut self,
+        pending_id: u64,
+        pending: &PendingCountObservation,
+        outcome: Option<&PendingCountOutcome>,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let mut record = self
+            .diagnostic_count_record(
+                pending.key,
+                pending.caller,
+                pending.observation,
+                pending.diagnostic.map_or(0, |diagnostic| diagnostic.base),
+                pending.diagnostic.map_or(0, |diagnostic| diagnostic.staged),
+                pending.diagnostic.map_or(0, |diagnostic| diagnostic.since),
+            )
+            .with_private_ids(
+                None,
+                match pending.origin {
+                    PendingCountOrigin::Recovered(epoch) => Some(epoch.0),
+                    _ => None,
+                },
+                Some(pending_id),
+            );
+        if let Some(diagnostic) = pending.diagnostic {
+            record.fence = nonzero_ref(diagnostic.fence);
+            record.baseline_post = nonzero_ref(diagnostic.baseline_post);
+            record.transition_ref = nonzero_ref(diagnostic.transition_ref);
+            record.context_unavailable = record.pid.is_none()
+                || record.observation_ref.is_none()
+                || diagnostic.base != 0 && record.baseline_post.is_none();
+        } else {
+            record.base = None;
+            record.staged = None;
+            record.after = None;
+            record.baseline_pre = None;
+            record.fence = None;
+            record.transition_ref = None;
+            record.context_unavailable = true;
+        }
+        match outcome {
+            Some(PendingCountOutcome::Placed { module }) => {
+                record.kind = DiagnosticKind::Publication;
+                record.decision = Some(DiagnosticDecision::Placed);
+                record.reason = Some(DiagnosticReason::SoleOwner);
+                record.module = self.registry.module_id_for(module).map(|module| module.0);
+                record.edge_total = self
+                    .registry
+                    .module_id_for(module)
+                    .and_then(|module| self.registry.edge(pending.caller, module))
+                    .map(|edge| edge.entry_count);
+            }
+            Some(PendingCountOutcome::Rejected { reason }) => {
+                record.decision = Some(DiagnosticDecision::Rejected);
+                record.reason = Some(match reason {
+                    PendingRejection::Ambiguous => DiagnosticReason::SharedOwner,
+                    PendingRejection::NoEdge => DiagnosticReason::OwnershipUnknown,
+                });
+            }
+            Some(PendingCountOutcome::Unadmitted { module }) => {
+                record.decision = Some(DiagnosticDecision::Pending);
+                record.reason = Some(DiagnosticReason::NotAdmitted);
+                record.module = self.registry.module_id_for(module).map(|module| module.0);
+            }
+            None => {
+                record.decision = Some(DiagnosticDecision::Rejected);
+                record.reason = Some(DiagnosticReason::StaleDecision);
+            }
+        }
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
+    }
+
+    fn diagnostic_withheld(
+        &mut self,
+        key: PairKey,
+        recovery: &PairRecovery,
+        after: u64,
+        through: u64,
+        reason: DiagnosticReason,
+        read: Option<PairCount>,
+    ) {
+        if self.diagnostics.is_none() || through <= after {
+            return;
+        }
+        let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(None, recovery.epoch.map(|epoch| epoch.0), None);
+        self.diagnostic_identity(&mut record, recovery.caller);
+        record.decision = Some(DiagnosticDecision::Withheld);
+        record.reason = Some(reason);
+        record.base = Some(after);
+        record.after = Some(after);
+        record.through = Some(through);
+        record.fence = recovery.fence.map(|read| read.count);
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        if let Some(read) = read {
+            record.absolute = Some(read.count);
+            record.pre = Some(read.anchor_ns);
+            record.post = Some(read.last_ns);
+            record.observation_ref = nonzero_ref(read.diagnostic_observation);
+        }
+        record.context_unavailable = true;
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
     }
 
     pub(crate) fn adapter(&self) -> &CallerAdapter<Source> {
@@ -271,10 +1964,502 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.registry
     }
 
+    /// The capture's `--exclude-module` report rows plus the inputs that
+    /// matched nothing, aggregated from the engine budget's per-(pid, file)
+    /// records. A declared operator choice, never a loss.
+    pub(crate) fn excluded_snapshot(&self) -> (Vec<crate::render::ExcludedOut>, Vec<String>) {
+        let (records, excludes) = self.engine.budget_excluded_snapshot();
+        crate::render::aggregate_excluded(records, excludes)
+    }
+
+    /// Fold an inventory-native pass's `--exclude-module` records into
+    /// the engine budget, where `excluded_snapshot` reports them. The
+    /// collector budgets that record these are per-pass copies; the
+    /// engine budget is the run's report sink. Aggregation dedupes
+    /// repeats, so multi-pass accumulation is idempotent.
+    fn absorb_catalog_excluded(&mut self, excluded: Vec<crate::discovery::scan::ExcludedRecord>) {
+        for record in excluded {
+            self.engine.budget.push_excluded(record);
+        }
+    }
+
+    /// Observe the actual engine tail attempts without adding counters or
+    /// changing the publication path.
+    #[cfg(test)]
+    pub(crate) fn reference_engine_tail_stats(&self) -> (u64, u64) {
+        self.engine.tail_stats()
+    }
+
+    /// Closes up to `max` retired graph files (§1.8); `true` when the
+    /// chain is empty. The lane calls this while opening the next graph
+    /// batch so no synchronous close joins a graph credit.
+    // consumed by T12a: called when the next graph batch opens.
+    #[allow(dead_code)]
+    pub(crate) fn close_retired_graph_files(&mut self, max: usize) -> bool {
+        self.engine.close_retired_files(max)
+    }
+
+    /// Fixture transport replacement only: processing still uses this
+    /// coordinator's actual Engine and its original retained queue.
+    #[cfg(test)]
+    pub(crate) fn service_collected_finish_discovery<S: crate::events::BoundedRecordSource>(
+        &mut self,
+        q: &crate::attach::CollectedFinishQ,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &mut crate::events::DiscoveryDrain<S>,
+        staged: &mut crate::attach::DiscoveryStage,
+        work: usize,
+    ) -> Result<
+        crate::inventory_semantics::LaneDrainOutcome,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        use crate::inventory_semantics::{LaneDrainOutcome, SemanticRefusal};
+        if !q.matches_discovery_drain(producers, discovery) {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let positions = crate::events::discovery_drain_positions(discovery);
+        if positions.producer != q.discovery_stop() || positions.consumer > q.discovery_stop() {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if work == 0 {
+            self.collected_finish_progressed = false;
+            return Ok(LaneDrainOutcome {
+                backlog: positions.consumer != q.discovery_stop()
+                    || self.engine.collected_finish_backlog_pending(staged.len()),
+                ..Default::default()
+            });
+        }
+        if self.promotion_finish {
+            // OD-11: a promotion Finish drains to Q and drops the records
+            // without entering the shared Engine (today's classic promotion
+            // drain). No records, assessment, graph or actions; post_q still
+            // fails.
+            let quantum = work.min(crate::discovery::engine::GRAPH_STRIDE);
+            let (records, malformed, post_q, ring_pending) =
+                crate::attach::collect_staged_discovery_to_position(
+                    staged,
+                    discovery,
+                    q.discovery_stop(),
+                    quantum,
+                )
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            let drained = records.len() as u64 + malformed;
+            drop(records);
+            self.promotion_records_discarded =
+                self.promotion_records_discarded.saturating_add(drained);
+            self.collected_finish_progressed = drained > 0;
+            let after = crate::events::discovery_drain_positions(discovery);
+            return Ok(LaneDrainOutcome {
+                records: drained,
+                post_q: post_q
+                    || after.producer != q.discovery_stop()
+                    || after.consumer > q.discovery_stop(),
+                backlog: ring_pending || staged.len() != 0 || after.consumer != q.discovery_stop(),
+                failed: false,
+            });
+        }
+        let held = self.engine.discovery_held_len();
+        // One transfer avoids losing a partially collected Vec if a later
+        // BUSY/error is encountered; subsequent originals retain their cursor.
+        let quantum = work
+            .min(1)
+            .min(crate::attach::DiscoveryStage::CAPACITY.saturating_sub(held));
+        let (records, malformed, post_q, ring_pending) =
+            if self.engine.collected_finish_transport_blocked() {
+                (
+                    Vec::new(),
+                    0,
+                    false,
+                    positions.consumer != q.discovery_stop() || staged.len() != 0,
+                )
+            } else {
+                crate::attach::collect_staged_discovery_to_position(
+                    staged,
+                    discovery,
+                    q.discovery_stop(),
+                    quantum,
+                )
+                .map_err(|_| SemanticRefusal::Unavailable)?
+            };
+        let mut count = records.len() as u64 + malformed;
+        let mut post_q = post_q;
+        let mut ring_pending = ring_pending;
+        // A terminal journal owns a still-unread suffix. Continue it through
+        // the SAME retained drain/Q even though that journal counts as Engine
+        // backlog. Each callback transfers at most one original; an allowance
+        // stop is an incomplete prefix, never a fabricated empty observation.
+        // Transport is at Q when the ring reached the stop with nothing staged.
+        let transport_at_q = !ring_pending && staged.len() == 0;
+        let mut collect = |_session: &mut dyn crate::discovery::engine::EngineSession| {
+            use crate::discovery::engine::IncompleteTerminalDrain;
+            if quantum == 0 {
+                return Err(IncompleteTerminalDrain::capacity_blocked(Vec::new(), 0, 0).into());
+            }
+            let (records, malformed, beyond, pending) =
+                crate::attach::collect_staged_discovery_to_position(
+                    staged,
+                    discovery,
+                    q.discovery_stop(),
+                    quantum,
+                )?;
+            count += records.len() as u64 + malformed;
+            post_q |= beyond;
+            ring_pending = pending;
+            if beyond {
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    0,
+                    anyhow!("discovery advanced beyond its original Q"),
+                )
+                .into());
+            }
+            if pending {
+                Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+            } else {
+                Ok((records, malformed))
+            }
+        };
+        // Only native/counter leaves are substituted. Dispatch and the
+        // lifecycle consequence observed by the test remain real Engine work.
+        let mut session = crate::discovery::engine::session_fixture::ScriptedSession::default();
+        let reserve = self.engine.collected_graph_reserver();
+        #[cfg(test)]
+        {
+            self.engine_collected_finish_calls =
+                self.engine_collected_finish_calls.saturating_add(1);
+        }
+        let progress = self
+            .engine
+            .service_collected_finish_records_with(
+                &mut session,
+                None,
+                &reserve,
+                records,
+                malformed,
+                work,
+                transport_at_q,
+                &mut collect,
+            )
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        self.collected_finish_progressed = progress.progressed;
+        let after = crate::events::discovery_drain_positions(discovery);
+        Ok(LaneDrainOutcome {
+            records: count,
+            post_q: post_q
+                || after.producer != q.discovery_stop()
+                || after.consumer > q.discovery_stop(),
+            backlog: ring_pending
+                || progress.pending
+                || staged.len() != 0
+                || after.consumer != q.discovery_stop(),
+            failed: self.engine.collected_graph_refused().is_some(),
+        })
+    }
+
+    /// One real Session/Q continuation. Acquiring transport and dispatching
+    /// retained Engine work are separate bounded opportunities.
+    #[allow(dead_code)] // The private collected machine is not selected by ordinary inventory.
+    pub(crate) fn service_collected_finish_session(
+        &mut self,
+        session: &mut Session,
+        q: &crate::attach::CollectedFinishQ,
+        work: usize,
+    ) -> Result<
+        crate::inventory_semantics::LaneDrainOutcome,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        use crate::inventory_semantics::{LaneDrainOutcome, SemanticRefusal};
+        session
+            .collected_finish_discovery_domain(q)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let positions = session
+            .discovery_positions()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        if work == 0 {
+            self.collected_finish_progressed = false;
+            return Ok(LaneDrainOutcome {
+                backlog: positions.consumer != q.discovery_stop()
+                    || self
+                        .engine
+                        .collected_finish_backlog_pending(session.staged_discovery_len()),
+                ..Default::default()
+            });
+        }
+        if self.promotion_finish {
+            // OD-11: a promotion Finish drains to Q and drops the records
+            // without entering the shared Engine (today's classic promotion
+            // drain). No records, assessment, graph or actions; post_q still
+            // fails.
+            let quantum = work.min(crate::discovery::engine::GRAPH_STRIDE);
+            let (records, malformed, post_q, ring_pending) = session
+                .collect_discovery_to_position(q.discovery_stop(), quantum)
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            let drained = records.len() as u64 + malformed;
+            drop(records);
+            self.promotion_records_discarded =
+                self.promotion_records_discarded.saturating_add(drained);
+            self.collected_finish_progressed = drained > 0;
+            let after = session
+                .discovery_positions()
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            return Ok(LaneDrainOutcome {
+                records: drained,
+                post_q: post_q
+                    || after.producer != q.discovery_stop()
+                    || after.consumer > q.discovery_stop(),
+                backlog: ring_pending
+                    || session.staged_discovery_len() != 0
+                    || after.consumer != q.discovery_stop(),
+                failed: false,
+            });
+        }
+        let quantum = work.min(1).min(
+            crate::attach::DiscoveryStage::CAPACITY
+                .saturating_sub(self.engine.discovery_held_len()),
+        );
+        let (records, malformed, post_q, ring_pending) =
+            if self.engine.collected_finish_transport_blocked() {
+                (
+                    Vec::new(),
+                    0,
+                    false,
+                    positions.consumer != q.discovery_stop() || session.staged_discovery_len() != 0,
+                )
+            } else {
+                session
+                    .collect_discovery_to_position(q.discovery_stop(), quantum)
+                    .map_err(|_| SemanticRefusal::Unavailable)?
+            };
+        let mut count = records.len() as u64 + malformed;
+        let mut post_q = post_q;
+        let mut ring_pending = ring_pending;
+        // Transport is at Q when the Session ring reached the stop with
+        // nothing staged (B1).
+        let transport_at_q = !ring_pending && session.staged_discovery_len() == 0;
+        let mut collect = |native: &mut dyn crate::discovery::engine::EngineSession| {
+            use crate::discovery::engine::IncompleteTerminalDrain;
+            if quantum == 0 {
+                return Err(IncompleteTerminalDrain::capacity_blocked(Vec::new(), 0, 0).into());
+            }
+            let (records, malformed, beyond, pending) =
+                native.collect_collected_finish_discovery(q, quantum)?;
+            count += records.len() as u64 + malformed;
+            post_q |= beyond;
+            ring_pending = pending;
+            if beyond {
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    0,
+                    anyhow!("discovery advanced beyond its original Q"),
+                )
+                .into());
+            }
+            if pending {
+                Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+            } else {
+                Ok((records, malformed))
+            }
+        };
+        let reserve = self.engine.collected_graph_reserver();
+        #[cfg(test)]
+        {
+            self.engine_collected_finish_calls =
+                self.engine_collected_finish_calls.saturating_add(1);
+        }
+        let progress = self
+            .engine
+            .service_collected_finish_records_with(
+                session,
+                Some(q),
+                &reserve,
+                records,
+                malformed,
+                work,
+                transport_at_q,
+                &mut collect,
+            )
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        self.collected_finish_progressed = progress.progressed;
+        session
+            .collected_finish_discovery_domain(q)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let after = session
+            .discovery_positions()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        Ok(LaneDrainOutcome {
+            records: count,
+            post_q,
+            backlog: ring_pending
+                || progress.pending
+                || session.staged_discovery_len() != 0
+                || after.consumer != q.discovery_stop(),
+            failed: self.engine.collected_graph_refused().is_some(),
+        })
+    }
+
+    pub(crate) fn collected_finish_discovery_pending(&self, staged: usize) -> bool {
+        // R-26 N2: a promotion Finish never sees the shared Engine's
+        // backlog; only staged items block it.
+        if self.promotion_finish {
+            staged != 0
+        } else {
+            self.engine.collected_finish_backlog_pending(staged)
+        }
+    }
+
+    /// Whether the last collected-Finish service call progressed the Engine.
+    pub(crate) fn collected_finish_progressed(&self) -> bool {
+        self.collected_finish_progressed
+    }
+
+    /// Arms or disarms the promotion-Finish drain (OD-11). Set for exactly
+    /// one coordinator before its Finish; the coordinator is consumed after.
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn set_promotion_finish(&mut self, on: bool) {
+        self.promotion_finish = on;
+    }
+
+    /// Whether the promotion-Finish drain is armed.
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn promotion_finish(&self) -> bool {
+        self.promotion_finish
+    }
+
+    /// Records discarded by the promotion route (diagnostics).
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn promotion_records_discarded(&self) -> u64 {
+        self.promotion_records_discarded
+    }
+
+    /// Calls into `service_collected_finish_records_with` (test count).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn engine_collected_finish_calls(&self) -> u64 {
+        self.engine_collected_finish_calls
+    }
+
+    /// Test read of the Engine's graph-input generation (§1.3).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T14.
+    pub(crate) fn graph_inputs_epoch_for_test(&self) -> u64 {
+        self.engine.graph_inputs_epoch_for_test()
+    }
+
+    /// Test seam seeding one retirement intent plus one pending leader-exit
+    /// assessment in the coordinator's Engine (R-26 N2 twin, T12c).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn seed_collected_finish_work_for_test(&mut self, view: ProcessViewId) {
+        self.engine.seed_collected_finish_work_for_test(view);
+    }
+
+    /// The terminal graph refusal the Engine recorded, if any (§1.9):
+    /// the retained consumer abandons with this reason when present.
+    pub(crate) fn collected_graph_refused(&self) -> Option<&'static str> {
+        self.engine.collected_graph_refused()
+    }
+
+    /// Test seam seeding the terminal graph refusal where the Engine
+    /// leaves it. The refusal-setting itself is engine-tested (G6);
+    /// consumers read it through [`Self::collected_graph_refused`].
+    #[cfg(test)]
+    pub(crate) fn seed_collected_graph_refusal_for_test(&mut self, reason: &'static str) {
+        self.engine.collected_graph_refusal = Some(reason);
+    }
+
+    /// Existing retained Engine work and actual Session FIFO occupancy only.
+    #[cfg(test)]
+    pub(crate) fn reference_collected_finish_discovery_backlog(
+        &self,
+        staged: usize,
+    ) -> (usize, bool) {
+        (
+            self.engine.discovery_held_len(),
+            self.engine.collected_finish_backlog_pending(staged),
+        )
+    }
+
+    /// Move this decoded fixture input through actual exhausted-frame
+    /// ingestion. No queue entry or successful processing fact is scripted.
+    #[cfg(test)]
+    pub(crate) fn reference_defer_finish_discovery_for_test(
+        &mut self,
+        record: p11scope_ebpf_common::DiscoveryRecord,
+    ) -> Result<()> {
+        self.engine.defer_finish_discovery_for_test(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_collected_finish_discovery_head_for_test(
+        &self,
+    ) -> Option<(u32, u64, u8)> {
+        self.engine.finish_discovery_head_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_finish_exit_subject_for_test(
+        &self,
+        pid: u32,
+        at: u64,
+    ) -> (bool, bool, bool) {
+        self.engine.finish_exit_subject_for_test(pid, at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_unmatched_finish_exit_for_test(&self, pid: u32, at: u64) -> bool {
+        self.engine.unmatched_finish_exit_for_test(pid, at)
+    }
+
+    /// Refuse the final receiver only after its actual disposal is retained.
+    #[cfg(test)]
+    pub(crate) fn reference_refuse_joint_finish_publication_once(&mut self) {
+        self.refuse_joint_finish_publication_once = true;
+    }
+
+    /// Borrow the canonical capture owner without changing its model or
+    /// ledger. Collected refresh checks original raw custody through this
+    /// same ledger while independently reserving provider storage.
+    pub(crate) fn joint_capture(
+        &self,
+    ) -> &crate::semantics_objects::journal::joint_driver::JointCaptureOwner {
+        &self.joint_capture
+    }
+
+    /// Borrow the canonical capture owner for raw custody and publication,
+    /// preserving its model history and reservation ledger.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged collection port; ordinary Joint is inactive.
+    pub(crate) fn joint_capture_mut(
+        &mut self,
+    ) -> &mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner {
+        &mut self.joint_capture
+    }
+
+    /// Deliver one H8 seal to an instance's Joint feed through the
+    /// capture owner's ledger: the test-side seal tick, borrowing the
+    /// registry and the owner disjointly exactly like publication.
+    /// Production has no grants until the joint seal tick lands.
+    #[cfg(test)]
+    pub(crate) fn deliver_joint_seal_through_owner(
+        &mut self,
+        id: crate::discovery::caller_registry::instance_input::RegistryInstanceId,
+        seal: &crate::semantics_objects::journal::SealSuccess,
+        model: &crate::semantics_objects::ObjectSemantics,
+    ) -> crate::semantics_key_use::SealApplyOutcome {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry
+            .deliver_joint_algorithm_seal_for_test(id, seal, model, ledger)
+    }
+
     /// Stages one scope-level gap (no caller, module or PID) that
-    /// publishes with the next pass: the run-wide PID-numbering mismatch
-    /// (`pidns::numbering_gap`, review F4) is the only producer.
+    /// publishes with the next commit: the run-wide PID-numbering
+    /// mismatch (`pidns::numbering_gap`, review F4), capture failures,
+    /// and the zero-pass stop diagnostic all ride this path.
     pub(crate) fn note_scope_gap(&mut self, subject: String, reason: String) {
+        if subject == "inventory capture failed" {
+            self.capture_failed = true;
+        }
         self.registry.record_gap(RegistryGap {
             caller: None,
             module: None,
@@ -285,12 +2470,50 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// Latch the lane's journal linkage from its drain producers at
+    /// machine init: the label reads `bootstrap_unavailable` instead
+    /// of `journal_unavailable` on linked lanes before the first
+    /// birth. The per-quantum birth-path latch stays as is.
+    pub(crate) fn note_journal_linked(&mut self, linked: bool) {
+        self.registry.note_journal_linked(linked);
+    }
+
+    /// Disclose the unlinked journal once per lane at machine init
+    /// (O0): idempotent with the Births and stray-receipt sites, so
+    /// the lane records exactly one `joint_journal_unavailable` row
+    /// however many quanta run unlinked.
+    pub(crate) fn disclose_joint_journal_unavailable_once(&mut self) {
+        self.registry.disclose_joint_journal_unavailable_once();
+    }
+
+    /// Whether a capture failure was staged this run (the pre-arm terminal
+    /// cause reads `Stop` for failures, per 6.13).
+    pub(crate) fn capture_failed(&self) -> bool {
+        self.capture_failed
+    }
+
+    /// Whether this run retains any `--prearm-module` pinning (the terminal
+    /// close and its guarded scan commit run only then, never on every run).
+    pub(crate) fn has_prearm(&self) -> bool {
+        self.prearm.is_some()
+    }
+
     /// Stages one pass-wide count-refresh loss boundary from the lane
     /// itself (P1-5 terminal-first): an incomplete terminal refresh
     /// demotes the retained counts to lower bounds exactly like a
     /// failed live read — a scope gap alone would leave them
     /// loss-free. The loss is a gap too, never silent loss.
     pub(crate) fn note_refresh_loss(&mut self, reason: String) {
+        if let Some(recorder) = &mut self.diagnostics {
+            if !self.diagnostic_refresh_loss {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+                record.reason = Some(DiagnosticReason::CaptureLoss);
+                recorder.record(record);
+                self.diagnostic_refresh_loss = true;
+            } else {
+                recorder.note_reason(DiagnosticReason::CaptureLoss);
+            }
+        }
         self.registry.note_refresh_loss(reason);
     }
 
@@ -299,6 +2522,53 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn registry_mut(&mut self) -> &mut CallerRegistry {
         &mut self.registry
+    }
+
+    /// Enable or disable the diagnostic settlement-latency
+    /// histogram on the registry. Default off; the run path enables
+    /// it from the diagnostic env toggle.
+    pub(crate) fn set_diagnostic_settlement_latency(&mut self, on: bool) {
+        self.registry.set_diagnostic_settlement_latency(on);
+    }
+
+    /// The cumulative settlement-latency summary, when enabled.
+    pub(crate) fn settlement_latency_summary(
+        &self,
+    ) -> Option<crate::discovery::caller_registry::SettlementLatencySummary> {
+        self.registry.settlement_latency_summary()
+    }
+
+    /// Accepted semantic bindings (H3 Task 3): the tick window borrows
+    /// from here; tests observe stable custody through it.
+    #[cfg(test)]
+    pub(crate) fn semantic_bindings(&self) -> &semantics::SemanticBindingSet {
+        &self.semantic_bindings
+    }
+
+    /// Mutable binding-set access for the tick window and tests.
+    pub(crate) fn semantic_bindings_mut(&mut self) -> &mut semantics::SemanticBindingSet {
+        &mut self.semantic_bindings
+    }
+
+    /// Test seam: stage one provisional marker the way cgroup collection
+    /// does, so the tail adjudicator's genuine arm fires without a full
+    /// scoped pass.
+    #[cfg(test)]
+    pub(crate) fn reference_stage_adjudication(&mut self, caller: CallerId, pid: u32) {
+        self.pending_adjudication.insert(caller, pid);
+    }
+
+    /// Test seam: retained proven-image count, bounded by live bindings.
+    #[cfg(test)]
+    pub(crate) fn proven_image_count(&self) -> usize {
+        self.proven_images.len()
+    }
+
+    /// Test seam: script the binder's current-binding clock so scripted
+    /// horizons can cover scripted sightings.
+    #[cfg(test)]
+    pub(crate) fn set_semantic_binding_clock(&mut self, clock: fn() -> Option<u64>) {
+        self.binder.set_current_binding_clock(clock);
     }
 
     /// The run's attach set (read side): presentation reports its
@@ -316,24 +2586,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         std::mem::take(&mut self.pending_targets)
     }
 
+    /// Whether a target delta pends (pre-arm proved offsets absorbed before
+    /// passes): the lane's activation extend carries it instead of waiting
+    /// for the first pass.
+    pub(crate) fn has_pending_targets(&self) -> bool {
+        !self.pending_targets.endpoints.is_empty() || !self.pending_targets.objects.is_empty()
+    }
+
     /// Native capture starts: from now on each scan projection stages a
     /// coverage note per mapped edge from the capture's attach receipts.
-    /// `scope` is the capture's PID incarnation (`None` for the machine):
+    /// `scope` is explicitly System, Cgroup, or the capture's PID incarnation:
     /// only a caller of that pid whose start time matches, and the first
     /// such caller (image) only, is in scope — a reused pid never is.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 starts native capture.
-    pub(crate) fn begin_capture_coverage(&mut self, scope: Option<ScopeIncarnation>) {
+    pub(crate) fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage) {
         self.capture = Some(CaptureCoverage {
             scope,
             bound: None,
             attached_at: BTreeMap::new(),
             failed: BTreeSet::new(),
             unproven: None,
+            original_pid_exit: None,
             changed_objects: BTreeSet::new(),
             health_unproven: None,
             pairs_unproven: None,
             pairs_uncounted: None,
             last_clean_ns: None,
+            prearm_first_loss: None,
             sweep_began_ns: None,
             preadmission: PreadmissionStash::new(PREADMISSION_STASH_LIMIT),
             stopped: false,
@@ -370,6 +2649,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             capture.attached_at.remove(&failed.id);
             capture.failed.insert(failed.id);
         }
+        // The receipt's stamps just landed; feed the pre-arm watches.
+        self.note_prearm_receipt();
         self.note_partial_attach(receipt);
         if let Some(custody) = &receipt.custody {
             self.note_capture_custody(custody);
@@ -511,22 +2792,53 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// every watch before stop (C5.2 D2): each ongoing interval freezes at
     /// `min(custody at_ns, last clean read)` — watches staged earlier in
     /// the same batch freeze with the rest, and one no clean read proved
-    /// reads unknown — the loss is a gap, and no watch starts after.
-    /// After stop it stages nothing: ended intervals are frozen facts.
+    /// reads unknown — every counted column is a lower bound (bound-pair
+    /// growth stages nothing more past this point; pending first-sight
+    /// installs still land, now `lossy`), the loss is a gap, and no
+    /// watch starts after. After stop it stages nothing: ended
+    /// intervals are frozen facts.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody.
     pub(crate) fn note_capture_custody(&mut self, custody: &ScopeCustody) {
-        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+        let Some(capture) = self.capture.as_mut() else {
             return;
         };
+        // Revocation precedes every sticky-loss early return. A later generic
+        // loss cannot leave the earlier historical exit allowance behind.
+        let exit = match custody {
+            ScopeCustody::PidExited { proof, .. } => Some(*proof),
+            ScopeCustody::PidUnproven { .. } | ScopeCustody::PidLost { .. } => {
+                capture.original_pid_exit = None;
+                None
+            }
+            ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld => return,
+        };
+        if capture.stopped {
+            capture.original_pid_exit = None;
+            return;
+        }
+        if capture.unproven.is_some() {
+            if capture.original_pid_exit != exit {
+                capture.original_pid_exit = None;
+            }
+            return;
+        }
         let (at_ns, reason) = match custody {
-            ScopeCustody::System | ScopeCustody::PidHeld => return,
+            ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld => return,
+            ScopeCustody::PidExited { at_ns, .. } => (
+                *at_ns,
+                "PID custody lost: the PID target exited".to_string(),
+            ),
             ScopeCustody::PidUnproven { at_ns, reason } => (*at_ns, reason.clone()),
             ScopeCustody::PidLost { at_ns, reason } => (*at_ns, reason.clone()),
         };
-        if capture.unproven.is_some() {
-            return;
-        }
+        capture.original_pid_exit = exit.filter(|proof| {
+            matches!(capture.scope, CaptureScopeCoverage::Pid(scope) if scope == proof.scope())
+        });
         capture.unproven = Some(reason.clone());
+        // Bound-pair growth stages nothing more past this point
+        // (pending first-sight installs still land, now lossy), so
+        // counted columns are lower bounds from here on.
+        self.registry.note_counted_loss();
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
             format!(
@@ -573,10 +2885,57 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// counts exactly like a live one (P1-5 terminal-first).
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards batches.
     pub(crate) fn note_witness_batch(&mut self, batch: &WitnessBatch) {
+        if let Some(recorder) = &mut self.diagnostics {
+            let health = u16::from(batch.health_unproven.is_some())
+                | (u16::from(batch.health_regression.is_some()) << 1)
+                | (u16::from(!batch.read_failures.is_empty()) << 2)
+                | (u16::from(batch.refresh_sweep_gaps) << 3)
+                | (u16::from(batch.refresh_deadline_reached) << 4)
+                | (u16::from(batch.lifecycle_loss.is_some()) << 5)
+                | (u16::from(!batch.changed_objects.is_empty()) << 6)
+                | (u16::from(!batch.health.failures.is_empty()) << 7)
+                | (u16::from(batch.health.malformed_discovery != 0) << 8)
+                | (u16::from(batch.health.pin_check_failures != 0) << 9)
+                | (u16::from(batch.health.caller_evidence.is_some_and(|counters| {
+                    counters[CallerEvidence::PairInsertFailure.counter_index() as usize] != 0
+                })) << 10)
+                | (u16::from(batch.sweep_gaps) << 11);
+            if self.diagnostic_health != Some(health) {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+                record.reason = (health != 0).then_some(DiagnosticReason::CaptureLoss);
+                record.pre = Some(batch.health_baseline_ns);
+                record.post = Some(batch.health_read_ns);
+                recorder.record(record);
+                self.diagnostic_health = Some(health);
+            } else if health != 0 {
+                recorder.note_reason(DiagnosticReason::CaptureLoss);
+            }
+        }
         self.note_count_freshness(batch);
         let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
             return;
         };
+        // Sticky first loss for pre-arm truncation: the first batch carrying
+        // a counter rise, unreadable health, or lifecycle loss latches its
+        // baseline and the last clean read before it. First wins; a later
+        // clean sweep must not wash the loss away.
+        if capture.prearm_first_loss.is_none()
+            && (batch.health_regression.is_some()
+                || batch.health_unproven.is_some()
+                || batch.lifecycle_loss.is_some())
+        {
+            let mut baseline = batch.health_baseline_ns;
+            let mut cause = crate::render::PrearmWatchEnd::HealthLoss;
+            if let Some(loss) = &batch.lifecycle_loss {
+                baseline = baseline.min(loss.at_ns);
+                cause = crate::render::PrearmWatchEnd::ScopeUncertain;
+            }
+            capture.prearm_first_loss = Some(PrearmFirstLoss {
+                cause,
+                baseline_ns: baseline,
+                clean_before_ns: capture.last_clean_ns,
+            });
+        }
         capture.health_unproven = batch.health_unproven.clone();
         if capture.pairs_unproven.is_none() {
             capture.pairs_unproven = pair_precondition_failure(batch);
@@ -601,7 +2960,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         capture
             .changed_objects
             .extend(batch.changed_objects.iter().copied());
-        let custody_held = matches!(batch.custody, ScopeCustody::System | ScopeCustody::PidHeld);
+        let custody_held = matches!(
+            batch.custody,
+            ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld
+        );
         // Only a completed, gap-free CALLER_USE sweep has visited every row
         // present when it began, so it proves that sweep's first health
         // read; a bounded read that stopped mid-sweep proves nothing.
@@ -696,16 +3058,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// System scope: lifecycle evidence was lost (C5.2 D4). A lost exec or
     /// exit record may belong to any watched caller and cannot be
     /// localized, so every watch interval reaching past `at_ns` demotes to
-    /// unknown, the loss is a gap, and — sticky — no watch starts again in
-    /// this capture. Only the first loss stages anything.
+    /// unknown, every counted column is a lower bound (bound-pair growth
+    /// stages nothing more past this point; pending first-sight
+    /// installs still land, now `lossy`), the loss is a gap, and —
+    /// sticky — no watch starts again in this capture. Only the first
+    /// loss stages anything.
     fn note_lifecycle_loss(&mut self, loss: &LifecycleLoss) {
-        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+        let Some(capture) = self.capture.as_mut() else {
             return;
         };
-        if capture.unproven.is_some() {
+        capture.original_pid_exit = None;
+        if capture.stopped || capture.unproven.is_some() {
             return;
         }
         capture.unproven = Some(loss.reason.clone());
+        self.registry.note_counted_loss();
+        if let Some(recorder) = &mut self.diagnostics {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+            record.reason = Some(DiagnosticReason::CaptureLoss);
+            record.post = Some(loss.at_ns);
+            recorder.record(record);
+        }
         self.registry.note_watch_demotion(
             "native capture lifecycle evidence lost",
             loss.reason.clone(),
@@ -728,6 +3101,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         capture.stopped = true;
+        // Freeze the pre-arm stop boundary (C1): the published watch
+        // interval ends here, never at a later publication read past the
+        // detach. First wins: the loop-end freeze (if any) stands.
+        self.prearm_stop.get_or_insert(Some(at_ns));
+        if let Some(recorder) = &mut self.diagnostics {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+            record.reason = Some(DiagnosticReason::CaptureStopped);
+            record.post = Some(at_ns);
+            recorder.record(record);
+        }
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
             "native capture stopped before a clean health read proved the watch",
@@ -741,8 +3124,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return ScopeVerdict::Outside;
         };
-        let Some(scope) = capture.scope else {
-            return ScopeVerdict::Inside;
+        let scope = match capture.scope {
+            CaptureScopeCoverage::System => return ScopeVerdict::Inside,
+            CaptureScopeCoverage::Cgroup => return ScopeVerdict::Cgroup,
+            CaptureScopeCoverage::Pid(scope) => scope,
         };
         if scope.pid != pid {
             return ScopeVerdict::Outside;
@@ -798,7 +3183,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     "a later image of the PID target: its scope custody covers the first image only",
                 );
             }
-            ScopeVerdict::Inside => {}
+            ScopeVerdict::Inside | ScopeVerdict::Cgroup => {}
         }
         if let Some(reason) = &capture.unproven {
             return loss(reason);
@@ -851,6 +3236,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return unknown(UnknownReason::Uncounted(reason.clone()));
         }
         match since_ns {
+            Some(_) if scope == ScopeVerdict::Cgroup => {
+                unknown(UnknownReason::ScopeMembershipUnproven)
+            }
             Some(_) if capture.health_unproven.is_some() || capture.pairs_unproven.is_some() => {
                 None
             }
@@ -932,15 +3320,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn test_open_native_owner(
         &mut self,
         pid: u32,
-        image: p11scope_ebpf_common::ImageIdentity,
+        image: crate::discovery::native_binding::BoundImage,
         guard: &mut dyn super::inventory::ImageGuard,
         now_ns: u64,
     ) -> Result<CallerId> {
         let owner = self.engine.open_inventory_owner(pid, image, guard)?;
-        let authority = ImageAuthority::NativeExact {
-            task_cookie: image.task_cookie,
-            exec_id: image.exec_id,
-        };
+        let authority = ImageAuthority::NativeExact { image };
         match self.adapter.admit(pid, authority, now_ns) {
             Ok(caller) => {
                 self.owners.insert(caller, owner);
@@ -954,6 +3339,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn passes(&self) -> u64 {
         self.passes
+    }
+
+    /// Refuse one scan pass after `stop` (H6 slice 2): no pass number is
+    /// consumed and nothing is scanned, reconciled, or projected.
+    fn stopped_pass_report(&mut self, what: &str) -> PassReport {
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "scan refused after stop".into(),
+            reason: format!(
+                "the coordinator stopped; {what} starts no new scan, attach, \
+                 successor admission, or retry"
+            ),
+            budget: None,
+        });
+        PassReport {
+            pass: self.passes,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        }
     }
 
     /// One scan pass: collect the scope, reconcile caller incarnations
@@ -978,6 +3390,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
     }
 
+    /// Share only the attach set's bounded, original held-file proofs with
+    /// the next collection. Scan-pinned callers need not own an Engine view.
+    fn collector_budget(
+        &self,
+        budget: crate::discovery::scan::CaptureWorkBudget,
+        semantic_capture_live: bool,
+    ) -> crate::discovery::scan::CaptureWorkBudget {
+        let objects: BTreeSet<_> = self
+            .attach_set
+            .endpoints()
+            .map(|entry| entry.object)
+            .collect();
+        let targets: Vec<_> = objects
+            .into_iter()
+            .filter_map(|object| self.attach_set.target(object))
+            .collect();
+        // Any live native owner may watch these retained files. This negative
+        // snapshot includes changed/unproved targets that the positive mapped
+        // identity cache deliberately refuses; it grants no proof authority.
+        let exclusions = if self.capture.is_some() || semantic_capture_live {
+            crate::discovery::kernel_identity::KernelAnchorExclusions::from_targets(
+                targets.iter().copied(),
+            )
+        } else {
+            crate::discovery::kernel_identity::KernelAnchorExclusions::default()
+        };
+        let mut out = budget
+            .with_retained_mapped_identities(
+                crate::discovery::identity::RetainedMappedIdentities::from_targets(targets),
+            )
+            .with_kernel_anchor_exclusions(exclusions);
+        // The collector budget is a fresh copy, but it scans for this
+        // run: it inherits the run's `--exclude-module` inputs so
+        // inventory-native passes skip and record excluded files.
+        out.set_excludes(self.engine.budget.excludes().to_vec());
+        out
+    }
+
     /// The pass's collection as an owned job (Task 6 C5.7): it reads
     /// `/proc` only, over its own copies of the run's fixed hints and hooks,
     /// and hands back its catalog. It borrows nothing of the coordinator, so
@@ -992,17 +3442,218 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // The catalog lowers its admission under the Inventory policy and
         // budget the attach set enforces, never the Detailed slot ceiling
         // `inspect` reports.
+        let cgroup_requires_transaction = matches!(self.engine.scope, Scope::Cgroup { .. });
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
-        move || match scope {
-            InventoryScope::Pid(pid) => {
-                crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
+        let manifests = self.count_manifests.clone();
+        let (prior_objects, prior_bytes) = self.prearm_prior;
+        let budget =
+            self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
+        move || {
+            if cgroup_requires_transaction {
+                bail!("cgroup inventory requires the bounded scoped collection job");
             }
-            InventoryScope::System => {
-                crate::inspect_system::collect(&hints, &hooks, max_scan_pids, policy)
+            match scope {
+                InventoryScope::Pid(pid) => {
+                    crate::inspect_system::collect_pid_with_count_manifests(
+                        pid,
+                        &hints,
+                        &hooks,
+                        policy,
+                        budget,
+                        &manifests,
+                        prior_objects,
+                        prior_bytes,
+                    )
+                }
+                InventoryScope::System => crate::inspect_system::collect_with_count_manifests(
+                    &hints,
+                    &hooks,
+                    max_scan_pids,
+                    policy,
+                    budget,
+                    &manifests,
+                    prior_objects,
+                    prior_bytes,
+                ),
             }
         }
+    }
+
+    /// The D3d System pass with capture-owned identity state: the job
+    /// shares the `Send` disclosure state plus the one capture-owned
+    /// session, taken for this pass and returned afterwards. PID scope
+    /// ignores the handle and stays userspace without identity output.
+    pub(crate) fn collector_with_identity(
+        &self,
+        scope: InventoryScope,
+        max_scan_pids: Option<usize>,
+        shared: crate::inspect_system::IdentityShared,
+        semantic_capture_live: bool,
+    ) -> impl FnOnce() -> Result<crate::inspect_system::Catalog> + Send + 'static {
+        let cgroup_requires_transaction = matches!(self.engine.scope, Scope::Cgroup { .. });
+        let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
+        let hints = self.engine.module_hints.clone();
+        let hooks = self.engine.hooks.clone();
+        let manifests = self.count_manifests.clone();
+        let (prior_objects, prior_bytes) = self.prearm_prior;
+        let budget = self.collector_budget(
+            crate::discovery::scan::CaptureWorkBudget::default(),
+            semantic_capture_live,
+        );
+        move || {
+            if cgroup_requires_transaction {
+                bail!("cgroup inventory requires the bounded scoped collection job");
+            }
+            match scope {
+                InventoryScope::Pid(pid) => {
+                    crate::inspect_system::collect_pid_with_count_manifests(
+                        pid,
+                        &hints,
+                        &hooks,
+                        policy,
+                        budget,
+                        &manifests,
+                        prior_objects,
+                        prior_bytes,
+                    )
+                }
+                InventoryScope::System => crate::inspect_system::collect_system_with_identity(
+                    &hints,
+                    &hooks,
+                    max_scan_pids,
+                    policy,
+                    shared,
+                    budget,
+                    &manifests,
+                    prior_objects,
+                    prior_bytes,
+                ),
+            }
+        }
+    }
+
+    /// Prepare one bounded cgroup job over exactly the root retained by the
+    /// engine. A legacy System/PID job can never stand in for this request.
+    #[cfg_attr(not(test), allow(dead_code))] // Cg4 supplies the runtime owner.
+    pub(crate) fn cgroup_collector(
+        &self,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        control: CollectionControl,
+        max_scan_pids: Option<usize>,
+    ) -> Result<impl FnOnce() -> CgroupCollection + Send + 'static> {
+        self.cgroup_collector_observed(state, limits, control, max_scan_pids, None)
+    }
+
+    pub(crate) fn cgroup_collector_observed(
+        &self,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        control: CollectionControl,
+        max_scan_pids: Option<usize>,
+        observer: Option<crate::cgroup_stop_acceptance::Observer>,
+    ) -> Result<impl FnOnce() -> CgroupCollection + Send + 'static> {
+        let Scope::Cgroup { dir, .. } = &self.engine.scope else {
+            bail!("scoped cgroup collection requires a retained cgroup root");
+        };
+        let crate::discovery::scan::DiscoveryPolicy::Inventory(work) = self.engine.budget.policy()
+        else {
+            bail!("cgroup inventory collection requires the immutable Inventory work policy");
+        };
+        let request = CgroupCollectRequest {
+            root: Arc::clone(dir),
+            fence: self.cgroup_fence.issue(),
+            state,
+            limits,
+            control,
+            max_scan_pids,
+            scan_budget: self.collector_budget(
+                crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+                false,
+            ),
+            observer,
+            count_manifests: self.count_manifests.clone(),
+            prearm_prior: self.prearm_prior,
+        };
+        let hints = self.engine.module_hints.clone();
+        let hooks = self.engine.hooks.clone();
+        let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
+        Ok(move || {
+            crate::inspect_system::inventory_cgroup::collect(request, &hints, &hooks, policy)
+        })
+    }
+
+    /// Store custody until commit, reconcile old lifecycle only, and withhold
+    /// all new facts. The final grouped sample runs inside commit_batch.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_cgroup_collection(
+        &mut self,
+        collection: CgroupCollection,
+        now_ns: u64,
+    ) -> Result<PassReport> {
+        if self.publication_pending() {
+            bail!("the previous Joint publication retains its cgroup continuation");
+        }
+        if self.stopped {
+            bail!(
+                "the coordinator stopped; the collection starts no new scan, attach, \
+                 successor admission, or retry"
+            );
+        }
+        let Scope::Cgroup { dir, .. } = &self.engine.scope else {
+            bail!("scoped cgroup collection cannot apply to a PID/System coordinator");
+        };
+        if !collection.issued_by(&self.cgroup_fence) {
+            bail!("cgroup collection was not issued by this coordinator");
+        }
+        if !Arc::ptr_eq(dir, collection.root()) {
+            bail!("cgroup collection retained a different root from the coordinator");
+        }
+        if self.pending_cgroup.is_some() || self.completed_cgroup.is_some() {
+            bail!(
+                "previous cgroup transaction must be committed and its continuation consumed first"
+            );
+        }
+        let work = collection.work();
+        let events = self
+            .adapter
+            .reconcile_scoped(now_ns, &mut || work.charge(5));
+        self.apply_reconcile_events(&events, now_ns);
+        // Any history absent from this bounded pass stays live and uncertain;
+        // a partial census is never an exit or physical-unmap proof. The
+        // marker is provisional, not an early placeholder: the commit tail
+        // proves continued authority or stages the genuine uncertainty,
+        // never before the catalog is known. The loop charges nothing:
+        // records are admission-bounded (one marker per live caller), and
+        // failed walks exhaust the collection work that a charge would
+        // draw on — those passes need their markers most.
+        for record in self.adapter.records() {
+            if !record.retired {
+                self.pending_adjudication.insert(record.id, record.pid);
+            }
+        }
+        let scanned = collection.member_pids().count();
+        self.pending_cgroup = Some((collection, now_ns));
+        let pass = self.passes;
+        self.passes += 1;
+        Ok(PassReport {
+            pass,
+            scanned,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events,
+            timings: crate::timing::StageTimings::new(),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_cgroup_completion(&mut self) -> Option<CgroupCompletion> {
+        self.completed_cgroup.take()
     }
 
     /// The pass after collection: absorb the lowering into the attach set,
@@ -1018,7 +3669,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> PassReport {
+        if self.stopped {
+            return self.stopped_pass_report("a catalog pass");
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            return self.observe_empty_pass(
+                guard,
+                identity,
+                "catalog without retained cgroup transaction authority was withheld",
+                now_ns,
+            );
+        }
         let mut timings = std::mem::take(&mut catalog.stage_timings);
+        self.absorb_catalog_excluded(std::mem::take(&mut catalog.excluded));
         // Absorb at once: the aggregate pins and their fds drop here, never
         // living across reconcile or the native owner scans below.
         let absorb_start = crate::attach::monotonic_ns();
@@ -1062,9 +3725,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scan_pinned: 0,
         };
         let reconcile_start = crate::attach::monotonic_ns();
-        let mut events =
-            self.adapter
-                .reconcile(&observed, &mut |pid| resolver.resolve(pid), now_ns);
+        // Admission detection runs per incarnation, after its
+        // generation/liveness/executable/reuse validation: stale
+        // native records order against when the incarnation was
+        // actually detected, never the pass-start clock or a
+        // sweep-start sample shared across admissions (F7a). On
+        // clock-read failure the guard falls back explicitly (below),
+        // never a silent pass-start stamp.
+        let mut events = self.adapter.reconcile_detected(
+            &observed,
+            &mut |pid| resolver.resolve(pid),
+            now_ns,
+            &mut crate::attach::monotonic_ns,
+        );
+        if self.adapter.take_detection_clock_failed() {
+            self.exit_clocks_comparable = false;
+        }
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
@@ -1149,9 +3825,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         let native_callers = native.len();
         let pass = self.passes;
         self.passes += 1;
+        // The scan completed: hooks that drained before it are covered
+        // (or pre-pass), so only later arrivals count as post-pass.
+        // Hooks drained between this collection's end and this apply
+        // (a pending publication's service window) clear as covered
+        // though the catalog could not hold them — a known narrow miss.
+        self.post_pass_exec_newcomers.clear();
+        self.completed_scan_pass = true;
         PassReport {
             pass,
             scanned,
@@ -1178,6 +3862,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         reason: &str,
         now_ns: u64,
     ) -> PassReport {
+        if self.stopped {
+            return self.stopped_pass_report("an empty pass");
+        }
+        self.count_ownership.begin_catalog_pass();
         let mut resolver = AuthorityResolver {
             engine: &mut self.engine,
             pending: &mut self.pending_owners,
@@ -1186,9 +3874,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
-        let mut events =
-            self.adapter
-                .reconcile(&BTreeSet::new(), &mut |pid| resolver.resolve(pid), now_ns);
+        let mut events = if matches!(resolver.engine.scope, Scope::Cgroup { .. }) {
+            self.adapter.reconcile_scoped(now_ns, &mut || true)
+        } else {
+            // Detection runs per incarnation, after its validation:
+            // admissions order against detection time, never the
+            // pass-start clock (F7a).
+            self.adapter.reconcile_detected(
+                &BTreeSet::new(),
+                &mut |pid| resolver.resolve(pid),
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            )
+        };
+        if self.adapter.take_detection_clock_failed() {
+            self.exit_clocks_comparable = false;
+        }
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
@@ -1201,6 +3902,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .collect();
         for caller in &live {
             self.registry.note_member_unscanned(*caller);
+            self.tail_uncertain.insert(*caller);
         }
         self.registry.record_gap(RegistryGap {
             caller: None,
@@ -1210,6 +3912,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             reason: reason.to_string(),
             budget: None,
         });
+        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         let native_callers = live
             .iter()
             .filter(|caller| self.owners.contains_key(caller))
@@ -1240,7 +3943,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 CallerEvent::Admitted { id }
                 | CallerEvent::ExecRetired { new: id, .. }
                 | CallerEvent::Reused { new: id, .. } => *id,
-                CallerEvent::Exited { id, .. } => {
+                CallerEvent::Exited { id, .. } | CallerEvent::Retired { id, .. } => {
                     self.retire_caller_in_registry(*id, now_ns);
                     continue;
                 }
@@ -1334,6 +4037,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn retire_caller_in_registry(&mut self, id: CallerId, now_ns: u64) {
+        self.pending_leader_exits.remove(&id);
+        self.adapter.mark_leader_exit_pending(id, false);
+        self.semantic_bindings.release_successor(id);
+        // Each retirement stages once: held handoffs report the old
+        // incarnation at mint and again at commit, and the second report
+        // is a no-op here (owner binding rides the normal event path).
+        if !self.staged_retirements.insert(id) {
+            return;
+        }
+        self.count_ownership.forget_live(id);
         let reason = self
             .adapter
             .record(id)
@@ -1370,6 +4083,908 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Prepare native owner activation for prepared members with live
+    /// callers, before the final membership sample. All owner I/O
+    /// completes here; each returned staged handle commits only under
+    /// its matching borrowed permit, or releases. Members without a
+    /// settled expected image or without an acquisition answer skip
+    /// with a named gap. Already-owning members are the refresh
+    /// path's candidates, never this one's.
+    fn prepare_scoped_native_owners(
+        &mut self,
+        candidates: Vec<(u32, CallerId, crate::inspect_system::MemberGeneration)>,
+        work: &SharedCollectionWork,
+        acquisition: &mut dyn ImageAcquisition,
+    ) -> Vec<StagedNativeOwner> {
+        let mut staged = Vec::new();
+        for (pid, caller, generation) in candidates {
+            if staged.len() >= SCOPED_OWNER_PREPARATION_ATTEMPTS {
+                break;
+            }
+            if !work.charge(8) {
+                break;
+            }
+            if let Some(one) =
+                self.prepare_one_scoped_native_owner(pid, caller, generation, &mut *acquisition)
+            {
+                staged.push(one);
+            }
+        }
+        staged
+    }
+
+    fn prepare_one_scoped_native_owner(
+        &mut self,
+        pid: u32,
+        caller: CallerId,
+        generation: crate::inspect_system::MemberGeneration,
+        acquisition: &mut dyn ImageAcquisition,
+    ) -> Option<StagedNativeOwner> {
+        if self.owners.contains_key(&caller) {
+            // Already active: the refresh preparation owns it.
+            return None;
+        }
+        let domain = acquisition.acquisition_domain();
+        let expected = match self
+            .binder
+            .expected_owner_image(domain, caller, pid, &self.adapter)
+        {
+            Some(expected) => expected,
+            None => {
+                self.refuse_scoped_native_owner(caller, pid,
+                        "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained");
+                return None;
+            }
+        };
+        let (owner, original) = match self.engine.provision_staged_owner(pid, expected) {
+            Ok(provisioned) => provisioned,
+            Err(error) => {
+                self.refuse_scoped_native_owner(
+                    caller,
+                    pid,
+                    format!("staged owner provision failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        // One bounded single-row window for the stored observation;
+        // the pass deadline bounds the whole commit around it.
+        let window = ReadWindow::new(1, Instant::now() + Duration::from_secs(5))
+            .expect("one-row observation window");
+        let observation = match acquisition.acquire_caller_image(&original, window) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("fresh image observation unavailable: {error:#}"),
+                );
+                return None;
+            }
+        };
+        let mut guard = FreshImageGuard::new(&mut *acquisition, &self.binder, window);
+        let lease = match self.engine.acquire_inventory_scan(owner) {
+            Ok(lease) => lease,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("staged scan lease unavailable: {error:#}"),
+                );
+                return None;
+            }
+        };
+        // I4a window around the staged scan, mirroring the scan
+        // lane: the window limits cap the scan's work. No separate
+        // deadline rides here (u64::MAX): the pass deadline bounds the
+        // whole commit from outside, and the collection control's
+        // deadline has no reader on this path yet (packet 2 seam note).
+        let window_id = self.next_window;
+        self.next_window = self.next_window.saturating_add(1);
+        let window_token = match self
+            .engine
+            .budget
+            .begin_window(WindowId::new(window_id), u64::MAX)
+        {
+            Ok(token) => token,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged scan window unavailable: {error}"),
+                );
+                return None;
+            }
+        };
+        let checkpoint = match self.engine.budget.checkpoint(window_token.clone()) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ = self.engine.budget.finish_window(window_token);
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged scan checkpoint unavailable: {error}"),
+                );
+                return None;
+            }
+        };
+        let receipt = match self.engine.scan_inventory_owner(&lease, &mut guard) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = self.engine.budget.finish_scan(checkpoint);
+                let _ = self.engine.budget.finish_window(window_token);
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged owner scan failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        if let Err(error) = self.engine.budget.finish_scan(checkpoint) {
+            let _ = self.engine.budget.finish_window(window_token);
+            guard.release();
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("staged scan finish failed: {error}"),
+            );
+            return None;
+        }
+        if let Err(error) = self.engine.budget.finish_window(window_token) {
+            guard.release();
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("staged scan window finish failed: {error}"),
+            );
+            return None;
+        }
+        let prepared = match self
+            .engine
+            .prepare_inventory_reconciliation(receipt, &mut guard)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged reconciliation preparation failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        // Pin preflight seals the prepared reconciliation before the
+        // final membership sample: the commit-time apply trusts this
+        // evidence and performs no provider I/O.
+        let preflighted = match Engine::preflight_scoped_reconciliation(prepared) {
+            Ok(preflighted) => preflighted,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged reconciliation preflight failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        guard.release();
+        Some(StagedNativeOwner {
+            caller,
+            pid,
+            generation,
+            expected,
+            observation,
+            original,
+            owner,
+            lease,
+            preflighted,
+        })
+    }
+
+    /// Prepare scoped refreshes for already-owning prepared members,
+    /// before the final membership sample, stalest owner first (the
+    /// caller sorted the candidates; a pending epoch is the stalest
+    /// state). Bounded like activation preparation. Runs only when
+    /// no activation was staged this pass: the one scoped commit
+    /// belongs to the activation, and a refresh prepared beside it
+    /// could only abandon after spending the same acquisitions.
+    fn prepare_scoped_native_refreshes(
+        &mut self,
+        candidates: Vec<(u32, CallerId, crate::inspect_system::MemberGeneration)>,
+        work: &SharedCollectionWork,
+        acquisition: &mut dyn ImageAcquisition,
+        invalidated: &mut BTreeSet<CallerId>,
+    ) -> Vec<StagedNativeOwner> {
+        let mut staged = Vec::new();
+        for (pid, caller, generation) in candidates {
+            if staged.len() >= SCOPED_OWNER_PREPARATION_ATTEMPTS {
+                break;
+            }
+            if !work.charge(8) {
+                break;
+            }
+            if let Some(one) = self.prepare_one_scoped_native_refresh(
+                pid,
+                caller,
+                generation,
+                &mut *acquisition,
+                invalidated,
+            ) {
+                staged.push(one);
+            }
+        }
+        staged
+    }
+
+    fn prepare_one_scoped_native_refresh(
+        &mut self,
+        pid: u32,
+        caller: CallerId,
+        generation: crate::inspect_system::MemberGeneration,
+        acquisition: &mut dyn ImageAcquisition,
+        invalidated: &mut BTreeSet<CallerId>,
+    ) -> Option<StagedNativeOwner> {
+        let Some(owner) = self.owners.get(&caller).copied() else {
+            // Not owning: the activation preparation owns it.
+            return None;
+        };
+        let cause = if !self.scanned_owners.contains(&owner) {
+            RefreshCause::ScopeRecheck
+        } else if self.churned_owners.remove(&owner) {
+            RefreshCause::LoaderHint
+        } else {
+            RefreshCause::Periodic
+        };
+        if let Err(error) = self.engine.request_inventory_refresh(owner, cause) {
+            self.abandon_scoped_native_refresh(
+                caller,
+                pid,
+                owner,
+                None,
+                format!("scoped owner refresh request failed: {error:#}"),
+                invalidated,
+            );
+            return None;
+        }
+        let (expected, original) = match self.engine.begin_scoped_owner_refresh(owner) {
+            Ok(begun) => begun,
+            Err(error) => {
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("scoped owner refresh begin failed: {error:#}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        let window = ReadWindow::new(1, Instant::now() + Duration::from_secs(5))
+            .expect("one-row observation window");
+        let observation = match acquisition.acquire_caller_image(&original, window) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("scoped owner refresh observation unavailable: {error:#}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        let mut guard = FreshImageGuard::new(&mut *acquisition, &self.binder, window);
+        let lease = match self.engine.acquire_inventory_scan(owner) {
+            Ok(lease) => lease,
+            Err(error) => {
+                guard.release();
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("scoped owner refresh lease unavailable: {error:#}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        let window_id = self.next_window;
+        self.next_window = self.next_window.saturating_add(1);
+        let window_token = match self
+            .engine
+            .budget
+            .begin_window(WindowId::new(window_id), u64::MAX)
+        {
+            Ok(token) => token,
+            Err(error) => {
+                guard.release();
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("scoped owner refresh window unavailable: {error}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        let checkpoint = match self.engine.budget.checkpoint(window_token.clone()) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ = self.engine.budget.finish_window(window_token);
+                guard.release();
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("scoped owner refresh checkpoint unavailable: {error}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        let receipt = match self.engine.scan_inventory_owner(&lease, &mut guard) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = self.engine.budget.finish_scan(checkpoint);
+                let _ = self.engine.budget.finish_window(window_token);
+                guard.release();
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("scoped owner refresh scan failed: {error:#}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        if let Err(error) = self.engine.budget.finish_scan(checkpoint) {
+            let _ = self.engine.budget.finish_window(window_token);
+            guard.release();
+            self.abandon_scoped_native_refresh(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("scoped owner refresh scan finish failed: {error}"),
+                invalidated,
+            );
+            return None;
+        }
+        if let Err(error) = self.engine.budget.finish_window(window_token) {
+            guard.release();
+            self.abandon_scoped_native_refresh(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("scoped owner refresh window finish failed: {error}"),
+                invalidated,
+            );
+            return None;
+        }
+        let prepared = match self
+            .engine
+            .prepare_inventory_reconciliation(receipt, &mut guard)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                guard.release();
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("scoped owner refresh preparation failed: {error:#}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        let preflighted = match Engine::preflight_scoped_reconciliation(prepared) {
+            Ok(preflighted) => preflighted,
+            Err(error) => {
+                guard.release();
+                self.abandon_scoped_native_refresh(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("scoped owner refresh preflight failed: {error:#}"),
+                    invalidated,
+                );
+                return None;
+            }
+        };
+        guard.release();
+        Some(StagedNativeOwner {
+            caller,
+            pid,
+            generation,
+            expected,
+            observation,
+            original,
+            owner,
+            lease,
+            preflighted,
+        })
+    }
+
+    /// Abandon one scoped refresh with a named refusal gap: clear
+    /// the candidate flag and release the lease through the engine,
+    /// each failure reporting its own loud gap, and route an owner
+    /// whose checked image ended to this pass's suspend set.
+    fn abandon_scoped_native_refresh(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        owner: ProcessViewId,
+        lease: Option<&ScanLease>,
+        reason: impl Into<String>,
+        invalidated: &mut BTreeSet<CallerId>,
+    ) {
+        self.refuse_scoped_native_refresh(caller, pid, reason.into());
+        self.release_scoped_refresh_state(caller, pid, owner, lease);
+        if matches!(self.engine.inventory_owner_image_changed(owner), Ok(true)) {
+            invalidated.insert(caller);
+        }
+    }
+
+    /// Release one staged refresh with no gap (deferral past the
+    /// shared commit budget, or a permitted member of an incomplete
+    /// transaction): only a failed state release reports loudly.
+    fn release_staged_native_refresh(&mut self, staged: StagedNativeOwner) {
+        self.release_scoped_refresh_state(
+            staged.caller,
+            staged.pid,
+            staged.owner,
+            Some(&staged.lease),
+        );
+    }
+
+    fn release_scoped_refresh_state(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        owner: ProcessViewId,
+        lease: Option<&ScanLease>,
+    ) {
+        if let Err(error) = self.engine.abandon_scoped_owner_refresh(owner, lease) {
+            self.refuse_scoped_native_refresh(
+                caller,
+                pid,
+                format!("scoped owner refresh abandon failed: {error:#}"),
+            );
+        }
+    }
+
+    fn refuse_scoped_native_refresh(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        reason: impl Into<String>,
+    ) {
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: Some(pid),
+            subject: "native owner refresh refused".into(),
+            reason: reason.into(),
+            budget: None,
+        });
+    }
+
+    /// Commit one staged refresh under its borrowed final-sample
+    /// permit: bounded pure work only. The engine commit clears the
+    /// candidate flag and releases the lease on every path; a
+    /// refused commit keeps prior facts, reports by name, and routes
+    /// a changed image to this pass's suspend set. Returns whether
+    /// the member was lost at a proof/liveness check after its
+    /// permit was granted (proof validation, or the engine
+    /// commit's liveness re-check): the caller then withdraws the
+    /// caller's admission standing if the transaction is still
+    /// complete. Other refused commits keep the owner.
+    fn commit_scoped_native_refresh(
+        &mut self,
+        staged: StagedNativeOwner,
+        permit: &CgroupAdmissionPermit<'_>,
+        verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
+        now_ns: u64,
+        invalidated: &mut BTreeSet<CallerId>,
+    ) -> bool {
+        let StagedNativeOwner {
+            caller,
+            pid,
+            generation,
+            observation,
+            original,
+            owner,
+            lease,
+            preflighted,
+            ..
+        } = staged;
+        let Some(proof) = ScopedOwnerProof::validate(pid, &generation, permit) else {
+            self.abandon_scoped_native_refresh(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                "the refreshed member does not match the final-sample permit",
+                invalidated,
+            );
+            return true;
+        };
+        #[cfg(test)]
+        scoped_commit_gate_test::notify(scoped_commit_gate_test::Phase::RefreshProofValidated);
+        let mut replay = ReplayImageGuard {
+            original,
+            observation,
+        };
+        match self.engine.commit_scoped_owner_refresh(
+            owner,
+            preflighted,
+            &lease,
+            &proof,
+            &mut replay,
+        ) {
+            Ok(commit) => {
+                self.project_native_commit(caller, owner, &commit, verdicts, now_ns);
+                if commit.complete {
+                    self.complete_scanned.insert(caller);
+                }
+                self.scanned_owners.insert(owner);
+                false
+            }
+            Err(error) => {
+                self.refuse_scoped_native_refresh(
+                    caller,
+                    pid,
+                    format!("scoped owner refresh commit failed: {error:#}"),
+                );
+                if matches!(self.engine.inventory_owner_image_changed(owner), Ok(true)) {
+                    invalidated.insert(caller);
+                    false
+                } else {
+                    !replay.original.still_the_same()
+                }
+            }
+        }
+    }
+
+    /// Suspend every active scoped owner its complete transaction
+    /// left behind: callers absent from `allowed_callers`, plus
+    /// owners proven exec-changed this pass, plus admitted
+    /// members lost at their later permit proof. Runs after the
+    /// scoped commit loop and before the engine-tail revision,
+    /// because release mutates engine facts. Complete outcomes
+    /// only (the caller gates): a failed collection proves no
+    /// absence.
+    fn suspend_absent_scoped_owners(
+        &mut self,
+        allowed_callers: &BTreeSet<CallerId>,
+        invalidated: &BTreeSet<CallerId>,
+        lost: &BTreeSet<CallerId>,
+        now_ns: u64,
+    ) {
+        let suspend: Vec<(CallerId, ProcessViewId)> = self
+            .owners
+            .iter()
+            .filter(|(caller, _)| {
+                !allowed_callers.contains(caller)
+                    || invalidated.contains(caller)
+                    || lost.contains(caller)
+            })
+            .map(|(caller, owner)| (*caller, *owner))
+            .collect();
+        for (caller, owner) in suspend {
+            self.suspend_one_scoped_owner(
+                caller,
+                owner,
+                invalidated.contains(&caller),
+                lost.contains(&caller),
+                now_ns,
+            );
+        }
+    }
+
+    /// Tear one suspended owner down to scan-pinned: cancel its
+    /// installed native authority where the caller still stands
+    /// (a cancel that misses retires the caller with its evidence
+    /// instead of claiming the fallback, mirroring the activation
+    /// rollback), then release the engine owner and report the
+    /// exact suspended gap. A refused release keeps the owner and
+    /// reports loudly through the scoped refusal helper.
+    fn suspend_one_scoped_owner(
+        &mut self,
+        caller: CallerId,
+        owner: ProcessViewId,
+        exec_changed: bool,
+        lost_member: bool,
+        now_ns: u64,
+    ) {
+        let record = self.adapter.record(caller);
+        let pid = record.map(|record| record.pid).unwrap_or(0);
+        let retired = record.is_none_or(|record| record.retired);
+        let reason: String = if retired {
+            NATIVE_OWNER_SUSPENDED_RETIRED_REASON.into()
+        } else {
+            let fallback_reason = if exec_changed {
+                NATIVE_OWNER_SUSPENDED_EXEC_REASON
+            } else if lost_member {
+                NATIVE_OWNER_SUSPENDED_LOST_REASON
+            } else {
+                NATIVE_OWNER_SUSPENDED_ABSENT_REASON
+            };
+            match self.engine.inventory_owner_image(owner) {
+                Ok(image)
+                    if record.is_some_and(|record| {
+                        record.authority == ImageAuthority::NativeExact { image }
+                    }) =>
+                {
+                    match self.adapter.cancel_scoped_native_authority(caller, image) {
+                        Ok(()) => fallback_reason.into(),
+                        Err(cancel_reason) => {
+                            if self.adapter.retire_native_caller_without_owner(
+                                caller,
+                                "native authority cancellation missed its installed image during suspend; the caller retires with its evidence rather than keep native-exact authority without an owner".into(),
+                                now_ns,
+                            ) {
+                                self.retire_caller_in_registry(caller, now_ns);
+                                format!(
+                                    "native authority cancellation missed its installed image during suspend ({cancel_reason}); the caller retired with its evidence and its native owner was released; scan-pinned fallback is not claimed"
+                                )
+                            } else {
+                                fallback_reason.into()
+                            }
+                        }
+                    }
+                }
+                Ok(_) => fallback_reason.into(),
+                Err(error) => format!(
+                    "scoped owner image unavailable during suspend: {error:#}; its native owner was released"
+                ),
+            }
+        };
+        match self.engine.release_scoped_owner(owner) {
+            Ok(()) => {
+                self.owners.remove(&caller);
+                self.complete_scanned.remove(&caller);
+                self.scanned_owners.remove(&owner);
+                self.churned_owners.remove(&owner);
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: None,
+                    pid: Some(pid),
+                    subject: "native owner suspended".into(),
+                    reason,
+                    budget: None,
+                });
+            }
+            Err(error) => {
+                self.refuse_scoped_native_owner(
+                    caller,
+                    pid,
+                    format!("scoped owner release failed: {error:#}"),
+                );
+            }
+        }
+    }
+
+    /// Commit one staged native owner under its borrowed final-sample
+    /// permit: bounded pure work only. Validates the staged pid and
+    /// generation against the permit, installs native-exact caller
+    /// authority, activates the staged owner (which replays the stored
+    /// observation through the real binding comparison and applies the
+    /// preflighted reconciliation with no provider I/O), binds owner
+    /// to caller, and projects the commit. Any failure releases the
+    /// staged reservation and lease with a named gap; an installed
+    /// authority rolls back when the engine commit refuses, and a
+    /// rollback that misses its installed image retires the caller
+    /// instead of leaving native-exact authority without an owner.
+    fn commit_staged_native_owner(
+        &mut self,
+        staged: StagedNativeOwner,
+        permit: &CgroupAdmissionPermit<'_>,
+        verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
+        now_ns: u64,
+    ) {
+        let StagedNativeOwner {
+            caller,
+            pid,
+            generation,
+            expected,
+            observation,
+            original,
+            owner,
+            lease,
+            preflighted,
+        } = staged;
+        let Some(proof) = ScopedOwnerProof::validate(pid, &generation, permit) else {
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                "the staged member does not match the final-sample permit; scan-pinned fallback retained",
+            );
+            return;
+        };
+        if let Err(failure) = self
+            .adapter
+            .install_scoped_native_authority(caller, expected, &proof)
+        {
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("native authority installation refused: {}", failure.reason),
+            );
+            return;
+        }
+        let mut replay = ReplayImageGuard {
+            original,
+            observation,
+        };
+        match self
+            .engine
+            .activate_staged_owner(owner, preflighted, &lease, &proof, &mut replay)
+        {
+            Ok(commit) => {
+                self.owners.insert(caller, owner);
+                self.project_native_commit(caller, owner, &commit, verdicts, now_ns);
+                if commit.complete {
+                    self.complete_scanned.insert(caller);
+                }
+            }
+            Err(error) => {
+                self.rollback_installed_native_authority(caller, pid, expected, &error, now_ns);
+            }
+        }
+    }
+
+    /// Roll back one installed native authority after its staged
+    /// activation failed: restore scan-pinned authority when the
+    /// installed image still stands. When the rollback misses its
+    /// installed image, the installed authority survives with no
+    /// activated owner, so retire the caller (evidence retained)
+    /// instead of leaving a live `NativeExact` caller without its
+    /// owner. Bounded pure work: no provider I/O. Every outcome
+    /// reports its own named gap; nothing drops silently.
+    fn rollback_installed_native_authority(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        expected: BoundImage,
+        error: &anyhow::Error,
+        now_ns: u64,
+    ) {
+        if let Err(rollback) = self
+            .adapter
+            .cancel_scoped_native_authority(caller, expected)
+        {
+            self.refuse_scoped_native_owner(caller, pid, rollback);
+            if self.adapter.retire_native_caller_without_owner(
+                caller,
+                "native authority rollback missed its installed image after a failed activation; the caller retires with its evidence rather than keep native-exact authority without an activated owner".into(),
+                now_ns,
+            ) {
+                self.retire_caller_in_registry(caller, now_ns);
+                self.refuse_scoped_native_owner(
+                    caller,
+                    pid,
+                    "the installed native authority survived a missed rollback with no activated owner; the caller retired with its evidence; scan-pinned fallback is not claimed",
+                );
+            }
+        }
+        self.refuse_scoped_native_owner(
+            caller,
+            pid,
+            format!("staged owner activation failed: {error:#}"),
+        );
+    }
+
+    /// Revise the engine tail after scoped owner work: the batch
+    /// tail already ran at this publication's start, and owner
+    /// preparation dirtied its inputs whether or not any activation
+    /// committed, so republish before the publication's revisions are
+    /// cut. Infallible by construction — the scoped region allows no
+    /// later fallible tail — so a failed revision keeps the previous
+    /// publication with a named gap and never unwinds committed work.
+    fn revise_engine_tail_after_scoped_owners(&mut self) {
+        if let Err(error) = self.engine.publish_batch_tail(true) {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "engine tail revision failed".into(),
+                reason: format!(
+                    "scoped owner work could not revise the engine tail: {error:#}; the previous publication stands"
+                ),
+                budget: None,
+            });
+        }
+    }
+
+    /// Release one staged owner that cannot commit: the scan lease when
+    /// one was acquired, and the staged record, view, and ID occupancy,
+    /// with a named refusal gap. Every release step reports its own
+    /// loud gap on failure; nothing is dropped silently.
+    fn abandon_staged_native_owner(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        owner: ProcessViewId,
+        lease: Option<&ScanLease>,
+        reason: impl Into<String>,
+    ) {
+        self.refuse_scoped_native_owner(caller, pid, reason.into());
+        if let Some(lease) = lease
+            && let Err(error) = self.engine.release_inventory_scan(lease)
+        {
+            self.refuse_scoped_native_owner(
+                caller,
+                pid,
+                format!("staged scan lease release failed: {error:#}"),
+            );
+        }
+        if let Err(error) = self.engine.release_staged_owner(owner) {
+            self.refuse_scoped_native_owner(
+                caller,
+                pid,
+                format!("staged owner release failed: {error:#}"),
+            );
+        }
+    }
+
+    fn refuse_scoped_native_owner(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        reason: impl Into<String>,
+    ) {
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: Some(pid),
+            subject: "native owner activation refused".into(),
+            reason: reason.into(),
+            budget: None,
+        });
+    }
     /// One native owner through the core: refresh request, lease, I4a
     /// window, scan, prepare, commit (which revalidates at the
     /// publication boundary). The lease releases on every path.
@@ -1515,6 +5130,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !shown {
                 self.registry
                     .note_module_absent(caller, edge.0, commit.complete, now_ns);
+                if !commit.complete {
+                    self.tail_uncertain.insert(caller);
+                }
                 absent = commit.complete && edge.1 == MappingState::Mapped;
             }
         }
@@ -1539,6 +5157,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let absorbed = self.attach_set.absorb(&lowering.plan, &lowering.pins);
         drop(lowering);
+        self.record_absorbed(absorbed)
+    }
+
+    fn record_absorbed(
+        &mut self,
+        absorbed: AbsorbOutcome,
+    ) -> BTreeMap<AttachModuleKey, AttachVerdict> {
         self.pending_targets.append(absorbed.delta);
         for gap in absorbed.gaps {
             self.registry.record_gap(RegistryGap {
@@ -1575,6 +5200,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
     ) {
         use crate::inspect_system::{MemberStatus, ObservationEvidence};
+        self.count_ownership.begin_catalog_pass();
+        self.count_ownership
+            .invalidate_memberships(self.attach_set.count_revision());
         let mut by_pid: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
         for (object_index, object) in catalog.objects.iter().enumerate() {
             for (observation_index, observation) in object.observations.iter().enumerate() {
@@ -1591,6 +5219,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             if !process.status.attributable() {
                 self.registry.note_member_unscanned(caller);
+                self.tail_uncertain.insert(caller);
+                self.count_ownership
+                    .queue_observation(caller, Vec::new(), None);
                 continue;
             }
             if let Err(loss) = self.generation_join(caller, process) {
@@ -1598,8 +5229,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // The collected mappings belong to another generation or
                 // image: they neither confirm nor refute this caller's.
                 self.registry.note_member_unscanned(caller);
+                self.tail_uncertain.insert(caller);
+                self.count_ownership
+                    .queue_observation(caller, Vec::new(), None);
                 continue;
             }
+            let mut retirement_admission_known = true;
+            let mut deep_scanned = false;
             // One mapping note per observation (not per object path):
             // aliased objects are observed under several paths and the
             // registry accumulates every spelling.
@@ -1612,6 +5248,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     sha256: sha256.clone(),
                 });
                 let verdict = attach_key.as_ref().and_then(|key| verdicts.get(key));
+                retirement_admission_known &= !observation.double_loaded
+                    && matches!(verdict, Some(AttachVerdict::Admitted { reasons, .. }) if reasons.is_empty());
                 let mut info = catalog_module_info(object, verdict);
                 info.path = observation.path.clone();
                 info.double_loaded = observation.double_loaded;
@@ -1620,6 +5258,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ObservationEvidence::DeepScan => {
                         self.registry
                             .note_mapping(caller, process.pid, info, now_ns);
+                        deep_scanned = true;
                     }
                     ObservationEvidence::MapsMatch => {
                         self.registry
@@ -1637,6 +5276,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Only a complete deep scan makes absence authoritative: a
             // maps match decoded nothing, so its absences read uncertain.
             let complete = matches!(process.status, MemberStatus::Scanned);
+            if complete && deep_scanned {
+                // Complete same-custody caller/provider/full-image proof:
+                // the generation join held above, the member image
+                // scanned completely, and provider mappings re-observed.
+                self.complete_scanned.insert(caller);
+            }
             let shown: BTreeSet<ModuleKey> = process
                 .objects
                 .iter()
@@ -1660,8 +5305,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if !shown {
                     self.registry
                         .note_module_absent(caller, module, complete, now_ns);
+                    if !complete {
+                        self.tail_uncertain.insert(caller);
+                    }
                     absent = complete && mapping == MappingState::Mapped;
                 }
+            }
+            let complete_scan = process
+                .complete_scan
+                .as_ref()
+                .filter(|receipt| {
+                    retirement_admission_known
+                        && matches!(process.status, MemberStatus::Scanned)
+                        && process.generation.as_ref() == Some(receipt.generation())
+                        && self.adapter.record(caller).is_some_and(|record| {
+                            !record.retired
+                                && record.start_time.is_some()
+                                && record.start_time == receipt.generation().start_time
+                                && record.exe.is_some()
+                                && record.exe == receipt.generation().exe
+                                && record.first_seen_ns <= receipt.started_ns()
+                        })
+                        && receipt.started_ns() > 0
+                        && receipt.finished_ns() > receipt.started_ns()
+                })
+                .cloned();
+            // This projection's mappings are staged above, unpublished: the
+            // observation is judged against the publication that carries
+            // them, never against the committed snapshot before it.
+            if !self.count_ownership.queue_projected_observation(
+                caller,
+                shown.into_iter().collect(),
+                complete_scan,
+                self.registry.published_revision(),
+            ) {
+                self.registry.record_gap(RegistryGap { caller: Some(caller), module: None, pid: Some(process.pid), subject: "current count ownership storage refused".into(), reason: "the bounded ownership observation could not be retained; historical evidence remains, current count eligibility is unknown".into(), budget: Some(BudgetRefusal { resource: "inventory_count_observations", limit: self.registry.limits().max_edges, requested: self.registry.limits().max_edges.saturating_add(1) }) });
             }
             if absent && let Some(owner) = self.owners.get(&caller).copied() {
                 self.churned_owners.insert(owner);
@@ -1685,7 +5363,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
         }
-        for gap in catalog.skipped.iter().chain(catalog.notes.iter()) {
+        let examining: BTreeSet<u32> = catalog
+            .processes
+            .iter()
+            .filter(|process| process.hints_examined)
+            .map(|process| process.pid)
+            .collect();
+        let object_paths: BTreeSet<&str> = catalog
+            .objects
+            .iter()
+            .map(|object| object.path.as_str())
+            .collect();
+        let notes = collapse_hint_misses(&examining, &object_paths, &catalog.notes);
+        for gap in catalog.skipped.iter().chain(notes.iter()) {
             self.registry.record_gap(RegistryGap {
                 caller: gap.pid.and_then(|pid| self.adapter.live_id(pid)),
                 module: None,
@@ -1746,6 +5436,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
     ) -> NativeReceipt {
+        let mut hook_events = Vec::new();
         match batch {
             NativeBatch::Witness(batch) => {
                 // The binder absorbs before the batch's health is noted:
@@ -1765,11 +5456,334 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.lifecycle_high_water_bytes = self
                     .lifecycle_high_water_bytes
                     .max(batch.drain_high_water_bytes);
-                self.binder.absorb_lifecycle(&batch)
+                self.binder.absorb_lifecycle(&batch);
+                self.note_leader_exits(&batch);
+                // Exec hooks for callers the binder never held mint through
+                // the hook path (the lost race); held callers stay the
+                // row-proven path's. Runs after absorption so a row the
+                // exec's own decide-ready bound already owns its caller.
+                let domain = batch.domain;
+                for record in &batch.records {
+                    if record.kind != DISCOVERY_KIND_EXEC {
+                        continue;
+                    }
+                    hook_events.extend(self.apply_exec_hook(
+                        domain,
+                        record,
+                        identity,
+                        now_ns,
+                        &mut crate::attach::monotonic_ns,
+                    ));
+                }
             }
             NativeBatch::Finish { domain } => self.binder.finish(domain),
+            NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
         }
-        self.stage_binder_output(identity, now_ns)
+        let mut receipt = self.stage_binder_output(identity, now_ns);
+        receipt.events.extend(hook_events);
+        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
+        receipt
+    }
+
+    /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
+    /// pin still holds is link loss, not death — record it once, keep the
+    /// original custody, and make no permanent dead tombstone. A later EXEC
+    /// still renews recovery, in the same or a later batch. Whole-group
+    /// death (a dead pin or no live caller) is reconcile's business, never
+    /// this record's. Under a mismatched PID numbering the record cannot
+    /// select a caller — the kernel tgid is looked up as an
+    /// observer-/proc pid — so every exit is dropped silently: no gap, no
+    /// fence.
+    fn note_leader_exits(&mut self, batch: &DiscoveryBatch) {
+        if !crate::pidns::numbering().agrees() {
+            return;
+        }
+        // All records drained after stop share one finite allowance.
+        // Unproved final records are disposed, never queued for retry.
+        let mut final_work = crate::process::leader_exit::LeaderExitReadBudget::for_commit();
+        for record in &batch.records {
+            // 6.14 Option A: kind 7 is a leader exit plus the mapping
+            // summary (inventory objects never emit it; defensive).
+            if !matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) {
+                continue;
+            }
+            let pid = (record.pid_tgid >> 32) as u32;
+            let Some(caller) = self.adapter.live_id(pid) else {
+                continue;
+            };
+            // A hook that predates the live incarnation's admission
+            // detection is the old image's delayed record (or a reused
+            // pid's): PID equality alone cannot select the live
+            // caller. The boundary is the actual detection time, never
+            // the pass-start clock. Under an unknown clock offset the
+            // guard stays off and the exit records: never silently
+            // suppress a genuine exit.
+            if !self.exit_clocks_comparable {
+                if !self.exit_clock_gap_noted {
+                    self.exit_clock_gap_noted = true;
+                    self.registry.record_gap(RegistryGap {
+                        caller: Some(caller),
+                        module: None,
+                        pid: Some(pid),
+                        subject: "leader-exit clocks unvalidated".into(),
+                        reason: "the observer's time-namespace offset is unknown, so BPF hook \
+                             timestamps and admission stamps may not share a clock; the \
+                             stale-exit guard is disabled and exits record unfiltered"
+                            .into(),
+                        budget: None,
+                    });
+                }
+            } else if self
+                .adapter
+                .record(caller)
+                .is_some_and(|incarnation| record.hook_ts_ns < incarnation.admitted_ns)
+            {
+                continue;
+            }
+            if self.stopped {
+                self.adjudicate_stopped_leader_exit(
+                    caller,
+                    pid,
+                    record.hook_ts_ns,
+                    batch.domain,
+                    &mut final_work,
+                );
+            } else {
+                self.defer_leader_exit(caller, pid, record.hook_ts_ns, batch.domain);
+            }
+        }
+    }
+
+    /// One `EXEC` record for a caller whose image the binder never held
+    /// (the lost race): the hook fired before any row of the old image
+    /// bound, so the row-proven transition path can never emit (Rules 4+5
+    /// refuse both generations under the pre-exec admission, and the live
+    /// cookie has moved on). The hook plus liveness through the held pin
+    /// (a cookie answer with or without a ticket) still prove the
+    /// turnover: retire the unheld predecessor and mint the successor,
+    /// disclosed, without exact old/new images. A caller the binder holds
+    /// is the row-proven path's: the hook stays out, so the two paths are
+    /// mutually exclusive by construction and never double-mint. Stale
+    /// hooks and missing callers skip silently (mirroring
+    /// `note_leader_exits`); every refusal to mint is a named gap, and the
+    /// mint itself is disclosed: nothing here is silent. Under a mismatched
+    /// PID numbering the hook does nothing at all (no lookup, no mint, no
+    /// gap): the kernel tgid cannot select an observer-/proc pid.
+    /// A hook inside collection but before admission additionally needs its
+    /// original producer task ticket to match the retained pin in this same
+    /// native domain. Timestamp/PID or a current cookie alone cannot select
+    /// that incarnation. No `ExecProof` is synthesized (only the binder proves
+    /// exact transitions); the old owner's image invalidates through the normal
+    /// guard revalidation instead.
+    fn apply_exec_hook(
+        &mut self,
+        domain: NativeDomainId,
+        record: &p11scope_ebpf_common::DiscoveryRecord,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Vec<CallerEvent> {
+        if !crate::pidns::numbering().agrees() {
+            return Vec::new();
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let hook_ts_ns = record.hook_ts_ns;
+        let original_ticket = record.exec_task_ticket();
+        let Some(caller) = self.adapter.live_id(pid) else {
+            // A hook for a process no pass ever admitted: after the last
+            // completed scan it is a newcomer the capture will never
+            // scan, so the terminal disclosure counts it. Cgroup scope
+            // stays out (transaction coverage, not scan passes).
+            if !matches!(self.engine.scope, Scope::Cgroup { .. }) {
+                self.post_pass_exec_newcomers.insert(pid);
+            }
+            return Vec::new();
+        };
+        if self.binder.holds_image(domain, caller) {
+            return Vec::new();
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            self.cgroup_fence.invalidate();
+        }
+        if let Some((collection, _)) = &mut self.pending_cgroup {
+            collection.invalidate(pid);
+        }
+        // The stale-hook guard is the exit guard's: without comparable
+        // clocks a hook cannot be ordered against the admission, and
+        // minting could retire a live caller for a stale hook. Unlike
+        // exits (safe unfiltered), a mint is fail-closed here.
+        if !self.exit_clocks_comparable {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused without comparable clocks".into(),
+                reason: "the observer's time-namespace offset is unknown, so the exec hook \
+                     cannot be ordered against the admission; minting could retire a live \
+                     caller for a stale hook, so no successor is minted"
+                    .into(),
+                budget: None,
+            });
+            return Vec::new();
+        }
+        let Some(incarnation) = self.adapter.record(caller) else {
+            return Vec::new();
+        };
+        if hook_ts_ns < incarnation.first_seen_ns {
+            return Vec::new();
+        }
+        let collection_query = if hook_ts_ns < incarnation.admitted_ns {
+            // A zero original word never triggers a lookup that could adopt
+            // a reused PID's current task. Nonzero evidence is compared only
+            // as the exact typed domain/cookie pair, through the held pin's
+            // existing before/after liveness-checked lookup.
+            let expected = original_ticket.map(|ticket| DomainCookie::new(domain, ticket));
+            let query = original_ticket.and_then(|_| {
+                self.adapter
+                    .live_pin(pid)
+                    .map(|(_, pin)| identity.query_cookie(domain, pin))
+            });
+            if !matches!(&query, Some(CookieQuery::Cookie(actual)) if Some(*actual) == expected) {
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: None,
+                    pid: Some(pid),
+                    subject: "collection-window exec task unproven".into(),
+                    reason: "the original exec task ticket is unavailable or does not agree \
+                         with a live retained-pin ticket in this native domain; the current \
+                         incarnation is neither retired nor replaced"
+                        .into(),
+                    budget: None,
+                });
+                return Vec::new();
+            }
+            query
+        } else {
+            None
+        };
+        // The successor's binding safety needs the staging clock (its
+        // first_seen) to be later than the hook's timestamp: at or before
+        // it, the binder would refuse every row the successor ever reads,
+        // since a proved exec of its thread group sits at or after its
+        // admission, so a mint here could never bind. Refuse fail-closed:
+        // the proved old incarnation retires without a successor, disclosed.
+        if now_ns <= hook_ts_ns {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused with a stale staging clock".into(),
+                reason: "the staging clock is not later than the exec hook's timestamp, so the \
+                     successor's first_seen would be at or before the proved exec and the binder \
+                     would refuse every row it ever reads, since a proved exec sits at or after \
+                     its admission; the proved old incarnation retires without a successor"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        // The live guard is liveness through the held pin: the cookie
+        // query checks the pidfd before and after its lookup, so a ticket
+        // (`Cookie`) and no ticket yet (`NoCookie`) both prove the pinned
+        // process lives on. `NoCookie` is the expected answer when the hook
+        // drains before the new image's first instrumented call and its
+        // leader never entered one here (or a nonleader exec replaced the
+        // ticketed leader): the ticket is a task lifetime token, never an
+        // image proof, so requiring one refused the common lost race. An
+        // exited or unanswerable pin leaves the successor unproven; the
+        // hook still proved the old image ended, so the predecessor
+        // retires honestly without a successor rather than being claimed
+        // current, and the refusal names which answer it got.
+        let query = collection_query.or_else(|| {
+            self.adapter
+                .live_pin(pid)
+                .map(|(_, pin)| identity.query_cookie(domain, pin))
+        });
+        let refusal = match query {
+            Some(CookieQuery::Cookie(_) | CookieQuery::NoCookie) => None,
+            Some(CookieQuery::Exited) => Some(
+                "the held pin reports the process exited, so no current image \
+                 exists; the proved old incarnation retires without a successor",
+            ),
+            Some(CookieQuery::Unavailable(_)) => Some(
+                "the cookie query through the held pin was unavailable, so the \
+                 current image is unproven; the proved old incarnation retires \
+                 without a successor",
+            ),
+            None => Some(
+                "no pin is held for the live caller, so the current image is \
+                 unproven; the proved old incarnation retires without a successor",
+            ),
+        };
+        if let Some(reason) = refusal {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused without a live image".into(),
+                reason: reason.into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: Some(pid),
+            subject: "exec successor minted without a held predecessor".into(),
+            reason: "an exec hook fired for a caller whose image the binder never held \
+                 (its rows were refused under the pre-exec admission, or none were \
+                 read); the hook proves the old image ended and the held pin proves the \
+                 process lives on, so the successor is minted without exact old/new \
+                 images"
+                .into(),
+            budget: None,
+        });
+        if self.stopped {
+            // Stop wins before successor admission: the old incarnation
+            // still retires on the proven image end, but no handoff is
+            // minted and no retry is scheduled.
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused while stopped".into(),
+                reason: "the coordinator stopped; the proved old incarnation retires \
+                     without a successor and no retry is scheduled"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if self
+            .mint_pending_successor(ExecTransition::unheld_predecessor(caller, pid), now_ns)
+            .is_none()
+        {
+            // Defensive only: live callers never hold a handoff and never
+            // lack their pin. Refuse rather than double-mint.
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            // An out-of-scope exec ends the old image but cannot admit its
+            // successor: re-entry needs a new current-scope transaction,
+            // which commits the held handoff.
+            return vec![self.adapter.retired_event(caller)];
+        }
+        let mut resolver = AuthorityResolver {
+            engine: &mut self.engine,
+            pending: &mut self.pending_owners,
+            guard: &mut super::inventory::UnavailableImageGuard,
+            identity,
+            native_failures: Vec::new(),
+            scan_pinned: 0,
+        };
+        let authority = resolver.resolve(pid);
+        let (native_failures, scan_pinned) = resolver.finish();
+        self.record_authority_gaps(native_failures, scan_pinned);
+        self.commit_pending_successor(caller, authority, now_ns, detected)
     }
 
     /// The exec-coverage revalidation (C1 ruling): for every domain whose
@@ -1827,7 +5841,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut events = Vec::new();
         for transition in self.binder.take_transitions() {
-            events.extend(self.apply_exec_transition(transition, &mut *identity, now_ns));
+            events.extend(self.apply_exec_transition(
+                transition,
+                &mut *identity,
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            ));
         }
         self.apply_reconcile_events(&events, now_ns);
         self.registry
@@ -1868,51 +5887,104 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn absorb_pair_counts(&mut self, batch: &WitnessBatch) {
         for row in &batch.rows {
             let key = PairKey::of(row);
-            if matches!(
+            let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            ) {
+            );
+            if !dropped {
+                self.pair_counts
+                    .entry(key)
+                    .or_insert(HeldPairCount::new(PairCount {
+                        count: 0,
+                        first_ns: row.recorded_at_ns,
+                        anchor_ns: batch.rows_anchor_ns,
+                        last_ns: batch.rows_read_ns,
+                        retirement_usable: false,
+                        diagnostic_observation: 0,
+                        diagnostic_transition: 0,
+                    }));
+            }
+            if self.diagnostics.is_some() {
+                self.diagnostic_raw_count(
+                    key,
+                    Some(row.host_tgid),
+                    ReadOrigin::Initial,
+                    row.entry_count,
+                    (batch.rows_anchor_ns, batch.rows_read_ns),
+                    row.entry_count > 0,
+                );
+            }
+            // Copy the already acquired read before declining attribution.
+            // A dropped pair gains no retained count state or placement.
+            if dropped {
                 continue;
             }
-            let held = self.pair_counts.entry(key).or_insert(PairCount {
-                count: 0,
-                first_ns: row.recorded_at_ns,
-                last_ns: batch.rows_read_ns,
-            });
+            let held = self.pair_counts.get_mut(&key).expect("inserted row count");
             // The row sets its first record whatever arrived before: a
             // refresh can only precede it in a scripted batch.
             held.first_ns = row.recorded_at_ns;
             if row.entry_count > held.count {
                 held.count = row.entry_count;
+                held.anchor_ns = batch.rows_anchor_ns;
                 held.last_ns = batch.rows_read_ns;
+                held.retirement_usable = false;
             }
         }
         let mut recheck = Vec::new();
         let mut retry = Vec::new();
         for update in &batch.counts {
             let key = PairKey::of_update(batch.domain, update);
-            if matches!(
+            let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            ) {
+            );
+            // Keep the refresh PRE bound for future base coverage and
+            // the common POST bound for this count's observation. Neither
+            // claims exactly when this particular pair was looked up.
+            if !dropped {
+                self.pair_counts
+                    .entry(key)
+                    .or_insert(HeldPairCount::new(PairCount {
+                        count: 0,
+                        first_ns: batch.rows_read_ns,
+                        anchor_ns: batch.counts_read_ns,
+                        last_ns: batch.rows_read_ns,
+                        retirement_usable: false,
+                        diagnostic_observation: 0,
+                        diagnostic_transition: 0,
+                    }));
+            }
+            if self.diagnostics.is_some() {
+                self.diagnostic_raw_count(
+                    key,
+                    None,
+                    ReadOrigin::Refresh,
+                    update.count,
+                    (batch.counts_read_ns, batch.rows_read_ns),
+                    valid_retirement_refresh(batch, update.count),
+                );
+            }
+            if dropped {
                 continue;
             }
-            // Count-side stamps come from the lookup stamp (round 5,
-            // anchor skew): the refresh observed every update here at
-            // or after it, so a base read anchors at-or-before its
-            // own lookup — never after the whole quantum.
-            let held = {
-                let held = self.pair_counts.entry(key).or_insert(PairCount {
-                    count: 0,
-                    first_ns: batch.counts_read_ns,
-                    last_ns: batch.counts_read_ns,
-                });
-                if update.count > held.count {
+            let (held, advanced) = {
+                let held = self
+                    .pair_counts
+                    .get_mut(&key)
+                    .expect("inserted refresh count");
+                let advanced = update.count > held.count;
+                if advanced {
                     held.count = update.count;
-                    held.last_ns = batch.counts_read_ns;
+                    held.anchor_ns = batch.counts_read_ns;
+                    held.last_ns = batch.rows_read_ns;
+                    held.retirement_usable = valid_retirement_refresh(batch, update.count);
                 }
-                *held
+                (held.read, advanced)
             };
+            // The rotating proof service may not visit this pair before the next
+            // read. Preserve its first eligible actual advance at this accounting
+            // boundary, before a later held maximum can replace the read bracket.
+            self.remember_retirement_advance(key, held, advanced);
             match self.pair_targets.get(&key) {
                 Some(PairTarget::Bound {
                     caller,
@@ -1957,15 +6029,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // advance past what is staged re-stages pending; the publication
         // decides, and its decisions finalize the target.
         for (key, caller, modules, count, staged, base, base_since) in retry {
+            if self.recoveries.get(&key).is_some_and(|recovery| {
+                recovery.deferred_count || (recovery.blocked && recovery.epoch.is_some())
+            }) {
+                continue;
+            }
             if count.count > staged {
-                self.stage_pending_count(
-                    key,
-                    caller,
-                    &modules,
-                    rebased_count(count, base),
-                    base_since,
-                    base,
-                );
+                self.stage_pending_count(key, caller, &modules, count, base_since, base);
                 if let Some(PairTarget::Pending {
                     staged: was,
                     staged_ns: was_ns,
@@ -1973,7 +6043,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }) = self.pair_targets.get_mut(&key)
                 {
                     *was = count.count;
-                    *was_ns = count.last_ns;
+                    *was_ns = count.anchor_ns;
                 }
             }
         }
@@ -2009,6 +6079,59 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Err(()) => false,
             };
             if confirmed {
+                // Retaining a proved exit before adapter classification is
+                // pending work, not permission for this earlier staging arm.
+                if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.unproven.is_some())
+                    && !self.recoveries.get(&key).is_some_and(|recovery| {
+                        self.retirement_exit_clean(key, recovery)
+                            && self.original_pid_exit_matches(key, recovery)
+                    })
+                {
+                    continue;
+                }
+                // Once current retirement authority is involved, its exact
+                // guards and immutable fence decide growth in the single
+                // reconciliation slice. Sticky deferral alone is not
+                // involvement — but the excuse needs the pair's own origin
+                // to be current: a stale-rooted read must fence, never
+                // borrow current summary state for ordinary authority. In
+                // a lane whose ownership never resolves, every advance
+                // defers, and that permanent deferral must not veto this
+                // present-tense proof for a current pair — otherwise every
+                // rowless refresh stalls and later discloses as
+                // owner-unproven. A genuine block still skips.
+                let held = match self.recoveries.get(&key) {
+                    Some(recovery) if recovery.blocked => true,
+                    Some(recovery) if !recovery.deferred_count => false,
+                    Some(recovery) if self.retirement_exit_clean(key, recovery) => {
+                        // A clean exit freezes the pair's history: its
+                        // origin was current at death, so post-death
+                        // summary churn must not veto the terminal read's
+                        // present-tense proof. Carrier disagreement,
+                        // blocks and armed retirement already exclude a
+                        // clean exit above and keep the cancel path.
+                        false
+                    }
+                    Some(recovery) => {
+                        let ownership = self.count_ownership.ordinary_view(caller, key.object);
+                        let changed = matches!(
+                            ownership.candidate,
+                            Some(CurrentCandidates::Sole { module, .. })
+                            if self.registry.module_id_for(module) != Some(recovery.carrier)
+                        );
+                        Self::retirement_armed(recovery)
+                            || recovery.ordinary_checkpoint == 0
+                            || recovery.ordinary_checkpoint != ownership.sequence
+                            || changed
+                    }
+                    None => false,
+                };
+                if held {
+                    continue;
+                }
                 // Only an advance past the absolute staged so far stages
                 // (round 4, re-place): growth stages rebased past the
                 // staged absolute and the publication accumulates it
@@ -2019,7 +6142,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // later publish, growth the edge already holds.
                 if count.count > staged_abs {
                     let growth = rebased_count(count, staged_abs);
-                    self.stage_pair_count(caller, &module, growth, staged_ns, staged_abs);
+                    self.stage_pair_count(
+                        caller,
+                        &module,
+                        growth,
+                        staged_ns,
+                        staged_abs,
+                        Some((key, count.count)),
+                    );
+                    if let Some(recovery) = self.recoveries.get_mut(&key) {
+                        recovery.watermark = recovery.watermark.max(count.count);
+                    }
                     if let Some(PairTarget::Bound {
                         base,
                         staged,
@@ -2030,10 +6163,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     {
                         *base = count.count;
                         *staged = count.count;
-                        *staged_ns = count.last_ns;
-                        *base_since = count.last_ns;
+                        *staged_ns = count.anchor_ns;
+                        *base_since = count.anchor_ns;
                     }
                 }
+                continue;
+            }
+            // An unproven read demotes only when retirement is not
+            // deferring it: an early demote would bypass the fence that
+            // keeps the first advance for the transition owner.
+            if self
+                .recoveries
+                .get(&key)
+                .is_some_and(|recovery| recovery.blocked || recovery.deferred_count)
+            {
                 continue;
             }
             let modules = admitted.unwrap_or_default();
@@ -2044,6 +6187,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // growth executed after the staged read, so it windows
             // from there (round 4, window anchor).
             let new_base = staged_abs;
+            if !self.recoveries.contains_key(&key) {
+                // A successful ordinary placement may have no optional retirement
+                // metadata. It keeps counting while confirmed above; a changed
+                // carrier cannot recover without that bounded state.
+                self.note_retirement_metadata_refusal(caller);
+                if self.diagnostics.is_some() {
+                    let mut record = self.diagnostic_count_record(
+                        key, caller, count, new_base, staged_abs, staged_ns,
+                    );
+                    record.decision = Some(DiagnosticDecision::Withheld);
+                    record.reason = Some(DiagnosticReason::BudgetRefused);
+                    if let Some(recorder) = &mut self.diagnostics {
+                        recorder.record(record);
+                    }
+                }
+                self.registry
+                    .note_retirement_count_gap(caller, new_base, count.count);
+                self.pair_targets.insert(
+                    key,
+                    PairTarget::Dropped {
+                        base: count.count,
+                        base_since: count.anchor_ns,
+                    },
+                );
+                self.pair_counts.remove(&key);
+                continue;
+            }
+            self.bump_placement_generation(key);
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.blocked = modules.len() != 1;
+            }
             self.pair_targets.insert(
                 key,
                 PairTarget::Pending {
@@ -2057,14 +6231,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 },
             );
             if count.count > new_base {
-                self.stage_pending_count(
-                    key,
-                    caller,
-                    &modules,
-                    rebased_count(count, new_base),
-                    staged_ns,
-                    new_base,
-                );
+                self.stage_pending_count(key, caller, &modules, count, staged_ns, new_base);
                 if let Some(PairTarget::Pending {
                     staged: was,
                     staged_ns: was_ns,
@@ -2072,10 +6239,229 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }) = self.pair_targets.get_mut(&key)
                 {
                     *was = count.count;
-                    *was_ns = count.last_ns;
+                    *was_ns = count.anchor_ns;
                 }
             }
         }
+    }
+
+    /// Constant indexed work for this actual update only: normalize at most
+    /// three receipt tags before capturing the current receipt's first advance.
+    /// A retired-with-proven-exit caller whose pair was never disowned is
+    /// not a retirement boundary: its terminal growth is pre-exit history
+    /// on a sole-continuous owner, and the pair stays Bound so the
+    /// ordinary confirmed arm can stage it. Anything else (armed
+    /// retirement, a blocked recovery, a disagreeing carrier, an unproven
+    /// origin, an exec transition, reuse or loss) keeps the conservative
+    /// cancel path. Sticky lifetime deferral is not consulted: in the
+    /// scan lane the candidate is always Unknown, so every lifetime
+    /// advance defers.
+    fn retirement_exit_clean(&self, key: PairKey, recovery: &PairRecovery) -> bool {
+        // Note: deferred_count is sticky from life (in the scan lane the
+        // candidate is always Unknown, so every advance defers) and must
+        // not veto a clean exit. Genuine sharing still blocks through
+        // `blocked`, an armed transition still cancels through `armed`,
+        // a carrier disagreement still cancels below, and the terminal
+        // read still needs the ordinary confirmed-arm proof (admitted ==
+        // edged == cached) to place.
+        if recovery.ordinary_checkpoint == 0 || recovery.blocked || Self::retirement_armed(recovery)
+        {
+            return false;
+        }
+        let ownership = self
+            .count_ownership
+            .ordinary_view(recovery.caller, key.object);
+        let changed = matches!(
+            ownership.candidate,
+            Some(CurrentCandidates::Sole { module, .. })
+            if self.registry.module_id_for(module) != Some(recovery.carrier)
+        );
+        !changed
+            && self.adapter.record(recovery.caller).is_some_and(|record| {
+                record.retired
+                    && record.lifecycle
+                        == crate::discovery::caller_registry::CallerLifecycle::Exited
+            })
+    }
+
+    /// Whether the retirement authority holds live state for this pair: an
+    /// epoch (armed or pending), a fence, or a refused receipt. Sticky
+    /// `deferred_count` alone is not arming, nor are tagged reads (saved
+    /// advances stay inert until an epoch consumes them): in a lane whose
+    /// ownership never resolves, every advance defers and tags, and that
+    /// permanent deferral must not veto present-tense ordinary proof.
+    fn retirement_armed(recovery: &PairRecovery) -> bool {
+        recovery.epoch.is_some()
+            || recovery.epoch_pending
+            || recovery.fence.is_some()
+            || recovery.receipt_refused
+    }
+
+    fn original_pid_exit_matches(&self, key: PairKey, recovery: &PairRecovery) -> bool {
+        let Some(capture) = self.capture.as_ref().filter(|capture| !capture.stopped) else {
+            return false;
+        };
+        let Some(proof) = capture.original_pid_exit else {
+            return false;
+        };
+        if !self.binder.domain_active(key.image.domain())
+            || proof.domain() != key.image.domain()
+            || capture.bound != Some(recovery.caller)
+        {
+            return false;
+        }
+        let scope = proof.scope();
+        if !matches!(capture.scope, CaptureScopeCoverage::Pid(held) if held == scope)
+            || !self.adapter.record(recovery.caller).is_some_and(|record| {
+                record.pid == scope.pid && record.start_time == scope.start_time
+            })
+        {
+            return false;
+        }
+        matches!(self.pair_targets.get(&key), Some(PairTarget::Bound {
+            caller, module, endpoint, ..
+        }) if *caller == recovery.caller
+            && self.registry.module_id_for(module) == Some(recovery.carrier)
+            && *endpoint == recovery.endpoint
+            && self.attach_set.endpoint(*endpoint).is_some_and(|entry| entry.object.index() == key.object
+                && !capture.changed_objects.contains(&entry.object)))
+    }
+
+    fn remember_retirement_advance(&mut self, key: PairKey, count: PairCount, advanced: bool) {
+        let Some(recovery) = self.recoveries.get(&key) else {
+            return;
+        };
+        let ownership = self
+            .count_ownership
+            .ordinary_view(recovery.caller, key.object);
+        let sole = match ownership.candidate {
+            Some(CurrentCandidates::Sole { module, epoch, .. }) => Some((module, *epoch)),
+            _ => None,
+        };
+        let deferred = self.count_ownership.deferred(recovery.caller, key.object);
+        let changed = sole.is_some_and(|(module, _)| {
+            self.registry.module_id_for(module) != Some(recovery.carrier)
+        });
+        let continuing = sole.is_some_and(|(_, epoch)| recovery.epoch == Some(epoch));
+        let continuity = recovery.ordinary_checkpoint != 0
+            && recovery.ordinary_checkpoint == ownership.sequence
+            && (ownership.startup || sole.is_some() && !changed)
+            && !deferred;
+        let ordinary = !recovery.blocked
+            && !recovery.recovered
+            && continuity
+            && (recovery.epoch.is_none() || recovery.epoch_pending && continuing);
+        let view = self.count_ownership.receipt_view(recovery.caller);
+        let scan = if continuing {
+            recovery.scan.clone()
+        } else {
+            self.count_ownership.supporting_scan(recovery.caller)
+        };
+        let recovery = self.recoveries.get_mut(&key).expect("checked exact pair");
+        let mut work = ReceiptWork::new();
+        // Candidate lookup already visits the caller, index and summary. Charge
+        // the additional failure, checkpoint and publication-interlock guards.
+        work.spend(3);
+        recovery.deferred_count |= deferred || changed || !continuity;
+        let was_refused = recovery.receipt_refused;
+        recovery.normalize_reads(&view, continuing || ordinary, &mut work);
+        if !was_refused && recovery.receipt_refused {
+            if let Some(recorder) = &mut self.diagnostics {
+                record_recovery_refusal(
+                    recorder,
+                    &self.adapter,
+                    key,
+                    recovery,
+                    DiagnosticReason::CountInvalid,
+                );
+            }
+            self.registry.record_gap(RegistryGap {
+                caller: Some(recovery.caller), module: None, pid: None,
+                subject: "count retirement earlier read invariant refused".into(),
+                reason: "a late earlier equivalent read contradicts a finalized boundary; history remains immutable and future retirement attribution is refused".into(), budget: None,
+            });
+        }
+        if recovery.receipt_refused || ordinary {
+            return;
+        }
+        let Some(scan) = scan else { return };
+        // Historical Pending requests retain their observation and generation.
+        // Deferral protects newer reads even when blocked=true and epoch=None.
+        if (continuing && recovery.fence.is_some())
+            || !advanced
+            || !count.retirement_usable
+            || count.count <= recovery.watermark
+            || count.anchor_ns <= scan.finished_ns()
+        {
+            return;
+        }
+        let mut vacant = None;
+        for index in 0..3 {
+            work.visit();
+            match &recovery.pending_reads[index] {
+                Some(tag) if Arc::ptr_eq(&tag.scan, &scan) || tag.scan.equivalent(&scan) => return,
+                None => vacant = Some(index),
+                _ => {}
+            }
+        }
+        work.visit();
+        if let Some(index) = vacant {
+            recovery.pending_reads[index] = Some(TaggedCountRead { scan, read: count });
+        } else {
+            // Three identities are the caller's entire retained receipt view.
+            // A fourth after normalization is an invariant failure, not a spill
+            // queue, an overwritten first read or a successful conservative path.
+            recovery.receipt_refused = true;
+            recovery.deferred_count = true;
+            recovery.withhold_reads();
+            recovery.discarded_through = recovery.discarded_through.max(count.count);
+            if let Some(read) = recovery.fence.take() {
+                recovery.withheld_through = recovery.withheld_through.max(read.count);
+            }
+            recovery.epoch = None;
+            recovery.scan = None;
+            recovery.sighting = None;
+            if let Some(recorder) = &mut self.diagnostics {
+                record_recovery_refusal(
+                    recorder,
+                    &self.adapter,
+                    key,
+                    recovery,
+                    DiagnosticReason::BudgetRefused,
+                );
+            }
+            self.registry.record_gap(RegistryGap {
+                caller: Some(recovery.caller), module: None, pid: None,
+                subject: "count retirement receipt invariant refused".into(),
+                reason: "a fourth unresolved current receipt remained after fixed-slot normalization; future retirement attribution is refused".into(),
+                budget: Some(BudgetRefusal { resource: "inventory_count_retirements", limit: 3, requested: 4 }),
+            });
+        }
+    }
+
+    fn note_retirement_metadata_refusal(&mut self, caller: CallerId) {
+        if self.diagnostics.is_some() {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition);
+            self.diagnostic_identity(&mut record, caller);
+            record.reason = Some(DiagnosticReason::BudgetRefused);
+            record.context_unavailable = true;
+            if let Some(recorder) = &mut self.diagnostics {
+                recorder.record(record);
+            }
+        }
+        let limit = self.registry.limits().max_edges;
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: "count retirement metadata refused".into(),
+            reason: "the bounded retirement metadata was not retained; ordinary exact single-owner counting continues, but a later ownership change has unknown count eligibility and cannot recover".into(),
+            budget: Some(BudgetRefusal {
+                resource: "inventory_count_retirements",
+                limit,
+                requested: limit.saturating_add(1),
+            }),
+        });
     }
 
     /// The admitted modules a count update's endpoint resolves to (F7):
@@ -2111,6 +6497,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         count: PairCount,
         since_ns: u64,
         base: u64,
+        diagnostic_source: Option<(PairKey, u64)>,
     ) {
         if count.count == 0 {
             return;
@@ -2120,6 +6507,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .module_id_for(module)
             .and_then(|id| self.registry.module(id))
             .is_some_and(|record| record.admission == AdmissionState::Admitted);
+        if let Some(recorder) = &mut self.diagnostics {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision);
+            record.caller = Some(caller.0);
+            if let Some(caller) = self.adapter.record(caller) {
+                record.pid = Some(caller.pid);
+                record.incarnation = Some(u64::from(caller.incarnation));
+            }
+            record.module = self.registry.module_id_for(module).map(|module| module.0);
+            record.base = Some(base);
+            record.staged = Some(count.count);
+            record.pre = Some(count.anchor_ns);
+            record.post = Some(count.last_ns);
+            record.baseline_pre = (base != 0).then_some(since_ns);
+            record.observation_ref = nonzero_ref(count.diagnostic_observation);
+            record.transition_ref = nonzero_ref(count.diagnostic_transition);
+            record.context_unavailable = base != 0 || record.observation_ref.is_none();
+            if let Some((key, absolute)) = diagnostic_source {
+                record = record.with_pair(key.diagnostic_key());
+                record.absolute = Some(absolute);
+                record.after = Some(base);
+                record.through = Some(absolute);
+            } else {
+                record.context_unavailable = true;
+            }
+            record.decision = Some(if admitted {
+                DiagnosticDecision::Staged
+            } else {
+                DiagnosticDecision::Rejected
+            });
+            record.reason = Some(if admitted {
+                DiagnosticReason::SoleOwner
+            } else {
+                DiagnosticReason::NotAdmitted
+            });
+            recorder.record(record);
+        }
         if !admitted {
             return;
         }
@@ -2169,11 +6592,62 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
                 ..
             }) => (*base, *staged, *staged_ns, *base_since),
-            Some(PairTarget::Dropped { base, base_since }) => {
-                (*base, *base, *base_since, *base_since)
-            }
+            Some(
+                PairTarget::Dropped { base, base_since }
+                | PairTarget::Suspended {
+                    base, base_since, ..
+                },
+            ) => (*base, *base, *base_since, *base_since),
             None => (0, 0, 0, held_first),
         };
+        if self.diagnostics.is_some() {
+            let mut record = if let Some(count) = self.pair_counts.get(&key).map(|held| held.read) {
+                self.diagnostic_count_record(key, caller, count, base, staged, base_since)
+            } else {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+                    .with_pair(key.diagnostic_key());
+                self.diagnostic_identity(&mut record, caller);
+                record.context_unavailable = true;
+                record
+            };
+            record.kind = DiagnosticKind::OwnershipTransition;
+            record.prior_eligibility = self.pair_targets.get(&key).map(|target| match target {
+                PairTarget::Bound { .. } => Eligibility::SoleOwner,
+                PairTarget::Pending { .. } => Eligibility::Unproven,
+                _ => Eligibility::Unknown,
+            });
+            record.new_eligibility = Some(Eligibility::Unproven);
+            record.reason = Some(DiagnosticReason::PendingPublication);
+            record.module = (modules.len() == 1)
+                .then(|| {
+                    self.registry
+                        .module_id_for(&modules[0])
+                        .map(|module| module.0)
+                })
+                .flatten();
+            let seq = self
+                .diagnostics
+                .as_mut()
+                .and_then(|recorder| recorder.record(record))
+                .unwrap_or(0);
+            if let Some(count) = self.pair_counts.get_mut(&key) {
+                count.diagnostic_transition = seq;
+            }
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.diagnostic.transition_ref = seq;
+            }
+        }
+        // A new, generically bound witness still owns its ordinary publication
+        // placement. It does not borrow or discharge an armed retirement proof.
+        if modules.len() == 1
+            && let Some(recovery) = self
+                .recoveries
+                .get_mut(&key)
+                .filter(|recovery| recovery.epoch.is_none())
+        {
+            recovery.blocked = false;
+        }
+        self.bump_placement_generation(key);
         self.pair_targets.insert(
             key,
             PairTarget::Pending {
@@ -2186,23 +6660,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
             },
         );
-        if let Some(count) = self.pair_counts.get(&key).copied()
+        if let Some(count) = self.pair_counts.get(&key).map(|held| held.read)
             && count.count > staged
         {
-            self.stage_pending_count(
-                key,
-                caller,
-                modules,
-                rebased_count(count, base),
-                base_since,
-                base,
-            );
+            self.stage_pending_count(key, caller, modules, count, base_since, base);
             if let Some(PairTarget::Pending {
                 staged, staged_ns, ..
             }) = self.pair_targets.get_mut(&key)
             {
                 *staged = count.count;
-                *staged_ns = count.last_ns;
+                *staged_ns = count.anchor_ns;
             }
         }
     }
@@ -2215,7 +6682,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// past (0 for a first-sight pair): a nonzero base marks a
     /// re-resolved pair, whose rejection the publication discloses
     /// (F3-02) and whose placement accumulates by segment. `since_ns`
-    /// is the read that observed `base`: a placement windows its
+    /// is the PRE bound for the `base` read: a placement windows its
     /// coverage from there (round 4, window anchor). The minted handle
     /// maps the publication's decision back to the pair.
     fn stage_pending_count(
@@ -2223,16 +6690,155 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         key: PairKey,
         caller: CallerId,
         modules: &[ModuleKey],
-        count: PairCount,
+        observation: PairCount,
         since_ns: u64,
         base: u64,
-    ) {
+    ) -> bool {
+        let count = rebased_count(observation, base);
         if count.count == 0 {
-            return;
+            return false;
         }
+        let generation = *self.placement_generations.entry(key).or_insert(Some(0));
+        let Some(next) = self.next_pending_id.checked_add(1) else {
+            self.diagnostic_pending_refusal(
+                key,
+                caller,
+                observation,
+                base,
+                since_ns,
+                DiagnosticReason::BudgetRefused,
+            );
+            self.registry
+                .note_retirement_count_gap(caller, base, observation.count);
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.watermark = recovery.watermark.max(observation.count);
+            }
+            self.placement_generations.insert(key, None);
+            return false;
+        };
+        if generation.is_none() || self.pending_ids.len() >= self.registry.limits().max_edges {
+            self.diagnostic_pending_refusal(
+                key,
+                caller,
+                observation,
+                base,
+                since_ns,
+                DiagnosticReason::BudgetRefused,
+            );
+            self.registry
+                .note_retirement_count_gap(caller, base, observation.count);
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.watermark = recovery.watermark.max(observation.count);
+            }
+            return false;
+        }
+        let endpoint = match self.pair_targets.get(&key) {
+            Some(
+                PairTarget::Pending {
+                    caller: bound,
+                    endpoint,
+                    ..
+                }
+                | PairTarget::Bound {
+                    caller: bound,
+                    endpoint,
+                    ..
+                }
+                | PairTarget::Suspended {
+                    caller: bound,
+                    endpoint,
+                    ..
+                },
+            ) if *bound == caller => *endpoint,
+            _ => {
+                self.diagnostic_pending_refusal(
+                    key,
+                    caller,
+                    observation,
+                    base,
+                    since_ns,
+                    DiagnosticReason::BindingUnproven,
+                );
+                return false;
+            }
+        };
+        let mut work = ReceiptWork::new();
+        let origin = if let Some(recovery) = self.recoveries.get(&key) {
+            work.visit();
+            match recovery.epoch.filter(|_| recovery.blocked) {
+                Some(epoch) => PendingCountOrigin::Recovered(epoch),
+                None => PendingCountOrigin::Ordinary(recovery.ordinary_checkpoint),
+            }
+        } else {
+            // Registration moves before the original immutable handle. Its
+            // cell/tombstone remains charged even if placement later rejects.
+            work.spend(7); // bounded registration/caller barrier and three origin lookups
+            if self.count_ownership.register_pair(caller, key.object) {
+                let ownership = self.count_ownership.ordinary_view(caller, key.object);
+                if ownership.initial_metadata_refused {
+                    // Optional index storage failed before any accepted source
+                    // or completed result. Preserve generic physical admission;
+                    // this exception cannot erase established failure history.
+                    PendingCountOrigin::Untracked
+                } else {
+                    PendingCountOrigin::Ordinary(ownership.checkpoint(observation.anchor_ns))
+                }
+            } else {
+                PendingCountOrigin::Untracked
+            }
+        };
         let pending_id = self.next_pending_id;
-        self.next_pending_id = self.next_pending_id.wrapping_add(1);
-        self.pending_ids.insert(pending_id, key);
+        self.next_pending_id = next;
+        let diagnostic = if self.diagnostics.is_some() {
+            // This is the exact rebased value queued below, not the prior
+            // absolute watermark retained by PairTarget.
+            let staged = count.count;
+            let mut record = self
+                .diagnostic_count_record(key, caller, observation, base, staged, since_ns)
+                .with_private_ids(
+                    None,
+                    match origin {
+                        PendingCountOrigin::Recovered(epoch) => Some(epoch.0),
+                        _ => None,
+                    },
+                    Some(pending_id),
+                );
+            record.decision = Some(DiagnosticDecision::Staged);
+            record.reason = Some(DiagnosticReason::PendingPublication);
+            record.module = (modules.len() == 1)
+                .then(|| {
+                    self.registry
+                        .module_id_for(&modules[0])
+                        .map(|module| module.0)
+                })
+                .flatten();
+            let diagnostic = PendingDiagnostics {
+                base,
+                staged,
+                since: since_ns,
+                baseline_post: record.baseline_post.unwrap_or(0),
+                fence: record.fence.unwrap_or(0),
+                transition_ref: record.transition_ref.unwrap_or(0),
+            };
+            if let Some(recorder) = &mut self.diagnostics {
+                recorder.record(record);
+            }
+            Some(diagnostic)
+        } else {
+            None
+        };
+        self.pending_ids.insert(
+            pending_id,
+            PendingCountObservation {
+                key,
+                caller,
+                endpoint,
+                observation,
+                generation,
+                origin,
+                diagnostic,
+            },
+        );
         self.registry.note_pending_count(
             pending_id,
             caller,
@@ -2243,65 +6849,770 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             since_ns,
             base,
         );
+        true
     }
 
-    /// Finalizes pending pair placements from the publication's
-    /// decisions (P3): a placed pair caches `Bound` — only now, after
-    /// the publication decided — so later advances stage to its edge,
-    /// folding the absolute staged into the new base (round 4,
-    /// re-place: the base is the accounted absolute, so later growth
-    /// rebases past everything placed); a rejected pair (ambiguity, no
-    /// edge) finalizes `Dropped` with its held count removed, so a
-    /// later mapping can never promote a count whose witness already
-    /// went module-level. An unadmitted single stays pending and
-    /// re-resolves on the next advance. Unknown handles (a pair
-    /// re-bound after its decision staged) are ignored: the newer
-    /// bind's own decision finalizes it.
+    fn bump_placement_generation(&mut self, key: PairKey) {
+        let generation = self.placement_generations.entry(key).or_insert(Some(0));
+        *generation = generation.and_then(|generation| generation.checked_add(1));
+    }
+
+    /// Finalization consumes only the immutable observation that produced the decision.
+    /// Stale decisions may preserve registry history but never authorize newer growth.
     fn finalize_pending_counts(&mut self) {
         for decision in self.registry.take_pending_count_decisions() {
-            let Some(key) = self.pending_ids.remove(&decision.pending_id) else {
+            let Some(pending) = self.pending_ids.remove(&decision.pending_id) else {
                 continue;
             };
+            let key = pending.key;
+            self.diagnostic_pending_result(decision.pending_id, &pending, Some(&decision.outcome));
+            if pending.generation.is_none()
+                || self.placement_generations.get(&key).copied().flatten() != pending.generation
+            {
+                self.diagnostic_pending_result(decision.pending_id, &pending, None);
+                continue;
+            }
+            if let PendingCountOrigin::Recovered(epoch) = pending.origin {
+                let valid = self.recovery_is_current(key, epoch);
+                if !valid {
+                    self.diagnostic_pending_result(decision.pending_id, &pending, None);
+                    continue;
+                }
+            }
+            let accounted = match self.pair_targets.get(&key) {
+                Some(
+                    PairTarget::Bound { base, .. }
+                    | PairTarget::Suspended { base, .. }
+                    | PairTarget::Pending { base, .. },
+                ) => *base,
+                _ => {
+                    self.diagnostic_pending_result(decision.pending_id, &pending, None);
+                    continue;
+                }
+            };
+            if pending.observation.count < accounted {
+                self.diagnostic_pending_result(decision.pending_id, &pending, None);
+                continue;
+            }
             match decision.outcome {
                 PendingCountOutcome::Placed { module } => {
-                    if let Some(PairTarget::Pending {
-                        caller,
-                        endpoint,
-                        staged,
-                        staged_ns,
-                        ..
-                    }) = self.pair_targets.get(&key)
-                    {
-                        let (caller, endpoint, staged, staged_ns) =
-                            (*caller, *endpoint, *staged, *staged_ns);
-                        self.pair_targets.insert(
-                            key,
-                            PairTarget::Bound {
-                                caller,
-                                module,
-                                endpoint,
-                                base: staged,
-                                staged,
-                                staged_ns,
-                                base_since: staged_ns,
-                            },
-                        );
+                    if !self.recoveries.contains_key(&key) {
+                        if self.recoveries.len() < self.registry.limits().max_edges
+                            && matches!(pending.origin, PendingCountOrigin::Ordinary(_))
+                        {
+                            self.recoveries.insert(
+                                key,
+                                PairRecovery {
+                                    caller: pending.caller,
+                                    endpoint: pending.endpoint,
+                                    carrier: self
+                                        .registry
+                                        .module_id_for(&module)
+                                        .expect("placed module is registered"),
+                                    ordinary_checkpoint: match pending.origin {
+                                        PendingCountOrigin::Ordinary(checkpoint) => checkpoint,
+                                        _ => unreachable!("checked original token"),
+                                    },
+                                    epoch: None,
+                                    scan: None,
+                                    sighting: None,
+                                    fence: None,
+                                    pending_reads: [None, None, None],
+                                    withheld_through: pending.observation.count,
+                                    discarded_through: pending.observation.count,
+                                    watermark: pending.observation.count,
+                                    blocked: false,
+                                    recovered: false,
+                                    deferred_count: false,
+                                    receipt_refused: false,
+                                    epoch_pending: false,
+                                    diagnostic: RecoveryDiagnostics::default(),
+                                },
+                            );
+                            self.recovery_order.push(key);
+                        } else {
+                            // Retirement metadata is optional for this ordinary
+                            // successful placement, not a physical-pair admission cap.
+                            self.note_retirement_metadata_refusal(pending.caller);
+                        }
                     }
+                    if let Some(recovery) = self.recoveries.get_mut(&key) {
+                        recovery.carrier = self
+                            .registry
+                            .module_id_for(&module)
+                            .expect("placed module is registered");
+                        recovery.watermark = recovery.watermark.max(pending.observation.count);
+                        recovery.recovered |=
+                            matches!(pending.origin, PendingCountOrigin::Recovered(_));
+                        recovery.blocked =
+                            matches!(pending.origin, PendingCountOrigin::Recovered(_));
+                    }
+                    self.pair_targets.insert(
+                        key,
+                        PairTarget::Bound {
+                            caller: pending.caller,
+                            module,
+                            endpoint: pending.endpoint,
+                            base: pending.observation.count,
+                            staged: pending.observation.count,
+                            staged_ns: pending.observation.anchor_ns,
+                            base_since: pending.observation.anchor_ns,
+                        },
+                    );
                 }
                 PendingCountOutcome::Rejected { .. } => {
-                    if let Some(PairTarget::Pending {
-                        staged, staged_ns, ..
-                    }) = self.pair_targets.get(&key)
-                    {
-                        // The drop remembers the absolute staged so far:
-                        // a later row rebinds past it (round 4, rebind).
-                        let (base, base_since) = (*staged, *staged_ns);
-                        self.pair_targets
-                            .insert(key, PairTarget::Dropped { base, base_since });
+                    if let Some(recovery) = self.recoveries.get_mut(&key) {
+                        recovery.blocked = true;
+                        recovery.recovered = false;
+                        recovery.watermark = recovery.watermark.max(pending.observation.count);
+                        self.pair_targets.insert(
+                            key,
+                            PairTarget::Suspended {
+                                caller: pending.caller,
+                                endpoint: pending.endpoint,
+                                base: pending.observation.count,
+                                base_since: pending.observation.anchor_ns,
+                            },
+                        );
+                    } else {
+                        self.pair_targets.insert(
+                            key,
+                            PairTarget::Dropped {
+                                base: pending.observation.count,
+                                base_since: pending.observation.anchor_ns,
+                            },
+                        );
                         self.pair_counts.remove(&key);
                     }
                 }
                 PendingCountOutcome::Unadmitted { .. } => {}
+            }
+        }
+    }
+
+    fn recovery_is_current(&self, key: PairKey, epoch: OwnershipEpoch) -> bool {
+        let Some(recovery) = self.recoveries.get(&key) else {
+            return false;
+        };
+        if recovery.epoch != Some(epoch) || recovery.epoch_pending || recovery.receipt_refused {
+            return false;
+        }
+        let Some(record) = self.adapter.record(recovery.caller) else {
+            return false;
+        };
+        if record.retired
+            || self.adapter.live_id(record.pid) != Some(recovery.caller)
+            || self
+                .adapter
+                .live_pin(record.pid)
+                .is_none_or(|(_, pin)| !self.adapter.source().still_the_same(pin))
+            || !self.binder.domain_active(key.image.domain())
+        {
+            return false;
+        }
+        let Some(scan) = recovery.scan.as_ref() else {
+            return false;
+        };
+        if record.start_time != scan.generation().start_time
+            || record.exe != scan.generation().exe
+            || record.first_seen_ns > scan.started_ns()
+        {
+            return false;
+        }
+        if self.capture.as_ref().is_some_and(|capture| {
+            capture.stopped
+                || capture.unproven.is_some()
+                || self
+                    .attach_set
+                    .endpoint(recovery.endpoint)
+                    .is_none_or(|endpoint| {
+                        endpoint.object.index() != key.object
+                            || capture.changed_objects.contains(&endpoint.object)
+                    })
+        }) {
+            return false;
+        }
+        matches!(self.count_ownership.candidates(recovery.caller, key.object), CurrentCandidates::Sole { epoch: current, module, .. }
+            if current == epoch && self.registry.module_id_for(&module)
+                .and_then(|id| self.registry.module(id).zip(self.registry.edge(recovery.caller, id)))
+                .is_some_and(|(module, edge)| module.admission == AdmissionState::Admitted
+                    && edge.mapping == MappingState::Mapped && !edge.double_loaded))
+            && recovery.sighting.as_ref().is_some_and(|sighting| {
+                matches!(
+                    self.binder.check_current_binding(sighting),
+                    CurrentBindingCheck::Proven
+                )
+            })
+    }
+
+    fn suspend_recovery(&mut self, key: PairKey, recovery: &mut PairRecovery) {
+        recovery.blocked = true;
+        recovery.recovered = false;
+        self.pair_targets.insert(
+            key,
+            PairTarget::Suspended {
+                caller: recovery.caller,
+                endpoint: recovery.endpoint,
+                base: recovery.watermark,
+                base_since: recovery.fence.map_or(0, |fence| fence.anchor_ns),
+            },
+        );
+    }
+
+    /// A bounded comparison resolved to the carrier that already placed this
+    /// pair. Resume its full ordinary growth, with its original staged base.
+    fn resume_deferred_count(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        module: &ModuleKey,
+        held: Option<PairCount>,
+    ) {
+        recovery.deferred_count = false;
+        recovery.clear_reads();
+        recovery.epoch_pending = false;
+        recovery.epoch = None;
+        recovery.scan = None;
+        recovery.sighting = None;
+        recovery.fence = None;
+        let Some(PairTarget::Bound {
+            staged, staged_ns, ..
+        }) = self.pair_targets.get(&key)
+        else {
+            return;
+        };
+        let (staged, staged_ns) = (*staged, *staged_ns);
+        let Some(count) = held.filter(|count| count.count > staged) else {
+            return;
+        };
+        self.stage_pair_count(
+            recovery.caller,
+            module,
+            rebased_count(count, staged),
+            staged_ns,
+            staged,
+            Some((key, count.count)),
+        );
+        recovery.watermark = recovery.watermark.max(count.count);
+        if let Some(PairTarget::Bound {
+            base,
+            staged,
+            staged_ns,
+            base_since,
+            ..
+        }) = self.pair_targets.get_mut(&key)
+        {
+            *base = count.count;
+            *staged = count.count;
+            *staged_ns = count.anchor_ns;
+            *base_since = count.anchor_ns;
+        }
+    }
+
+    /// Only a classified contiguous unknown prefix is disclosed here. Callers
+    /// first resolve historical generic decisions and continuing ownership.
+    fn flush_withheld_prefix(&mut self, key: PairKey, recovery: &mut PairRecovery) {
+        self.diagnostic_withheld(
+            key,
+            recovery,
+            recovery.watermark,
+            recovery.withheld_through,
+            DiagnosticReason::OwnershipTransition,
+            None,
+        );
+        self.registry.note_retirement_count_gap(
+            recovery.caller,
+            recovery.watermark,
+            recovery.withheld_through,
+        );
+        recovery.watermark = recovery.watermark.max(recovery.withheld_through);
+        recovery.withheld_through = recovery.watermark;
+    }
+
+    fn generic_predecessor(&self, key: PairKey, recovery: &PairRecovery) -> bool {
+        (recovery.epoch.is_none() || recovery.epoch_pending)
+            && matches!(self.pair_targets.get(&key), Some(PairTarget::Pending { base, staged, .. }) if staged > base)
+    }
+
+    fn cancel_retirement_candidate(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        held: Option<PairCount>,
+        reason: DiagnosticReason,
+    ) {
+        self.diagnostic_recovery_decision(
+            key,
+            recovery,
+            reason,
+            held,
+            DiagnosticDecision::Rejected,
+        );
+        let predecessor = self.generic_predecessor(key, recovery);
+        let protected = recovery.deferred_count
+            || recovery.epoch.is_some()
+            || recovery.scan.is_some()
+            || recovery.pending_reads.iter().any(Option::is_some);
+        recovery.withhold_reads();
+        if let Some(read) = recovery.fence.take() {
+            recovery.withheld_through = recovery.withheld_through.max(read.count);
+        }
+        recovery.epoch = None;
+        recovery.epoch_pending = false;
+        recovery.scan = None;
+        recovery.sighting = None;
+        recovery.deferred_count = predecessor && protected;
+        if !predecessor {
+            // No surviving allocation candidate remains after genuine revocation.
+            recovery.withheld_through = recovery.withheld_through.max(recovery.discarded_through);
+            recovery.discarded_through = recovery.watermark;
+            self.flush_withheld_prefix(key, recovery);
+            if let Some(held) = held {
+                self.diagnostic_withheld(
+                    key,
+                    recovery,
+                    recovery.watermark,
+                    held.count,
+                    reason,
+                    Some(held),
+                );
+                self.registry.note_retirement_count_gap(
+                    recovery.caller,
+                    recovery.watermark,
+                    held.count,
+                );
+                recovery.watermark = recovery.watermark.max(held.count);
+                recovery.withheld_through = recovery.watermark;
+            }
+            self.suspend_recovery(key, recovery);
+        }
+    }
+
+    /// One top-level call shares a single visit/query allowance. Reserved proof
+    /// work prevents a large observation/index rebuild from starving later pairs.
+    fn reconcile_count_eligibility(
+        &mut self,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        budget: &mut RecoveryWorkBudget,
+    ) {
+        budget.limit_visits(64);
+        self.count_ownership
+            .advance(&self.attach_set, &self.registry, budget);
+        budget.limit_visits(128);
+        let mut serviced = 0;
+        while budget.remaining() >= 48 && serviced < self.recovery_order.len() {
+            let key = self.recovery_order[self.recovery_cursor];
+            self.recovery_cursor = (self.recovery_cursor + 1) % self.recovery_order.len();
+            serviced += 1;
+            // 16 existing exact target/count/caller/pin/domain guards plus 32
+            // fixed receipt resolution operations, including refused branches.
+            // The allowance is reserved once, never refilled for another pair.
+            budget.spend(48);
+            let Some(mut recovery) = self.recoveries.remove(&key) else {
+                continue;
+            };
+            let held = self.pair_counts.get(&key).map(|held| held.read);
+            let ownership = self
+                .count_ownership
+                .ordinary_view(recovery.caller, key.object);
+            let candidate = ownership
+                .candidate
+                .cloned()
+                .unwrap_or(CurrentCandidates::Unknown);
+            let continuing = matches!(&candidate, CurrentCandidates::Sole { epoch, .. } if recovery.epoch == Some(*epoch));
+            let ordinary = matches!(&candidate, CurrentCandidates::Sole { module, .. }
+                if !recovery.blocked && self.registry.module_id_for(module) == Some(recovery.carrier)
+                    && !recovery.recovered
+                    && (recovery.epoch.is_none() || recovery.epoch_pending && continuing)
+                    && recovery.ordinary_checkpoint != 0
+                    && recovery.ordinary_checkpoint == ownership.sequence);
+            self.diagnostic_ownership(key, &mut recovery, &candidate);
+            let mut work = ReceiptWork::new();
+            work.spend(3); // ordinary source/checkpoint guards within the fixed reservation
+            let was_refused = recovery.receipt_refused;
+            recovery.normalize_reads(
+                &self.count_ownership.receipt_view(recovery.caller),
+                continuing || ordinary,
+                &mut work,
+            );
+            if !was_refused && recovery.receipt_refused {
+                if let Some(recorder) = &mut self.diagnostics {
+                    record_recovery_refusal(
+                        recorder,
+                        &self.adapter,
+                        key,
+                        &mut recovery,
+                        DiagnosticReason::CountInvalid,
+                    );
+                }
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(recovery.caller), module: None, pid: None,
+                    subject: "count retirement earlier read invariant refused".into(),
+                    reason: "a late earlier equivalent read contradicts a finalized boundary; history remains immutable and future retirement attribution is refused".into(), budget: None,
+                });
+            }
+            let live = self
+                .adapter
+                .record(recovery.caller)
+                .filter(|record| {
+                    !record.retired
+                        && self.adapter.live_id(record.pid) == Some(recovery.caller)
+                        && self
+                            .adapter
+                            .live_pin(record.pid)
+                            .is_some_and(|(_, pin)| self.adapter.source().still_the_same(pin))
+                })
+                .cloned();
+            // A clean exit excuses only the liveness leg: the caller's death
+            // ends observation, it does not unprove the sole owner. Refusals,
+            // domain loss and capture loss still cancel.
+            let exit_clean = self.retirement_exit_clean(key, &recovery);
+            // Native service ticks run between catalog reconciliations. A
+            // dead original pin can therefore precede the adapter's Exited
+            // classification. Keep an unarmed ordinary pair pending until
+            // that classification, rather than permanently treating this
+            // scheduling race as an ownership change. This stages no count
+            // and grants no current-image proof. Stop and every independent
+            // refusal below still cancel, even before another catalog pass.
+            let classification_pending = live.is_none()
+                && !self.stopped
+                && recovery.ordinary_checkpoint != 0
+                && !recovery.blocked
+                && !Self::retirement_armed(&recovery)
+                && self.adapter.record(recovery.caller).is_some_and(|record| {
+                    !record.retired
+                        && self.adapter.live_id(record.pid) == Some(recovery.caller)
+                        && self.adapter.live_pin(record.pid).is_some()
+                });
+            let original_exit_history = (exit_clean || classification_pending)
+                && self.original_pid_exit_matches(key, &recovery);
+            let canceled = recovery.receipt_refused
+                || (live.is_none() && !exit_clean && !classification_pending)
+                || !self.binder.domain_active(key.image.domain())
+                || self.capture.as_ref().is_some_and(|capture| {
+                    capture.stopped
+                        || (capture.unproven.is_some() && !original_exit_history)
+                        || self
+                            .attach_set
+                            .endpoint(recovery.endpoint)
+                            .is_none_or(|endpoint| {
+                                endpoint.object.index() != key.object
+                                    || capture.changed_objects.contains(&endpoint.object)
+                            })
+                });
+            if canceled {
+                let reason = if recovery.receipt_refused {
+                    DiagnosticReason::CountInvalid
+                } else if self.capture.as_ref().is_some_and(|capture| capture.stopped) {
+                    DiagnosticReason::CaptureStopped
+                } else if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.unproven.is_some())
+                {
+                    DiagnosticReason::CaptureLoss
+                } else {
+                    DiagnosticReason::IdentityChanged
+                };
+                self.cancel_retirement_candidate(key, &mut recovery, held, reason);
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if classification_pending {
+                self.diagnostic_recovery_wait(
+                    key,
+                    &mut recovery,
+                    DiagnosticReason::IdentityChanged,
+                    held,
+                );
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            let predecessor = self.generic_predecessor(key, &recovery);
+            let CurrentCandidates::Sole {
+                module,
+                epoch,
+                scan,
+            } = candidate
+            else {
+                let deferred = self.count_ownership.deferred(recovery.caller, key.object);
+                let reason = if deferred {
+                    DiagnosticReason::ScanIncomplete
+                } else if matches!(candidate, CurrentCandidates::Shared) {
+                    DiagnosticReason::SharedOwner
+                } else {
+                    DiagnosticReason::OwnershipUnknown
+                };
+                // A clean exit excuses this cancel too: the caller's death
+                // ends observation, it does not unprove the sole owner,
+                // and the pair stays Bound so the terminal read can still
+                // place through the ordinary confirmed-arm proof. Any
+                // genuine recovery (epoch, block, refusal) still cancels
+                // above; an unprovable terminal read simply does not place.
+                if !exit_clean
+                    && !self.count_ownership.deferred(recovery.caller, key.object)
+                    && (recovery.blocked || recovery.deferred_count || recovery.epoch.is_some())
+                {
+                    self.cancel_retirement_candidate(key, &mut recovery, held, reason);
+                } else {
+                    self.diagnostic_recovery_wait(key, &mut recovery, reason, held);
+                }
+                self.recoveries.insert(key, recovery);
+                continue;
+            };
+            if ordinary {
+                if predecessor {
+                    self.recoveries.insert(key, recovery);
+                    continue;
+                }
+                if recovery.deferred_count || recovery.epoch_pending {
+                    self.resume_deferred_count(key, &mut recovery, &module, held);
+                } else {
+                    recovery.clear_reads();
+                }
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if recovery.epoch != Some(epoch) {
+                let selected = recovery.take_read(&scan, &mut work);
+                if let Some(read) = recovery.fence.take() {
+                    recovery.withheld_through = recovery.withheld_through.max(read.count);
+                }
+                recovery.epoch = Some(epoch);
+                recovery.scan = Some(
+                    selected
+                        .as_ref()
+                        .map_or_else(|| scan.clone(), |tag| tag.scan.clone()),
+                );
+                recovery.fence = selected.map(|tag| tag.read);
+                recovery.sighting = None;
+                recovery.deferred_count = true;
+                recovery.epoch_pending = true;
+            } else if recovery.fence.is_none()
+                && let Some(selected) = recovery.take_read(&scan, &mut work)
+            {
+                // The bounded current summary established this continuing
+                // logical epoch, including any unrelated global revision.
+                recovery.fence = Some(selected.read);
+                if recovery
+                    .scan
+                    .as_ref()
+                    .is_none_or(|old| selected.scan.started_ns() < old.started_ns())
+                {
+                    recovery.scan = Some(selected.scan);
+                }
+            }
+            // Ownership selection above may coexist with old generic handles.
+            // It changes neither their generation/target nor any H/D disposition.
+            if predecessor {
+                self.diagnostic_recovery_wait(
+                    key,
+                    &mut recovery,
+                    DiagnosticReason::PendingPublication,
+                    held,
+                );
+                self.diagnostic_recovery_selection(key, &mut recovery, false);
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if recovery.epoch_pending {
+                self.bump_placement_generation(key);
+                self.suspend_recovery(key, &mut recovery);
+                recovery.epoch_pending = false;
+                recovery.deferred_count = false;
+            }
+            // Classify surviving full current candidates BEFORE D conversion.
+            // A later detached11 cannot consume valid new-epoch10 at rollover.
+            if let Some(read) = recovery.fence {
+                if recovery.discarded_through <= read.count {
+                    // This actually saved obsolete prefix precedes the full
+                    // source-validated boundary. H is independent old history.
+                    recovery.withheld_through =
+                        recovery.withheld_through.max(recovery.discarded_through);
+                }
+                // A qualifying full tag/selected epoch independently proves
+                // current sampled continuation. D above it supplies no loss.
+                recovery.discarded_through = recovery.watermark;
+                if recovery.withheld_through > read.count
+                    && recovery.withheld_through > recovery.watermark
+                {
+                    // Independently unknown H contradicts this candidate. All
+                    // affected future claims are revoked before true loss.
+                    recovery.fence = None;
+                    recovery.withhold_reads();
+                    recovery.withheld_through =
+                        recovery.withheld_through.max(recovery.discarded_through);
+                    recovery.discarded_through = recovery.watermark;
+                    self.registry.record_gap(RegistryGap {
+                        caller: Some(recovery.caller), module: None, pid: None,
+                        subject: "count retirement candidate revoked".into(),
+                        reason: "independently unknown historical coverage crosses the retained candidate after genuine revocation; future recovery needs a new actual advancing read".into(),
+                        budget: None,
+                    });
+                }
+            } else {
+                // All conditional tags are detached from this new current
+                // authority and no full surviving candidate claims their range.
+                recovery.withheld_through =
+                    recovery.withheld_through.max(recovery.discarded_through);
+                recovery.discarded_through = recovery.watermark;
+            }
+            self.flush_withheld_prefix(key, &mut recovery);
+            let scan = recovery
+                .scan
+                .as_ref()
+                .expect("epoch owns its original scan")
+                .clone();
+            let record = live.expect("checked live caller");
+            if record.start_time != scan.generation().start_time
+                || record.exe != scan.generation().exe
+                || record.first_seen_ns > scan.started_ns()
+            {
+                self.cancel_retirement_candidate(
+                    key,
+                    &mut recovery,
+                    held,
+                    DiagnosticReason::IdentityChanged,
+                );
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if recovery.sighting.is_none() {
+                if !budget.query() {
+                    self.recoveries.insert(key, recovery);
+                    continue;
+                }
+                let request = CurrentBindingRequest {
+                    caller: recovery.caller,
+                    pid: record.pid,
+                    image: key.image,
+                    exec_id: key.exec,
+                };
+                match self
+                    .binder
+                    .sight_current_binding(request, &self.adapter, identity)
+                {
+                    Ok(sighting) => {
+                        if sighting.sighted_ns() > scan.finished_ns() {
+                            recovery.sighting = Some(sighting);
+                        }
+                    }
+                    Err(UnboundReason::CookieUnavailable) => {
+                        self.diagnostic_recovery_wait(
+                            key,
+                            &mut recovery,
+                            DiagnosticReason::BindingUnproven,
+                            held,
+                        );
+                    }
+                    Err(
+                        reason @ (UnboundReason::NoLiveCaller
+                        | UnboundReason::CallerExited
+                        | UnboundReason::CookieMismatch
+                        | UnboundReason::BeforeAdmission
+                        | UnboundReason::ExecAfterAdmission
+                        | UnboundReason::LifecycleLoss
+                        | UnboundReason::ExecAmbiguous
+                        | UnboundReason::ExecTransition
+                        | UnboundReason::ExecCoverageGap
+                        | UnboundReason::EvidenceIncomplete
+                        | UnboundReason::Capacity),
+                    ) => {
+                        // A failed completion clock also supplies no authority.
+                        // Preserve history, but never retry a rejected read as
+                        // though its original identity proof merely waited.
+                        self.cancel_retirement_candidate(
+                            key,
+                            &mut recovery,
+                            held,
+                            diagnostic_binding_reason(reason),
+                        );
+                        self.recoveries.insert(key, recovery);
+                        continue;
+                    }
+                }
+            }
+            // Selection above retained an unproven candidate only. A genuine
+            // post-scan sighting now permits classifying the saved prefix and
+            // first-read uncertainty. Allocation still waits for Proven horizons.
+            if recovery.sighting.is_some()
+                && let Some(read) = recovery.fence.filter(|read| {
+                    read.count > recovery.watermark
+                        && read.retirement_usable
+                        && read.anchor_ns > scan.finished_ns()
+                })
+            {
+                self.flush_withheld_prefix(key, &mut recovery);
+                self.diagnostic_withheld(
+                    key,
+                    &recovery,
+                    recovery.watermark,
+                    read.count,
+                    DiagnosticReason::AwaitingFence,
+                    Some(read),
+                );
+                self.registry.note_retirement_count_gap(
+                    recovery.caller,
+                    recovery.watermark,
+                    read.count,
+                );
+                recovery.watermark = read.count;
+                recovery.withheld_through = recovery.watermark;
+                self.suspend_recovery(key, &mut recovery);
+            }
+            let proof = recovery
+                .sighting
+                .as_ref()
+                .map(|sighting| self.binder.check_current_binding(sighting));
+            self.diagnostic_recovery_selection(
+                key,
+                &mut recovery,
+                matches!(proof, Some(CurrentBindingCheck::Proven)),
+            );
+            if let Some(CurrentBindingCheck::Rejected(reason)) = proof {
+                self.cancel_retirement_candidate(
+                    key,
+                    &mut recovery,
+                    held,
+                    diagnostic_binding_reason(reason),
+                );
+            }
+            let stage = matches!(proof, Some(CurrentBindingCheck::Proven))
+                && recovery.fence.is_some()
+                && held
+                    .is_some_and(|held| held.count > recovery.watermark && held.retirement_usable);
+            if !stage && !matches!(proof, Some(CurrentBindingCheck::Rejected(_))) {
+                let reason = if recovery.fence.is_none() {
+                    DiagnosticReason::AwaitingFence
+                } else if !matches!(proof, Some(CurrentBindingCheck::Proven)) {
+                    DiagnosticReason::BindingUnproven
+                } else if held.is_some_and(|held| !held.retirement_usable) {
+                    DiagnosticReason::CountInvalid
+                } else {
+                    DiagnosticReason::AwaitingFence
+                };
+                self.diagnostic_recovery_wait(key, &mut recovery, reason, held);
+            }
+            self.recoveries.insert(key, recovery);
+            if stage && self.recovery_is_current(key, epoch) {
+                let held = held.expect("stage has held observation");
+                let recovery = self.recoveries.get(&key).expect("retained recovery");
+                let caller = recovery.caller;
+                let base = recovery.watermark;
+                let since = recovery.fence.expect("stage has fence").anchor_ns;
+                if self.stage_pending_count(
+                    key,
+                    caller,
+                    std::slice::from_ref(&module),
+                    held,
+                    since,
+                    base,
+                ) {
+                    self.recoveries
+                        .get_mut(&key)
+                        .expect("retained recovery")
+                        .watermark = held.count;
+                }
             }
         }
     }
@@ -2311,13 +7622,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// remembers the held absolute, so a later row rebinds past it
     /// instead of attributing pre-drop calls to a new owner (round 4,
     /// rebind).
-    fn drop_pair_count(&mut self, row: &WitnessRow) {
+    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) {
         let key = PairKey::of(row);
         let (base, base_since) = self
             .pair_counts
             .get(&key)
-            .map(|count| (count.count, count.last_ns))
+            .map(|count| (count.count, count.anchor_ns))
             .unwrap_or((0, 0));
+        if let Some(recorder) = &mut self.diagnostics {
+            let held = self.pair_counts.get(&key).map(|held| held.read);
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+                .with_pair(key.diagnostic_key());
+            record.pid = Some(row.host_tgid);
+            record.decision = Some(DiagnosticDecision::Rejected);
+            record.reason = Some(reason);
+            record.absolute = Some(base);
+            record.through = Some(base);
+            record.context_unavailable = true;
+            if let Some(held) = held {
+                record.pre = Some(held.anchor_ns);
+                record.post = Some(held.last_ns);
+                record.observation_ref = nonzero_ref(held.diagnostic_observation);
+                record.transition_ref = nonzero_ref(held.diagnostic_transition);
+            }
+            recorder.record(record);
+        }
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
@@ -2331,7 +7660,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let modules = match self.witness_modules(&row) {
             Ok(modules) => modules,
             Err(reason) => {
-                self.drop_pair_count(&row);
+                self.drop_pair_count(&row, DiagnosticReason::NotAdmitted);
                 if let Binding::Unbound(unbound) = binding {
                     self.note_preadmission(row.host_tgid, &[None], unbound);
                 }
@@ -2345,7 +7674,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
-                self.drop_pair_count(&row);
+                self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
@@ -2545,17 +7874,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(modules.into_iter().collect())
     }
 
-    /// A proven exec transition: the incarnation's image ended. A still
-    /// live incarnation retires (exec-retired) and its successor is
-    /// admitted; one the scan lane already retired needs nothing. A native
-    /// owner gets the `ExecProof` the transition carries.
+    /// A proven exec transition: the incarnation's image ended. The
+    /// coordinator's ended-incarnation path mints one held handoff
+    /// (`mint_pending_successor`) and commits it: immediately outside scope
+    /// transactions, at the next fresh collection inside them. One the scan
+    /// lane already retired needs nothing. A native owner gets the
+    /// `ExecProof` the transition carries; a stale owner refuses the whole
+    /// handoff while the old incarnation still retires.
     fn apply_exec_transition(
         &mut self,
         transition: ExecTransition,
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Vec<CallerEvent> {
         let caller = transition.caller();
+        let transition_pid = transition.pid();
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            self.cgroup_fence.invalidate();
+        }
+        if let Some((collection, _)) = &mut self.pending_cgroup {
+            collection.invalidate(transition_pid);
+        }
         // The binder emits a transition only for the live incarnation that
         // held the row's tgid, so the pid matches by construction; whether
         // that incarnation is still live is what may have changed since.
@@ -2575,11 +7915,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.registry.record_gap(RegistryGap {
                 caller: Some(caller),
                 module: None,
-                pid: Some(transition.pid()),
+                pid: Some(transition_pid),
                 subject: "native exec proof not applied".into(),
                 reason: format!("{error:#}; the caller incarnation still retires"),
                 budget: None,
             });
+            // A stale owner refuses the handoff: the image end is fact (the
+            // old incarnation retires) but no successor is minted for it.
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if self.stopped {
+            // Stop wins before successor admission: the old incarnation
+            // still retires on the proven image end, but no handoff is
+            // minted and no retry is scheduled.
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition_pid),
+                subject: "successor admission refused while stopped".into(),
+                reason: "the coordinator stopped; the proved old incarnation retires \
+                     without a successor and no retry is scheduled"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if self.mint_pending_successor(transition, now_ns).is_none() {
+            // Defensive only: live callers never hold a handoff and never
+            // lack their pin. Refuse rather than double-mint.
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            // An out-of-scope exec ends the old image but cannot admit its
+            // successor: re-entry needs a new current-scope transaction,
+            // which commits the held handoff.
+            return vec![self.adapter.retired_event(caller)];
         }
         let mut resolver = AuthorityResolver {
             engine: &mut self.engine,
@@ -2589,29 +7959,1164 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
-        let events = self
-            .adapter
-            .exec_transition(caller, &mut |pid| resolver.resolve(pid), now_ns);
+        let authority = resolver.resolve(transition_pid);
         let (native_failures, scan_pinned) = resolver.finish();
         self.record_authority_gaps(native_failures, scan_pinned);
-        events
+        self.commit_pending_successor(caller, authority, now_ns, detected)
     }
 
-    /// The I4b batch: the engine tail and the registry publish as one
-    /// synchronous step. Facts from every scan since the last commit are
-    /// invisible before this returns and visible after — the ordering
-    /// the Phase 2 test pins, extended to caller/edge facts.
+    /// Mint one held exec handoff for a proven transition (H6 slice 2).
+    /// Called by `apply_exec_transition` (row-proven) and `apply_exec_hook`
+    /// (unheld predecessor). The original held pin moves into the handoff
+    /// first, then the old incarnation retires; at most one handoff per
+    /// ended caller. `None` when one is already held or custody is gone
+    /// (both defensive: live callers hold neither state).
+    fn mint_pending_successor(&mut self, transition: ExecTransition, now_ns: u64) -> Option<()> {
+        let caller = transition.caller();
+        if self.pending_successors.contains_key(&caller) {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition.pid()),
+                subject: "duplicate exec handoff refused".into(),
+                reason: "an exec handoff is already held for this caller; \
+                     at most one successor commits per ended caller"
+                    .into(),
+                budget: None,
+            });
+            return None;
+        }
+        let old = self.adapter.record(caller)?;
+        let old_incarnation = old.incarnation;
+        let old_generation = crate::inspect_system::MemberGeneration {
+            start_time: old.start_time,
+            exe: old.exe.clone(),
+        };
+        if !old.retired
+            && old.pid == transition.pid()
+            && self.adapter.share_caller_pin(caller).is_some()
+        {
+            self.resolve_leader_exit_for_exec(caller);
+        }
+        let pending_exact = self
+            .pending_successors
+            .values()
+            .filter(|pending| {
+                pending
+                    .semantic
+                    .as_ref()
+                    .is_some_and(|semantic| semantic.is_exact())
+            })
+            .count();
+        let semantic = self.semantic_bindings.take_handoff(
+            caller,
+            old_incarnation,
+            &old_generation,
+            pending_exact,
+        );
+        let Some((pid, pin)) = self.adapter.retire_for_exec_handoff(caller, now_ns) else {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition.pid()),
+                subject: "exec handoff without custody refused".into(),
+                reason: "the live incarnation holds no pin to hand over; \
+                     the successor is never reopened by scalar PID"
+                    .into(),
+                budget: None,
+            });
+            return None;
+        };
+        self.pending_successors.insert(
+            caller,
+            PendingExecSuccessor {
+                old: caller,
+                old_incarnation,
+                pid,
+                custody: pin,
+                semantic,
+                mint_start: self.adapter.source().start_time(pid),
+                mint_exe: self.adapter.source().exe_identity(pid),
+                transition,
+            },
+        );
+        Some(())
+    }
+
+    /// A physical success only transfers the original H0 Arc. A new
+    /// semantic binding still requires this destination's accepted owner
+    /// scan, provider receipt, and current scope guard.
+    fn publish_semantic_successor(
+        &mut self,
+        destination: CallerId,
+        custody: Option<semantics::SemanticHandoffCustody>,
+    ) {
+        let Some(custody) = custody else {
+            return;
+        };
+        let Some(record) = self.adapter.record(destination) else {
+            self.semantic_admission_refused(destination, "no_live_caller");
+            return;
+        };
+        let (pid, incarnation, generation) = (
+            record.pid,
+            record.incarnation,
+            crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            },
+        );
+        let pending_exact = self
+            .pending_successors
+            .values()
+            .filter(|pending| {
+                pending
+                    .semantic
+                    .as_ref()
+                    .is_some_and(|semantic| semantic.is_exact())
+            })
+            .count();
+        if let Some(reason) = self.semantic_bindings.publish_successor(
+            custody,
+            destination,
+            pid,
+            incarnation,
+            generation,
+            pending_exact,
+        ) {
+            self.semantic_admission_refused(destination, reason.code());
+        }
+    }
+
+    /// Commit one held exec handoff: the fresh admission transaction (H6
+    /// slice 2). Unscoped commits run here; the scoped collection commit
+    /// verifies through `verify_pending_successor` under its own permit.
+    /// The handoff is consumed either way; every refusal is an honest
+    /// event, never silent.
+    fn commit_pending_successor(
+        &mut self,
+        old: CallerId,
+        authority: ImageAuthority,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Vec<CallerEvent> {
+        let Some(pending) = self.pending_successors.remove(&old) else {
+            return Vec::new();
+        };
+        let pid = pending.pid;
+        match self.verify_pending_successor(&pending) {
+            Ok(Some(new)) => {
+                // An already-admitted same-incarnation candidate stands on
+                // its own admission; the handoff links to it by retirement
+                // order (same pid, next incarnation) without minting again.
+                self.publish_semantic_successor(new, pending.semantic);
+                Vec::new()
+            }
+            Ok(None) => {
+                let semantic = pending.semantic;
+                let events = match self.adapter.admit_retained_successor(
+                    pid,
+                    pending.custody,
+                    authority,
+                    now_ns,
+                    detected,
+                ) {
+                    Ok(new) => {
+                        self.publish_semantic_successor(new, semantic);
+                        vec![CallerEvent::ExecRetired { old, new }]
+                    }
+                    Err(failure) => vec![CallerEvent::AdmitFailed {
+                        pid,
+                        reason: format!("post-exec re-admission failed: {}", failure.reason),
+                        budget: failure.budget,
+                    }],
+                };
+                // A failed detection clock falls back explicitly before
+                // subsequent exit attribution (F7a): exits record
+                // unfiltered with their gap, never against a silent
+                // pass-start stamp.
+                if self.adapter.take_detection_clock_failed() {
+                    self.exit_clocks_comparable = false;
+                }
+                events
+            }
+            Err(failure) => vec![CallerEvent::AdmitFailed {
+                pid,
+                reason: failure.reason,
+                budget: failure.budget,
+            }],
+        }
+    }
+
+    /// Verify one held handoff against current truth (H6 slice 2): the
+    /// ended incarnation is unchanged since mint, original custody still
+    /// holds the same process, and no newer image or generation arrived
+    /// before commit. Returns the adoptable live candidate when one
+    /// already holds this pid's current incarnation — pid equality alone
+    /// never selects it.
+    fn verify_pending_successor(
+        &self,
+        pending: &PendingExecSuccessor<Source::Pin>,
+    ) -> Result<Option<CallerId>, AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        // The held evidence names this handoff's ended incarnation (the
+        // binder's domain-carrying proof; never rendered, only matched).
+        if pending.transition.caller() != pending.old || pending.transition.pid() != pending.pid {
+            return Err(failed(
+                "stale exec handoff: the held transition names another incarnation",
+            ));
+        }
+        let unchanged = self.adapter.record(pending.old).is_some_and(|record| {
+            record.retired
+                && record.pid == pending.pid
+                && record.incarnation == pending.old_incarnation
+        });
+        if !unchanged {
+            return Err(failed(
+                "stale exec handoff: the ended incarnation changed since the handoff was minted",
+            ));
+        }
+        if !self.adapter.source().still_the_same(&pending.custody) {
+            return Err(failed(
+                "original process custody lost: the process exited or the pid was reused",
+            ));
+        }
+        if self.adapter.source().start_time(pending.pid) != pending.mint_start
+            || self.adapter.source().exe_identity(pending.pid) != pending.mint_exe
+        {
+            return Err(failed(
+                "stale exec handoff: a newer image or generation arrived before commit; \
+                 the stale candidate is rejected and the renewed request services separately",
+            ));
+        }
+        if let Some(live) = self.adapter.live_id(pending.pid) {
+            let adoptable = self.adapter.record(live).is_some_and(|record| {
+                !record.retired
+                    && record.start_time == pending.mint_start
+                    && record.exe == pending.mint_exe
+            });
+            if !adoptable {
+                return Err(failed(
+                    "the pid's live caller is not this handoff's current incarnation; \
+                     pid equality alone never adopts it",
+                ));
+            }
+            return Ok(Some(live));
+        }
+        Ok(None)
+    }
+
+    /// Release held exec handoffs whose original custody died (H6 slice
+    /// 2): a dead pin can never commit, so the handoff drops now instead
+    /// of holding its FD for a re-entry that cannot come. Live-but-absent
+    /// handoffs stay held: the member may re-enter.
+    fn release_dead_handoffs(&mut self) {
+        self.semantic_bindings.release_dead_successors();
+        let dead: Vec<CallerId> = self
+            .pending_successors
+            .iter()
+            .filter(|(_, pending)| !self.adapter.source().still_the_same(&pending.custody))
+            .map(|(old, _)| *old)
+            .collect();
+        for old in dead {
+            if let Some(pending) = self.pending_successors.remove(&old) {
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(old),
+                    module: None,
+                    pid: Some(pending.pid),
+                    subject: "held exec handoff released".into(),
+                    reason: "original process custody died while the handoff was held; \
+                         no successor commits and the pin is released"
+                        .into(),
+                    budget: None,
+                });
+            }
+        }
+    }
+
+    /// Stop the coordinator (H6 slice 2): no new scan, attach,
+    /// successor/name admission, or retry starts afterwards. Held exec
+    /// handoffs release their custody now; staged facts still drain
+    /// through `commit_batch`.
+    #[cfg_attr(not(test), allow(dead_code))] // Production stop wiring lands with the runtime consumer.
+    pub(crate) fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.stop_pending_leader_exits();
+        let held = self.pending_successors.len();
+        self.pending_successors.clear();
+        self.semantic_bindings.release_unused_successors();
+        if held > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "held exec handoffs released at stop".into(),
+                reason: format!(
+                    "{held} held exec handoff(s) released their custody at stop; \
+                     no successor commits and no retry is scheduled"
+                ),
+                budget: None,
+            });
+        }
+    }
+
+    /// A collection the stop discarded before apply: inspect the dropped
+    /// catalog, read-only over admission, for attributable members the
+    /// coordinator never admitted that map a provider — deep-scan
+    /// provider tables or interfaces, or a maps-match against a pinned
+    /// provider — and leave one named gap for their unobserved calls.
+    /// Provider-free and newcomer-free discards stay silent. Cgroup
+    /// retained collections carry transaction state rather than final
+    /// scan verdicts, so provider mappings there stay unjudged.
+    pub(crate) fn note_discarded_collection(
+        &mut self,
+        collected: &crate::inventory_capture::CollectedPass,
+    ) {
+        let crate::inventory_capture::CollectedPass::Legacy(Ok(catalog)) = collected else {
+            return;
+        };
+        let mut provider_pids: BTreeSet<u32> = BTreeSet::new();
+        for object in &catalog.objects {
+            for observation in &object.observations {
+                if !observation.tables.is_empty() || !observation.interfaces.is_empty() {
+                    provider_pids.insert(observation.pid);
+                }
+            }
+        }
+        for process in &catalog.processes {
+            if self.adapter.live_id(process.pid).is_some() {
+                continue;
+            }
+            if !process.status.attributable() {
+                continue;
+            }
+            let maps_provider = process.status == crate::inspect_system::MemberStatus::MapsMatched
+                || provider_pids.contains(&process.pid);
+            if maps_provider {
+                // Same phenomenon class as the discovery Engine's
+                // stop-time mark, reworded for this seam: the mapping may
+                // predate the stop; the drop happened while stopping.
+                self.note_scope_gap(
+                    "live inventory transaction".into(),
+                    "a process mapping a provider was dropped before it was admitted, while the capture was stopping; its calls were not observed".into(),
+                );
+                return;
+            }
+        }
+    }
+
+    /// EXEC hooks for never-admitted pids that drained after the last
+    /// completed scan pass: those processes started too late to be
+    /// scanned, so one scope gap names their unknown provider
+    /// mappings. Silent when nothing drained post-pass or no scan
+    /// completed (the zero-pass diagnostic owns that run). Cgroup
+    /// scope stays unjudged (transaction coverage, not scan passes).
+    /// Drains the set, so a repeated terminal call stays silent.
+    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {
+        let pending = std::mem::take(&mut self.post_pass_exec_newcomers);
+        if !self.completed_scan_pass || pending.is_empty() {
+            return;
+        }
+        self.note_scope_gap(
+            "discovery coverage ended before stop".into(),
+            format!(
+                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown",
+                pending.len()
+            ),
+        );
+    }
+
+    /// The physical tail and registry share the actual publication boundary.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
+        match self.commit_batch_inner(engine_changed, None, None, None)? {
+            JointCommitProgress::Published(receipt) => Ok(receipt),
+            JointCommitProgress::Pending => unreachable!("plain commit cannot start Joint work"),
+        }
+    }
+
+    pub(crate) fn commit_batch_with_semantics(
+        &mut self,
+        engine_changed: bool,
+        lane: Option<&mut AttestedSemanticLane>,
+    ) -> Result<BatchReceipt> {
+        match self.commit_batch_inner(engine_changed, lane, None, None)? {
+            JointCommitProgress::Published(receipt) => Ok(receipt),
+            JointCommitProgress::Pending => unreachable!("plain commit cannot start Joint work"),
+        }
+    }
+
+    /// Commit with the pass's native image-acquisition handle
+    /// threaded from the active capture lane: scoped owner
+    /// preparation acquires fresh observations through it before
+    /// the final membership sample, and the coordinator retains
+    /// nothing once the call returns. `None` (no active capture
+    /// lane at this commit) keeps scan-pinned fallback with the
+    /// standing unavailable disclosure.
+    pub(crate) fn commit_batch_with_acquisition(
+        &mut self,
+        engine_changed: bool,
+        lane: Option<&mut AttestedSemanticLane>,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<BatchReceipt> {
+        match self.commit_batch_inner(engine_changed, lane, None, acquisition)? {
+            JointCommitProgress::Published(receipt) => Ok(receipt),
+            JointCommitProgress::Pending => unreachable!("plain commit cannot start Joint work"),
+        }
+    }
+
+    /// The single publication entrypoint dispatches retries before engine,
+    /// cgroup, semantic finalizer or observer preparation can repeat.
+    fn commit_batch_inner(
+        &mut self,
+        engine_changed: bool,
+        mut lane: Option<&mut AttestedSemanticLane>,
+        joint: Option<semantics::JointCommitInput<'_>>,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<JointCommitProgress> {
+        if let Some(joint) = joint {
+            return self.commit_joint_publication_inner(joint);
+        }
+        if self.publication_pending() {
+            bail!("an unfinished Joint publication must resume its original frame");
+        }
+        let completion =
+            self.prepare_physical_publication(engine_changed, lane.as_deref_mut(), acquisition)?;
+        // Poll the EVENTS ring-loss counter on every plain commit, so a
+        // rise discloses in the same publication instead of staying
+        // silent. A failed read only delays disclosure: the counter is
+        // cumulative and the last good value stands.
+        if let Some(lane) = lane.as_deref_mut() {
+            self.poll_and_disclose_events_ring_loss(lane);
+        }
+        self.finalize_semantic_batches(lane);
+        let applied = self.publish_registry(None)?;
+        Ok(JointCommitProgress::Published(
+            self.finish_publication_context(completion, applied),
+        ))
+    }
+
+    pub(crate) fn publication_pending(&self) -> bool {
+        self.joint_publication.is_some() || self.registry.publication_pending()
+    }
+
+    /// Abandon an unfinished Joint publication the driver can no
+    /// longer resume (its machine latched after preparing), so the
+    /// exit-hold abandon commit and every later plain commit proceed
+    /// past it. Stranded semantic batches resolve first (a Prepared
+    /// batch drains S1-direct and mints its H3; a Collected batch
+    /// drops through the audited path). An applied registry phase
+    /// finishes through the retained frame's abandon disposal; an
+    /// unapplied phase cancels. The prepared physical work publishes,
+    /// the abandon stages its named loss gap, and nothing pending is
+    /// a quiet no-op. An applied phase without its frame, without
+    /// bound seal targets, or refusing the finish is left standing:
+    /// the later refusal discloses it exactly as today.
+    pub(crate) fn abandon_unfinished_joint_publication(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        frame: Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum>,
+        reason: String,
+    ) {
+        if !self.publication_pending() {
+            drop(frame);
+            return;
+        }
+        self.abandon_stranded_semantic_batches(lane);
+        let mut applied = 0;
+        if self.registry.publication_pending() {
+            if self.registry.joint_publication_applied() {
+                let Some(frame) = frame else {
+                    return;
+                };
+                if !self.registry.joint_publication_targets_bound() {
+                    drop(frame);
+                    return;
+                }
+                let disposed = frame.abandon_unfinished();
+                let finished = self
+                    .registry
+                    .finish_joint_publication(&mut self.joint_capture, &disposed);
+                let Ok(finished) = finished else {
+                    return;
+                };
+                applied = finished;
+            } else {
+                drop(frame);
+                self.registry.cancel_unapplied_joint_publication();
+            }
+        } else {
+            drop(frame);
+        }
+        if let Some(pending) = self.joint_publication.take() {
+            let _ = self.finish_publication_context(pending.completion, applied);
+            drop(pending._storage);
+        }
+        self.note_scope_gap("unfinished joint publication abandoned".to_string(), reason);
+    }
+
+    /// Pose a coordinator-half pending Joint publication (no registry
+    /// phase): the hold twin's wedge stand-in. Real registry-pending
+    /// shapes are driven by the joint fixtures instead.
+    #[cfg(test)]
+    pub(crate) fn pose_pending_joint_publication_for_test(&mut self) {
+        let storage = self
+            .registry
+            .reserve_semantic_storage(std::mem::size_of::<PendingJointPublication>())
+            .expect("the test publication lease fits its budget");
+        self.joint_publication = Some(PendingJointPublication {
+            completion: PublicationCompletion {
+                cgroup: None,
+                events: Vec::new(),
+                admitted: 0,
+                scan_callers: 0,
+            },
+            cut_barrier: None,
+            finish: None,
+            _storage: storage,
+        });
+    }
+
+    fn prepare_physical_publication(
+        &mut self,
+        engine_changed: bool,
+        mut lane: Option<&mut AttestedSemanticLane>,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<PublicationCompletion> {
+        self.retry_pending_leader_exits();
+        // Original cgroup custody is still in self during the fallible engine
+        // tail. Scoped preparation/staging then has no later fallible tail.
         self.engine.publish_batch_tail(engine_changed)?;
-        let registry_applied = self.registry.publish();
+        // Fresh per-publication proof tracking for the tail adjudication.
+        // Tail bits are NOT cleared here: they join this publication's
+        // cut directly, and drain in the finalizer either way.
+        self.complete_scanned.clear();
+        let mut publishing_cgroup = self.pending_cgroup.take();
+        let mut scoped_events = Vec::new();
+        let mut scoped_semantic_successors = Vec::new();
+        let mut scoped_admitted = 0;
+        let mut scoped_scan_callers = 0;
+        let mut cgroup_proof_complete = false;
+        if let Some((collection, now_ns)) = &mut publishing_cgroup {
+            // Dead custody can never re-enter: release those handoffs
+            // before the transaction prepares anything.
+            self.release_dead_handoffs();
+            // At most one held handoff commits per pid in a transaction.
+            let mut handoff_pids = BTreeMap::new();
+            for (old, pending) in &self.pending_successors {
+                let previous = handoff_pids.insert(pending.pid, *old);
+                debug_assert!(previous.is_none(), "at most one held handoff per pid");
+            }
+            let work = collection.work();
+            let pids: Vec<u32> = if work.charge(
+                collection
+                    .member_pids()
+                    .count()
+                    .saturating_mul(2)
+                    .saturating_add(1),
+            ) {
+                collection.member_pids().collect() // private cap128; charged before allocation
+            } else {
+                Vec::new()
+            };
+            let mut prepared = BTreeMap::new();
+            let mut prepared_handoffs = BTreeMap::new();
+            for pid in pids {
+                if !work.charge(6) {
+                    break;
+                }
+                if let Some(&old) = handoff_pids.get(&pid) {
+                    // Handoff members never take the ordinary fresh-open
+                    // path: verify the held handoff against current truth
+                    // and require the walk to show its current image.
+                    // Anything unproven here stays held silently for a
+                    // fresher walk; only terminal refusals consume.
+                    let Some(pending) = self.pending_successors.get(&old) else {
+                        continue;
+                    };
+                    let verified = self.verify_pending_successor(pending);
+                    let (mint_start, mint_exe) = (pending.mint_start, pending.mint_exe.clone());
+                    if let Err(failure) = verified {
+                        self.pending_successors.remove(&old);
+                        collection.preparation_failed();
+                        scoped_events.push(CallerEvent::AdmitFailed {
+                            pid,
+                            reason: failure.reason,
+                            budget: failure.budget,
+                        });
+                        continue;
+                    }
+                    let Some(preparation) = collection.preparation(pid) else {
+                        continue;
+                    };
+                    if preparation.generation().start_time == mint_start
+                        && preparation.generation().exe == mint_exe
+                    {
+                        // The verified pre-sample generation travels with
+                        // the handoff: commit matches it against the end
+                        // sample with no post-sample generation recapture;
+                        // permit.check() custody liveness reread excepted
+                        // (refuses on mismatch, supplies no replacement
+                        // identity).
+                        prepared_handoffs.insert(pid, (old, preparation.generation().clone()));
+                    }
+                    continue;
+                }
+                let Some(preparation) = collection.preparation(pid) else {
+                    continue;
+                };
+                match self.adapter.prepare_scoped_caller(&preparation) {
+                    Ok(pin) => {
+                        prepared.insert(pid, pin);
+                    }
+                    Err(failure) => {
+                        collection.preparation_failed();
+                        scoped_events.push(CallerEvent::AdmitFailed {
+                            pid,
+                            reason: failure.reason,
+                            budget: failure.budget,
+                        });
+                    }
+                }
+            }
+            // Owner scans use the original prepared source pin, while this
+            // collection still owns its membership/generation bracket. At
+            // most four attempts (including failures) allocate proof here.
+            let mut semantic_prepared = Vec::with_capacity(4);
+            if let Some(lane) = lane
+                .as_deref_mut()
+                .filter(|lane| lane.is_live() && !lane.is_finished())
+            {
+                let eligible = if work.charge(prepared.len().saturating_add(1)) {
+                    prepared.values().filter_map(|pin| pin.existing()).collect()
+                } else {
+                    BTreeSet::new()
+                };
+                for attempt in self
+                    .semantic_refresh_attempts(lane, Some(&eligible), |units| work.charge(units))
+                {
+                    if !work.charge(4) {
+                        break;
+                    }
+                    let Some(module) = attempt.module else {
+                        self.semantic_admission_refused(
+                            attempt.caller,
+                            "provider_mapping_unproven",
+                        );
+                        continue;
+                    };
+                    let candidate = prepared
+                        .values()
+                        .find(|pin| pin.existing() == Some(attempt.caller))
+                        .and_then(|pin| self.prepare_scoped_semantic_candidate(pin, lane.domain()));
+                    let Some(candidate) = candidate else {
+                        self.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
+                        continue;
+                    };
+                    match lane.prepare_caller_admission(
+                        candidate.pin(),
+                        attempt.slot,
+                        &module,
+                        |bytes| self.registry.reserve_semantic_storage(bytes),
+                    ) {
+                        Ok(owner) => semantic_prepared.push((candidate, owner)),
+                        Err(reason) => {
+                            self.semantic_admission_prepare_failed(attempt.caller, reason)
+                        }
+                    }
+                    if !work.charge(0) {
+                        break;
+                    }
+                }
+            }
+            // Native owner preparation: all owner I/O completes
+            // here, before the final membership sample. Only prepared
+            // members with a live caller qualify, split into
+            // activations (not yet owning) and refreshes (owning);
+            // the commit below spends one shared scoped commit under
+            // borrowed final-sample permits and releases the rest.
+            // Without an acquisition handle nothing prepares: the
+            // commit keeps the standing unavailable disclosure.
+            let owner_candidates: Vec<(u32, CallerId, crate::inspect_system::MemberGeneration)> =
+                prepared
+                    .iter()
+                    .filter_map(|(pid, pin)| {
+                        pin.existing()
+                            .map(|caller| (*pid, caller, pin.generation().clone()))
+                    })
+                    .collect();
+            let handle_present = acquisition.is_some();
+            let mut invalidated_owners = BTreeSet::new();
+            let (staged_owners, staged_refreshes) = match acquisition {
+                None => (Vec::new(), Vec::new()),
+                Some(acq) => {
+                    let (activations, mut refreshes): (Vec<_>, Vec<_>) = owner_candidates
+                        .into_iter()
+                        .partition(|(_, caller, _)| !self.owners.contains_key(caller));
+                    let staged = self.prepare_scoped_native_owners(activations, &work, &mut *acq);
+                    // Refresh preparation runs only when no activation
+                    // was staged: the pass's one scoped commit then
+                    // belongs to the activation, and the refresh waits
+                    // silently for a later pass.
+                    let refreshes = if staged.is_empty() {
+                        refreshes.sort_by_key(|(pid, caller, _)| {
+                            let serviced = self
+                                .owners
+                                .get(caller)
+                                .and_then(|owner| self.engine.inventory_refresh_epochs(*owner).ok())
+                                .map(|(_, serviced)| serviced)
+                                .unwrap_or(u64::MAX);
+                            (serviced, *pid)
+                        });
+                        self.prepare_scoped_native_refreshes(
+                            refreshes,
+                            &work,
+                            &mut *acq,
+                            &mut invalidated_owners,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    (staged, refreshes)
+                }
+            };
+            // Prepare every provider read while retaining exclusive attach-set
+            // custody. No aliases/endpoints/memberships are published here.
+            let provider = if collection.reserve_projection(self.registry.edge_count()) {
+                match self
+                    .attach_set
+                    .prepare_absorption(collection.provider_inputs(), |units| work.charge(units))
+                {
+                    Ok(provider) => Some(provider),
+                    Err(reason) => {
+                        collection.preparation_incomplete();
+                        self.registry.record_gap(RegistryGap {
+                            caller: None,
+                            module: None,
+                            pid: None,
+                            subject: "cgroup provider preparation incomplete".into(),
+                            reason,
+                            budget: None,
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let requested = if provider.is_some()
+                && work.charge(
+                    prepared
+                        .len()
+                        .saturating_add(prepared_handoffs.len())
+                        .saturating_mul(8)
+                        .saturating_add(1),
+                ) {
+                prepared
+                    .keys()
+                    .copied()
+                    .chain(prepared_handoffs.keys().copied())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            collection.sample_end(&requested);
+            // Admission detection runs per incarnation at commit, after
+            // the end sample and the commit validation: stale native
+            // records order against detection time, never the
+            // pass-start clock (F7a).
+            let mut allowed = BTreeSet::new();
+            let mut allowed_callers = BTreeSet::new();
+            for (pid, pin) in prepared {
+                let Some(permit) = collection.permit(pid) else {
+                    continue;
+                };
+                match self.adapter.commit_scoped_caller(
+                    pin,
+                    permit,
+                    *now_ns,
+                    &mut crate::attach::monotonic_ns,
+                ) {
+                    Ok((id, admitted)) => {
+                        allowed.insert(pid);
+                        allowed_callers.insert(id);
+                        if admitted {
+                            scoped_admitted += 1;
+                            scoped_events.push(CallerEvent::Admitted { id });
+                        }
+                    }
+                    Err(failure) => scoped_events.push(CallerEvent::AdmitFailed {
+                        pid,
+                        reason: failure.reason,
+                        budget: failure.budget,
+                    }),
+                }
+            }
+            // Held handoffs commit under their own exact member permits:
+            // borrow the permit, commit the moved custody, finish. No
+            // permit this transaction holds the handoff for a fresher one.
+            for (pid, (old, generation)) in prepared_handoffs {
+                let Some(pending) = self.pending_successors.remove(&old) else {
+                    continue;
+                };
+                let Some(permit) = collection.permit(pid) else {
+                    self.pending_successors.insert(old, pending);
+                    continue;
+                };
+                let semantic = pending.semantic;
+                match self.adapter.commit_handoff_caller(
+                    pid,
+                    pending.custody,
+                    permit,
+                    generation,
+                    *now_ns,
+                    &mut crate::attach::monotonic_ns,
+                ) {
+                    Ok((new, admitted)) => {
+                        if let Some(semantic) = semantic {
+                            scoped_semantic_successors.push((new, semantic));
+                        }
+                        allowed.insert(pid);
+                        allowed_callers.insert(new);
+                        if admitted {
+                            scoped_admitted += 1;
+                            scoped_events.push(CallerEvent::ExecRetired { old, new });
+                        }
+                    }
+                    Err(failure) => scoped_events.push(CallerEvent::AdmitFailed {
+                        pid,
+                        reason: failure.reason,
+                        budget: failure.budget,
+                    }),
+                }
+            }
+            if self.adapter.take_detection_clock_failed() {
+                self.exit_clocks_comparable = false;
+            }
+            scoped_scan_callers = allowed.len();
+            collection.observe_allowed(&allowed);
+            let mut catalog = collection.catalog(&allowed);
+            // Same fold as `absorb_catalog_excluded`, inline: `provider`
+            // borrows the attach set, so only disjoint field access fits.
+            for record in std::mem::take(&mut catalog.excluded) {
+                self.engine.budget.push_excluded(record);
+            }
+            let absorbed = match (provider, catalog.lowering.take()) {
+                (Some(provider), Some(lowering)) => {
+                    match provider
+                        .absorb(&lowering.plan, &lowering.pins, |units| work.charge(units))
+                    {
+                        Ok(absorbed) => Some(absorbed),
+                        Err(reason) => {
+                            collection.preparation_incomplete();
+                            self.registry.record_gap(RegistryGap {
+                                caller: None,
+                                module: None,
+                                pid: None,
+                                subject: "cgroup provider consumption incomplete".into(),
+                                reason,
+                                budget: None,
+                            });
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            // The prepared guard has been consumed/dropped, so ordinary staging
+            // can borrow the coordinator again. It performed no provider reads.
+            for (new, semantic) in scoped_semantic_successors.drain(..) {
+                self.publish_semantic_successor(new, Some(semantic));
+            }
+            self.apply_reconcile_events(&scoped_events, *now_ns);
+            let verdicts =
+                absorbed.map_or_else(BTreeMap::new, |absorbed| self.record_absorbed(absorbed));
+            self.project_catalog(&catalog, &verdicts, *now_ns);
+            if let Some(lane) = lane {
+                for (candidate, prepared) in semantic_prepared {
+                    // The same final sampled member owns this permit. No
+                    // owner/provider scan, PID reopen, or replacement
+                    // candidate can run beyond this boundary.
+                    let permit = collection.permit(candidate.pid());
+                    let (receipt, _) = self.consume_semantic_admission(candidate, prepared, permit);
+                    lane.deliver_admission_receipt(receipt);
+                }
+            }
+            // Without an acquisition handle at this commit (no
+            // active capture lane): the standing unavailable
+            // disclosure the installed consumer recognizes records
+            // once per pass; scan-pinned fallback stands.
+            if !handle_present {
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: NATIVE_OWNER_UNAVAILABLE_SUBJECT.into(),
+                    reason: NATIVE_OWNER_UNAVAILABLE_REASON.into(),
+                    budget: None,
+                });
+            }
+            // Native owner activation and refresh: commit staged
+            // owners under their borrowed final-sample permits. A
+            // commit requires both its member permit and a complete
+            // transaction (the outcome gates the fence); a missing
+            // permit reports the member-precise reason, a permitted
+            // member of an incomplete transaction the fence reason
+            // (activations by name, refreshes silently — periodic
+            // work retries next pass, while a permit-missing refresh
+            // refuses by name at any outcome). At most one scoped
+            // commit per transaction, shared by activations first and
+            // refreshes after: each commit replaces the whole engine
+            // state, so a further permitted member defers
+            // deterministically to a later pass with its staged state
+            // released.
+            let transaction_complete = collection.outcome() == ScopedCollectionOutcome::Complete;
+            #[cfg(test)]
+            scoped_commit_gate_test::notify(scoped_commit_gate_test::Phase::GateSampled);
+            let mut commits_used = 0;
+            for staged in staged_owners {
+                let permit = collection.permit(staged.pid);
+                match (permit, transaction_complete) {
+                    (Some(permit), true) => {
+                        if commits_used >= SCOPED_OWNER_COMMITS_PER_TRANSACTION {
+                            self.abandon_staged_native_owner(
+                                staged.caller,
+                                staged.pid,
+                                staged.owner,
+                                Some(&staged.lease),
+                                "only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained",
+                            );
+                        } else {
+                            commits_used += 1;
+                            self.commit_staged_native_owner(staged, &permit, &verdicts, *now_ns);
+                        }
+                    }
+                    (None, _) => {
+                        self.abandon_staged_native_owner(
+                            staged.caller,
+                            staged.pid,
+                            staged.owner,
+                            Some(&staged.lease),
+                            "the final-sample permit was not granted; scan-pinned fallback retained",
+                        );
+                    }
+                    (Some(_), false) => {
+                        self.abandon_staged_native_owner(
+                            staged.caller,
+                            staged.pid,
+                            staged.owner,
+                            Some(&staged.lease),
+                            "the cgroup transaction did not complete; scan-pinned fallback retained",
+                        );
+                    }
+                }
+            }
+            let mut lost_owners = BTreeSet::new();
+            for staged in staged_refreshes {
+                let permit = collection.permit(staged.pid);
+                #[cfg(test)]
+                scoped_commit_gate_test::notify(
+                    scoped_commit_gate_test::Phase::RefreshPermitPolled,
+                );
+                match (permit, transaction_complete) {
+                    (Some(permit), true) => {
+                        if commits_used >= SCOPED_OWNER_COMMITS_PER_TRANSACTION {
+                            self.release_staged_native_refresh(staged);
+                        } else {
+                            commits_used += 1;
+                            let caller = staged.caller;
+                            let lost = self.commit_scoped_native_refresh(
+                                staged,
+                                &permit,
+                                &verdicts,
+                                *now_ns,
+                                &mut invalidated_owners,
+                            );
+                            if lost && collection.outcome() == ScopedCollectionOutcome::Complete {
+                                allowed_callers.remove(&caller);
+                                lost_owners.insert(caller);
+                            }
+                        }
+                    }
+                    (None, _) => {
+                        // A permit missing while the transaction
+                        // is still complete was lost after the
+                        // final sample (earlier loss already
+                        // incompleted it): the member no longer
+                        // stands, so withdraw its admission
+                        // standing for this pass's teardown. A
+                        // permit refused through latched
+                        // cancellation or work exhaustion leaves
+                        // the outcome non-complete and marks
+                        // nobody; that is work state, not a lost
+                        // member, and never an exec change.
+                        let still_complete =
+                            collection.outcome() == ScopedCollectionOutcome::Complete;
+                        let caller = staged.caller;
+                        self.abandon_scoped_native_refresh(
+                            caller,
+                            staged.pid,
+                            staged.owner,
+                            Some(&staged.lease),
+                            if still_complete {
+                                "the final-sample permit was not granted"
+                            } else {
+                                "the final-sample permit was not granted; prior owner facts retained"
+                            },
+                            &mut invalidated_owners,
+                        );
+                        if still_complete {
+                            allowed_callers.remove(&caller);
+                            lost_owners.insert(caller);
+                        }
+                    }
+                    (Some(_), false) => {
+                        self.release_staged_native_refresh(staged);
+                    }
+                }
+            }
+            // Suspend owners the complete transaction left behind
+            // (absent members, retired callers, proven exec changes,
+            // admitted members lost at their later permit proof)
+            // before the tail revision: release mutates engine
+            // facts. Poll the current outcome here, after every
+            // returning commit/refusal check above: permit and
+            // proof charges inside the loop can latch cancellation
+            // or work exhaustion after the pre-loop sample, and a
+            // transaction no longer complete suspends nobody.
+            if collection.outcome() == ScopedCollectionOutcome::Complete {
+                self.suspend_absent_scoped_owners(
+                    &allowed_callers,
+                    &invalidated_owners,
+                    &lost_owners,
+                    *now_ns,
+                );
+            }
+            debug_assert!(
+                !self.engine.scoped_refresh_in_progress(),
+                "no scoped refresh candidate flag survives the publication"
+            );
+            // Preparation dirtied engine facts after the first tail
+            // whether or not any activation committed: revise through
+            // the non-unwinding handler before revisions are cut.
+            self.revise_engine_tail_after_scoped_owners();
+            let outcome = collection.outcome(); // final cancellation/deadline poll
+            if outcome != ScopedCollectionOutcome::Complete {
+                allowed_callers.clear();
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "cgroup scope transaction incomplete".into(),
+                    reason: outcome.reason().into(),
+                    budget: None,
+                });
+            } else {
+                cgroup_proof_complete = true;
+            }
+            // A prior binding is not current membership. Suspend failed
+            // members and cut their live operations before any queued owner
+            // receipt/call can regain current standing in finalization.
+            self.suspend_semantic_scope_except(&allowed_callers);
+        }
+        // Provisional adjudication runs at the end of the commit's catalog
+        // work, before any semantic input stages: suppression needs a
+        // complete publication's proof, never less.
+        self.adjudicate_provisional_unscanned(cgroup_proof_complete);
+        Ok(PublicationCompletion {
+            cgroup: publishing_cgroup,
+            events: scoped_events,
+            admitted: scoped_admitted,
+            scan_callers: scoped_scan_callers,
+        })
+    }
+
+    fn publish_registry(
+        &mut self,
+        joint: Option<(
+            &crate::semantics_objects::journal::joint_audit::IngestedJointQuantum,
+            &crate::attach::SessionDrainProducers,
+        )>,
+    ) -> Result<usize> {
+        let registry_applied = if let Some(recorder) = &mut self.diagnostics {
+            let adapter = &self.adapter;
+            let mut observer = |count: CountPublication| {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::Publication);
+                record.caller = Some(count.caller.0);
+                if let Some(caller) = adapter.record(count.caller) {
+                    record.pid = Some(caller.pid);
+                    record.incarnation = Some(u64::from(caller.incarnation));
+                }
+                record.module = count.module.map(|module| module.0);
+                record.staged = Some(count.staged);
+                record.base = Some(count.base);
+                record.edge_total = count.edge_total;
+                // The registry mutation has no genuine raw pair/read reference.
+                record.reason = Some(DiagnosticReason::ContextUnavailable);
+                record.context_unavailable = true;
+                recorder.record(record);
+            };
+            if let Some((frame, producers)) = joint {
+                self.registry.apply_joint_publication(
+                    &mut self.joint_capture,
+                    frame,
+                    producers,
+                    Some(&mut observer),
+                )?
+            } else {
+                self.registry.publish_with_count_observer(
+                    Some(&mut observer),
+                    self.joint_capture.ledger_mut(),
+                )
+            }
+        } else if let Some((frame, producers)) = joint {
+            self.registry.apply_joint_publication(
+                &mut self.joint_capture,
+                frame,
+                producers,
+                None,
+            )?
+        } else {
+            self.registry
+                .publish_with_ledger(self.joint_capture.ledger_mut())
+        };
+        Ok(registry_applied)
+    }
+
+    fn finish_publication_context(
+        &mut self,
+        completion: PublicationCompletion,
+        registry_applied: usize,
+    ) -> BatchReceipt {
         self.finalize_pending_counts();
-        Ok(BatchReceipt {
+        if let Some((collection, _)) = completion.cgroup {
+            collection.observe_publication(
+                completion.admitted,
+                completion.scan_callers,
+                self.attach_set.len(),
+            );
+            let (state, outcome) = collection.finish();
+            self.completed_cgroup = Some(CgroupCompletion {
+                state,
+                outcome,
+                events: completion.events,
+                admitted: completion.admitted,
+                scan_callers: completion.scan_callers,
+            });
+        }
+        self.synchronize_caller_metadata(crate::discovery::caller_registry::now_ns());
+        BatchReceipt {
             engine_facts: self.engine.facts_revision,
             engine_published: self.engine.published_facts_revision,
             registry_facts: self.registry.facts_revision(),
             registry_published: self.registry.published_revision(),
             registry_applied,
-        })
+        }
     }
 }
 
@@ -2629,6 +9134,9 @@ pub(crate) enum NativeBatch {
     /// capture retired): every row of that domain still waiting is decided
     /// unbound. Pass the retired facade's `domain()`.
     Finish { domain: NativeDomainId },
+    /// One owned lane batch (H0 outcomes, current-partition receipts and
+    /// lane negatives) queued for finalization after the commit tail.
+    Semantic(SemanticBatch),
 }
 
 /// What one `stage_native` call did.
@@ -2663,6 +9171,10 @@ impl PairKey {
         }
     }
 
+    fn diagnostic_key(self) -> NativePairKey {
+        NativePairKey::new(self.image, self.exec, self.object)
+    }
+
     fn of_update(domain: NativeDomainId, update: &CallerCountUpdate) -> Self {
         Self {
             image: DomainCookie::new(domain, update.image.task_cookie),
@@ -2680,7 +9192,42 @@ impl PairKey {
 struct PairCount {
     count: u64,
     first_ns: u64,
+    /// Batch PRE lower bound on the lookup that observed this absolute.
+    /// Kept separately from POST observation time when it becomes a base.
+    anchor_ns: u64,
     last_ns: u64,
+    /// The original strict advance had a valid, healthy observation bracket.
+    retirement_usable: bool,
+    diagnostic_observation: u64,
+    diagnostic_transition: u64,
+}
+
+/// Poll suppression belongs only to the mutable held entry, not immutable reads.
+#[derive(Debug, Clone, Copy)]
+struct HeldPairCount {
+    read: PairCount,
+    diagnostic_last_raw: Option<u64>,
+    diagnostic_refusal: Option<(DiagnosticReason, u64, u64)>,
+}
+impl HeldPairCount {
+    fn new(read: PairCount) -> Self {
+        Self {
+            read,
+            diagnostic_last_raw: None,
+            diagnostic_refusal: None,
+        }
+    }
+}
+impl std::ops::Deref for HeldPairCount {
+    type Target = PairCount;
+    fn deref(&self) -> &Self::Target {
+        &self.read
+    }
+}
+impl std::ops::DerefMut for HeldPairCount {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.read
+    }
 }
 
 /// Rebase one held absolute count past `base` (F3-03): what stages is
@@ -2696,8 +9243,24 @@ fn rebased_count(count: PairCount, base: u64) -> PairCount {
         } else {
             count.last_ns
         },
+        anchor_ns: count.anchor_ns,
         last_ns: count.last_ns,
+        retirement_usable: count.retirement_usable,
+        diagnostic_observation: count.diagnostic_observation,
+        diagnostic_transition: count.diagnostic_transition,
     }
+}
+
+fn valid_retirement_refresh(batch: &WitnessBatch, count: u64) -> bool {
+    batch.counts_read_ns > 0
+        && batch.rows_read_ns >= batch.counts_read_ns
+        && batch.rows_read_ns != u64::MAX
+        && count < u64::MAX
+        && batch.health_unproven.is_none()
+        && batch.health_regression.is_none()
+        && batch.read_failures.is_empty()
+        && !batch.refresh_sweep_gaps
+        && !batch.refresh_deadline_reached
 }
 
 /// Where one decided pair's counts go (C7 C4).
@@ -2723,10 +9286,10 @@ enum PairTarget {
         endpoint: EndpointId,
         base: u64,
         staged: u64,
-        /// The read that observed `staged` (round 4, window anchor):
+        /// The PRE bound on the read that observed `staged`:
         /// demotion re-roots the base (and its anchor) here.
         staged_ns: u64,
-        /// The read that observed `base` (round 4, window anchor):
+        /// The PRE bound on the read that observed `base`:
         /// demoted growth stages with this as its coverage anchor, so
         /// the ledger window covers the segment the growth executed
         /// in. 0 only when `base` is 0 (nothing accounted yet).
@@ -2746,12 +9309,12 @@ enum PairTarget {
         caller: CallerId,
         modules: Vec<ModuleKey>,
         staged: u64,
-        /// The read that observed `staged` (round 4, window anchor):
+        /// The PRE bound on the read that observed `staged`:
         /// finalization folds it into the new base's anchor.
         staged_ns: u64,
         endpoint: EndpointId,
         base: u64,
-        /// The read that observed `base` (round 4, window anchor):
+        /// The PRE bound on the read that observed `base`:
         /// demoted growth stages with this as its coverage anchor.
         /// The pair's first record while unbased.
         base_since: u64,
@@ -2761,15 +9324,273 @@ enum PairTarget {
     /// but `base` remembers the absolute count through the drop
     /// (attributed or disclosed history), so a later witness row for
     /// the same pair rebinds past it instead of re-absorbing it (round
-    /// 4, rebind). `base_since` is the read that observed `base`: a
+    /// 4, rebind). `base_since` is the PRE bound for the `base` read: a
     /// revival's growth windows from the drop.
     Dropped { base: u64, base_since: u64 },
+    /// Exact, previously placed history remains; future ownership needs a fresh fence.
+    Suspended {
+        caller: CallerId,
+        endpoint: EndpointId,
+        base: u64,
+        base_since: u64,
+    },
+}
+
+/// One immutable publication request. A decision cannot borrow a newer held maximum.
+struct PendingCountObservation {
+    key: PairKey,
+    caller: CallerId,
+    endpoint: EndpointId,
+    observation: PairCount,
+    generation: Option<u64>,
+    origin: PendingCountOrigin,
+    diagnostic: Option<PendingDiagnostics>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingCountOrigin {
+    Untracked,
+    Ordinary(u64),
+    Recovered(OwnershipEpoch),
+}
+
+/// Fixed-size recovery state per exact pair with successfully placed history.
+struct PairRecovery {
+    caller: CallerId,
+    endpoint: EndpointId,
+    carrier: ModuleId,
+    /// Frozen with this exact pair's original ordinary observation. Historical
+    /// handles never refresh it; selected recovery has its independent epoch.
+    ordinary_checkpoint: u64,
+    epoch: Option<OwnershipEpoch>,
+    scan: Option<Arc<OwnershipScan>>,
+    sighting: Option<CurrentBindingSighting>,
+    /// Ownership-selected original read. Retention is unproven: until a genuine
+    /// sighting exists it causes no accounting, gap or allocation side effect.
+    /// Only the subsequent Proven binding check permits new-owner allocation.
+    fence: Option<PairCount>,
+    pending_reads: [Option<TaggedCountRead>; 3],
+    /// Actual saved obsolete reads can justify an unknown prefix after any
+    /// historical generic predecessor finishes. At/below watermark it is only
+    /// normalized storage: watermark may include an immutable staged request,
+    /// not successful placement. Only its excess can be new unknown coverage.
+    /// This never supplies a fence.
+    withheld_through: u64,
+    /// Conditional actual detached reads: no known loss or read authority.
+    /// Current logical-epoch classification precedes any historical conversion.
+    discarded_through: u64,
+    watermark: u64,
+    blocked: bool,
+    recovered: bool,
+    deferred_count: bool,
+    receipt_refused: bool,
+    /// Selected ownership may wait for original generic publication handles.
+    /// Its placement generation and target are untouched until those finish.
+    epoch_pending: bool,
+    diagnostic: RecoveryDiagnostics,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDiagnostics {
+    base: u64,
+    staged: u64,
+    since: u64,
+    baseline_post: u64,
+    fence: u64,
+    transition_ref: u64,
+}
+
+#[derive(Default)]
+struct RecoveryDiagnostics {
+    ownership: Option<(Eligibility, Option<ModuleId>, Option<u64>)>,
+    transition_ref: u64,
+    wait: Option<(DiagnosticReason, DiagnosticDecision, u64, u64, u64)>,
+    selection: Option<(Option<u64>, u64, bool)>,
+}
+
+fn record_recovery_refusal<Source: ProcessSource>(
+    recorder: &mut Recorder,
+    adapter: &CallerAdapter<Source>,
+    key: PairKey,
+    recovery: &mut PairRecovery,
+    reason: DiagnosticReason,
+) {
+    let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+        .with_pair(key.diagnostic_key())
+        .with_private_ids(None, recovery.epoch.map(|epoch| epoch.0), None);
+    record.caller = Some(recovery.caller.0);
+    if let Some(caller) = adapter.record(recovery.caller) {
+        record.pid = Some(caller.pid);
+        record.incarnation = Some(u64::from(caller.incarnation));
+    }
+    record.reason = Some(reason);
+    record.new_eligibility = Some(Eligibility::Unknown);
+    record.base = Some(recovery.watermark);
+    record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+    record.context_unavailable = true;
+    recovery.diagnostic.transition_ref = recorder.record(record).unwrap_or(0);
+}
+
+fn diagnostic_binding_reason(reason: UnboundReason) -> DiagnosticReason {
+    match reason {
+        UnboundReason::CookieUnavailable
+        | UnboundReason::ExecCoverageGap
+        | UnboundReason::EvidenceIncomplete => DiagnosticReason::BindingUnproven,
+        UnboundReason::LifecycleLoss => DiagnosticReason::CaptureLoss,
+        UnboundReason::Capacity => DiagnosticReason::BudgetRefused,
+        _ => DiagnosticReason::IdentityChanged,
+    }
+}
+
+fn nonzero_ref(seq: u64) -> Option<u64> {
+    (seq != 0).then_some(seq)
+}
+
+struct TaggedCountRead {
+    scan: Arc<OwnershipScan>,
+    read: PairCount,
+}
+impl PairRecovery {
+    fn clear_reads(&mut self) {
+        self.pending_reads = [None, None, None];
+        self.withheld_through = self.watermark;
+        self.discarded_through = self.watermark;
+    }
+    fn withhold_reads(&mut self) {
+        for slot in &mut self.pending_reads {
+            if let Some(tag) = slot.take() {
+                self.discarded_through = self.discarded_through.max(tag.read.count);
+            }
+        }
+    }
+    fn normalize_reads(
+        &mut self,
+        view: &ReceiptView<'_>,
+        continuing: bool,
+        work: &mut ReceiptWork,
+    ) {
+        if continuing {
+            // Only speculative D is resolved by proven current continuation.
+            // Independently justified old H remains until predecessor settlement.
+            self.discarded_through = self.watermark;
+        }
+        let mut retained = 0;
+        for slot in &mut self.pending_reads {
+            work.visit();
+            let Some(tag) = slot else { continue };
+            let disposition = view.disposition(&tag.scan, work);
+            work.visit();
+            let selected_equivalent = self
+                .scan
+                .as_ref()
+                .is_some_and(|scan| tag.scan.equivalent(scan));
+            if disposition == ReceiptDisposition::Retained
+                && selected_equivalent
+                && self.fence.is_some()
+            {
+                work.visit();
+                if let Some(fence) = self.fence.as_mut()
+                    && tag.read.count < fence.count
+                {
+                    if fence.count > self.watermark {
+                        // Full read and brackets move together before first use.
+                        *fence = tag.read;
+                        if self
+                            .scan
+                            .as_ref()
+                            .is_none_or(|scan| tag.scan.started_ns() < scan.started_ns())
+                        {
+                            self.scan = Some(tag.scan.clone());
+                        }
+                    } else {
+                        self.receipt_refused = true;
+                        self.deferred_count = true;
+                    }
+                }
+                *slot = None;
+                continue;
+            }
+            if disposition == ReceiptDisposition::Obsolete || tag.read.count <= self.watermark {
+                work.visit();
+                if !continuing && tag.read.count > self.watermark {
+                    self.discarded_through = self.discarded_through.max(tag.read.count);
+                }
+                *slot = None;
+            } else {
+                retained += 1;
+            }
+        }
+        // The slot visits already established cardinality. Empty/singleton
+        // sets have no pair comparison to perform. With the added continuity
+        // guards, the full capture/service branch still fits 32 operations.
+        if retained < 2 {
+            return;
+        }
+        // Three constant comparisons, never a position-based overwrite.
+        for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+            work.visit();
+            let equal = match (&self.pending_reads[left], &self.pending_reads[right]) {
+                (Some(left), Some(right)) => {
+                    Arc::ptr_eq(&left.scan, &right.scan) || left.scan.equivalent(&right.scan)
+                }
+                _ => false,
+            };
+            if equal {
+                work.visit();
+                let right = self.pending_reads[right]
+                    .take()
+                    .expect("equal occupied tag");
+                let left = self.pending_reads[left]
+                    .as_mut()
+                    .expect("equal occupied tag");
+                if right.read.count < left.read.count {
+                    left.read = right.read;
+                }
+                if right.scan.started_ns() < left.scan.started_ns() {
+                    left.scan = right.scan;
+                }
+            }
+        }
+    }
+    fn take_read(
+        &mut self,
+        scan: &Arc<OwnershipScan>,
+        work: &mut ReceiptWork,
+    ) -> Option<TaggedCountRead> {
+        let mut selected = None;
+        for index in 0..3 {
+            work.visit();
+            if self.pending_reads[index]
+                .as_ref()
+                .is_some_and(|tag| tag.scan.equivalent(scan))
+            {
+                selected = Some(index);
+            }
+        }
+        selected.and_then(|index| {
+            work.visit();
+            self.pending_reads[index].take()
+        })
+    }
+}
+
+/// Sticky first health loss for pre-arm truncation: the first witness
+/// batch carrying a counter rise, unreadable health, or lifecycle loss.
+/// Records the loss baseline (the earliest instant of the drop) and the
+/// last clean read before it, so a later clean sweep cannot wash the loss
+/// away. The terminal close truncates at `min(clean_before, baseline)`,
+/// floored at the arm instant.
+#[derive(Debug, Clone, Copy)]
+struct PrearmFirstLoss {
+    cause: crate::render::PrearmWatchEnd,
+    baseline_ns: u64,
+    clean_before_ns: Option<u64>,
 }
 
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
 /// the endpoint budget N: each endpoint is attached or failed at most once.
 struct CaptureCoverage {
-    scope: Option<ScopeIncarnation>,
+    scope: CaptureScopeCoverage,
     /// The first caller proven to be the scope incarnation.
     bound: Option<CallerId>,
     attached_at: BTreeMap<EndpointId, u64>,
@@ -2780,6 +9601,9 @@ struct CaptureCoverage {
     /// exec or leader exit of the PID target, lifecycle loss — PID or
     /// system scope).
     unproven: Option<String>,
+    /// A proved original-pidfd exit only excuses historical count retention.
+    /// The watch loss stays sticky and every later uncertainty revokes this.
+    original_pid_exit: Option<crate::attach::capture::OriginalPidExit>,
     /// Sticky: objects modified in place after they were attached.
     changed_objects: BTreeSet<AttachObjectId>,
     /// The last witness batch's unproven health (not sticky).
@@ -2796,6 +9620,10 @@ struct CaptureCoverage {
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
+    /// Sticky first health loss for pre-arm truncation (see
+    /// `PrearmFirstLoss`): latched by the first witness batch carrying a
+    /// counter rise, unreadable health, or lifecycle loss.
+    prearm_first_loss: Option<PrearmFirstLoss>,
     /// The health read of the batch the open CALLER_USE sweep began in
     /// (`None`: the next batch begins one).
     sweep_began_ns: Option<u64>,
@@ -2935,6 +9763,8 @@ fn pair_precondition_failure(batch: &WitnessBatch) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopeVerdict {
     Inside,
+    /// Admitted cgroup caller, with no continuous-membership timeline.
+    Cgroup,
     /// Another process (a different pid, or a reused one).
     Outside,
     /// The pid matches but a start time is unreadable: unprovable.
@@ -3046,11 +9876,12 @@ fn catalog_module_info(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::inventory::{ImageCheck, UnavailableImageGuard};
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
-    use crate::discovery::native_binding::{OwnerImages, ScanOnlyIdentity};
+    use crate::discovery::native_binding::{BoundImage, OwnerImages, ScanOnlyIdentity};
+    use crate::fixture_guard::DieWithParent as _;
     use p11scope_ebpf_common::ImageIdentity;
     use std::cell::Cell;
 
@@ -3058,16 +9889,192 @@ mod tests {
     // host's task-storage identity map or qualify a running capture.
     struct FixtureImages;
 
-    fn fixture_image(pid: u32) -> Option<ImageIdentity> {
-        Some(ImageIdentity {
-            task_cookie: u64::from(pid) + 1,
-            exec_id: 7,
-        })
+    /// One stable scripted domain for this module's fixture images; a
+    /// fresh domain per call would break equality for the wrong reason.
+    fn fixture_domain() -> NativeDomainId {
+        static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+        *DOMAIN.get_or_init(NativeDomainId::mint)
+    }
+
+    fn fixture_image(pid: u32) -> Option<BoundImage> {
+        BoundImage::scripted(fixture_domain(), u64::from(pid) + 1, 7)
+    }
+
+    fn hint_miss_note(pid: u32, subject: &str) -> crate::inspect_system::PidGap {
+        crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: subject.into(),
+            reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.into(),
+            generic: false,
+        }
+    }
+
+    #[test]
+    fn hint_misses_for_matched_hints_collapse_to_no_gap() {
+        // Three deep-scanned views, 121 operator hints; the workload view
+        // maps every hint (no miss notes), the other two map none: 242
+        // per-view miss notes must collapse to nothing, or the gap store
+        // drowns (~49k suppressed gaps at system scale) and hides real loss.
+        let examining: BTreeSet<u32> = [1, 2, 7].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let mut notes = Vec::new();
+        for view in [1u32, 2] {
+            for hint in 0..121 {
+                notes.push(hint_miss_note(
+                    view,
+                    &format!("/providers/provider-{hint:03}.so"),
+                ));
+            }
+        }
+        notes.push(crate::inspect_system::PidGap {
+            pid: Some(7),
+            subject: "/providers/provider-000.so".into(),
+            reason: "matched a --module hint; no function table was found".into(),
+            generic: false,
+        });
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1, "only the non-hint note survives");
+        assert_eq!(collapsed[0].pid, Some(7));
+    }
+
+    #[test]
+    fn hint_matched_nowhere_collapses_to_one_scope_gap() {
+        // A hint missed in every examining view is owed one scope-level
+        // answer, not one gap per view.
+        let examining: BTreeSet<u32> = [1, 2].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].pid, None);
+        assert_eq!(collapsed[0].subject, "/opt/typo.so");
+        assert_eq!(
+            collapsed[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    #[test]
+    fn hint_silent_inventoried_view_does_not_mask_unmatched_hint() {
+        // System-scope shape: inventoried is {1, 2, 3} with pid 3 a
+        // hint-silent view (kernel thread: Scanned with no hint-miss
+        // notes, never evaluated hints), so examining is {1, 2}. A hint
+        // missed in every examining view still owes one pid-less scope
+        // gap; silence is not a match.
+        let examining: BTreeSet<u32> = [1, 2].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1, "silent pid 3 must not mask the miss");
+        assert_eq!(collapsed[0].pid, None);
+        assert_eq!(collapsed[0].subject, "/opt/typo.so");
+        assert_eq!(
+            collapsed[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    /// A catalog whose three members shape the examining projection:
+    /// pids 1 and 2 examined hints and missed `subject` in both views;
+    /// pid 3 is a hint-silent Scanned view (kernel thread shape) with the
+    /// given flag. No objects: only the miss collapse is under test.
+    fn examining_catalog(pid3_examined: bool) -> crate::inspect_system::Catalog {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut catalog = capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            1,
+            None,
+        );
+        let application = || {
+            crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            )
+        };
+        let member = |pid: u32, hints_examined: bool| ProcessRecord {
+            application: application(),
+            complete_scan: None,
+            hints_examined,
+            pid,
+            status: MemberStatus::Scanned,
+            objects: Vec::new(),
+            generation: None,
+        };
+        catalog.processes = vec![member(1, true), member(2, true), member(3, pid3_examined)];
+        catalog.notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
+        catalog
+    }
+
+    #[test]
+    fn silent_unexamined_view_does_not_mask_unmatched_hint() {
+        // The projection behind the collapse: examining is {1, 2} (pid 3
+        // never evaluated hints), so a hint missed in both examining
+        // views still owes one pid-less scope gap.
+        let catalog = examining_catalog(false);
+        let mut coordinator = coordinator();
+        coordinator.project_catalog(&catalog, &BTreeMap::new(), 60);
+        coordinator.registry.publish();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "/opt/typo.so")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "silent pid 3 must not mask the miss: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(gaps[0].pid, None);
+        assert_eq!(
+            gaps[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    #[test]
+    fn silent_examined_view_matches_its_hint() {
+        // Healthy twin: pid 3 examined hints and reports no miss, so its
+        // silence is a match and no scope gap is owed.
+        let catalog = examining_catalog(true);
+        let mut coordinator = coordinator();
+        coordinator.project_catalog(&catalog, &BTreeMap::new(), 60);
+        coordinator.registry.publish();
+        assert!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "/opt/typo.so"),
+            "an examining view's silence is a match: {:?}",
+            coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn hint_matched_by_maps_identity_collapses_to_no_gap() {
+        // A hint no deep scan matched but maps identity attributed (a
+        // catalog object carries its path) is mapped: drop the miss notes.
+        let examining: BTreeSet<u32> = [1].into_iter().collect();
+        let object_paths: BTreeSet<&str> = ["/opt/pinned.so"].into_iter().collect();
+        let notes = vec![hint_miss_note(1, "/opt/pinned.so")];
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
+        assert!(collapsed.is_empty(), "maps-matched hint is mapped");
     }
 
     impl ImageGuard for FixtureImages {
-        fn check(&mut self, view: &ProcessView, expected: ImageIdentity) -> ImageCheck {
-            assert_eq!(expected.task_cookie, u64::from(view.pid()) + 1);
+        fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
+            assert_eq!(expected, fixture_image(view.pid()).unwrap());
             ImageCheck::Exact
         }
     }
@@ -3077,10 +10084,1429 @@ mod tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    /// Two-view retirement population behind the coordinator's Engine for
+    /// the graph-pool twins: the retiring view owns one absorbed pin and
+    /// one reconciled module, while only the retained module feeds the
+    /// plan — so the retiring view removes no slots and its graph closes
+    /// without a native carrier. The T4 seed leaves one retirement intent
+    /// plus one leader-exit assessment, as a reaped exit would; the view
+    /// stays live, so Intake disposes the intent as unproven while the
+    /// pre-seeded pending retirement drives the Selection copy. Returns
+    /// the coordinator, the retiring view, and the shared pin file (kept
+    /// alive for the absorbed pins' paths).
+    fn collected_graph_pool_engine() -> (
+        InventoryCoordinator<OsProcessSource>,
+        crate::process::ProcessViewId,
+        tempfile::NamedTempFile,
+    ) {
+        use crate::discovery::identity::test_fixture;
+        use crate::discovery::identity::{PinnedObjects, reconcile_scanned_modules};
+        use crate::process::{ProcessView, ProcessViewId};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        let mut coordinator = coordinator();
+        let view = ProcessViewId(coordinator.engine.next_view_id);
+        let retained = ProcessViewId(coordinator.engine.next_view_id + 1);
+        coordinator.engine.next_view_id += 2;
+        let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+        std::fs::write(shared_file.path(), vec![0x7fu8; 8192]).expect("pin bytes");
+        let shared_path = shared_file.path().to_path_buf();
+        let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
+        let mut pins = PinnedObjects::empty();
+        let mut keys = Vec::new();
+        for (slot, id) in [(0u64, view), (1, retained)] {
+            let key = ObjectKey {
+                device: Device {
+                    major: 8,
+                    minor: slot,
+                },
+                inode: 1000 + slot,
+            };
+            let absorbed = pins.absorb(test_fixture::real_scan_pin(
+                &shared_path,
+                Some(key),
+                slot,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ));
+            assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+            keys.push((key, id));
+        }
+        let scanned: Vec<crate::discovery::scan::ScannedModule> = keys
+            .iter()
+            .map(|(key, id)| {
+                let mut module = test_fixture::module(*key);
+                module.view = *id;
+                module.path.clone_from(&shared_path_text);
+                module.tables[0].entries[0]
+                    .object_path
+                    .clone_from(&shared_path_text);
+                module
+            })
+            .collect();
+        let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+        assert!(lost.is_empty(), "both twin rows reconcile");
+        assert_eq!(reconciled.len(), 2);
+        // Only the retained module feeds the plan: the retiring view owns
+        // pins but no slots, so its graph closes without native work.
+        let retained_module = reconciled
+            .iter()
+            .find(|module| module.scanned.view == retained)
+            .expect("the retained module reconciled")
+            .clone();
+        coordinator.engine.pinned = pins;
+        coordinator.engine.modules = reconciled;
+        coordinator.engine.plan =
+            crate::plan::build_from_reconciled_modules(std::slice::from_ref(&retained_module));
+        coordinator.engine.bind_plan_module_ids_for_test();
+        // A plain engine behind the coordinator transport: the overwritten
+        // Detailed plan must not meet the inventory constructor's state.
+        coordinator.engine.inventory = None;
+        coordinator
+            .engine
+            .views
+            .push(ProcessView::open(view, std::process::id()).expect("a live process view"));
+        coordinator.seed_collected_finish_work_for_test(view);
+        assert!(coordinator.engine.pending_retirements.insert(view));
+        (coordinator, view, shared_file)
+    }
+
+    /// Empty discovery drain at Q for the fixture transport: no records,
+    /// nothing staged, so transport is at Q on the first credit and the
+    /// Finish exercises only Engine work.
+    struct CollectedFinishTransport {
+        producers: crate::attach::SessionDrainProducers,
+        observer: crate::attach::CollectedFinishQObserverForTest,
+        staged: crate::attach::DiscoveryStage,
+        q: crate::attach::CollectedFinishQ,
+    }
+
+    fn collected_finish_transport_at_q() -> CollectedFinishTransport {
+        use crate::attach::capture::NativeDomainId;
+        use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+
+        let events = EventsDomain::test_standin(0x51);
+        let producers = crate::attach::SessionDrainProducers::test_pair(
+            NativeDomainId::try_mint().expect("a native test domain"),
+            events.clone(),
+        );
+        let observer = crate::attach::CollectedFinishQObserverForTest::with_discovery_bytes(
+            &producers,
+            Vec::<Vec<u8>>::new(),
+        );
+        let drain =
+            EventDrain::over_domain(ScriptedRecords::records(Vec::<Vec<u8>>::new(), 0), events);
+        observer.request_stop();
+        let q = observer
+            .observe(&producers, None, &drain)
+            .expect("Q observation reads the original rings")
+            .expect("STOP with no records mints Q");
+        CollectedFinishTransport {
+            producers,
+            observer,
+            staged: crate::attach::DiscoveryStage::default(),
+            q,
+        }
+    }
+
+    #[test]
+    fn collected_graph_charges_dedicated_pool_not_registry() {
+        let (mut coordinator, view, _shared) = collected_graph_pool_engine();
+        let mut transport = collected_finish_transport_at_q();
+        let registry_before = coordinator.registry().semantic_resource_snapshot();
+        let pool_baseline = coordinator
+            .engine
+            .collected_graph_pool
+            .snapshot()
+            .charged_bytes;
+        let mut drained = false;
+        let mut failed = false;
+        for _ in 0..600 {
+            let outcome = coordinator
+                .service_collected_finish_discovery(
+                    &transport.q,
+                    &transport.producers,
+                    transport.observer.discovery_drain_mut(),
+                    &mut transport.staged,
+                    1,
+                )
+                .expect("the fixture transport serves the seeded work");
+            failed = outcome.failed;
+            if !outcome.backlog {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "one graph drains through the fixture transport");
+        assert!(!failed, "the lane does not fail");
+        assert_eq!(coordinator.engine.collected_graphs_created, 1);
+        assert!(coordinator.engine.pending_retirements.is_empty());
+        assert!(coordinator.engine.collected_graph_refused().is_none());
+        assert_eq!(coordinator.engine.collected_graph_reclaim_forgotten, 0);
+        assert!(
+            coordinator
+                .engine
+                .views
+                .iter()
+                .any(|owner| owner.id() == view),
+            "the unproven live view stays"
+        );
+        assert!(
+            coordinator.engine.counters.object_skips.iter().any(|skip| {
+                skip.subject == "live discovery lifecycle"
+                    && skip.reason.starts_with("1 retirements not proven")
+            }),
+            "the live intent disposes as unproven"
+        );
+        assert_eq!(
+            coordinator.registry().semantic_resource_snapshot(),
+            registry_before,
+            "the graph charges no registry byte"
+        );
+        assert!(
+            coordinator
+                .engine
+                .collected_graph_pool
+                .snapshot()
+                .peak_charged_bytes
+                > pool_baseline,
+            "the graph pool paid the copy"
+        );
+    }
+
+    #[test]
+    fn collected_graph_pool_refusal_fails_lane_without_registry_refusal() {
+        let (mut coordinator, _view, _shared) = collected_graph_pool_engine();
+        let mut transport = collected_finish_transport_at_q();
+        let registry_before = coordinator.registry().semantic_resource_snapshot();
+        // The graph pool pays nothing beyond its baseline, so the
+        // barrier's box reservation refuses before any graph work.
+        let pool_baseline = coordinator
+            .engine
+            .collected_graph_pool
+            .snapshot()
+            .charged_bytes;
+        coordinator
+            .engine
+            .collected_graph_pool
+            .reference_set_limit(pool_baseline);
+        let mut refused = false;
+        let mut failed = false;
+        for _ in 0..64 {
+            let outcome = coordinator
+                .service_collected_finish_discovery(
+                    &transport.q,
+                    &transport.producers,
+                    transport.observer.discovery_drain_mut(),
+                    &mut transport.staged,
+                    1,
+                )
+                .expect("a refused graph stays contained");
+            failed = outcome.failed;
+            if coordinator.engine.collected_graph_refused().is_some() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the box refuses against the baseline limit");
+        assert_eq!(
+            coordinator.engine.collected_graph_refused(),
+            Some("terminal graph refused before native mutation")
+        );
+        assert_eq!(coordinator.engine.collected_graphs_created, 0);
+        assert!(coordinator.engine.collected_graph.is_none());
+        assert!(failed, "the lane reports the refusal");
+        assert!(
+            coordinator.engine.collected_graph_pool.snapshot().refused >= 1,
+            "the graph pool counts the refusal"
+        );
+        assert_eq!(
+            coordinator.registry().semantic_resource_snapshot(),
+            registry_before,
+            "no registry byte moves on a graph-pool refusal"
+        );
+    }
+
+    /// The source holds real OS custody but refuses to share it with a first
+    /// Detailed owner. Known H0 custody must remain independently reusable.
+    struct RefusingSharedCustodySource {
+        attempted: std::rc::Rc<Cell<usize>>,
+    }
+
+    impl ProcessSource for RefusingSharedCustodySource {
+        type Pin = crate::process::PidPin;
+
+        fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+            OsProcessSource.open(pid)
+        }
+        fn still_the_same(&self, pin: &Self::Pin) -> bool {
+            OsProcessSource.still_the_same(pin)
+        }
+        fn start_time(&self, pid: u32) -> Option<u64> {
+            OsProcessSource.start_time(pid)
+        }
+        fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
+            OsProcessSource.exe_identity(pid)
+        }
+        fn gone(&self, pid: u32) -> bool {
+            OsProcessSource.gone(pid)
+        }
+        fn shared_semantic_custody(
+            &self,
+            _pin: &Arc<Self::Pin>,
+        ) -> Option<Arc<crate::process::PidPin>> {
+            self.attempted.set(self.attempted.get() + 1);
+            None
+        }
+        fn semantic_custody_ref<'pin>(
+            &self,
+            pin: &'pin Self::Pin,
+        ) -> Option<&'pin crate::process::PidPin> {
+            Some(pin)
+        }
+    }
+
+    #[test]
+    fn known_semantic_custody_survives_shared_source_refusal_but_first_admission_does_not() {
+        let pid = std::process::id();
+        let attempted = std::rc::Rc::new(Cell::new(0));
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            RefusingSharedCustodySource {
+                attempted: attempted.clone(),
+            },
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 1)
+            .unwrap();
+        let domain = NativeDomainId::mint();
+
+        assert!(
+            coordinator
+                .prepare_legacy_semantic_candidate(caller, domain)
+                .is_none(),
+            "first owner admission requires actual shared original custody"
+        );
+        assert_eq!(attempted.get(), 1);
+
+        let original = Arc::new(
+            coordinator
+                .adapter
+                .live_pin(pid)
+                .unwrap()
+                .1
+                .try_clone()
+                .unwrap(),
+        );
+        coordinator
+            .semantic_bindings
+            .insert_for_test(semantics::SemanticCallerBinding::scripted(
+                caller,
+                ModuleKey::Unidentified {
+                    path: "/clone-refusal/provider.so".into(),
+                },
+                domain,
+                ImageIdentity {
+                    task_cookie: 7,
+                    exec_id: 0,
+                },
+                original.clone(),
+            ))
+            .unwrap();
+        let candidate = coordinator
+            .prepare_legacy_semantic_candidate(caller, domain)
+            .expect("known original owner custody must not need a second pidfd");
+        assert!(Arc::ptr_eq(&candidate.pin(), &original));
+        assert_eq!(
+            attempted.get(),
+            1,
+            "known custody must skip another custody acquisition"
+        );
+    }
+
+    /// Heap-built cgroup-scope coordinator over `dir` (H6 slice 2
+    /// oracles): coverage begins here, like `cgroup_os_scene`.
+    fn boxed_cgroup_coordinator(
+        dir: &std::path::Path,
+        providers: Vec<PathBuf>,
+    ) -> Box<InventoryCoordinator<OsProcessSource>> {
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(dir).unwrap(),
+            HookRegistry::builtin(),
+            providers,
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        Box::new(coordinator)
+    }
+
+    /// Heap-built PID-scope coordinator (H6 slice 2 oracles): see
+    /// `NativeScene::boxed` for why multi-scene oracles box.
+    fn boxed_os_coordinator(pid: u32) -> Box<InventoryCoordinator<OsProcessSource>> {
+        Box::new(
+            InventoryCoordinator::new(
+                Scope::Pid(pid),
+                HookRegistry::builtin(),
+                Vec::new(),
+                vec![],
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn inventory_selected_budget_reaches_plan_and_attach_set() {
+        for n in [1, 4097, 6531, 8192] {
+            let budget = crate::capacity::inventory_endpoint_budget(Some(n)).unwrap();
+            let selected = InventoryCoordinator::new_with_budget(
+                Scope::Pid(std::process::id()),
+                HookRegistry::builtin(),
+                Vec::new(),
+                vec![],
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                budget,
+            )
+            .unwrap();
+            assert_eq!(selected.attach_set().budget(), budget);
+            assert_eq!(
+                selected.engine.plan().admission_policy(),
+                crate::plan::AdmissionPolicy::Inventory(budget)
+            );
+        }
+        let default = coordinator();
+        let budget = crate::capacity::inventory_endpoint_budget(None).unwrap();
+        assert_eq!(default.attach_set().budget(), budget);
+        assert_eq!(
+            default.engine.plan().admission_policy(),
+            crate::plan::AdmissionPolicy::Inventory(budget)
+        );
+    }
+
+    #[test]
+    fn set_prearm_pinning_records_combined_budget_usage() {
+        // Packet 6.13 round-3 (re-audit finding 3): retaining pre-arm pins
+        // records their real object/byte usage for the manifest-side
+        // charge — in production setter order and reversed.
+        let dir = tempfile::tempdir().unwrap();
+        for prearm_first in [false, true] {
+            let a = dir.path().join(format!("prearm-{prearm_first}-a.so"));
+            let b = dir.path().join(format!("prearm-{prearm_first}-b.so"));
+            std::fs::copy("/bin/sh", &a).unwrap();
+            std::fs::copy("/bin/sh", &b).unwrap();
+            let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+                &[a, b],
+                &[],
+                None,
+                0,
+                0,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
+            )
+            .expect("two real pre-arm pins");
+            let usage = (
+                pinning.pins.pinned().count(),
+                pinning.pins.pinned_object_bytes(),
+            );
+            assert_eq!(usage.0, 2);
+            let mut coordinator = InventoryCoordinator::new_with_budget(
+                Scope::Pid(std::process::id()),
+                HookRegistry::builtin(),
+                Vec::new(),
+                vec![],
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                crate::capacity::inventory_endpoint_budget(None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(coordinator.prearm_prior(), (0, 0));
+            if prearm_first {
+                coordinator.set_prearm_pinning(pinning);
+                coordinator.set_manifests(Vec::new());
+            } else {
+                coordinator.set_manifests(Vec::new());
+                coordinator.set_prearm_pinning(pinning);
+            }
+            assert_eq!(coordinator.prearm_prior(), usage);
+            assert_eq!(
+                coordinator.semantic_prearm_prior(),
+                usage,
+                "the semantic reader charges the same retained usage"
+            );
+        }
+    }
+
+    /// Pre-arm activation fixture: a real provider .so exporting two
+    /// standard-name functions (proved) and defining one standard-name data
+    /// word (not executable: disclosed, never attached pre-mapping).
+    fn prearm_provider_with_proved_exports(dir: &std::path::Path, name: &str) -> PathBuf {
+        let src = dir.join(format!("{name}.c"));
+        std::fs::write(
+            &src,
+            "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
+             unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n\
+             unsigned long C_Finalize = 1;\n",
+        )
+        .unwrap();
+        let so = dir.join(format!("{name}.so"));
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        so
+    }
+
+    fn pin_prearm_for_test(paths: &[PathBuf]) -> crate::discovery::identity::PrearmPinning {
+        crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+            paths,
+            &[],
+            None,
+            0,
+            0,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("test pre-arm pins")
+    }
+
+    #[test]
+    fn prearm_proved_offsets_enter_the_inventory_attach_set() {
+        // Absorb half: proved offsets appear in the inventory attach set
+        // with retained-FD custody (the from_plan preconditions:
+        // valid Inventory plan, retained pins, held-fd bytes, unchanged);
+        // the watch opens unarmed over the declared proved set.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "proved");
+        let bytes = std::fs::read(&provider).unwrap();
+        let pinning = pin_prearm_for_test(&[provider]);
+        assert_eq!(pinning.inputs.len(), 1);
+        let proved: BTreeSet<String> = pinning.inputs[0]
+            .proved
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(
+            proved,
+            BTreeSet::from(["C_GetFunctionList".to_string(), "C_Initialize".to_string()]),
+            "the fixture proves exactly its two standard-name functions"
+        );
+        let skipped: Vec<String> = pinning.inputs[0]
+            .non_executable
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(skipped, ["C_Finalize"]);
+        let proved_offsets: BTreeSet<u64> = pinning.inputs[0]
+            .proved
+            .iter()
+            .map(|(_, offset)| *offset)
+            .collect();
+
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        assert_eq!(
+            delta.endpoints.len(),
+            2,
+            "both proved offsets attach, nothing else"
+        );
+        assert_eq!(delta.objects.len(), 1, "one retained object");
+        assert_eq!(
+            delta
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.file_offset)
+                .collect::<BTreeSet<_>>(),
+            proved_offsets,
+        );
+        for endpoint in &delta.endpoints {
+            let target = coordinator
+                .attach_set()
+                .target(endpoint.object)
+                .expect("every pre-arm endpoint resolves to a retained target");
+            assert!(
+                target.attach_path().starts_with("/proc/self/fd/"),
+                "attach via the held FD, never a reopened pathname"
+            );
+            assert_eq!(
+                std::fs::read(target.attach_path()).unwrap(),
+                bytes,
+                "the held FD reads the pinned bytes"
+            );
+            assert!(target.check_unchanged().unwrap());
+        }
+        let rows = coordinator.prearm_rows();
+        assert_eq!(rows.len(), 1);
+        let watch = rows[0]
+            .watch
+            .as_ref()
+            .expect("an absorbed input has a watch");
+        assert_eq!(watch.state, crate::render::PrearmWatchState::PinnedUnarmed);
+        assert_eq!(watch.since_ns, None);
+    }
+
+    #[test]
+    fn prearm_never_mapped_watch_bounds_and_cancels() {
+        // Never-mapped half: a never-mapped pre-arm input renders a bounded
+        // watch and never attaches by guess; scope end closes the watch
+        // exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "never-mapped");
+        let bytes = std::fs::read(&provider).unwrap();
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+
+        // No-attach-by-guess guard: every absorbed endpoint resolves to a
+        // held pin of this pinning (fd bytes), never by path.
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        for endpoint in &delta.endpoints {
+            let target = coordinator
+                .attach_set()
+                .target(endpoint.object)
+                .expect("retained target");
+            assert!(target.attach_path().starts_with("/proc/self/fd/"));
+            assert_eq!(std::fs::read(target.attach_path()).unwrap(), bytes);
+        }
+
+        // Open watch: pinned, unarmed, no arm instant, no end — and no
+        // attach keys (its watch speaks).
+        let rows = coordinator.prearm_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].mapped);
+        let watch = rows[0].watch.as_ref().unwrap();
+        assert_eq!(watch.state, crate::render::PrearmWatchState::PinnedUnarmed);
+        assert_eq!(watch.since_ns, None);
+        assert_eq!(watch.until_ns, None);
+        assert_eq!(watch.ended_by, None);
+        assert!(rows[0].attached_at_ns.is_none());
+        assert!(rows[0].unobserved_windows.is_none());
+
+        // Real cancellation: scope end closes exactly once; the wait ended
+        // unarmed — coverage was never claimed.
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(9_000));
+        let rows = coordinator.prearm_rows();
+        let watch = rows[0].watch.as_ref().unwrap();
+        assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
+        assert_eq!(watch.until_ns, Some(9_000));
+        assert_eq!(watch.since_ns, None);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(10_000));
+        let again = coordinator.prearm_rows();
+        assert_eq!(
+            again[0].watch.as_ref().unwrap().until_ns,
+            Some(9_000),
+            "until_ns is set exactly once"
+        );
+    }
+
+    #[test]
+    fn prearm_same_path_replacement_keeps_pinned_inode_and_reports_change() {
+        // Replacement half (mirrors RED-4 through the same retained owner):
+        // rename-over keeps the old inode behind /proc/self/fd and discloses
+        // the change as a bracket + ended watch + changed-identity gap.
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "replaced");
+        let old_bytes = std::fs::read(&provider).unwrap();
+        let old_ino = std::fs::metadata(&provider).unwrap().ino();
+        let pinning = pin_prearm_for_test(std::slice::from_ref(&provider));
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().expect("monotonic clock"));
+
+        std::thread::sleep(std::time::Duration::from_millis(20)); // ctime granularity margin
+        let other_src = dir.path().join("other.c");
+        std::fs::write(&other_src, "int g(void){return 2;}\n").unwrap();
+        let other = dir.path().join("other.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&other)
+                .arg(&other_src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::rename(&other, &provider).unwrap();
+
+        // Custody: the held old inode survives, never retargeted.
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        for endpoint in &delta.endpoints {
+            let target = coordinator.attach_set().target(endpoint.object).unwrap();
+            assert_eq!(std::fs::read(target.attach_path()).unwrap(), old_bytes);
+        }
+
+        // Per-object disclosure: the refresh attributes exactly this object,
+        // once (sticky).
+        let changed = coordinator.refresh_prearm_object_changes();
+        assert_eq!(
+            changed.len(),
+            1,
+            "the refresh attributes the replaced object"
+        );
+        assert!(
+            coordinator.refresh_prearm_object_changes().is_empty(),
+            "change evidence is sticky: the second refresh reports nothing new"
+        );
+
+        // The watch ends with the bracket; the first end wins over the later
+        // scope end.
+        let stop = crate::attach::monotonic_ns().expect("monotonic clock");
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(stop));
+        let rows = coordinator.prearm_rows();
+        let watch = rows[0].watch.as_ref().unwrap();
+        assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ObjectChanged)
+        );
+        let bracket = watch
+            .changed
+            .as_ref()
+            .expect("a detected change publishes its bracket");
+        assert_eq!(bracket.previous_ino, old_ino);
+        assert!(bracket.last_ok_ns > 0);
+        assert!(
+            bracket.detected_ns >= bracket.last_ok_ns,
+            "the bracket orders last-ok before detection: {bracket:?}"
+        );
+        assert_eq!(watch.until_ns, Some(bracket.detected_ns));
+
+        // Run-level loss accounting: the changed-identity gap names it (the
+        // inventory idiom for declared-incomplete coverage).
+        coordinator.registry_mut().publish();
+        let gaps = coordinator.registry().gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject
+                == crate::discovery::inventory_attach_set::CHANGED_SUBJECT
+                && gap.reason.contains("changed identity")),
+            "a changed pre-arm object stages the changed-identity gap: {:?}",
+            gaps.iter().map(|gap| &gap.subject).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prearm_absorb_without_pinning_changes_nothing() {
+        // Guard: absorbing with no retained pinning is a no-op — a capture
+        // without --prearm-module is untouched.
+        let mut coordinator = coordinator();
+        coordinator.absorb_prearm_plan(1_000);
+        assert!(coordinator.take_target_delta().is_empty());
+        assert!(coordinator.prearm_rows().is_empty());
+    }
+
+    #[test]
+    fn prearm_without_proved_offsets_is_unavailable_with_zero_endpoints() {
+        // A pin with no proved offsets never arms, holds zero endpoints, and
+        // is still disclosed (Detailed-lane parity: the fresh RED-4 wait).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("prearm-empty.c");
+        std::fs::write(&src, "int prearm_empty_marker;\n").unwrap();
+        let provider = dir.path().join("prearm-empty.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pinning = pin_prearm_for_test(&[provider]);
+        assert!(pinning.inputs[0].proved.is_empty());
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        assert!(coordinator.take_target_delta().is_empty());
+        let rows = coordinator.prearm_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::Unavailable
+        );
+        assert!(rows[0].attached_at_ns.is_none());
+        assert!(rows[0].unobserved_windows.is_none());
+    }
+
+    #[test]
+    fn prearm_beyond_run_budget_is_refused_whole_with_declared_watch() {
+        // No admission-cap change: past the run budget the pre-arm module is
+        // refused whole by name (a plan-level refusal the attach set
+        // verdicts refused and this absorb discloses as a run gap); the
+        // watch keeps its declared set with zero linked endpoints (the
+        // operator declaration stands). Positive half: a fitting budget
+        // admits every proved offset. (The exact admit threshold is the
+        // merge's inherited reserve rule, not this packet's to dictate.)
+        for (budget_endpoints, admitted) in [(1u64, false), (4096u64, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = prearm_provider_with_proved_exports(
+                dir.path(),
+                &format!("budget-{budget_endpoints}"),
+            );
+            let pinning = pin_prearm_for_test(&[provider]);
+            let object = pinning.pins.pinned().next().unwrap().id;
+            let mut coordinator = InventoryCoordinator::new_with_budget(
+                Scope::Pid(std::process::id()),
+                HookRegistry::builtin(),
+                Vec::new(),
+                vec![],
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                crate::capacity::inventory_endpoint_budget(Some(budget_endpoints)).unwrap(),
+            )
+            .unwrap();
+            coordinator.set_prearm_pinning(pinning);
+            coordinator.absorb_prearm_plan(1_000);
+            let delta = coordinator.take_target_delta();
+            coordinator.registry_mut().publish();
+            let gaps = coordinator.registry().gaps();
+            let refused = gaps
+                .iter()
+                .find(|gap| gap.subject == crate::discovery::inventory_attach_set::REFUSED_SUBJECT);
+            let rows = coordinator.prearm_rows();
+            assert_eq!(rows.len(), 1);
+            let watch = rows[0].watch.as_ref().unwrap();
+            assert_eq!(
+                watch.state,
+                crate::render::PrearmWatchState::PinnedUnarmed,
+                "budget {budget_endpoints}: the declared watch stands"
+            );
+            assert_eq!(
+                coordinator.prearm_declared_endpoints(object).unwrap().len(),
+                2,
+                "budget {budget_endpoints}: the declaration is intact"
+            );
+            if admitted {
+                assert_eq!(delta.endpoints.len(), 2, "budget {budget_endpoints}");
+                assert!(
+                    refused.is_none(),
+                    "budget {budget_endpoints}: no refusal gap"
+                );
+            } else {
+                assert!(delta.endpoints.is_empty(), "budget {budget_endpoints}");
+                let Some(gap) = refused else {
+                    panic!("budget {budget_endpoints}: the refusal gap names it");
+                };
+                assert!(
+                    gap.reason.contains("refused 2 proved offsets"),
+                    "budget {budget_endpoints}: the gap names the plan refusal: {}",
+                    gap.reason
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prearm_receipt_stamps_arm_the_declared_set() {
+        // Full declared set + every member's real stamp arms the watch at
+        // the max stamp; attached_at merges from the lane's own stamps; the
+        // never-mapped input carries no window (its watch speaks) and no
+        // exactness is claimed without proof. Partial attachment stays
+        // unarmed (R2-D1-4); without a use/health feed the watch stays
+        // armed, never armed_idle (no quiet claim without the feed).
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "armed");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: delta.endpoints[0].id,
+                object: delta.endpoints[0].object,
+                at_ns: 2_000,
+            }],
+            ..ExtendReceipt::default()
+        });
+        assert_eq!(
+            coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::PinnedUnarmed,
+            "partial attachment remains unarmed for the declared set"
+        );
+
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        let watch = rows[0].watch.as_ref().unwrap();
+        assert_eq!(watch.state, crate::render::PrearmWatchState::Armed);
+        assert_eq!(watch.since_ns, Some(3_000));
+        assert_eq!(rows[0].attached_at_ns, Some(3_000));
+        assert!(
+            rows[0].unobserved_windows.is_none(),
+            "never-mapped pre-arm carries no window: its watch speaks"
+        );
+    }
+
+    #[test]
+    fn prearm_armed_watch_clamps_to_frozen_stop() {
+        // C1: the watch end is the frozen first-stop boundary from
+        // `end_capture_coverage`, never a later publication read. Armed at
+        // 3000, coverage ends at 5000, the terminal close samples 9000 (the
+        // blind tail after detach): the published `until` stays 5000.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "frozen-stop");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        assert_eq!(
+            coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::Armed,
+        );
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(9_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(watch.until_ns, Some(5_000));
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
+    }
+
+    #[test]
+    fn prearm_armed_watch_truncates_for_health_loss() {
+        // I2 (health_loss): a lossy capture truncates the armed interval at
+        // the last proven-clean bound instead of riding to the natural end.
+        // Armed at 3000, last clean read at 4000, health regressed after:
+        // the watch ends `health_loss` with `until` 4000, not `scope_end`.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "health-loss");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        {
+            let capture = coordinator.capture.as_mut().expect("native coverage");
+            capture.last_clean_ns = Some(4_000);
+            capture.health_unproven = Some("scripted witness health loss".to_string());
+        }
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::HealthLoss)
+        );
+        assert_eq!(watch.until_ns, Some(4_000));
+    }
+
+    #[test]
+    fn prearm_armed_watch_truncates_for_scope_uncertain() {
+        // I2 (scope_uncertain): custody loss truncates with the scope cause
+        // at the same proven-clean bound.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "scope-uncertain");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        {
+            let capture = coordinator.capture.as_mut().expect("native coverage");
+            capture.last_clean_ns = Some(4_000);
+            capture.unproven = Some("scripted custody loss".to_string());
+        }
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeUncertain)
+        );
+        assert_eq!(watch.until_ns, Some(4_000));
+    }
+
+    #[test]
+    fn prearm_counter_rise_through_witness_batches_truncates() {
+        // A counter rise through `note_witness_batch` truncates the armed
+        // interval at the loss baseline even when a later clean sweep would
+        // otherwise wash the loss away: armed at 3000, clean read at 3200,
+        // regression dated at baseline 3200 (read 3600), clean read at 4000,
+        // stop at 5000. The watch ends `health_loss` with `until` 3200, not
+        // `scope_end` at 5000.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "counter-rise");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        assert_eq!(
+            coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::Armed,
+        );
+        let mut clean_before = witness_batch();
+        clean_before.custody = ScopeCustody::System;
+        clean_before.health_baseline_ns = 1_000;
+        clean_before.health_read_ns = 3_200;
+        clean_before.rows_anchor_ns = 3_201;
+        clean_before.rows_read_ns = 3_201;
+        clean_before.counts_read_ns = 3_201;
+        coordinator.note_witness_batch(&clean_before);
+        let mut regressed = witness_batch();
+        regressed.custody = ScopeCustody::System;
+        regressed.health_baseline_ns = 3_200;
+        regressed.health_read_ns = 3_600;
+        regressed.health_regression =
+            Some("native capture health counters rose: EVIDENCE[1] 0->1".into());
+        regressed.rows_anchor_ns = 3_601;
+        regressed.rows_read_ns = 3_601;
+        regressed.counts_read_ns = 3_601;
+        coordinator.note_witness_batch(&regressed);
+        let mut clean_after = witness_batch();
+        clean_after.custody = ScopeCustody::System;
+        clean_after.health_baseline_ns = 3_600;
+        clean_after.health_read_ns = 4_000;
+        clean_after.rows_anchor_ns = 4_001;
+        clean_after.rows_read_ns = 4_001;
+        clean_after.counts_read_ns = 4_001;
+        coordinator.note_witness_batch(&clean_after);
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::HealthLoss)
+        );
+        assert_eq!(watch.until_ns, Some(3_200));
+        assert!(
+            watch.until_ns.is_some_and(|until| until <= 3_200),
+            "truncation never rides past the loss baseline: {watch:?}"
+        );
+    }
+
+    #[test]
+    fn prearm_mapped_rows_emit_pre_attach_and_undeclared_windows() {
+        // Window-emission half: a registry module record matching the pinned
+        // object (`mapped == true`) with the declared set stamped [1000 →
+        // 3000] emits exactly one `pre_attach` window over the scope start;
+        // one attached same-object endpoint outside the declared set adds
+        // the `mapped_unattached` window without moving the declared attach
+        // instant; partial stamps emit nothing (a subset maximum is not
+        // readiness).
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "windowed");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let summary = pinning.pins.pinned().next().expect("one pinned object");
+        let object = summary.id;
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+
+        // The mapped join: a registry module record naming the pinned file
+        // (physical key + retained digest).
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some(sha256),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+
+        // Partial stamps: one member only — mapped but no window.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: delta.endpoints[0].id,
+                object: delta.endpoints[0].object,
+                at_ns: 2_000,
+            }],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        assert!(rows[0].mapped);
+        assert!(rows[0].attached_at_ns.is_none());
+        assert!(
+            rows[0].unobserved_windows.is_none(),
+            "a subset maximum is not declared-set readiness"
+        );
+
+        // Full declared set: the base window over [scope start, max].
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        assert_eq!(rows[0].attached_at_ns, Some(3_000));
+        assert_eq!(
+            rows[0].unobserved_windows,
+            Some(vec![crate::render::UnobservedWindow {
+                start_ns: 1_000,
+                end_ns: 3_000,
+                reason: crate::render::UnobservedReason::PreAttach,
+            }]),
+        );
+
+        // One same-object endpoint outside the declared set (a later
+        // scan-corroborated offset): absorbed straight into the attach
+        // set, never into the declared watch.
+        let declared = coordinator
+            .prearm_declared_endpoints(object)
+            .expect("the declared set stands");
+        let extra_offset = declared.iter().map(|key| key.file_offset).max().unwrap() + 0x1000;
+        let path = coordinator
+            .prearm
+            .as_ref()
+            .expect("retained pinning")
+            .inputs[0]
+            .path
+            .clone();
+        let budget = coordinator.attach_set.budget();
+        let mut extra = crate::plan::AttachPlan::from_slots_with_policy(
+            vec![crate::plan::Slot {
+                index: 0,
+                descriptor_index: 0,
+                object,
+                object_path: path.clone(),
+                file_offset: extra_offset,
+                names: vec!["C_Sign".to_string()],
+                aliased: false,
+                semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                semantic_authorized: false,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            }],
+            crate::plan::AdmissionPolicy::Inventory(budget),
+        )
+        .expect("one extra slot lowers");
+        extra.modules.push(crate::plan::ModuleSummary {
+            id: crate::plan::ModuleId(0),
+            object,
+            key,
+            path,
+            tables: Vec::new(),
+            interfaces: 0,
+            source: "scan",
+            corroborated: false,
+            skipped: Vec::new(),
+        });
+        let pins = coordinator
+            .prearm
+            .as_ref()
+            .expect("retained pinning")
+            .pins
+            .clone();
+        let absorbed = coordinator.attach_set.absorb(&extra, &pins);
+        assert_eq!(
+            absorbed.delta.endpoints.len(),
+            1,
+            "the scan-corroborated offset joins the same object"
+        );
+        let extra_endpoint = absorbed.delta.endpoints[0];
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: extra_endpoint.id,
+                object: extra_endpoint.object,
+                at_ns: 4_000,
+            }],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        assert_eq!(
+            rows[0].attached_at_ns,
+            Some(3_000),
+            "the undeclared attach is disclosed, never folded into the declared instant"
+        );
+        assert_eq!(
+            rows[0].unobserved_windows,
+            Some(vec![
+                crate::render::UnobservedWindow {
+                    start_ns: 1_000,
+                    end_ns: 3_000,
+                    reason: crate::render::UnobservedReason::PreAttach,
+                },
+                crate::render::UnobservedWindow {
+                    start_ns: 1_000,
+                    end_ns: 4_000,
+                    reason: crate::render::UnobservedReason::MappedUnattached,
+                },
+            ]),
+        );
+    }
+
+    #[test]
+    fn prearm_mapped_requires_matching_digest() {
+        // Digest negative: the same physical key (device, inode) with a
+        // different digest does not count as mapped. Kills mutants of the
+        // `is_none_or` / `!pin_sha.is_empty()` guard.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "digest-neg");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let summary = pinning.pins.pinned().next().expect("one pinned object");
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        assert!(!sha256.is_empty(), "the pin carries a proven digest");
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        // Same key, wrong digest: unmapped.
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some("deadbeef".repeat(8)),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+        assert!(
+            !coordinator.prearm_rows()[0].mapped,
+            "a digest mismatch is not the pinned object"
+        );
+        // Same key, matching digest: mapped.
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some(sha256),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+        assert!(
+            coordinator.prearm_rows()[0].mapped,
+            "the matching digest names the pinned object"
+        );
+    }
+
+    #[test]
+    fn inventory_selected_budget_growth_refusal_keeps_ids_and_positive_history() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let mut scene = CaptureScene::new(2);
+        let budget = crate::capacity::inventory_endpoint_budget(Some(3)).unwrap();
+        scene.coordinator = InventoryCoordinator::new_with_budget(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            scene.source.clone(),
+            RegistryLimits::default_limits(),
+            budget,
+        )
+        .unwrap();
+        let other = fx::provider(&scene._dir, "b.so", "provider-b");
+        scene.pins = fx::pass_pins(&[(&scene.path, "sha-a"), (&other, "sha-b")]);
+        let policy = crate::plan::AdmissionPolicy::Inventory(budget);
+        let initial = [
+            fx::module(&scene.pins, &scene.path, &fx::offsets(2)),
+            fx::module(&scene.pins, &other, &fx::offsets(1)),
+        ];
+        let absorbed = scene
+            .coordinator
+            .attach_set
+            .absorb(&fx::lower_named(&initial, &scene.pins, policy), &scene.pins);
+        scene.delta = absorbed.delta;
+        scene.verdicts = absorbed.verdicts;
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let path = scene.path.clone();
+        scene.project_paths(7, &[&path, &other], 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 5;
+        native.witness(vec![row]);
+        let retained: Vec<_> = native
+            .scene
+            .coordinator
+            .attach_set
+            .endpoints()
+            .copied()
+            .collect();
+        let positive = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller && edge.entry_count == 5)
+            .map(|edge| {
+                (
+                    edge.module,
+                    edge.entry_count,
+                    edge.entry_first_seen_ns,
+                    edge.entry_last_seen_ns,
+                )
+            })
+            .expect("initial positive");
+
+        // Lowering fits A's new3 whole first, then refuses B. The lifetime
+        // set already holds A2+B1, so it must refuse A's one new ID too.
+        let growth = [
+            fx::module(&native.scene.pins, &path, &fx::offsets(3)),
+            fx::module(&native.scene.pins, &other, &fx::offsets(1)),
+        ];
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(&growth, &native.scene.pins, policy),
+            &native.scene.pins,
+        );
+        assert!(absorbed.delta.is_empty());
+        assert_eq!(absorbed.gaps.len(), 1);
+        assert_eq!(absorbed.gaps[0].budget, Some((ENDPOINT_RESOURCE, 3, 4)));
+        native.scene.verdicts.extend(absorbed.verdicts);
+        native.scene.project_paths(7, &[&path, &other], 10_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .endpoints()
+                .copied()
+                .collect::<Vec<_>>(),
+            retained
+        );
+        let preserved = native
+            .scene
+            .coordinator
+            .registry
+            .edge(caller, positive.0)
+            .unwrap();
+        assert_eq!(preserved.entry_count, positive.1);
+        assert_eq!(preserved.entry_first_seen_ns, positive.2);
+        assert_eq!(preserved.entry_last_seen_ns, positive.3);
     }
 
     /// E-test-style fixture build: compile one C source with gcc into the
@@ -3124,6 +11550,513 @@ mod tests {
         }
     }
 
+    struct CountManifestFixture {
+        _dir: tempfile::TempDir,
+        provider: PathBuf,
+        manifest: PathBuf,
+        child: ChildReaper,
+    }
+
+    impl CountManifestFixture {
+        fn new() -> Self {
+            use p11scope_manifest::manifest::{Manifest, Resolution};
+            let dir = tempfile::tempdir().unwrap();
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let provider = gcc(
+                dir.path(),
+                "private-tail.so",
+                &source.join("crates/discover/tests/fixture/version_matrix.c"),
+                &["-shared", "-fPIC", "-DCAPACITY_UNIQUE=32"],
+                &[],
+            );
+            let manifest = dir.path().join("tail.json");
+            let helper = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("P11SCOPE_TEST_DISCOVERY_PROVIDER", &provider)
+                .env("P11SCOPE_TEST_DISCOVERY_MANIFEST", &manifest)
+                .output()
+                .unwrap();
+            assert!(helper.status.success(), "{helper:?}");
+            let acquired: Manifest =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            assert!(crate::manifest_input::validate_structure(&acquired).is_empty());
+            assert_eq!(acquired.surfaces[0].functions.len(), 68);
+            let targets: BTreeSet<_> = acquired
+                .surfaces
+                .iter()
+                .flat_map(|surface| &surface.functions)
+                .filter_map(|function| match function.resolution {
+                    Resolution::Resolved {
+                        object,
+                        file_offset,
+                    } => Some((object, file_offset)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                32,
+                "the actual helper observes32 unique bodies"
+            );
+            let driver = gcc(
+                dir.path(),
+                "holder",
+                &source.join("tests/fixtures/catalog-driver.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror"],
+                &["-ldl"],
+            );
+            let ready = dir.path().join("ready");
+            let child = ChildReaper(
+                std::process::Command::new(driver)
+                    .arg("--ready")
+                    .arg(&ready)
+                    .arg(&provider)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .die_with_parent()
+                    .spawn()
+                    .unwrap(),
+            );
+            wait_ready(&ready);
+            Self {
+                _dir: dir,
+                provider,
+                manifest,
+                child,
+            }
+        }
+
+        fn coordinator(&self, scope: Scope) -> InventoryCoordinator<OsProcessSource> {
+            InventoryCoordinator::new_with_budget(
+                scope,
+                HookRegistry::builtin(),
+                vec![self.provider.clone()],
+                vec![],
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                crate::capacity::InventoryBudget::new(32, 256).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn scan_paths(
+            &self,
+            pid: u32,
+            paths: Vec<PathBuf>,
+        ) -> InventoryCoordinator<OsProcessSource> {
+            let mut coordinator = self.coordinator(Scope::Pid(pid));
+            // The same input setter the public inventory facade uses.
+            coordinator.set_manifests(paths);
+            coordinator
+                .scan_pass(
+                    &InventoryScope::Pid(pid),
+                    None,
+                    &mut UnavailableImageGuard,
+                    &mut ScanOnlyIdentity,
+                    u64::MAX,
+                    crate::discovery::caller_registry::now_ns(),
+                )
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            coordinator
+        }
+
+        fn scan(&self, manifest: bool) -> InventoryCoordinator<OsProcessSource> {
+            self.scan_paths(
+                self.child.0.id(),
+                if manifest {
+                    vec![self.manifest.clone()]
+                } else {
+                    vec![]
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn count_manifest_enters_the_collector_before_shared_admission() {
+        let fixture = CountManifestFixture::new();
+        let mut coordinator = fixture.scan(true);
+        let modules: Vec<_> = coordinator
+            .registry()
+            .modules()
+            .map(|module| {
+                (
+                    &module.paths,
+                    module.admission,
+                    module.admission_endpoints,
+                    &module.admission_reasons,
+                )
+            })
+            .collect();
+        assert_eq!(coordinator.attach_set().len(), 32, "{modules:?}");
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 32);
+        assert_eq!(delta.objects.len(), 1);
+        assert!(
+            delta
+                .endpoints
+                .iter()
+                .all(|entry| entry.abi == p11scope_manifest::elf::ElfAbi::Lp64)
+        );
+        assert!(coordinator.engine.selection_claims.is_empty());
+        assert!(
+            coordinator.engine.manifests.is_empty(),
+            "count admission grants no semantic inputs to the engine"
+        );
+        assert!(coordinator.registry().modules().all(|module| {
+            module.admission == AdmissionState::Admitted
+                && module.admission_class.as_deref() == Some("operator")
+        }));
+    }
+
+    #[test]
+    fn private_count_table_without_manifest_admits_first_come_without_reserve() {
+        let fixture = CountManifestFixture::new();
+        let coordinator = fixture.scan(false);
+        // GT-5: pid-scope with --module hints is Named, first-come with no reserve.
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert!(coordinator.registry().modules().all(|module| {
+            module.admission == AdmissionState::Admitted
+                && module
+                    .admission_reasons
+                    .iter()
+                    .all(|reason| !reason.contains("reserved"))
+        }));
+    }
+
+    #[test]
+    fn count_manifest_identity_drift_refuses_input_and_keeps_raw_observations() {
+        use p11scope_manifest::manifest::Manifest;
+        let fixture = CountManifestFixture::new();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        document.objects[0].identity.sha256 = Some("0".repeat(64));
+        if document.objects[0].identity.kind == p11scope_manifest::IdentityKind::Sha256 {
+            document.objects[0].identity.value = Some("0".repeat(64));
+        }
+        let provider = document
+            .provenance_objects
+            .iter_mut()
+            .find(|object| object.path == document.module_path)
+            .unwrap();
+        provider.identity = document.objects[0].identity.clone();
+        assert!(
+            crate::manifest_input::validate_structure(&document).is_empty(),
+            "{:?}",
+            crate::manifest_input::validate_structure(&document)
+        );
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let coordinator = fixture.scan(true);
+        // GT-5: pid-scope with --module hints is Named, so raw scan targets admit first-come.
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert!(
+            coordinator
+                .registry()
+                .modules()
+                .any(|module| module.paths.contains(fixture.provider.to_str().unwrap()))
+        );
+        assert!(
+            coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.reason.contains("count manifest refused"))
+        );
+        let pid = fixture.child.0.id();
+        let mut roomy = InventoryCoordinator::new_with_budget(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            vec![fixture.provider.clone()],
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+            crate::capacity::InventoryBudget::new(256, 2048).unwrap(),
+        )
+        .unwrap();
+        roomy.set_manifests(vec![fixture.manifest.clone()]);
+        roomy
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut UnavailableImageGuard,
+                &mut ScanOnlyIdentity,
+                u64::MAX,
+                crate::discovery::caller_registry::now_ns(),
+            )
+            .unwrap();
+        roomy.commit_batch(false).unwrap();
+        assert_eq!(
+            roomy.attach_set().len(),
+            32,
+            "a bad manifest cannot erase independently admissible raw targets"
+        );
+    }
+
+    #[test]
+    fn count_manifest_same_bytes_replacement_is_not_the_mapped_provider() {
+        let fixture = CountManifestFixture::new();
+        let replacement = fixture._dir.path().join("replacement.so");
+        std::fs::copy(&fixture.provider, &replacement).unwrap();
+        std::fs::rename(&replacement, &fixture.provider).unwrap();
+        let coordinator = fixture.scan(true);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        assert!(
+            coordinator.registry().gaps().iter().any(|gap| {
+                gap.reason.contains("count manifest refused")
+                    && gap.reason.contains("not exactly mapped")
+            }),
+            "{:?}",
+            coordinator.registry().gaps()
+        );
+    }
+
+    #[test]
+    fn count_manifest_aliases_share_one_physical_target_union() {
+        use p11scope_manifest::manifest::Manifest;
+        let fixture = CountManifestFixture::new();
+        let alias = fixture._dir.path().join("alias.so");
+        std::fs::hard_link(&fixture.provider, &alias).unwrap();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        let provenance = document
+            .provenance_objects
+            .iter()
+            .position(|object| object.path == document.module_path)
+            .unwrap();
+        document.module_path = alias.to_str().unwrap().into();
+        document.objects[0].path = document.module_path.clone();
+        document.provenance_objects[provenance].path = document.module_path.clone();
+        let alias_manifest = fixture._dir.path().join("alias.json");
+        std::fs::write(&alias_manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut coordinator = fixture.scan_paths(
+            fixture.child.0.id(),
+            vec![fixture.manifest.clone(), alias_manifest],
+        );
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert_eq!(coordinator.attach_set().module_records(), 1);
+        assert!(
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.reason.contains("count manifest refused")),
+            "both actual aliases must validate"
+        );
+        let delta = coordinator.take_target_delta();
+        assert_eq!((delta.endpoints.len(), delta.objects.len()), (32, 1));
+    }
+
+    #[test]
+    fn count_manifest_proc_root_locator_uses_the_collected_generation() {
+        use p11scope_manifest::manifest::Manifest;
+        let fixture = CountManifestFixture::new();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        let provenance = document
+            .provenance_objects
+            .iter()
+            .position(|object| object.path == document.module_path)
+            .unwrap();
+        document.module_path = format!(
+            "/proc/{}/root{}",
+            fixture.child.0.id(),
+            fixture.provider.display()
+        );
+        document.objects[0].path = document.module_path.clone();
+        document.provenance_objects[provenance].path = document.module_path.clone();
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let coordinator = fixture.scan(true);
+        assert_eq!(
+            coordinator.attach_set().len(),
+            32,
+            "{:?}",
+            coordinator.registry().gaps()
+        );
+        let outside = fixture.scan_paths(std::process::id(), vec![fixture.manifest.clone()]);
+        assert_eq!(outside.attach_set().len(), 0);
+        assert!(outside.registry().gaps().iter().any(|gap| {
+            gap.reason
+                .contains("locator is outside the collected scope")
+        }));
+    }
+
+    #[test]
+    fn count_manifest_cannot_admit_a_provider_outside_the_collected_pid() {
+        let fixture = CountManifestFixture::new();
+        let coordinator = fixture.scan_paths(std::process::id(), vec![fixture.manifest.clone()]);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        assert!(coordinator.registry().gaps().iter().any(|gap| {
+            gap.reason
+                .contains("not exactly mapped in the collected scope")
+        }));
+    }
+
+    #[test]
+    fn count_manifest_document_reads_obey_the_collector_allowance() {
+        let fixture = CountManifestFixture::new();
+        let mut bytes = vec![b' '; 1 << 20];
+        bytes.extend(std::fs::read(&fixture.manifest).unwrap());
+        std::fs::write(&fixture.manifest, bytes).unwrap();
+        let catalog = crate::inspect_system::collect_pid_with_count_manifests(
+            fixture.child.0.id(),
+            std::slice::from_ref(&fixture.provider),
+            &HookRegistry::builtin(),
+            crate::plan::AdmissionPolicy::Inventory(
+                crate::capacity::InventoryBudget::new(32, 256).unwrap(),
+            ),
+            crate::discovery::scan::CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: 8 << 20,
+                total_bytes: 256 << 10,
+            }),
+            std::slice::from_ref(&fixture.manifest),
+            0,
+            0,
+        )
+        .unwrap();
+        // GT-5: pid-scope with --module hints is Named, so raw scan targets admit first-come.
+        assert_eq!(
+            catalog.lowering.as_ref().unwrap().plan.slots.len(),
+            32,
+            "an oversized manifest is refused but the scan's 32 targets still admit first-come"
+        );
+        assert!(
+            catalog
+                .skipped
+                .iter()
+                .any(|gap| gap.reason.contains("count manifest refused"))
+        );
+    }
+
+    #[test]
+    fn unaimed_capture_keeps_the_shared_reserve() {
+        // GT-5 twin: unaimed system scope stays Shared, so a 32 budget reserves all 32.
+        assert_eq!(crate::plan::shared_scope_reserve(32), 32);
+    }
+
+    #[test]
+    fn count_manifest_full_and_tail_share_the_scan_inspection_cache() {
+        use std::io::Write as _;
+        let fixture = CountManifestFixture::new();
+        let full = gcc(
+            fixture._dir.path(),
+            "full-copy.so",
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DCAPACITY_UNIQUE=68"],
+            &[],
+        );
+        // Keep this owned full-copy fixture larger than the helper's fresh
+        // count-read allowance. Every byte is included in the real identity.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&full)
+            .unwrap()
+            .write_all(&vec![0u8; 256 << 10])
+            .unwrap();
+        let full_manifest = fixture._dir.path().join("full.json");
+        let helper = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("P11SCOPE_TEST_DISCOVERY_PROVIDER", &full)
+            .env("P11SCOPE_TEST_DISCOVERY_MANIFEST", &full_manifest)
+            .output()
+            .unwrap();
+        assert!(helper.status.success(), "{helper:?}");
+        let proof = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance", "--exact", "--ignored", "--nocapture"])
+            .env_clear()
+            .env("P11SCOPE_COUNT_MANIFEST_FULL", &full_manifest)
+            .env("P11SCOPE_COUNT_MANIFEST_TAIL", &fixture.manifest)
+            .output().unwrap();
+        assert!(proof.status.success(), "{proof:?}");
+        let output = String::from_utf8(proof.stdout).unwrap();
+        assert!(output.contains("1 passed; 0 failed;"), "{output}");
+        assert!(
+            output.contains("COUNT_MANIFEST_INPUTS"),
+            "the real cache proof must execute: {output}"
+        );
+    }
+
+    #[test]
+    fn count_manifest_partial_rows_preserve_the_complete_count_only_union() {
+        use p11scope_manifest::manifest::{Manifest, WalkOutcome};
+        let fixture = CountManifestFixture::new();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        document.surfaces[0].functions.truncate(17);
+        document.surfaces[0].walk = WalkOutcome::Unreadable {
+            detail: "remaining words unavailable".into(),
+        };
+        document.alias_groups.clear();
+        assert!(crate::manifest_input::validate_structure(&document).is_empty());
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut coordinator = fixture.coordinator(Scope::Pid(fixture.child.0.id()));
+        coordinator.set_manifests(vec![fixture.manifest.clone()]);
+        let now = crate::discovery::caller_registry::now_ns();
+        let catalog =
+            coordinator.collector(InventoryScope::Pid(fixture.child.0.id()), None)().unwrap();
+        let plan = &catalog.lowering.as_ref().unwrap().plan;
+        assert_eq!(
+            plan.slots.len(),
+            32,
+            "valid source parts merge before admission"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY)
+        );
+        coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            u64::MAX,
+            now,
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert!(coordinator.engine.selection_claims.is_empty());
+    }
+
+    #[test]
+    fn count_manifest_cgroup_final_member_cut_controls_the_same_plan() {
+        let fixture = CountManifestFixture::new();
+        let group = tempfile::tempdir().unwrap();
+        let pid = fixture.child.0.id();
+        std::fs::write(group.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let scope = crate::scope::cgroup(group.path()).unwrap();
+        let mut coordinator = fixture.coordinator(scope);
+        coordinator.set_manifests(vec![fixture.manifest.clone()]);
+        for allowed in [BTreeSet::from([pid]), BTreeSet::new()] {
+            let mut collection = coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            collection.sample_end(&BTreeSet::from([pid]));
+            assert!(collection.permit(pid).is_some());
+            let catalog = collection.catalog(&allowed);
+            let plan = &catalog.lowering.as_ref().unwrap().plan;
+            assert_eq!(plan.slots.len(), if allowed.is_empty() { 0 } else { 32 });
+        }
+    }
+
     #[test]
     fn native_pass_over_self_commits_and_publishes_through_one_batch() {
         let mut coordinator = coordinator();
@@ -3163,6 +12096,85 @@ mod tests {
         assert_eq!(epochs.serviced, 1);
         assert_eq!(epochs.requested, 1);
         assert_eq!(epochs.dirty, 0);
+    }
+
+    #[test]
+    fn native_authority_snapshot_keeps_private_image_null() {
+        use std::process::{Command, Stdio};
+        struct Reaper(std::process::Child);
+        impl Drop for Reaper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // Two native callers with two different opaque images.
+        let child = Reaper(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+        );
+        let other = child.0.id();
+        let this = std::process::id();
+        assert_ne!(this, other);
+        let image_this = fixture_image(this).unwrap();
+        let image_other = fixture_image(other).unwrap();
+        assert_ne!(image_this, image_other);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let now = crate::discovery::caller_registry::now_ns();
+        let mut guard = FixtureImages;
+        for (pid, image) in [(this, image_this), (other, image_other)] {
+            let caller = coordinator
+                .test_open_native_owner(pid, image, &mut guard, now)
+                .unwrap();
+            assert!(
+                matches!(
+                    coordinator.adapter().record(caller).unwrap().authority,
+                    ImageAuthority::NativeExact { .. }
+                ),
+                "the opened owner installs native authority"
+            );
+        }
+        coordinator.commit_batch(true).unwrap();
+        let document = crate::inventory::render_json(
+            &coordinator,
+            "native",
+            now,
+            crate::discovery::caller_registry::now_ns(),
+            1,
+        );
+        let callers = document["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 2);
+        let mut pids = Vec::new();
+        for caller in callers {
+            assert_eq!(caller["image"]["authority"], "native_exact");
+            assert!(
+                caller["image"]["task_cookie"].is_null(),
+                "private ticket never renders: {caller}"
+            );
+            assert!(
+                caller["image"]["exec_id"].is_null(),
+                "private exec never renders: {caller}"
+            );
+            pids.push(caller["pid"].as_u64().unwrap());
+        }
+        pids.sort_unstable();
+        let mut expected = [u64::from(this), u64::from(other)];
+        expected.sort_unstable();
+        assert_eq!(pids, expected, "caller identity fields stay");
     }
 
     #[test]
@@ -3216,12 +12228,87 @@ mod tests {
     }
 
     #[test]
+    fn cold_owner_refusal_preserves_scan_pinned_counter_target() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        use p11scope_manifest::maps::{MapIndex, parse_maps};
+
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        let maps =
+            parse_maps(&std::fs::read(format!("/proc/{pid}/task/{}/maps", group.tids[0])).unwrap())
+                .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mapping = index.containing(group.callback_address).unwrap();
+        let callback_offset = mapping.file_offset + group.callback_address - mapping.start;
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            vec![group.program.clone()],
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let report = coordinator
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut FixtureImages,
+                &mut OwnerImages(fixture_image),
+                u64::MAX,
+                crate::discovery::caller_registry::now_ns(),
+            )
+            .unwrap();
+        assert_eq!(report.native_callers, 0);
+        assert_eq!(report.scan_callers, 1);
+        let caller = coordinator.adapter().live_id(pid).unwrap();
+        assert_eq!(
+            coordinator.adapter().record(caller).unwrap().authority,
+            ImageAuthority::ScanPinned
+        );
+        assert!(coordinator.owner_of(caller).is_none());
+        let endpoint = coordinator
+            .attach_set
+            .endpoints()
+            .find(|endpoint| {
+                endpoint.file_offset == callback_offset
+                    && coordinator
+                        .attach_set
+                        .target(endpoint.object)
+                        .is_some_and(|target| std::path::Path::new(target.path()) == group.program)
+            })
+            .expect("the actual sparse-provider callback remains a counter target");
+        assert!(
+            coordinator
+                .attach_set
+                .target(endpoint.object)
+                .unwrap()
+                .check_unchanged()
+                .unwrap()
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert!(
+            coordinator
+                .registry()
+                .edges()
+                .any(|edge| edge.caller == caller)
+        );
+        assert!(coordinator.registry().gaps().iter().any(|gap| {
+            gap.pid == Some(pid)
+                && gap.subject == "native inventory owner unavailable"
+                && gap.reason.contains("warm-only")
+        }));
+        group.call_three();
+    }
+
+    #[test]
     fn commit_revalidates_after_prepare_and_refuses_changed_images() {
         struct FlipGuard {
             exact: Cell<bool>,
         }
         impl ImageGuard for FlipGuard {
-            fn check(&mut self, _: &ProcessView, _: ImageIdentity) -> ImageCheck {
+            fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
                 if self.exact.get() {
                     ImageCheck::Exact
                 } else {
@@ -3334,6 +12421,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -3342,6 +12430,7 @@ mod tests {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -3476,6 +12565,7 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let driver_pid = child.id();
@@ -3485,6 +12575,7 @@ mod tests {
             Scope::Pid(driver_pid),
             HookRegistry::builtin(),
             vec![provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -3608,6 +12699,7 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let driver_pid = child.id();
@@ -3617,6 +12709,7 @@ mod tests {
             Scope::Pid(driver_pid),
             HookRegistry::builtin(),
             vec![provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -3787,7 +12880,7 @@ mod tests {
 
     /// One catalog object per path, each observed by `pid`, plus that
     /// member's complete scan record.
-    fn capture_catalog(
+    pub(super) fn capture_catalog(
         pins: &crate::discovery::identity::PinnedObjects,
         paths: &[&std::path::Path],
         pid: u32,
@@ -3838,6 +12931,11 @@ mod tests {
             cap: 1,
             scan_ms: 0,
             processes: vec![crate::inspect_system::ProcessRecord {
+                application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                    crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                ),
+                complete_scan: None,
+                hints_examined: true,
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,
                 objects: (0..objects.len()).collect(),
@@ -3855,6 +12953,8 @@ mod tests {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            excluded: Vec::new(),
+            exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
         }
     }
@@ -3879,6 +12979,7 @@ mod tests {
                 scope,
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )
@@ -3960,7 +13061,7 @@ mod tests {
         );
 
         // A capture scoped to another process stages nothing for this one.
-        coordinator.begin_capture_coverage(Some(ScopeIncarnation {
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Pid(ScopeIncarnation {
             pid: pid + 1,
             start_time: crate::process::process_start_time(pid).ok(),
         }));
@@ -3971,7 +13072,7 @@ mod tests {
             UseCoverage::Unknown(UnknownReason::ScanOnly)
         );
 
-        coordinator.begin_capture_coverage(Some(ScopeIncarnation {
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Pid(ScopeIncarnation {
             pid,
             start_time: crate::process::process_start_time(pid).ok(),
         }));
@@ -4076,7 +13177,7 @@ mod tests {
             exe: crate::discovery::caller_registry::read_exe_identity(pid),
         });
         let catalog = capture_catalog(&pins, &[&a], pid, generation);
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.project_catalog(&catalog, &verdicts, 60);
         coordinator.registry.publish();
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
@@ -4179,7 +13280,7 @@ mod tests {
             exe: crate::discovery::caller_registry::read_exe_identity(pid),
         });
         let catalog = capture_catalog(&pins, &[&a], pid, generation);
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.project_catalog(&catalog, &verdicts, 60);
         coordinator.registry.publish();
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
@@ -4281,7 +13382,7 @@ mod tests {
         // A commits; B's mapping stages but does NOT publish before its
         // deferred receipt.
         let catalog_a = capture_catalog(&pins, &[&a], pid, generation.clone());
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.project_catalog(&catalog_a, &verdicts, 60);
         coordinator.registry.publish();
         let catalog_b = capture_catalog(&pins, &[&b], pid, generation);
@@ -4350,6 +13451,13 @@ mod tests {
     }
 
     #[test]
+    fn partial_attach_subject_matches_the_oracle_drain_gate() {
+        // Pinned verbatim: scripts/inventory-native-oracle.py matches this
+        // subject to gate the attach drain; a rewording breaks the gate.
+        assert_eq!(PARTIAL_ATTACH_SUBJECT, "native endpoint attach failed");
+    }
+
+    #[test]
     fn partial_or_unrecorded_admission_is_never_watched() {
         use crate::discovery::inventory_attach_set::tests as fx;
         let dir = tempfile::tempdir().unwrap();
@@ -4363,7 +13471,7 @@ mod tests {
             &pins,
         );
         let key = absorbed.verdicts.keys().next().unwrap().clone();
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.note_extend_receipt(&ExtendReceipt {
             attached: absorbed
                 .delta
@@ -4413,21 +13521,105 @@ mod tests {
 
     // ---- C3 review fixes: incarnation-scoped, demotable capture coverage ----
 
+    #[test]
+    fn collector_budget_excludes_all_retained_provider_anchors() {
+        let mut scene = CaptureScene::new(3);
+        let id = scene.pins.pinned().next().unwrap().id;
+        let file = scene.pins.file_for(id).unwrap();
+        let target = scene.pins.retain_inventory_target(id).unwrap();
+        for physical_live in [false, true] {
+            if physical_live {
+                scene
+                    .coordinator
+                    .begin_capture_coverage(CaptureScopeCoverage::System);
+            }
+            for semantic_live in [false, true] {
+                let budget = scene.coordinator.collector_budget(
+                    crate::discovery::scan::CaptureWorkBudget::default(),
+                    semantic_live,
+                );
+                assert_eq!(
+                    budget
+                        .kernel_anchor_exclusions()
+                        .excludes(&BTreeSet::from([target.object_key()]), file,),
+                    physical_live || semantic_live,
+                    "physical={physical_live}, semantic={semantic_live}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collector_budget_inherits_the_run_exclude_module_inputs() {
+        let coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![PathBuf::from("libp11-kit.so.0")],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        for semantic_live in [false, true] {
+            let budget = coordinator.collector_budget(
+                crate::discovery::scan::CaptureWorkBudget::default(),
+                semantic_live,
+            );
+            assert_eq!(
+                budget.excludes(),
+                &[PathBuf::from("libp11-kit.so.0")],
+                "semantic_live={semantic_live}"
+            );
+        }
+    }
+
+    #[test]
+    fn absorb_catalog_excluded_surfaces_in_the_run_excluded_snapshot() {
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![
+                PathBuf::from("libp11-kit.so.0"),
+                PathBuf::from("libnothing.so"),
+            ],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let record = || crate::discovery::scan::ExcludedRecord {
+            pid: 100,
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            via: PathBuf::from("libp11-kit.so.0"),
+        };
+        coordinator.absorb_catalog_excluded(vec![record()]);
+        // Twice: multi-pass accumulation is idempotent.
+        coordinator.absorb_catalog_excluded(vec![record()]);
+        let (excluded, unmatched) = coordinator.excluded_snapshot();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].path, "/opt/libp11-kit.so.0.4.8");
+        assert_eq!(excluded[0].processes, 1);
+        assert_eq!(unmatched, vec!["libnothing.so".to_string()]);
+    }
+
     /// A coordinator over a scripted process source, its attach set holding
     /// one provider with `endpoints` entries, and that provider's catalog
     /// for `pid`.
-    struct CaptureScene {
-        _dir: tempfile::TempDir,
-        source: crate::discovery::caller_registry::tests::ScriptedSource,
-        coordinator: InventoryCoordinator<crate::discovery::caller_registry::tests::ScriptedSource>,
-        delta: TargetDelta,
-        verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
-        pins: crate::discovery::identity::PinnedObjects,
-        path: PathBuf,
+    pub(super) struct CaptureScene {
+        pub(super) _dir: tempfile::TempDir,
+        pub(super) source: crate::discovery::caller_registry::tests::ScriptedSource,
+        pub(super) coordinator:
+            InventoryCoordinator<crate::discovery::caller_registry::tests::ScriptedSource>,
+        pub(super) delta: TargetDelta,
+        pub(super) verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
+        pub(super) pins: crate::discovery::identity::PinnedObjects,
+        pub(super) path: PathBuf,
     }
 
     impl CaptureScene {
-        fn new(endpoints: u64) -> Self {
+        pub(super) fn new(endpoints: u64) -> Self {
             use crate::discovery::inventory_attach_set::tests as fx;
             let dir = tempfile::tempdir().unwrap();
             let path = fx::provider(&dir, "a.so", "provider-a");
@@ -4438,10 +13630,16 @@ mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 source.clone(),
                 RegistryLimits::default_limits(),
             )
             .unwrap();
+            // Scripted scenes define their own clocks: the stale-exit
+            // guard always sees comparable stamps here, whatever time
+            // namespace the test host runs under. Production
+            // coordinators keep the auto-detected decision.
+            coordinator.exit_clocks_comparable = true;
             let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
             let absorbed = coordinator.attach_set.absorb(
                 &fx::lower_named(std::slice::from_ref(&module), &pins, policy),
@@ -4458,7 +13656,7 @@ mod tests {
             }
         }
 
-        fn attach_all(&mut self, at_ns: u64, custody: ScopeCustody) {
+        pub(super) fn attach_all(&mut self, at_ns: u64, custody: ScopeCustody) {
             let receipt = ExtendReceipt {
                 attached: self
                     .delta
@@ -4476,12 +13674,12 @@ mod tests {
             self.coordinator.note_extend_receipt(&receipt);
         }
 
-        fn project(&mut self, pid: u32, now_ns: u64) {
+        pub(super) fn project(&mut self, pid: u32, now_ns: u64) {
             let path = self.path.clone();
             self.project_paths(pid, &[&path], now_ns);
         }
 
-        fn project_paths(&mut self, pid: u32, paths: &[&std::path::Path], now_ns: u64) {
+        pub(super) fn project_paths(&mut self, pid: u32, paths: &[&std::path::Path], now_ns: u64) {
             // Collected under the incarnation reconcile holds for the pid.
             let generation = self
                 .coordinator
@@ -4497,7 +13695,10 @@ mod tests {
                 .project_catalog(&catalog, &self.verdicts, now_ns);
         }
 
-        fn coverage(&self, caller: CallerId) -> crate::discovery::caller_registry::UseCoverage {
+        pub(super) fn coverage(
+            &self,
+            caller: CallerId,
+        ) -> crate::discovery::caller_registry::UseCoverage {
             let registry = &self.coordinator.registry;
             let edge = registry
                 .edges()
@@ -4522,14 +13723,14 @@ mod tests {
         )
     }
 
-    fn incarnation(pid: u32, start_time: u64) -> Option<ScopeIncarnation> {
-        Some(ScopeIncarnation {
+    fn incarnation(pid: u32, start_time: u64) -> CaptureScopeCoverage {
+        CaptureScopeCoverage::Pid(ScopeIncarnation {
             pid,
             start_time: Some(start_time),
         })
     }
 
-    fn witness_batch() -> WitnessBatch {
+    pub(super) fn witness_batch() -> WitnessBatch {
         WitnessBatch {
             domain: crate::attach::capture::NativeDomainId::mint(),
             phase: crate::attach::capture::CapturePhase::Active,
@@ -4556,6 +13757,7 @@ mod tests {
             health_unproven: None,
             health_baseline_ns: 0,
             health_read_ns: 150,
+            rows_anchor_ns: 151,
             rows_read_ns: 151,
             counts_read_ns: 151,
             changed_objects: Vec::new(),
@@ -4565,6 +13767,2217 @@ mod tests {
             lifecycle_loss: None,
             unsettled: false,
         }
+    }
+
+    #[test]
+    fn cgroup_receipts_and_clean_reads_never_claim_quiet_membership() {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        scene.attach_all(100, ScopeCustody::CgroupHeld);
+        let mut clean = witness_batch();
+        clean.custody = ScopeCustody::CgroupHeld;
+        for at in [120, 180] {
+            scene.coordinator.note_witness_batch(&clean);
+            scene.project(7, at);
+            scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                scene.coverage(caller),
+                UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+            );
+        }
+        assert_eq!(
+            scene.coordinator.capture_scope_verdict(caller, 7),
+            ScopeVerdict::Cgroup
+        );
+        scene.coordinator.end_capture_coverage(200);
+        scene.project(7, 250);
+        scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+        );
+    }
+
+    #[test]
+    fn cgroup_membership_uncertainty_preserves_counted_positive_history() {
+        let (mut native, caller) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        native.scene.attach_all(100, ScopeCustody::CgroupHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+        );
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        let cgroup_read = |native: &NativeScene, rows| {
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, rows) else {
+                unreachable!("the scripted read constructs a witness batch")
+            };
+            batch.custody = ScopeCustody::CgroupHeld;
+            batch
+        };
+        native.stage(NativeBatch::Witness(cgroup_read(&native, vec![row])));
+        native.drain();
+        native.stage(NativeBatch::Witness(cgroup_read(&native, Vec::new())));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let mut refreshed = cgroup_read(&native, Vec::new());
+        refreshed.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: native.scene.delta.endpoints[0].object,
+            count: 7,
+        }];
+        native.stage(NativeBatch::Witness(refreshed));
+        native.scene.project(7, 2000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .unwrap();
+        assert_eq!(edge.entry_count, 7);
+    }
+
+    fn cgroup_retained_history_scene() -> (NativeScene, CallerId) {
+        let (mut native, caller) = NativeScene::new();
+        std::fs::write(native.scene._dir.path().join("cgroup.procs"), b"").unwrap();
+        native.scene.coordinator.engine.scope =
+            crate::scope::cgroup(native.scene._dir.path()).unwrap();
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        native.scene.attach_all(100, ScopeCustody::CgroupHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let first = native.row(41, 1, 7, 100, 0);
+        let cgroup_read = |native: &NativeScene, rows| {
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, rows) else {
+                unreachable!("the scripted read constructs a witness batch")
+            };
+            batch.custody = ScopeCustody::CgroupHeld;
+            batch
+        };
+        native.stage(NativeBatch::Witness(cgroup_read(&native, vec![first])));
+        native.drain();
+        native.stage(NativeBatch::Witness(cgroup_read(&native, Vec::new())));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let mut refreshed = cgroup_read(&native, Vec::new());
+        refreshed.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: native.scene.delta.endpoints[0].object,
+            count: 7,
+        }];
+        native.stage(NativeBatch::Witness(refreshed));
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false,
+            }
+        );
+        (native, caller)
+    }
+
+    fn assert_cgroup_old_history_only(native: &NativeScene, caller: CallerId) {
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(
+            adapter.live_id(7),
+            None,
+            "a tracked PID cannot authorize an outside or unproven successor"
+        );
+        assert_eq!(
+            adapter.len(),
+            1,
+            "never mint a successor just to retire old"
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the old history stays retained");
+        assert_eq!(edge.entry_count, 7);
+        assert_eq!(
+            edge.mapping,
+            crate::discovery::caller_registry::MappingState::Ended,
+            "registry retirement must be consumed"
+        );
+    }
+
+    /// Heap-built retained-history scene (H6 slice 2 oracles): see
+    /// `NativeScene::boxed` for why multi-scene oracles box.
+    fn boxed_cgroup_retained_history_scene() -> (Box<NativeScene>, CallerId) {
+        let (native, caller) = cgroup_retained_history_scene();
+        (Box::new(native), caller)
+    }
+
+    #[test]
+    fn cgroup_reconcile_empty_scope_never_admits_outside_exec_successor() {
+        let (mut native, caller) = cgroup_retained_history_scene();
+        native.scene.source.exec(7, 200, "/bin/outside");
+        native.scene.coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            "scoped collection has no positive member transaction",
+            2_000,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_cgroup_old_history_only(&native, caller);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .lifecycle,
+            crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+        );
+    }
+
+    #[test]
+    fn cgroup_reconcile_partial_scope_never_admits_unknown_reused_successor() {
+        let (mut native, caller) = cgroup_retained_history_scene();
+        native.scene.source.spawn(7, 700);
+        native.scene.source.blind(7);
+        native.scene.coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            "scoped membership sampling was interrupted",
+            2_000,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_cgroup_old_history_only(&native, caller);
+    }
+
+    #[test]
+    fn cgroup_exec_transition_never_admits_successor_without_current_scope_transaction() {
+        let (mut native, caller) = cgroup_retained_history_scene();
+        let later = native.row(41, 2, 7, 200, 1);
+        native.witness(vec![later]);
+        assert_cgroup_old_history_only(&native, caller);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .lifecycle,
+            crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+        );
+    }
+
+    fn cgroup_os_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+    ) {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("cgroup.procs"),
+            format!("{}\n", child.id()),
+        )
+        .unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(fixture.path()).unwrap(),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            crate::discovery::caller_registry::OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        (fixture, child, coordinator)
+    }
+
+    /// Heap-built OS scene (H6 slice 2 oracles): see
+    /// `NativeScene::boxed` for why multi-scene oracles box.
+    fn boxed_cgroup_os_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        Box<InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>>,
+    ) {
+        let (fixture, child, coordinator) = cgroup_os_scene();
+        (fixture, child, Box::new(coordinator))
+    }
+
+    /// One witness read, both horizons, on an OS coordinator: the
+    /// scripted native proof channel (H6 slice 2 oracles).
+    fn stage_os_rows(
+        coordinator: &mut InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+        identity: &mut OneTicket,
+        stamps: &Stamps,
+        domain: NativeDomainId,
+        rows: Vec<WitnessRow>,
+        now_ns: u64,
+    ) -> Vec<CallerEvent> {
+        let mut events = Vec::new();
+        for batch in [
+            stamps.read(domain, rows),
+            stamps.drain(domain),
+            stamps.read(domain, Vec::new()),
+        ] {
+            events.extend(
+                coordinator
+                    .stage_native(batch, &mut *identity, now_ns)
+                    .events,
+            );
+        }
+        events
+    }
+
+    /// Mint one held exec handoff on an OS coordinator through the
+    /// scripted native proof channel: a pre-admission row, then the
+    /// proving row that retires the caller and holds its custody (H6
+    /// slice 2 oracles). The handoff mechanics themselves are proven
+    /// with a real exec by the core recovery leg; these legs compose
+    /// the held handoff with scope-boundary transactions.
+    fn mint_os_handoff(
+        coordinator: &mut InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+        caller: CallerId,
+        pid: u32,
+        leg: &str,
+    ) {
+        let domain = NativeDomainId::mint();
+        let mut identity = OneTicket { domain, ticket: 41 };
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let seen = coordinator.adapter.record(caller).unwrap().first_seen_ns;
+        let stamps = Stamps::from(seen);
+        let object = AttachObjectId::scripted(0);
+        assert!(
+            stage_os_rows(
+                &mut *coordinator,
+                &mut identity,
+                &stamps,
+                domain,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    1,
+                    object,
+                    EndpointId(0),
+                    pid,
+                    seen + 100
+                )],
+                seen + 10,
+            )
+            .is_empty(),
+            "{leg}: the pre-admission row retires nothing"
+        );
+        let events = stage_os_rows(
+            &mut *coordinator,
+            &mut identity,
+            &stamps,
+            domain,
+            vec![WitnessRow::scripted(
+                domain,
+                41,
+                2,
+                object,
+                EndpointId(1),
+                pid,
+                seen + 200,
+            )],
+            seen + 10,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [CallerEvent::Retired { id, .. }] if *id == caller
+            ),
+            "{leg}: the proving row retires the old image: {events:?}"
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert!(
+            coordinator.pending_successors.contains_key(&caller),
+            "{leg}: the native proof holds its handoff"
+        );
+        assert_eq!(coordinator.adapter.live_id(pid), None, "{leg}");
+    }
+
+    /// One cgroup transaction end to end: collect, apply, commit, take
+    /// the completion (H6 slice 2 oracles).
+    fn cgroup_pass(
+        coordinator: &mut InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        now_ns: u64,
+    ) -> CgroupCompletion {
+        let collection = coordinator
+            .cgroup_collector(state, limits, CollectionControl::new(None), None)
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, now_ns)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        coordinator.take_cgroup_completion().unwrap()
+    }
+
+    pub(crate) fn cgroup_provider_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        InventoryCoordinator<OsProcessSource>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let child = spawn_cgroup_provider_child(dir.path(), &provider, "ready");
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(dir.path()).unwrap(),
+            HookRegistry::builtin(),
+            vec![provider],
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        (dir, child, coordinator)
+    }
+
+    fn spawn_cgroup_provider_child(
+        dir: &std::path::Path,
+        provider: &std::path::Path,
+        ready_name: &str,
+    ) -> crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let ready = dir.join(ready_name);
+        OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new(dir.join("scoped-driver"))
+                .arg("--ready")
+                .arg(&ready)
+                .arg("--call")
+                .arg(provider)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |pid| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned provider child did not finish startup"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // SAFETY: pid names the child retained by spawn_stopped.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            },
+        )
+    }
+
+    #[test]
+    fn scoped_driver_child_inherits_no_observer_fds() {
+        // Anti-wedge regression: a SIGSTOPped fixture orphaned by an
+        // aborted run must hold no observer fd — notably the
+        // cargo-lane lock, which flock(1) holds without CLOEXEC by
+        // design and which an inheriting orphan wedges via the shared
+        // open file description. The twin holds two marker fds with
+        // CLOEXEC cleared (mimicking the lock fd) across the real
+        // spawn, then asserts the stopped child's table carries
+        // neither file. Fails pre-fix with both markers inherited.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let held_a = std::fs::File::open(&provider).unwrap();
+        let held_b = std::fs::File::open(dir.path().join("scoped-driver")).unwrap();
+        let mut markers = Vec::new();
+        for held in [&held_a, &held_b] {
+            let fd = held.as_raw_fd();
+            assert!(fd >= 3, "markers stand past stdio");
+            // SAFETY: fd names our own open marker; clearing CLOEXEC
+            // mimics flock(1)'s lock fd across exec.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+            markers.push(std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap());
+        }
+        let ready = dir.path().join("ready");
+        let child = crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new(dir.path().join("scoped-driver"))
+                .arg("--ready")
+                .arg(&ready)
+                .arg("--call")
+                .arg(&provider)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |pid| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned provider child did not finish startup"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // SAFETY: pid names the child retained by spawn_stopped.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            },
+        );
+        // A stopped child still answers /proc: compare file targets,
+        // never bare numbers (the child's own fds may reuse them).
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap() {
+            let target = std::fs::read_link(entry.unwrap().path()).unwrap();
+            if markers.contains(&target) {
+                leaked.push(target);
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "the fixture inherits no observer fds, leaked: {leaked:?}"
+        );
+    }
+
+    /// (marker_min, lowered_soft) for the lowered-limit twins: a high
+    /// marker placed above the lowered soft limit, derived from the
+    /// current limit so the twins run wherever the suite runs (the
+    /// typical soft limit is 1024, giving marker 512 under limit 256).
+    fn lowered_limit_pair() -> (libc::c_int, libc::rlim_t) {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the owned struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+            0
+        );
+        assert!(
+            current.rlim_cur >= 48,
+            "the suite needs headroom above a lowered fd limit"
+        );
+        let marker = current.rlim_cur.saturating_sub(8).min(512) as libc::c_int;
+        (marker, marker as libc::rlim_t / 2)
+    }
+
+    /// Duplicates `file` onto a descriptor at or above `min_fd` with
+    /// CLOEXEC cleared (mimicking flock(1)'s lock fd). Must run
+    /// BEFORE the soft limit drops: new fds cannot be created above
+    /// it, while existing ones survive the lowering — the gap under
+    /// test.
+    fn dup_high_marker(file: &std::fs::File, min_fd: libc::c_int) -> std::os::fd::OwnedFd {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: fcntl names our own open marker and returns a fresh
+        // owned fd, which FromRawFd then owns exactly once.
+        let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, min_fd) };
+        assert!(
+            high >= min_fd,
+            "the marker must sit above the lowered soft limit"
+        );
+        assert_eq!(unsafe { libc::fcntl(high, libc::F_SETFD, 0) }, 0);
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(high) }
+    }
+
+    /// Guards a temporarily lowered soft RLIMIT_NOFILE, restoring the
+    /// saved limit on demand and on drop (the drop path never panics,
+    /// so a failing twin cannot abort the harness during unwinding).
+    struct LoweredFdLimit {
+        saved: libc::rlimit,
+        restored: bool,
+        // Held for the whole lowered window: the soft limit is
+        // process-global, so two twins lowering at once corrupt each
+        // other's window (and every sibling's fd opens). The guard
+        // serializes all lowerings suite-wide.
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static LOWERED_FD_LIMIT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl LoweredFdLimit {
+        fn lower_to(soft: libc::rlim_t) -> Self {
+            // A poisoned mutex still yields its guard: a failed twin
+            // must not wedge the rest of the suite.
+            let serial = LOWERED_FD_LIMIT_SERIAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut saved = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit/setrlimit only read and write the
+            // owned structs; the soft limit is lowered, never raised
+            // past the retained hard limit.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                0
+            );
+            assert!(
+                saved.rlim_cur > soft,
+                "the lowered limit must sit below the current one"
+            );
+            let lowered = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: saved.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+            Self {
+                saved,
+                restored: false,
+                _serial: serial,
+            }
+        }
+
+        fn restore(&mut self) {
+            if !self.restored {
+                // SAFETY: the saved limit was read from this process
+                // and only ever lowers-then-restores the soft ceiling.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
+                    0
+                );
+                self.restored = true;
+            }
+        }
+    }
+
+    impl Drop for LoweredFdLimit {
+        fn drop(&mut self) {
+            if !self.restored {
+                // SAFETY: as in restore; errors are ignored so a
+                // panic cannot turn into an abort here.
+                let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+                self.restored = true;
+            }
+        }
+    }
+
+    #[test]
+    fn rust_spawn_scrubs_fds_above_lowered_limit() {
+        // Lowered-limit twin for the Rust pre-exec scrub: a marker fd
+        // opened BEFORE the soft limit drops survives the lowering,
+        // and an rlimit-bounded sweep then misses it. The shell
+        // fixture performs no scrub of its own, so only
+        // OwnedStoppedChild::harden_spawn stands between the marker
+        // and the child. Fails pre-fix with the marker inherited.
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("high-marker");
+        std::fs::write(&probe, b"marker").unwrap();
+        let held = std::fs::File::open(&probe).unwrap();
+        let (marker_min, lowered) = lowered_limit_pair();
+        let high = dup_high_marker(&held, marker_min);
+        let target = std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).unwrap();
+        let mut limit = LoweredFdLimit::lower_to(lowered);
+        // The child's table is fixed at spawn, so the suite's limit
+        // is restored inside the handshake: concurrent tests never
+        // observe the lowered ceiling.
+        let child = OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "kill -STOP $$; exit 99"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |_pid| limit.restore(),
+        );
+        drop(limit);
+        // A stopped child still answers /proc: compare file targets,
+        // never bare numbers (the child's own fds may reuse them).
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap() {
+            if std::fs::read_link(entry.unwrap().path()).unwrap() == target {
+                leaked.push(target.clone());
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "high marker fd leaked past the Rust scrub: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_driver_scrubs_fds_above_lowered_limit() {
+        // Lowered-limit twin for the C startup scrub: the driver is
+        // spawned WITHOUT the Rust hardening, so only its own live
+        // table sweep stands between the high marker and the fixture.
+        // Fails pre-fix with the marker inherited.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, driver) = build_scoped_pair(dir.path());
+        let probe = dir.path().join("high-marker");
+        std::fs::write(&probe, b"marker").unwrap();
+        let held = std::fs::File::open(&probe).unwrap();
+        let (marker_min, lowered) = lowered_limit_pair();
+        let high = dup_high_marker(&held, marker_min);
+        let target = std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).unwrap();
+        let ready = dir.path().join("ready");
+        let mut limit = LoweredFdLimit::lower_to(lowered);
+        // The driver inherits the lowered limit at fork; restoring
+        // the suite's limit right after spawn cannot reopen what its
+        // startup sweep already decided.
+        let child = std::process::Command::new(&driver)
+            .arg("--ready")
+            .arg(&ready)
+            .arg("--call")
+            .arg(&provider)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        limit.restore();
+        let child = ChildReaper(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unhardened driver did not finish startup"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The ready file appears at fopen, so the running driver may
+        // still be closing it while its table is listed: an fd gone
+        // before readlink is not the inherited marker.
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", child.0.id())).unwrap() {
+            match std::fs::read_link(entry.unwrap().path()) {
+                Ok(found) if found == target => leaked.push(target.clone()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot read the driver's fd table: {error}"),
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "high marker fd leaked past the C scrub: {leaked:?}"
+        );
+    }
+
+    /// Builds the scoped provider/driver pair for the orphan-policy twins.
+    fn build_scoped_pair(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir,
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        let driver = gcc(
+            dir,
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        (provider, driver)
+    }
+
+    /// Builds the isolated orphan reaper for the orphan-policy twins.
+    fn build_orphan_reaper(dir: &std::path::Path) -> PathBuf {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        gcc(
+            dir,
+            "orphan-reaper",
+            &manifest.join("tests/fixtures/orphan-reaper.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &[],
+        )
+    }
+
+    /// Choreographed abortable observer: records its own pid, spawns
+    /// the driver, records the driver pid, waits for readiness,
+    /// optionally SIGSTOPs it, stages the sync file, then waits for
+    /// the twin's release before exiting.
+    /// Positional args: driver ready provider pidfile sync go log
+    /// owned(1/0) dostop(1/0) shellpid. Owned drivers get
+    /// `--die-with-parent $$` so the shell is their expected owner. The
+    /// bounded waits and the short driver sleep keep a failed twin from
+    /// leaking sleepers.
+    const ORPHAN_CHOREOGRAPHY: &str = r#"
+DRIVER=$1; READY=$2; PROVIDER=$3; PIDFILE=$4; SYNC=$5; GO=$6; LOG=$7; OWNED=$8; DOSTOP=$9; SHELLPID=${10}
+echo $$ > "$SHELLPID"
+if [ "$OWNED" = 1 ]; then
+  "$DRIVER" --die-with-parent $$ --sleep 60 --ready "$READY" --call "$PROVIDER" </dev/null >"$LOG" 2>&1 &
+else
+  "$DRIVER" --sleep 60 --ready "$READY" --call "$PROVIDER" </dev/null >"$LOG" 2>&1 &
+fi
+DPID=$!
+echo "$DPID" > "$PIDFILE"
+i=0
+while [ ! -f "$READY" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 100 ]; then echo "driver never ready" >&2; exit 3; fi
+  sleep 0.1
+done
+if [ "$DOSTOP" = 1 ]; then kill -STOP "$DPID"; fi
+touch "$SYNC"
+i=0
+while [ ! -f "$GO" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 600 ]; then echo "twin never released the observer" >&2; exit 4; fi
+  sleep 0.05
+done
+exit 0
+"#;
+
+    /// Single-letter state from /proc/<pid>/status; None once reaped.
+    /// Unlike kill(pid, 0) — which answers for zombies — this tells a
+    /// lingering zombie (Z) apart from survival (R/S/T) and death.
+    fn proc_state(pid: u32) -> Option<char> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("State:") {
+                return rest.split_whitespace().next()?.chars().next();
+            }
+        }
+        None
+    }
+
+    /// Parent pid from /proc/<pid>/stat; None once reaped.
+    fn proc_ppid(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    /// A choreographed observer run under the isolated helper reaper:
+    /// the reaper (the twin's direct child) adopts and reaps the
+    /// orphaned driver, so disappearance never depends on PID 1 or an
+    /// unrelated subreaper.
+    struct OrphanTwin {
+        reaper: ChildReaper,
+        pidfile: PathBuf,
+        sync: PathBuf,
+        go: PathBuf,
+        log: PathBuf,
+        shell: PathBuf,
+        reaped: PathBuf,
+        reaper_log: PathBuf,
+    }
+
+    /// Spawns the choreographed observer under the helper reaper.
+    fn spawn_orphan_observer(
+        dir: &std::path::Path,
+        reaper: &std::path::Path,
+        driver: &std::path::Path,
+        provider: &std::path::Path,
+        owned: &str,
+        dostop: &str,
+    ) -> OrphanTwin {
+        let ready = dir.join("ready");
+        let pidfile = dir.join("driver.pid");
+        let sync = dir.join("sync");
+        let go = dir.join("go");
+        let log = dir.join("driver.log");
+        let shell = dir.join("shell.pid");
+        let reaped = dir.join("reaped");
+        let reaper_log = dir.join("reaper.log");
+        let reaper_stderr = std::fs::File::create(&reaper_log).unwrap();
+        let child = std::process::Command::new(reaper)
+            .arg(&pidfile)
+            .arg(&reaped)
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(ORPHAN_CHOREOGRAPHY)
+            .arg("orphan-observer")
+            .arg(driver)
+            .arg(&ready)
+            .arg(provider)
+            .arg(&pidfile)
+            .arg(&sync)
+            .arg(&go)
+            .arg(&log)
+            .arg(owned)
+            .arg(dostop)
+            .arg(&shell)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(reaper_stderr))
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        OrphanTwin {
+            reaper: ChildReaper(child),
+            pidfile,
+            sync,
+            go,
+            log,
+            shell,
+            reaped,
+            reaper_log,
+        }
+    }
+
+    #[test]
+    fn scoped_driver_dies_with_aborted_observer() {
+        // Anti-orphan regression: an EXPLICITLY-OWNED fixture dies with
+        // its observer even while SIGSTOPped, instead of lingering
+        // stopped on shared coordination. The twin orphans a real
+        // driver through a choreographed shell under the isolated
+        // helper reaper: the shell waits for driver readiness,
+        // SIGSTOPs the driver, then waits for the twin's release. The
+        // twin first proves the fixture is LIVE and STOPPED (state T —
+        // the startup orphan guard only runs before readiness, so a
+        // stopped driver proves the guard passed and the stop landed),
+        // releases the shell, and asserts the helper reaped the pid —
+        // reading /proc state so a lingering zombie cannot masquerade
+        // as survival. Fails pre-fix with the orphan still stopped.
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, driver) = build_scoped_pair(dir.path());
+        let reaper = build_orphan_reaper(dir.path());
+        let mut twin = spawn_orphan_observer(dir.path(), &reaper, &driver, &provider, "1", "1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !twin.sync.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer never staged the stopped fixture: {}",
+                std::fs::read_to_string(&twin.log).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid: u32 = std::fs::read_to_string(&twin.pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Live AND stopped: SIGSTOP delivery is async, so poll for T.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = proc_state(pid);
+            if state == Some('T') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned fixture never reached stopped state: pid {pid} state {state:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // SAFETY: kill(pid, 0) only probes existence; T proves liveness.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+        std::fs::write(&twin.go, b"go").unwrap();
+        let status = twin.reaper.0.wait().unwrap();
+        assert!(
+            status.success(),
+            "helper reaper reaps the orphaned owned fixture: {}",
+            std::fs::read_to_string(&twin.reaper_log).unwrap_or_default()
+        );
+        // The report proves THIS helper did the reaping — not PID 1 or
+        // an unrelated subreaper — and that the death signal (not an
+        // exit) killed the stopped fixture.
+        let report = std::fs::read_to_string(&twin.reaped).unwrap();
+        assert_eq!(
+            report,
+            format!("REAPED {pid} signal=9\n"),
+            "the helper reaped the signal-killed fixture"
+        );
+        // Reaped, not merely dead: poll /proc disappearance, reporting
+        // the last state so survival (T/R/S) and unreaped death (Z)
+        // stay distinguishable.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match proc_state(pid) {
+                None => return,
+                Some(state) => {
+                    if std::time::Instant::now() >= deadline {
+                        // SAFETY: pid names only the twin's orphaned driver.
+                        unsafe {
+                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                        panic!(
+                            "orphaned owned fixture not reaped 5s after its observer died: pid {pid} state {state}"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_parent_death_kills_owned_fixture_without_c_flag() {
+        // Rust-path parent-death twin: the driver runs WITHOUT
+        // --die-with-parent, so only the PR_SET_PDEATHSIG armed by
+        // OwnedStoppedChild::harden_spawn (which survives exec) can
+        // kill it; the C path cannot mask a removed Rust
+        // registration. A helper thread performs the hardened spawn
+        // and the SIGSTOP handshake, proves the fixture live and
+        // stopped, then exits: the death signal fires for the dead
+        // spawner thread even though the test process lives on
+        // (spawn() returns only after exec, so the registration runs
+        // strictly before the thread can exit — no arm-vs-exit race).
+        // The twin then observes the zombie (Z) — a state only death
+        // produces — before reaping through the retained handle.
+        // Fails if the Rust registration is removed: the orphan stays
+        // stopped.
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, driver) = build_scoped_pair(dir.path());
+        let ready = dir.path().join("ready");
+        let helper = std::thread::spawn(move || {
+            let child = OwnedStoppedChild::spawn_stopped(
+                std::process::Command::new(&driver)
+                    .arg("--ready")
+                    .arg(&ready)
+                    .arg("--call")
+                    .arg(&provider)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+                |pid| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !ready.exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "rust-owned driver did not finish startup"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // SAFETY: pid names the child retained by spawn_stopped.
+                    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+                },
+            );
+            // Live AND stopped before the thread exits: SIGSTOP
+            // delivery is async, so poll for T.
+            let pid = child.id();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if proc_state(pid) == Some('T') {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rust-owned fixture never reached stopped state: pid {pid}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // The thread exits with the live stopped child retained:
+            // the death signal fires for the dead spawner thread.
+            child
+        });
+        let child = helper
+            .join()
+            .expect("helper thread completes the hardened spawn");
+        let pid = child.id();
+        // Dead, not surviving: poll for the zombie the retained
+        // handle has not reaped yet, so death stays distinguishable
+        // from a lingering stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match proc_state(pid) {
+                Some('Z') => break,
+                state => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "rust-owned fixture survived its spawner thread: pid {pid} state {state:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        drop(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if proc_state(pid).is_none() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rust-owned fixture not reaped after death: pid {pid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn ground_truth_fixture_survives_observer_exit() {
+        // Scoped-policy twin: a fixture WITHOUT --die-with-parent must
+        // outlive its observer, so post-observer /proc verification keeps
+        // working (the identity sweeps read holders' live mappings AFTER
+        // the observer exits). Same choreography as the owned twin, but
+        // unowned and unstopped: after the shell exits, the twin proves
+        // the driver was orphaned (adopted by the helper reaper), is
+        // alive, and still serves mapping ground truth — then the
+        // helper reaps it after the twin's SIGKILL. Fails if
+        // parent-death handling ever goes unconditional.
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, driver) = build_scoped_pair(dir.path());
+        let reaper = build_orphan_reaper(dir.path());
+        let mut twin = spawn_orphan_observer(dir.path(), &reaper, &driver, &provider, "0", "0");
+        let helper = twin.reaper.0.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !twin.sync.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer never staged the fixture: {}",
+                std::fs::read_to_string(&twin.log).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid: u32 = std::fs::read_to_string(&twin.pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: kill(pid, 0) only probes existence.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+        std::fs::write(&twin.go, b"go").unwrap();
+        // The shell exits on release while the helper reaper stays
+        // alive waiting for the driver: wait for the shell pid itself
+        // to vanish (the reaper waitpids it promptly).
+        let shell: u32 = std::fs::read_to_string(&twin.shell)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if proc_state(shell).is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer shell never exited after release: {}",
+                std::fs::read_to_string(&twin.log).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // A death signal would land in milliseconds; two seconds of
+        // survival proves the policy stayed scoped.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let state = proc_state(pid);
+        assert!(
+            matches!(state, Some('R' | 'S')),
+            "ground-truth fixture survives its observer: pid {pid} state {state:?}"
+        );
+        let ppid = proc_ppid(pid);
+        assert_eq!(
+            ppid,
+            Some(helper),
+            "fixture adopted by the helper reaper after observer exit: ppid {ppid:?} helper {helper}"
+        );
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        assert!(
+            maps.contains("scoped-provider.so"),
+            "live mappings stay readable for ground truth"
+        );
+        // SAFETY: pid names only the twin's driver.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let status = twin.reaper.0.wait().unwrap();
+        assert!(
+            status.success(),
+            "helper reaper reaps the ground-truth fixture: {}",
+            std::fs::read_to_string(&twin.reaper_log).unwrap_or_default()
+        );
+        let report = std::fs::read_to_string(&twin.reaped).unwrap();
+        assert_eq!(
+            report,
+            format!("REAPED {pid} signal=9\n"),
+            "the helper reaped the signal-killed fixture"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if proc_state(pid).is_none() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ground-truth fixture not reaped after SIGKILL: pid {pid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn owned_spawn_reports_exec_failure() {
+        // The selective scrub preserves Rust's spawn-error channel: an
+        // exec failure must surface as spawn() Err carrying the real
+        // errno, not as a bogus Ok child. Fails pre-fix (indiscriminate
+        // close) with Ok for a dead pid.
+        let mut command = std::process::Command::new("/nonexistent/p11scope-fixture-probe");
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::harden_spawn(
+            &mut command,
+        );
+        let err = command
+            .spawn()
+            .expect_err("exec failure must surface, not a bogus Ok child");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the real errno crosses the channel: {err}"
+        );
+    }
+
+    struct ReturningLivenessSource {
+        control: CollectionControl,
+        armed: std::rc::Rc<std::cell::Cell<bool>>,
+        returned: std::rc::Rc<std::cell::Cell<usize>>,
+        successful: std::rc::Rc<std::cell::Cell<usize>>,
+        stop_on_return: bool,
+        proc_fallback: bool,
+        signal_on_return: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    }
+
+    impl crate::discovery::caller_registry::ProcessSource for ReturningLivenessSource {
+        type Pin = crate::process::PidPin;
+
+        fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+            OsProcessSource.open(pid)
+        }
+        fn still_the_same(&self, pin: &Self::Pin) -> bool {
+            // The fallback branch performs the same actual /proc start-time
+            // operation as PidPin's documented fallback, without changing the
+            // ordinary source or forcing the host's pidfd capability off.
+            let same = if self.proc_fallback {
+                crate::process::process_start_time(pin.pid()).ok() == pin.start_time()
+            } else {
+                OsProcessSource.still_the_same(pin)
+            };
+            if self.armed.get() {
+                self.returned.set(self.returned.get() + 1);
+                if same {
+                    self.successful.set(self.successful.get() + 1);
+                }
+                if self.stop_on_return {
+                    if let Some(signals) = &self.signal_on_return {
+                        signals.store(1, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        self.control.cancel();
+                    }
+                }
+            }
+            same
+        }
+        fn start_time(&self, pid: u32) -> Option<u64> {
+            OsProcessSource.start_time(pid)
+        }
+        fn exe_identity(&self, pid: u32) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+            OsProcessSource.exe_identity(pid)
+        }
+        fn gone(&self, pid: u32) -> bool {
+            OsProcessSource.gone(pid)
+        }
+    }
+
+    fn cgroup_returning_liveness_control(
+        stop_on_return: bool,
+        proc_fallback: bool,
+        original_signal_source: bool,
+    ) {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (fixture, child, old_coordinator) = cgroup_provider_scene();
+        drop(old_coordinator);
+        let signal_flag = original_signal_source
+            .then(crate::inventory_dashboard::StopFlag::test_without_handlers);
+        let signals = signal_flag.as_ref().map(|flag| flag.signal_source());
+        let control = signals.as_ref().map_or_else(
+            || CollectionControl::new(None),
+            |source| CollectionControl::new(None).with_operator_stop_source(Arc::clone(source)),
+        );
+        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let returned = std::rc::Rc::new(std::cell::Cell::new(0));
+        let successful = std::rc::Rc::new(std::cell::Cell::new(0));
+        let source = ReturningLivenessSource {
+            control: control.clone(),
+            armed: armed.clone(),
+            returned: returned.clone(),
+            successful: successful.clone(),
+            stop_on_return,
+            proc_fallback,
+            signal_on_return: signals,
+        };
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(fixture.path()).unwrap(),
+            HookRegistry::builtin(),
+            vec![fixture.path().join("scoped-provider.so")],
+            vec![],
+            source,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control,
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check()),
+            "the real provider child supplies attributable facts before preparation"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        provider_read_test::observe(
+            move || armed.set(true), // after actual provider retention, before final sampling
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert_eq!(
+            returned.get(),
+            1,
+            "exactly the final source liveness operation returned"
+        );
+        assert_eq!(
+            successful.get(),
+            1,
+            "the retained child remained the same generation"
+        );
+        if let Some(flag) = &signal_flag {
+            assert_eq!(flag.signal_count(), usize::from(stop_on_return));
+        }
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        if stop_on_return {
+            assert_eq!(
+                completion.admitted, 0,
+                "stop during returning liveness must precede ID mint"
+            );
+            assert_eq!(coordinator.adapter.live_id(child.id()), None);
+            assert_eq!(coordinator.adapter.records().count(), 0);
+            assert_eq!(coordinator.attach_set.len(), 0);
+            assert_eq!(coordinator.registry.caller_count(), 0);
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+                )
+            );
+        } else {
+            assert_eq!(completion.admitted, 1);
+            assert!(coordinator.adapter.live_id(child.id()).is_some());
+            assert!(coordinator.attach_set.len() > 0);
+            assert!(coordinator.registry.edges().next().is_some());
+        }
+    }
+
+    #[test]
+    fn cgroup_returning_liveness_stop_prevents_caller_mint() {
+        cgroup_returning_liveness_control(true, false, false);
+    }
+
+    #[test]
+    fn cgroup_returning_liveness_proc_fallback_stop_prevents_caller_mint() {
+        cgroup_returning_liveness_control(true, true, false);
+    }
+
+    #[test]
+    fn cgroup_returning_liveness_healthy_child_keeps_admission() {
+        cgroup_returning_liveness_control(false, false, false);
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_after_returning_liveness_prevents_mint() {
+        cgroup_returning_liveness_control(true, false, true);
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_liveness_healthy_keeps_admission() {
+        cgroup_returning_liveness_control(false, false, true);
+    }
+
+    fn cgroup_original_signal_retention_control(stop_on_return: bool) {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let flag = crate::inventory_dashboard::StopFlag::test_without_handlers();
+        let original_source = flag.signal_source();
+        let control =
+            CollectionControl::new(None).with_operator_stop_source(Arc::clone(&original_source));
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control,
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check()),
+            "real provider child has attributable facts"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let returned = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = returned.clone();
+        provider_read_test::observe(
+            move || {
+                count.set(count.get() + 1);
+                if stop_on_return {
+                    original_source.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            returned.get() > 0,
+            "actual held provider metadata read returned"
+        );
+        assert_eq!(flag.signal_count(), usize::from(stop_on_return));
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        if stop_on_return {
+            assert_eq!(
+                completion.admitted, 0,
+                "original signal during final preparation must stop ID mint"
+            );
+            assert_eq!(coordinator.adapter.live_id(child.id()), None);
+            assert_eq!(coordinator.attach_set.len(), 0);
+            assert_eq!(coordinator.registry.caller_count(), 0);
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+                )
+            );
+        } else {
+            assert_eq!(completion.admitted, 1);
+            assert!(coordinator.attach_set.len() > 0);
+            assert!(coordinator.registry.edges().next().is_some());
+        }
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_after_returning_provider_prevents_mint() {
+        cgroup_original_signal_retention_control(true);
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_provider_healthy_keeps_admission() {
+        cgroup_original_signal_retention_control(false);
+    }
+
+    #[test]
+    fn cgroup_review_provider_transaction_admits_after_retention_and_final_sample() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check()),
+            "a real provider scan produced attributable facts for the held child"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || read_counter.set(read_counter.get() + 1),
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "real provider retention metadata reads ran"
+        );
+        assert!(
+            coordinator.attach_set.len() > 0,
+            "provider endpoints actually admitted"
+        );
+        assert!(coordinator.registry.edges().count() > 0);
+        assert_eq!(coordinator.take_cgroup_completion().unwrap().admitted, 1);
+    }
+
+    #[test]
+    fn cgroup_review_movement_during_retention_prevents_admission_and_targets() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (fixture, child, mut coordinator) = cgroup_provider_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let membership = fixture.path().join("cgroup.procs");
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || {
+                read_counter.set(read_counter.get() + 1);
+                std::fs::write(&membership, b"").unwrap();
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "movement occurred after actual provider retention read"
+        );
+        assert_eq!(
+            coordinator.adapter.len(),
+            0,
+            "the final sample must enclose provider reads"
+        );
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+        assert!(coordinator.take_target_delta().is_empty());
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_review_mixed_retention_move_keeps_the_other_valid_member() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (fixture, moved, mut coordinator) = cgroup_provider_scene();
+        let provider = &coordinator.engine.module_hints[0];
+        let kept = spawn_cgroup_provider_child(fixture.path(), provider, "ready-second");
+        let membership = fixture.path().join("cgroup.procs");
+        std::fs::write(&membership, format!("{}\n{}\n", moved.id(), kept.id())).unwrap();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(moved.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        assert!(
+            collection
+                .preparation(kept.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let retained_member = format!("{}\n", kept.id());
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || {
+                read_counter.set(read_counter.get() + 1);
+                std::fs::write(&membership, &retained_member).unwrap();
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "movement occurred at actual retention metadata read"
+        );
+        assert_eq!(
+            coordinator.adapter.live_id(moved.id()),
+            None,
+            "the member removed before the final sample is withheld"
+        );
+        let kept_id = coordinator
+            .adapter
+            .live_id(kept.id())
+            .expect("valid member remains useful");
+        assert_eq!(coordinator.adapter.len(), 1);
+        assert!(coordinator.attach_set.len() > 0);
+        assert!(
+            coordinator
+                .registry
+                .edges()
+                .any(|edge| edge.caller == kept_id)
+        );
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.admitted, 1);
+        assert_ne!(completion.outcome, ScopedCollectionOutcome::Complete);
+    }
+
+    #[test]
+    fn cgroup_review_stop_during_retention_prevents_admission_and_targets() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let control = CollectionControl::new(None);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || {
+                read_counter.set(read_counter.get() + 1);
+                control.cancel();
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "stop was requested after actual provider retention read"
+        );
+        assert_eq!(
+            coordinator.adapter.len(),
+            0,
+            "stop cannot authorize a caller before provider reads end"
+        );
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+        assert!(coordinator.take_target_delta().is_empty());
+        assert_eq!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+    }
+
+    #[test]
+    fn cgroup_tiny_remaining_budget_stops_before_provider_preparation() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let limits = CgroupWalkLimits::default();
+        let maximum = limits.work_units;
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                limits,
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(collection.preparation(child.id()).is_some());
+        let remaining = maximum - collection.used_work();
+        assert!(remaining > 1);
+        assert!(collection.work().charge(remaining - 1));
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = reads.clone();
+        provider_read_test::observe(
+            move || counter.set(counter.get() + 1),
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert_eq!(
+            reads.get(),
+            0,
+            "no next provider identity read after allowance exhaustion"
+        );
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_exhausted_exec_fence_never_wraps_or_reads_provider_inputs() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let old = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(old.preparation(child.id()).is_some());
+        coordinator.cgroup_fence.exhaust();
+        coordinator.cgroup_fence.invalidate();
+        let stale_work = old.work();
+        assert!(!stale_work.charge(0));
+        coordinator.apply_cgroup_collection(old, 1_000).unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = reads.clone();
+        provider_read_test::observe(
+            move || counter.set(counter.get() + 1),
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        let stale = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            stale.outcome,
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::GenerationChanged
+            )
+        );
+        assert_eq!(reads.get(), 0);
+        assert_eq!(coordinator.adapter.len(), 0);
+        let fresh = coordinator
+            .cgroup_collector(
+                stale.state,
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(fresh.member_pids().count(), 0);
+        coordinator.apply_cgroup_collection(fresh, 2_000).unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_admission_waits_for_true_commit_and_releases_original_after_publish() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let pid = child.id();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        let original = collection
+            .original_weak(pid)
+            .expect("fresh begin retained the original child");
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        assert_eq!(
+            coordinator.adapter.len(),
+            0,
+            "preparation cannot mint an ID"
+        );
+        assert!(
+            original.upgrade().is_some(),
+            "pending state retains original custody"
+        );
+        assert!(coordinator.take_cgroup_completion().is_none());
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.admitted, 1);
+        let id = coordinator
+            .adapter
+            .live_id(pid)
+            .expect("both fresh samples authorize the held generation");
+        assert_eq!(completion.events, vec![CallerEvent::Admitted { id }]);
+        assert!(
+            original.upgrade().is_none(),
+            "custody drops only after actual publication"
+        );
+        assert_eq!(
+            coordinator.adapter.record(id).unwrap().authority,
+            ImageAuthority::ScanPinned
+        );
+    }
+
+    #[test]
+    fn cgroup_final_sample_occurs_after_apply_and_prevents_moved_member_admission() {
+        let (fixture, child, mut coordinator) = cgroup_os_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(
+            collection.member_pids().collect::<Vec<_>>(),
+            vec![child.id()]
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        std::fs::write(fixture.path().join("cgroup.procs"), b"").unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+        assert!(coordinator.take_target_delta().endpoints.is_empty());
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.admitted, 0);
+        assert_ne!(completion.outcome, ScopedCollectionOutcome::Complete);
+    }
+
+    #[test]
+    fn cgroup_stop_after_apply_never_admits_or_publishes_complete_scope_receipt() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let control = CollectionControl::new(None);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        let original = collection.original_weak(child.id()).unwrap();
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        control.cancel();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert!(original.upgrade().is_none());
+        assert_eq!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+    }
+
+    #[test]
+    fn cgroup_generation_exit_after_preparation_never_mints_a_caller() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(
+            collection.member_pids().collect::<Vec<_>>(),
+            vec![child.id()]
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        drop(child); // RAII kills and reaps only the owned process.
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_same_image_reentry_keeps_the_original_caller_id() {
+        let (fixture, child, mut coordinator) = cgroup_os_scene();
+        let pid = child.id();
+        let mut state = CgroupWalkState::default();
+        let mut admitted = None;
+        for (pass, members) in [format!("{pid}\n"), String::new(), format!("{pid}\n")]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(fixture.path().join("cgroup.procs"), members).unwrap();
+            let collection = coordinator
+                .cgroup_collector(
+                    state,
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, 1_000 + pass as u64)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            state = completion.state;
+            let current = coordinator.adapter.live_id(pid).unwrap();
+            if pass == 0 {
+                admitted = Some(current);
+                assert_eq!(completion.admitted, 1);
+            } else {
+                assert_eq!(Some(current), admitted);
+                assert_eq!(completion.admitted, 0);
+            }
+            assert!(
+                !coordinator.adapter.record(current).unwrap().retired,
+                "mere scope movement does not prove exit"
+            );
+        }
+        assert_eq!(coordinator.adapter.len(), 1);
+    }
+
+    #[test]
+    fn cgroup_partial_candidate_passes_eventually_admit_a_later_member() {
+        let (fixture, child, mut coordinator) = cgroup_os_scene();
+        let pid = child.id();
+        std::fs::write(
+            fixture.path().join("cgroup.procs"),
+            format!("4000000000\n4000000001\n4000000002\n{pid}\n"),
+        )
+        .unwrap();
+        let mut state = CgroupWalkState::default();
+        let mut reached = false;
+        for pass in 0..6 {
+            let limits = CgroupWalkLimits {
+                members: 1,
+                ..CgroupWalkLimits::default()
+            };
+            let collection = coordinator
+                .cgroup_collector(state, limits, CollectionControl::new(None), Some(1))
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, 1_000 + pass)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_ne!(
+                completion.outcome,
+                ScopedCollectionOutcome::Complete,
+                "partial passes never union into complete scope absence"
+            );
+            state = completion.state;
+            if coordinator.adapter.live_id(pid).is_some() {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "later candidate can be admitted when both fresh samples and scan fit"
+        );
+        assert_eq!(coordinator.adapter.len(), 1);
+    }
+
+    #[test]
+    fn cgroup_wrong_root_and_legacy_catalog_jobs_cannot_supply_authority() {
+        let (_fixture, _child, mut coordinator) = cgroup_os_scene();
+        assert!(coordinator.collector(InventoryScope::System, None)().is_err());
+        let (_other_fixture, _, other) = cgroup_os_scene();
+        let collection = other
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            coordinator
+                .apply_cgroup_collection(collection, 1_000)
+                .is_err()
+        );
+        assert_eq!(coordinator.adapter.len(), 0);
+    }
+
+    #[test]
+    fn cgroup_catalog_without_transaction_cannot_admit_a_fresh_outside_caller() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let catalog = crate::inspect_system::collect_pid(
+            child.id(),
+            &[],
+            &HookRegistry::builtin(),
+            crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget()),
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .processes
+                .iter()
+                .any(|process| process.pid == child.id() && process.status.attributable()),
+            "the unscoped catalog actually observed the positive child"
+        );
+        coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            u64::MAX,
+            1_000,
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+    }
+
+    #[test]
+    fn cgroup_native_exec_invalidates_pending_transaction_even_with_unchanged_scalars() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn_matching_process(pid);
+        let birth = scene.source.start_time(pid).unwrap();
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.project(pid, 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        std::fs::write(scene._dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        scene.coordinator.engine.scope = crate::scope::cgroup(scene._dir.path()).unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        scene.attach_all(100, ScopeCustody::CgroupHeld);
+        let mut native = NativeScene::over(scene, 0);
+        native.answer(pid, birth, 41);
+        native.witness(vec![native.row(41, 1, pid, 100, 0)]);
+        let collection = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(pid)
+                .is_some_and(|preparation| preparation.check()),
+            "the pending scan transaction is usable before EXEC invalidation"
+        );
+        let before = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .unwrap()
+            .exe
+            .clone();
+        native
+            .scene
+            .coordinator
+            .apply_cgroup_collection(collection, 2_000)
+            .unwrap();
+        native.witness(vec![native.row(41, 2, pid, 200, 1)]);
+        assert_eq!(
+            native.scene.source.exe_identity(pid),
+            before,
+            "same scalar executable identity cannot reconstruct the invalidated proof"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert_eq!(native.scene.coordinator.adapter.live_id(pid), None);
+        assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .unwrap()
+                .mapping,
+            MappingState::Ended
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .take_cgroup_completion()
+                .unwrap()
+                .admitted,
+            0
+        );
+    }
+
+    #[test]
+    fn cgroup_review_exec_between_collect_and_apply_invalidates_stale_job() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn_matching_process(pid);
+        let birth = scene.source.start_time(pid).unwrap();
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.project(pid, 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        std::fs::write(scene._dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        scene.coordinator.engine.scope = crate::scope::cgroup(scene._dir.path()).unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        scene.attach_all(100, ScopeCustody::CgroupHeld);
+        let mut native = NativeScene::over(scene, 0);
+        native.answer(pid, birth, 41);
+        native.witness(vec![native.row(41, 1, pid, 100, 0)]);
+        let collection = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(pid)
+                .is_some_and(|preparation| preparation.check()),
+            "the collected transaction is usable before EXEC invalidation"
+        );
+        let before = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .unwrap()
+            .exe
+            .clone();
+        native.witness(vec![native.row(41, 2, pid, 200, 1)]);
+        native
+            .scene
+            .coordinator
+            .apply_cgroup_collection(collection, 2_000)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.source.exe_identity(pid),
+            before,
+            "same scalar executable identity cannot reconstruct the invalidated proof"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert_eq!(native.scene.coordinator.adapter.live_id(pid), None);
+        assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .unwrap()
+                .mapping,
+            MappingState::Ended
+        );
+        let stale = native.scene.coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(stale.admitted, 0);
+        assert_ne!(stale.outcome, ScopedCollectionOutcome::Complete);
+        let fresh = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                stale.state,
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        native
+            .scene
+            .coordinator
+            .apply_cgroup_collection(fresh, 4_000)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let fresh = native.scene.coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            fresh.admitted, 1,
+            "a fresh next job can authorize the current image"
+        );
+        assert_ne!(native.scene.coordinator.adapter.live_id(pid), Some(caller));
+        assert_eq!(native.scene.coordinator.adapter.len(), 2);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
     }
 
     #[test]
@@ -4691,7 +16104,7 @@ mod tests {
             .unwrap();
         blind
             .coordinator
-            .begin_capture_coverage(Some(ScopeIncarnation {
+            .begin_capture_coverage(CaptureScopeCoverage::Pid(ScopeIncarnation {
                 pid: 11,
                 start_time: None,
             }));
@@ -5104,7 +16517,9 @@ mod tests {
             .adapter
             .admit(7, ImageAuthority::ScanPinned, 50)
             .unwrap();
-        scene.coordinator.begin_capture_coverage(None);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         scene.attach_all(100, ScopeCustody::System);
         scene.project(7, 120);
         let mut clean = witness_batch();
@@ -5207,16 +16622,18 @@ mod tests {
 
     /// Scripted cookie answers per (pin, domain); never a host read.
     #[derive(Default)]
-    struct ScriptedCookies {
+    pub(super) struct ScriptedCookies {
         answers: std::collections::HashMap<(ScriptedPin, NativeDomainId), CookieQuery>,
+        pub(super) queries: usize,
     }
 
     impl NativeIdentity<ScriptedPin> for ScriptedCookies {
-        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
             None
         }
 
         fn query_cookie(&mut self, domain: NativeDomainId, pin: &ScriptedPin) -> CookieQuery {
+            self.queries += 1;
             self.answers
                 .get(&(*pin, domain))
                 .cloned()
@@ -5229,14 +16646,14 @@ mod tests {
 
     /// Facade stamps for scripted native batches: strictly increasing, so
     /// each batch follows the one staged before it.
-    struct Stamps(std::cell::Cell<u64>);
+    pub(super) struct Stamps(std::cell::Cell<u64>);
 
     impl Stamps {
-        fn from(start: u64) -> Self {
+        pub(super) fn from(start: u64) -> Self {
             Self(std::cell::Cell::new(start))
         }
 
-        fn tick(&self) -> u64 {
+        pub(super) fn tick(&self) -> u64 {
             let at = self.0.get() + 10;
             self.0.set(at);
             at
@@ -5244,37 +16661,44 @@ mod tests {
 
         /// One readable witness read of `domain`: health at the stamp, rows
         /// read just after it.
-        fn read(&self, domain: NativeDomainId, rows: Vec<WitnessRow>) -> NativeBatch {
+        pub(super) fn read(&self, domain: NativeDomainId, rows: Vec<WitnessRow>) -> NativeBatch {
             let at = self.tick();
             let mut read = witness_batch();
             read.domain = domain;
             read.rows = rows;
             read.health.discovery_counters = Some([0; 5]);
             read.health_read_ns = at;
+            read.rows_anchor_ns = at + 1;
             read.rows_read_ns = at + 1;
             read.counts_read_ns = at + 1;
             NativeBatch::Witness(Box::new(read))
         }
 
         /// One complete lifecycle drain of `domain`.
-        fn drain(&self, domain: NativeDomainId) -> NativeBatch {
+        pub(super) fn drain(&self, domain: NativeDomainId) -> NativeBatch {
             NativeBatch::Lifecycle(DiscoveryBatch::scripted(domain, Vec::new(), self.tick()))
         }
     }
 
-    struct NativeScene {
-        scene: CaptureScene,
-        domain: NativeDomainId,
-        cookies: ScriptedCookies,
-        stamps: Stamps,
+    pub(super) struct NativeScene {
+        pub(super) scene: CaptureScene,
+        pub(super) domain: NativeDomainId,
+        pub(super) cookies: ScriptedCookies,
+        pub(super) stamps: Stamps,
     }
 
     impl NativeScene {
         /// One provider with two endpoints in the attach set, pid 7
         /// spawned (start 500) and admitted at 50 and mapped.
-        fn new() -> (Self, CallerId) {
+        pub(super) fn new() -> (Self, CallerId) {
             let mut scene = CaptureScene::new(2);
             scene.source.spawn(7, 500);
+            // Ordinary synthetic leader-loss scenes explicitly supply the
+            // fresh worker proof. A held pin alone now supplies none.
+            scene.source.set_leader_exit_observation(
+                7,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
             let caller = scene
                 .coordinator
                 .adapter
@@ -5285,10 +16709,30 @@ mod tests {
             (Self::over(scene, 0), caller)
         }
 
+        /// Collection begins at50; the actual per-incarnation admission
+        /// validation finishes at200, through the production reconcile path.
+        fn with_collection_admission_window() -> (Self, CallerId) {
+            let mut scene = CaptureScene::new(2);
+            scene.coordinator.engine.scope = Scope::System;
+            scene.source.spawn(7, 500);
+            scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let caller = scene.coordinator.adapter.live_id(7).unwrap();
+            let record = scene.coordinator.adapter.record(caller).unwrap();
+            assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+            scene.project(7, 300);
+            scene.coordinator.commit_batch(false).unwrap();
+            (Self::over(scene, 0), caller)
+        }
+
         /// A native lane over `scene` whose exec coverage began at
         /// `coverage_ns`, forwarded the way C5 forwards it: through the
         /// activating extend receipt.
-        fn over(mut scene: CaptureScene, coverage_ns: u64) -> Self {
+        pub(super) fn over(mut scene: CaptureScene, coverage_ns: u64) -> Self {
             let domain = NativeDomainId::mint();
             scene.coordinator.note_extend_receipt(&ExtendReceipt {
                 activated_roots: true,
@@ -5303,14 +16747,39 @@ mod tests {
             }
         }
 
-        fn answer(&mut self, pid: u32, start: u64, ticket: u64) {
+        pub(super) fn answer(&mut self, pid: u32, start: u64, ticket: u64) {
             self.cookies.answers.insert(
                 ((pid, start), self.domain),
                 CookieQuery::Cookie(DomainCookie::scripted(self.domain, ticket)),
             );
         }
 
-        fn row(&self, ticket: u64, exec: u64, tgid: u32, t0: u64, member: usize) -> WitnessRow {
+        pub(super) fn forget_answer(&mut self, pid: u32, start: u64) {
+            self.cookies.answers.remove(&((pid, start), self.domain));
+        }
+
+        pub(super) fn query_answer(&mut self, pid: u32, start: u64, answer: CookieQuery) {
+            self.cookies
+                .answers
+                .insert(((pid, start), self.domain), answer);
+        }
+
+        pub(super) fn unavailable_answer(&mut self, pid: u32, start: u64) {
+            self.query_answer(
+                pid,
+                start,
+                CookieQuery::Unavailable("scripted temporary cookie-query failure".into()),
+            );
+        }
+
+        pub(super) fn row(
+            &self,
+            ticket: u64,
+            exec: u64,
+            tgid: u32,
+            t0: u64,
+            member: usize,
+        ) -> WitnessRow {
             let endpoint = self.scene.delta.endpoints[member];
             WitnessRow::scripted(
                 self.domain,
@@ -5323,14 +16792,14 @@ mod tests {
             )
         }
 
-        fn stage(&mut self, batch: NativeBatch) -> NativeReceipt {
+        pub(super) fn stage(&mut self, batch: NativeBatch) -> NativeReceipt {
             let now = self.stamps.tick();
             self.scene
                 .coordinator
                 .stage_native(batch, &mut self.cookies, now)
         }
 
-        fn read(&mut self, rows: Vec<WitnessRow>) -> NativeReceipt {
+        pub(super) fn read(&mut self, rows: Vec<WitnessRow>) -> NativeReceipt {
             let batch = self.stamps.read(self.domain, rows);
             self.stage(batch)
         }
@@ -5338,7 +16807,7 @@ mod tests {
         /// One witness read carrying `counts` (C4): each `(ticket, exec,
         /// member, count)` names the image, the member's object, and the
         /// re-read count. `rows` ride along: a read may carry both.
-        fn counts_read(
+        pub(super) fn counts_read(
             &mut self,
             rows: Vec<WitnessRow>,
             counts: Vec<(u64, u64, usize, u64)>,
@@ -5362,18 +16831,19 @@ mod tests {
                 .collect();
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
+            batch.rows_anchor_ns = at + 1;
             batch.rows_read_ns = at + 1;
             batch.counts_read_ns = at + 1;
             self.stage(NativeBatch::Witness(Box::new(batch)))
         }
 
-        fn drain(&mut self) -> NativeReceipt {
+        pub(super) fn drain(&mut self) -> NativeReceipt {
             let batch = self.stamps.drain(self.domain);
             self.stage(batch)
         }
 
         /// Read `rows`, then both horizons, then publish.
-        fn witness(&mut self, rows: Vec<WitnessRow>) -> Vec<CallerEvent> {
+        pub(super) fn witness(&mut self, rows: Vec<WitnessRow>) -> Vec<CallerEvent> {
             let mut events = self.read(rows).events;
             events.extend(self.drain().events);
             events.extend(self.read(Vec::new()).events);
@@ -5381,7 +16851,45 @@ mod tests {
             events
         }
 
-        fn module_unbound(&self) -> Option<UnboundUse> {
+        /// Heap-built scene (H6 slice 2 oracles): the ~54 KiB scene
+        /// value is constructed and boxed inside this call, so only the
+        /// box lives in the oracle's frame and multi-scene oracles fit
+        /// the default test stack (debug builds retain every local's
+        /// slot, so inline scenes would overflow it).
+        pub(super) fn boxed() -> (Box<NativeScene>, CallerId) {
+            let (scene, caller) = NativeScene::new();
+            (Box::new(scene), caller)
+        }
+
+        /// Drive `rows` through the binder only (H6 slice 2): no
+        /// coordinator staging runs, so the caller captures proven
+        /// transitions for manual application. Returns what the binder
+        /// proved, in emission order.
+        pub(super) fn binder_only(&mut self, rows: Vec<WitnessRow>) -> Vec<ExecTransition> {
+            for batch in [
+                self.stamps.read(self.domain, rows),
+                self.stamps.drain(self.domain),
+                self.stamps.read(self.domain, Vec::new()),
+            ] {
+                match batch {
+                    NativeBatch::Witness(read) => {
+                        let coordinator = &mut self.scene.coordinator;
+                        coordinator.binder.absorb_witnesses(
+                            &read,
+                            &coordinator.adapter,
+                            &mut self.cookies,
+                        );
+                    }
+                    NativeBatch::Lifecycle(drain) => {
+                        self.scene.coordinator.binder.absorb_lifecycle(&drain);
+                    }
+                    _ => unreachable!("scripted read/drain only"),
+                }
+            }
+            self.scene.coordinator.binder.take_transitions()
+        }
+
+        pub(super) fn module_unbound(&self) -> Option<UnboundUse> {
             self.scene
                 .coordinator
                 .registry
@@ -5390,11 +16898,11 @@ mod tests {
                 .and_then(|module| module.unbound_use.clone())
         }
 
-        fn preadmission(&self) -> PreadmissionCounters {
+        pub(super) fn preadmission(&self) -> PreadmissionCounters {
             self.scene.coordinator.preadmission_counters().unwrap()
         }
 
-        fn gap_subjects(&self) -> Vec<String> {
+        pub(super) fn gap_subjects(&self) -> Vec<String> {
             self.scene
                 .coordinator
                 .registry
@@ -5515,6 +17023,1159 @@ mod tests {
     }
 
     #[test]
+    fn an_exec_without_a_held_image_still_mints_its_successor() {
+        // The lost race (Fedora mint): the exec is discovered before any
+        // row of the old image binds, so the binder can never emit a
+        // transition (Rules 4+5 refuse both generations under the pre-exec
+        // admission, and the live cookie has moved on). The exec hook plus
+        // the live guard still prove the turnover: retire the unheld
+        // predecessor and mint the successor, disclosed.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // NO rows: gen-0 never binds.
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::ExecRetired { old, new }] = receipt.events.as_slice() else {
+            panic!("the hook must mint the successor: {:?}", receipt.events);
+        };
+        assert_eq!(*old, caller);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(*new));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "exec successor minted without a held predecessor"),
+            "the unheld predecessor is disclosed: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn an_exec_during_collection_mints_a_bindable_successor_before_admission() {
+        fn no_private_ticket_fields(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (name, value) in fields {
+                        // The established inventory schema retains these
+                        // null placeholders. An EXEC ticket must never turn
+                        // them into an exact-image authority or public value.
+                        if matches!(name.as_str(), "task_cookie" | "exec_id") {
+                            assert!(
+                                value.is_null(),
+                                "private EXEC data reached public JSON: {name}"
+                            );
+                        }
+                        assert!(
+                            !matches!(
+                                name.as_str(),
+                                "binding_id" | "exec_task_ticket" | "original_ticket"
+                            ),
+                            "private EXEC data reached public JSON: {name}"
+                        );
+                        no_private_ticket_fields(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        no_private_ticket_fields(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for hook_ts_ns in [50, 125] {
+            for class in [
+                p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN,
+                p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+                p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
+            ] {
+                let (mut native, caller) = NativeScene::with_collection_admission_window();
+                native.answer(7, 500, 41);
+                native.scene.coordinator.exit_clocks_comparable = true;
+                assert!(
+                    !native
+                        .scene
+                        .coordinator
+                        .binder
+                        .holds_image(native.domain, caller)
+                );
+                let at = native.stamps.tick();
+                let mut drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+                drain.records[0].binding_id = 41;
+                drain.records[0].case_id = class;
+                let receipt = native.stage(NativeBatch::Lifecycle(drain));
+                let [CallerEvent::ExecRetired { old, new }] = receipt.events.as_slice() else {
+                    panic!(
+                        "matching collection-window EXEC must mint: hook={hook_ts_ns} class={class}, events={:?}",
+                        receipt.events
+                    );
+                };
+                assert_eq!(*old, caller);
+                let successor = *new;
+                let adapter = &native.scene.coordinator.adapter;
+                assert!(adapter.record(caller).unwrap().retired);
+                assert_eq!(adapter.live_id(7), Some(successor));
+                assert!(adapter.record(successor).unwrap().first_seen_ns > hook_ts_ns);
+                let queries = native.cookies.queries;
+                let at = native.stamps.tick();
+                let mut replay = exec_hook_drain(native.domain, at, hook_ts_ns);
+                replay.records[0].binding_id = 41;
+                replay.records[0].case_id = class;
+                let replay = native.stage(NativeBatch::Lifecycle(replay));
+                assert!(
+                    replay.events.is_empty(),
+                    "one EXEC mints once: {:?}",
+                    replay.events
+                );
+                assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+                assert_eq!(
+                    native.cookies.queries, queries,
+                    "replay queries no current ticket"
+                );
+                let at = native.stamps.tick();
+                native.scene.project(7, at);
+                let entered = native.stamps.tick();
+                let row = native.row(41, 2, 7, entered, 0);
+                let events = native.witness(vec![row]);
+                assert!(events.is_empty(), "{events:?}");
+                assert!(
+                    native
+                        .scene
+                        .coordinator
+                        .binder
+                        .holds_image(native.domain, successor)
+                );
+                assert!(matches!(
+                    native.scene.coverage(successor),
+                    UseCoverage::Counted { lossy: false, .. }
+                ));
+                native.scene.coordinator.commit_batch(false).unwrap();
+                let public = crate::inventory::render_json(
+                    &native.scene.coordinator,
+                    "system",
+                    0,
+                    native.stamps.tick(),
+                    1,
+                );
+                assert!(!public["edges"].as_array().unwrap().is_empty());
+                no_private_ticket_fields(&public);
+            }
+        }
+    }
+
+    #[test]
+    fn an_exec_before_collection_cannot_retire_a_later_admission() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 49);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(!adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(caller));
+        assert_eq!(native.cookies.queries, 0, "older hooks query no image");
+    }
+
+    #[test]
+    fn an_unstamped_exec_during_collection_cannot_retire_the_caller() {
+        for hook_ts_ns in [50, 125] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired
+            );
+            assert_eq!(
+                native.cookies.queries, 0,
+                "zero original ticket queries nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collection_exec_requires_the_original_same_domain_live_ticket() {
+        let foreign = NativeDomainId::mint();
+        for answer in [
+            CookieQuery::Cookie(DomainCookie::scripted(foreign, 41)),
+            CookieQuery::NoCookie,
+            CookieQuery::Exited,
+            CookieQuery::Unavailable("scripted lookup refusal".into()),
+        ] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.query_answer(7, 500, answer.clone());
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let modules: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert!(
+                !modules.is_empty(),
+                "the physical provider observation exists"
+            );
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = 41;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(
+                receipt.events.is_empty(),
+                "{answer:?}: {:?}",
+                receipt.events
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let retained: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert_eq!(retained, modules, "the provider observation stays useful");
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired
+            );
+            assert_eq!(
+                native.cookies.queries, 1,
+                "the original pin was queried: {answer:?}"
+            );
+        }
+        for scripted in [Some(42), None] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            // A zero cell answers Unavailable in production; Cookie(0)
+            // never occurs.
+            match scripted {
+                Some(ticket) => native.answer(7, 500, ticket),
+                None => native.unavailable_answer(7, 500),
+            }
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = 41;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(receipt.events.is_empty());
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired
+            );
+            assert_eq!(native.cookies.queries, 1);
+        }
+    }
+
+    #[test]
+    fn cgroup_collection_exec_refuses_mismatch_with_invalidations_only() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn_matching_process(pid);
+        let birth = scene.source.start_time(pid).unwrap();
+        // Collection begins at 50; admission validation finishes at 200.
+        scene.coordinator.adapter.reconcile_detected(
+            &[pid].into_iter().collect(),
+            &mut |_| ImageAuthority::ScanPinned,
+            50,
+            &mut || Some(200),
+        );
+        let caller = scene.coordinator.adapter.live_id(pid).unwrap();
+        let record = scene.coordinator.adapter.record(caller).unwrap();
+        assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+        scene.project(pid, 300);
+        scene.coordinator.commit_batch(false).unwrap();
+        std::fs::write(scene._dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        scene.coordinator.engine.scope = crate::scope::cgroup(scene._dir.path()).unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // The staged transaction is usable before the EXEC invalidation.
+        let collection = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(pid)
+                .is_some_and(|preparation| preparation.check()),
+            "the pending scan transaction is usable before EXEC invalidation"
+        );
+        let work = collection.work();
+        assert!(work.charge(0), "the job fence starts fresh");
+        native.scene.coordinator.pending_cgroup = Some((collection, 2_000));
+        // A mismatching in-window ticket refuses: invalidations only.
+        native.answer(pid, birth, 99);
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 125;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(!adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(pid), Some(caller));
+        assert_eq!(
+            native.cookies.queries, 1,
+            "the in-window branch queried once"
+        );
+        // These twins never commit (the refused twin holds a directly
+        // staged pending collection), so disclosure is read staged.
+        let staged: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .map(|(subject, _)| subject)
+            .collect();
+        assert!(
+            staged.contains(&"collection-window exec task unproven".to_string()),
+            "the refusal is disclosed: {staged:?}"
+        );
+        assert!(
+            !work.charge(0),
+            "the refused hook invalidated the job fence"
+        );
+        let (pending, _) = native.scene.coordinator.pending_cgroup.as_ref().unwrap();
+        assert!(
+            pending.preparation(pid).is_none(),
+            "the refused hook invalidated the pending collection"
+        );
+    }
+
+    #[test]
+    fn cgroup_collection_exec_matching_ticket_holds_handoff_with_retired_event() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        std::fs::write(native.scene._dir.path().join("cgroup.procs"), b"").unwrap();
+        native.scene.coordinator.engine.scope =
+            crate::scope::cgroup(native.scene._dir.path()).unwrap();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 125);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+            panic!(
+                "a matching cgroup EXEC retires with its handoff held: {:?}",
+                receipt.events
+            );
+        };
+        assert_eq!(*id, caller);
+        let coordinator = &native.scene.coordinator;
+        assert!(
+            coordinator.pending_successors.contains_key(&caller),
+            "the successor handoff is held for re-entry"
+        );
+        let adapter = &coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), None);
+        assert_eq!(adapter.len(), 1, "no successor is admitted inline");
+        assert_eq!(
+            adapter.record(caller).unwrap().lifecycle,
+            crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+        );
+        assert_eq!(native.cookies.queries, 1);
+        let staged: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .map(|(subject, _)| subject)
+            .collect();
+        assert!(
+            staged.contains(&"exec successor minted without a held predecessor".to_string()),
+            "the witnessed mint is disclosed: {staged:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_collection_exec_leaves_no_birth_path_and_keeps_stage1_useful() {
+        // 6.05 step 1(c), exec half: a collection-window EXEC the ticket
+        // path refused (zero/mismatch/cross-domain) records its gap, mints
+        // nothing, retires nothing, and keeps the provider observation
+        // useful (S1 intact). The marker half of this twin lives in
+        // the semantic-capture tests module: the marker row stays
+        // un-READY-able.
+        let foreign = NativeDomainId::mint();
+        for (binding, setup) in [
+            (0u64, "zero ticket performs no lookup"),
+            (41u64, "cross-domain ticket"),
+            (41u64, "same-domain mismatch"),
+            (41u64, "no ticket held yet"),
+        ] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            match setup {
+                "zero ticket performs no lookup" => native.answer(7, 500, 41),
+                "cross-domain ticket" => native.query_answer(
+                    7,
+                    500,
+                    CookieQuery::Cookie(DomainCookie::scripted(foreign, 41)),
+                ),
+                "same-domain mismatch" => native.answer(7, 500, 42),
+                _ => native.query_answer(7, 500, CookieQuery::NoCookie),
+            }
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let modules: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert!(!modules.is_empty(), "{setup}: provider observation exists");
+            let gaps_before = native.scene.coordinator.registry.gaps().len();
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = binding;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(receipt.events.is_empty(), "{setup}: {:?}", receipt.events);
+            assert_eq!(
+                native.scene.coordinator.adapter.live_id(7),
+                Some(caller),
+                "{setup}: the incarnation is not retired"
+            );
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired,
+                "{setup}: the incarnation is not replaced"
+            );
+            // Gaps stage at apply_exec_hook and materialize at commit.
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let retained: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert_eq!(retained, modules, "{setup}: S1 stays useful");
+            assert_eq!(
+                native.cookies.queries,
+                usize::from(binding != 0),
+                "{setup}: only a nonzero ticket queries the pin"
+            );
+            let gaps = native.scene.coordinator.registry.gaps();
+            assert_eq!(gaps.len(), gaps_before + 1, "{setup}: one refusal gap");
+            let gap = gaps.last().unwrap();
+            assert_eq!(gap.subject, "collection-window exec task unproven");
+            assert_eq!(gap.caller, Some(caller));
+            assert_eq!(gap.pid, Some(7));
+            assert!(
+                gap.reason.contains("ticket"),
+                "{setup}: the gap names the ticket: {}",
+                gap.reason
+            );
+            assert_eq!(
+                native.scene.coordinator.adapter.live_id(7),
+                Some(caller),
+                "{setup}: still live after commit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stopped_collection_exec_needs_the_original_task_before_retirement() {
+        for ticket in [0, 42, 41] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.stop();
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = ticket;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            let adapter = &native.scene.coordinator.adapter;
+            if ticket == 41 {
+                assert!(
+                    matches!(receipt.events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller)
+                );
+                assert!(adapter.record(caller).unwrap().retired);
+                assert_eq!(adapter.live_id(7), None);
+            } else {
+                assert!(
+                    receipt.events.is_empty(),
+                    "ticket={ticket}: {:?}",
+                    receipt.events
+                );
+                assert!(!adapter.record(caller).unwrap().retired);
+                assert_eq!(adapter.live_id(7), Some(caller));
+            }
+            assert_eq!(adapter.len(), 1, "stop never admits a successor");
+            assert!(native.scene.coordinator.pending_successors.is_empty());
+            assert_eq!(native.cookies.queries, usize::from(ticket != 0));
+        }
+    }
+
+    #[test]
+    fn a_held_image_keeps_the_collection_exec_on_the_row_proven_path() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        native.answer(7, 500, 41);
+        native.witness(vec![native.row(41, 1, 7, 210, 0)]);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, caller)
+        );
+        let queries = native.cookies.queries;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 125);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, caller)
+        );
+        assert_eq!(
+            native.cookies.queries, queries,
+            "held image bypasses the shortcut"
+        );
+    }
+
+    #[test]
+    fn a_collection_exec_without_comparable_clocks_queries_no_ticket() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = false;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 125);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert_eq!(native.cookies.queries, 0);
+    }
+
+    #[test]
+    fn a_queued_old_exec_cannot_retire_a_reused_pid_inside_collection() {
+        for ticket in [0, 41] {
+            let (mut native, original) = NativeScene::new();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let mut queued_old_exec = exec_hook_drain(native.domain, 300, 125);
+            queued_old_exec.records[0].binding_id = ticket;
+            native.scene.source.spawn(7, 700);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let replacement = native.scene.coordinator.adapter.live_id(7).unwrap();
+            assert_ne!(replacement, original);
+            let adapter = &native.scene.coordinator.adapter;
+            assert!(adapter.record(original).unwrap().retired);
+            let record = adapter.record(replacement).unwrap();
+            assert_eq!(record.start_time, Some(700));
+            assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+            native.answer(7, 700, 99);
+            let queries = native.cookies.queries;
+            let receipt = native.stage(NativeBatch::Lifecycle(queued_old_exec));
+            assert!(
+                receipt.events.is_empty(),
+                "old task ticket={ticket}: {:?}",
+                receipt.events
+            );
+            let adapter = &native.scene.coordinator.adapter;
+            assert_eq!(adapter.live_id(7), Some(replacement));
+            assert!(!adapter.record(replacement).unwrap().retired);
+            assert_eq!(native.cookies.queries - queries, usize::from(ticket != 0));
+        }
+    }
+
+    #[test]
+    fn a_stale_exec_hook_mints_no_successor() {
+        // A hook that predates the live incarnation's admission is the
+        // old image's delayed record (or a reused pid's): minting would
+        // retire a live caller for another process's exec.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 40;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(!adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(caller));
+    }
+
+    #[test]
+    fn an_exec_without_comparable_clocks_mints_no_successor() {
+        // Without comparable clocks a hook cannot be ordered against the
+        // admission: minting could retire a live caller for a stale hook,
+        // so the successor is refused (fail-closed) and disclosed.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = false;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "successor admission refused without comparable clocks"),
+            "{:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn an_exec_without_a_live_answer_mints_no_successor() {
+        // The cookie query through the held pin cannot answer: the current
+        // image is unproven, so the old incarnation retires (the hook
+        // proved its end) without a successor, disclosed. (A `NoCookie`
+        // answer is liveness, not this case: see
+        // `an_exec_hook_mints_while_the_leader_holds_no_ticket_yet`.)
+        let (mut native, caller) = NativeScene::new();
+        native.unavailable_answer(7, 500);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+            panic!("the proved end retires honestly: {:?}", receipt.events);
+        };
+        assert_eq!(*id, caller);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "successor admission refused without a live image"),
+            "{:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_second_exec_hook_mints_no_second_successor() {
+        // The first hook mints and retires; the replayed hook predates the
+        // successor's admission, so it is stale and mints nothing.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let first = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::ExecRetired { new, .. }] = first.events.as_slice() else {
+            panic!("the first hook must mint: {:?}", first.events);
+        };
+        let successor = *new;
+        assert_ne!(successor, caller);
+        let at2 = native.stamps.tick();
+        let mut replay = DiscoveryBatch::scripted(native.domain, Vec::new(), at2);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record2: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record2.hook_ts_ns = at;
+        record2.pid_tgid = (7u64 << 32) | 7u64;
+        record2.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        replay.records.push(record2);
+        let second = native.stage(NativeBatch::Lifecycle(replay));
+        assert!(second.events.is_empty(), "{:?}", second.events);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+    }
+
+    /// One `EXEC` lifecycle record for pid 7 stamped `hook_ts_ns`, drained
+    /// at `at`.
+    fn exec_hook_drain(domain: NativeDomainId, at: u64, hook_ts_ns: u64) -> DiscoveryBatch {
+        let mut drain = DiscoveryBatch::scripted(domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = hook_ts_ns;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        drain
+    }
+
+    #[test]
+    fn an_exec_hook_mints_while_the_leader_holds_no_ticket_yet() {
+        // Fedora's lost race: the EXEC record drains before the new image
+        // enters any instrumented endpoint, so its leader holds no ticket
+        // in this domain yet (`NoCookie`: the pidfd was live before and
+        // after the lookup). Liveness through the held pin plus the
+        // ordered hook prove the turnover: the successor mints, disclosed,
+        // and the new image's first row binds to it. Refusing here retired
+        // the caller and left the pid to a later scalar-PID re-admission.
+        let (mut native, caller) = NativeScene::new();
+        native.query_answer(7, 500, CookieQuery::NoCookie);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, at);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::ExecRetired { old, new }] = receipt.events.as_slice() else {
+            panic!(
+                "a live pin without a ticket must still mint: {:?}",
+                receipt.events
+            );
+        };
+        assert_eq!(*old, caller);
+        let successor = *new;
+        assert_ne!(successor, caller);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(successor));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = native.gap_subjects();
+        assert!(
+            subjects.contains(&"exec successor minted without a held predecessor".to_string()),
+            "the unheld predecessor is disclosed: {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"successor admission refused without a live image".to_string()),
+            "a live pin is not refused: {subjects:?}"
+        );
+        // The new image's first entry mints its ticket after the hook; its
+        // row binds to the minted successor, never to the retired image.
+        native.answer(7, 500, 41);
+        let t0 = native.stamps.tick();
+        let row = native.row(41, 2, 7, t0, 0);
+        native.witness(vec![row]);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, successor),
+            "the successor's own row binds: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, caller)
+        );
+    }
+
+    #[test]
+    fn an_exec_hook_for_an_exited_process_mints_no_successor() {
+        // Twin: the held pin reports the process exited during the query,
+        // so no current image exists. The hook still proved the old image
+        // ended: it retires without a successor, and the refusal names the
+        // exit.
+        let (mut native, caller) = NativeScene::new();
+        native.query_answer(7, 500, CookieQuery::Exited);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, at);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+            panic!("an exited pin mints nothing: {:?}", receipt.events);
+        };
+        assert_eq!(*id, caller);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let refusal = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .find(|gap| gap.subject == "successor admission refused without a live image")
+            .map(|gap| gap.reason.clone())
+            .expect("the refusal is disclosed");
+        assert!(refusal.contains("exited"), "{refusal}");
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"exec successor minted without a held predecessor".to_string())
+        );
+    }
+
+    #[test]
+    fn an_ordered_exec_hook_for_a_held_caller_mints_no_successor() {
+        // The won race, held successor: the row path proved the exec
+        // transition and the successor bound its own first row, so the
+        // binder holds an image for it. An ORDERED exec hook (stamped
+        // after the successor's admission, comparable clocks, the held
+        // pin answering live) must stay out: the row path owns this
+        // caller, and only the holds-image skip stops the mint. This
+        // pins the mutual exclusion the stale-hint test cannot (a stale
+        // hook skips before the holds check runs).
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        // Gen-0 binds, then its next image proves the row-proven
+        // transition: the won race mints the successor.
+        let first = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![first]);
+        let later = native.row(41, 2, 7, 1_100, 1);
+        let events = native.witness(vec![later]);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("the row path must mint the successor: {events:?}");
+        };
+        assert_eq!(*old, caller);
+        let successor = *new;
+        assert_ne!(successor, caller);
+        // The successor's own first row binds to it: the row path now
+        // holds this caller.
+        let t0 = native.stamps.tick();
+        let row = native.row(41, 2, 7, t0, 0);
+        let bound_events = native.witness(vec![row]);
+        assert!(bound_events.is_empty(), "{bound_events:?}");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, successor),
+            "the successor's own row binds: {:?}",
+            native.gap_subjects()
+        );
+        // Preconditions for the pin: comparable clocks, the live pin
+        // held, and an ordered hook (stamped after the successor's
+        // admission, so the stale skip cannot engage).
+        native.scene.coordinator.exit_clocks_comparable = true;
+        assert!(native.scene.coordinator.exit_clocks_comparable);
+        assert!(native.scene.coordinator.adapter.live_pin(7).is_some());
+        let admitted_ns = native
+            .scene
+            .coordinator
+            .adapter
+            .record(successor)
+            .unwrap()
+            .admitted_ns;
+        let hook_ts_ns = admitted_ns + 10;
+        assert!(
+            hook_ts_ns >= admitted_ns,
+            "the hook is ordered against the admission"
+        );
+        let before = native.gap_subjects();
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        // The row path still owns the caller: live, unretired, held.
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(successor)
+                .unwrap()
+                .retired
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, successor)
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let after = native.gap_subjects();
+        for subject in [
+            "exec successor minted without a held predecessor",
+            "successor admission refused without comparable clocks",
+            "successor admission refused without a live image",
+            "successor admission refused while stopped",
+            "duplicate exec handoff refused",
+            "exec handoff without custody refused",
+        ] {
+            assert!(
+                !after.iter().any(|gap| gap == subject),
+                "no hook mint or refusal gap: {after:?} (before: {before:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exec_hook_under_a_mismatched_numbering_mints_no_successor() {
+        // The EXEC tgid is the kernel's initial-namespace number, but the
+        // registry lookup uses the observer's own /proc numbering. When the
+        // two numberings disagree (a nested or unknown observer), PID
+        // equality is a numeric coincidence with an unrelated caller: the
+        // hook must do nothing — no events, no mint, no gap — and leave the
+        // live caller untouched.
+        for numbering in [
+            crate::pidns::test_seam::nested(),
+            crate::pidns::PidNumbering {
+                observer: crate::pidns::ObserverPidNs::Unknown(
+                    "scripted unreadable namespace".into(),
+                ),
+                proc_view: crate::pidns::ProcView::Own,
+            },
+        ] {
+            let label = numbering.observer.label();
+            let (mut native, caller) = NativeScene::new();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // NO rows: gen-0 never binds, so this is the unheld lost race
+            // the hook would mint under an agreeing numbering.
+            let at = native.stamps.tick();
+            assert!(at >= 50, "the hook is ordered against the admission");
+            assert!(
+                native.scene.coordinator.adapter.live_pin(7).is_some(),
+                "the live pin is held"
+            );
+            let drain = exec_hook_drain(native.domain, at, at);
+            let receipt = crate::pidns::test_seam::with_numbering(numbering, || {
+                assert!(
+                    !crate::pidns::numbering().agrees(),
+                    "the scene runs mismatched"
+                );
+                native.stage(NativeBatch::Lifecycle(drain))
+            });
+            assert!(receipt.events.is_empty(), "{label}: {:?}", receipt.events);
+            let adapter = &native.scene.coordinator.adapter;
+            assert!(!adapter.record(caller).unwrap().retired, "{label}");
+            assert_eq!(adapter.live_id(7), Some(caller), "{label}");
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let after = native.gap_subjects();
+            for subject in [
+                "exec successor minted without a held predecessor",
+                "successor admission refused without comparable clocks",
+                "successor admission refused without a live image",
+                "successor admission refused while stopped",
+                "successor admission refused with a stale staging clock",
+                "duplicate exec handoff refused",
+                "exec handoff without custody refused",
+            ] {
+                assert!(
+                    !after.iter().any(|gap| gap == subject),
+                    "{label}: no hook mint or refusal gap: {after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_leader_exit_under_a_mismatched_numbering_records_nothing() {
+        // The same cross-numbering lookup as the exec hook: the LEADER_EXIT
+        // tgid is the kernel's number, looked up as an observer-/proc pid.
+        // Under a mismatched numbering the exit must record nothing — no
+        // link-loss gap on the unrelated caller whose number coincides, and
+        // no tail uncertainty fencing it. (Scripted scenes cannot bind, so
+        // the gap is the discriminating half; the tail set is the cheap
+        // invariant for the fenced-caller concern.)
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 1_500;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        let drain = DiscoveryBatch::scripted(native.domain, vec![record], native.stamps.tick());
+        let receipt =
+            crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
+                assert!(
+                    !crate::pidns::numbering().agrees(),
+                    "the scene runs mismatched"
+                );
+                native.stage(NativeBatch::Lifecycle(drain))
+            });
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert!(
+            !native.scene.coordinator.tail_uncertain.contains(&caller),
+            "no fence on the unrelated caller"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"leader task link loss".to_string()),
+            "no link-loss gap: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    #[test]
+    fn an_exec_hook_with_a_stale_staging_clock_mints_no_successor() {
+        // The successor's binding safety needs the staging clock (its
+        // first_seen) to be later than the hook's timestamp: at or before
+        // it, the binder would refuse every row the successor ever reads,
+        // since a proved exec of its thread group sits at or after its
+        // admission. When now_ns <= hook_ts_ns the hook refuses with a gap
+        // and the proved old incarnation retires without a successor. Both
+        // the boundary (equal) and a strictly stale clock refuse.
+        for (hook_ts_ns, now_ns) in [(1_500, 1_500), (1_500, 1_400)] {
+            let (mut native, caller) = NativeScene::new();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+            assert!(
+                hook_ts_ns >= 50,
+                "the hook is ordered against the admission"
+            );
+            assert!(
+                now_ns <= hook_ts_ns,
+                "the staging clock is not later than the hook"
+            );
+            let receipt = native.scene.coordinator.stage_native(
+                NativeBatch::Lifecycle(drain),
+                &mut native.cookies,
+                now_ns,
+            );
+            let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+                panic!(
+                    "the proved end retires without a successor: {:?}",
+                    receipt.events
+                );
+            };
+            assert_eq!(*id, caller);
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                native.gap_subjects().contains(
+                    &"successor admission refused with a stale staging clock".to_string()
+                ),
+                "the staging-clock refusal is disclosed: {:?}",
+                native.gap_subjects()
+            );
+            assert!(
+                !native
+                    .gap_subjects()
+                    .contains(&"exec successor minted without a held predecessor".to_string())
+            );
+        }
+    }
+
+    #[test]
     fn a_bound_caller_without_a_mapping_edge_stays_module_level() {
         let (mut native, _) = NativeScene::new();
         native.scene.source.spawn(8, 600);
@@ -5546,7 +18207,10 @@ mod tests {
         // C7 C4: a count is a positive fact like its witness, so it
         // stages after stop too.
         let (mut native, caller) = NativeScene::new();
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.scene.coordinator.end_capture_coverage(90);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
@@ -5710,6 +18374,284 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_loss_during_churn_never_freezes_a_loss_free_count() {
+        // A bound pair keeps refreshing (churn) while the lifecycle
+        // ring loses exec/exit records. The edge either tracks the
+        // refreshes or reads lossy — never a frozen count under
+        // counted/lossy:false with its caller still mapped.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        let key = PairKey::of(&row);
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 10)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 10, "the pre-loss count stages");
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            },
+            "pre-loss coverage is an exact count"
+        );
+        // Churn continues; the same read discloses lost lifecycle
+        // records (an exec or exit of a watched caller may be among
+        // them), then one more churn read follows.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: native.scene.delta.endpoints[0].object,
+            count: 25,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_anchor_ns = at + 1;
+        batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
+        batch.lifecycle_loss = Some(crate::attach::capture::LifecycleLoss {
+            at_ns: at,
+            reason: "the lifecycle ring lost records (DISCOVERY ring loss 0 -> 4411): \
+                 an exec or exit of a watched caller may be among them"
+                .into(),
+        });
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 40)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Non-vacuity: both churn refreshes reached the held pair, the
+        // loss is disclosed, and the caller is still mapped and live.
+        let held = native
+            .scene
+            .coordinator
+            .pair_counts
+            .get(&key)
+            .map(|held| held.count)
+            .unwrap_or(0);
+        assert_eq!(held, 40, "both churn refreshes reached the held pair");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture lifecycle evidence lost"),
+            "the lifecycle loss is a disclosed gap"
+        );
+        let record = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .expect("the caller is retained");
+        assert!(!record.retired, "the caller is still live");
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(
+            edge.mapping,
+            crate::discovery::caller_registry::MappingState::Mapped,
+            "the caller is still mapped"
+        );
+        assert_eq!(
+            edge.mapping_interruptions, 0,
+            "no unload/reload interrupts the edge"
+        );
+        let coverage = native.scene.coverage(caller);
+        let tracked = edge.entry_count == 40;
+        let honest = matches!(
+            coverage,
+            UseCoverage::Counted { lossy: true, .. } | UseCoverage::Unknown(_)
+        );
+        assert!(
+            tracked || honest,
+            "frozen at {} with {coverage:?}: a stopped counter under disclosed loss \
+             must read lossy, never counted/lossy:false",
+            edge.entry_count
+        );
+    }
+
+    #[test]
+    fn custody_loss_during_churn_never_freezes_a_loss_free_count() {
+        // The PID-custody sibling of the lifecycle twin: custody loss
+        // sets the same unproven gate that withholds bound-pair
+        // staging, so the same disjunction holds here.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(7, 500));
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::PidHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        let key = PairKey::of(&row);
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 10)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 10, "the pre-loss count stages");
+        native
+            .scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidLost {
+                at_ns: 2_000,
+                reason: "scripted PID custody loss".into(),
+            });
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 40)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let held = native
+            .scene
+            .coordinator
+            .pair_counts
+            .get(&key)
+            .map(|held| held.count)
+            .unwrap_or(0);
+        assert_eq!(held, 40, "the churn refresh reached the held pair");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture scope custody unproven"),
+            "the custody loss is a disclosed gap"
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(
+            edge.mapping,
+            crate::discovery::caller_registry::MappingState::Mapped,
+            "the caller is still mapped"
+        );
+        let coverage = native.scene.coverage(caller);
+        let tracked = edge.entry_count == 40;
+        let honest = matches!(
+            coverage,
+            UseCoverage::Counted { lossy: true, .. } | UseCoverage::Unknown(_)
+        );
+        assert!(
+            tracked || honest,
+            "frozen at {} with {coverage:?}: a stopped counter under disclosed loss \
+             must read lossy, never counted/lossy:false",
+            edge.entry_count
+        );
+    }
+
+    #[test]
+    fn a_count_placed_after_lifecycle_loss_reads_lossy() {
+        // The production shape: the lifecycle ring loses records before
+        // the driver is admitted, and the driver's pair places its
+        // first count after the loss. The first-sight install lands via
+        // pending placement while the later refresh is withheld once
+        // bound — either way the edge must read lossy, never
+        // counted/lossy:false.
+        let mut scene = CaptureScene::new(2);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut lost = witness_batch();
+        lost.health_read_ns = 60;
+        lost.lifecycle_loss = Some(crate::attach::capture::LifecycleLoss {
+            at_ns: 60,
+            reason: "the lifecycle ring lost records (DISCOVERY ring loss 0 -> 4411): \
+                 an exec or exit of a watched caller may be among them"
+                .into(),
+        });
+        scene.coordinator.note_witness_batch(&lost);
+        scene.coordinator.registry.publish();
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 70)
+            .unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 130, 0);
+        let key = PairKey::of(&row);
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 10)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let held = native
+            .scene
+            .coordinator
+            .pair_counts
+            .get(&key)
+            .map(|held| held.count)
+            .unwrap_or(0);
+        assert_eq!(held, 10, "the churn refresh reached the held pair");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture lifecycle evidence lost"),
+            "the lifecycle loss is a disclosed gap"
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(
+            edge.entry_count, 1,
+            "the first-sight install lands; the refresh is withheld once bound"
+        );
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 130,
+                lossy: true
+            },
+            "a count placed after lifecycle loss reads lossy"
+        );
+    }
+
+    #[test]
     fn counted_use_for_a_refused_module_stages_no_count() {
         // Counted needs an admitted module: the backstop drops the
         // count (the witness stands); the absolute staging self-heals
@@ -5739,10 +18681,15 @@ mod tests {
             PairCount {
                 count: 5,
                 first_ns: 100,
+                anchor_ns: 100,
                 last_ns: 200,
+                retirement_usable: false,
+                diagnostic_observation: 0,
+                diagnostic_transition: 0,
             },
             100,
             0,
+            None,
         );
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -7484,6 +20431,164 @@ mod tests {
         );
     }
 
+    fn assert_demoted_read_brackets(initial_row: bool) {
+        // A baseline lookup sees five calls; growth after that lookup
+        // must transfer once. The pre-read anchor and post-read observation
+        // bound are different instants on both first-row and refresh paths.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        if !initial_row {
+            let row_a = native.row(41, 1, 7, 100, 0);
+            native.witness(vec![row_a]);
+        }
+        // History while A is the sole owner, at a skewed read: looked
+        // up at `h`, batch-stamped after the quantum.
+        let h = native.stamps.tick();
+        let mut history = witness_batch();
+        history.domain = native.domain;
+        if initial_row {
+            let mut row = native.row(41, 1, 7, 100, 0);
+            row.entry_count = 5;
+            history.rows = vec![row];
+        } else {
+            history.counts = vec![crate::attach::capture::CallerCountUpdate {
+                image: p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: 41,
+                    exec_id: 1,
+                },
+                object: native.scene.delta.endpoints[0].object,
+                count: 5,
+            }];
+        }
+        history.health.discovery_counters = Some([0; 5]);
+        history.health_read_ns = h;
+        history.rows_anchor_ns = h;
+        let base_lookup = h + 10;
+        let base_post = h + 30;
+        history.rows_read_ns = base_post;
+        history.counts_read_ns = if initial_row { h + 20 } else { h };
+        native.stage(NativeBatch::Witness(Box::new(history)));
+        if initial_row {
+            // Binding needs a lifecycle drain strictly after this read's
+            // POST, followed by its count horizon. The skewed POST is later
+            // than the next ordinary fixture tick.
+            native.stamps.0.set(base_post);
+            native.drain();
+            native.read(Vec::new());
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        // One advance past the history, at a later read.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 6,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        let growth_lookup = at + 20;
+        let growth_post = at + 30;
+        batch.rows_read_ns = growth_post;
+        batch.counts_read_ns = at + 10;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge_of = |needle: &str| {
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .unwrap()
+        };
+        let edge_b = edge_of("b.so");
+        assert_eq!(edge_b.entry_count, 1, "B carries only post-demotion growth");
+        let edge_a = edge_of("a.so");
+        assert_eq!(
+            edge_a.entry_count, 5,
+            "A keeps exactly its historical count"
+        );
+        assert_eq!(
+            edge_a.entry_count + edge_b.entry_count,
+            6,
+            "no growth duplication"
+        );
+        let UseCoverage::Counted { since_ns, lossy } = registry.coverage(edge_b) else {
+            panic!("the demoted growth must retain counted coverage");
+        };
+        assert!(!lossy);
+        assert!(
+            since_ns <= base_lookup,
+            "coverage cannot begin after its base lookup"
+        );
+        assert_eq!(
+            since_ns, h,
+            "coverage keeps the base PRE bound, not its observation POST"
+        );
+        assert!(
+            edge_a.entry_last_seen_ns.unwrap() >= base_lookup,
+            "the history observation cannot predate its baseline lookup"
+        );
+        assert_eq!(edge_a.entry_last_seen_ns, Some(base_post));
+        assert!(
+            edge_b.entry_first_seen_ns.unwrap() >= growth_lookup,
+            "the growth observation cannot predate its own lookup"
+        );
+        assert_eq!(edge_b.entry_first_seen_ns, Some(growth_post));
+        assert_eq!(edge_b.entry_last_seen_ns, Some(growth_post));
+    }
+
+    #[test]
+    fn demoted_initial_row_keeps_anchor_before_lookup_and_observation_after_lookup() {
+        assert_demoted_read_brackets(true);
+    }
+
+    #[test]
+    fn demoted_refresh_keeps_anchor_before_lookup_and_observation_after_lookup() {
+        assert_demoted_read_brackets(false);
+    }
+
     #[test]
     fn demoted_place_marks_its_edge() {
         // Round 4, window anchor (R4-N2): a demoted placement marks its
@@ -7941,10 +21046,10 @@ mod tests {
     }
 
     #[test]
-    fn an_ambiguous_count_finalizes_dropped_and_stays_there() {
+    fn a_previously_placed_ambiguous_count_suspends_without_retirement_authority() {
         // P3 finalization (sol#2): a shared-endpoint use both edges hold
-        // reads ambiguous — its count finalizes Dropped with its held
-        // count removed, so later advances can never attribute it.
+        // reads ambiguous. Its successfully placed prefix remains recoverable
+        // only through private retirement authority, absent from this fixture.
         use crate::discovery::inventory_attach_set::tests as fx;
         let (mut native, caller) = NativeScene::new();
         native.answer(7, 500, 41);
@@ -7985,18 +21090,18 @@ mod tests {
             placement.ambiguous, 1,
             "the shared-endpoint witness reads ambiguous: {placement:?}"
         );
-        // The rejection finalizes: Dropped, held count removed.
+        // The rejection suspends the previously placed exact pair.
         assert!(
             matches!(
                 native.scene.coordinator.pair_targets.get(&key),
-                Some(PairTarget::Dropped { .. })
+                Some(PairTarget::Suspended { .. })
             ),
-            "the ambiguous pair finalizes Dropped: {:?}",
+            "the previously placed pair suspends: {:?}",
             native.scene.coordinator.pair_targets.get(&key)
         );
         assert!(
-            !native.scene.coordinator.pair_counts.contains_key(&key),
-            "the rejected held count is removed"
+            native.scene.coordinator.pair_counts.contains_key(&key),
+            "the recoverable exact pair keeps its bounded held maximum"
         );
         // Permanence: a later advance attributes nowhere.
         let at = native.stamps.tick();
@@ -8041,7 +21146,10 @@ mod tests {
         let (mut native, caller) = NativeScene::new();
         // Production order: capture coverage begins before the reads, so
         // witness batches run the coverage half (health, freshness).
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
@@ -8126,7 +21234,10 @@ mod tests {
         // stale count.
         use crate::inventory_present::{Activity, Presentation};
         let (mut native, caller) = NativeScene::new();
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
@@ -8193,7 +21304,10 @@ mod tests {
         // is withheld even though no live loss was ever recorded.
         use crate::inventory_present::{Activity, Presentation};
         let (mut native, caller) = NativeScene::new();
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
@@ -8218,7 +21332,7 @@ mod tests {
             edge_of(&native).2
         );
         // Stop begins (production order: the coverage ends before the
-        // post-stop terminal refresh, inventory_capture.rs).
+        // post-stop terminal refresh, inventory/capture.rs).
         let live_last_seen = edge_of(&native)
             .1
             .expect("the positive read left a last-seen");
@@ -8359,7 +21473,10 @@ mod tests {
             "the display goes quiet past its window"
         );
         // Unreadable: the refresh fails persistently.
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         for _ in 0..2 {
             let at = native.stamps.tick();
             let mut batch = witness_batch();
@@ -8571,7 +21688,7 @@ mod tests {
     }
 
     impl NativeIdentity<crate::process::PidPin> for OneTicket {
-        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
             None
         }
 
@@ -8628,17 +21745,3651 @@ mod tests {
             "{events:?}"
         );
         coordinator.commit_batch(false).unwrap();
-        let proof_gap = coordinator
-            .registry()
-            .gaps()
-            .iter()
-            .find(|gap| gap.subject == "native exec proof not applied")
-            .expect("the owner lane refuses the proof until its adapter exists");
         assert!(
-            proof_gap.reason.contains("native lifecycle adapter"),
-            "{proof_gap:?}"
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native exec proof not applied"),
+            "the lifecycle adapter applies the proof: {:?}",
+            coordinator.registry().gaps()
+        );
+        let owner = coordinator.owner_of(caller).unwrap();
+        assert_eq!(
+            coordinator
+                .engine
+                .inventory_owner_epochs(owner)
+                .unwrap()
+                .image_state,
+            ImageCheck::Changed,
+            "the proved old owner is invalidated"
         );
         assert!(coordinator.adapter().record(caller).unwrap().retired);
+    }
+
+    /// H6 slice 2: a proved old incarnation invalidates all prepared old
+    /// leases/receipts before publication, with retained history. A generic
+    /// EXEC hint does not grant exact image state. Fresh correctly scoped
+    /// successor scan/physical names remain useful without a manifest or H0.
+    #[test]
+    fn automatic_exec_invalidates_old_inventory_leases() {
+        // Real provider child under PID scope: its mapped provider gives the
+        // owner committed module history to retain.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let child = spawn_cgroup_provider_child(dir.path(), &provider, "ready");
+        let pid = child.id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let now = crate::discovery::caller_registry::now_ns();
+        // Committed history first: a full native pass over the child.
+        let report = coordinator
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut FixtureImages,
+                &mut OwnerImages(fixture_image),
+                u64::MAX,
+                now,
+            )
+            .unwrap();
+        assert_eq!(report.native_callers, 1);
+        coordinator.commit_batch(true).unwrap();
+        let caller = coordinator.adapter().live_id(pid).unwrap();
+        let owner = coordinator.owner_of(caller).unwrap();
+        let modules_before = coordinator.engine.modules.len();
+        assert!(modules_before > 0, "the owner committed real history");
+        let complete_before = coordinator.engine.inventory_last_complete(owner).unwrap();
+        assert!(
+            complete_before.is_some(),
+            "the owner committed a complete receipt"
+        );
+        // A prepared old lease and a prepared old receipt, held across the
+        // proof: both must die with the proved old image.
+        let lease = coordinator.engine.acquire_inventory_scan(owner).unwrap();
+        let receipt = coordinator
+            .engine
+            .scan_inventory_owner(&lease, &mut FixtureImages)
+            .unwrap();
+        let prepared = coordinator
+            .engine
+            .prepare_inventory_reconciliation(receipt, &mut FixtureImages)
+            .unwrap();
+        // Natively proven transition: image (41,1) binds, then (41,2).
+        let domain = NativeDomainId::mint();
+        let mut identity = OneTicket { domain, ticket: 41 };
+        let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        let stamps = Stamps::from(now);
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                         rows: Vec<WitnessRow>| {
+            let mut events = Vec::new();
+            for batch in [
+                stamps.read(domain, rows),
+                stamps.drain(domain),
+                stamps.read(domain, Vec::new()),
+            ] {
+                events.extend(
+                    coordinator
+                        .stage_native(batch, &mut identity, now + 10)
+                        .events,
+                );
+            }
+            events
+        };
+        let bound = WitnessRow::scripted(domain, 41, 1, object, EndpointId(0), pid, now + 1);
+        assert!(stage(&mut coordinator, vec![bound]).is_empty());
+        let later = WitnessRow::scripted(domain, 41, 2, object, EndpointId(1), pid, now + 2);
+        let events = stage(&mut coordinator, vec![later]);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+            "{events:?}"
+        );
+        coordinator.commit_batch(false).unwrap();
+        // Decisive: the proof applies (no refusal gap) and the old owner is
+        // invalidated before publication.
+        assert!(
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native exec proof not applied"),
+            "the proof must apply, not refuse: {:?}",
+            coordinator.registry().gaps()
+        );
+        let epochs = coordinator.engine.inventory_owner_epochs(owner).unwrap();
+        assert_eq!(
+            epochs.image_state,
+            ImageCheck::Changed,
+            "the proved old image is invalidated"
+        );
+        assert!(
+            coordinator.engine.release_inventory_scan(&lease).is_err(),
+            "the prepared old scan lease dies with the image"
+        );
+        assert!(
+            coordinator
+                .engine
+                .commit_inventory_reconciliation(prepared, &mut FixtureImages)
+                .is_err(),
+            "the prepared old receipt dies with the image"
+        );
+        // History is retained, not rewritten.
+        assert_eq!(coordinator.engine.modules.len(), modules_before);
+        assert_eq!(
+            coordinator.engine.inventory_last_complete(owner).unwrap(),
+            complete_before
+        );
+        assert!(
+            coordinator.adapter().record(caller).unwrap().retired,
+            "the proved old caller retires"
+        );
+        let successor = coordinator.adapter().live_id(pid).unwrap();
+        assert_ne!(successor, caller);
+
+        // A generic EXEC hint grants nothing exact: an EXEC lifecycle
+        // record alone proves no transition and touches no owner.
+        let mut hinted = DiscoveryBatch::scripted(domain, Vec::new(), now + 20);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut hint_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        hint_record.hook_ts_ns = now + 20;
+        hint_record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        hint_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        hinted.records.push(hint_record);
+        let receipt = coordinator.stage_native(
+            NativeBatch::Lifecycle(hinted),
+            &mut OneTicket { domain, ticket: 41 },
+            now + 21,
+        );
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert!(
+            coordinator.binder.take_transitions().is_empty(),
+            "a hint alone is not an ended-incarnation proof"
+        );
+
+        // Fresh successor authority comes from its own validated admission:
+        // LoaderHint/Periodic touch neither image state nor the revision, and
+        // the successor scans usefully with no manifest and no H0 receipt.
+        // The successor carries its own expected image (a different exec
+        // from the fixture), so it gets its own exact guard.
+        struct ExactImage(BoundImage);
+        impl ImageGuard for ExactImage {
+            fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
+                assert!(view.still_the_same());
+                assert_eq!(expected, self.0);
+                ImageCheck::Exact
+            }
+        }
+        let image2 = BoundImage::scripted(fixture_domain(), u64::from(pid) + 1, 9).unwrap();
+        let owner2 = coordinator
+            .engine
+            .open_inventory_owner(pid, image2, &mut ExactImage(image2))
+            .unwrap();
+        coordinator.owners.insert(successor, owner2);
+        for cause in [RefreshCause::LoaderHint, RefreshCause::Periodic] {
+            coordinator
+                .engine
+                .request_inventory_refresh(owner2, cause)
+                .unwrap();
+        }
+        assert_eq!(
+            coordinator
+                .engine
+                .inventory_owner_epochs(owner2)
+                .unwrap()
+                .image_state,
+            ImageCheck::Exact,
+            "generic hints grant nothing exact and change nothing proven"
+        );
+        let commit2 = coordinator
+            .scan_owner(owner2, &mut ExactImage(image2), u64::MAX, now + 100)
+            .unwrap();
+        assert!(commit2.complete, "the successor scan commits");
+        assert!(
+            coordinator.engine.manifests.is_empty(),
+            "physical recovery needs no manifest"
+        );
+        assert_eq!(
+            coordinator.semantic_bindings().len(),
+            0,
+            "physical recovery needs no H0 receipt"
+        );
+        assert!(
+            coordinator
+                .engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == owner2 && !module.scanned.path.is_empty()),
+            "the successor scan names its modules"
+        );
+        assert!(
+            coordinator
+                .engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == owner),
+            "the old owner's module history stays retained alongside"
+        );
+
+        // A proof naming another owner is refused and changes nothing; the
+        // guard is never consulted and no Detailed cookie is assigned.
+        let self_pid = std::process::id();
+        let mut prover = InventoryCoordinator::new(
+            Scope::Pid(self_pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let proof_owner = prover
+            .test_open_native_owner(
+                self_pid,
+                fixture_image(self_pid).unwrap(),
+                &mut FixtureImages,
+                now,
+            )
+            .unwrap();
+        let proof_domain = NativeDomainId::mint();
+        let mut proof_identity = OneTicket {
+            domain: proof_domain,
+            ticket: 41,
+        };
+        prover
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(proof_domain, 0));
+        let proof_stamps = Stamps::from(now);
+        let mut proof_stage = |prover: &mut InventoryCoordinator<OsProcessSource>,
+                               rows: Vec<WitnessRow>| {
+            for batch in [
+                proof_stamps.read(proof_domain, rows),
+                proof_stamps.drain(proof_domain),
+                proof_stamps.read(proof_domain, Vec::new()),
+            ] {
+                prover.stage_native(batch, &mut proof_identity, now + 10);
+            }
+        };
+        let proof_object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        proof_stage(
+            &mut prover,
+            vec![WitnessRow::scripted(
+                proof_domain,
+                41,
+                1,
+                proof_object,
+                EndpointId(0),
+                self_pid,
+                now + 1,
+            )],
+        );
+        // The proving row goes through the binder only, so the transition
+        // can be captured for proof-construction without being applied.
+        let proving = WitnessRow::scripted(
+            proof_domain,
+            41,
+            2,
+            proof_object,
+            EndpointId(1),
+            self_pid,
+            now + 2,
+        );
+        for batch in [
+            proof_stamps.read(proof_domain, vec![proving]),
+            proof_stamps.drain(proof_domain),
+            proof_stamps.read(proof_domain, Vec::new()),
+        ] {
+            match batch {
+                NativeBatch::Witness(read) => {
+                    prover
+                        .binder
+                        .absorb_witnesses(&read, &prover.adapter, &mut proof_identity);
+                }
+                NativeBatch::Lifecycle(drain) => prover.binder.absorb_lifecycle(&drain),
+                _ => unreachable!("scripted read/drain only"),
+            }
+        }
+        let transitions = prover.binder.take_transitions();
+        assert_eq!(transitions.len(), 1, "one proven transition captured");
+        let stale_owner = ProcessViewId(999_999);
+        let before = coordinator.engine.inventory_owner_epochs(owner2).unwrap();
+        assert!(
+            coordinator
+                .engine
+                .request_inventory_refresh(
+                    owner2,
+                    RefreshCause::ValidatedExec(ExecProof::from_transition(
+                        stale_owner,
+                        transitions[0]
+                    )),
+                )
+                .is_err(),
+            "a proof naming another owner is refused"
+        );
+        assert_eq!(
+            coordinator.engine.inventory_owner_epochs(owner2).unwrap(),
+            before,
+            "a refused proof changes nothing"
+        );
+        // Re-proving the ended owner is idempotent: history stays intact and
+        // no new exact authority is granted.
+        let epochs_before = coordinator.engine.inventory_owner_epochs(owner).unwrap();
+        coordinator
+            .engine
+            .request_inventory_refresh(
+                owner,
+                RefreshCause::ValidatedExec(ExecProof::from_transition(owner, transitions[0])),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.engine.inventory_owner_epochs(owner).unwrap(),
+            epochs_before,
+            "re-proving an ended owner changes nothing"
+        );
+        // No guard can resurrect the ended owner: acquisition refuses before
+        // any guard check, so invalidation grants no new exact result and
+        // assigns no Detailed cookie.
+        struct CountingGuard(std::cell::Cell<usize>);
+        impl ImageGuard for CountingGuard {
+            fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
+                self.0.set(self.0.get() + 1);
+                ImageCheck::Exact
+            }
+        }
+        let mut counting = CountingGuard(std::cell::Cell::new(0));
+        assert!(
+            coordinator
+                .scan_owner(owner, &mut counting, u64::MAX, now + 200)
+                .is_err(),
+            "an ended owner scans nothing new"
+        );
+        assert_eq!(
+            counting.0.get(),
+            0,
+            "the ended owner refuses before any guard check"
+        );
+        let _ = proof_owner;
+    }
+
+    /// H6 slice 2: poison the numeric-PID reopen path; the successful
+    /// same-process successor still admits using original custody. Changed
+    /// process, wrong original Arc/domain, stale owner/revision and
+    /// mismatched current receipt refuse. Inventory and Detailed colliding
+    /// numeric cookies do not join. Replayed/delayed second-domain
+    /// transition creates no second successor.
+    #[test]
+    fn automatic_exec_successor_keeps_original_custody() {
+        // Scenes are boxed below: each coordinator value is ~54 KiB and
+        // debug builds retain every local's stack slot, so the oracle's
+        // scenes live on the heap to fit the default test stack.
+        use crate::discovery::native_binding::CallerLookup;
+        let pid = std::process::id();
+        let now = crate::discovery::caller_registry::now_ns();
+
+        // Native proof with reopen poisoned: the successor admits on the
+        // original held pin, with no numeric reopen attempted.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.scene.source.exec(7, 200, "/bin/other");
+            native.scene.source.poison_reopen();
+            let opens_before = native.scene.source.reopen_attempts();
+            native.answer(7, 500, 41);
+            let first = native.row(41, 1, 7, 100, 0);
+            native.witness(vec![first]);
+            let later = native.row(41, 2, 7, 1_100, 1);
+            let events = native.witness(vec![later]);
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("poisoned reopen must still admit the successor: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            let adapter = &native.scene.coordinator.adapter;
+            assert!(adapter.record(caller).unwrap().retired);
+            assert_eq!(adapter.live_id(7), Some(*new));
+            let successor = adapter.record(*new).unwrap();
+            assert_eq!(successor.start_time, Some(500), "same process");
+            assert_eq!(successor.incarnation, 1);
+            assert_eq!(
+                successor.exe.as_ref().unwrap().path.as_deref(),
+                Some("/bin/other"),
+                "the successor carries the current image"
+            );
+            let (_, pin) = adapter.live_pin(7).unwrap();
+            assert_eq!(*pin, (7, 500), "the original held pin moves over");
+            assert_eq!(
+                native.scene.source.reopen_attempts(),
+                opens_before,
+                "no numeric-PID reopen during the handoff"
+            );
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                },
+                "the old image keeps its count"
+            );
+        }
+
+        // Scan-proven exec with reopen poisoned: same retained custody.
+        {
+            let (mut scan, caller) = NativeScene::boxed();
+            scan.scene.source.exec(7, 200, "/bin/other");
+            scan.scene.source.poison_reopen();
+            let opens_before = scan.scene.source.reopen_attempts();
+            let observed: BTreeSet<u32> = [7].into_iter().collect();
+            let events = scan.scene.coordinator.adapter.reconcile(
+                &observed,
+                &mut |_| ImageAuthority::ScanPinned,
+                1_200,
+            );
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("poisoned scan handoff must still admit: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            let adapter = &scan.scene.coordinator.adapter;
+            assert_eq!(adapter.live_id(7), Some(*new));
+            assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+            assert_eq!(
+                scan.scene.source.reopen_attempts(),
+                opens_before,
+                "scan handoff never reopens by PID"
+            );
+        }
+
+        // Same-file reexec: the scan lane sees no change and splits
+        // nothing; actual native evidence still establishes the transition.
+        {
+            let (mut same, caller) = NativeScene::boxed();
+            same.scene.source.poison_reopen();
+            let observed: BTreeSet<u32> = [7].into_iter().collect();
+            let events = same.scene.coordinator.adapter.reconcile(
+                &observed,
+                &mut |_| ImageAuthority::ScanPinned,
+                1_200,
+            );
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(same.scene.coordinator.adapter.live_id(7), Some(caller));
+            same.answer(7, 500, 41);
+            same.witness(vec![same.row(41, 1, 7, 100, 0)]);
+            let events = same.witness(vec![same.row(41, 2, 7, 1_100, 1)]);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+                "{events:?}"
+            );
+            let adapter = &same.scene.coordinator.adapter;
+            let successor = adapter.record(adapter.live_id(7).unwrap()).unwrap();
+            assert_eq!(
+                successor.exe,
+                adapter.record(caller).unwrap().exe,
+                "same-file successor keeps the shared exe identity"
+            );
+        }
+
+        // Changed process refuses: a dead pin ends the old incarnation but
+        // mints no successor, attempts no reopen, and the reused pid later
+        // admits fresh with no inherited history.
+        {
+            let (mut dead, caller) = NativeScene::boxed();
+            dead.scene.source.poison_reopen();
+            dead.scene.source.kill(7);
+            let opens_before = dead.scene.source.reopen_attempts();
+            let events = dead.scene.coordinator.adapter.exec_transition(
+                caller,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_000,
+            );
+            let [
+                CallerEvent::AdmitFailed {
+                    pid,
+                    reason,
+                    budget,
+                },
+            ] = events.as_slice()
+            else {
+                panic!("a dead pin must refuse the successor: {events:?}");
+            };
+            assert_eq!(*pid, 7);
+            assert!(
+                reason.contains("custody lost"),
+                "the refusal names custody, not a pin failure: {reason}"
+            );
+            assert_eq!(*budget, None);
+            assert_eq!(
+                dead.scene.source.reopen_attempts(),
+                opens_before,
+                "no reopen is attempted without custody"
+            );
+            let adapter = &dead.scene.coordinator.adapter;
+            assert!(adapter.record(caller).unwrap().retired);
+            assert_eq!(adapter.live_id(7), None);
+            assert_eq!(adapter.len(), 1, "no successor incarnation was minted");
+        }
+
+        // Caller budget N/N+1 at the shared reservation: N works, N+1
+        // refuses with the exact requested occupancy.
+        {
+            let (mut full, caller) = NativeScene::boxed();
+            full.scene.coordinator.adapter.set_max_callers(2);
+            full.scene.source.spawn(8, 600);
+            full.scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 60)
+                .unwrap();
+            let events = full.scene.coordinator.adapter.exec_transition(
+                caller,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_000,
+            );
+            let [CallerEvent::AdmitFailed { budget, .. }] = events.as_slice() else {
+                panic!("a full budget must refuse the successor: {events:?}");
+            };
+            assert_eq!(
+                budget.unwrap(),
+                BudgetRefusal {
+                    resource: "callers",
+                    limit: 2,
+                    requested: 3,
+                }
+            );
+            assert_eq!(
+                full.scene.coordinator.adapter.admit_refused(),
+                1,
+                "the refusal counts exactly once"
+            );
+            let (mut roomy, caller) = NativeScene::boxed();
+            roomy.scene.coordinator.adapter.set_max_callers(3);
+            roomy.scene.source.spawn(8, 600);
+            roomy
+                .scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 60)
+                .unwrap();
+            let events = roomy.scene.coordinator.adapter.exec_transition(
+                caller,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_000,
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { .. }]),
+                "{events:?}"
+            );
+            assert_eq!(roomy.scene.coordinator.adapter.len(), 3);
+        }
+
+        // Mismatched current-image queries refuse: wrong exec, wrong pid,
+        // foreign domain, and a post-admission exec record.
+        {
+            let (mut current, caller) = NativeScene::boxed();
+            current.answer(7, 500, 41);
+            current.witness(vec![current.row(41, 1, 7, 100, 0)]);
+            let image = DomainCookie::scripted(current.domain, 41);
+            let request = |exec_id: u64, pid: u32| CurrentBindingRequest {
+                caller,
+                pid,
+                image,
+                exec_id,
+            };
+            let sight = |scene: &mut NativeScene, req: CurrentBindingRequest| {
+                let coordinator = &scene.scene.coordinator;
+                let lookup = &coordinator.adapter as &dyn CallerLookup<(u32, u64)>;
+                coordinator
+                    .binder
+                    .sight_current_binding(req, lookup, &mut scene.cookies)
+            };
+            // CurrentBindingSighting carries no Debug by design; match instead.
+            let refused =
+                |scene: &mut NativeScene, req: CurrentBindingRequest| match sight(scene, req) {
+                    Err(reason) => reason,
+                    Ok(_) => panic!("a mismatched current image must refuse"),
+                };
+            assert_eq!(
+                refused(&mut current, request(2, 7)),
+                UnboundReason::ExecAmbiguous,
+                "a mismatched exec refuses"
+            );
+            assert_eq!(
+                refused(&mut current, request(1, 999)),
+                UnboundReason::NoLiveCaller,
+                "a mismatched pid refuses"
+            );
+            let foreign = DomainCookie::scripted(NativeDomainId::mint(), 41);
+            assert_eq!(
+                refused(
+                    &mut current,
+                    CurrentBindingRequest {
+                        caller,
+                        pid: 7,
+                        image: foreign,
+                        exec_id: 1
+                    }
+                ),
+                UnboundReason::EvidenceIncomplete,
+                "a foreign domain proves nothing here"
+            );
+            current
+                .scene
+                .coordinator
+                .binder
+                .set_current_binding_clock(|| Some(1_005));
+            let sighted = match sight(&mut current, request(1, 7)) {
+                Ok(sighted) => sighted,
+                Err(reason) => panic!("the matched current image must sight: {reason:?}"),
+            };
+            assert!(
+                matches!(
+                    current
+                        .scene
+                        .coordinator
+                        .binder
+                        .check_current_binding(&sighted),
+                    CurrentBindingCheck::Proven
+                ),
+                "the matched current image proves"
+            );
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut exec_record: p11scope_ebpf_common::DiscoveryRecord =
+                unsafe { std::mem::zeroed() };
+            exec_record.hook_ts_ns = 60;
+            exec_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+            exec_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            let at = current.stamps.tick();
+            current.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                current.domain,
+                vec![exec_record],
+                at,
+            )));
+            assert_eq!(
+                refused(&mut current, request(1, 7)),
+                UnboundReason::ExecAfterAdmission,
+                "an exec record after admission refuses the old proof"
+            );
+        }
+
+        // Colliding numeric cookies across domains never join: a Detailed
+        // transition for pid 7 leaves the Inventory-bound pid 8 alone, and
+        // pid 8 keeps binding its own ticket afterwards.
+        {
+            let (mut split, caller) = NativeScene::boxed();
+            let detailed = split.domain;
+            split.scene.source.spawn(8, 600);
+            let caller8 = split
+                .scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 150)
+                .unwrap();
+            let inventory = NativeDomainId::mint();
+            split
+                .scene
+                .coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(inventory, 0));
+            split.cookies.answers.insert(
+                ((8, 600), inventory),
+                CookieQuery::Cookie(DomainCookie::scripted(inventory, 41)),
+            );
+            let endpoint = split.scene.delta.endpoints[0];
+            let bind8 =
+                WitnessRow::scripted(inventory, 41, 1, endpoint.object, endpoint.id, 8, 200);
+            split.stage(split.stamps.read(inventory, vec![bind8]));
+            split.stage(split.stamps.drain(inventory));
+            split.stage(split.stamps.read(inventory, Vec::new()));
+            split.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                split.scene.coordinator.binder.census().bound,
+                1,
+                "pid 8 binds ticket 41 in the Inventory domain"
+            );
+            split.answer(7, 500, 41);
+            split.witness(vec![split.row(41, 1, 7, 100, 0)]);
+            let events = split.witness(vec![split.row(41, 2, 7, 1_100, 1)]);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+                "{events:?}"
+            );
+            assert_eq!(
+                split.scene.coordinator.adapter.live_id(8),
+                Some(caller8),
+                "the Detailed transition touches no Inventory caller"
+            );
+            assert_eq!(
+                split.scene.coordinator.adapter.live_id(7).unwrap(),
+                match events.as_slice() {
+                    [CallerEvent::ExecRetired { new, .. }] => *new,
+                    _ => unreachable!(),
+                }
+            );
+            let _ = detailed;
+        }
+
+        // Held handoff, changed process: the generation turns over while
+        // the handoff is held, so commit refuses with custody lost and the
+        // handoff is consumed without minting.
+        {
+            let (mut held, caller) = NativeScene::boxed();
+            held.answer(7, 500, 41);
+            held.witness(vec![held.row(41, 1, 7, 100, 0)]);
+            let captured = held.binder_only(vec![held.row(41, 2, 7, 1_100, 1)]);
+            assert_eq!(captured.len(), 1);
+            assert!(
+                held.scene
+                    .coordinator
+                    .mint_pending_successor(captured[0], 1_200)
+                    .is_some()
+            );
+            assert!(
+                held.scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the handoff is held, not committed"
+            );
+            held.scene.source.kill(7);
+            held.scene.source.spawn(7, 900);
+            let events = held.scene.coordinator.commit_pending_successor(
+                caller,
+                ImageAuthority::ScanPinned,
+                1_300,
+                &mut crate::attach::monotonic_ns,
+            );
+            let [CallerEvent::AdmitFailed { reason, .. }] = events.as_slice() else {
+                panic!("a turned-over generation must refuse: {events:?}");
+            };
+            assert!(reason.contains("custody lost"), "{reason}");
+            assert!(
+                held.scene.coordinator.pending_successors.is_empty(),
+                "a refused handoff is consumed"
+            );
+            assert_eq!(held.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(held.scene.coordinator.adapter.len(), 1);
+        }
+
+        // Held handoff, newer image: a second exec before commit rejects
+        // the stale candidate; the renewed request services separately.
+        {
+            let (mut stale, caller) = NativeScene::boxed();
+            stale.answer(7, 500, 41);
+            stale.witness(vec![stale.row(41, 1, 7, 100, 0)]);
+            let captured = stale.binder_only(vec![stale.row(41, 2, 7, 1_100, 1)]);
+            stale
+                .scene
+                .coordinator
+                .mint_pending_successor(captured[0], 1_200)
+                .unwrap();
+            stale.scene.source.exec(7, 300, "/bin/newer");
+            let events = stale.scene.coordinator.commit_pending_successor(
+                caller,
+                ImageAuthority::ScanPinned,
+                1_300,
+                &mut crate::attach::monotonic_ns,
+            );
+            let [CallerEvent::AdmitFailed { reason, .. }] = events.as_slice() else {
+                panic!("a newer image before commit must refuse: {events:?}");
+            };
+            assert!(reason.contains("newer image"), "{reason}");
+        }
+
+        // Held handoff, clean commit: the manually held handoff commits to
+        // exactly one successor on original custody.
+        {
+            let (mut manual, caller) = NativeScene::boxed();
+            manual.answer(7, 500, 41);
+            manual.witness(vec![manual.row(41, 1, 7, 100, 0)]);
+            let captured = manual.binder_only(vec![manual.row(41, 2, 7, 1_100, 1)]);
+            manual
+                .scene
+                .coordinator
+                .mint_pending_successor(captured[0], 1_200)
+                .unwrap();
+            let events = manual.scene.coordinator.commit_pending_successor(
+                caller,
+                ImageAuthority::ScanPinned,
+                1_300,
+                &mut crate::attach::monotonic_ns,
+            );
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("a clean held handoff must commit: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            assert_eq!(manual.scene.coordinator.adapter.live_id(7), Some(*new));
+            assert!(manual.scene.coordinator.pending_successors.is_empty());
+            assert!(
+                manual
+                    .scene
+                    .coordinator
+                    .mint_pending_successor(captured[0], 1_400)
+                    .is_none(),
+                "no second handoff for an ended caller"
+            );
+        }
+
+        // Delayed proof from a second domain allocates no second
+        // successor: both transitions name the old incarnation, the first
+        // commits, and the replayed/delayed remainder changes nothing.
+        {
+            let (mut two, caller) = NativeScene::boxed();
+            let second = NativeDomainId::mint();
+            two.scene
+                .coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(second, 0));
+            two.cookies.answers.insert(
+                ((7, 500), second),
+                CookieQuery::Cookie(DomainCookie::scripted(second, 41)),
+            );
+            two.answer(7, 500, 41);
+            two.witness(vec![two.row(41, 1, 7, 100, 0)]);
+            let endpoint = two.scene.delta.endpoints[0];
+            let other = WitnessRow::scripted(second, 41, 1, endpoint.object, endpoint.id, 7, 100);
+            two.stage(two.stamps.read(second, vec![other]));
+            two.stage(two.stamps.drain(second));
+            two.stage(two.stamps.read(second, Vec::new()));
+            two.scene.coordinator.commit_batch(false).unwrap();
+            let first = two.binder_only(vec![two.row(41, 2, 7, 1_100, 1)]);
+            assert_eq!(first.len(), 1);
+            let proving =
+                WitnessRow::scripted(second, 41, 2, endpoint.object, endpoint.id, 7, 1_100);
+            let batches = [
+                two.stamps.read(second, vec![proving]),
+                two.stamps.drain(second),
+                two.stamps.read(second, Vec::new()),
+            ];
+            for batch in batches {
+                match batch {
+                    NativeBatch::Witness(read) => {
+                        let coordinator = &mut two.scene.coordinator;
+                        coordinator.binder.absorb_witnesses(
+                            &read,
+                            &coordinator.adapter,
+                            &mut two.cookies,
+                        );
+                    }
+                    NativeBatch::Lifecycle(drain) => {
+                        two.scene.coordinator.binder.absorb_lifecycle(&drain);
+                    }
+                    _ => unreachable!("scripted read/drain only"),
+                }
+            }
+            let delayed = two.scene.coordinator.binder.take_transitions();
+            assert_eq!(delayed.len(), 1, "the second domain proves independently");
+            assert_eq!(delayed[0].caller(), caller);
+            let events = two.scene.coordinator.apply_exec_transition(
+                first[0],
+                &mut two.cookies,
+                1_200,
+                &mut || Some(1_200),
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+                "{events:?}"
+            );
+            let events = two.scene.coordinator.apply_exec_transition(
+                delayed[0],
+                &mut two.cookies,
+                1_300,
+                &mut || Some(1_300),
+            );
+            assert!(events.is_empty(), "delayed proof mints nothing: {events:?}");
+            let events = two.scene.coordinator.apply_exec_transition(
+                first[0],
+                &mut two.cookies,
+                1_400,
+                &mut || Some(1_400),
+            );
+            assert!(
+                events.is_empty(),
+                "replayed proof mints nothing: {events:?}"
+            );
+            assert_eq!(two.scene.coordinator.adapter.len(), 2);
+        }
+
+        // Stale owner refuses the handoff: a desynced owner mapping ends
+        // the old incarnation without minting, and the real owner is
+        // untouched.
+        {
+            let mut stale_owner = boxed_os_coordinator(pid);
+            let caller = stale_owner
+                .test_open_native_owner(pid, fixture_image(pid).unwrap(), &mut FixtureImages, now)
+                .unwrap();
+            let owner = stale_owner.owner_of(caller).unwrap();
+            stale_owner.owners.insert(caller, ProcessViewId(999_999));
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+            let stamps = Stamps::from(now);
+            stale_owner
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                             rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    stamps.read(domain, rows),
+                    stamps.drain(domain),
+                    stamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(
+                        coordinator
+                            .stage_native(batch, &mut identity, now + 10)
+                            .events,
+                    );
+                }
+                events
+            };
+            assert!(
+                stage(
+                    &mut stale_owner,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        now + 1
+                    )]
+                )
+                .is_empty()
+            );
+            let events = stage(
+                &mut stale_owner,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    2,
+                    object,
+                    EndpointId(1),
+                    pid,
+                    now + 2,
+                )],
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller),
+                "a stale owner retires without a successor: {events:?}"
+            );
+            stale_owner.commit_batch(false).unwrap();
+            assert!(
+                stale_owner
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "native exec proof not applied"),
+                "the stale handoff records its refusal"
+            );
+            assert_eq!(stale_owner.adapter.live_id(pid), None);
+            assert_eq!(stale_owner.adapter.len(), 1);
+            assert_eq!(
+                stale_owner
+                    .engine
+                    .inventory_owner_epochs(owner)
+                    .unwrap()
+                    .image_state,
+                ImageCheck::Exact,
+                "the real owner is untouched by the desync"
+            );
+        }
+
+        // Exhausted owner revision refuses permanently with history
+        // intact: the old incarnation retires, nothing is minted, and the
+        // owner stays readable.
+        {
+            let mut exhausted = boxed_os_coordinator(pid);
+            let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+            let stamps = Stamps::from(now);
+            let caller = exhausted
+                .test_open_native_owner(pid, fixture_image(pid).unwrap(), &mut FixtureImages, now)
+                .unwrap();
+            let owner = exhausted.owner_of(caller).unwrap();
+            exhausted.engine.test_exhaust_owner_revision(owner).unwrap();
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            exhausted
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                             rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    stamps.read(domain, rows),
+                    stamps.drain(domain),
+                    stamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(
+                        coordinator
+                            .stage_native(batch, &mut identity, now + 10)
+                            .events,
+                    );
+                }
+                events
+            };
+            assert!(
+                stage(
+                    &mut exhausted,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        now + 1
+                    )]
+                )
+                .is_empty()
+            );
+            let events = stage(
+                &mut exhausted,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    2,
+                    object,
+                    EndpointId(1),
+                    pid,
+                    now + 2,
+                )],
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller),
+                "an exhausted revision retires without a successor: {events:?}"
+            );
+            exhausted.commit_batch(false).unwrap();
+            assert!(
+                exhausted
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "native exec proof not applied"),
+                "the exhausted handoff records its refusal"
+            );
+            assert!(exhausted.engine.inventory_owner_epochs(owner).is_ok());
+        }
+
+        // Stop wins before successor admission: a held handoff releases
+        // its custody at stop and no commit follows.
+        {
+            let (mut held_stop, caller) = NativeScene::boxed();
+            held_stop.answer(7, 500, 41);
+            held_stop.witness(vec![held_stop.row(41, 1, 7, 100, 0)]);
+            let captured = held_stop.binder_only(vec![held_stop.row(41, 2, 7, 1_100, 1)]);
+            held_stop
+                .scene
+                .coordinator
+                .mint_pending_successor(captured[0], 1_200)
+                .unwrap();
+            held_stop.scene.coordinator.stop();
+            assert!(
+                held_stop.scene.coordinator.pending_successors.is_empty(),
+                "stop releases held handoffs"
+            );
+            assert!(
+                held_stop
+                    .scene
+                    .coordinator
+                    .commit_pending_successor(
+                        caller,
+                        ImageAuthority::ScanPinned,
+                        1_300,
+                        &mut || Some(1_300),
+                    )
+                    .is_empty(),
+                "no commit after the release"
+            );
+            held_stop.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                held_stop
+                    .gap_subjects()
+                    .iter()
+                    .any(|subject| subject == "held exec handoffs released at stop"),
+                "the release is recorded"
+            );
+        }
+
+        // Stop wins before successor admission and new scans: the proved
+        // old incarnation still retires, no successor is minted, new
+        // passes refuse without consuming a pass number, and staged facts
+        // still drain.
+        {
+            let (mut stopped, caller) = NativeScene::boxed();
+            stopped.answer(7, 500, 41);
+            stopped.witness(vec![stopped.row(41, 1, 7, 100, 0)]);
+            stopped.scene.coordinator.stop();
+            stopped.scene.coordinator.stop();
+            let events = stopped.witness(vec![stopped.row(41, 2, 7, 1_100, 1)]);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller),
+                "stop retires the proved caller without a successor: {events:?}"
+            );
+            assert_eq!(stopped.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(stopped.scene.coordinator.adapter.len(), 1);
+            let passes_before = stopped.scene.coordinator.passes();
+            let report = stopped.scene.coordinator.observe_empty_pass(
+                &mut super::inventory::UnavailableImageGuard,
+                &mut stopped.cookies,
+                "post-stop pass",
+                1_500,
+            );
+            assert_eq!(report.scanned, 0);
+            assert!(report.events.is_empty());
+            assert_eq!(report.pass, passes_before);
+            assert_eq!(
+                stopped.scene.coordinator.passes(),
+                passes_before,
+                "a refused pass consumes no pass number"
+            );
+            stopped.scene.coordinator.commit_batch(false).unwrap();
+            let subjects = stopped.gap_subjects();
+            for want in [
+                "successor admission refused while stopped",
+                "scan refused after stop",
+            ] {
+                assert!(
+                    subjects.iter().any(|subject| subject == want),
+                    "the refusal is recorded: {subjects:?}"
+                );
+            }
+        }
+    }
+
+    /// A normal single-thread exit reaches sched_process_exit before
+    /// exit_notify makes its pidfd readable. The source's still-held pin
+    /// scripts that interval; it is not a positive live-worker witness.
+    #[test]
+    fn automatic_exec_single_thread_exit_before_pidfd_ready_has_no_link_loss() {
+        let (mut native, caller) = NativeScene::boxed();
+        native.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::Unresolved,
+        );
+        native.scene.source.poison_reopen();
+        let opens_before = native.scene.source.reopen_attempts();
+        // SAFETY: DiscoveryRecord contains only integer fields.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 1_500;
+        record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+        // The ordinary exit is not complete yet: the original pin still
+        // holds, but no non-leader liveness proof has been supplied.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![record],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let adapter = &native.scene.coordinator.adapter;
+        assert_eq!(adapter.live_id(7), Some(caller), "original custody stays");
+        assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+        assert!(!adapter.record(caller).unwrap().retired, "no tombstone");
+
+        // Now the same ordinary exit completes. A later empty lifecycle
+        // pass must not leave an irreversible false worker-loss history.
+        native.scene.source.kill(7);
+        let receipt = native.drain();
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.source.reopen_attempts(),
+            opens_before,
+            "exit adjudication never reopens the numeric PID"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.caller != Some(caller) || gap.subject != "leader task link loss"),
+            "a held pin during ordinary exit is not evidence of surviving workers: {:?}",
+            native.scene.coordinator.registry.gaps(),
+        );
+    }
+
+    /// H6 slice 2: leader exit with live sibling keeps original custody and
+    /// explicit link loss; later EXEC in the same and a later batch restores
+    /// useful endpoints. Whole-group death and delayed pre-admission EXEC
+    /// for reused PID cannot attach. Owned-initial-exec acknowledgement
+    /// happens exactly once.
+    #[test]
+    fn automatic_exec_live_group_exit_then_exec_recovers() {
+        // Leader exit with a live sibling: explicit link loss once, custody
+        // kept, no tombstone, sibling untouched.
+        let (mut native, leader) = NativeScene::new();
+        native.scene.source.spawn(8, 600);
+        let sibling = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 150)
+            .unwrap();
+        native.answer(7, 500, 41);
+        native.answer(8, 600, 42);
+        native.witness(vec![native.row(41, 1, 7, 100, 0)]);
+        native.witness(vec![native.row(42, 1, 8, 200, 0)]);
+        // SAFETY: DiscoveryRecord contains only integer fields.
+        let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit_record.hook_ts_ns = 1_500;
+        exit_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        exit_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let adapter = &native.scene.coordinator.adapter;
+        assert_eq!(adapter.live_id(7), Some(leader), "custody kept");
+        assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+        assert!(!adapter.record(leader).unwrap().retired, "no tombstone");
+        assert_eq!(
+            adapter.live_id(8),
+            Some(sibling),
+            "the live sibling is untouched"
+        );
+        let losses = native
+            .gap_subjects()
+            .iter()
+            .filter(|subject| subject.as_str() == "leader task link loss")
+            .count();
+        assert_eq!(losses, 1, "explicit link loss, recorded once");
+        // A replayed exit, an unknown pid, and a truly dead caller add no
+        // further link-loss record.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "link loss is recorded once per incarnation"
+        );
+
+        // Later EXEC in the next cycle restores useful endpoints.
+        native.scene.source.exec(7, 200, "/bin/other");
+        let events = native.witness(vec![native.row(41, 2, 7, 1_600, 1)]);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("EXEC after link loss must recover: {events:?}");
+        };
+        assert_eq!(*old, leader);
+        let successor = *new;
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+        native.scene.project(7, 1_700);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        native.witness(vec![native.row(41, 2, 7, 1_800, 0)]);
+        // The recovery row binds the successor (useful endpoints). Its pair
+        // stays count-dropped by the proving row's unbound decision — the
+        // pre-existing C7 dropped-pair rule, unchanged by this slice — so
+        // the edge reads witnessed, not counted.
+        assert_eq!(
+            native.scene.coverage(successor),
+            UseCoverage::Witnessed { first_ns: 1_800 },
+            "the successor serves useful endpoints"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 3, "leader, sibling, and successor rows bind");
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecTransition),
+            Some(&1),
+            "only the proving row stays unbound"
+        );
+        assert_eq!(
+            native.scene.coverage(leader),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            },
+            "the old image keeps its count"
+        );
+
+        // Later EXEC in a later batch (after unrelated work) recovers too.
+        let (mut later, leader) = NativeScene::new();
+        later.scene.source.spawn(8, 600);
+        later
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 150)
+            .unwrap();
+        later.answer(7, 500, 41);
+        later.answer(8, 600, 42);
+        later.witness(vec![later.row(41, 1, 7, 100, 0)]);
+        let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit_record.hook_ts_ns = 1_500;
+        exit_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        exit_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        later.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            later.domain,
+            vec![exit_record],
+            later.stamps.tick(),
+        )));
+        later.scene.coordinator.commit_batch(false).unwrap();
+        later.witness(vec![later.row(42, 1, 8, 1_550, 0)]);
+        later.scene.source.exec(7, 200, "/bin/other");
+        let events = later.witness(vec![later.row(41, 2, 7, 1_600, 1)]);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == leader),
+            "EXEC in a later batch must recover: {events:?}"
+        );
+
+        // Whole-group death twin: both incarnations exit, the pid is reused
+        // by a fresh generation, and a delayed pre-admission EXEC for the
+        // old incarnation cannot attach to anything.
+        let (mut dead, leader) = NativeScene::new();
+        dead.scene.source.spawn(8, 600);
+        dead.scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 150)
+            .unwrap();
+        dead.answer(7, 500, 41);
+        dead.witness(vec![dead.row(41, 1, 7, 100, 0)]);
+        let proving = dead.row(41, 2, 7, 1_600, 1);
+        let delayed = dead.binder_only(vec![proving]);
+        assert_eq!(delayed.len(), 1, "one transition captured pre-death");
+        dead.scene.source.kill(7);
+        dead.scene.source.kill(8);
+        let events = dead.scene.coordinator.adapter.reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, CallerEvent::Exited { .. })),
+            "whole-group death exits every incarnation: {events:?}"
+        );
+        dead.scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        dead.scene.coordinator.commit_batch(false).unwrap();
+        dead.scene.source.spawn(7, 900);
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = dead.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_100,
+        );
+        let [CallerEvent::Admitted { id }] = events.as_slice() else {
+            panic!("the reused pid admits fresh: {events:?}");
+        };
+        let fresh = *id;
+        assert_ne!(fresh, leader);
+        let adapter = &dead.scene.coordinator.adapter;
+        let record = adapter.record(fresh).unwrap();
+        assert_eq!(record.start_time, Some(900));
+        assert_eq!(record.incarnation, 1);
+        dead.scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_100);
+        dead.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            dead.scene
+                .coordinator
+                .registry
+                .edges()
+                .all(|edge| edge.caller != fresh),
+            "the fresh incarnation inherits no history"
+        );
+        let stale = dead.scene.coordinator.apply_exec_transition(
+            delayed[0],
+            &mut dead.cookies,
+            2_200,
+            &mut || Some(2_200),
+        );
+        assert!(
+            stale.is_empty(),
+            "a delayed transition for a dead caller attaches nothing: {stale:?}"
+        );
+        assert_eq!(dead.scene.coordinator.adapter.live_id(7), Some(fresh));
+        assert_eq!(dead.scene.coordinator.adapter.len(), 3);
+
+        // Owned-initial-exec acknowledgement happens exactly once: the
+        // initial image binds without emitting, the real exec emits one
+        // transition, and a replay emits nothing further.
+        let (mut once, leader) = NativeScene::new();
+        once.answer(7, 500, 41);
+        assert!(
+            once.binder_only(vec![once.row(41, 1, 7, 100, 0)])
+                .is_empty(),
+            "the initial image binds; it never transitions"
+        );
+        let emitted = once.binder_only(vec![once.row(41, 2, 7, 1_100, 1)]);
+        assert_eq!(emitted.len(), 1, "the real exec emits one transition");
+        assert_eq!(emitted[0].caller(), leader);
+        assert!(
+            once.binder_only(vec![once.row(41, 2, 7, 1_100, 1)])
+                .is_empty(),
+            "a replayed proof emits no second transition"
+        );
+        let events = once.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut once.cookies,
+            1_200,
+            &mut || Some(1_200),
+        );
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == leader),
+            "{events:?}"
+        );
+        let again = once.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut once.cookies,
+            1_300,
+            &mut || Some(1_300),
+        );
+        assert!(
+            again.is_empty(),
+            "one successor per ended caller: {again:?}"
+        );
+        assert_eq!(once.scene.coordinator.adapter.len(), 2);
+    }
+
+    /// H6 stale attribution: a leader exit whose hook predates the live
+    /// caller's admission is the old image's delayed record, never the
+    /// live incarnation's link loss — PID equality alone cannot select
+    /// it. A delayed old-image exit and a reused-PID exit both stay
+    /// silent; a fresh exit still records exactly once.
+    #[test]
+    fn stale_leader_exits_never_cut_a_later_incarnation() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+        fn link_losses(native: &NativeScene) -> usize {
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count()
+        }
+
+        // Delayed old-image exit: the hook predates pid 7's admission
+        // at 50, so it records nothing on the live incarnation.
+        let (mut native, _leader) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.witness(vec![native.row(41, 1, 7, 100, 0)]);
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record(7, 40)],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&native), 0, "a pre-admission exit stays silent");
+        // Control: a fresh exit for the live incarnation still records.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record(7, 1_500)],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&native), 1, "a fresh exit still records once");
+
+        // Reused PID: pid 7 exits, the pid is reused by a fresh
+        // generation admitted at 2,100, and the old image's delayed
+        // exit (hook 1,500) lands on nothing.
+        let (mut reused, _leader) = NativeScene::new();
+        reused.scene.source.kill(7);
+        let events = reused.scene.coordinator.adapter.reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        reused
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        reused.scene.source.spawn(7, 900);
+        reused.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = reused.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_100,
+        );
+        let [CallerEvent::Admitted { id }] = events.as_slice() else {
+            panic!("the reused pid admits fresh: {events:?}");
+        };
+        let fresh = *id;
+        reused
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_100);
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(reused.scene.coordinator.adapter.live_id(7), Some(fresh));
+        let receipt = reused.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            reused.domain,
+            vec![exit_record(7, 1_500)],
+            reused.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            link_losses(&reused),
+            0,
+            "the old image's delayed exit never cuts the fresh incarnation"
+        );
+        // Control: a fresh exit for the new incarnation still records.
+        let receipt = reused.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            reused.domain,
+            vec![exit_record(7, 2_500)],
+            reused.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&reused), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, same pass: the pass starts at 2_000, the old
+    /// leader exits (hook 2_050), the pid is reused, ONE reconcile retires
+    /// the old incarnation and admits the successor, then the held exit
+    /// stages. The exit predates the successor's admission detection, so
+    /// it stays silent: no link-loss gap and no tail uncertainty on the
+    /// successor (the cut's two inputs; only bound callers fill the tail,
+    /// and scripted scenes cannot bind, so the gap is the discriminating
+    /// half). A pass-start boundary accepts this exit.
+    #[test]
+    fn same_pass_reuse_admission_refuses_the_old_exit() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+        fn link_losses(native: &NativeScene) -> usize {
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count()
+        }
+
+        let (mut reused, _leader) = NativeScene::new();
+        reused.scene.source.kill(7);
+        reused.scene.source.spawn(7, 900);
+        reused.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = reused.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+            &mut || Some(2_100),
+        );
+        let [CallerEvent::Reused { new, .. }] = events.as_slice() else {
+            panic!("one pass retires the old incarnation and admits the reuse: {events:?}");
+        };
+        let fresh = *new;
+        let record = reused.scene.coordinator.adapter.record(fresh).unwrap();
+        assert_eq!(
+            record.first_seen_ns, 2_000,
+            "the pass clock stamps first-seen"
+        );
+        assert_eq!(
+            record.admitted_ns, 2_100,
+            "detection time stamps the admission boundary"
+        );
+        reused
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(reused.scene.coordinator.adapter.live_id(7), Some(fresh));
+        let receipt = reused.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            reused.domain,
+            vec![exit_record(7, 2_050)],
+            reused.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            link_losses(&reused),
+            0,
+            "the same-pass old exit stays silent"
+        );
+        assert!(
+            !reused.scene.coordinator.tail_uncertain.contains(&fresh),
+            "no false semantic cut fences the successor"
+        );
+        // Control: a fresh exit for the successor still records.
+        let receipt = reused.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            reused.domain,
+            vec![exit_record(7, 2_500)],
+            reused.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&reused), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, turnover during reconciliation (F7a):
+    /// two incarnations admitted in one sweep each stamp after their
+    /// own validation. Pid 7 reuses and pid 8 exec-changes; the sweep
+    /// meets 7 first (2100) then 8 (2200). An old exit for pid 8 at
+    /// 2150 predates 8's admission and stays silent; a fresh exit at
+    /// 2500 still records. A sweep-start sample shared across both
+    /// admissions cuts the successor (link loss 1 vs 0).
+    #[test]
+    fn turnover_during_reconciliation_stamps_each_admission_after_its_validation() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+        fn link_losses(native: &NativeScene) -> usize {
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count()
+        }
+
+        let (mut scene, _leader) = NativeScene::new();
+        scene.scene.source.spawn(8, 600);
+        scene.scene.source.set_leader_exit_observation(
+            8,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let observed8: BTreeSet<u32> = [7, 8].into_iter().collect();
+        let events = scene.scene.coordinator.adapter.reconcile(
+            &observed8,
+            &mut |_| ImageAuthority::ScanPinned,
+            100,
+        );
+        scene.scene.coordinator.apply_reconcile_events(&events, 100);
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        // Mid-sweep turnover: pid 7 reuses (new generation), pid 8
+        // execs (same generation, new image). The sweep meets 7 first.
+        scene.scene.source.kill(7);
+        scene.scene.source.spawn(7, 900);
+        scene.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        scene.scene.source.exec(8, 200, "/bin/driver2");
+        let observed: BTreeSet<u32> = [7, 8].into_iter().collect();
+        // The detection clock advances mid-sweep: pid 7's successor
+        // stamps 2100, pid 8's 2200.
+        let mut stamps = [2_100, 2_200].into_iter();
+        let events = scene.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+            &mut || stamps.next(),
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        let [first, second] = events.as_slice() else {
+            panic!("two successors admit in sweep order: {events:?}");
+        };
+        let (fresh7, fresh8) = match (first, second) {
+            (
+                CallerEvent::Reused { new: fresh7, .. },
+                CallerEvent::ExecRetired { new: fresh8, .. },
+            ) => (*fresh7, *fresh8),
+            _ => panic!("pid 7 reuses first, pid 8 execs second: {events:?}"),
+        };
+        let record7 = scene.scene.coordinator.adapter.record(fresh7).unwrap();
+        let record8 = scene.scene.coordinator.adapter.record(fresh8).unwrap();
+        assert_eq!(
+            record7.admitted_ns, 2_100,
+            "the first admission stamps its own detection"
+        );
+        assert_eq!(
+            record8.admitted_ns, 2_200,
+            "the mid-sweep admission stamps after its own validation, not the sweep start"
+        );
+        scene
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        // The pid-8 successor was detected after pid 7's, so an exit
+        // at 2150 predates its admission and stays silent.
+        let receipt = scene.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            scene.domain,
+            vec![exit_record(8, 2_150)],
+            scene.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            link_losses(&scene),
+            0,
+            "the mid-sweep old exit stays silent"
+        );
+        // Control: a fresh exit for the successor still records.
+        let receipt = scene.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            scene.domain,
+            vec![exit_record(8, 2_500)],
+            scene.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&scene), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, detection-clock failure (F7a): when the
+    /// per-incarnation stamp cannot read the clock, the incarnation
+    /// stamps zero (the guard never filters it) and the coordinator
+    /// takes the gap fallback explicitly — never a silent pass-start
+    /// stamp. Exits then record unfiltered with one unvalidated-clocks
+    /// gap.
+    #[test]
+    fn detection_clock_failure_takes_the_gap_fallback_explicitly() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+
+        let (mut scene, _leader) = NativeScene::new();
+        scene.scene.source.kill(7);
+        scene.scene.source.spawn(7, 900);
+        scene.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = scene.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+            &mut || None,
+        );
+        let [CallerEvent::Reused { new, .. }] = events.as_slice() else {
+            panic!("the reuse admits despite the clock failure: {events:?}");
+        };
+        let fresh = *new;
+        let record = scene.scene.coordinator.adapter.record(fresh).unwrap();
+        assert_eq!(
+            record.admitted_ns, 0,
+            "clock failure stamps zero, never the silent pass-start 2000"
+        );
+        assert!(
+            scene
+                .scene
+                .coordinator
+                .adapter
+                .take_detection_clock_failed(),
+            "the failure flag is set for the coordinator"
+        );
+        // Production takes the gap fallback explicitly here.
+        scene.scene.coordinator.exit_clocks_comparable = false;
+        scene
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        let receipt = scene.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            scene.domain,
+            vec![exit_record(7, 100)],
+            scene.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = scene.gap_subjects();
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "the exit records unfiltered: {subjects:?}"
+        );
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader-exit clocks unvalidated")
+                .count(),
+            1,
+            "one gap notes the unvalidated clocks: {subjects:?}"
+        );
+    }
+
+    /// H6 stale attribution, exec successor: the native transition path
+    /// admits with a fresh boundary already, so a pre-transition exit
+    /// stays silent and a fresh one records. Pins the exec path while
+    /// the scan path moves to detection time.
+    #[test]
+    fn exec_successor_admission_refuses_the_pre_transition_exit() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+        fn link_losses(native: &NativeScene) -> usize {
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count()
+        }
+
+        let (mut native, leader) = NativeScene::new();
+        native.answer(7, 500, 41);
+        assert!(
+            native
+                .binder_only(vec![native.row(41, 1, 7, 100, 0)])
+                .is_empty(),
+            "the initial image binds; it never transitions"
+        );
+        let emitted = native.binder_only(vec![native.row(41, 2, 7, 1_100, 1)]);
+        assert_eq!(emitted.len(), 1, "the real exec emits one transition");
+        let events = native.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut native.cookies,
+            1_200,
+            &mut || Some(1_200),
+        );
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("the transition retires the old incarnation: {events:?}");
+        };
+        assert_eq!(*old, leader);
+        let fresh = *new;
+        native
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 1_200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(fresh));
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record(7, 1_100)],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            link_losses(&native),
+            0,
+            "the pre-transition exit stays silent"
+        );
+        assert!(
+            !native.scene.coordinator.tail_uncertain.contains(&fresh),
+            "no false semantic cut fences the successor"
+        );
+        // Control: a fresh exit for the successor still records.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record(7, 1_500)],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&native), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, native retained successor (F7a): the
+    /// supplied `now_ns` may be a stale pass-start stamp, so admission
+    /// samples the detection clock after validation instead. A clock
+    /// failure stamps zero and takes the gap fallback explicitly
+    /// through the commit path — before subsequent exit attribution.
+    #[test]
+    fn native_successor_admission_samples_detection_after_validation() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+
+        // Earlier supplied timestamp: the boundary is the fresh
+        // detection sample, never the stale pass-start stamp.
+        let (mut stale, _leader) = NativeScene::new();
+        stale.answer(7, 500, 41);
+        assert!(
+            stale
+                .binder_only(vec![stale.row(41, 1, 7, 100, 0)])
+                .is_empty()
+        );
+        let emitted = stale.binder_only(vec![stale.row(41, 2, 7, 1_100, 1)]);
+        let events = stale.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut stale.cookies,
+            1_200,
+            &mut || Some(5_000),
+        );
+        let [CallerEvent::ExecRetired { new, .. }] = events.as_slice() else {
+            panic!("the transition must commit: {events:?}");
+        };
+        let record = stale
+            .scene
+            .coordinator
+            .adapter
+            .record(*new)
+            .expect("the successor is recorded");
+        assert_eq!(
+            record.admitted_ns, 5_000,
+            "detection sampled after validation, not the stale supplied 1200"
+        );
+        assert_eq!(
+            record.first_seen_ns, 1_200,
+            "scan-window semantics keep the supplied stamp"
+        );
+
+        // Clock failure: zero stamp plus the explicit gap fallback,
+        // propagated by the commit path itself — then the old exit
+        // records unfiltered, never silently suppressed.
+        let (mut failed, _leader) = NativeScene::new();
+        failed.answer(7, 500, 41);
+        assert!(
+            failed
+                .binder_only(vec![failed.row(41, 1, 7, 100, 0)])
+                .is_empty()
+        );
+        let emitted = failed.binder_only(vec![failed.row(41, 2, 7, 1_100, 1)]);
+        let events = failed.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut failed.cookies,
+            1_200,
+            &mut || None,
+        );
+        let [CallerEvent::ExecRetired { new, .. }] = events.as_slice() else {
+            panic!("admission still commits on clock failure: {events:?}");
+        };
+        let record = failed
+            .scene
+            .coordinator
+            .adapter
+            .record(*new)
+            .expect("the successor is recorded");
+        assert_eq!(
+            record.admitted_ns, 0,
+            "clock failure stamps zero, never the silent pass-start 1200"
+        );
+        assert!(
+            !failed.scene.coordinator.exit_clocks_comparable,
+            "the commit path propagates the failure into the gap fallback"
+        );
+        failed
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 1_200);
+        failed.scene.coordinator.commit_batch(false).unwrap();
+        let receipt = failed.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            failed.domain,
+            vec![exit_record(7, 100)],
+            failed.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        failed.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = failed.gap_subjects();
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "the exit records unfiltered: {subjects:?}"
+        );
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader-exit clocks unvalidated")
+                .count(),
+            1,
+            "one gap notes the unvalidated clocks: {subjects:?}"
+        );
+    }
+
+    /// H6 stale attribution, clock comparability: the detector agrees
+    /// with this process's ACTIVE time namespace — identical
+    /// active/children namespaces plus a zero monotonic offset read
+    /// comparable, anything else (or anything unreadable) reads
+    /// unvalidated.
+    #[test]
+    fn exit_clock_comparability_matches_this_process_offsets() {
+        let namespaces_match = match (
+            std::fs::read_link("/proc/self/ns/time"),
+            std::fs::read_link("/proc/self/ns/time_for_children"),
+        ) {
+            (Ok(active), Ok(children)) => active == children,
+            _ => false,
+        };
+        let offsets_zero = std::fs::read_to_string("/proc/self/timens_offsets")
+            .ok()
+            .and_then(|offsets| {
+                offsets.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    if fields.next()? != "monotonic" {
+                        return None;
+                    }
+                    let (sec, nsec) = (fields.next()?, fields.next()?);
+                    Some(sec.parse::<i64>().ok()? == 0 && nsec.parse::<i64>().ok()? == 0)
+                })
+            })
+            .unwrap_or(false);
+        assert_eq!(
+            super::exit_clocks_comparable(),
+            namespaces_match && offsets_zero,
+            "the detector reads this process's active time namespace"
+        );
+    }
+
+    /// H6 stale attribution, active time namespace (F7b): the offsets
+    /// file exposes `time_ns_for_children`, so differing active and
+    /// children namespaces read incomparable even with a zero offset —
+    /// otherwise an offset active namespace plus a zero-offset
+    /// children namespace would wrongly enable comparison and suppress
+    /// genuine exits. Anything unreadable stays incomparable (closed).
+    #[test]
+    fn differing_time_namespaces_read_incomparable_despite_zero_offsets() {
+        let active: std::path::PathBuf = "time:[4026531834]".into();
+        let children_same: std::path::PathBuf = "time:[4026531834]".into();
+        let children_other: std::path::PathBuf = "time:[4026532900]".into();
+        let zero = "monotonic           0         0\nboottime            0         0\n";
+        let offset = "monotonic           5         0\nboottime            0         0\n";
+        assert!(
+            super::exit_clocks_comparable_with(Some(&active), Some(&children_same), Some(zero)),
+            "identical namespaces with a zero offset compare"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), Some(&children_other), Some(zero)),
+            "differing namespaces never compare, even with a zero offset"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), Some(&children_same), Some(offset)),
+            "a nonzero offset never compares"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(None, Some(&children_same), Some(zero)),
+            "an unreadable active namespace reads incomparable"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), None, Some(zero)),
+            "an unreadable children namespace reads incomparable"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), Some(&children_same), None),
+            "unreadable offsets read incomparable"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(
+                Some(&active),
+                Some(&children_same),
+                Some("monotonic           xx         0\n")
+            ),
+            "unparseable offsets read incomparable"
+        );
+    }
+
+    /// H6 stale attribution, unvalidated clocks: with an unknown clock
+    /// offset the stale-exit guard stays off — even a predating exit
+    /// records rather than risk suppressing a genuine one — and one
+    /// gap says the clocks are unvalidated.
+    #[test]
+    fn unvalidated_exit_clocks_record_without_filtering() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+
+        let (mut native, _leader) = NativeScene::new();
+        assert!(
+            native.scene.coordinator.exit_clocks_comparable,
+            "scripted scenes define comparable clocks"
+        );
+        native.scene.coordinator.exit_clocks_comparable = false;
+        // Predates pid 7's admission at 50: filtered with validated
+        // clocks, recorded without.
+        for _ in 0..2 {
+            let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                native.domain,
+                vec![exit_record(7, 40)],
+                native.stamps.tick(),
+            )));
+            assert!(receipt.events.is_empty());
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        let subjects = native.gap_subjects();
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "the unfiltered exit records once: {subjects:?}"
+        );
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader-exit clocks unvalidated")
+                .count(),
+            1,
+            "one gap notes the unvalidated clocks: {subjects:?}"
+        );
+    }
+
+    /// A scripted source that counts identity reads and can diverge from
+    /// the collection's truth: post-sample commits must use the verified
+    /// generation, never fresh reads.
+    struct CountingSource {
+        inner: crate::discovery::caller_registry::tests::ScriptedSource,
+        identity_reads: std::rc::Rc<Cell<u64>>,
+        divergent: std::rc::Rc<Cell<bool>>,
+    }
+
+    impl crate::discovery::caller_registry::ProcessSource for CountingSource {
+        type Pin = (u32, u64);
+
+        fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+            self.inner.open(pid)
+        }
+
+        fn still_the_same(&self, pin: &Self::Pin) -> bool {
+            self.inner.still_the_same(pin)
+        }
+
+        fn start_time(&self, pid: u32) -> Option<u64> {
+            self.identity_reads
+                .set(self.identity_reads.get().saturating_add(1));
+            if self.divergent.get() {
+                return Some(123_456_789);
+            }
+            self.inner.start_time(pid)
+        }
+
+        fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
+            self.identity_reads
+                .set(self.identity_reads.get().saturating_add(1));
+            if self.divergent.get() {
+                return Some(ExeIdentity {
+                    dev: 4242,
+                    ino: 4242,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                    path: Some("/diverged".into()),
+                });
+            }
+            self.inner.exe_identity(pid)
+        }
+
+        fn gone(&self, pid: u32) -> bool {
+            self.inner.gone(pid)
+        }
+    }
+
+    /// H6 commit order: a held handoff commits under its verified
+    /// pre-sample generation with zero post-sample identity reads. A
+    /// source that diverges after the end sample still commits the
+    /// verified generation — fresh reads never override it.
+    #[test]
+    fn handoff_commit_uses_the_verified_generation_without_post_sample_reads() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(fixture.path()).unwrap(),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            crate::discovery::caller_registry::OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        // The pre-sample preparation: the walk shows the live member and
+        // its generation is verified before the end sample runs.
+        let preparation = collection.preparation(pid).expect("member prepared");
+        assert!(preparation.check(), "the walk shows the live member");
+        let verified = preparation.generation().clone();
+        let mut requested = BTreeSet::new();
+        requested.insert(pid);
+        collection.sample_end(&requested);
+        let permit = collection.permit(pid).expect("the end sample permits");
+        assert_eq!(
+            permit.generation(),
+            &verified,
+            "the member is stable across the sample"
+        );
+
+        // Commit under a source that diverges after the end sample: the
+        // handoff still commits its verified generation, reading nothing.
+        let identity_reads = std::rc::Rc::new(Cell::new(0));
+        let divergent = std::rc::Rc::new(Cell::new(false));
+        let inner = crate::discovery::caller_registry::tests::ScriptedSource::default();
+        inner.spawn_matching_process(pid);
+        let source = CountingSource {
+            inner,
+            identity_reads: std::rc::Rc::clone(&identity_reads),
+            divergent: std::rc::Rc::clone(&divergent),
+        };
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let mut adapter = CallerAdapter::new(source, registry.semantic_storage_reserver());
+        let old = adapter.admit(pid, ImageAuthority::ScanPinned, 1).unwrap();
+        let (_, pin) = adapter.retire_for_exec_handoff(old, 2).unwrap();
+        identity_reads.set(0);
+        divergent.set(true);
+        let (id, admitted) = adapter
+            .commit_handoff_caller(pid, pin, permit, verified.clone(), 3_000, &mut || {
+                Some(3_100)
+            })
+            .map_err(|failure| failure.reason)
+            .expect("the verified generation commits");
+        assert!(admitted, "the handoff mints its successor");
+        assert_eq!(
+            identity_reads.get(),
+            0,
+            "commit performs no post-sample identity reads"
+        );
+        let record = adapter.record(id).expect("successor retained");
+        assert_eq!(record.start_time, verified.start_time);
+        assert_eq!(record.exe, verified.exe);
+        assert_eq!(record.first_seen_ns, 3_000);
+        assert_eq!(record.admitted_ns, 3_100);
+        assert_eq!(adapter.live_id(pid), Some(id));
+    }
+
+    /// H6 slice 2: outside exec cannot admit on reconcile/native paths; a
+    /// held handoff re-enters only through one fresh collection
+    /// transaction (fresh zero-origin end sample, exact member permit at
+    /// commit, no fallible tail). Rename/replace root, descendant move,
+    /// invalidate between prepare/end/commit, partial census, and stop all
+    /// preserve the boundary. Same-image re-entry keeps history; quiet
+    /// edges keep scope_membership_unproven.
+    #[test]
+    fn automatic_exec_cgroup_successor_requires_fresh_end_permit() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        use std::time::{Duration, Instant};
+
+        // Outside exec cannot admit: the scoped reconcile arm retires
+        // without minting or holding, and the native arm retires while
+        // holding the handoff for a later current-scope transaction.
+        {
+            let (mut native, caller) = cgroup_retained_history_scene();
+            native.scene.source.exec(7, 200, "/bin/outside");
+            let report = native.scene.coordinator.observe_empty_pass(
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                "scoped collection has no positive member transaction",
+                2_000,
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                matches!(
+                    report.events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{:?}",
+                report.events
+            );
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "scoped reconcile holds no handoff"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+        {
+            let (mut native, caller) = cgroup_retained_history_scene();
+            let later = native.row(41, 2, 7, 200, 1);
+            let events = native.witness(vec![later]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the native proof holds its handoff for re-entry"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+
+        // Core recovery: a stale transaction (collected before the proof)
+        // cannot commit the held handoff; the fresh collection commits it
+        // under a new end sample and exact permit, and the successor
+        // serves useful new calls.
+        {
+            let build = tempfile::tempdir().unwrap();
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let provider = gcc(
+                build.path(),
+                "scoped-provider.so",
+                &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+                &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+                &[],
+            );
+            gcc(
+                build.path(),
+                "scoped-driver",
+                &manifest.join("tests/fixtures/catalog-driver.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror"],
+                &["-ldl"],
+            );
+            let driver = build.path().join("scoped-driver");
+            let fixture = tempfile::tempdir().unwrap();
+            let ready = fixture.path().join("ready");
+            let child = OwnedStoppedChild::with_command(&format!(
+                "kill -STOP $$; exec {} --ready {} --call {}",
+                driver.display(),
+                ready.display(),
+                provider.display()
+            ));
+            let pid = child.id();
+            std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let mut coordinator = boxed_cgroup_coordinator(fixture.path(), vec![provider.clone()]);
+            let control = CollectionControl::new(None);
+            let collect = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                           control: &CollectionControl| {
+                coordinator
+                    .cgroup_collector(
+                        CgroupWalkState::default(),
+                        CgroupWalkLimits::default(),
+                        control.clone(),
+                        None,
+                    )
+                    .unwrap()()
+            };
+            // Collection 1 (shell image): admit the old incarnation.
+            let collection = collect(&mut coordinator, &control);
+            coordinator
+                .apply_cgroup_collection(collection, 1_000)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(completion.admitted, 1);
+            let old = coordinator.adapter.live_id(pid).unwrap();
+            // A transaction collected and applied before the proof: once
+            // the proof lands it carries the stale fence, so it cannot
+            // commit the handoff even though it walked a live member.
+            let stale = collect(&mut coordinator, &control);
+            coordinator.apply_cgroup_collection(stale, 2_000).unwrap();
+            assert_eq!(coordinator.adapter.live_id(pid), Some(old));
+            let shell_exe = OsProcessSource.exe_identity(pid);
+            // Exec into the provider driver; STOP deterministically after.
+            // SAFETY: these signals address only the retained owned child.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while OsProcessSource.exe_identity(pid) == shell_exe || !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned child did not exec into the driver"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut status = 0;
+                // SAFETY: pid names only this retained owned child.
+                let waited = unsafe {
+                    libc::waitpid(
+                        pid as libc::pid_t,
+                        &mut status,
+                        libc::WUNTRACED | libc::WNOHANG,
+                    )
+                };
+                assert!(waited >= 0 && Instant::now() < deadline);
+                if waited == pid as libc::pid_t && libc::WIFSTOPPED(status) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // The proof lands while the stale transaction is applied:
+            // the old image ends, the handoff is held, and the stale
+            // transaction is fenced off from committing it.
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let seen = coordinator.adapter.record(old).unwrap().first_seen_ns;
+            let stamps = Stamps::from(seen);
+            let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                             rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    stamps.read(domain, rows),
+                    stamps.drain(domain),
+                    stamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(
+                        coordinator
+                            .stage_native(batch, &mut identity, seen + 10)
+                            .events,
+                    );
+                }
+                events
+            };
+            let object = AttachObjectId::scripted(0);
+            let seen_at = |t: u64| seen + t;
+            assert!(
+                stage(
+                    &mut coordinator,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        seen_at(100)
+                    )]
+                )
+                .is_empty()
+            );
+            let events = stage(
+                &mut coordinator,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    2,
+                    object,
+                    EndpointId(1),
+                    pid,
+                    seen_at(200),
+                )],
+            );
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == old
+                ),
+                "{events:?}"
+            );
+            coordinator.commit_batch(false).unwrap();
+            assert!(
+                coordinator.pending_successors.contains_key(&old),
+                "the stale transaction holds the handoff without committing"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), None);
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_ne!(
+                completion.outcome,
+                ScopedCollectionOutcome::Complete,
+                "the stale transaction proves nothing"
+            );
+            // The fresh collection commits the held handoff under its own
+            // end sample and exact member permit.
+            let fresh = collect(&mut coordinator, &control);
+            coordinator.apply_cgroup_collection(fresh, 3_000).unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Complete,
+                "re-entry needs a new current-scope transaction"
+            );
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old: ended, .. } if *ended == old
+                )),
+                "the handoff commits as a successor: {:?}",
+                completion.events
+            );
+            let successor = coordinator.adapter.live_id(pid).unwrap();
+            assert_ne!(successor, old);
+            let (_, pin) = coordinator.adapter.live_pin(pid).unwrap();
+            assert!(
+                OsProcessSource.still_the_same(pin),
+                "the successor rides original custody"
+            );
+            assert_eq!(coordinator.adapter.len(), 2);
+            // The successor serves useful new calls: attach its provider
+            // endpoints and re-project so the coverage note sees the
+            // attach; the quiet edge reads scope_membership_unproven
+            // until rows bind and count on it.
+            let endpoint = coordinator
+                .attach_set
+                .endpoints()
+                .next()
+                .map(|endpoint| (endpoint.id, endpoint.object))
+                .expect("the driver image admits provider endpoints");
+            coordinator.note_extend_receipt(&ExtendReceipt {
+                attached: vec![crate::attach::capture::AttachedEndpoint {
+                    id: endpoint.0,
+                    object: endpoint.1,
+                    at_ns: 4_000,
+                }],
+                custody: Some(ScopeCustody::CgroupHeld),
+                ..ExtendReceipt::default()
+            });
+            let refresh = collect(&mut coordinator, &control);
+            coordinator.apply_cgroup_collection(refresh, 4_000).unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            // The proving row named this pid before the successor
+            // admitted, so R-C51 honestly downgrades the successor's
+            // watch to use_before_admission (a proper unknown, never a
+            // false positive); truly quiet edges are pinned below.
+            assert_eq!(
+                coordinator.registry.coverage(edge),
+                UseCoverage::Unknown(UnknownReason::UseBeforeAdmission),
+                "pre-admission evidence downgrades the successor watch"
+            );
+            let restamps = Stamps::from(5_000);
+            let mut restage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                               rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    restamps.read(domain, rows),
+                    restamps.drain(domain),
+                    restamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(coordinator.stage_native(batch, &mut identity, 5_010).events);
+                }
+                events
+            };
+            // The first recovery row binds the successor (useful
+            // endpoints). Its pair stays count-dropped by the proving
+            // row's unbound decision — the pre-existing C7 dropped-pair
+            // rule, unchanged by this slice — so the edge reads
+            // witnessed, not counted.
+            assert!(
+                restage(
+                    &mut coordinator,
+                    vec![WitnessRow::scripted(
+                        domain, 41, 2, endpoint.1, endpoint.0, pid, 5_100
+                    )]
+                )
+                .is_empty()
+            );
+            coordinator.commit_batch(false).unwrap();
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(
+                coordinator.registry.coverage(edge),
+                UseCoverage::Witnessed { first_ns: 5_100 },
+                "the successor serves useful endpoints"
+            );
+            assert_eq!(edge.entry_count, 0, "no count is invented on recovery");
+            let census = coordinator.binder.census();
+            assert_eq!(census.rows, 3, "pre-admission, proving, recovery");
+            // The pre-admission row re-resolves once the successor is
+            // live, but its pair stays count-dropped: the edge above
+            // still carries no count.
+            assert_eq!(census.bound, 2, "{census:?}");
+            assert_eq!(
+                census.unbound.get(&UnboundReason::ExecTransition),
+                Some(&1),
+                "only the proving row stays unbound: {census:?}"
+            );
+            // Later useful calls count on the successor: the rebound pair
+            // re-targets, so growth past the dropped first-sight base
+            // stages (F3-03) while the base itself is never re-attributed.
+            let mut growth =
+                WitnessRow::scripted(domain, 41, 2, endpoint.1, endpoint.0, pid, 5_200);
+            growth.entry_count = 2;
+            assert!(restage(&mut coordinator, vec![growth]).is_empty());
+            coordinator.commit_batch(false).unwrap();
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(
+                coordinator.registry.coverage(edge),
+                UseCoverage::Counted {
+                    since_ns: 1_041,
+                    lossy: false
+                },
+                "useful new calls count on the successor"
+            );
+            assert_eq!(edge.entry_count, 1, "only growth past the base stages");
+            let census = coordinator.binder.census();
+            assert_eq!(census.rows, 4, "{census:?}");
+            assert_eq!(census.bound, 3, "{census:?}");
+            assert_eq!(
+                census.unbound.get(&UnboundReason::ExecTransition),
+                Some(&1),
+                "only the proving row stays unbound: {census:?}"
+            );
+            // The old history stays retained in the adapter lineage (the
+            // ExecRetired link), not as a fabricated counted edge: its
+            // only row never bound.
+            let record = coordinator.adapter.record(old).unwrap();
+            assert!(record.retired, "the old incarnation stays retired");
+            assert_eq!(record.pid, pid);
+            assert!(
+                coordinator.registry.edges().all(|edge| edge.caller != old),
+                "the old image keeps no counted edge"
+            );
+            // No second successor: replaying the proof changes nothing.
+            let mut events = Vec::new();
+            for batch in [
+                stamps.read(
+                    domain,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        2,
+                        object,
+                        EndpointId(1),
+                        pid,
+                        seen_at(300),
+                    )],
+                ),
+                stamps.drain(domain),
+                stamps.read(domain, Vec::new()),
+            ] {
+                events.extend(
+                    coordinator
+                        .stage_native(batch, &mut identity, seen + 10)
+                        .events,
+                );
+            }
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(coordinator.adapter.len(), 2);
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(edge.entry_count, 1, "the replay stages no new growth");
+        }
+
+        // A collection issued by another root cannot apply: the fence
+        // and the retained root reject it before anything commits, and
+        // the held handoff waits for the original root.
+        {
+            let (mut native, caller) = boxed_cgroup_retained_history_scene();
+            let events = native.witness(vec![native.row(41, 2, 7, 200, 1)]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the native proof holds its handoff"
+            );
+            let budget = native.scene.coordinator.attach_set.budget();
+            let edges = native.scene.coordinator.registry.edges().count();
+            let (other, _) = boxed_cgroup_retained_history_scene();
+            std::fs::write(other.scene._dir.path().join("cgroup.procs"), b"7\n").unwrap();
+            let collect = other
+                .scene
+                .coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap();
+            drop(other);
+            let foreign = collect();
+            let err = native
+                .scene
+                .coordinator
+                .apply_cgroup_collection(foreign, 3_000)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cgroup collection was not issued by this coordinator"),
+                "{err:?}"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the refused collection holds the handoff for the original root"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+            assert_eq!(
+                native.scene.coordinator.attach_set.budget(),
+                budget,
+                "the refused collection charges no budget"
+            );
+            assert_eq!(
+                native.scene.coordinator.registry.edges().count(),
+                edges,
+                "the refused collection stages no edge"
+            );
+        }
+
+        // Stop releases every held handoff exactly once: no successor
+        // commits, no retry is scheduled, and later collections start
+        // nothing.
+        {
+            let (mut native, caller) = boxed_cgroup_retained_history_scene();
+            let events = native.witness(vec![native.row(41, 2, 7, 200, 1)]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            let collection = native
+                .scene
+                .coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            native.scene.coordinator.stop();
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "stop releases the held handoff"
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "held exec handoffs released at stop"),
+                "the release is recorded once"
+            );
+            let err = native
+                .scene
+                .coordinator
+                .apply_cgroup_collection(collection, 3_000)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("the coordinator stopped"),
+                "{err:?}"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+
+        // Cancelling a transaction commits nothing, but the held
+        // handoff survives for a fresher walk: cancel is not stop.
+        {
+            let (mut native, caller) = boxed_cgroup_retained_history_scene();
+            let events = native.witness(vec![native.row(41, 2, 7, 200, 1)]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            let control = CollectionControl::new(None);
+            let collection = native
+                .scene
+                .coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    control.clone(),
+                    None,
+                )
+                .unwrap()();
+            native
+                .scene
+                .coordinator
+                .apply_cgroup_collection(collection, 3_000)
+                .unwrap();
+            control.cancel();
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let completion = native.scene.coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+                )
+            );
+            assert_eq!(completion.admitted, 0);
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the cancelled transaction holds the handoff"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+
+        // A truly quiet edge — attached and projected, never named by
+        // a row — reads scope_membership_unproven. The successor's
+        // use_before_admission above is that quiet state plus honest
+        // pre-admission evidence, never a false positive.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native
+                .scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+            native.scene.attach_all(100, ScopeCustody::CgroupHeld);
+            native.scene.project(7, 120);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+            );
+        }
+
+        // Renaming the root path changes nothing: the transaction walks
+        // the retained root handle, so the held handoff still commits
+        // under the original root.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "rename");
+            let renamed = fixture.path().parent().unwrap().join("renamed-root");
+            std::fs::rename(fixture.path(), &renamed).unwrap();
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                2_000,
+            );
+            std::fs::rename(&renamed, fixture.path()).unwrap();
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the handoff commits under the renamed root: {:?}",
+                completion.events
+            );
+            let successor = coordinator.adapter.live_id(pid).unwrap();
+            assert_ne!(successor, caller);
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // Replacing the root path cannot hijack the transaction: the
+        // walk follows the retained handle, so the impostor directory
+        // is never even opened and the handoff commits under the
+        // original root.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "replace");
+            let impostor = OwnedStoppedChild::new();
+            let impostor_pid = impostor.id();
+            let stash = fixture.path().parent().unwrap().join("original-root");
+            std::fs::rename(fixture.path(), &stash).unwrap();
+            std::fs::create_dir(fixture.path()).unwrap();
+            std::fs::write(
+                fixture.path().join("cgroup.procs"),
+                format!("{impostor_pid}\n"),
+            )
+            .unwrap();
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                2_000,
+            );
+            std::fs::remove_dir_all(fixture.path()).unwrap();
+            std::fs::rename(&stash, fixture.path()).unwrap();
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the handoff commits under the original root: {:?}",
+                completion.events
+            );
+            assert_eq!(coordinator.adapter.live_id(impostor_pid), None);
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // A descendant replaced between collect and the final sample
+        // cannot reauthorize the retained generation: no permit, no
+        // commit, the handoff waits; restoring the leaf lets the next
+        // transaction commit it.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            std::fs::write(fixture.path().join("cgroup.procs"), b"").unwrap();
+            let leaf = fixture.path().join("leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "leaf");
+            let collection = coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, 2_000)
+                .unwrap();
+            std::fs::rename(&leaf, fixture.path().join("old")).unwrap();
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let moved = coordinator.take_cgroup_completion().unwrap();
+            assert_ne!(moved.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(moved.admitted, 0);
+            assert!(
+                coordinator.pending_successors.contains_key(&caller),
+                "the replaced leaf holds the handoff"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), None);
+            assert_eq!(coordinator.adapter.len(), 1);
+            std::fs::remove_dir_all(&leaf).unwrap();
+            std::fs::rename(fixture.path().join("old"), &leaf).unwrap();
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                3_000,
+            );
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the restored leaf commits the handoff: {:?}",
+                completion.events
+            );
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // An exec proof landing between collect and apply invalidates
+        // the pending transaction: it commits nothing and the handoff
+        // waits for a fresh walk.
+        {
+            let (_fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            let collection = coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            mint_os_handoff(&mut coordinator, caller, pid, "stale");
+            coordinator
+                .apply_cgroup_collection(collection, 2_000)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let stale = coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(stale.admitted, 0);
+            assert_ne!(stale.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                coordinator.pending_successors.contains_key(&caller),
+                "the invalidated transaction holds the handoff"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), None);
+            assert_eq!(coordinator.adapter.len(), 1);
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                3_000,
+            );
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the fresh walk commits the handoff: {:?}",
+                completion.events
+            );
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // Partial passes never union into a commit for an unreached
+        // member: the handoff waits through every slice and commits
+        // once a pass reaches it with fresh samples.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "partial");
+            std::fs::write(
+                fixture.path().join("cgroup.procs"),
+                format!("4000000000\n4000000001\n4000000002\n{pid}\n"),
+            )
+            .unwrap();
+            let mut state = CgroupWalkState::default();
+            let mut committed = None;
+            for pass in 0..6 {
+                let limits = CgroupWalkLimits {
+                    members: 1,
+                    ..CgroupWalkLimits::default()
+                };
+                let completion = cgroup_pass(&mut coordinator, state, limits, 2_000 + pass);
+                assert_ne!(
+                    completion.outcome,
+                    ScopedCollectionOutcome::Complete,
+                    "partial passes never union into complete scope absence"
+                );
+                state = completion.state;
+                if pass == 0 {
+                    assert_eq!(coordinator.adapter.live_id(pid), None);
+                    assert!(
+                        coordinator.pending_successors.contains_key(&caller),
+                        "the first slice holds the handoff"
+                    );
+                }
+                if coordinator.adapter.live_id(pid).is_some() {
+                    committed = Some(completion.events);
+                    break;
+                }
+            }
+            let events = committed.expect("a later slice reaches the member");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the reaching slice commits the handoff: {events:?}"
+            );
+            assert_ne!(coordinator.adapter.live_id(pid).unwrap(), caller);
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // Same-image leave and re-entry keeps the original caller and
+        // its history without ever claiming continuous membership.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let first = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(first.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(first.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            let before = coordinator.adapter.record(caller).unwrap().clone();
+            std::fs::write(fixture.path().join("cgroup.procs"), b"").unwrap();
+            let away = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                2_000,
+            );
+            assert_eq!(away.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(away.admitted, 0);
+            assert_eq!(
+                away.scan_callers, 0,
+                "the leave pass validates no membership"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), Some(caller));
+            assert!(
+                !coordinator.adapter.record(caller).unwrap().retired,
+                "mere scope movement does not prove exit"
+            );
+            std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let back = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                3_000,
+            );
+            assert_eq!(back.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(back.admitted, 0);
+            assert_eq!(back.scan_callers, 1);
+            assert_eq!(coordinator.adapter.live_id(pid), Some(caller));
+            let after = coordinator.adapter.record(caller).unwrap();
+            assert_eq!(after.first_seen_ns, before.first_seen_ns);
+            assert_eq!(after.exe, before.exe);
+            assert_eq!(after.start_time, before.start_time);
+            assert_eq!(after.incarnation, before.incarnation);
+            assert!(!after.retired);
+            assert_eq!(coordinator.adapter.len(), 1);
+        }
+    }
+
+    #[test]
+    fn automatic_exec_failed_exec_preserves_live_call() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+
+        // A failed exec emits no lifecycle record: the producer hooks
+        // sched_process_exec, which fires only after the new image
+        // installs. At the coordinator the failure is covered absence
+        // — complete drains carrying no record, an unchanged image,
+        // continued same-image use — and the live call continues
+        // exactly: no successor, no cut, no rearm; the in-flight
+        // return still matches and following complete calls remain
+        // positive. Leader and nonleader attempts are indistinguishable
+        // here (rows and records key callers by tgid); the nonleader
+        // leg adds sibling exec activity to prove per-tgid isolation.
+
+        // Leader attempt, covered absence: the call entered before the
+        // attempt completes on the original caller, and following
+        // calls stay positive.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.answer(7, 500, 41);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 100, 0)])
+                    .is_empty()
+            );
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                },
+                "the entered call binds and counts"
+            );
+            // The failed exec: a complete drain carrying no record for
+            // this tgid — covered absence, not missing data.
+            let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                native.domain,
+                Vec::new(),
+                native.stamps.tick(),
+            )));
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            // The in-flight return still matches the original caller.
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the live call keeps its edge");
+            assert_eq!(edge.entry_count, 5, "the return lands on the original");
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                }
+            );
+            // Following complete calls remain positive.
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 300, 0)])
+                    .is_empty()
+            );
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the live call keeps its edge");
+            assert_eq!(edge.entry_count, 9);
+            assert_eq!(edge.mapping, MappingState::Mapped, "no cut");
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert_eq!(native.scene.coordinator.adapter.len(), 1, "no successor");
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "no rearm"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .binder
+                    .take_transitions()
+                    .is_empty(),
+                "no ended-incarnation proof"
+            );
+        }
+
+        // Nonleader attempt with sibling exec activity: our tgid shows
+        // covered absence while a sibling really execs. Our live call
+        // continues untouched; only the sibling's old proof is refused.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.scene.source.spawn(8, 600);
+            let sibling = native
+                .scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 150)
+                .unwrap();
+            native.answer(7, 500, 41);
+            native.answer(8, 600, 42);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 100, 0)])
+                    .is_empty()
+            );
+            assert!(
+                native
+                    .witness(vec![native.row(42, 1, 8, 200, 0)])
+                    .is_empty()
+            );
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut exec_record: p11scope_ebpf_common::DiscoveryRecord =
+                unsafe { std::mem::zeroed() };
+            exec_record.hook_ts_ns = 250;
+            exec_record.pid_tgid = (u64::from(8u32) << 32) | u64::from(8u32);
+            exec_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                native.domain,
+                vec![exec_record],
+                native.stamps.tick(),
+            )));
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            // Our in-flight return still matches; following calls stay
+            // positive, exactly as in the leader leg.
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 300, 0)])
+                    .is_empty()
+            );
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the live call keeps its edge");
+            assert_eq!(edge.entry_count, 9);
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                }
+            );
+            // Control: the sibling's record landed — a new proof for
+            // the sibling is refused — while its established row
+            // attribution continues: a bare hint never evicts it.
+            {
+                use crate::discovery::native_binding::CallerLookup;
+                let coordinator = &native.scene.coordinator;
+                let lookup = &coordinator.adapter as &dyn CallerLookup<(u32, u64)>;
+                assert!(
+                    matches!(
+                        coordinator.binder.sight_current_binding(
+                            CurrentBindingRequest {
+                                caller: sibling,
+                                pid: 8,
+                                image: DomainCookie::scripted(native.domain, 42),
+                                exec_id: 1,
+                            },
+                            lookup,
+                            &mut native.cookies,
+                        ),
+                        Err(UnboundReason::ExecAfterAdmission)
+                    ),
+                    "the sibling record refuses new sibling proofs"
+                );
+            }
+            assert!(
+                native
+                    .witness(vec![native.row(42, 1, 8, 400, 0)])
+                    .is_empty()
+            );
+            let census = native.scene.coordinator.registry.witness_census();
+            assert_eq!(
+                census.bound, 4,
+                "established attribution continues: {census:?}"
+            );
+            assert!(
+                census.unbound.is_empty(),
+                "a hint alone unbinds nothing established: {census:?}"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert_eq!(native.scene.coordinator.adapter.live_id(8), Some(sibling));
+            assert_eq!(native.scene.coordinator.adapter.len(), 2, "no successor");
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "no rearm"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .binder
+                    .take_transitions()
+                    .is_empty(),
+                "a hint alone proves no ended incarnation"
+            );
+        }
+
+        // Real failed execve in both the leader and a nonleader thread:
+        // execve returns, the image never changes, no record exists.
+        // Against real custody the coordinator mints no phantom
+        // successor and cuts nothing.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("fail-exec.c"),
+                r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+static void *try_exec(void *arg) {
+    (void)arg;
+    char *const argv[] = {"/x", NULL};
+    char *const envp[] = {NULL};
+    execve("/nonexistent-p11scope-failed-exec", argv, envp);
+    return (void *)(long)errno;
+}
+int main(void) {
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, try_exec, NULL) != 0) return 2;
+    void *thread_errno = 0;
+    pthread_join(tid, &thread_errno);
+    char *const argv[] = {"/x", NULL};
+    char *const envp[] = {NULL};
+    execve("/nonexistent-p11scope-failed-exec", argv, envp);
+    int main_errno = errno;
+    if (thread_errno == 0 || main_errno == 0) return 3;
+    kill(getpid(), SIGSTOP);
+    for (;;) pause();
+}
+"#,
+            )
+            .unwrap();
+            let bin = gcc(
+                dir.path(),
+                "fail-exec",
+                &dir.path().join("fail-exec.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"],
+                &[],
+            );
+            let mut command = std::process::Command::new(&bin);
+            let child = OwnedStoppedChild::spawn_stopped(&mut command, |_| {});
+            let pid = child.id();
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let mut coordinator = boxed_cgroup_coordinator(fixture.path(), Vec::new());
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            let before = coordinator.adapter.record(caller).unwrap().clone();
+            // Rows plus a covered-absence drain against real custody
+            // retire nothing.
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let stamps = Stamps::from(before.first_seen_ns);
+            let object = AttachObjectId::scripted(0);
+            assert!(
+                stage_os_rows(
+                    &mut coordinator,
+                    &mut identity,
+                    &stamps,
+                    domain,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        before.first_seen_ns + 100
+                    )],
+                    before.first_seen_ns + 10,
+                )
+                .is_empty()
+            );
+            let receipt = coordinator.stage_native(
+                NativeBatch::Lifecycle(DiscoveryBatch::scripted(domain, Vec::new(), stamps.tick())),
+                &mut identity,
+                before.first_seen_ns + 20,
+            );
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            coordinator.commit_batch(false).unwrap();
+            assert_eq!(coordinator.adapter.live_id(pid), Some(caller));
+            assert_eq!(coordinator.adapter.len(), 1, "no successor");
+            assert!(coordinator.pending_successors.is_empty(), "no rearm");
+            assert!(
+                coordinator.binder.take_transitions().is_empty(),
+                "no ended-incarnation proof"
+            );
+            let after = coordinator.adapter.record(caller).unwrap();
+            assert_eq!(after.start_time, before.start_time);
+            assert_eq!(after.exe, before.exe, "the failed exec changed no image");
+            assert!(!after.retired, "no cut");
+        }
+
+        // Successful twin: the same live call with real proof retires
+        // instead — old live operations end frozen, and a new instance
+        // recovers.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.answer(7, 500, 41);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 100, 0)])
+                    .is_empty()
+            );
+            native.scene.source.exec(7, 200, "/bin/other");
+            let events = native.witness(vec![native.row(41, 2, 7, 1_600, 1)]);
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("real proof must recover: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            let successor = *new;
+            let old_edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the old edge stays retained");
+            assert_eq!(
+                old_edge.mapping,
+                MappingState::Ended,
+                "the cut ends old use"
+            );
+            assert_eq!(old_edge.entry_count, 1);
+            // A late return for the old image stages nowhere: neither
+            // the retired edge nor the successor moves.
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let old_edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the old edge stays retained");
+            assert_eq!(old_edge.entry_count, 1, "retired operations stay frozen");
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges()
+                    .all(|edge| edge.caller != successor),
+                "old returns invent no successor edge"
+            );
+            // The new instance recovers: project its modules, then it
+            // binds, then counts growth.
+            native.scene.project(7, 1_700);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 500, 41);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 2, 7, 1_800, 0)])
+                    .is_empty()
+            );
+            assert_eq!(
+                native.scene.coverage(successor),
+                UseCoverage::Witnessed { first_ns: 1_800 },
+                "the successor serves useful endpoints"
+            );
+            let endpoint = native.scene.delta.endpoints[0];
+            let mut growth =
+                WitnessRow::scripted(native.domain, 41, 2, endpoint.object, endpoint.id, 7, 1_900);
+            growth.entry_count = 2;
+            assert!(native.witness(vec![growth]).is_empty());
+            let successor_edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(
+                successor_edge.entry_count, 1,
+                "growth past the dropped base stages"
+            );
+            assert_eq!(
+                native.scene.coverage(successor),
+                UseCoverage::Counted {
+                    since_ns: 1_071,
+                    lossy: false
+                },
+                "the new instance recovers counted use from the proving read"
+            );
+        }
     }
 
     #[test]
@@ -9109,7 +25860,9 @@ mod tests {
             .adapter
             .admit(7, ImageAuthority::ScanPinned, 50)
             .unwrap();
-        scene.coordinator.begin_capture_coverage(None);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         let mut native = NativeScene::over(scene, 0);
         native.scene.attach_all(100, ScopeCustody::System);
         native.scene.project(7, 120);
@@ -9514,5 +26267,42 @@ mod tests {
             &native.scene.coverage(caller),
             "use row could bind"
         ));
+    }
+}
+
+#[cfg(test)]
+#[path = "demotion_retirement_tests.rs"]
+mod demotion_retirement_tests;
+
+#[cfg(test)]
+#[path = "cgroup_native_owner_tests.rs"]
+mod cgroup_native_owner_tests;
+
+#[cfg(test)]
+#[path = "inventory_diagnostics_tests.rs"]
+mod inventory_diagnostics_tests;
+
+#[cfg(test)]
+pub(crate) use inventory_diagnostics_tests::{
+    G21CountDiagnosticFixture, genuine_g21_count_diagnostics,
+};
+
+#[cfg(test)]
+mod continuity_clock_tests {
+    use super::*;
+    #[test]
+    fn pid_continuity_clock_origin_rejects_duplicate_and_malformed_offsets() {
+        let ns = std::path::PathBuf::from("time:[7]");
+        for text in [
+            "monotonic 0 0\nmonotonic 0 0",
+            "monotonic 1 0\nmonotonic 0 0",
+            "monotonic bad 0\nmonotonic 0 0",
+            "monotonic 0 0 extra",
+        ] {
+            assert!(
+                !exit_clocks_comparable_with(Some(&ns), Some(&ns), Some(text)),
+                "malformed/duplicate offset must not be rescued: {text}"
+            );
+        }
     }
 }

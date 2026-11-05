@@ -698,12 +698,28 @@ def rustc_versions(observer_bytes):
                    re.findall(rb"rustc version [0-9][ -~]{0,120}", observer_bytes)})
 
 
+def resolve_observer(path):
+    """The exact observer file a packaged run measures with.
+
+    Only absolute paths are accepted: a relative name is refused rather
+    than resolved against the working directory or PATH.
+    """
+    require(Path(path).is_absolute(), f"observer path is not absolute: {path}")
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except OSError as error:
+        raise Unknown(f"observer is not available: {path}: {error}") from error
+    require(resolved.is_file(), f"observer is not a regular file: {resolved}")
+    return resolved
+
+
 def make_provenance(observer, bpf_objects, *, root=ROOT, git=run_git):
     revision = git(["rev-parse", "HEAD"], root).strip()
     require(HEX40.fullmatch(revision), "source revision is not a commit id")
     status = git(["status", "--porcelain=v1", "--untracked-files=all"], root)
     require(status == "", "source checkout is dirty; provenance binds clean commits only")
-    observer_bytes = Path(observer).read_bytes()
+    observer = resolve_observer(observer)
+    observer_bytes = observer.read_bytes()
     objects = []
     for path in bpf_objects:
         data = Path(path).read_bytes()
@@ -721,8 +737,8 @@ def make_provenance(observer, bpf_objects, *, root=ROOT, git=run_git):
         "source": {"revision": revision, "tree_clean": True,
                    "files": {rel: sha256_path(root / rel) for rel in BOUND_SOURCES}},
         "release_rust_version": (root / ".release-rust-version").read_text().strip(),
-        "observer": {"sha256": sha256_bytes(observer_bytes), "size": len(observer_bytes),
-                     "rustc": rustc_versions(observer_bytes)},
+        "observer": {"path": str(observer), "sha256": sha256_bytes(observer_bytes),
+                     "size": len(observer_bytes), "rustc": rustc_versions(observer_bytes)},
         "bpf_objects": objects,
     }
 
@@ -1415,7 +1431,7 @@ def command_run(args):
         raise Unknown("run needs root; use: " + " ".join(OPERATOR_COMMAND) + " ...")
     require(0 < args.calls < args.foreign_calls <= 100000, "call counts are invalid")
     manifest = json.loads(Path(args.provenance).read_text(encoding="utf-8"))
-    observer_bytes = Path(args.observer).read_bytes()
+    observer_bytes = resolve_observer(args.observer).read_bytes()
     # Bind observer, BPF objects and every runner/fixture source before
     # anything is loaded, created or launched.
     validate_provenance(manifest, observer_bytes)

@@ -1,9 +1,11 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! The release compiler is single-sourced from `.release-rust-version`.
 //!
-//! Every live toolchain selector (shell, Python, CI) reads that file instead
-//! of pinning a literal, and the crate `rust-version` fields equal that
-//! compiler's major.minor (latest only, no older supported floor). These tests
+//! Live release toolchain selectors (shell, Python, CI) read that file instead
+//! of pinning a literal; the exact BPF comparison rebuilds both sides with the
+//! release compiler and installs no historical toolchain. The crate
+//! `rust-version` fields equal the release compiler's major.minor (latest only,
+//! no older supported floor). These tests
 //! pin the mechanism so a future bump touches the version file first and cannot
 //! silently reintroduce a literal selector or a stale-toolchain job.
 
@@ -95,32 +97,187 @@ fn ci_selectors_read_the_version_file() {
     );
 }
 
-#[test]
-fn ci_has_no_stale_toolchain_job() {
-    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
-    assert!(
-        !ci.contains("\n  msrv:\n"),
-        "CI must not define an msrv job: the release compiler is the only supported toolchain"
-    );
+fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
+    if ci.contains("\n  msrv:\n") {
+        return Err(
+            "CI must not define an msrv job: the release compiler is the only supported toolchain"
+                .into(),
+        );
+    }
+    let mut comparison_job = false;
+    let mut comparison = String::new();
     // Every `cargo +X` / `rustup toolchain install X` selector in executable
-    // steps must be the release version file or the pinned BPF nightly.
+    // steps uses the release pin or BPF nightly. The host-compiler transition
+    // is complete: no historical compiler remains anywhere, including the
+    // exact comparison job.
     for line in ci
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
     {
+        // Follow the existing workflow's two-space job boundary, without
+        // introducing another YAML parser.
+        if !line.trim().is_empty() && !line.starts_with("    ") {
+            comparison_job = line == "  bpf-noninterference:";
+        }
+        if comparison_job {
+            comparison.push_str(line);
+            comparison.push('\n');
+        }
         for marker in ["cargo +", "toolchain install "] {
             let mut rest = line;
             while let Some(index) = rest.find(marker) {
                 rest = &rest[index + marker.len()..];
                 let selector = rest.trim_start_matches('"');
-                assert!(
-                    selector.starts_with("$(cat .release-rust-version)")
-                        || selector.starts_with("nightly-2026-05-20"),
-                    "CI toolchain selector must be the release compiler or the BPF nightly: {line}"
-                );
+                if selector.starts_with("$(cat .release-rust-version)")
+                    || selector.starts_with("nightly-2026-05-20")
+                {
+                    continue;
+                }
+                return Err(format!(
+                    "CI toolchain selector must use the release pin or BPF nightly: {line}"
+                ));
             }
         }
     }
+    // The comparison keeps both calls on the moved baseline: the repeat
+    // control, then the integration call with no transition flag. The
+    // integration text ends at its line end, so a re-added flag breaks it.
+    let repeat = r#"
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$BASELINE" \
+            --work "$comparison_root/repeat-baseline" --repeat-baseline
+"#;
+    let integration = r#"
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
+            --work "$comparison_root/integration"
+"#;
+    if !comparison
+        .lines()
+        // Pinned baseline 3681a1ab7: the keygen return-path gate
+        // (Detailed .text +128 B in the two inlined return functions;
+        // the unsafe entry flag compiles out of default builds) and the
+        // round-10 inventory ring raise (one `maps` word per Inventory
+        // object; code byte-identical), on top of 873adf5c4 (6.14
+        // exit-time mapping summaries); all enumerated in the ci.yml
+        // comment.
+        .any(|line| line == "          BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81")
+        || !comparison.contains(repeat)
+        || !comparison.contains(integration)
+        || comparison.contains("--host-compiler-transition")
+    {
+        return Err("the comparison job must run the exact pinned repeat and integration calls without a host compiler transition".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn ci_has_no_stale_toolchain_job() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+    let with_msrv = ci.replacen(
+        "\n  lint:\n",
+        "\n  msrv:\n    runs-on: ubuntu-26.04\n  lint:\n",
+        1,
+    );
+    assert!(
+        validate_ci_toolchain_selectors(&with_msrv).is_err(),
+        "an added msrv job must be rejected"
+    );
+}
+
+#[test]
+fn ci_comparison_job_installs_no_historical_compiler() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+    let header = "\n  bpf-noninterference:\n";
+    assert!(ci.contains(header), "missing comparison job");
+    for selector in [
+        "      - run: rustup toolchain install 1.98.1 --profile minimal",
+        "      - run: cargo +1.98.1 test --locked",
+    ] {
+        let changed = ci.replacen(header, &format!("{header}{selector}\n"), 1);
+        assert!(
+            validate_ci_toolchain_selectors(&changed).is_err(),
+            "historical compiler leaked into the comparison job: {selector}"
+        );
+    }
+}
+
+#[test]
+fn ci_ordinary_jobs_install_no_historical_compiler() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+    for job in ["lint", "tests", "coverage"] {
+        let header = format!("\n  {job}:\n");
+        assert!(ci.contains(&header), "missing healthy job {job}");
+        for selector in [
+            "      - run: rustup toolchain install 1.98.1 --profile minimal",
+            "      - run: cargo +1.98.1 test --locked",
+        ] {
+            let changed = ci.replacen(&header, &format!("{header}{selector}\n"), 1);
+            assert!(
+                validate_ci_toolchain_selectors(&changed).is_err(),
+                "historical compiler leaked into {job}: {selector}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+    let header = "\n  bpf-noninterference:\n";
+    assert!(ci.contains(header), "missing comparison job");
+    let renamed = ci.replacen(header, "\n  ordinary-history:\n", 1);
+    assert_ne!(renamed, ci, "renamed comparison must differ");
+    assert!(
+        renamed.contains("\n  ordinary-history:\n"),
+        "renamed comparison must carry the new job name"
+    );
+    assert!(
+        validate_ci_toolchain_selectors(&renamed).is_err(),
+        "a renamed comparison job must be rejected"
+    );
+    for marker in [
+        // Pinned baseline 3681a1ab7: the keygen return-path gate
+        // (Detailed .text +128 B in the two inlined return functions;
+        // the unsafe entry flag compiles out of default builds) and the
+        // round-10 inventory ring raise (one `maps` word per Inventory
+        // object; code byte-identical), on top of 873adf5c4 (6.14
+        // exit-time mapping summaries); all enumerated in the ci.yml
+        // comment.
+        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
+        "--repeat-baseline",
+        "--candidate \"$GITHUB_SHA\"",
+        "--work \"$comparison_root/integration\"",
+    ] {
+        assert!(ci.contains(marker), "missing healthy comparison {marker}");
+        assert!(
+            validate_ci_toolchain_selectors(&ci.replacen(marker, "", 1)).is_err(),
+            "comparison call survived removal of {marker}"
+        );
+    }
+    let revived = ci.replacen(
+        "--work \"$comparison_root/integration\"\n",
+        "--work \"$comparison_root/integration\" --host-compiler-transition\n",
+        1,
+    );
+    assert!(
+        validate_ci_toolchain_selectors(&revived).is_err(),
+        "a revived host compiler transition must be rejected"
+    );
+    let selector = "      - run: rustup toolchain install 1.98.0 --profile minimal";
+    let injected = ci.replacen(header, &format!("{header}{selector}\n"), 1);
+    assert!(
+        injected.contains(selector),
+        "missing injected unreviewed compiler selector"
+    );
+    assert!(
+        validate_ci_toolchain_selectors(&injected).is_err(),
+        "an unreviewed compiler version must be rejected: {selector}"
+    );
 }
 
 #[test]

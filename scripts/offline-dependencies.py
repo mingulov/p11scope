@@ -335,7 +335,7 @@ def _git_identity(source: str) -> dict:
     return {"url": url, "revision": revision}
 
 
-def _locked_dependencies(lock_paths: list[Path]) -> tuple[dict, dict[str, dict]]:
+def _locked_dependencies(lock_paths: list[Path]) -> tuple[dict | None, dict[str, dict]]:
     shared = None
     vendored = {}
     for lock in lock_paths:
@@ -363,8 +363,10 @@ def _locked_dependencies(lock_paths: list[Path]) -> tuple[dict, dict[str, dict]]
             prior = vendored.setdefault(directory, expected)
             if prior != expected:
                 raise OfflineDependencyError(f"conflicting vendored package identity: {directory}")
-    if shared is None:
-        raise OfflineDependencyError("dependency locks contain no shared Git revision")
+    # No git+ source in any lock: every external package is a checksummed
+    # registry crate, so there is no shared revision to prove. Callers bind
+    # this None against `"shared_git": null` in the fixed recipe exactly
+    # like a revision; more than one distinct identity still refuses above.
     return shared, dict(sorted(vendored.items()))
 
 
@@ -605,7 +607,7 @@ def _normalize_payload(root: Path) -> None:
 
 
 def _payload_structure(payload: Path, manifest: dict, expected_vendor: dict[str, dict],
-                       expected_shared: dict) -> None:
+                       expected_shared: dict | None) -> None:
     _entry_inventory(payload, payload_modes=True)
     actual_top = {path.name for path in payload.iterdir()}
     if actual_top != PAYLOAD_TOP:
@@ -618,7 +620,14 @@ def _payload_structure(payload: Path, manifest: dict, expected_vendor: dict[str,
         raise OfflineDependencyError(f"unexpected payload entry in provenance: {sorted(provenance_names)}")
     shared_dir, nightly_dir = provenance / "shared", provenance / "nightly"
     shared_names = {path.name for path in shared_dir.iterdir()}
-    if shared_names != SHARED_FILES:
+    if expected_shared is None:
+        # Without a shared revision the provenance carries no bundle or
+        # origin licenses: only the null-source record below may be present.
+        if shared_names != {"packages.json"}:
+            missing, extra = sorted({"packages.json"} - shared_names), sorted(shared_names - {"packages.json"})
+            phrase = "missing payload entry" if missing else "unexpected payload entry"
+            raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
+    elif shared_names != SHARED_FILES:
         missing, extra = sorted(SHARED_FILES - shared_names), sorted(shared_names - SHARED_FILES)
         phrase = "missing payload entry" if missing else "unexpected payload entry"
         raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
@@ -641,6 +650,13 @@ def _payload_structure(payload: Path, manifest: dict, expected_vendor: dict[str,
         if actual != expected:
             raise OfflineDependencyError(f"original archive digest mismatch for {name}: expected {expected}, got {actual}")
     shared_packages = _validate_vendor(payload / "vendor", expected_vendor)
+    if expected_shared is None:
+        if shared_packages:
+            raise OfflineDependencyError("shared package provenance mismatch")
+        actual_shared = _read_json(shared_dir / "packages.json", "shared provenance")
+        if actual_shared != {"schema_version": 1, "source": None, "licenses": {}, "packages": []}:
+            raise OfflineDependencyError("shared package provenance mismatch")
+        return
     actual_shared = _read_json(shared_dir / "packages.json", "shared provenance")
     revision = _bundle_revision(shared_dir / "source.bundle")
     if revision != expected_shared["source"]["revision"]:
@@ -668,7 +684,7 @@ def _verify_nightly_provenance(payload: Path, nightly: dict) -> None:
         raise OfflineDependencyError("payload nightly sysroot lock mismatch")
 
 
-def _recipe_value(root: Path, manifest: dict, preparer, nightly: dict, shared: dict,
+def _recipe_value(root: Path, manifest: dict, preparer, nightly: dict, shared: dict | None,
                   payload_digest: str) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -717,10 +733,13 @@ def _validate_recipe(value: object, manifest: dict, preparer, root: Path) -> dic
     digests.extend(nightly[field] for field in (
         "rust_src_tree_sha256", "sysroot_manifest_sha256", "sysroot_lock_sha256"))
     shared = value["shared_git"]
-    if (not isinstance(shared, dict) or set(shared) != {"url", "revision"}
-            or not isinstance(shared.get("url"), str)
-            or not isinstance(shared.get("revision"), str)
-            or not REVISION_RE.fullmatch(shared["revision"])):
+    if shared is not None and (
+        not isinstance(shared, dict)
+        or set(shared) != {"url", "revision"}
+        or not isinstance(shared.get("url"), str)
+        or not isinstance(shared.get("revision"), str)
+        or not REVISION_RE.fullmatch(shared["revision"])
+    ):
         raise OfflineDependencyError("fixed recipe shared Git fields mismatch")
     if any(not isinstance(item, str) or not SHA256_RE.fullmatch(item) for item in digests):
         raise OfflineDependencyError("fixed recipe contains an invalid SHA-256 digest")
@@ -746,7 +765,7 @@ def check_fixed_recipe_inputs(root: Path, recipe: dict, manifest: dict, preparer
 
 
 def _check_current_inputs(root: Path, recipe: dict, manifest: dict, preparer,
-                          nightly: dict, shared: dict) -> dict:
+                          nightly: dict, shared: dict | None) -> dict:
     fixed = check_fixed_recipe_inputs(root, recipe, manifest, preparer)
     if nightly != recipe["nightly"]:
         raise OfflineDependencyError("nightly source input changed")
@@ -880,7 +899,8 @@ def assemble(root: Path, options, preparer, checker) -> None:
                         (options.prefix, "evidence prefix")):
         _external_target(root, path, label)
     _absolute_directory(options.archive_dir, "archive directory")
-    _absolute_directory(options.shared_source, "shared source directory")
+    if options.shared_source is not None:
+        _absolute_directory(options.shared_source, "shared source directory")
     if os.path.lexists(options.output) or os.path.lexists(options.candidate_recipe):
         raise OfflineDependencyError("payload output and candidate recipe must not already exist")
     tools = {name: {
@@ -903,6 +923,10 @@ def assemble(root: Path, options, preparer, checker) -> None:
                   for workspace in manifest["workspace_manifests"]]
     lock_paths.append(rust / "library/Cargo.lock")
     shared, expected_vendor = _locked_dependencies(lock_paths)
+    if shared is None and options.shared_source is not None:
+        raise OfflineDependencyError("shared source supplied but dependency locks contain no Git revision")
+    if shared is not None and options.shared_source is None:
+        raise OfflineDependencyError("shared source directory is required for the shared Git revision")
     with tempfile.TemporaryDirectory(prefix="p11scope-offline-payload-") as temporary_name:
         temporary = Path(temporary_name)
         metadata_commands, admission = _metadata_admission(root, manifest, checker, tools, temporary)
@@ -935,9 +959,14 @@ def assemble(root: Path, options, preparer, checker) -> None:
                 raise OfflineDependencyError("workspace lock or manifest changed during Cargo vendor")
             _normalize_payload(payload / "vendor")
             packages = _validate_vendor(payload / "vendor", expected_vendor)
-            provenance = _shared_provenance(options.shared_source, shared, packages)
-            for name in ("source.bundle", *SHARED_LICENSES):
-                _copy_regular(options.shared_source / name, shared_output / name)
+            if shared is None:
+                if packages:
+                    raise OfflineDependencyError("shared package provenance mismatch")
+                provenance = {"schema_version": 1, "source": None, "licenses": {}, "packages": []}
+            else:
+                provenance = _shared_provenance(options.shared_source, shared, packages)
+                for name in ("source.bundle", *SHARED_LICENSES):
+                    _copy_regular(options.shared_source / name, shared_output / name)
             (shared_output / "packages.json").write_bytes(_canonical_json(provenance) + b"\n")
             os.chmod(shared_output / "packages.json", 0o644)
             for name, expected in _required_archives(manifest).items():
@@ -975,7 +1004,7 @@ def assemble(root: Path, options, preparer, checker) -> None:
                 preparer.run(root, check=True, offline=False, archive_dir=None)
             except preparer.PreparationError as error:
                 raise OfflineDependencyError(f"package recipe input changed during assembly: {error}") from error
-            _payload_structure(payload, manifest, expected_vendor, provenance)
+            _payload_structure(payload, manifest, expected_vendor, None if shared is None else provenance)
             _verify_nightly_provenance(payload, nightly)
             payload_digest = tree_content_digest(payload)
             recipe = {
@@ -1011,18 +1040,18 @@ def assemble(root: Path, options, preparer, checker) -> None:
                                            "inputs": inputs, "outcome": outcome})
 
 
-def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
-    _external_target(root, options.prefix, "evidence prefix")
-    _absolute_directory(options.payload, "offline dependency payload")
+def _verify_payload_contents(root: Path, payload: Path, nightly_rustc: Path,
+                             preparer, *, reconstruct: bool = True) -> tuple[dict, dict]:
+    """Validate all payload content against maintained inputs, without source-origin evidence."""
+    _absolute_directory(payload, "offline dependency payload")
     recipe_path = root / RECIPE_RELATIVE
     if not recipe_path.is_file():
         raise OfflineDependencyError(f"fixed recipe is missing: {recipe_path}")
     manifest = _strict_manifest(root, preparer)
-    project_source = _project_source_identity(root)
     recipe_bytes = recipe_path.read_bytes()
     recipe = _validate_recipe(_read_json(recipe_path, "fixed recipe"), manifest, preparer, root)
-    tool = _tool_identity(options.nightly_rustc, "nightly rustc")
-    rust, nightly = _rust_source(options.nightly_rustc)
+    tool = _tool_identity(nightly_rustc, "nightly rustc")
+    rust, nightly = _rust_source(nightly_rustc)
     inputs = _check_current_inputs(
         root, recipe, manifest, preparer, nightly, recipe["shared_git"]
     )
@@ -1031,29 +1060,36 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
     shared, expected_vendor = _locked_dependencies(lock_paths)
     if shared != recipe["shared_git"]:
         raise OfflineDependencyError("shared Git revision in dependency locks changed")
-    _entry_inventory(options.payload, payload_modes=True)
-    shared_dir = options.payload / "provenance/shared"
+    _entry_inventory(payload, payload_modes=True)
+    shared_dir = payload / "provenance/shared"
     try:
         shared_names = {path.name for path in shared_dir.iterdir()}
     except OSError as error:
         raise OfflineDependencyError(f"missing payload entry for shared provenance: {error}") from error
-    if shared_names != SHARED_FILES:
-        missing, extra = sorted(SHARED_FILES - shared_names), sorted(shared_names - SHARED_FILES)
-        phrase = "missing payload entry" if missing else "unexpected payload entry"
-        raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
-    expected_shared = {
-        "schema_version": 1,
-        "source": {"url": shared["url"], "revision": shared["revision"],
-                   "bundle_sha256": _sha256_file(shared_dir / "source.bundle")},
-        "licenses": _shared_license_digests(shared_dir),
-        "packages": [],
-    }
-    _payload_structure(options.payload, manifest, expected_vendor, expected_shared)
-    _verify_nightly_provenance(options.payload, nightly)
+    if shared is None:
+        if shared_names != {"packages.json"}:
+            missing, extra = sorted({"packages.json"} - shared_names), sorted(shared_names - {"packages.json"})
+            phrase = "missing payload entry" if missing else "unexpected payload entry"
+            raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
+        expected_shared = None
+    else:
+        if shared_names != SHARED_FILES:
+            missing, extra = sorted(SHARED_FILES - shared_names), sorted(shared_names - SHARED_FILES)
+            phrase = "missing payload entry" if missing else "unexpected payload entry"
+            raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
+        expected_shared = {
+            "schema_version": 1,
+            "source": {"url": shared["url"], "revision": shared["revision"],
+                       "bundle_sha256": _sha256_file(shared_dir / "source.bundle")},
+            "licenses": _shared_license_digests(shared_dir),
+            "packages": [],
+        }
+    _payload_structure(payload, manifest, expected_vendor, expected_shared)
+    _verify_nightly_provenance(payload, nightly)
     try:
         if reconstruct:
             preparer.run(root, check=False, offline=True,
-                         archive_dir=options.payload / "archives")
+                         archive_dir=payload / "archives")
         else:
             with _existing_preparation_lock(root):
                 preparer.run(root, check=True, offline=False, archive_dir=None)
@@ -1061,7 +1097,7 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
         action = "original archives cannot reconstruct prepared trees" if reconstruct \
             else "existing prepared outputs failed read-only verification"
         raise OfflineDependencyError(f"{action}: {error}") from error
-    final_rust, final_nightly = _rust_source(options.nightly_rustc)
+    final_rust, final_nightly = _rust_source(nightly_rustc)
     if final_rust != rust or final_nightly != nightly:
         raise OfflineDependencyError("nightly source input changed during verification")
     final_shared, final_vendor = _locked_dependencies(lock_paths)
@@ -1071,14 +1107,30 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
         raise OfflineDependencyError("recipe inputs changed during verification")
     if recipe_path.read_bytes() != recipe_bytes:
         raise OfflineDependencyError("fixed recipe changed during verification")
-    actual_digest = tree_content_digest(options.payload)
+    actual_digest = tree_content_digest(payload)
     if actual_digest != recipe["payload_tree_sha256"]:
         raise OfflineDependencyError(
             f"payload tree digest mismatch: expected {recipe['payload_tree_sha256']}, got {actual_digest}"
         )
     receipt = {"schema_version": 1, "recipe_sha256": _sha256_bytes(recipe_bytes),
-               "observed_inputs": inputs, "payload": str(options.payload),
-               "payload_tree_sha256": actual_digest, "project_source": project_source}
+               "observed_inputs": inputs, "payload": str(payload),
+               "payload_tree_sha256": actual_digest}
+    return receipt, tool
+
+
+def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
+    _external_target(root, options.prefix, "evidence prefix")
+    _absolute_directory(options.payload, "offline dependency payload")
+    if not (root / RECIPE_RELATIVE).is_file():
+        raise OfflineDependencyError(f"fixed recipe is missing: {root / RECIPE_RELATIVE}")
+    _strict_manifest(root, preparer)
+    project_source = _project_source_identity(root)
+    receipt, tool = _verify_payload_contents(
+        root, options.payload, options.nightly_rustc, preparer, reconstruct=reconstruct
+    )
+    receipt["project_source"] = project_source
+    inputs = receipt["observed_inputs"]
+    actual_digest = receipt["payload_tree_sha256"]
     values = {
         "command": {"operation": "verify", "payload": str(options.payload),
                     "nightly_rustc": str(options.nightly_rustc), "root": str(root)},
@@ -1092,12 +1144,15 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
     return receipt
 
 
-def replacement_config(payload: Path, shared_git: dict, *, vendor_path: str | None = None) -> bytes:
+def replacement_config(payload: Path, shared_git: dict | None, *, vendor_path: str | None = None) -> bytes:
     """Return the finite Cargo replacement configuration for one verified payload."""
-    if (not isinstance(shared_git, dict) or set(shared_git) != {"url", "revision"}
-            or not isinstance(shared_git["url"], str)
-            or not isinstance(shared_git["revision"], str)
-            or not REVISION_RE.fullmatch(shared_git["revision"])):
+    if shared_git is not None and (
+        not isinstance(shared_git, dict)
+        or set(shared_git) != {"url", "revision"}
+        or not isinstance(shared_git["url"], str)
+        or not isinstance(shared_git["revision"], str)
+        or not REVISION_RE.fullmatch(shared_git["revision"])
+    ):
         raise OfflineDependencyError("invalid shared Git identity for replacement config")
     if vendor_path is None:
         if not payload.is_absolute() or Path(os.path.normpath(str(payload))) != payload:
@@ -1105,10 +1160,18 @@ def replacement_config(payload: Path, shared_git: dict, *, vendor_path: str | No
         directory = str(payload / "vendor")
     else:
         directory = _safe_relative(vendor_path, "relative vendor path").as_posix()
-    for value, label in ((directory, "vendor directory"), (shared_git["url"], "shared Git URL")):
+    guarded = [(directory, "vendor directory")]
+    if shared_git is not None:
+        guarded.append((shared_git["url"], "shared Git URL"))
+    for value, label in guarded:
         if (any(character in value for character in ('"', "\n", "\r", "\\"))
                 or any(ord(character) < 32 or ord(character) == 127 for character in value)):
             raise OfflineDependencyError(f"{label} cannot be represented safely")
+    if shared_git is None:
+        return (
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n"
+            f"[source.vendored-sources]\ndirectory = \"{directory}\"\n\n[net]\noffline = true\n"
+        ).encode("utf-8")
     source = f"git+{shared_git['url']}?rev={shared_git['revision']}"
     return (
         "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n"
@@ -1122,9 +1185,10 @@ def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="operation", required=True)
     assemble_parser = subparsers.add_parser("assemble")
-    for option in ("output", "candidate-recipe", "archive-dir", "shared-source", "prefix",
+    for option in ("output", "candidate-recipe", "archive-dir", "prefix",
                    "stable-cargo", "stable-rustc", "bpf-cargo", "bpf-rustc"):
         assemble_parser.add_argument(f"--{option}", type=Path, required=True)
+    assemble_parser.add_argument("--shared-source", type=Path, required=False, default=None)
     verify_parser = subparsers.add_parser("verify")
     for option in ("payload", "nightly-rustc", "prefix"):
         verify_parser.add_argument(f"--{option}", type=Path, required=True)

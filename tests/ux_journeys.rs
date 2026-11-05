@@ -14,9 +14,20 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use support::DieWithParent as _;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_p11scope")
+#[path = "support/multi_host.rs"]
+mod multi_host;
+
+#[allow(dead_code)]
+mod support;
+
+/// The observer under test: the `P11SCOPE_E2E_OBSERVER` override when the
+/// runner stages a prebuilt binary elsewhere, else the binary Cargo built
+/// beside this test target.
+fn bin() -> String {
+    std::env::var("P11SCOPE_E2E_OBSERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
 }
 
 struct Outcome {
@@ -37,10 +48,40 @@ fn run(args: &[&str]) -> Outcome {
     }
 }
 
+fn assert_scoped_hint(stderr: &str, command: &str) {
+    let hint = match command {
+        "profile" => "Try 'p11scope profile --help'.",
+        "trace" => "Try 'p11scope trace --help'.",
+        "run" => "Try 'p11scope run --help'.",
+        "inspect" => "Try 'p11scope inspect --help'.",
+        "doctor" => "Try 'p11scope doctor --help'.",
+        "inventory" => "Try 'p11scope inventory --help'.",
+        other => panic!("no scoped-help contract for {other}"),
+    };
+    assert_eq!(stderr.lines().last(), Some(hint), "{stderr}");
+}
+
 /// Whether this host and these privileges allow the capture lane at all —
 /// asked with the observer's own doctor rather than a second copy of the rule.
 fn capture_available() -> bool {
     p11scope::doctor::verdict(&p11scope::doctor::probe(None, None)) == 0
+}
+
+/// With `P11SCOPE_REQUIRE_CAPTURE=1` (the privileged root run) the
+/// capture-unavailable branch is a named failure instead of a passing
+/// refusal, so the run proves the positive branch. Without the variable
+/// this is a no-op and the test keeps its two-branch behavior.
+fn require_capture_positive(test: &str) {
+    if !matches!(
+        std::env::var("P11SCOPE_REQUIRE_CAPTURE").as_deref(),
+        Ok("1")
+    ) {
+        return;
+    }
+    panic!(
+        "P11SCOPE_REQUIRE_CAPTURE=1 requires the positive branch, \
+         but capture is unavailable ({test})"
+    );
 }
 
 /// A live same-uid target the suite owns; killed and reaped on drop.
@@ -52,6 +93,7 @@ impl SleepTarget {
     fn spawn() -> Self {
         let child = Command::new("sleep")
             .arg("287.4139")
+            .die_with_parent()
             .spawn()
             .expect("spawn sleep target");
         Self { child }
@@ -105,8 +147,7 @@ fn b2_subcommand_help_is_scoped_to_that_subcommand() {
     for subcommand in ["profile", "trace", "run", "inspect", "doctor"] {
         let scoped = run(&[subcommand, "--help"]);
         assert_eq!(scoped.code, Some(0), "{subcommand} --help");
-        // F1 fixed (Task 2): scoped help carries only that subcommand's
-        // section plus the shared notes footer — never another subcommand.
+        // Scoped help has one usage section plus command-specific guidance.
         assert!(
             scoped.stderr.is_empty(),
             "{subcommand} --help: {:?}",
@@ -128,11 +169,25 @@ fn b2_subcommand_help_is_scoped_to_that_subcommand() {
             }
         }
         assert_ne!(scoped.stdout, global.stdout, "{subcommand} --help");
-        assert!(
-            scoped.stdout.contains("notes: discovery scans"),
-            "{subcommand} --help: {}",
-            scoped.stdout
-        );
+        if subcommand == "doctor" {
+            for guidance in [
+                "Check host and requested-target capability before capture.",
+                "Without --pid or --cgroup, target readiness is unassessed.",
+                "--extra-strict also treats warnings as failure",
+            ] {
+                assert!(
+                    scoped.stdout.contains(guidance),
+                    "{subcommand} --help missing {guidance:?}: {}",
+                    scoped.stdout
+                );
+            }
+        } else {
+            assert!(
+                scoped.stdout.contains("notes: discovery scans"),
+                "{subcommand} --help: {}",
+                scoped.stdout
+            );
+        }
     }
 }
 
@@ -169,7 +224,7 @@ fn b3_missing_or_unknown_subcommand_names_problem_exit_2() {
 fn b4_version_prints_plain_version_exit_0() {
     let version = run(&["--version"]);
     assert_eq!(version.code, Some(0));
-    assert_eq!(version.stdout, "p11scope 0.3.0\n");
+    assert_eq!(version.stdout, "p11scope 0.6.0\n");
     assert!(version.stderr.is_empty());
 }
 
@@ -205,12 +260,15 @@ fn b6_doctor_reports_rows_and_verdict() {
     // prompt no longer lands on the verdict line.
     assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
     if capture_available() {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         assert!(
             matches!(doctor.code, Some(0) | Some(1)),
             "{:?}",
             doctor.code
         );
     } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("b6_doctor_reports_rows_and_verdict");
         assert_eq!(doctor.code, Some(1));
         assert!(
             doctor.stdout.contains("capture unavailable"),
@@ -222,7 +280,14 @@ fn b6_doctor_reports_rows_and_verdict() {
 
 #[test]
 fn b7_run_refuses_without_capture_lane() {
-    if !capture_available() && unsafe { libc::geteuid() } != 0 {
+    // The hoisted check also covers the root-without-capture hole below,
+    // which otherwise asserts nothing.
+    let available = capture_available();
+    if !available {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("b7_run_refuses_without_capture_lane");
+    }
+    if !available && unsafe { libc::geteuid() } != 0 {
         // HIGH-1 (flipped from the F-01 hazard pin): without privilege the
         // uretprobe self-probe cannot load BPF, which is a missing-privilege
         // fact, not a seccomp hazard. The refusal says so, points at doctor,
@@ -264,7 +329,8 @@ fn b7_run_refuses_without_capture_lane() {
                 refused.stderr
             );
         }
-    } else if capture_available() {
+    } else if available {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         let outcome = run(&["run", "--", "/bin/true"]);
         assert!(outcome.code.is_some());
     }
@@ -419,7 +485,7 @@ fn j4_bad_flag_values_name_flag_exit_2() {
             "{flag} {value}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{flag} {value}");
+        assert_scoped_hint(&usage.stderr, "profile");
     }
     // F5 fixed (Task 3): like --ring-bytes (whose error line prints its
     // 4K..64M range) and --pause, the --mode error line lists its valid
@@ -430,11 +496,7 @@ fn j4_bad_flag_values_name_flag_exit_2() {
         first,
         "--mode: invalid value \"frobnicate\" (expected profile|metrics)"
     );
-    assert!(
-        mode.stderr.contains("[--mode profile|metrics]"),
-        "{}",
-        mode.stderr
-    );
+    assert_scoped_hint(&mode.stderr, "profile");
 }
 
 #[test]
@@ -483,12 +545,15 @@ fn t3_f3_doctor_verdict_ends_with_newline() {
     assert!(doctor.stdout.contains("verdict:"), "{}", doctor.stdout);
     assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
     if capture_available() {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         assert!(
             matches!(doctor.code, Some(0) | Some(1)),
             "{:?}",
             doctor.code
         );
     } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("t3_f3_doctor_verdict_ends_with_newline");
         assert_eq!(doctor.code, Some(1));
     }
 }
@@ -576,28 +641,40 @@ fn t3_f6_typo_and_exited_pids_read_differently() {
 
 #[test]
 fn t3_f7_attach_refusal_points_at_doctor() {
-    // F7 fixed (Task 3): the attach hint keeps its cause list and doc
-    // pointer, and now names `p11scope doctor` as the command that knows
-    // which cause applies. Exit 1 unchanged.
+    // OD36's host admission can refuse before an attach session starts.
+    // Both stages keep actionable guidance and exit 1; only a failure that
+    // actually reaches Session has the attach context and its cause-list doc.
     if !capture_available() && unsafe { libc::geteuid() } != 0 {
-        // HIGH-1: `run` now stops at the self-probe with the missing
-        // privilege (pinned in b7), so the attach hint is pinned where it is
-        // still reached: an unconfined `--pid` target needs no self-probe.
+        let host_refusal = multi_host::refusal();
         let target = SleepTarget::spawn();
         let refused = run(&["profile", "--pid", &target.pid(), "--duration", "1"]);
         assert_eq!(refused.code, Some(1));
-        assert!(
-            refused.stderr.contains("starting attach session"),
-            "{}",
-            refused.stderr
-        );
+        if let Some(reason) = host_refusal {
+            assert_eq!(refused.stderr, format!("p11scope: {reason}\n"));
+            assert!(
+                !refused.stderr.contains("starting attach session"),
+                "{}",
+                refused.stderr
+            );
+            assert!(
+                refused.stderr.contains("p11scope inspect --pid"),
+                "{}",
+                refused.stderr
+            );
+        } else {
+            assert!(
+                refused.stderr.contains("starting attach session"),
+                "{}",
+                refused.stderr
+            );
+            assert!(
+                refused.stderr.contains("phase5-unsupported.md"),
+                "{}",
+                refused.stderr
+            );
+        }
         assert!(
             refused.stderr.contains("p11scope doctor"),
-            "{}",
-            refused.stderr
-        );
-        assert!(
-            refused.stderr.contains("phase5-unsupported.md"),
             "{}",
             refused.stderr
         );
@@ -892,22 +969,23 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
-/// SE-09: profile without --duration prints one stderr line at start
-/// saying it captures until Ctrl-C (trace already warns).
+/// SE-09: an eligible profile without --duration names Ctrl-C at startup;
+/// an ineligible host refuses by name before that notice.
 #[test]
 fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
     use std::io::Read as _;
     use std::process::Stdio;
+    let host_refusal = multi_host::refusal();
     let target = SleepTarget::spawn();
     let mut child = Command::new(bin())
         .args(["profile", "--pid", &target.pid()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .expect("spawn p11scope profile");
-    // The notice prints before discovery; give it time to land, then stop
-    // the capture the way an operator would. Without privilege it has
-    // already exited 1 at the BPF preflight and the signal is a no-op.
+    // On eligible hosts the notice precedes discovery; give it time to land,
+    // then stop like an operator. A host refusal has already exited 1.
     std::thread::sleep(std::time::Duration::from_secs(3));
     let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
     let mut waited = 0;
@@ -927,18 +1005,29 @@ fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
         .expect("piped stderr")
         .read_to_string(&mut stderr)
         .expect("read profile stderr");
-    assert!(
-        stderr.contains("profile captures until interrupted (Ctrl-C)"),
-        "{stderr}"
-    );
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.contains("no --duration given"))
-            .count(),
-        1,
-        "exactly one no-duration line: {stderr}"
-    );
+    match host_refusal {
+        Some(reason) => {
+            assert_eq!(
+                child.try_wait().expect("profile status").unwrap().code(),
+                Some(1)
+            );
+            assert_eq!(stderr, format!("p11scope: {reason}\n"));
+        }
+        None => {
+            assert!(
+                stderr.contains("profile captures until interrupted (Ctrl-C)"),
+                "{stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.contains("no --duration given"))
+                    .count(),
+                1,
+                "exactly one no-duration line: {stderr}"
+            );
+        }
+    }
 }
 
 /// SE-08: `-o -` never creates a file literally named `-`. Trace
@@ -960,7 +1049,7 @@ fn se08_dash_output_never_creates_a_file_named_dash() {
     let stderr = String::from_utf8(refused.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("-o -"), "{stderr}");
     assert!(stderr.contains("omit -o"), "{stderr}");
-    assert!(stderr.contains("usage:"), "{stderr}");
+    assert_scoped_hint(&stderr, "profile");
     // Trace accepts `-o -` as stdout: never exit 2, never a file.
     let target = SleepTarget::spawn();
     let pid = target.pid();
@@ -1031,7 +1120,7 @@ fn se07_repeated_scalar_flag_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1067,7 +1156,7 @@ fn se06_empty_option_values_are_usage_errors_exit_2() {
         let usage = run(&refs);
         assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
         assert!(usage.stderr.contains(flag), "{argv:?}: {}", usage.stderr);
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1087,7 +1176,7 @@ fn se05_pid_zero_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0]);
     }
 }
 
@@ -1118,7 +1207,7 @@ fn se04_zero_duration_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1167,6 +1256,88 @@ fn b2_huge_duration_is_a_usage_error_not_a_panic() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
+}
+
+/// Static guard: every dual-outcome test in this file reads
+/// `P11SCOPE_REQUIRE_CAPTURE` through `require_capture_positive`, so the
+/// privileged root run cannot pass on the refusal branch. A new
+/// dual-outcome test that forgets the call fails here by name.
+///
+/// Exempt by design, not by omission:
+/// - `j2_unprivileged_profile_names_inspect_and_doctor`,
+///   `t3_f7_attach_refusal_points_at_doctor` and
+///   `high1_missing_privilege_is_named_and_never_offers_the_override` pin
+///   the unprivileged refusal itself and assert nothing once capture
+///   exists; requiring capture there would invert their purpose.
+/// - `high4_a_closed_stdout_reader_never_panics` asserts on both paths and
+///   only uses availability to pick the expected doctor code.
+#[test]
+fn every_capture_branch_names_the_require_guard() {
+    let path = format!("{}/tests/ux_journeys.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains("fn require_capture_positive"),
+        "the require guard is missing from {path}"
+    );
+    assert!(
+        source.contains("P11SCOPE_REQUIRE_CAPTURE"),
+        "the require guard no longer reads the variable in {path}"
+    );
+    let exempt = [
+        "j2_unprivileged_profile_names_inspect_and_doctor",
+        "t3_f7_attach_refusal_points_at_doctor",
+        "high1_missing_privilege_is_named_and_never_offers_the_override",
+        "high4_a_closed_stdout_reader_never_panics",
+    ];
+    let mut seen = Vec::new();
+    for segment in source.split("#[test]") {
+        let Some(name) = test_fn_name(segment) else {
+            continue;
+        };
+        seen.push(name.to_string());
+        if name == "every_capture_branch_names_the_require_guard" {
+            continue;
+        }
+        if segment.contains("capture_available()") && !exempt.contains(&name) {
+            assert!(
+                segment.contains("require_capture_positive"),
+                "{name} branches on capture availability without reading \
+                 P11SCOPE_REQUIRE_CAPTURE"
+            );
+        }
+    }
+    for name in exempt {
+        assert!(
+            seen.iter().any(|found| found == name),
+            "exemption {name} names no test in {path}"
+        );
+    }
+}
+
+/// The `fn` name of a `#[test]` segment, if the segment holds a test.
+fn test_fn_name(segment: &str) -> Option<&str> {
+    let rest = segment.split("fn ").nth(1)?;
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
+}
+
+/// Static guard: the staged-binary override `bin()` reads is the dedicated
+/// `P11SCOPE_E2E_OBSERVER` variable. A stray matrix export must not silently
+/// switch the binary in an ordinary `cargo test`, so `bin()` must not read
+/// that variable. (The needle is spelled in two halves so this guard does
+/// not match its own source.)
+#[test]
+fn observer_override_uses_the_dedicated_variable() {
+    let path = format!("{}/tests/ux_journeys.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains(r#"std::env::var("P11SCOPE_E2E_OBSERVER")"#),
+        "bin() must read P11SCOPE_E2E_OBSERVER in {path}"
+    );
+    assert!(
+        !source.contains(&["P11SCOPE", "BIN"].join("_")),
+        "bin() must not read the matrix override variable in {path}"
+    );
 }

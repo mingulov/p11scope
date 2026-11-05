@@ -5,24 +5,29 @@
 # of the lane is that one capture keeps them apart.
 #
 # Kept apart here means the plan's capacity semantics, which is what a real
-# libp11-kit forces: it maps 64 static CK_FUNCTION_LIST_3_2 closure templates
-# (104 entries each, 6530 distinct targets) into its own image, so discovery
-# decodes thousands of entries against a frozen 512-slot ceiling. Since Task
-# 1.2 the K=4 per-object heuristic cap admits 4 tables (410 distinct targets)
-# and records the other 60 as `discovery_uncorroborated_candidates` — spill is
-# evidence, never slots — so the proxy module is NOT refused whole: both
-# providers attach (478 slots, nothing skipped) and a target both providers
-# publish is attached exactly once. Completeness stays PARTIAL.
+# libp11-kit forces: it maps M static CK_FUNCTION_LIST_3_2 closure templates
+# (104 entries each) into its own image, so discovery decodes thousands of
+# entries against a frozen 512-slot ceiling. The late-start closure takes
+# the reserve-capped heuristic prefix: the leading N tables attach ("N of M
+# template tables attached") and the other M-N spill as
+# `discovery_uncorroborated_candidates` — spill is evidence, never slots —
+# so the proxy module is NOT refused whole: SoftHSM2 attaches in full first
+# (68 slots), then the prefix, and a target both providers publish is
+# attached exactly once. Completeness stays PARTIAL. (Measured on Fedora 42
+# / libp11-kit.so.0.4.11: "3 of 67 template tables attached", 68+308=376
+# slots, 478 calls.)
 #
 # p11-kit loads its backends lazily, at C_Initialize, after the observer has
 # attached. LD_PRELOAD maps SoftHSM2 at exec instead, so both providers are
 # mapped before attach; p11-kit then dlopens the same inode and its refcount
 # rises, which is exactly the "two providers, one process" shape being tested.
+#
+# P11SCOPE_BIN=/abs/p11scope reuses a prebuilt product instead of building one.
 set -eu
 cd "$(dirname "$0")/../.."
 
-PROXY=/usr/lib/x86_64-linux-gnu/p11-kit-proxy.so
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+PROXY=${PROXY-}
+MODULE=${MODULE-}
 WORK=target/matrix-proxy
 WPID=
 SPID=
@@ -30,12 +35,31 @@ NESTED_ROOT_PID=
 NESTED_ROOT_START=
 NESTED=
 . scripts/lib.sh
+. scripts/matrix/matrix-lib.sh
 require_non_root_caller
 
-test -f "$PROXY" || { echo "SKIP: p11-kit proxy not installed at $PROXY"; exit 0; }
-test -f "$MODULE" || { echo "SKIP: SoftHSM2 not installed at $MODULE"; exit 0; }
-command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
-command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
+# Probe provider paths (Debian + Fedora); a missing prerequisite exits 77.
+if [ -z "$PROXY" ]; then
+    for candidate in /usr/lib/x86_64-linux-gnu/p11-kit-proxy.so /usr/lib64/p11-kit-proxy.so /usr/lib/p11-kit-proxy.so; do
+        if [ -f "$candidate" ]; then PROXY=$candidate; break; fi
+    done
+    unset candidate
+fi
+test -f "${PROXY-}" || { echo "SKIP: p11-kit proxy not installed (probed Debian/Fedora paths)" >&2; exit 77; }
+if [ -z "$MODULE" ]; then
+    if command -v python3 >/dev/null 2>&1 && MODULE_PROBED=$(python3 -I scripts/release-matrix-contract.py --select-module 2>/dev/null); then
+        MODULE=$MODULE_PROBED
+    else
+        for candidate in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so; do
+            if [ -f "$candidate" ]; then MODULE=$candidate; break; fi
+        done
+        unset candidate
+    fi
+    unset MODULE_PROBED
+fi
+test -f "${MODULE-}" || { echo "SKIP: SoftHSM2 not installed (probed Debian/Fedora paths)" >&2; exit 77; }
+command -v gcc >/dev/null || { echo "gcc required" >&2; exit 77; }
+command -v softhsm2-util >/dev/null || { echo "softhsm2-util required" >&2; exit 77; }
 mkdir -p "$WORK"
 
 cleanup() {
@@ -63,8 +87,12 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build ==="
-scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace --target-dir "$WORK/build"
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
+if ! matrix_prebuilt_product; then
+    scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace --target-dir "$WORK/build"
+    P11SCOPE_EXE=$WORK/build/release/p11scope
+fi
+matrix_report_product
+sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 77; }
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token (private, disposable) ==="
@@ -98,7 +126,7 @@ WPID=$!
 wait_for_mapped_provider "$WPID" libsofthsm2.so
 wait_for_mapped_provider "$WPID" p11-kit
 sudo --preserve-env=SOFTHSM2_CONF --preserve-env=XDG_CONFIG_HOME \
-    "$WORK/build/release/p11scope" profile --pid "$WPID" \
+    "$P11SCOPE_EXE" profile --pid "$WPID" \
     --mode metrics --duration 20 -o "$WORK/observed.json" > "$WORK/profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics || {
@@ -126,10 +154,11 @@ doc = json.load(open(sys.argv[1]))
 ev = doc["evidence"]
 
 # The plan's capacity semantics are this lane's expected outcome, not a
-# fallback. A real libp11-kit maps 64 static CK_FUNCTION_LIST_3_2 closure
+# fallback. A real libp11-kit maps M static CK_FUNCTION_LIST_3_2 closure
 # templates into the scanned image — thousands of decoded entries against the
-# frozen 512-slot ceiling — so the K=4 per-object heuristic cap admits 4
-# tables and spills 60 as candidates: both providers attach, nothing is
+# frozen 512-slot ceiling — so the reserve-capped heuristic prefix admits the
+# leading N tables ("N of M template tables attached") and spills M-N as
+# candidates: SoftHSM2 attaches in full first, then the prefix, nothing is
 # refused whole, and a target both providers publish is attached exactly
 # once. No p11-kit module-directory scoping can change that: the closures
 # are part of the mapped image, not of any backend it loads.
@@ -144,7 +173,7 @@ for module in doc["capture"]["modules"]:
     print("  attached:", module["path"])
 print("  slots:", ev["slots"], "probes:", ev["attached_probes"], "calls:", called)
 print("  decoded entries:", ev["table_entries"], "over", len(ev["surfaces"]), "surfaces")
-print("  K=4 spill (uncorroborated candidates):", ev["discovery_uncorroborated_candidates"])
+print("  prefix spill (uncorroborated candidates):", ev["discovery_uncorroborated_candidates"])
 PY
 
 echo "=== nested function-list and interface-list exports ==="
@@ -162,7 +191,7 @@ WPID=$!
 wait_for_mapped_provider "$WPID" provider-1.so
 wait_for_mapped_provider "$WPID" provider-2.so
 launch_root_recorded_process "$NESTED/observer.pid" "$NESTED/profile.log" \
-    "$WORK/build/release/p11scope" profile --pid "$WPID" \
+    "$P11SCOPE_EXE" profile --pid "$WPID" \
     --mode metrics --duration 10 -o "$NESTED/observed.json"
 SPID=$ROOT_LAUNCH_PID
 NESTED_ROOT_PID=$ROOT_PROCESS_PID

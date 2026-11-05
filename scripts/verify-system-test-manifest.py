@@ -17,13 +17,50 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER = ROOT / "tests/fixtures/system-qualification/closure-ledger.json"
 DEFERRED = ROOT / "tests/fixtures/system-qualification/system-deferred-gates.json"
+BOUNDED_SCOPE = ROOT / "tests/fixtures/system-qualification/system-bounded-scope.json"
 SCHEMA = "p11scope/system-test-manifest/v1"
 OUTCOMES = {"PASS", "FAIL", "INVALID", "NOT_RUN", "UNSUPPORTED", "BLOCKED"}
 ENTRYPOINTS = {"model": "unit-test", "artifact": "artifact-check",
                "live-mechanism": "private-live-test", "public-command": "public-cli",
                "installed": "installed-cli", "soak": "installed-cli"}
 REQUIREMENTS = {f"R{number:02}" for number in range(1, 11)}
-CLAIMS = {"system-product", "t7-static"}
+CLAIMS = {"system-product", "t7-static", "bounded-release"}
+# T1 fix policy: the bounded v0.4 release claim requires exactly the IN
+# list of the checked-in bounded-scope catalog (system-bounded-scope.json,
+# status proposed-for-owner-approval). Placeholder-kernel cells stay
+# required for system-product; their bounded OUT status comes only from
+# that catalog with a per-cell reason, never from metadata inference, so
+# flipping a cell's kernel metadata cannot silently change bounded
+# membership. The 30-minute meaningful-activity soak is IN; the 4h/24h
+# endurance soaks are OUT with full-endurance reasons. Controller review
+# needed: this membership is a product-scope decision.
+PLACEHOLDER_KERNEL = "final-supported-matrix"
+# Registered T7 acceptance selectors: the generator seeds them so a
+# regeneration never silently drops concrete acceptance registration.
+# Rule: "T7.{profile}.{slug}" runs
+# "attach::inventory::activation::privileged_tests::privileged_t7_{slug}";
+# spelled out so a slug change fails loudly at regen review instead of
+# deriving a wrong ID.
+T7_SELECTORS = {
+    "T7.default.inventory_n576_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n576_lp64"],
+    "T7.default.inventory_n1024_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64"],
+    "T7.default.inventory_n4097_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"],
+    "T7.default.inventory_n6530_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"],
+    "T7.default.inventory_n6531_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64"],
+    "T7.default.inventory_n8192_boundary_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64"],
+    "T7.default.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
+    "T7.wide.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
+}
+# Registered soak acceptance selectors: the generator seeds them so a
+# regeneration never silently drops concrete acceptance registration.
+# Rule: "soak.{duration}s" runs the soak vehicle
+# (scripts/system-scope-soak.sh) once against the installed artifact; the
+# selector names the continuous-owned-workload test the run executes.
+SOAK_SELECTORS = {
+    "soak.1800s": ["soak.1800s::continuous-owned-workload"],
+    "soak.14400s": ["soak.14400s::continuous-owned-workload"],
+    "soak.86400s": ["soak.86400s::continuous-owned-workload"],
+}
 
 
 def require(condition, message):
@@ -85,7 +122,7 @@ def catalog():
             "kernel_profile": "final-supported-matrix", "required_for_claims": ["system-product"],
             "expected_behavior": "public-contract",
             "limitation": "Requires public command and independent oracle; concrete tests remain to be registered."}
-    for profile, slug in [("default", f"inventory_n{n}_lp64") for n in [576, 1024, 4097, 6530]] + [
+    for profile, slug in [("default", f"inventory_n{n}_lp64") for n in [576, 1024, 4097, 6530, 6531]] + [
             ("default", "inventory_n8192_boundary_lp64"), ("default", "detailed_hot_slot_third_rv_lp64"),
             ("wide", "detailed_hot_slot_third_rv_lp64")]:
         policies[f"T7.{profile}.{slug}"] = {
@@ -105,15 +142,45 @@ def catalog():
             "kernel_profile": "current/default", "required_for_claims": ["system-product"],
             "expected_behavior": "continuous-owned-workload", "minimum_duration_s": duration,
             "limitation": "Actual wall time with independent workload/loss and resource accounting required."}
+    scope = json.loads(BOUNDED_SCOPE.read_text())
+    require(scope.get("schema") == "p11scope/system-bounded-scope/v1", "wrong bounded-scope schema")
+    require(scope.get("claim") == "bounded-release", "bounded-scope claim mismatch")
+    ins = scope.get("in")
+    require(isinstance(ins, list) and all(isinstance(identifier, str) for identifier in ins),
+            "bounded-scope IN list must pin explicit cell identities")
+    require(len(set(ins)) == len(ins), "duplicate bounded-scope IN identity")
+    outs = scope.get("out")
+    require(isinstance(outs, list), "bounded-scope OUT list must pin explicit exclusions")
+    out_ids = []
+    for entry in outs:
+        require(isinstance(entry, dict)
+                and all(isinstance(entry.get(key), str) and entry[key]
+                        for key in ("id", "reason", "owner_task", "move_in")),
+                "bounded-scope OUT entry needs id/reason/owner_task/move_in")
+        out_ids.append(entry["id"])
+        require(entry["id"] in policies, f"bounded-scope OUT identity unknown: {entry['id']}")
+        require(entry["owner_task"] == policies[entry["id"]]["owner_task"],
+                f"bounded-scope OUT owner drifted: {entry['id']}")
+    require(len(set(out_ids)) == len(out_ids), "duplicate bounded-scope OUT identity")
+    system = {identifier for identifier, policy in policies.items()
+              if "system-product" in policy["required_for_claims"]}
+    require(set(ins) <= set(policies), "bounded-scope IN identity unknown")
+    require(set(ins) | set(out_ids) == system and not (set(ins) & set(out_ids)),
+            "bounded scope must partition system-product exactly; edit the scope catalog")
+    for identifier in ins:
+        policies[identifier]["required_for_claims"].append("bounded-release")
     return policies
 
 
 def new_manifest():
     cells = []
     for identifier, policy in catalog().items():
-        cells.append({"id": identifier, **policy, "test_ids": [], "command": [], "artifact_hashes": {},
+        seeded = T7_SELECTORS.get(identifier, SOAK_SELECTORS.get(identifier, []))
+        cells.append({"id": identifier, **policy, "test_ids": list(seeded),
+                      "command": [], "artifact_hashes": {},
                       "evidence_paths": [], "outcome": "NOT_RUN", "receipt": None, "receipt_sha256": None})
     return {"schema": SCHEMA, "ledger_sha256": digest(LEDGER), "deferred_sha256": digest(DEFERRED),
+            "bounded_scope_sha256": digest(BOUNDED_SCOPE),
             "subject": None, "cells": cells}
 
 
@@ -128,7 +195,7 @@ def evidence_path(root, relative):
 
 def verify_pass(row, subject, root):
     label = row["id"]
-    require(row["kernel_profile"] != "final-supported-matrix",
+    require(row["kernel_profile"] != PLACEHOLDER_KERNEL,
             f"{label}: placeholder matrix must be replaced by concrete kernel/profile cells in the catalog")
     require(isinstance(subject, dict) and all(re.fullmatch(r"[0-9a-f]{40}", subject.get(key, ""))
             for key in ["revision", "tree"]), "PASS requires exact source subject")
@@ -168,6 +235,7 @@ def verify_manifest(manifest, root, claim="system-product", structure_only=False
     require(manifest.get("schema") == SCHEMA, "wrong manifest schema")
     require(manifest.get("ledger_sha256") == digest(LEDGER), "closure ledger hash mismatch")
     require(manifest.get("deferred_sha256") == digest(DEFERRED), "deferred gate hash mismatch")
+    require(manifest.get("bounded_scope_sha256") == digest(BOUNDED_SCOPE), "bounded-scope catalog hash mismatch")
     require(claim in CLAIMS, "unknown acceptance claim")
     policies = catalog()
     rows = manifest.get("cells")

@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned, stopped subjects for tests that need a stable process mapping lifetime.
 
+use crate::fixture_guard::DieWithParent as _;
+
 /// An acknowledged, stopped process whose mappings cannot change while a
 /// fixture selects or pins them. The guard retains all child custody until Drop.
 pub(super) struct OwnedMapper(pub(super) std::process::Child);
@@ -15,6 +17,7 @@ impl OwnedMapper {
             .args(["-c", "printf 'ready\\n'; read -r ignored"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap();
         Self::from_child(child, std::time::Duration::from_secs(5)).unwrap()

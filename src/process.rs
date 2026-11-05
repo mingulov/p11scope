@@ -3,10 +3,24 @@
 
 use crate::discovery::scan::{CaptureWorkBudget, read_mountinfo};
 use crate::semantics::ProcessKey;
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
+};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+
+// Staged DR04 backend; no live caller metadata publication is wired yet.
+#[allow(dead_code)]
+pub(crate) mod cgroup_context;
+pub(crate) mod leader_exit;
+mod view_filesystem;
+use std::sync::{Arc, Weak};
+pub(crate) use view_filesystem::{
+    ViewFilesystem, cold_filesystem_deadline, snapshot_leader_is_zombie,
+    with_cold_snapshot_filesystem,
+};
 
 pub(crate) const MAX_TRACKED: usize = 16_384;
 #[cfg(test)]
@@ -305,10 +319,14 @@ pub struct MountNamespaceId {
 }
 
 fn mount_namespace_id(pid: u32) -> Result<MountNamespaceId, String> {
+    mount_namespace_id_io(pid)
+        .map_err(|error| format!("cannot identify process mount namespace: {error}"))
+}
+
+fn mount_namespace_id_io(pid: u32) -> io::Result<MountNamespaceId> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
-        .map_err(|error| format!("cannot identify process mount namespace: {error}"))?;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))?;
     Ok(MountNamespaceId {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -343,9 +361,9 @@ pub(crate) fn mountinfo_reads_for_test() -> u64 {
 fn read_view_mountinfo(
     pid: u32,
     budget: &mut CaptureWorkBudget,
+    open: impl FnOnce() -> io::Result<std::fs::File>,
 ) -> Result<(std::fs::File, String), String> {
-    let table = std::fs::File::open(format!("/proc/{pid}/mountinfo"))
-        .map_err(|error| format!("cannot open pid {pid}'s mount table: {error}"))?;
+    let table = open().map_err(|error| format!("cannot open pid {pid}'s mount table: {error}"))?;
     #[cfg(test)]
     MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
     let text = read_mountinfo(&table, budget)
@@ -437,6 +455,7 @@ impl MountTableCache {
         &mut self,
         owner: (ProcessViewId, u32),
         budget: &mut CaptureWorkBudget,
+        open: impl FnOnce() -> io::Result<std::fs::File>,
     ) -> Result<(), String> {
         if let Some(table) = &self.table
             && table.owner == owner
@@ -445,7 +464,7 @@ impl MountTableCache {
             return Ok(());
         }
         self.table = None;
-        let (file, text) = read_view_mountinfo(owner.1, budget)?;
+        let (file, text) = read_view_mountinfo(owner.1, budget, open)?;
         self.table = Some(CachedMountTable { owner, file, text });
         Ok(())
     }
@@ -482,15 +501,34 @@ fn run_while_same_with<T>(
     Ok(result)
 }
 
+/// Allocation identity of one admitted view; carries no descriptor.
+#[derive(Clone)]
+pub(crate) struct ViewAdmission(std::sync::Arc<()>);
+impl ViewAdmission {
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+}
+
 /// One accepted process generation and its filesystem view. Task 4 uses the pin
 /// through scan/open/hash; the later lifecycle task can retain this value and recheck
 /// it before subtracting this view's claims.
 pub struct ProcessView {
+    admission: ViewAdmission,
     id: ProcessViewId,
     mount_namespace: MountNamespaceId,
-    pin: PidPin,
+    pin: Arc<PidPin>,
     admitted_ns: u64,
+    cold_filesystem_observed: std::sync::atomic::AtomicBool,
 }
+
+#[cfg(test)]
+#[path = "process/cold_view_tests.rs"]
+pub(crate) mod cold_view_tests;
 
 fn validated_with_admission_time<T>(
     validate: impl FnOnce() -> Result<T, String>,
@@ -504,25 +542,86 @@ fn validated_with_admission_time<T>(
 
 impl ProcessView {
     pub fn open(id: ProcessViewId, pid: u32) -> Result<Self, String> {
-        let ((pin, mount_namespace), admitted_ns) = validated_with_admission_time(
+        Self::open_with_budget(id, pid, &mut CaptureWorkBudget::default())
+    }
+
+    /// Original leader metadata only, for native-owner custody before an
+    /// Inventory scan window exists. This never starts a cold task census or
+    /// allocates a default discovery allowance. Cold discovery requires the
+    /// separate constructor with its caller's actual budget.
+    pub(crate) fn open_warm_only(id: ProcessViewId, pid: u32) -> Result<Self, String> {
+        Self::open_with_filesystem(id, pid, |pin| {
+            mount_namespace_id(pin.pid())
+                .map(|namespace| (namespace, false))
+                .map_err(|error| {
+                    format!(
+                        "warm-only process view lacks original leader filesystem metadata: \
+                         {error}; cold filesystem proof requires an active capture allowance"
+                    )
+                })
+        })
+    }
+
+    pub(crate) fn open_with_budget(
+        id: ProcessViewId,
+        pid: u32,
+        work: &mut CaptureWorkBudget,
+    ) -> Result<Self, String> {
+        if let Some(reason) = work.check_deadline_now() {
+            return Err(reason.into());
+        }
+        work.spend(1).map_err(str::to_owned)?;
+        Self::open_with_filesystem(id, pid, |pin| {
+            let filesystem = ViewFilesystem::open(pin, work)?;
+            filesystem.validate(work)?;
+            Ok((filesystem.namespace(), filesystem.is_cold()))
+        })
+    }
+
+    fn open_with_filesystem(
+        id: ProcessViewId,
+        pid: u32,
+        identify: impl FnOnce(&PidPin) -> Result<(MountNamespaceId, bool), String>,
+    ) -> Result<Self, String> {
+        let ((pin, mount_namespace, cold_filesystem), admitted_ns) = validated_with_admission_time(
             || {
                 let pin = PidPin::open(pid)?;
-                let mount_namespace = mount_namespace_id(pid)?;
-                if !pin.still_the_same() {
+                let (mount_namespace, cold_filesystem) = identify(&pin)?;
+                if pin.original_exited()? {
                     return Err(format!(
                         "pid {pid} exited while its mount namespace was identified"
                     ));
                 }
-                Ok((pin, mount_namespace))
+                Ok((pin, mount_namespace, cold_filesystem))
             },
             crate::attach::monotonic_ns,
         )?;
         Ok(Self {
+            admission: ViewAdmission(std::sync::Arc::new(())),
             id,
             mount_namespace,
-            pin,
+            // The already opened pin moves into its shared allocation
+            // exactly once: no PID reopen, no duplicate pidfd.
+            pin: Arc::new(pin),
             admitted_ns,
+            cold_filesystem_observed: std::sync::atomic::AtomicBool::new(cold_filesystem),
         })
+    }
+
+    pub(crate) fn retained_pin(&self) -> &PidPin {
+        &self.pin
+    }
+
+    /// The view's original pin allocation, shared without another open or
+    /// FD: repeated identity queries borrow this same allocation. It rides
+    /// the view's own bounded custody (one view per retained owner, paid
+    /// by the view's opening budget); there is no fresh budget and no
+    /// long-lived observation cache.
+    pub(crate) fn retained_pin_arc(&self) -> &Arc<PidPin> {
+        &self.pin
+    }
+    pub(crate) fn view_admission(&self) -> ViewAdmission {
+        self.admission.clone()
     }
 
     pub fn id(&self) -> ProcessViewId {
@@ -573,21 +672,52 @@ impl ProcessView {
         run_while_same_with(|| self.still_the_same(), action)
     }
 
-    fn ensure_retained(&self) -> Result<(), String> {
-        let exited = || {
-            format!(
-                "pid {} exited while its mount namespace was being checked",
-                self.pid()
-            )
-        };
-        if !self.still_the_same() {
-            return Err(exited());
+    fn filesystem(&self, work: &mut CaptureWorkBudget) -> Result<ViewFilesystem<'_>, String> {
+        let filesystem = ViewFilesystem::open_for_view(
+            &self.pin,
+            self.cold_filesystem_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            work,
+            || {
+                self.cold_filesystem_observed
+                    .store(true, std::sync::atomic::Ordering::Release)
+            },
+        )?;
+        if filesystem.is_cold() {
+            self.cold_filesystem_observed
+                .store(true, std::sync::atomic::Ordering::Release);
         }
-        let current = mount_namespace_id(self.pid())?;
-        if !self.still_the_same() {
-            return Err(exited());
+        Ok(filesystem)
+    }
+
+    fn ensure_filesystem(
+        &self,
+        filesystem: &ViewFilesystem<'_>,
+        work: &mut CaptureWorkBudget,
+    ) -> Result<(), String> {
+        if self
+            .cold_filesystem_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !filesystem.is_cold()
+        {
+            return Err(
+                "a retained view crossed leader exit and requires fresh member custody".into(),
+            );
         }
-        ensure_same_mount_namespace(self.mount_namespace, current)
+        ensure_same_mount_namespace(self.mount_namespace, filesystem.namespace())?;
+        filesystem.validate(work)
+    }
+
+    pub(crate) fn with_filesystem<T>(
+        &self,
+        work: &mut CaptureWorkBudget,
+        action: impl FnOnce(&ViewFilesystem<'_>, &mut CaptureWorkBudget) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let filesystem = self.filesystem(work)?;
+        self.ensure_filesystem(&filesystem, work)?;
+        let outcome = action(&filesystem, work);
+        self.ensure_filesystem(&filesystem, work)?;
+        outcome
     }
 
     /// Opens one object through this retained process view before reading the
@@ -595,13 +725,20 @@ impl ProcessView {
     /// is resolved, and both process generation and mount namespace are rechecked.
     pub(crate) fn open_then_mountinfo<T>(
         &self,
-        open: impl FnOnce() -> Result<T, String>,
+        open: impl FnOnce(&ViewFilesystem<'_>) -> Result<T, String>,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(T, String), String> {
+        let filesystem = self.filesystem(budget)?;
+        let work = std::cell::RefCell::new(budget);
         open_then_mountinfo_checked(
-            || self.ensure_retained(),
-            open,
-            || read_view_mountinfo(self.pid(), budget).map(|(_, text)| text),
+            || self.ensure_filesystem(&filesystem, &mut work.borrow_mut()),
+            || open(&filesystem),
+            || {
+                read_view_mountinfo(self.pid(), &mut work.borrow_mut(), || {
+                    filesystem.open_mountinfo()
+                })
+                .map(|(_, text)| text)
+            },
         )
     }
 
@@ -609,15 +746,21 @@ impl ProcessView {
     /// table once and proves it unchanged — after `open` — on every later use.
     pub(crate) fn open_then_cached_mountinfo<'c, T>(
         &self,
-        open: impl FnOnce() -> Result<T, String>,
+        open: impl FnOnce(&ViewFilesystem<'_>) -> Result<T, String>,
         mounts: &'c mut MountTableCache,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(T, &'c str), String> {
         let owner = (self.id(), self.pid());
+        let filesystem = self.filesystem(budget)?;
+        let work = std::cell::RefCell::new(budget);
         let (opened, ()) = open_then_mountinfo_checked(
-            || self.ensure_retained(),
-            open,
-            || mounts.refresh(owner, budget),
+            || self.ensure_filesystem(&filesystem, &mut work.borrow_mut()),
+            || open(&filesystem),
+            || {
+                mounts.refresh(owner, &mut work.borrow_mut(), || {
+                    filesystem.open_mountinfo()
+                })
+            },
         )?;
         Ok((opened, mounts.text()))
     }
@@ -640,11 +783,12 @@ pub(crate) fn reused_process_view_for_test(
     let retained = process_start_time(pid)
         .map_err(|error| format!("cannot build reused-pid test view: {error}"))?
         .wrapping_add(1);
-    view.pin = PidPin {
+    view.pin = Arc::new(PidPin {
+        shared_charge: None,
         pid,
         pidfd: None,
         start_time: Some(retained),
-    };
+    });
     Ok(view)
 }
 
@@ -654,19 +798,18 @@ pub(crate) fn unprovable_process_view_for_test(
     pid: u32,
 ) -> Result<ProcessView, String> {
     let mut view = ProcessView::open(id, pid)?;
-    view.pin = PidPin {
+    view.pin = Arc::new(PidPin {
+        shared_charge: None,
         pid,
         pidfd: None,
         start_time: None,
-    };
+    });
     Ok(view)
 }
 
-/// A view pinned by `/proc` start time only, for the no-executable loader
-/// test: the child is killed into a zombie AFTER this opens, so
-/// `/proc/PID/exe` readlinks ENOENT while the retained start time still
-/// matches and `still_the_same()` stays true (the kthread shape — a live
-/// generation with no executable — without needing a kernel thread).
+/// A view pinned by `/proc` start time only. An unreaped zombie still
+/// matches this weak generation check; it has no original pidfd authority
+/// for full-image custody or cold filesystem proof.
 #[cfg(test)]
 pub(crate) fn start_time_pinned_process_view_for_test(
     id: ProcessViewId,
@@ -675,11 +818,12 @@ pub(crate) fn start_time_pinned_process_view_for_test(
     let mut view = ProcessView::open(id, pid)?;
     let retained = process_start_time(pid)
         .map_err(|error| format!("cannot build start-time-pinned test view: {error}"))?;
-    view.pin = PidPin {
+    view.pin = Arc::new(PidPin {
+        shared_charge: None,
         pid,
         pidfd: None,
         start_time: Some(retained),
-    };
+    });
     Ok(view)
 }
 
@@ -698,6 +842,402 @@ pub struct PidPin {
     pid: u32,
     pidfd: Option<OwnedFd>,
     start_time: Option<u64>,
+    shared_charge: Option<Arc<CustodyCharge>>,
+}
+
+/// Accounting only. The same peer follows all strong process custody and every
+/// paired weak view; it cannot establish process or semantic authority.
+pub(crate) struct CustodyCharge {
+    _storage: ResourceLease,
+}
+
+impl CustodyCharge {
+    fn arc_bytes<T>() -> Option<usize> {
+        // Pinned alloc::sync::ArcInner is repr(C, align(2)), two atomic usize
+        // counters then data. Match its header.extend(data).pad_to_align().
+        std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<T>())
+            .ok()
+            .map(|(layout, _)| layout.pad_to_align().size())
+    }
+
+    pub(crate) fn requested_bytes<Pin>(inline_bytes: usize) -> Option<usize> {
+        Self::arc_bytes::<Pin>()?
+            .checked_add(Self::arc_bytes::<Self>()?)?
+            .checked_add(2 * OWNED_ALLOCATION_PADDING)?
+            .checked_add(inline_bytes)
+    }
+
+    pub(crate) fn reserve<Pin>(
+        reserve: &SemanticResourceReserver,
+        inline_bytes: usize,
+    ) -> Result<Arc<Self>, SemanticResourceRefusal> {
+        let bytes = Self::requested_bytes::<Pin>(inline_bytes).unwrap_or(usize::MAX);
+        // No Arc allocation precedes this reservation.
+        let storage = reserve.reserve(bytes)?;
+        Ok(Arc::new(Self { _storage: storage }))
+    }
+}
+
+/// A weak process identity paired with the charge for its still-live allocation.
+/// Field order matters: release the Weak allocation before refunding its lease.
+pub(crate) struct WeakProcessCustody {
+    original: Weak<PidPin>,
+    _charge: Arc<CustodyCharge>,
+}
+
+impl WeakProcessCustody {
+    pub(crate) fn matches_original(&self, original: &Arc<PidPin>) -> bool {
+        self.original
+            .upgrade()
+            .is_some_and(|held| Arc::ptr_eq(&held, original))
+    }
+
+    /// Tests-only custody over a caller-held live pin: downgrades the
+    /// pin with a test-pool charge, so `matches_original` passes for
+    /// that pin through the real upgrade + ptr_eq check. Reclaim-path
+    /// scenes only (I4): production custody comes from acquisition.
+    #[cfg(test)]
+    pub(crate) fn pinned_for_test(pin: &Arc<PidPin>) -> Self {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let charge = CustodyCharge::reserve::<PidPin>(&pool.reserver(), 0)
+            .expect("the test pool charges one custody");
+        Self {
+            original: Arc::downgrade(pin),
+            _charge: charge,
+        }
+    }
+}
+
+impl PidPin {
+    pub(crate) fn install_shared_custody_charge(&mut self, charge: Arc<CustodyCharge>) {
+        assert!(
+            self.shared_charge.is_none(),
+            "original custody is charged exactly once"
+        );
+        self.shared_charge = Some(charge);
+    }
+
+    pub(crate) fn downgrade_shared(original: &Arc<Self>) -> Option<WeakProcessCustody> {
+        let charge = Arc::clone(original.shared_charge.as_ref()?);
+        Some(WeakProcessCustody {
+            original: Arc::downgrade(original),
+            _charge: charge,
+        })
+    }
+}
+
+/// Acquisition seam shared by the strict proc owner and its race regressions.
+fn acquire_proc_dir_with<T>(
+    has_pidfd: bool,
+    birth: Option<u64>,
+    mut alive: impl FnMut() -> Result<bool, String>,
+    open: impl FnOnce() -> Result<T, String>,
+    directory_birth: impl FnOnce(&T) -> Result<u64, String>,
+) -> Result<T, String> {
+    if !has_pidfd {
+        return Err("full-image custody requires the original pidfd".into());
+    }
+    let birth =
+        birth.ok_or_else(|| "full-image custody requires the admission start time".to_string())?;
+    if !alive()? {
+        return Err("original process exited before proc acquisition".into());
+    }
+    let directory = open()?;
+    if !alive()? {
+        return Err("original process exited during proc acquisition".into());
+    }
+    if directory_birth(&directory)? != birth {
+        return Err("proc acquisition crossed a process generation change".into());
+    }
+    if !alive()? {
+        return Err("original process exited while proc identity was read".into());
+    }
+    Ok(directory)
+}
+
+/// A proc directory acquired under original-pidfd custody. It pins a struct
+/// pid, not an mm: only the full-image scan brackets authorize its ranges.
+pub(crate) struct ProcPin<'a> {
+    pin: &'a PidPin,
+    directory: OwnedFd,
+}
+
+fn relative_proc_open(directory: BorrowedFd<'_>, path: &std::ffi::CStr) -> Result<OwnedFd, String> {
+    // SAFETY: live directory fd and NUL-terminated, internally selected path.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "opening retained proc member: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: openat returned a newly owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+impl PidPin {
+    pub(crate) fn open_proc_dir(&self) -> Result<ProcPin<'_>, String> {
+        if !crate::pidns::numbering().agrees() {
+            return Err("full-image custody requires observer/proc/kernel PID agreement".into());
+        }
+        let path = std::ffi::CString::new(format!("/proc/{}", self.pid)).unwrap();
+        let directory = acquire_proc_dir_with(
+            self.pidfd.is_some(),
+            self.start_time,
+            || self.original_exited().map(|exited| !exited),
+            || {
+                // SAFETY: internally formed numeric proc path, no symlink.
+                let fd = unsafe {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if fd < 0 {
+                    return Err(format!(
+                        "acquiring proc directory: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                // SAFETY: open returned a new owned directory descriptor.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            },
+            |directory| {
+                let stat = relative_proc_open(directory.as_fd(), c"stat")?;
+                let text = read_stat_bytes(std::fs::File::from(stat))
+                    .map_err(|error| format!("reading retained proc stat: {error}"))?;
+                start_time_from_stat(&text)
+                    .map_err(|error| format!("parsing retained proc stat: {error}"))
+            },
+        )?;
+        Ok(ProcPin {
+            pin: self,
+            directory,
+        })
+    }
+}
+
+impl ProcPin<'_> {
+    fn before_io(&self, deadline: std::time::Instant) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err("full-image scan deadline exhausted".into());
+        }
+        if self.pin.original_exited()? {
+            return Err("original process exited during full-image scan".into());
+        }
+        Ok(())
+    }
+
+    /// One relative maps open retained to real EOF. `max_bytes` includes all
+    /// maps rows, not just selected ranges; truncation never means completion.
+    pub(crate) fn read_maps(
+        &self,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        self.read_maps_with(deadline, max_bytes, || {})
+    }
+
+    fn read_maps_with(
+        &self,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+        mut after_read: impl FnMut(),
+    ) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+        if max_bytes == 0 || max_bytes > 8 * 1024 * 1024 {
+            return Err("invalid maps byte bound".into());
+        }
+        self.before_io(deadline)?;
+        let fd = relative_proc_open(self.directory.as_fd(), c"maps")?;
+        self.before_io(deadline)?;
+        let mut file = std::fs::File::from(fd);
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            self.before_io(deadline)?;
+            let count = file
+                .read(&mut buffer)
+                .map_err(|error| format!("reading retained maps: {error}"))?;
+            after_read();
+            self.before_io(deadline)?;
+            if count == 0 {
+                return Ok(bytes);
+            }
+            if count > max_bytes.saturating_sub(bytes.len()) {
+                return Err("retained maps exceeds its byte bound".into());
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_open_at<'a>(
+        pin: &'a PidPin,
+        path: &std::path::Path,
+    ) -> Result<ProcPin<'a>, String> {
+        let directory = acquire_proc_dir_with(
+            pin.pidfd.is_some(),
+            pin.start_time,
+            || pin.original_exited().map(|exited| !exited),
+            || {
+                std::fs::File::open(path)
+                    .map(OwnedFd::from)
+                    .map_err(|error| error.to_string())
+            },
+            |directory| {
+                let stat = relative_proc_open(directory.as_fd(), c"stat")?;
+                let text = read_stat_bytes(std::fs::File::from(stat))
+                    .map_err(|error| error.to_string())?;
+                start_time_from_stat(&text).map_err(|error| error.to_string())
+            },
+        )?;
+        Ok(ProcPin { pin, directory })
+    }
+
+    /// Typed range confirmation only; no raw descriptor or arbitrary-path API.
+    pub(crate) fn mapped_file_identity(
+        &self,
+        start: u64,
+        end: u64,
+        deadline: std::time::Instant,
+    ) -> Result<crate::discovery::instances::MappedFileIdentity, String> {
+        if start >= end || start & 4095 != 0 || end & 4095 != 0 {
+            return Err("invalid mapped range".into());
+        }
+        self.before_io(deadline)?;
+        let path = std::ffi::CString::new(format!("map_files/{start:x}-{end:x}")).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: retained directory, typed internally generated range path,
+        // output buffer; flags=0 follows this procfs map_files link.
+        let result = unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "confirming retained mapped file: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        self.before_io(deadline)?;
+        // SAFETY: successful fstatat initialized the complete stat buffer.
+        let stat = unsafe { stat.assume_init() };
+        Ok(crate::discovery::instances::MappedFileIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        })
+    }
+}
+
+#[cfg(test)]
+mod proc_custody_tests {
+    use super::acquire_proc_dir_with;
+    use crate::fixture_guard::DieWithParent as _;
+    use std::cell::Cell;
+
+    #[test]
+    fn pid_reuse_between_pin_and_proc_open_refuses() {
+        let calls = Cell::new(0);
+        let result = acquire_proc_dir_with(
+            true,
+            Some(11),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(calls.get() == 1)
+            },
+            || Ok(22),
+            |directory| Ok(*directory),
+        );
+        assert!(result.is_err(), "replacement proc directory was accepted");
+    }
+
+    #[test]
+    fn changed_admission_birth_during_proc_open_refuses() {
+        let result = acquire_proc_dir_with(
+            true,
+            Some(11),
+            || Ok(true),
+            || Ok(22),
+            |directory| Ok(*directory),
+        );
+        assert!(result.is_err(), "a changed admission birth was accepted");
+    }
+
+    #[test]
+    fn strict_proc_acquisition_requires_birth_and_original_pidfd() {
+        for (pidfd, birth) in [(false, Some(11)), (true, None)] {
+            let result = acquire_proc_dir_with(
+                pidfd,
+                birth,
+                || Ok(true),
+                || Ok(11),
+                |directory| Ok(*directory),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn stable_proc_acquisition_keeps_directory_after_final_liveness_check() {
+        let calls = Cell::new(0);
+        let result = acquire_proc_dir_with(
+            true,
+            Some(11),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            },
+            || Ok(11),
+            |directory| Ok(*directory),
+        );
+        assert_eq!(result.unwrap(), 11);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn original_pin_death_during_actual_maps_read_refuses() {
+        struct ReapOnDrop(std::process::Child);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ReapOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+        );
+        let pin = super::PidPin::open(child.0.id()).unwrap();
+        let proc = pin.open_proc_dir().unwrap();
+        let mut killed = false;
+        let result = proc.read_maps_with(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            8 * 1024 * 1024,
+            || {
+                if !killed {
+                    child.0.kill().unwrap();
+                    child.0.wait().unwrap();
+                    killed = true;
+                }
+            },
+        );
+        assert!(killed && result.is_err());
+    }
 }
 
 impl PidPin {
@@ -717,6 +1257,7 @@ impl PidPin {
             pid: self.pid,
             pidfd,
             start_time: self.start_time,
+            shared_charge: None,
         })
     }
 }
@@ -758,6 +1299,7 @@ impl PidPin {
             pid,
             pidfd,
             start_time,
+            shared_charge: None,
         })
     }
 
@@ -767,6 +1309,7 @@ impl PidPin {
             pid,
             pidfd: None,
             start_time: Some(1),
+            shared_charge: None,
         }
     }
 
@@ -943,6 +1486,50 @@ fn pidfd_ready(fd: &OwnedFd) -> io::Result<bool> {
 }
 
 fn pidfd_ready_with_timeout(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
+    pidfd_poll_retry_with(timeout_ms, std::time::Instant::now, |timeout| {
+        poll_pidfd_once(fd, timeout)
+    })
+}
+
+/// Retries an interrupted pidfd readiness poll, preserving the caller's
+/// timeout: a non-blocking probe (0) and an infinite wait (negative)
+/// retry the same timeout, while a finite wait retries against a
+/// deadline, so signals can never stretch it into an infinite one.
+/// Only `Interrupted` retries; any other failure propagates unchanged.
+fn pidfd_poll_retry_with(
+    timeout_ms: i32,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut poll: impl FnMut(i32) -> io::Result<bool>,
+) -> io::Result<bool> {
+    if timeout_ms <= 0 {
+        loop {
+            match poll(timeout_ms) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+    let start = now();
+    let deadline = start
+        .checked_add(std::time::Duration::from_millis(timeout_ms as u64))
+        .unwrap_or(start);
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let remaining_ms = remaining
+            .as_millis()
+            .max(1)
+            .min(u128::from(i32::MAX as u32)) as i32;
+        match poll(remaining_ms) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn poll_pidfd_once(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
     let mut pollfd = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
@@ -1055,6 +1642,10 @@ fn gone_from(start_time: io::Result<u64>) -> bool {
 
 pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
     let stat = read_proc_stat(pid)?;
+    start_time_from_stat(&stat)
+}
+
+pub(crate) fn start_time_from_stat(stat: &str) -> io::Result<u64> {
     let end = stat
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat comm"))?;
@@ -1066,10 +1657,28 @@ pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))
 }
 
+/// `PF_KTHREAD` (`include/linux/sched.h`): set in `/proc/<pid>/stat` field 9
+/// (flags) only for kernel threads, which have no user address space.
+pub(crate) const PF_KTHREAD: u32 = 0x0020_0000;
+
+/// Flags word (field 9) of a `/proc/<pid>/stat` line, parsed after the LAST
+/// `)` of the comm field (comm may contain spaces and `)`). `None` on any
+/// malformed input — callers fail closed.
+pub(crate) fn stat_flags_from_stat_text(stat: &str) -> Option<u32> {
+    let end = stat.rfind(')')?;
+    stat[end + 1..]
+        .split_whitespace()
+        .nth(6)?
+        .parse::<u32>()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_guard::DieWithParent as _;
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::os::unix::process::CommandExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
@@ -1212,6 +1821,336 @@ mod tests {
         );
     }
 
+    /// A no-op SIGURG disposition for EINTR injection, restored on drop.
+    /// Signals are aimed at one thread with `pthread_kill`, so concurrent
+    /// tests are undisturbed; the handler does nothing, which is
+    /// behaviorally identical to SIGURG's default ignore.
+    struct SigurgNoop {
+        previous: libc::sigaction,
+    }
+
+    extern "C" fn sigurg_noop_handler(_signal: libc::c_int) {}
+
+    impl SigurgNoop {
+        fn install() -> Self {
+            // SAFETY: zeroed sigaction with an empty mask and no flags (in
+            // particular no SA_RESTART, so a signal during poll surfaces as
+            // EINTR exactly like the second SIGINT in production).
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction =
+                sigurg_noop_handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: installing a signal-safe no-op handler; the old
+            // disposition is restored by Drop, including on panic.
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGURG, &action, &mut previous) },
+                0
+            );
+            Self { previous }
+        }
+    }
+
+    impl Drop for SigurgNoop {
+        fn drop(&mut self) {
+            // SAFETY: restoring the previously installed disposition.
+            unsafe {
+                libc::sigaction(libc::SIGURG, &self.previous, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// Sends SIGURG at `target` until `stop` is set. The tight loop keeps a
+    /// signal pending nearly always, so a `poll` on the target thread is
+    /// interrupted the way the second SIGINT interrupts teardown.
+    fn pummel_with_sigurg(
+        target: libc::pthread_t,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        // musl's `pthread_t` is a raw pointer, which is not `Send`.
+        struct Target(libc::pthread_t);
+        // SAFETY: the handle is only passed back to `pthread_kill`, which
+        // accepts it from any thread of the process.
+        unsafe impl Send for Target {}
+        impl Target {
+            fn get(&self) -> libc::pthread_t {
+                self.0
+            }
+        }
+        let target = Target(target);
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: pthread_kill to a live test thread with a valid signal.
+                unsafe {
+                    libc::pthread_kill(target.get(), libc::SIGURG);
+                }
+            }
+        })
+    }
+
+    /// A `sleep` child that is always killed and reaped, including when
+    /// an assertion panics: leaked sleeps would hold their pids for 30 s.
+    struct SleepChild(std::process::Child);
+
+    impl Drop for SleepChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn live_pin_and_child() -> (PidPin, SleepChild) {
+        let child = Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .expect("a live child to pin");
+        let pin = PidPin::open(child.id()).expect("pinning the live child");
+        assert!(
+            pin.pidfd().is_ok(),
+            "the test needs a pidfd pin: a /proc fallback never EINTRs, so it cannot prove the retry"
+        );
+        (pin, SleepChild(child))
+    }
+
+    #[test]
+    fn leader_exit_probe_real_single_thread_and_fallback_stay_unresolved_until_exit() {
+        use leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+        let (pin, mut child) = live_pin_and_child();
+        assert_eq!(
+            pin.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+            LeaderExitObservation::Unresolved
+        );
+        let fallback = PidPin {
+            pid: pin.pid(),
+            pidfd: None,
+            start_time: pin.start_time(),
+            shared_charge: None,
+        };
+        assert_eq!(
+            fallback.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+            LeaderExitObservation::Unresolved
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(
+            pin.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+            LeaderExitObservation::GroupExited
+        );
+    }
+
+    #[test]
+    fn leader_exit_probe_real_zombie_leader_keeps_one_or_two_live_workers() {
+        use leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("workers.c");
+        let executable = dir.path().join("workers");
+        std::fs::write(
+            &source,
+            r#"
+#include <pthread.h>
+#include <unistd.h>
+static void *worker(void *unused) {
+    (void)unused;
+    for (;;) pause();
+    return 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    pthread_t threads[2];
+    int n = argc > 1 ? 2 : 1;
+    for (int i = 0; i < n; i++)
+        if (pthread_create(&threads[i], 0, worker, 0) != 0) return 2;
+    pthread_exit(0);
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            Command::new("gcc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-O1"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for two in [false, true] {
+            let mut command = Command::new(&executable);
+            if two {
+                command.arg("two");
+            }
+            command.die_with_parent();
+            let child = SleepChild(command.spawn().unwrap());
+            let pin = PidPin::open(child.0.id()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !process_is_zombie(pin.pid()) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                process_is_zombie(pin.pid()),
+                "fixture reaches the real zombie-leader boundary"
+            );
+            assert_eq!(
+                pin.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+                LeaderExitObservation::LiveNonleader,
+                "two_workers={two}"
+            );
+            assert_eq!(pin.original_exited(), Ok(false));
+        }
+    }
+
+    /// A signal landing in a finite pidfd wait retries to the deadline
+    /// instead of failing: the second SIGINT during teardown must not
+    /// turn the exit probe into an error that drops the report.
+    #[test]
+    fn a_signal_during_a_finite_pidfd_wait_does_not_fail_the_wait() {
+        let (pin, _child) = live_pin_and_child();
+        let _sigurg = SigurgNoop::install();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: pthread_self names the calling test thread.
+        let target = unsafe { libc::pthread_self() };
+        let sender = pummel_with_sigurg(target, Arc::clone(&stop));
+        let start = Instant::now();
+        let ready = pin.wait_ready(Some(Duration::from_millis(400)));
+        let elapsed = start.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().expect("the sender thread joins");
+        assert!(
+            !ready.expect("a signal during a finite wait retries, never fails"),
+            "a live child is never ready"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a finite wait stays finite: {elapsed:?}"
+        );
+    }
+
+    /// Timeout-zero exit probes under signals also retry: `original_exited`
+    /// is the teardown observation, and one EINTR there used to veto the
+    /// whole report.
+    #[test]
+    fn signals_during_timeout_zero_exit_probes_do_not_fail_them() {
+        let (pin, _child) = live_pin_and_child();
+        let _sigurg = SigurgNoop::install();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: pthread_self names the calling test thread.
+        let target = unsafe { libc::pthread_self() };
+        let sender = pummel_with_sigurg(target, Arc::clone(&stop));
+        let mut failures = 0u32;
+        let mut first = None;
+        for _ in 0..2000 {
+            match pin.original_exited() {
+                Ok(false) => {}
+                other => {
+                    failures += 1;
+                    if first.is_none() {
+                        first = Some(format!("{other:?}"));
+                    }
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().expect("the sender thread joins");
+        assert_eq!(
+            failures, 0,
+            "2000 live-child probes under signals, first failure: {first:?}"
+        );
+    }
+
+    /// Healthy twin: a finite wait with no signals times out unready.
+    #[test]
+    fn a_finite_pidfd_wait_without_signals_times_out_unready() {
+        let (pin, _child) = live_pin_and_child();
+        assert!(
+            !pin.wait_ready(Some(Duration::from_millis(50)))
+                .expect("an unobstructed wait succeeds")
+        );
+    }
+
+    /// Healthy twin: timeout-zero probes with no signals report a live child.
+    #[test]
+    fn timeout_zero_exit_probes_without_signals_report_a_live_child() {
+        let (pin, _child) = live_pin_and_child();
+        assert_eq!(pin.original_exited(), Ok(false));
+    }
+
+    /// Scripted twin of the live probe test: interrupted non-blocking
+    /// polls retry with the same timeout until one succeeds.
+    #[test]
+    fn pidfd_poll_retries_interrupted_probes_until_one_succeeds() {
+        let scripted = RefCell::new(VecDeque::from([
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Ok(false),
+        ]));
+        let seen = RefCell::new(Vec::new());
+        let ready = pidfd_poll_retry_with(0, Instant::now, |timeout| {
+            seen.borrow_mut().push(timeout);
+            scripted.borrow_mut().pop_front().expect("a scripted poll")
+        })
+        .expect("retries end in the scripted result");
+        assert!(!ready);
+        assert_eq!(*seen.borrow(), vec![0, 0, 0]);
+    }
+
+    /// A finite wait under constant interruption still ends at its
+    /// deadline: signals retry, they never stretch the wait into an
+    /// infinite one.
+    #[test]
+    fn pidfd_poll_stops_retrying_a_finite_wait_at_its_deadline() {
+        let start = Instant::now();
+        let ticks = Cell::new(0u32);
+        let seen = RefCell::new(Vec::new());
+        let ready = pidfd_poll_retry_with(
+            500,
+            || {
+                let tick = ticks.get();
+                ticks.set(tick + 1);
+                start + Duration::from_millis(u64::from(tick) * 100)
+            },
+            |timeout| {
+                seen.borrow_mut().push(timeout);
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            },
+        )
+        .expect("an expired deadline is a timeout, not an error");
+        assert!(!ready);
+        let seen = seen.borrow();
+        assert!(
+            seen.len() <= 7,
+            "retries stop at the deadline: {} polls",
+            seen.len()
+        );
+        assert!(
+            seen.windows(2).all(|pair| pair[1] <= pair[0]),
+            "remaining timeouts never grow: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|timeout| *timeout > 0),
+            "a live deadline always polls positively: {seen:?}"
+        );
+    }
+
+    /// Only interruption retries: any other poll failure propagates with
+    /// its kind intact, after the interruptions before it.
+    #[test]
+    fn pidfd_poll_propagates_non_interrupt_errors_unchanged() {
+        let scripted = RefCell::new(VecDeque::from([
+            Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        ]));
+        let calls = Cell::new(0u32);
+        let error = pidfd_poll_retry_with(0, Instant::now, |_| {
+            calls.set(calls.get() + 1);
+            scripted.borrow_mut().pop_front().expect("a scripted poll")
+        })
+        .expect_err("a non-interrupt failure must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls.get(), 2);
+    }
+
     /// Mutation caught: classifying a changed `/proc` start time as an exit
     /// would grant a later process at the reused numeric PID terminal authority.
     #[test]
@@ -1281,7 +2220,11 @@ mod tests {
 
     #[test]
     fn original_pidfd_is_the_only_signal_authority() {
-        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("10")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let pin = PidPin::open(child.id()).unwrap();
         pin.probe_signal_authority().unwrap();
         assert_eq!(
@@ -1293,6 +2236,7 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGTERM));
 
         let fallback = PidPin {
+            shared_charge: None,
             pid: std::process::id(),
             pidfd: None,
             start_time: process_start_time(std::process::id()).ok(),
@@ -1330,7 +2274,11 @@ mod tests {
 
     #[test]
     fn low_pidfd_budget_demotes_without_global_failure() {
-        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let mut tracker = Tracker::with_limits(1, 4);
         tracker.identify(std::process::id());
         tracker.identify(child.id());
@@ -1342,7 +2290,11 @@ mod tests {
 
     #[test]
     fn whole_process_exit_becomes_a_retirement() {
-        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let mut tracker = Tracker::with_limits(4, 4);
         let key = tracker.identify(pid).key;
@@ -1549,7 +2501,12 @@ mod tests {
         // argv[0] stays `sleep` for multi-call coreutils.
         let link = dir.path().join("a) Z 1 (b");
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        let mut child = Command::new(&link).arg0("sleep").arg("30").spawn().unwrap();
+        let mut child = Command::new(&link)
+            .arg0("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let stat = loop {
@@ -1881,6 +2838,7 @@ mod tests {
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(stderr.try_clone().expect("share the stderr capture"))
+                        .die_with_parent()
                         .spawn()
                         .expect("re-exec the pidfd-denial helper"),
                 ));
@@ -2038,6 +2996,7 @@ mod tests {
                 Command::new("cat")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
+                    .die_with_parent()
                     .spawn()
                     .expect("spawn the ready target"),
             ));

@@ -68,6 +68,7 @@ self_test() {
     done
     if [ "$(id -u)" -ne 0 ]; then
         fetch_self_test
+        resolve_self_test
     fi
     echo "attach-pod argument self-test: OK"
     exit 0
@@ -106,6 +107,8 @@ EOF
 case " $* " in
     *"containerStatuses[0].name"*)
         printf '%s' "$FETCH_NAME" ;;
+    *"metadata.uid"*)
+        printf '%s' "${FETCH_UID-}" ;;
     *"containerID"*)
         printf '%s' "containerd://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" ;;
 esac
@@ -127,17 +130,148 @@ EOF
     }
 
     # Good cluster: fetch and validation pass, and the run fails later, at
-    # the cgroup lookup that genuinely needs the node.
+    # the cgroup lookup that genuinely needs the node. The lookup runs against
+    # an empty v2 tree so the refusal is deterministic on any host.
+    mkdir -p "$stub/empty-cg"
+    : > "$stub/empty-cg/cgroup.controllers"
     status=0
-    FETCH_NAME='good-name' PATH="$stub:$PATH" P11SCOPE_OBSERVER="$stub/observer" \
+    FETCH_NAME='good-name' FETCH_UID='0123abcd-4567-89ef-0123-456789abcdef' \
+        PATH="$stub:$PATH" P11SCOPE_OBSERVER="$stub/observer" \
+        P11SCOPE_CGROUP_ROOT="$stub/empty-cg" \
         sh "$0" --pod good --namespace default >"$stub/good.log" 2>&1 || status=$?
     [ "$status" -eq 1 ] || {
         echo "attach-pod exited $status (want 1) for a good fetched name" >&2
         exit 1
     }
-    grep -q "could not locate the container cgroup" "$stub/good.log" || {
+    grep -q "could not locate the pod cgroup" "$stub/good.log" || {
         echo "good fetched name did not reach the cgroup lookup:" >&2
         cat "$stub/good.log" >&2
+        exit 1
+    }
+    rm -rf "$stub"
+    trap - EXIT
+}
+
+# The scope-selection regression (Sol-full F1): a foreign subtree with a
+# colliding container scope name must neither hijack the observation scope
+# nor block the real pod, and two valid matches must be refused loudly. The
+# script runs end to end against a fabricated cgroup tree; P11SCOPE_CGROUP_ROOT
+# reaches the resolver only through the stub sudo below, while production sudo
+# drops it, so a real run always resolves against the node's own hierarchy.
+resolve_self_test() {
+    stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-attach-resolve-XXXXXX")
+    trap 'rm -rf "$stub"' EXIT
+    cat > "$stub/timeout" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case $1 in
+        --signal=*|--kill-after=*) shift ;;
+        --signal|--kill-after) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+exec "$@"
+EOF
+    cat > "$stub/sudo" <<'EOF'
+#!/bin/sh
+[ "${1-}" = "-n" ] && shift
+exec "$@"
+EOF
+    cat > "$stub/kubectl" <<'EOF'
+#!/bin/sh
+case " $* " in
+    *"containerStatuses[0].name"*)
+        printf '%s' "good-name" ;;
+    *"metadata.uid"*)
+        printf '%s' "$FETCH_UID" ;;
+    *"containerID"*)
+        printf '%s' "containerd://$FETCH_CID" ;;
+esac
+EOF
+    cat > "$stub/observer" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" > "$stub/argv"
+exit 0
+EOF
+    chmod +x "$stub/timeout" "$stub/sudo" "$stub/kubectl" "$stub/observer"
+    cid=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    uid=0123abcd-4567-89ef-0123-456789abcdef
+    u2=99999999-8888-7777-6666-555555555555
+    u3=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    u_=$(printf '%s' "$uid" | tr '-' '_')
+    u2_=$(printf '%s' "$u2" | tr '-' '_')
+    real=$stub/cg/kubepods.slice/kubepods-pod${u_}.slice
+    # The foreign subtree is created first so an unanchored traversal meets it
+    # first, exactly the hijack shape.
+    mkdir -p "$stub/cg/aaa-foreign.slice/cri-containerd-$cid.scope"
+    mkdir -p "$real/cri-containerd-$cid.scope"
+    : > "$stub/cg/cgroup.controllers"
+    run_case() {
+        rc_uid=$1
+        rc_status=0
+        FETCH_UID=$rc_uid FETCH_CID=$cid PATH="$stub:$PATH" \
+            P11SCOPE_OBSERVER="$stub/observer" P11SCOPE_CGROUP_ROOT="$stub/cg" \
+            sh "$0" --pod good --namespace default -- --mode metrics \
+            >"$stub/$2.log" 2>&1 || rc_status=$?
+        printf '%s' "$rc_status"
+    }
+    # Collision: the foreign decoy is reported and ignored, the real pod is
+    # selected exactly.
+    status=$(run_case "$uid" ok)
+    [ "$status" -eq 0 ] || {
+        echo "attach-pod exited $status (want 0) with a foreign decoy present" >&2
+        cat "$stub/ok.log" >&2
+        exit 1
+    }
+    selected=$(grep -A1 -- '--cgroup' "$stub/argv" | tail -1)
+    [ "$selected" = "$real" ] || {
+        echo "attach-pod selected [$selected] (want [$real])" >&2
+        exit 1
+    }
+    grep -q "ignored 1 match" "$stub/ok.log" || {
+        echo "foreign decoy was not reported:" >&2
+        cat "$stub/ok.log" >&2
+        exit 1
+    }
+    # Disambiguation: the same container id under another pod's valid path
+    # does not disturb the UID-bound selection.
+    mkdir -p "$stub/cg/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod${u2_}.slice/cri-containerd-$cid.scope"
+    status=$(run_case "$uid" disamb)
+    [ "$status" -eq 0 ] || {
+        echo "attach-pod exited $status (want 0) for a uid-bound container id" >&2
+        cat "$stub/disamb.log" >&2
+        exit 1
+    }
+    selected=$(grep -A1 -- '--cgroup' "$stub/argv" | tail -1)
+    [ "$selected" = "$real" ] || {
+        echo "attach-pod selected [$selected] (want [$real])" >&2
+        exit 1
+    }
+    # Ambiguity: the requested UID itself matching two valid pod cgroups is
+    # refused loudly, never guessed.
+    mkdir -p "$stub/cg/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod${u_}.slice/cri-containerd-$cid.scope"
+    status=$(run_case "$uid" amb)
+    [ "$status" -eq 1 ] || {
+        echo "attach-pod exited $status (want 1) for an ambiguous container id" >&2
+        exit 1
+    }
+    grep -q "refusing" "$stub/amb.log" || {
+        echo "ambiguous match was not refused loudly:" >&2
+        cat "$stub/amb.log" >&2
+        exit 1
+    }
+    # UID binding: the same container id under pods carrying other UIDs is not
+    # the requested pod.
+    status=$(run_case "$u3" mismatch)
+    [ "$status" -eq 1 ] || {
+        echo "attach-pod exited $status (want 1) for a uid mismatch" >&2
+        exit 1
+    }
+    grep -q "could not locate the pod cgroup" "$stub/mismatch.log" || {
+        echo "uid mismatch was not refused as absent:" >&2
+        cat "$stub/mismatch.log" >&2
         exit 1
     }
     rm -rf "$stub"
@@ -192,6 +326,10 @@ if [ -z "$CONTAINER" ]; then
         exit 1
     }
 fi
+POD_UID=$(kube get pod "$POD" -o jsonpath='{.metadata.uid}')
+[ -n "$POD_UID" ] || { echo "pod $POD has no uid" >&2; exit 1; }
+# The UID travels to the resolver as an argv word (never interpolated), which
+# also validates its shape and refuses a malformed one loudly.
 CID_REF=$(kube get pod "$POD" \
     -o jsonpath="{.status.containerStatuses[?(@.name==\"$CONTAINER\")].containerID}")
 case $CID_REF in
@@ -204,15 +342,17 @@ case $CID in ''|*[!0-9a-f]*) echo "container id invalid: $CID_REF" >&2; exit 1 ;
 
 # The pod's cgroup is resolved on the node, not inside the container: with a
 # cgroup namespace the pod's own /proc/self/cgroup reads "/" and names nothing.
-CONTAINER_CG=
-for candidate in "cri-containerd-$CID.scope" "crio-$CID.scope" "docker-$CID.scope" "$CID"; do
-    CONTAINER_CG=$(sudo -n timeout --signal=TERM --kill-after=5s 60s \
-        find /sys/fs/cgroup -type d -name "$candidate" -print -quit 2>/dev/null)
-    [ -z "$CONTAINER_CG" ] || break
-done
-test -n "$CONTAINER_CG" || { echo "could not locate the container cgroup for $CID" >&2; exit 1; }
-# The pod cgroup, one level up, holds every container in the pod.
-POD_CG=$(dirname "$CONTAINER_CG")
+# Resolution is the shared kubelet-anchored resolver from
+# scripts/k8s-profile-entry.sh: the container's parent must be exactly one
+# kubelet pod cgroup carrying this pod's UID. A foreign subtree with a
+# colliding scope name is ignored (and reported), while ambiguity and absence
+# are refused loudly; the wrapper never guesses a scope.
+ENTRY=$PWD/scripts/k8s-profile-entry.sh
+if ! POD_CG=$(sudo -n timeout --signal=TERM --kill-after=5s 60s \
+        sh "$ENTRY" --print-pod-cgroup --pod-uid "$POD_UID" --cid "$CID"); then
+    exit 1
+fi
+[ -n "$POD_CG" ] || { echo "pod cgroup resolution printed nothing" >&2; exit 1; }
 echo "pod cgroup: $POD_CG" >&2
 
 # Paths the operator typed (-o out.json) are relative to where they ran this,

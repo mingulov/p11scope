@@ -18,6 +18,12 @@
  * rate from it), and one `TRUTH {...}` JSON line at the end with the exact
  * post-go generated-call counts (the harness's workload oracle), and exits
  * 0. Same dlopen/table convention as scripts/fixtures/hammer.c.
+ *
+ * An optional tenth argument, epoch_calls, prints one `EPOCH {...}` JSON
+ * line per epoch_calls C_GenerateRandom calls (epoch index, exact call
+ * count, CLOCK_MONOTONIC timestamp): the soak vehicle's continuity proof
+ * that calls fired across the whole window rather than in one burst.
+ * Omitted or 0 prints no epoch lines and changes no other byte of output.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -183,8 +189,8 @@ static int signal_mapped(const char *mapped_file)
 
 int main(int argc, char **argv)
 {
-    if (argc != 9) {
-        fprintf(stderr, "usage: %s /path/to/module.so <n_calls> <pace_us> <early:0|1> <ready_file> <go_file> <mapped_file> <receipt_ready_file>\n",
+    if (argc != 9 && argc != 10) {
+        fprintf(stderr, "usage: %s /path/to/module.so <n_calls> <pace_us> <early:0|1> <ready_file> <go_file> <mapped_file> <receipt_ready_file> [epoch_calls]\n",
                 argv[0]);
         return 2;
     }
@@ -195,7 +201,8 @@ int main(int argc, char **argv)
     const char *go_file = argv[6];
     const char *mapped_file = argv[7];
     const char *receipt_ready_file = argv[8];
-    if (n < 0 || pace_us < 0 || (early != 0 && early != 1)) {
+    long epoch_calls = argc == 10 ? atol(argv[9]) : 0;
+    if (n < 0 || pace_us < 0 || (early != 0 && early != 1) || epoch_calls < 0) {
         fprintf(stderr, "workload: bad arguments\n");
         return 2;
     }
@@ -242,6 +249,11 @@ int main(int argc, char **argv)
         CHECK("C_GenerateRandom", ((fn_rand)fns[I_GenerateRandom])(sess, rnd, sizeof rnd));
         if (pace_us > 0)
             usleep((useconds_t)pace_us);
+        if (epoch_calls > 0 && (i + 1) % epoch_calls == 0) {
+            printf("EPOCH {\"epoch\": %ld, \"calls\": %ld, \"t_mono_ns\": %llu}\n",
+                   (i + 1) / epoch_calls - 1, epoch_calls, now_ns());
+            fflush(stdout);
+        }
     }
 
     CHECK("C_CloseSession", ((fn_close)fns[I_CloseSession])(sess));

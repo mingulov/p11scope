@@ -25,11 +25,27 @@
  *   --single-call M  (mech) late module M performs only C_Initialize after the
  *                    quarantine, flushes, waits --gate2, then finishes setup;
  *                    needs a late module and --gate2                           [AB]
+ *   --pre-init-gate FILE (mech) with --single-call M: after the quarantine, wait
+ *                    for FILE before module M's C_Initialize (default -: no
+ *                    wait)                                                     [AB]
  *   --delay-ms N     sleep N ms after the gate (after a --late dlopen) before calling;
  *                    exec-chain also sleeps N ms before every exec
  *   --sleep-us N     sleep N us after every iteration (stretches a short CLI)
  *   --chain SPEC     (exec-chain) comma list of HOW:EXE steps, HOW = leader|thread
  *   --gen K          (internal) exec generation, set by the chain itself
+ *   --ledger-singletons opt-in: flush each returned call as a singleton entry
+ *   --c8-gate-prefix P --c8-gated-images N --c8-deadline NS
+ *                    C8 only: images0..N-1 wait before all API calls on
+ *                    P.GEN.go; exec-chain also waits after DONE on P.GEN.next.
+ *                    All waits retain the same absolute monotonic deadline.
+ *   --h6-control     opt-in mech/exec-chain stdin controller; every image maps
+ *                    providers without API calls before READY, then waits.
+ *                    Commands: W/M/T/X/F GEN SEQ LOWER DEADLINE
+ *                    ATTEMPT; W's attempt is 1..20, other commands use 0.
+ *                    Every command has a flushed ACK; M always runs two
+ *                    iterations and one actual corrupted-HMAC verification.
+ *   --h6-deadline N  absolute CLOCK_MONOTONIC ns bound of the initial idle hold
+ *   --h6-leg-deadline N absolute bound retained across all image/phase holds
  *
  * Every line is an independent, deterministic ledger of what THIS process did; it
  * never reads p11scope state. Lines (one key=value token each, no spaces in values):
@@ -99,6 +115,7 @@ CK_RV C_GetFunctionList(void **pp) {
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,7 +156,7 @@ enum {
     I_Initialize = 0, I_Finalize = 1, I_GetFunctionList = 3, I_GetSlotList = 4,
     I_OpenSession = 12, I_CloseSession = 13, I_Login = 18, I_Logout = 19,
     I_DestroyObject = 22, I_EncryptInit = 29, I_Encrypt = 30, I_DigestInit = 37,
-    I_Digest = 38, I_SignInit = 42, I_Sign = 43, I_GenerateKey = 58,
+    I_Digest = 38, I_SignInit = 42, I_Sign = 43, I_VerifyInit = 48, I_Verify = 49, I_GenerateKey = 58,
     I_WaitForSlotEvent = 67,
 };
 #define CKM_SHA256 0x250UL
@@ -155,6 +172,9 @@ static char self_exe[PATH_MAX];
 static unsigned long self_start;
 static int gen;
 static volatile sig_atomic_t stop;
+static int ledger_singletons, c8_gated_images;
+static const char *c8_gate_prefix;
+static unsigned long c8_deadline;
 static void on_signal(int s) { (void)s; stop = 1; }
 
 static unsigned long now_ns(void) {
@@ -164,6 +184,7 @@ static unsigned long now_ns(void) {
 }
 
 static void flush_ledger_try(void);
+static void flush_ledger(void);
 static _Noreturn void die(const char *what) {
     flush_ledger_try();
     fprintf(stdout, "DONE cell=%s pid=%d start=%lu gen=%d exe=%s status=fail\n", cell, getpid(),
@@ -209,8 +230,17 @@ struct entry { int module, fn, phase; unsigned long mech, n, bad, t0, t1; };
 static struct entry ledger[512];
 static int ledger_len;
 static pthread_mutex_t ledger_lock = PTHREAD_MUTEX_INITIALIZER;
-static const char *const PHASES[] = {"setup", "main", "teardown", "held"};
-enum { PH_SETUP, PH_MAIN, PH_TEARDOWN, PH_HELD };
+static const char *PHASES[28] = {"setup", "main", "teardown", "held",
+    "h6-setup", "h6-measured", "h6-failed", "h6-teardown"};
+enum { PH_SETUP, PH_MAIN, PH_TEARDOWN, PH_HELD, PH_H6_SETUP,
+       PH_H6_MEASURED, PH_H6_FAILED, PH_H6_TEARDOWN, PH_H6_WARM };
+static unsigned long h6_work_deadline;
+static void check_h6_work(void) {
+    if (c8_deadline && (stop || now_ns() >= c8_deadline))
+        die("C8 original work deadline expired");
+    if (h6_work_deadline && (stop || now_ns() >= h6_work_deadline))
+        die("H6 work deadline expired");
+}
 
 struct module {
     char path[PATH_MAX];
@@ -244,10 +274,12 @@ static void enter(int module, int fn, unsigned long mech, int phase) {
 }
 
 static void returned(int module, int fn, unsigned long mech, int phase, CK_RV rv) {
-    if (rv == 0) return;
-    pthread_mutex_lock(&ledger_lock);
-    slot(module, fn, mech, phase)->bad++;
-    pthread_mutex_unlock(&ledger_lock);
+    if (rv != 0) {
+        pthread_mutex_lock(&ledger_lock);
+        slot(module, fn, mech, phase)->bad++;
+        pthread_mutex_unlock(&ledger_lock);
+    }
+    if (ledger_singletons) flush_ledger();
 }
 
 static void flush_ledger(void) {
@@ -279,6 +311,7 @@ static void flush_ledger_try(void) {
 /* CALL(module, phase, index, mech, type, args...) records, calls, and records rv. */
 #define CALL(m, ph, idx, mech, T, ...)                                               \
     ({                                                                               \
+        check_h6_work();                                                              \
         enter((m), (idx), (mech), (ph));                                             \
         CK_RV rv_ = ((T)modules[(m)].fns[(idx)])(__VA_ARGS__);                       \
         returned((m), (idx), (mech), (ph), rv_);                                     \
@@ -300,14 +333,15 @@ static void load_module(int m) {
     fflush(stdout);
 }
 
-static void bind_module(int m) {
+static void bind_module(int m, int phase) {
+    check_h6_work();
     struct module *mod = &modules[m];
     CK_RV (*gfl)(void **) = (CK_RV (*)(void **))dlsym(mod->handle, "C_GetFunctionList");
     if (!gfl) die("no C_GetFunctionList");
     void *list = NULL;
-    enter(m, I_GetFunctionList, NO_MECH, PH_SETUP);
+    enter(m, I_GetFunctionList, NO_MECH, phase);
     CK_RV rv = gfl(&list);
-    returned(m, I_GetFunctionList, NO_MECH, PH_SETUP, rv);
+    returned(m, I_GetFunctionList, NO_MECH, phase, rv);
     if (rv || !list) die("C_GetFunctionList failed");
     mod->fns = (void **)((char *)list + 8);
 }
@@ -316,10 +350,12 @@ static void wait_gate(const char *gate) {
     if (!gate || !strcmp(gate, "-")) return;
     unsigned long deadline = now_ns() + 600UL * 1000000000UL;
     while (access(gate, F_OK) != 0) {
+        check_h6_work();
         if (stop) die("stopped before the gate opened");
         if (now_ns() > deadline) die("gate never opened");
         usleep(10000);
     }
+    check_h6_work();
 }
 
 static void sleep_ms(long ms) {
@@ -330,41 +366,41 @@ static void sleep_ms(long ms) {
 
 /* The first setup call on its own, so a staged late module can publish
  * exactly one counted call before the harness releases the rest. */
-static void initialize_module(int m) {
+static void initialize_module(int m, int phase) {
     CK_INIT_ARGS args = {0};
     args.flags = 2; /* CKF_OS_LOCKING_OK: leader-exit calls from a second thread */
-    if (CALL(m, PH_SETUP, I_Initialize, NO_MECH, CK_RV (*)(void *), &args)) die("C_Initialize");
+    if (CALL(m, phase, I_Initialize, NO_MECH, CK_RV (*)(void *), &args)) die("C_Initialize");
 }
 
-static CK_SESSION_HANDLE setup_after_init(int m) {
+static CK_SESSION_HANDLE setup_after_init(int m, int phase) {
     CK_SLOT_ID slots[16];
     CK_ULONG ns = 16;
-    if (CALL(m, PH_SETUP, I_GetSlotList, NO_MECH, CK_RV (*)(unsigned char, CK_SLOT_ID *, CK_ULONG *),
+    if (CALL(m, phase, I_GetSlotList, NO_MECH, CK_RV (*)(unsigned char, CK_SLOT_ID *, CK_ULONG *),
              1, slots, &ns) || !ns)
         die("C_GetSlotList");
     CK_SESSION_HANDLE s;
-    if (CALL(m, PH_SETUP, I_OpenSession, NO_MECH,
+    if (CALL(m, phase, I_OpenSession, NO_MECH,
              CK_RV (*)(CK_SLOT_ID, CK_ULONG, void *, void *, CK_SESSION_HANDLE *), slots[0], 6, 0, 0, &s))
         die("C_OpenSession");
-    if (CALL(m, PH_SETUP, I_Login, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, unsigned long, unsigned char *, CK_ULONG),
+    if (CALL(m, phase, I_Login, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, unsigned long, unsigned char *, CK_ULONG),
              s, 1, (unsigned char *)"1234", 4))
         die("C_Login");
     return s;
 }
 
-static CK_SESSION_HANDLE setup(int m) {
-    initialize_module(m);
-    return setup_after_init(m);
+static CK_SESSION_HANDLE setup(int m, int phase) {
+    initialize_module(m, phase);
+    return setup_after_init(m, phase);
 }
 
-static void teardown(int m, CK_SESSION_HANDLE s) {
-    CALL(m, PH_TEARDOWN, I_Logout, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE), s);
-    CALL(m, PH_TEARDOWN, I_CloseSession, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE), s);
-    CALL(m, PH_TEARDOWN, I_Finalize, NO_MECH, CK_RV (*)(void *), NULL);
+static void teardown(int m, CK_SESSION_HANDLE s, int phase) {
+    CALL(m, phase, I_Logout, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE), s);
+    CALL(m, phase, I_CloseSession, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE), s);
+    CALL(m, phase, I_Finalize, NO_MECH, CK_RV (*)(void *), NULL);
 }
 
 static CK_OBJECT_HANDLE keygen(int m, CK_SESSION_HANDLE s, unsigned long mech, unsigned long key_type,
-                               unsigned long usage_attr) {
+                               unsigned long usage_attr, int phase, int verify) {
     unsigned long cls = 4 /* CKO_SECRET_KEY */, len = 32;
     unsigned char yes = 1, no = 0;
     CK_ATTRIBUTE t[] = {
@@ -373,57 +409,71 @@ static CK_OBJECT_HANDLE keygen(int m, CK_SESSION_HANDLE s, unsigned long mech, u
         {0x161 /* CKA_VALUE_LEN */, &len, sizeof len},
         {0x1 /* CKA_TOKEN */, &no, 1},
         {usage_attr, &yes, 1},
+        {0x10a /* CKA_VERIFY */, &yes, 1},
     };
     CK_MECHANISM mm = {mech, 0, 0};
     CK_OBJECT_HANDLE h = 0;
-    CALL(m, PH_MAIN, I_GenerateKey, mech,
+    CALL(m, phase, I_GenerateKey, mech,
          CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_ATTRIBUTE *, CK_ULONG, CK_OBJECT_HANDLE *), s, &mm, t,
-         5, &h);
+         verify ? 6 : 5, &h);
     return h;
 }
 
 /* One iteration: 10 table calls, mechanisms 0x250 0x1080 0x1087 0x350 0x251. */
-static void iteration(int m, CK_SESSION_HANDLE s) {
+static void iteration(int m, CK_SESSION_HANDLE s, int phase) {
     unsigned char in[64] = {1}, out[128];
     CK_ULONG ol;
     CK_MECHANISM digest = {CKM_SHA256, 0, 0};
-    CALL(m, PH_MAIN, I_DigestInit, CKM_SHA256, CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *), s, &digest);
+    CALL(m, phase, I_DigestInit, CKM_SHA256, CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *), s, &digest);
     ol = sizeof out;
-    CALL(m, PH_MAIN, I_Digest, CKM_SHA256,
+    CALL(m, phase, I_Digest, CKM_SHA256,
          CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *), s, in, sizeof in,
          out, &ol);
 
-    CK_OBJECT_HANDLE aes = keygen(m, s, CKM_AES_KEY_GEN, 0x1f /* CKK_AES */, 0x104 /* CKA_ENCRYPT */);
+    CK_OBJECT_HANDLE aes = keygen(m, s, CKM_AES_KEY_GEN, 0x1f /* CKK_AES */, 0x104 /* CKA_ENCRYPT */, phase, 0);
     unsigned char iv[12] = {7};
     CK_GCM_PARAMS gcm = {iv, sizeof iv, 96, NULL, 0, 128};
     CK_MECHANISM enc = {CKM_AES_GCM, &gcm, sizeof gcm};
-    CALL(m, PH_MAIN, I_EncryptInit, CKM_AES_GCM, CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE),
+    CALL(m, phase, I_EncryptInit, CKM_AES_GCM, CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE),
          s, &enc, aes);
     ol = sizeof out;
-    CALL(m, PH_MAIN, I_Encrypt, CKM_AES_GCM,
+    CALL(m, phase, I_Encrypt, CKM_AES_GCM,
          CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *), s, in, 32, out,
          &ol);
 
     CK_OBJECT_HANDLE mac = keygen(m, s, CKM_GENERIC_SECRET_KEY_GEN, 0x10 /* CKK_GENERIC_SECRET */,
-                                  0x108 /* CKA_SIGN */);
+                                  0x108 /* CKA_SIGN */, phase, 0);
     CK_MECHANISM hmac = {CKM_SHA256_HMAC, 0, 0};
-    CALL(m, PH_MAIN, I_SignInit, CKM_SHA256_HMAC,
+    CALL(m, phase, I_SignInit, CKM_SHA256_HMAC,
          CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE), s, &hmac, mac);
     ol = sizeof out;
-    CALL(m, PH_MAIN, I_Sign, CKM_SHA256_HMAC,
+    CALL(m, phase, I_Sign, CKM_SHA256_HMAC,
          CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *), s, in, sizeof in,
          out, &ol);
 
-    CALL(m, PH_MAIN, I_DestroyObject, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s, aes);
-    CALL(m, PH_MAIN, I_DestroyObject, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s, mac);
+    CALL(m, phase, I_DestroyObject, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s, aes);
+    CALL(m, phase, I_DestroyObject, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s, mac);
 }
 
 struct options {
-    const char *mode, *gate, *gate2, *chain;
+    const char *mode, *gate, *gate2, *pre_init_gate, *chain;
     long iters, delay_ms, sleep_us;
-    int hold, late_from, single_call;
+    int hold, late_from, single_call, h6_control, c8_warm_initial;
+    unsigned long h6_deadline, h6_leg_deadline;
 };
-static struct options opt = {.gate = "-", .iters = 4, .late_from = -1, .single_call = -1};
+static struct options opt = {.gate = "-", .pre_init_gate = "-", .iters = 4, .late_from = -1,
+                             .single_call = -1};
+
+static unsigned long absolute_bound(const char *value) {
+    if (!*value) die("empty H6 bound");
+    for (const char *p = value; *p; p++)
+        if (*p < '0' || *p > '9') die("nondecimal H6 bound");
+    errno = 0;
+    char *end;
+    unsigned long bound = strtoul(value, &end, 10);
+    if (errno || *end || !bound) die("invalid H6 bound");
+    return bound;
+}
 
 static void hold_if_asked(void) {
     if (!opt.hold) return;
@@ -431,8 +481,29 @@ static void hold_if_asked(void) {
 }
 
 static void done_ok(void) {
-    printf("DONE " HEAD " status=ok\n", HEAD_ARGS);
+    printf("DONE " HEAD " status=ok", HEAD_ARGS);
+    if (c8_gate_prefix) printf(" t=%lu", now_ns());
+    putchar('\n');
     fflush(stdout);
+}
+
+static int c8_gated(void) { return c8_gate_prefix && gen < c8_gated_images; }
+
+static void c8_wait(const char *phase) {
+    if (!c8_gated()) return;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s.%d.%s", c8_gate_prefix, gen, phase) >= (int)sizeof path)
+        die("C8 gate path too long");
+    if (access(path, F_OK) == 0) die("stale C8 gate already exists");
+    check_h6_work();
+    printf("WATCH_READY " HEAD " phase=%s t=%lu deadline=%lu\n",
+           HEAD_ARGS, phase, now_ns(), c8_deadline);
+    fflush(stdout);
+    while (access(path, F_OK) != 0) {
+        check_h6_work();
+        usleep(10000);
+    }
+    check_h6_work();
 }
 
 /* The mech generation over every module: setup all, gate, main, teardown. */
@@ -440,7 +511,21 @@ static void mech_generation(long iters, int gated) {
     CK_SESSION_HANDLE s[MAX_MODULES];
     int split = opt.late_from < 0 ? module_count : opt.late_from;
     if (split > module_count) split = module_count;
-    for (int m = 0; m < split; m++) { load_module(m); bind_module(m); s[m] = setup(m); }
+    int warm_late = c8_gated() && opt.c8_warm_initial && gen == 0 && opt.late_from == 0;
+    if (c8_gated() && !warm_late) {
+        for (int m = 0; m < split; m++) load_module(m);
+        c8_wait("go");
+        for (int m = 0; m < split; m++) {
+            bind_module(m, PH_SETUP);
+            if ((opt.c8_warm_initial && gen == 0) || (gen == 2 && !strcmp(opt.mode, "exec-chain"))) {
+                flush_ledger();
+                c8_wait("semantic");
+            }
+            s[m] = setup(m, PH_SETUP);
+        }
+    } else {
+        for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
+    }
     flush_ledger();
     if (gated) {
         printf("READY " HEAD "\n", HEAD_ARGS);
@@ -454,38 +539,46 @@ static void mech_generation(long iters, int gated) {
         if (opt.single_call >= 0 && opt.single_call < split) die("--single-call module is not late");
         if (opt.single_call >= 0 && (!opt.gate2 || !strcmp(opt.gate2, "-")))
             die("--single-call needs --gate2");
-        /* AB only: one eager call after the gate (post-capture, the
-         * capture started before gate1 opened) and before B maps, so
-         * the lane caches the caller through A first — P3's
-         * cached-caller sequence needs A counted before B is ever
-         * observed (round 2, F5). */
+        /* AB only: one eager call after the gate and before B maps.
+         * The harness opens gate1 only once the observer published A
+         * as attached for this caller, so the call is counted and the
+         * lane caches the caller through A first — P3's cached-caller
+         * sequence needs A counted before B is ever observed. */
         if (opt.single_call >= 0 && split > 0) {
-            iteration(0, s[0]);
+            iteration(0, s[0], PH_MAIN);
             flush_ledger();
         }
         for (int m = split; m < module_count; m++) load_module(m);
         if (opt.single_call < 0) {
             sleep_ms(opt.delay_ms);
-            for (int m = split; m < module_count; m++) { bind_module(m); s[m] = setup(m); }
+            if (warm_late) c8_wait("go");
+            for (int m = split; m < module_count; m++) {
+                bind_module(m, PH_SETUP);
+                if (warm_late) { flush_ledger(); c8_wait("semantic"); }
+                s[m] = setup(m, PH_SETUP);
+            }
         } else {
             /* Bind before the quarantine: the dlsym acquisition is
-             * pre-attach (uncounted) while C_Initialize lands post-attach. */
-            for (int m = split; m < module_count; m++) bind_module(m);
+             * pre-attach (uncounted) while C_Initialize lands post-attach.
+             * The quarantine ends at --pre-init-gate (the harness opens it
+             * on published readiness), after any --delay-ms. */
+            for (int m = split; m < module_count; m++) bind_module(m, PH_SETUP);
             sleep_ms(opt.delay_ms);
-            initialize_module(opt.single_call);
+            wait_gate(opt.pre_init_gate);
+            initialize_module(opt.single_call, PH_SETUP);
             flush_ledger();
             wait_gate(opt.gate2);
             for (int m = split; m < module_count; m++)
-                s[m] = (m == opt.single_call) ? setup_after_init(m) : setup(m);
+                s[m] = (m == opt.single_call) ? setup_after_init(m, PH_SETUP) : setup(m, PH_SETUP);
         }
     }
     for (int m = 0; m < module_count; m++)
         for (long i = 0; i < iters * (m + 1); i++) {
-            iteration(m, s[m]);
+            iteration(m, s[m], PH_MAIN);
             if (opt.sleep_us > 0) usleep((useconds_t)opt.sleep_us);
         }
     flush_ledger();
-    for (int m = 0; m < module_count; m++) teardown(m, s[m]);
+    for (int m = 0; m < module_count; m++) teardown(m, s[m], PH_TEARDOWN);
     flush_ledger();
 }
 
@@ -515,17 +608,19 @@ static void exec_next(void) {
     const char *how = step, *exe = colon + 1;
     int thread = !strcmp(how, "thread");
     if (!thread && strcmp(how, "leader")) die("--chain HOW must be leader or thread");
-    char genbuf[16];
+    char genbuf[16], deadlinebuf[32];
+    snprintf(deadlinebuf, sizeof deadlinebuf, "%lu", opt.h6_deadline);
     snprintf(genbuf, sizeof genbuf, "%d", gen + 1);
     char **argv = calloc((size_t)saved_argc + 8, sizeof *argv);
     int k = 0;
     argv[k++] = (char *)exe;
     for (int i = 1; i < saved_argc; i++) {
         if (!strcmp(saved_argv[i], "--chain") || !strcmp(saved_argv[i], "--gen") ||
-            !strcmp(saved_argv[i], "--gate")) { i++; continue; }
+            !strcmp(saved_argv[i], "--gate") || !strcmp(saved_argv[i], "--h6-deadline")) { i++; continue; }
         argv[k++] = saved_argv[i];
     }
     argv[k++] = "--gen"; argv[k++] = genbuf;
+    if (opt.h6_control) { argv[k++] = "--h6-deadline"; argv[k++] = deadlinebuf; }
     if (*rest) { argv[k++] = "--chain"; argv[k++] = (char *)rest; }
     argv[k] = NULL;
     printf("EXEC " HEAD " how=%s next=%s\n", HEAD_ARGS, how, exe);
@@ -536,6 +631,131 @@ static void exec_next(void) {
     if (pthread_create(&t, NULL, exec_from_thread, &r)) die("pthread_create");
     pthread_join(t, NULL); /* never returns: the worker's exec replaces this thread group */
     die("non-leader exec returned");
+}
+
+/* Opt-in H6 controller. All provider work is ledgered independently of the
+ * observer. The ordinary fixture paths above retain their original phases. */
+static void h6_generation(void) {
+    if (!opt.h6_deadline || !opt.h6_leg_deadline ||
+        opt.h6_deadline > opt.h6_leg_deadline || now_ns() >= opt.h6_deadline)
+        die("H6 initial bound invalid or expired");
+    char warm_names[20][24];
+    for (int a = 0; a < 20; a++) {
+        snprintf(warm_names[a], sizeof warm_names[a], "h6-warm%d", a + 1);
+        PHASES[PH_H6_WARM + a] = warm_names[a];
+    }
+    CK_SESSION_HANDLE sessions[MAX_MODULES] = {0};
+    CK_OBJECT_HANDLE keys[MAX_MODULES] = {0};
+    unsigned char signatures[MAX_MODULES][128];
+    CK_ULONG lengths[MAX_MODULES] = {0};
+    unsigned char input[64] = {1};
+    CK_MECHANISM hmac = {CKM_SHA256_HMAC, NULL, 0};
+    unsigned long seq = 0, recovery_deadline = 0;
+    int attempts = 0, measured = 0, torn_down = 0;
+    h6_work_deadline = opt.h6_deadline;
+    for (int m = 0; m < module_count; m++) {
+        check_h6_work();
+        load_module(m);
+        check_h6_work();
+    }
+    printf("H6_READY " HEAD " seq=0 t=%lu deadline=%lu\n", HEAD_ARGS, now_ns(), opt.h6_deadline);
+    fflush(stdout);
+    for (;;) {
+        char line[256];
+        size_t used = 0;
+        for (;;) {
+            unsigned long t = now_ns();
+            if (stop || t >= opt.h6_deadline) die("H6 idle deadline expired");
+            struct pollfd fd = {STDIN_FILENO, POLLIN, 0};
+            int ms = (int)((opt.h6_deadline - t) / 1000000UL);
+            if (ms > 100) ms = 100;
+            int result = poll(&fd, 1, ms > 0 ? ms : 1);
+            if (result < 0) { if (errno == EINTR) continue; die("H6 command poll"); }
+            if (!result) continue;
+            char c;
+            ssize_t n = read(STDIN_FILENO, &c, 1);
+            if (n < 0 && errno == EINTR) continue;
+            if (n != 1) die("H6 command EOF");
+            if (c == '\n') { line[used] = 0; break; }
+            if (used == sizeof line - 1) die("H6 command too long");
+            line[used++] = c;
+        }
+        char command, extra;
+        int image, attempt;
+        unsigned long sequence, lower, deadline;
+        if (sscanf(line, "%c %d %lu %lu %lu %d %c", &command, &image, &sequence,
+                   &lower, &deadline, &attempt, &extra) != 6 || image != gen ||
+            sequence != seq + 1 || lower > now_ns() || lower >= deadline ||
+            deadline > opt.h6_leg_deadline || now_ns() >= deadline)
+            die("H6 stale, unordered or expired command");
+        seq = sequence;
+        h6_work_deadline = deadline;
+        unsigned long t0 = now_ns();
+        CK_RV failure = 0;
+        if (command == 'W') {
+            if (measured || torn_down || attempt != attempts + 1 || attempt > 20)
+                die("H6 warmup attempt invalid");
+            if (!recovery_deadline) recovery_deadline = deadline;
+            if (deadline > recovery_deadline) die("H6 recovery bound renewed");
+            if (!attempts) {
+                for (int m = 0; m < module_count; m++) {
+                    check_h6_work();
+                    bind_module(m, PH_H6_SETUP);
+                    sessions[m] = setup(m, PH_H6_SETUP);
+                    keys[m] = keygen(m, sessions[m], CKM_GENERIC_SECRET_KEY_GEN,
+                                    0x10, 0x108, PH_H6_SETUP, 1);
+                    if (CALL(m, PH_H6_SETUP, I_SignInit, CKM_SHA256_HMAC,
+                        CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE),
+                        sessions[m], &hmac, keys[m])) die("H6 signature SignInit");
+                    lengths[m] = sizeof signatures[m];
+                    if (CALL(m, PH_H6_SETUP, I_Sign, CKM_SHA256_HMAC,
+                        CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *),
+                        sessions[m], input, sizeof input, signatures[m], &lengths[m]) || !lengths[m])
+                        die("H6 signature preparation");
+                }
+                flush_ledger();
+            }
+            attempts = attempt;
+            for (int m = 0; m < module_count; m++)
+                iteration(m, sessions[m], PH_H6_WARM + attempt - 1);
+        } else if (command == 'M') {
+            if (!attempts || measured || torn_down || attempt) die("H6 measurement invalid");
+            measured = 1;
+            for (int m = 0; m < module_count; m++) {
+                for (int i = 0; i < 2; i++) {
+                    iteration(m, sessions[m], PH_H6_MEASURED);
+                    if (opt.sleep_us > 0) usleep((useconds_t)opt.sleep_us);
+                }
+                signatures[m][0] ^= 1;
+                if (CALL(m, PH_H6_FAILED, I_VerifyInit, CKM_SHA256_HMAC,
+                    CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE),
+                    sessions[m], &hmac, keys[m])) die("H6 corrupted signature VerifyInit");
+                failure = CALL(m, PH_H6_FAILED, I_Verify, CKM_SHA256_HMAC,
+                    CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG),
+                    sessions[m], input, sizeof input, signatures[m], lengths[m]);
+                if (failure != 0xc0UL /* CKR_SIGNATURE_INVALID */) die("H6 expected CKR_SIGNATURE_INVALID");
+            }
+        } else if (command == 'T') {
+            if (!attempts || torn_down || attempt) die("H6 teardown invalid");
+            torn_down = 1;
+            for (int m = 0; m < module_count; m++) {
+                CALL(m, PH_H6_TEARDOWN, I_DestroyObject, NO_MECH,
+                     CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), sessions[m], keys[m]);
+                teardown(m, sessions[m], PH_H6_TEARDOWN);
+            }
+        } else if (command == 'X' || command == 'F') {
+            if (!torn_down || attempt || (command == 'X' && (!opt.chain || !*opt.chain)) ||
+                (command == 'F' && opt.chain && *opt.chain)) die("H6 terminal command invalid");
+        } else die("H6 unknown command");
+        flush_ledger();
+        check_h6_work();
+        opt.h6_deadline = deadline;
+        printf("ACK " HEAD " command=%c seq=%lu attempt=%d t0=%lu t1=%lu deadline=%lu rv=0x%lx idle=1\n",
+               HEAD_ARGS, command, seq, attempt, t0, now_ns(), deadline, failure);
+        fflush(stdout);
+        if (command == 'X') { done_ok(); exec_next(); die("H6 exec did not replace image"); }
+        if (command == 'F') { done_ok(); return; }
+    }
 }
 
 static CK_SESSION_HANDLE lx_session;
@@ -556,11 +776,11 @@ static void *leader_exit_worker(void *arg) {
     wait_gate(opt.gate);
     sleep_ms(opt.delay_ms);
     for (long i = 0; i < opt.iters; i++) {
-        iteration(0, lx_session);
+        iteration(0, lx_session, PH_MAIN);
         if (opt.sleep_us > 0) usleep((useconds_t)opt.sleep_us);
     }
     flush_ledger();
-    teardown(0, lx_session);
+    teardown(0, lx_session, PH_TEARDOWN);
     flush_ledger();
     done_ok();
     hold_if_asked();
@@ -574,13 +794,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: inventory-ledger mech|map|exec-chain|held|leader-exit --cell LABEL "
                         "[--module P]... [--iters N] [--gate F|-] [--hold] [--late] [--delay-ms N] "
                         "[--sleep-us N] [--chain HOW:EXE,...] [--late-from N] [--gate2 F] "
-                        "[--single-call M]\n");
+                        "[--single-call M] [--pre-init-gate F]\n");
         return 2;
     }
     opt.mode = argv[1];
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
+        if (!strcmp(a, "--h6-control")) { opt.h6_control = 1; continue; }
+        if (!strcmp(a, "--ledger-singletons")) { ledger_singletons = 1; continue; }
+        if (!strcmp(a, "--c8-warm-initial")) { opt.c8_warm_initial = 1; continue; }
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
         if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }
@@ -598,13 +821,27 @@ int main(int argc, char **argv) {
             opt.single_call = atoi(v);
         } else if (!strcmp(a, "--gate")) opt.gate = v;
         else if (!strcmp(a, "--gate2")) opt.gate2 = v;
+        else if (!strcmp(a, "--pre-init-gate")) opt.pre_init_gate = v;
         else if (!strcmp(a, "--delay-ms")) opt.delay_ms = atol(v);
         else if (!strcmp(a, "--sleep-us")) opt.sleep_us = atol(v);
         else if (!strcmp(a, "--chain")) opt.chain = v;
         else if (!strcmp(a, "--gen")) gen = atoi(v);
+        else if (!strcmp(a, "--h6-deadline")) opt.h6_deadline = absolute_bound(v);
+        else if (!strcmp(a, "--h6-leg-deadline")) opt.h6_leg_deadline = absolute_bound(v);
+        else if (!strcmp(a, "--c8-gate-prefix")) c8_gate_prefix = v;
+        else if (!strcmp(a, "--c8-gated-images")) {
+            unsigned long count = absolute_bound(v);
+            if (count > 3) die("C8 gates cover at most three required images");
+            c8_gated_images = (int)count;
+        }
+        else if (!strcmp(a, "--c8-deadline")) c8_deadline = absolute_bound(v);
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (has_space(cell)) { fprintf(stderr, "--cell must not contain whitespace or '='\n"); return 2; }
+    if (strcmp(opt.pre_init_gate, "-") && opt.single_call < 0) {
+        fprintf(stderr, "--pre-init-gate needs --single-call\n");
+        return 2;
+    }
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
     sigaction(SIGTERM, &sa, NULL);
@@ -612,6 +849,28 @@ int main(int argc, char **argv) {
     read_identity();
     printf("IDENT " HEAD "\n", HEAD_ARGS);
     fflush(stdout);
+
+    if (c8_gate_prefix || c8_gated_images || c8_deadline || opt.c8_warm_initial) {
+        int warm_late = opt.c8_warm_initial && gen == 0 && !strcmp(opt.mode, "mech") && opt.late_from == 0;
+        if (!c8_gate_prefix || !c8_gated_images || !c8_deadline || !ledger_singletons ||
+            opt.h6_control || (opt.late_from >= 0 && !warm_late) || opt.gate2 || opt.single_call >= 0 ||
+            module_count != 1 || has_space(c8_gate_prefix) ||
+            (strcmp(opt.mode, "mech") && strcmp(opt.mode, "exec-chain")) ||
+            (!strcmp(opt.mode, "mech") && c8_gated_images != 1))
+            die("C8 gate options require a precise single-provider mech/exec plan");
+        check_h6_work();
+    }
+
+    if (opt.h6_control) {
+        if ((!strcmp(opt.mode, "exec-chain") && module_count == 1) ||
+            (!strcmp(opt.mode, "mech") && module_count > 0)) {
+            if (opt.late_from >= 0 || opt.gate2 || opt.single_call >= 0)
+                die("H6 control does not take staged loading options");
+            h6_generation();
+            return 0;
+        }
+        die("H6 control requires mech or single-module exec-chain");
+    }
 
     if (!strcmp(opt.mode, "mech")) {
         if (!module_count) die("mech needs --module");
@@ -638,10 +897,12 @@ int main(int argc, char **argv) {
         /* Generation k runs ITERS*(k+1) iterations, so every image's count is distinct. */
         mech_generation(opt.iters * (gen + 1), gen == 0);
         done_ok();
+        c8_wait("next");
         if (opt.chain && *opt.chain) {
             /* A quiet gap on both sides of every exec, so a witness timestamp
              * can only fall inside one image's call window. */
             sleep_ms(opt.delay_ms);
+            check_h6_work();
             exec_next();
         }
         hold_if_asked();
@@ -650,7 +911,7 @@ int main(int argc, char **argv) {
     if (!strcmp(opt.mode, "held")) {
         if (module_count != 1) die("held needs exactly one --module (the blocking provider)");
         load_module(0);
-        bind_module(0);
+        bind_module(0, PH_SETUP);
         flush_ledger();
         printf("READY " HEAD "\n", HEAD_ARGS);
         fflush(stdout);
@@ -669,8 +930,8 @@ int main(int argc, char **argv) {
     if (!strcmp(opt.mode, "leader-exit")) {
         if (module_count != 1) die("leader-exit needs exactly one --module");
         load_module(0);
-        bind_module(0);
-        lx_session = setup(0);
+        bind_module(0, PH_SETUP);
+        lx_session = setup(0, PH_SETUP);
         flush_ledger();
         printf("READY " HEAD "\n", HEAD_ARGS);
         fflush(stdout);

@@ -8,6 +8,47 @@ use std::time::{Duration, Instant};
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SLEEP_ARGUMENT: &str = "287.4139";
 
+/// A `Command` extension arming parent-death SIGKILL on the future child:
+/// `PR_SET_PDEATHSIG` in a `pre_exec` hook plus a `getppid` recheck
+/// against the forking process, closing the fork race (a parent that died
+/// before the `prctl` never fires the signal, and a live subreaper may
+/// adopt the child first, so testing for init alone misses live
+/// adoption). A parent already gone exits 127 before exec, so no orphan
+/// starts.
+///
+/// The signal fires when the forking *thread* exits. That is fine here
+/// because the spawning test thread outlives its children: holders are
+/// spawned on the test thread and reaped before the test returns. Never
+/// spawn a guarded long-lived child on a short-lived helper thread.
+///
+/// Mirror of `src/fixture_guard.rs` (integration tests cannot link that
+/// `cfg(test)` module). Keep the two bodies in sync.
+pub trait DieWithParent {
+    fn die_with_parent(&mut self) -> &mut Self;
+}
+
+impl DieWithParent for Command {
+    fn die_with_parent(&mut self) -> &mut Self {
+        use std::os::unix::process::CommandExt as _;
+        let owner = std::process::id();
+        // SAFETY: the hook runs after fork before exec; its body uses
+        // async-signal-safe calls only (prctl, getppid, _exit), allocates
+        // nothing and touches no parent memory.
+        unsafe {
+            self.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+}
+
 pub struct ChildGuard {
     pub child: Child,
     live: bool,
@@ -173,6 +214,9 @@ impl SameUidNonDescendant {
 
     fn spawn_with_failure(failure: Option<LaunchFailure>) -> io::Result<Self> {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/non-descendant.sh");
+        // No parent-death guard can reach the detached target below: the
+        // double fork reparents it to init, so on test SIGKILL it sleeps
+        // out its ~287 s bound (non-descendant is the point of this fixture).
         let mut wrapper = ChildGuard::new(
             Command::new("setsid")
                 .arg("--fork")
@@ -329,6 +373,7 @@ impl MatchingDecoy {
     pub fn spawn() -> io::Result<Self> {
         Command::new("sleep")
             .arg(SLEEP_ARGUMENT)
+            .die_with_parent()
             .spawn()
             .map(ChildGuard::new)
             .map(Self)
@@ -349,7 +394,11 @@ mod tests {
 
     #[test]
     fn pending_child_kill_failure_returns_without_an_unbounded_wait() {
-        let child = Command::new("sleep").arg(SLEEP_ARGUMENT).spawn().unwrap();
+        let child = Command::new("sleep")
+            .arg(SLEEP_ARGUMENT)
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let mut child = ChildGuard::new(child);
         let started = Instant::now();
         let error = child

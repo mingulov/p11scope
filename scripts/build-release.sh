@@ -399,7 +399,7 @@ receipt_seal_and_reexec() {
         P11SCOPE_RECEIPT_SEALED_BIN="$t4_seal_bin" \
         P11SCOPE_RECEIPT_CALLER_PATH="$PATH" \
         P11SCOPE_RECEIPT_CALLER_ARGV0="$0" \
-        "$t4_seal_sh" "$t4_driver" "$1"
+        "$t4_seal_sh" "$t4_driver" "$@"
     "$t4_seal_rm" -rf "$t4_seal_bin" || :
     echo "cannot enter the sealed release environment" >&2
     exit 77
@@ -590,9 +590,51 @@ receipt_finalize() {
     exit "$t4_result"
 }
 
+receipt_release_usage() {
+    echo "usage: $0 [--capture-mode full|p0] [--jobs 1..16] ABSENT_EVIDENCE_ROOT | --self-test" >&2
+    exit 2
+}
+
 receipt_receipt_run() {
-    [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    if [ -z "${P11SCOPE_RECEIPT_SEALED-}" ]; then receipt_seal_and_reexec "$1"; fi
+    RELEASE_CAPTURE_MODE=full
+    RELEASE_CAPTURE_SELECTED=0
+    RELEASE_BUILD_JOBS=cargo-default
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --capture-mode)
+                [ "$#" -ge 2 ] && [ "$RELEASE_CAPTURE_SELECTED" -eq 0 ] || receipt_release_usage
+                case $2 in
+                    full|p0) RELEASE_CAPTURE_MODE=$2 ;;
+                    *) receipt_release_usage ;;
+                esac
+                RELEASE_CAPTURE_SELECTED=1
+                shift 2
+                ;;
+            --jobs)
+                [ "$#" -ge 2 ] && [ "$RELEASE_BUILD_JOBS" = cargo-default ] || receipt_release_usage
+                case $2 in
+                    [1-9]|1[0-6]) RELEASE_BUILD_JOBS=$2 ;;
+                    *) receipt_release_usage ;;
+                esac
+                shift 2
+                ;;
+            --*) receipt_release_usage ;;
+            *) break ;;
+        esac
+    done
+    [ "$#" -eq 1 ] || receipt_release_usage
+    if [ -z "${P11SCOPE_RECEIPT_SEALED-}" ]; then
+        if [ "$RELEASE_BUILD_JOBS" != cargo-default ]; then
+            if [ "$RELEASE_CAPTURE_SELECTED" -eq 1 ]; then
+                set -- --capture-mode "$RELEASE_CAPTURE_MODE" "$@"
+            fi
+            receipt_seal_and_reexec --jobs "$RELEASE_BUILD_JOBS" "$@"
+        elif [ "$RELEASE_CAPTURE_SELECTED" -eq 1 ]; then
+            receipt_seal_and_reexec --capture-mode "$RELEASE_CAPTURE_MODE" "$1"
+        else
+            receipt_seal_and_reexec "$1"
+        fi
+    fi
     receipt_verify_seal \
         || { echo "refusing an unsealed or forged release environment" >&2; exit 77; }
     receipt_prepare_root "$1" \
@@ -633,6 +675,8 @@ receipt_receipt_run() {
     RECEIPT_DRIVER_HASH=$(receipt_digest scripts/build-release.sh); RECEIPT_CHECKER_HASH=$(receipt_digest scripts/check-capture-evidence.py)
     receipt_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     receipt_fact argv "$P11SCOPE_RECEIPT_CALLER_ARGV0 $1"; receipt_fact cwd "$(pwd -P)"
+    receipt_fact capture_mode "$RELEASE_CAPTURE_MODE"
+    receipt_fact build_jobs "$RELEASE_BUILD_JOBS"
     receipt_fact sealed_bin "$P11SCOPE_RECEIPT_SEALED_BIN"
     receipt_fact sealed_bin_identity "$(stat -Lc %d:%i "$P11SCOPE_RECEIPT_SEALED_BIN")"
     receipt_fact sealed_environment "$(echo $RECEIPT_SEALED_ENVIRONMENT)"
@@ -680,7 +724,15 @@ receipt_receipt_run() {
     ATTACH_WORK=$WORK
     DISCOVER_BASE=$WORK
     DISCOVER_WORK="$DISCOVER_BASE/discover"
-    release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    if [ "$RELEASE_BUILD_JOBS" = cargo-default ]; then
+        release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    else
+        # Set the validated budget only for the build body and its children,
+        # including prepared builds and build.rs's nested BPF Cargo. Keep the
+        # receipt shell's exact sealed environment unchanged.
+        CARGO_BUILD_JOBS="$RELEASE_BUILD_JOBS" \
+            release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    fi
     exec 8< "$RECEIPT_ROOT/artifacts/discover.facts"
     RECEIPT_CHILD_FACTS_ID=$(stat -Lc %d:%i /proc/$$/fd/8) || exit 1
     [ "$RECEIPT_CHILD_FACTS_ID" = "$(awk -F '\t' '$1=="facts_identity"{print $2; exit}' /proc/$$/fd/8)" ] || exit 1
@@ -718,7 +770,7 @@ P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
 P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
+P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh --capture-mode "${RELEASE_CAPTURE_MODE-full}"
 
 echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_PRODUCT_BUILD_MODE=prepared \
@@ -726,7 +778,7 @@ P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
 P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-P11SCOPE_RECEIPT_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
+P11SCOPE_RECEIPT_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh --capture-mode "${RELEASE_CAPTURE_MODE-full}"
 
 echo "=== p11scope: isolated safe-only official static build ==="
 rm -rf "$OFFICIAL_TARGET"
@@ -744,12 +796,19 @@ rm -rf "$OFFICIAL_TARGET"
 # defaults under HOME.
 RELEASE_FLAG_SEPARATOR=$(printf '\037')
 RELEASE_SOURCE_ROOT=$(pwd -P)
+# FULL (default features) is the official capture mode; P0 stays an
+# explicit --capture-mode p0 selection for the verifier-budget lane.
+case ${RELEASE_CAPTURE_MODE-full} in
+    full) set -- ;;
+    p0) set -- --no-default-features --features stub-object-attributes ;;
+    *) echo "invalid release capture mode: ${RELEASE_CAPTURE_MODE-}" >&2; exit 1 ;;
+esac
 CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
 CARGO_ENCODED_RUSTFLAGS="-C${RELEASE_FLAG_SEPARATOR}target-feature=+crt-static${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$RELEASE_SOURCE_ROOT=/p11scope${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.cargo=/cargo${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.rustup=/rustup" \
 RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-    "$T4_TOOLCHAIN_CARGO" build --locked --offline --release --no-default-features \
+    "$T4_TOOLCHAIN_CARGO" build --locked --offline --release "$@" \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 
@@ -760,6 +819,9 @@ set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
 "$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+set -- "$OFFICIAL_TARGET"/x86_64-unknown-linux-musl/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "official journal object is not unique"; exit 1; }
+"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --inventory journal "$1"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
     --manifest /nonexistent/manifest.json --pid 1 \
@@ -783,8 +845,12 @@ ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforce
 cp "$P11SCOPE_STATIC" "$DIST/p11scope"
 
 echo "=== p11scope-discover: dynamic glibc + dynamic musl builds ==="
+set --
+if [ "$RELEASE_BUILD_JOBS" != cargo-default ]; then
+    set -- --jobs "$RELEASE_BUILD_JOBS"
+fi
 P11SCOPE_RECEIPT_WORK="$DISCOVER_BASE" \
-    sh scripts/verify-discover-containers.sh \
+    sh scripts/verify-discover-containers.sh "$@" \
     --lane14-facts "$RECEIPT_ROOT/artifacts/discover.facts"
 GLIBC_DISCOVER=$DISCOVER_WORK/glibc-build/release/p11scope-discover
 MUSL_DISCOVER=$DISCOVER_WORK/musl-build/release/p11scope-discover

@@ -4,6 +4,7 @@
 //! aliased slot whose names disagree degrades to OTHER: reading the wrong
 //! argument shape could touch a PIN pointer, so ambiguity never guesses.
 
+use p11scope_ebpf_common::object_policy::ObjectCaptureDescriptor;
 use p11scope_ebpf_common::{
     MAX_DESCRIPTORS, SlotSemantics, direct, lifecycle, operation, semantic_flags, transition,
 };
@@ -75,6 +76,51 @@ pub fn descriptor_slot(names: &[String]) -> (SlotSemantics, bool) {
     (DESCRIPTORS[index as usize], ambiguous)
 }
 
+/// Finite alias verdict for the object lane: S1 shapes and object protocols
+/// must both agree, with a named reason otherwise. The production S1 path
+/// (`descriptor_index`) is unchanged; this gates object facts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasAgreement {
+    Agree,
+    S1Ambiguous,
+    ObjectDisagree,
+}
+
+/// Select one fixed descriptor for one static target, requiring exact S1
+/// agreement (as `descriptor_index`) plus exact object-protocol agreement.
+/// Equal S1 shapes with differing object protocols become count-only with
+/// `ObjectDisagree`; attach-cookie encoding is unchanged.
+pub fn descriptor_index_with_object_agreement(names: &[String]) -> (u32, AliasAgreement) {
+    if names.is_empty() {
+        return (0, AliasAgreement::Agree);
+    }
+    let mut index: Option<u32> = None;
+    let mut selected: Option<(SlotSemantics, Option<ObjectCaptureDescriptor>)> = None;
+    for name in names {
+        let Some(function_id) = function_id(name) else {
+            return (0, AliasAgreement::S1Ambiguous);
+        };
+        let candidate_s1 = DESCRIPTORS[(function_id + 1) as usize];
+        let candidate_object = object_descriptor(name);
+        match (&mut index, &mut selected) {
+            (Some(previous), Some((s1, object))) => {
+                if candidate_s1 != *s1 {
+                    return (0, AliasAgreement::S1Ambiguous);
+                }
+                if candidate_object != *object {
+                    return (0, AliasAgreement::ObjectDisagree);
+                }
+                *previous = (*previous).min(function_id + 1);
+            }
+            _ => {
+                index = Some(function_id + 1);
+                selected = Some((candidate_s1, candidate_object));
+            }
+        }
+    }
+    (index.unwrap_or(0), AliasAgreement::Agree)
+}
+
 fn session(operations: u16, transition: u8) -> SlotSemantics {
     SlotSemantics {
         operations,
@@ -130,8 +176,12 @@ fn with_output(mut value: SlotSemantics, output: u8) -> SlotSemantics {
 /// reserved for names outside the shared published 104-slot inventory.
 pub fn descriptor(name: &str) -> Option<SlotSemantics> {
     let value = match name {
-        "C_Initialize" | "C_GetInfo" | "C_GetFunctionList" | "C_GetSlotList"
-        | "C_GetInterfaceList" | "C_GetInterface" => SlotSemantics::COUNT_ONLY,
+        // P4-M2: every Initialize argument selector stays ARG_NONE
+        // (argument 0 is not a session handle); only the lifecycle
+        // tag is added, so S1 claims nothing new for the call.
+        "C_Initialize" => lifecycle_only(lifecycle::CRYPTOKI_INITIALIZE),
+        "C_GetInfo" | "C_GetFunctionList" | "C_GetSlotList" | "C_GetInterfaceList"
+        | "C_GetInterface" => SlotSemantics::COUNT_ONLY,
 
         "C_Finalize" => lifecycle_only(lifecycle::FINALIZE),
         "C_GetSlotInfo" | "C_GetTokenInfo" | "C_GetMechanismList" | "C_GetMechanismInfo"
@@ -406,7 +456,7 @@ mod tests {
             );
             permitted += usize::from(object_descriptor(field.name).is_some());
         }
-        assert_eq!(permitted, 25);
+        assert_eq!(permitted, 27);
         for name in [
             "",
             "C_NotAStandardFunction",
@@ -416,10 +466,21 @@ mod tests {
             " C_DeriveKey",
             "C_DeriveKey ",
             "C_UnwrapKeyAuthenticated",
-            "C_EncapsulateKey",
             "C_FindObjectsInit",
         ] {
             assert_eq!(object_descriptor(name), None, "{name:?}");
+        }
+        for (name, action) in [
+            ("C_EncapsulateKey", policy::ObjectAction::Encapsulate),
+            ("C_DecapsulateKey", policy::ObjectAction::Decapsulate),
+        ] {
+            let descriptor = object_descriptor(name).unwrap_or_else(|| panic!("{name} modeled"));
+            assert_eq!(descriptor.action, action, "{name}");
+            assert_eq!(
+                descriptor.result_protocol_guard,
+                policy::ResultProtocolGuard::NamedFunction,
+                "{name}"
+            );
         }
         let pair = object_descriptor("C_GenerateKeyPair").unwrap();
         assert_eq!(pair.action, policy::ObjectAction::GeneratePair);

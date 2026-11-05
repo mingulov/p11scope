@@ -40,18 +40,18 @@
 //! 15. `f_e08_null_default_and_failure_request_matrix`
 //! 16. `f_e08_version_shape_matrix`
 //! 17. `f_e13_first_call_gap_and_precapture_boundary`
-//! 18. `f_e15_malicious_entries_refused_equally`
+//! 18. `f_e15_partial_tables_retain_valid_targets`
 //! 19. `f_e15_forged_exact_name_stays_count_only`
 //! 20. `f_e21_gi_public_output_carries_no_raw_pointers`
 //!
-//! Supported equivalent factory forms must yield the same exact count-only
-//! endpoint set; unsupported forms must refuse with the same specific
-//! omission on every route. Selection authority guards stay intact: the
+//! Equivalent factory forms retain the same observed count-only endpoint set.
+//! Partial reads and unusable entries disclose the coverage actually obtained. Selection authority guards stay intact: the
 //! `C_GetInterface` tuple/claim path is unchanged, and publication lowers
 //! through the shared bounded ownership-validation path.
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::discovery::identity::{ManifestStaleReason, pin_manifest_objects_deferred};
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
@@ -305,6 +305,7 @@ impl StageChild {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("spawn workload stage");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -518,14 +519,23 @@ struct LsChild {
 }
 
 impl LsChild {
-    fn spawn(lshold: &Path, provider: &Path, log: &Path, ords: &str) -> Self {
-        let mut child = Command::new(lshold)
-            .arg(provider)
-            .arg(log)
-            .arg(ords)
+    fn spawn(
+        lshold: &Path,
+        provider: &Path,
+        log: &Path,
+        ords: &str,
+        preload: Option<&Path>,
+    ) -> Self {
+        let mut command = Command::new(lshold);
+        command.arg(provider).arg(log).arg(ords);
+        if let Some(preload) = preload {
+            command.env("LD_PRELOAD", preload);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("spawn lshold");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -676,10 +686,15 @@ fn gfl_record(pid: u32, table: &TablePrint, hooks: &HookRegistry) -> DiscoveryRe
     record.version_minor = table.minor;
     record.symbol_id = hooks.id("C_GetFunctionList").expect("builtin hook id");
     record.name_class = DISCOVERY_NAME_NA;
-    for (slot, (addr, _)) in record.pointers.iter_mut().zip(table.entries.iter()) {
+    for (slot, (addr, _)) in record
+        .pointers
+        .iter_mut()
+        .take(68)
+        .zip(table.entries.iter())
+    {
         *slot = *addr;
     }
-    record.pointers_attempted = u8::try_from(table.nentry).expect("nentry fits");
+    record.pointers_attempted = u8::try_from(table.nentry.min(68)).expect("legacy bound fits");
     record.completed_prefix = record.pointers_attempted;
     record.usable_n = record.pointers_attempted;
     assert!(
@@ -1332,15 +1347,43 @@ fn actual_slot_names(engine: &Engine) -> std::collections::BTreeMap<(String, u64
         .collect()
 }
 
-/// `(address, version, live_return, manifest_supported)` for every
-/// unlocated (heap/anonymous) table instance, sorted by address.
+/// Physical unlocated instances, including distinct retained allocations after
+/// address reuse. Compatible shorter extents are source observations of the
+/// same view/address/content, rather than additional physical allocations.
 fn live_instances(engine: &Engine) -> Vec<(u64, (u8, u8), bool, bool)> {
-    let mut live: Vec<(u64, (u8, u8), bool, bool)> = engine
+    let mut observations: Vec<_> = engine
         .modules
         .iter()
-        .flat_map(|module| &module.scanned.tables)
-        .filter(|table| table.file_offset.is_none())
-        .map(|table| {
+        .flat_map(|module| {
+            module
+                .scanned
+                .tables
+                .iter()
+                .filter(|table| table.file_offset.is_none())
+                .map(|table| (module.scanned.view, table.clone()))
+        })
+        .collect();
+    // Use the most informative content first so a common short prefix cannot
+    // merge two distinct retained allocations with different extended targets.
+    observations.sort_by_key(|(_, table)| std::cmp::Reverse(table.decoded_slot_count()));
+    let mut physical: Vec<(ProcessViewId, ScannedTable)> = Vec::new();
+    for (view, table) in observations {
+        if let Some((_, known)) = physical.iter_mut().find(|(known_view, known)| {
+            *known_view == view
+                && known.address == table.address
+                && known.entries.starts_with(&table.entries)
+                && known.null_entries.starts_with(&table.null_entries)
+                && known.unpinned.starts_with(&table.unpinned)
+        }) {
+            known.live_return |= table.live_return;
+            known.manifest_supported |= table.manifest_supported;
+        } else {
+            physical.push((view, table));
+        }
+    }
+    let mut live: Vec<_> = physical
+        .into_iter()
+        .map(|(_, table)| {
             (
                 table.address,
                 table.version,
@@ -1421,6 +1464,60 @@ fn template_linkage(engine: &Engine) -> std::collections::BTreeMap<u64, &'static
         .filter(|table| table.version == (3, 2) && table.entries == 104)
         .filter_map(|table| table.file_offset.map(|offset| (offset, table.linkage)))
         .collect()
+}
+
+#[test]
+fn same_allocation_observed_at_two_extents_is_one_live_instance() {
+    let build = pub_build();
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    for want in 0..18 {
+        assert_eq!(stage.alloc(0, -1).0, want);
+    }
+    for index in 0..17 {
+        stage.free(index);
+    }
+    let published = stage.publish();
+    let table = published
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .unwrap();
+    let maps = MapLite::snapshot(stage.pid);
+    let hooks = HookRegistry::builtin();
+    let mut engine = engine_over_pids(&[stage.pid]);
+    // The two ABI origins can expose different known extents of the same
+    // actual allocation. Each record still gets a fresh real memory read.
+    drain_records(&mut engine, vec![gfl_record(stage.pid, table, &hooks)]);
+    drain_records(
+        &mut engine,
+        vec![element_record(stage.pid, table.addr, 0, 1, &hooks)],
+    );
+    assert_eq!(
+        live_instances(&engine),
+        vec![(table.addr, (3, 2), true, false)],
+        "source observations do not manufacture another physical allocation"
+    );
+    let observations: Vec<_> = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .filter(|observed| observed.address == table.addr)
+        .collect();
+    assert_eq!(
+        observations.len(),
+        2,
+        "different known extents remain source observations"
+    );
+    let targets: std::collections::BTreeSet<_> = observations
+        .iter()
+        .flat_map(|observed| {
+            observed
+                .entries
+                .iter()
+                .map(|entry| (entry.object_path.clone(), entry.file_offset))
+        })
+        .collect();
+    assert_eq!(targets, printed_targets(&maps, std::slice::from_ref(table)));
 }
 
 /// Case 1: no active wrappers. Only the legacy table is published; the
@@ -1644,8 +1741,8 @@ fn holes_admit_index_17_despite_free_0_to_3() {
     assert_eq!(engine.plan().slots.len(), 34);
     assert_eq!(slot_object_keys(&engine).len(), 1, "provider only");
 
-    // Provenance: both published tables carry live returns and authorize
-    // names; the live element interfaces link nothing (no widening).
+    // Both tables were published. Only the independent typed legacy return
+    // supplies standard layout names; the opaque wrapper keeps unknown names.
     assert_eq!(
         live_instances(&engine),
         sorted_live(vec![
@@ -1661,7 +1758,10 @@ fn holes_admit_index_17_despite_free_0_to_3() {
         .flat_map(|module| &module.scanned.interfaces)
         .filter(|interface| interface.table.is_none())
         .count();
-    assert_eq!(unlinked_live, 2, "both live elements stay unlinked");
+    assert_eq!(
+        unlinked_live, 1,
+        "the typed legacy proof retains its unlinked opaque metadata"
+    );
     let linkage_none: Vec<&str> = engine
         .plan()
         .modules
@@ -1670,14 +1770,12 @@ fn holes_admit_index_17_despite_free_0_to_3() {
         .filter(|table| table.file_offset.is_none())
         .map(|table| table.linkage)
         .collect();
-    assert_eq!(linkage_none, vec!["live_return", "live_return"]);
+    assert_eq!(linkage_none, vec!["heuristic", "live_return"]);
 
-    // Names: heap 17's closures authorize their ordinal labels; the
-    // swept templates carry no exact_standard interface link and no
-    // live-return or manifest evidence of their own, so none of them
-    // are authorized (U-15; F-T2-1).
+    // Opaque wrappers and raw templates carry no independent standard-layout
+    // proof. Their targets remain observable with unknown API names.
     let template_auth = |_index: i64| false;
-    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap17, true)];
+    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap17, false)];
     claimants.extend(
         visible
             .iter()
@@ -1789,8 +1887,8 @@ fn five_active_wrappers_admit_all_closure_sets() {
     assert_eq!(engine.plan().slots.len(), 34);
     assert_eq!(slot_object_keys(&engine).len(), 1, "provider only");
 
-    // Index 4's closures — beyond the heuristic window — are admitted
-    // with authorized names.
+    // Opaque index4 callbacks admit beyond the heuristic window while their
+    // standard API names remain unproven.
     let heap4 = publish
         .elements
         .iter()
@@ -1803,12 +1901,8 @@ fn five_active_wrappers_admit_all_closure_sets() {
         let names = &actual_slot_names(&engine)[&(path.clone(), offset)];
         assert_eq!(
             *names,
-            vec![
-                pkcs11_module::function_name(ord as usize)
-                    .unwrap()
-                    .to_string()
-            ],
-            "idx4 ord{ord} is authorized, never unknown"
+            vec!["unknown".to_string()],
+            "idx4 ord{ord} has no standard-layout naming proof"
         );
     }
 
@@ -1833,16 +1927,19 @@ fn five_active_wrappers_admit_all_closure_sets() {
         .filter(|table| table.file_offset.is_none())
         .map(|table| table.linkage)
         .collect();
-    assert_eq!(linkage_none, vec!["live_return"; 6]);
+    assert_eq!(
+        linkage_none,
+        [vec!["heuristic"; 5], vec!["live_return"]].concat()
+    );
 
-    let template_auth = |index: i64| index == 0;
+    let template_auth = |_index: i64| false;
     let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true)];
     claimants.extend(
         publish
             .elements
             .iter()
             .filter(|table| table.index >= 0)
-            .map(|table| (table, true)),
+            .map(|table| (table, false)),
     );
     claimants.extend(
         visible
@@ -2041,7 +2138,7 @@ fn two_processes_union_indices_of_one_inode() {
     assert_eq!(live_instances(&engine), sorted_live(expected_live));
 
     // Names from both views' claimants (template offsets coincide).
-    let template_auth = |index: i64| index == 0;
+    let template_auth = |_index: i64| false;
     let mut names_a = expected_slot_names(&maps_a, &{
         let mut claimants_a: Vec<(&TablePrint, bool)> = vec![(&publish_a.legacy, true)];
         claimants_a.extend(
@@ -2049,7 +2146,7 @@ fn two_processes_union_indices_of_one_inode() {
                 .elements
                 .iter()
                 .filter(|table| table.index >= 0)
-                .map(|table| (table, true)),
+                .map(|table| (table, false)),
         );
         claimants_a.extend(
             visible
@@ -2065,7 +2162,7 @@ fn two_processes_union_indices_of_one_inode() {
                 .elements
                 .iter()
                 .filter(|table| table.index >= 0)
-                .map(|table| (table, true)),
+                .map(|table| (table, false)),
         );
         claimants_b
     });
@@ -2245,7 +2342,7 @@ fn direct_backend_forwarding_admits_cross_object_targets() {
     // live-return or manifest evidence of their own, so none of them
     // are authorized (U-15; F-T2-1).
     let template_auth = |_index: i64| false;
-    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap0, true)];
+    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap0, false)];
     claimants.extend(
         visible
             .iter()
@@ -2602,6 +2699,7 @@ fn unknown_build_admits_by_publication_without_layout() {
     let started = Instant::now();
     let mut engine = engine_over_pids(&[stage.pid]);
     let scan_baseline = engine.plan().slots.len();
+    let sweep_interface_records = engine.budget.interface_records_count();
     let baseline_targets = slot_targets(&engine);
     eprintln!("t8-stripped: scan-only baseline is {scan_baseline} slots");
     // The stripped fixture's file tail may decode incidental tables depending
@@ -2675,7 +2773,7 @@ fn unknown_build_admits_by_publication_without_layout() {
             .count(),
         engine.plan().uncorroborated_candidates,
     );
-    // Index 4's closures admit with authorized ordinal names.
+    // The stripped opaque interface admits callbacks with unknown API names.
     let heap4 = publish
         .elements
         .iter()
@@ -2686,12 +2784,8 @@ fn unknown_build_admits_by_publication_without_layout() {
         let names = &actual_slot_names(&engine)[&(path, offset)];
         assert_eq!(
             *names,
-            vec![
-                pkcs11_module::function_name(ord as usize)
-                    .unwrap()
-                    .to_string()
-            ],
-            "stripped idx4 ord{ord} is authorized, never unknown"
+            vec!["unknown".to_string()],
+            "stripped idx4 ord{ord} has no standard-layout naming proof"
         );
     }
     // The file-backed legacy merges (scan + live are one instance with
@@ -2733,15 +2827,12 @@ fn unknown_build_admits_by_publication_without_layout() {
         "every wrapper call is admitted"
     );
 
-    // Six live list elements plus whatever sweep triples this layout
-    // decoded (layout-unknown, so read the sweep's own count).
-    let sweep_triples: usize = engine
-        .modules
-        .iter()
-        .flat_map(|module| &module.scanned.interfaces)
-        .filter(|interface| interface.table.is_some())
-        .count();
-    assert_eq!(engine.budget.interface_records_count(), 6 + sweep_triples);
+    // Six real list-element records join the independently captured initial
+    // sweep count; opaque source associations do not fabricate sweep triples.
+    assert_eq!(
+        engine.budget.interface_records_count(),
+        6 + sweep_interface_records
+    );
     assert!(
         session.attached_slots.iter().sum::<usize>() == engine.plan().slots.len() - scan_baseline,
         "publication attaches exactly its new slots"
@@ -2811,17 +2902,47 @@ fn stale_ls_manifest(
 }
 
 /// Case 9: a non-p11-kit legacy static table. Five file-backed static
-/// tables: scan-only spills one past K=4 with unknown names; a stale
-/// manifest's exact-target fallback binds one table (bypass + authorized
-/// names + linkage "manifest"); a live return merges with the scan
-/// instance (bypass + linkage "live_return").
+/// tables: scan-only admits the fitting family whole with unknown names; a
+/// stale manifest's exact-target fallback binds one table (bypass +
+/// authorized names + linkage "manifest"); a live return merges with the
+/// scan instance (bypass + linkage "live_return").
 /// Guards: static behavior that must survive the heap work.
 #[test]
 fn legacy_static_table_scan_manifest_and_live() {
     let build = pub_build();
     let dir = pub_tmp("t9-ls");
+    // PA-9/C1 sidecar: one small provider preloaded into the holder, so the
+    // first plan holds a non-closure provider beside the five-table closure
+    // array and whole admission applies; the closure stays unnamed. The
+    // sidecar makes no calls, so the exact call bytes below are unaffected.
+    let sidecar_c =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-static/sidecar.c");
+    let sidecar = dir.join("sidecar.so");
+    let mut args: Vec<std::ffi::OsString> = [
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fPIC",
+        "-shared",
+        "-Wl,-z,defs",
+        "-o",
+    ]
+    .iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    args.push(sidecar.clone().into());
+    args.push(sidecar_c.into());
+    pub_gcc(&args);
     let log = dir.join("ls.log");
-    let holder = LsChild::spawn(&build.lshold, &build.ls_provider, &log, "0,1,2,0,43");
+    let holder = LsChild::spawn(
+        &build.lshold,
+        &build.ls_provider,
+        &log,
+        "0,1,2,0,43",
+        Some(&sidecar),
+    );
     assert_eq!(
         holder.calls,
         vec![(0, 0), (1, 0), (2, 0), (0, 0), (43, 0)],
@@ -2857,11 +2978,18 @@ fn legacy_static_table_scan_manifest_and_live() {
         })
         .collect();
 
-    // 9a: scan-only. Five heuristic tables, one spills past K=4.
+    // 9a: scan-only. Five heuristic tables, a closure array that fits,
+    // so the family admits whole beside the preloaded sidecar provider.
     let started = Instant::now();
     let engine_a = engine_over_pids(&[holder.pid]);
-    assert_eq!(engine_a.modules.len(), 1);
-    let scan_tables = &engine_a.modules[0].scanned.tables;
+    assert_eq!(engine_a.modules.len(), 2);
+    let scan_tables = &engine_a
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned
+        .tables;
     assert_eq!(scan_tables.len(), 5, "all five static tables decode");
     for table in scan_tables {
         assert_eq!(table.version, (2, 40));
@@ -2874,9 +3002,16 @@ fn legacy_static_table_scan_manifest_and_live() {
     scan_addrs.sort();
     scan_addrs.dedup();
     assert_eq!(scan_addrs.len(), 5, "five distinct instances");
-    assert_eq!(engine_a.plan().slots.len(), 68);
+    // Slot targets for the ls closure only; the sidecar's 68 land under
+    // its own path.
+    let ls_targets: BTreeSet<(String, u64)> = slot_targets(&engine_a)
+        .into_iter()
+        .filter(|(path, _)| path.ends_with("ls/provider.so"))
+        .collect();
+    // 68 ls targets plus the sidecar's 68.
+    assert_eq!(engine_a.plan().slots.len(), 68 + 68);
     assert_eq!(
-        slot_targets(&engine_a),
+        ls_targets,
         printed_targets(&maps, std::slice::from_ref(&table0))
     );
     assert!(
@@ -2887,7 +3022,12 @@ fn legacy_static_table_scan_manifest_and_live() {
             .all(|slot| slot.names.as_slice() == ["unknown"]),
         "scan-only heuristic tables stay unknown"
     );
-    let linkage_a: Vec<&str> = engine_a.plan().modules[0]
+    let linkage_a: Vec<&str> = engine_a
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
         .tables
         .iter()
         .map(|table| table.linkage)
@@ -2895,17 +3035,18 @@ fn legacy_static_table_scan_manifest_and_live() {
     assert_eq!(linkage_a, vec!["heuristic"; 5], "no sweep triples here");
     assert_eq!(
         engine_a.plan().uncorroborated_candidates,
-        1,
-        "the fifth heuristic table spills past K=4"
+        0,
+        "the fitting family admits whole, nothing spills"
     );
-    assert_eq!(engine_a.plan().entries_seen, 5 * 68);
-    assert_eq!(engine_a.budget.table_candidates_count(), 5);
-    assert_eq!(engine_a.budget.decoded_table_entries_count(), 5 * 68);
+    // Five ls tables plus the sidecar's one, 68 entries each.
+    assert_eq!(engine_a.plan().entries_seen, 6 * 68);
+    assert_eq!(engine_a.budget.table_candidates_count(), 6);
+    assert_eq!(engine_a.budget.decoded_table_entries_count(), 6 * 68);
     // The scripted calls land on admitted slots.
     for ord in [0, 1, 2, 43] {
         let (path, offset, _) = MapLite::file_target(&maps, table0.entries[ord].0);
         assert!(
-            slot_targets(&engine_a).contains(&(path, offset)),
+            ls_targets.contains(&(path, offset)),
             "called ordinal {ord} is admitted"
         );
     }
@@ -2913,7 +3054,13 @@ fn legacy_static_table_scan_manifest_and_live() {
 
     // 9b: a stale manifest's exact-target fallback supports all five.
     let mut engine_b = engine_over_pids(&[holder.pid]);
-    let scanned_key = engine_b.modules[0].scanned.key;
+    let scanned_key = engine_b
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned
+        .key;
     let metadata = std::fs::metadata(&build.ls_provider).unwrap();
     assert_eq!(
         scanned_key.inode,
@@ -2942,8 +3089,13 @@ fn legacy_static_table_scan_manifest_and_live() {
         stale: pinning.stale,
     });
     rebuild_discovered(&mut engine_b).expect("fallback proof completes");
-    let supported: Vec<u64> = engine_b.modules[0]
-        .scanned
+    let ls_scanned_b = &engine_b
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned;
+    let supported: Vec<u64> = ls_scanned_b
         .tables
         .iter()
         .filter(|table| table.manifest_supported)
@@ -2955,18 +3107,16 @@ fn legacy_static_table_scan_manifest_and_live() {
         "the single surface binds exactly one table"
     );
     assert!(
-        engine_b.modules[0]
-            .scanned
-            .tables
-            .iter()
-            .all(|table| !table.live_return),
+        ls_scanned_b.tables.iter().all(|table| !table.live_return),
         "no live evidence was observed"
     );
-    let mut linkage_b: Vec<&str> = engine_b.plan().modules[0]
-        .tables
+    let ls_plan_b = engine_b
+        .plan()
+        .modules
         .iter()
-        .map(|table| table.linkage)
-        .collect();
+        .find(|module| module.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar");
+    let mut linkage_b: Vec<&str> = ls_plan_b.tables.iter().map(|table| table.linkage).collect();
     linkage_b.sort();
     assert_eq!(
         linkage_b,
@@ -2982,10 +3132,17 @@ fn legacy_static_table_scan_manifest_and_live() {
     assert_eq!(
         engine_b.plan().uncorroborated_candidates,
         0,
-        "manifest support bypasses K=4"
+        "the bound table plus four heuristic tables all admit"
     );
-    assert_eq!(engine_b.plan().slots.len(), 68);
-    for slot in &engine_b.plan().slots {
+    // 68 ls targets plus the sidecar's 68; only the ls slots carry
+    // manifest-authorized names.
+    assert_eq!(engine_b.plan().slots.len(), 68 + 68);
+    for slot in engine_b
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| slot.module_ids.contains(&ls_plan_b.id))
+    {
         assert_eq!(slot.names.len(), 1, "one ordinal label per target");
         assert_ne!(slot.names[0], "unknown", "manifest authorizes names");
     }
@@ -2997,8 +3154,13 @@ fn legacy_static_table_scan_manifest_and_live() {
     let hooks = HookRegistry::builtin();
     let session_c = drain_records(&mut engine_c, vec![gfl_record(holder.pid, &table0, &hooks)]);
     let wall = started.elapsed();
-    let at_published: Vec<&ScannedTable> = engine_c.modules[0]
-        .scanned
+    let ls_scanned_c = &engine_c
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned;
+    let at_published: Vec<&ScannedTable> = ls_scanned_c
         .tables
         .iter()
         .filter(|table| table.address == table0.addr)
@@ -3010,12 +3172,14 @@ fn legacy_static_table_scan_manifest_and_live() {
     );
     assert!(at_published[0].live_return);
     assert!(at_published[0].file_offset.is_some());
-    assert_eq!(engine_c.modules[0].scanned.tables.len(), 5);
-    let mut linkage_c: Vec<&str> = engine_c.plan().modules[0]
-        .tables
+    assert_eq!(ls_scanned_c.tables.len(), 5);
+    let ls_plan_c = engine_c
+        .plan()
+        .modules
         .iter()
-        .map(|table| table.linkage)
-        .collect();
+        .find(|module| module.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar");
+    let mut linkage_c: Vec<&str> = ls_plan_c.tables.iter().map(|table| table.linkage).collect();
     linkage_c.sort();
     assert_eq!(
         linkage_c,
@@ -3029,14 +3193,21 @@ fn legacy_static_table_scan_manifest_and_live() {
         "the published table bypasses; the rest stay heuristic"
     );
     assert_eq!(engine_c.plan().uncorroborated_candidates, 0);
-    assert_eq!(engine_c.plan().slots.len(), 68);
-    for slot in &engine_c.plan().slots {
+    // 68 ls targets plus the sidecar's 68; only the ls slots carry
+    // live-authorized names.
+    assert_eq!(engine_c.plan().slots.len(), 68 + 68);
+    for slot in engine_c
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| slot.module_ids.contains(&ls_plan_c.id))
+    {
         assert_eq!(slot.names.len(), 1);
         assert_ne!(slot.names[0], "unknown", "the live return authorizes names");
     }
     assert_eq!(
         engine_c.budget.table_candidates_count(),
-        5,
+        6,
         "the live lower deduplicates on the scan's file identity"
     );
     assert_eq!(
@@ -3213,12 +3384,14 @@ fn broad_stripped_build_adds_nothing_beyond_selected() {
     assert_costing(&broad, wall, "t11-broad-stripped");
 }
 
-/// Case 12 (Task 1.6): broad is fit-or-refuse-whole. Six validated
-/// heuristic tables exceed the selected profile's slot ceiling (100 targets
-/// each at 512, 400 each at 2112): selected admission takes the
-/// strongest-evidence prefix (4 tables) and spills 2; broad refuses the
+/// Case 12 (Task 1.6): broad is fit-or-refuse-whole. Four validated
+/// heuristic tables exceed the selected profile's slot ceiling (150 targets
+/// each at 512, 600 each at 2112): selected admission takes the
+/// strongest-evidence prefix (3 tables) and spills 1; broad refuses the
 /// module whole with zero spill — a prefix
 /// would break the dormant-activation promise without forcing PARTIAL.
+/// (Six tables would be a closure array, which selected admission also
+/// decides whole; four keep the heuristic prefix under test.)
 #[test]
 fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     use std::os::unix::fs::MetadataExt as _;
@@ -3233,15 +3406,15 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     };
     let object = PinnedObjectId(7);
     let per_table = if cfg!(feature = "wide-detailed-2112") {
-        400u32
+        600u32
     } else {
-        100u32
+        150u32
     };
     assert!(
-        4 * per_table <= p11scope_ebpf_common::MAX_SLOTS
-            && 6 * per_table > p11scope_ebpf_common::MAX_SLOTS
+        3 * per_table <= p11scope_ebpf_common::MAX_SLOTS
+            && 4 * per_table > p11scope_ebpf_common::MAX_SLOTS
     );
-    let tables: Vec<ScannedTable> = (0..6u32)
+    let tables: Vec<ScannedTable> = (0..4u32)
         .map(|table| ScannedTable {
             version: (3, 2),
             walk: "full",
@@ -3259,13 +3432,18 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             file_offset: Some(0x3000 + u64::from(table) * 0x400),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     let module = ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         scanned: ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: ProcessViewId(0),
             mount_namespace: namespace,
             key,
@@ -3276,23 +3454,27 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             interfaces: vec![],
         },
         object,
-        entry_objects: vec![vec![object; per_table as usize]; 6],
+        entry_objects: vec![vec![object; per_table as usize]; 4],
     };
     let mut selected_counters = DiscoveryCounters::default();
+    let mut tombstones = BTreeSet::new();
     let selected = build_current_plan(
         std::slice::from_ref(&module),
         &[],
+        &[],
         &PinnedObjects::empty(),
         &mut selected_counters,
+        &mut tombstones,
         &BTreeSet::new(),
         0,
         0,
         false,
         plan::AdmissionScope::Named,
+        false,
     )
     .expect("selected plan builds");
-    assert_eq!(selected.slots.len(), (4 * per_table) as usize);
-    assert_eq!(selected.uncorroborated_candidates, 2);
+    assert_eq!(selected.slots.len(), (3 * per_table) as usize);
+    assert_eq!(selected.uncorroborated_candidates, 1);
     assert!(selected.modules_skipped.is_empty());
 
     // Alone, the oversized module refuses everything: the plan fails
@@ -3301,13 +3483,16 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let error = build_current_plan(
         std::slice::from_ref(&module),
         &[],
+        &[],
         &PinnedObjects::empty(),
         &mut broad_counters,
+        &mut tombstones,
         &BTreeSet::new(),
         0,
         0,
         true,
         plan::AdmissionScope::Named,
+        false,
     )
     .expect_err("broad refuses the oversized module whole");
     let text = format!("{error:?}");
@@ -3322,9 +3507,13 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let small_object = PinnedObjectId(8);
     let small = ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         scanned: ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: ProcessViewId(0),
             mount_namespace: namespace,
             key,
@@ -3348,6 +3537,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
                 file_offset: Some(0x9000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         },
@@ -3358,13 +3548,16 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let mixed = build_current_plan(
         &[module, small],
         &[],
+        &[],
         &PinnedObjects::empty(),
         &mut mixed_counters,
+        &mut tombstones,
         &BTreeSet::new(),
         0,
         0,
         true,
         plan::AdmissionScope::Named,
+        false,
     )
     .expect("broad plan builds around the refusal");
     assert_eq!(mixed.slots.len(), 10);
@@ -3378,9 +3571,11 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
 /// descendant (python3 + ctypes, no calls) and prints selected-vs-broad
 /// admission for the report. Run filtered, alone in the process:
 /// `cargo test -p p11scope --lib broad_p11kit -- --ignored --nocapture`.
-/// Asserts only host-robust invariants (broad never spills; a total
-/// refusal carries the whole-module shape); the exact printed numbers
-/// are recorded by hand into the Task 1.6 report.
+/// Asserts only host-robust invariants: selected refuses the lone
+/// dormant proxy whole as awaiting publication (no slots, every table
+/// spilled, one closure-awaiting-publication skip), broad never spills,
+/// and a total refusal carries the whole-module shape. The exact printed
+/// numbers are recorded by hand into the Task 1.6 report.
 #[test]
 #[ignore = "manual: needs host libp11-kit + python3; run filtered with --ignored --nocapture"]
 fn broad_p11kit_admission_arithmetic() {
@@ -3394,6 +3589,7 @@ fn broad_p11kit_admission_arithmetic() {
         )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("python3 holds libp11-kit");
     let mut ready = String::new();
@@ -3419,9 +3615,31 @@ fn broad_p11kit_admission_arithmetic() {
         selected.plan().uncorroborated_candidates,
         selected.plan().modules_skipped.len(),
     );
+    // Closure era (PA-9/C1): a lone dormant proxy takes no prefix — the
+    // capture's first plan holds no provider beside it, nothing is
+    // published yet, so selected refuses it whole as awaiting publication.
     assert!(
-        !selected.plan().slots.is_empty(),
-        "selected admits something on a real provider"
+        selected.plan().slots.is_empty(),
+        "a lone dormant proxy takes no prefix without a provider beside it"
+    );
+    assert!(
+        selected_tables > 0,
+        "the scan really saw the proxy's lookalike tables"
+    );
+    assert_eq!(
+        selected.plan().uncorroborated_candidates,
+        selected_tables as u64,
+        "every lookalike table spills while unpublished"
+    );
+    assert_eq!(
+        selected.plan().modules_skipped.len(),
+        1,
+        "the lone proxy is the only refusal"
+    );
+    assert!(
+        plan::is_closure_awaiting_publication(&selected.plan().modules_skipped[0].reason),
+        "the lone-proxy refusal carries the awaiting-publication shape: {}",
+        selected.plan().modules_skipped[0].reason,
     );
 
     let mut broad = scan_engine_over_pids(std::slice::from_ref(&pid), true);
@@ -3831,11 +4049,16 @@ fn f_e08_version_shape_matrix() {
         stage.free(idx);
     }
 
-    // Walked shapes: GI and element admit the identical walked set.
+    // The acquired known extent is complete independently of its metadata label.
     for (major, minor, version_class, walked) in [
         (3u8, 2u8, DISCOVERY_VERSION_V3_2, 104usize),
         (3, 1, DISCOVERY_VERSION_V3_1, 92),
         (3, 0, DISCOVERY_VERSION_V3_0, 92),
+        (2, 39, DISCOVERY_VERSION_OTHER, 68),
+        (2, 41, DISCOVERY_VERSION_OTHER, 68),
+        (3, 3, DISCOVERY_VERSION_OTHER, 104),
+        (4, 0, DISCOVERY_VERSION_OTHER, 68),
+        (7, 231, DISCOVERY_VERSION_OTHER, 68),
     ] {
         stage.set_version(17, major, minor);
         let publish = stage.publish();
@@ -3891,126 +4114,6 @@ fn f_e08_version_shape_matrix() {
             );
         }
         assert_count_only(&gi_engine);
-    }
-
-    // Non-listed minors: both routes admit the same known prefix with
-    // the explicit known-prefix marker — the shared export contract for
-    // shapes past the fully known list (owner-approved 2026-09-27: the
-    // live-export path follows the helper's versioning rule, so `{2,41}`
-    // and `{3,3}` prefix instead of refusing).
-    for (major, minor, walked) in [(2u8, 39u8, 68usize), (2, 41, 68), (3, 3, 104)] {
-        stage.set_version(17, major, minor);
-        let publish = stage.publish();
-        let heap17 = publish
-            .elements
-            .iter()
-            .find(|table| table.index == 17)
-            .expect("heap 17 published")
-            .clone();
-        assert_eq!((heap17.major, heap17.minor), (major, minor));
-        let iface = stage.gi(Some("P11Scope-MW-17"), None);
-        assert_eq!(iface.rv, 0);
-        let mut element_engine = engine_over_pids(&[stage.pid]);
-        drain_records(
-            &mut element_engine,
-            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
-        );
-        let mut gi_engine = engine_over_pids(&[stage.pid]);
-        let view = gi_engine.views[0].id();
-        let object = gi_provider_object(&gi_engine);
-        let binding = gi_binding(&mut gi_engine, view, object);
-        drain_records(
-            &mut gi_engine,
-            vec![gi_record(
-                stage.pid,
-                binding.id,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
-                iface.table,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
-            )],
-        );
-        assert_eq!(
-            slot_targets(&gi_engine),
-            slot_targets(&element_engine),
-            "{{{major},{minor}}}: identical known-prefix endpoint sets"
-        );
-        for (label, engine) in [("element", &element_engine), ("gi", &gi_engine)] {
-            let tables: Vec<_> = engine
-                .modules
-                .iter()
-                .flat_map(|module| &module.scanned.tables)
-                .filter(|table| table.address == heap17.addr)
-                .collect();
-            assert_eq!(tables.len(), 1, "{label} {{{major},{minor}}}: one instance");
-            assert_eq!(tables[0].version, (major, minor));
-            assert_eq!(tables[0].walk, "known_prefix", "{label}: explicit bound");
-            assert_eq!(
-                tables[0].entries.len(),
-                walked,
-                "{label} {{{major},{minor}}}: the walked prefix only"
-            );
-        }
-    }
-
-    // Unwalkable shapes: both routes refuse with the explicit decode
-    // omission and admit nothing beyond the scan baseline. Only the new
-    // major refuses now (owner-approved 2026-09-27).
-    {
-        let (major, minor) = (4u8, 0u8);
-        stage.set_version(17, major, minor);
-        let publish = stage.publish();
-        let heap17 = publish
-            .elements
-            .iter()
-            .find(|table| table.index == 17)
-            .expect("heap 17 published")
-            .clone();
-        assert_eq!((heap17.major, heap17.minor), (major, minor));
-        let iface = stage.gi(Some("P11Scope-MW-17"), None);
-        assert_eq!(iface.rv, 0, "the factory still returns the table");
-
-        let mut element_engine = engine_over_pids(&[stage.pid]);
-        let element_baseline = slot_targets(&element_engine);
-        drain_records(
-            &mut element_engine,
-            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
-        );
-        let mut gi_engine = engine_over_pids(&[stage.pid]);
-        let gi_baseline = slot_targets(&gi_engine);
-        let view = gi_engine.views[0].id();
-        let object = gi_provider_object(&gi_engine);
-        let binding = gi_binding(&mut gi_engine, view, object);
-        drain_records(
-            &mut gi_engine,
-            vec![gi_record(
-                stage.pid,
-                binding.id,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
-                iface.table,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
-            )],
-        );
-        assert_eq!(
-            slot_targets(&element_engine),
-            element_baseline,
-            "{{{major},{minor}}}: element admits nothing"
-        );
-        assert_eq!(
-            slot_targets(&gi_engine),
-            gi_baseline,
-            "{{{major},{minor}}}: GI admits nothing"
-        );
-        let omission = "a published table's bytes did not decode as a function table";
-        assert!(
-            skip_reasons(&element_engine)
-                .contains(&("live export discovery".to_string(), omission.to_string())),
-            "{{{major},{minor}}}: element carries the explicit omission"
-        );
-        assert!(
-            skip_reasons(&gi_engine)
-                .contains(&("live interface selection".to_string(), omission.to_string())),
-            "{{{major},{minor}}}: GI carries the same explicit omission"
-        );
     }
 }
 
@@ -4109,7 +4212,7 @@ fn f_e13_first_call_gap_and_precapture_boundary() {
 /// poisoned table admits nothing, not even a prefix. A NULL hole is the
 /// control: holes admit identically on both routes.
 #[test]
-fn f_e15_malicious_entries_refused_equally() {
+fn f_e15_partial_tables_retain_valid_targets() {
     let build = pub_build();
     let hooks = HookRegistry::builtin();
     // Modes: 1 unmapped, 2 file-backed provider data, 3 heap data.
@@ -4117,8 +4220,8 @@ fn f_e15_malicious_entries_refused_equally() {
         let dir = pub_tmp(&format!("f18-poison-{mode}"));
         let _ = &dir;
         let mut stage = StageChild::spawn(&build.workload, &build.provider);
-        // Index 17 sits beyond the template window: no sweep aliasing
-        // can admit its healthy ordinals, so refusal is total.
+        // Index 17 sits beyond the template window: the live result,
+        // rather than sweep aliasing, must admit its healthy ordinals.
         for want in 0..18 {
             let (idx, _) = stage.alloc(0, -1);
             assert_eq!(idx, want);
@@ -4159,37 +4262,43 @@ fn f_e15_malicious_entries_refused_equally() {
                 (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
             )],
         );
-        assert_eq!(
-            slot_targets(&element_engine),
-            element_baseline,
-            "mode {mode}: element admits nothing"
-        );
-        assert_eq!(
-            slot_targets(&gi_engine),
-            gi_baseline,
-            "mode {mode}: GI admits nothing"
-        );
-        // Whole-table refusal: even the healthy ordinals admit nothing.
-        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[0].0);
+        let valid: std::collections::BTreeSet<_> = heap17
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, _)| *ordinal != 5)
+            .map(|(_, (target, _))| {
+                let (path, offset, _) = MapLite::file_target(&maps, *target);
+                (path, offset)
+            })
+            .collect();
         assert!(
-            !slot_targets(&gi_engine).contains(&(path.clone(), offset)),
-            "mode {mode}: no prefix admission from a poisoned table"
+            valid
+                .iter()
+                .any(|target| !element_baseline.contains(target))
         );
-        assert!(
-            !slot_targets(&element_engine).contains(&(path, offset)),
-            "mode {mode}: no prefix admission from a poisoned table"
-        );
-        let omission = "a published table's bytes did not decode as a function table";
-        assert!(
-            skip_reasons(&element_engine)
-                .contains(&("live export discovery".to_string(), omission.to_string())),
-            "mode {mode}: element carries the explicit omission"
-        );
-        assert!(
-            skip_reasons(&gi_engine)
-                .contains(&("live interface selection".to_string(), omission.to_string())),
-            "mode {mode}: GI carries the same explicit omission"
-        );
+        assert!(valid.iter().any(|target| !gi_baseline.contains(target)));
+        for (label, engine) in [("element", &element_engine), ("GI", &gi_engine)] {
+            assert!(
+                valid.is_subset(&slot_targets(engine)),
+                "mode {mode}: {label} retains every independently valid target; version={}.{} physical={} slots={} missing={} reasons={:?}",
+                heap17.major,
+                heap17.minor,
+                heap17.entries.len(),
+                slot_targets(engine).len(),
+                valid.difference(&slot_targets(engine)).count(),
+                skip_reasons(engine),
+            );
+            let table = engine
+                .modules
+                .iter()
+                .flat_map(|module| &module.scanned.tables)
+                .find(|table| table.address == heap17.addr)
+                .expect("the partial acquired table remains visible");
+            assert_eq!(table.entries.len(), heap17.entries.len() - 1);
+            assert_eq!(table.unpinned.len(), 1);
+            assert_eq!(table.walk, "known_prefix");
+        }
     }
 
     // Control: a NULL hole is not poison — both routes admit the table
@@ -4249,10 +4358,10 @@ fn f_e15_malicious_entries_refused_equally() {
 }
 
 /// Case 19 (Package F, E15): a forged exact-standard name class on a
-/// `C_GetInterface` result changes nothing about authority. Admission
-/// still rests on byte validation alone, slot names still come from the
-/// ordinal catalog (never the record), and no selection claim authorizes
-/// a heap table. SYNTHETIC record: no fixture interface is exact-named.
+/// `C_GetInterface` result supplies no semantic or selection authority.
+/// Admission still rests on byte validation and names come from the catalog.
+/// No selection claim authorizes a heap table. SYNTHETIC record: no fixture
+/// interface is exact-named.
 #[test]
 fn f_e15_forged_exact_name_stays_count_only() {
     let build = pub_build();
@@ -4296,18 +4405,29 @@ fn f_e15_forged_exact_name_stays_count_only() {
             0,
         )],
     );
-    // The bytes validate, so the endpoints admit — exactly as the
-    // element route admits them. The name class grants nothing extra.
+    // Both sources admit the same verified endpoints. The synthetic standard
+    // class can supply ordinary catalog names, while opaque names stay unknown;
+    // neither source gains semantic or selection authority from that class.
     assert_eq!(
         slot_targets(&gi_engine),
         slot_targets(&element_engine),
-        "forged exact name: identical endpoint sets"
+        "forged exact name: identical endpoint sets",
     );
-    assert_eq!(
-        actual_slot_names(&gi_engine),
-        actual_slot_names(&element_engine),
-        "slot names come from the ordinal catalog, never the record"
-    );
+    for ordinal in EX_ORDS {
+        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[ordinal as usize].0);
+        assert_eq!(
+            actual_slot_names(&gi_engine)[&(path.clone(), offset)],
+            vec![
+                pkcs11_module::function_name(ordinal as usize)
+                    .unwrap()
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            actual_slot_names(&element_engine)[&(path, offset)],
+            vec!["unknown".to_string()]
+        );
+    }
     assert_instance_entries(&gi_engine, &maps, &heap17, true);
     // ... and no selection claim authorizes the heap table either: the
     // same-object authority guard holds against the forged class.
@@ -4323,6 +4443,90 @@ fn f_e15_forged_exact_name_stays_count_only() {
         "the forged class authorizes no count-only claim"
     );
     assert_count_only(&gi_engine);
+}
+
+/// True when `needle` occurs in `haystack` bounded on both sides by a
+/// character outside `alphabet` or by the string edge.
+fn contains_token(haystack: &str, needle: &str, alphabet: impl Fn(char) -> bool) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !alphabet(c));
+        let after_ok = haystack[start + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !alphabet(c));
+        before_ok && after_ok
+    })
+}
+
+/// True when `addr` leaks into `haystack`: its hex or decimal rendering
+/// appears as a standalone token. Hex is bounded by non-hexdigits, so a
+/// short canary inside a longer hex run (a digest, another address) is
+/// not mistaken for a leak; decimal is bounded by non-alphanumerics, so
+/// it also stays quiet inside identifiers. A genuinely printed address —
+/// always standalone in structured output — still matches.
+/// Length-agnostic: short fixture addresses stay unambiguous without a
+/// length floor.
+fn canary_address_leaked(haystack: &str, addr: u64) -> bool {
+    let hex = format!("{addr:x}");
+    let dec = format!("{addr}");
+    contains_token(haystack, &hex, |c: char| c.is_ascii_hexdigit())
+        || contains_token(haystack, &dec, |c: char| c.is_ascii_alphanumeric())
+}
+
+#[test]
+fn canary_matcher_ignores_substrings_and_catches_standalone_leaks() {
+    // A short Fedora-style canary (7 hex digits) inside longer runs is
+    // not a leak ...
+    let short = 0x1234567u64;
+    let haystack = "digest 0001234567ff count 12345670 offset 0x12345678";
+    assert!(
+        !canary_address_leaked(haystack, short),
+        "a short canary inside longer runs stays quiet"
+    );
+    // ... but standalone in either rendering is.
+    assert!(canary_address_leaked(
+        &format!("table {short:x} end"),
+        short
+    ));
+    assert!(canary_address_leaked(&format!("table {short} end"), short));
+    assert!(canary_address_leaked(&format!("\"table\":{short}"), short));
+    assert!(canary_address_leaked(&format!("0x{short:x}"), short));
+}
+
+#[test]
+fn canary_matcher_stays_quiet_on_realistic_output_with_short_addresses() {
+    // Forced short addresses (Fedora prints fewer than 8 hex digits):
+    // realistic selection/slot output without a leak stays clean, and
+    // an injected leak in either rendering is caught.
+    let addrs = [0x1234567u64, 0xabcdefu64, 0x10000u64];
+    let selection = r#"{"providers":[{"coverage":"observed","count":17}],"tuples":[{"rv":0,"count":2}],"selection_truncated":false}"#;
+    let slots = r#"[Slot { index: 17, descriptor_index: 0, object: PinnedObjectId(3), object_path: "/owned-provider.so", file_offset: 128 }]"#;
+    for addr in addrs {
+        assert!(
+            !canary_address_leaked(selection, addr),
+            "selection clean for {addr:x}"
+        );
+        assert!(
+            !canary_address_leaked(slots, addr),
+            "slots clean for {addr:x}"
+        );
+        let hex_leak = format!(r#"{{"table":"{addr:x}"}}"#);
+        assert!(
+            canary_address_leaked(&hex_leak, addr),
+            "hex leak caught for {addr:x}"
+        );
+        let dec_leak = format!(r#"{{"table":{addr}}}"#);
+        assert!(
+            canary_address_leaked(&dec_leak, addr),
+            "decimal leak caught for {addr}"
+        );
+    }
 }
 
 /// Case 20 (Package F, E21): nothing a `C_GetInterface` publication
@@ -4375,33 +4579,172 @@ fn f_e21_gi_public_output_carries_no_raw_pointers() {
         slot_targets(&gi_engine).contains(&(path, offset)),
         "GI publication admits before privacy is assessed"
     );
-    let heap_hex = format!("{:x}", heap17.addr);
-    assert!(
-        heap_hex.len() >= 8,
-        "the canary address is long enough to be unambiguous"
-    );
     let selection_json =
         serde_json::to_string(&gi_engine.interface_selection()).expect("selection serializes");
     assert!(
-        !selection_json.contains(&heap_hex),
+        !canary_address_leaked(&selection_json, heap17.addr),
         "the selection projection carries no table address"
     );
     let slots_debug = format!("{:?}", gi_engine.plan().slots);
     assert!(
-        !slots_debug.contains(&heap_hex),
+        !canary_address_leaked(&slots_debug, heap17.addr),
         "the slot inventory carries no table address"
     );
     // Entry pointers stay private too: every printed entry address is
     // absent from both public surfaces.
     for (addr, _) in heap17.entries.iter().take(8) {
-        let entry_hex = format!("{addr:x}");
         assert!(
-            !selection_json.contains(&entry_hex),
-            "entry {entry_hex} stays out of the selection projection"
+            !canary_address_leaked(&selection_json, *addr),
+            "entry {addr:x} stays out of the selection projection"
         );
         assert!(
-            !slots_debug.contains(&entry_hex),
-            "entry {entry_hex} stays out of the slot inventory"
+            !canary_address_leaked(&slots_debug, *addr),
+            "entry {addr:x} stays out of the slot inventory"
         );
     }
+}
+
+#[test]
+fn ambiguous_factory_ownership_keeps_verified_code_targets_count_only() {
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-compatibility.c");
+    let libraries: Vec<_> = ["first.so", "second.so"]
+        .iter()
+        .map(|name| {
+            let library = dir.path().join(name);
+            assert!(
+                Command::new("cc")
+                    .args([
+                        "-shared",
+                        "-fPIC",
+                        "-std=c11",
+                        "-O0",
+                        "-DCOMPAT_EMPTY_FACTORY"
+                    ])
+                    .arg(&fixture)
+                    .arg("-o")
+                    .arg(&library)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            library
+        })
+        .collect();
+    let source = dir.path().join("loader.c");
+    std::fs::write(
+        &source,
+        r#"
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    void *a = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    void *b = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    if (!a || !b) return 1;
+    uint64_t *words = calloc(69, sizeof(uint64_t));
+    if (!words) return 2;
+    words[0] = 0x2802;
+    words[1] = (uintptr_t)dlsym(a, "C_Initialize");
+    words[68] = (uintptr_t)dlsym(b, "C_WaitForSlotEvent");
+    void (*set)(void *) = dlsym(a, "compatibility_set_table");
+    unsigned long (*get)(void **) = dlsym(a, "C_GetFunctionList");
+    if (!set || !get || !words[1] || !words[68]) return 3;
+    set(words);
+    void *table = 0;
+    if (get(&table) || table != words) return 4;
+    printf("%p %p %p\n", table, (void *)words[1], (void *)words[68]);
+    fflush(stdout);
+    char byte;
+    (void)read(STDIN_FILENO, &byte, 1);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .args(&libraries)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let values: Vec<_> = line.split_whitespace().map(parse_hex_addr).collect();
+    assert_eq!(values.len(), 3);
+    let pid = child.0.id();
+    let maps = MapLite::snapshot(pid);
+    let mut table = TablePrint {
+        index: 0,
+        addr: values[0],
+        major: 2,
+        minor: 40,
+        nentry: 68,
+        entries: vec![(0, String::new()); 68],
+    };
+    table.entries[0].0 = values[1];
+    table.entries[67].0 = values[2];
+    let mut engine = engine_over_pids(&[pid]);
+    let expected: std::collections::BTreeSet<_> = values[1..]
+        .iter()
+        .map(|address| {
+            let (path, offset, _) = MapLite::file_target(&maps, *address);
+            (path, offset)
+        })
+        .collect();
+    assert_eq!(expected.len(), 2, "two real target-code objects");
+    drain_records(
+        &mut engine,
+        vec![gfl_record(pid, &table, &HookRegistry::builtin())],
+    );
+    assert!(expected.is_subset(&slot_targets(&engine)));
+    assert_count_only(&engine);
+    for slot in &engine.plan().slots {
+        assert!(
+            slot.names.iter().all(|name| name == "unknown"),
+            "uncertain provider/API names stay unknown"
+        );
+    }
+    let observations: Vec<_> = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .filter(|observed| observed.address == values[0])
+        .collect();
+    assert_eq!(observations.len(), 2);
+    assert!(observations.iter().all(|observed| !observed.live_return
+        && !observed.manifest_supported
+        && observed.file_offset.is_none()));
+    assert!(
+        skip_reasons(&engine)
+            .iter()
+            .any(|(_, reason)| reason.contains("uncertain provider ownership"))
+    );
 }

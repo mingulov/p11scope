@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 static CC_LOCK: Mutex<()> = Mutex::new(());
 static DISCOVER_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -27,13 +31,6 @@ fn tmpdir(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
-}
-
-fn self_binary_budget() -> CaptureWorkBudget {
-    CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: u64::MAX,
-        total_bytes: u64::MAX,
-    })
 }
 
 /// Build a .so with a caller-chosen build-id so two builds differ.
@@ -102,6 +99,9 @@ fn discover_fixture(mode: &str) -> PathBuf {
         "short-table" => {
             provider_command.arg("-DSHORT_TABLE_FIXTURE=1");
         }
+        "interface-only" => {
+            provider_command.arg("-DINTERFACE_ONLY_FIXTURE=1");
+        }
         "normal" => {}
         other => panic!("unknown fixture mode {other}"),
     }
@@ -113,6 +113,313 @@ fn discover_fixture(mode: &str) -> PathBuf {
             .success()
     );
     provider
+}
+
+fn compatibility_fixture(name: &str, defines: &[String]) -> PathBuf {
+    let _guard = CC_LOCK.lock().unwrap();
+    let dir = tmpdir("manifest-compatibility");
+    let provider = dir.join(format!("{name}.so"));
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("crates/discover/tests/fixture/version_matrix.c")
+            )
+            .args(defines)
+            .status()
+            .unwrap()
+            .success()
+    );
+    provider
+}
+
+#[test]
+fn provider_compatibility_prefixes_validate_and_plan_without_invented_nulls() {
+    for (major, minor, words, populated) in [
+        (2, 0, 68, 67),
+        (3, 0, 68, 67),
+        (3, 1, 68, 67),
+        (3, 2, 68, 67),
+        (4, 19, 68, 27),
+        (0, 255, 68, -1),
+        (2, 0, 67, 0),
+        (3, 2, 3, 0),
+        (3, 2, 0, -1),
+    ] {
+        let name = format!("legacy-{major}-{minor}-{words}-{populated}");
+        let provider = compatibility_fixture(
+            &name,
+            &[
+                format!("-DLEGACY_MAJOR={major}"),
+                format!("-DLEGACY_MINOR={minor}"),
+                format!("-DMAPPED_LEGACY_WORDS={words}"),
+                format!("-DSPARSE_LEGACY={populated}"),
+                "-DMATRIX_INTERFACES=0".into(),
+                "-DLEGACY_PADDING=1".into(),
+            ],
+        );
+        let manifest = discover_provider(&provider).unwrap();
+        let surface = &manifest.surfaces[0];
+        assert_eq!(surface.functions.len(), words, "{name}");
+        assert_eq!(surface.version, Some(Version { major, minor }));
+        let partial = words < 68;
+        assert_eq!(
+            matches!(surface.walk, WalkOutcome::Unreadable { .. }),
+            partial,
+            "{name}"
+        );
+        let problems = p11scope::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{name}: {problems:?}");
+        let pins = p11scope::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        let plan = p11scope::plan::build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        assert_eq!(plan.entries_seen, words, "{name}");
+        assert_eq!(plan.slots.len(), usize::from(populated >= 0), "{name}");
+        assert_eq!(plan.skipped.len(), words - plan.slots.len(), "{name}");
+        if let Some(slot) = plan.slots.first() {
+            assert!(
+                slot.semantic_authorized,
+                "{name}: a validated manifest keeps per-function authority"
+            );
+            assert_eq!(
+                slot.names,
+                [if populated == 67 {
+                    "C_WaitForSlotEvent"
+                } else if populated == 27 {
+                    "C_FindObjects"
+                } else {
+                    "C_Initialize"
+                }],
+                "{name}"
+            );
+        }
+        if partial {
+            assert!(plan.surfaces[0].walk.starts_with("unreadable:"), "{name}");
+            assert!(
+                manifest.selection_evidence.queries.iter().all(|query| query
+                    .inventory_matches
+                    .iter()
+                    .all(|found| found.surface != 0)),
+                "{name}: incomplete table cannot grant inventory selection"
+            );
+        }
+    }
+
+    for ((major, minor, bound), words) in [
+        (2, 40, 68),
+        (3, 0, 92),
+        (3, 1, 92),
+        (3, 2, 104),
+        (4, 19, 68),
+    ]
+    .into_iter()
+    .flat_map(|case| [68, 92, 104].map(|words| (case, words)))
+    {
+        let name = format!("interface-{major}-{minor}-with-{words}");
+        let provider = compatibility_fixture(
+            &name,
+            &[
+                format!("-DINTERFACE_MAJOR={major}"),
+                format!("-DINTERFACE_MINOR={minor}"),
+                format!("-DMAPPED_V32_WORDS={words}"),
+                "-DSINGLE_INTERFACE=1".into(),
+                "-DSPARSE_LEGACY=-1".into(),
+            ],
+        );
+        let manifest = discover_provider(&provider).unwrap();
+        let problems = p11scope::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{name}: {problems:?}");
+        // Only this interface has targets; the complete all-NULL legacy table
+        // cannot hide loss of the interface's observed entries.
+        let pins = p11scope::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        let plan = p11scope::plan::build_from_sources(&[], &[manifest], &pins);
+        assert_eq!(plan.entries_seen, 68 + words.min(bound), "{name}");
+        assert_eq!(plan.slots.len(), words.min(bound), "{name}");
+        assert_eq!(
+            plan.surfaces[1].walk.starts_with("unreadable:"),
+            words < bound,
+            "{name}"
+        );
+        if words.min(bound) >= 92 {
+            assert!(
+                plan.slots
+                    .iter()
+                    .any(|slot| slot.names == ["C_MessageVerifyFinal"]),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unfamiliar_versions_preserve_legacy_and_interface_inventory_without_selection_claims() {
+    let provider = compatibility_fixture(
+        "unfamiliar-version",
+        &[
+            "-DLEGACY_MAJOR=4".into(),
+            "-DLEGACY_MINOR=19".into(),
+            "-DINTERFACE_MAJOR=4".into(),
+            "-DINTERFACE_MINOR=19".into(),
+            "-DMAPPED_LEGACY_WORDS=68".into(),
+            "-DMAPPED_V32_WORDS=68".into(),
+        ],
+    );
+    let manifest = discover_provider(&provider).unwrap();
+    let problems = p11scope::manifest_input::validate_structure(&manifest);
+    assert!(problems.is_empty(), "{problems:?}");
+    for surface_index in [0, 4] {
+        let surface = &manifest.surfaces[surface_index];
+        assert_eq!(
+            surface.version,
+            Some(Version {
+                major: 4,
+                minor: 19
+            })
+        );
+        assert_eq!(surface.functions.len(), 68);
+        assert!(matches!(surface.walk, WalkOutcome::KnownPrefix));
+        assert!(manifest.selection_evidence.queries.iter().all(|query| {
+            query
+                .inventory_matches
+                .iter()
+                .all(|found| found.surface != surface_index)
+        }));
+        let mut forged = manifest.clone();
+        let query = &mut forged.selection_evidence.queries[0];
+        query.rv = 0;
+        query.result = Some(SelectionResult {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::Other,
+            flags: 0,
+        });
+        query.inventory_matches = vec![SelectionInventoryMatch {
+            surface: surface_index,
+            name_agrees: surface_index == 4,
+            version_agrees: true,
+        }];
+        query.selection_table = None;
+        query.authority = SelectionAuthority::Inventory;
+        query.helper_failure = None;
+        assert!(
+            p11scope::manifest_input::validate_structure(&forged)
+                .iter()
+                .any(|problem| problem.contains("unavailable inventory surface")),
+            "unknown metadata cannot create stronger selection authority"
+        );
+    }
+}
+
+#[test]
+fn unreadable_manifest_prefix_requires_canonical_order_without_selection_authority() {
+    let path = Path::new("/bin/true");
+    let mut manifest = manifest_for(path);
+    manifest.surfaces[0] = SurfaceRecord {
+        source: SurfaceSource::LegacyFunctionList,
+        acquisition: Acquisition::Ok,
+        version: Some(Version { major: 3, minor: 2 }),
+        walk: WalkOutcome::Unreadable {
+            detail: "slot 3 is unavailable".into(),
+        },
+        functions: vec![
+            FunctionRecord {
+                name: "C_Initialize".into(),
+                resolution: Resolution::NullPointer,
+            },
+            FunctionRecord {
+                name: "C_Finalize".into(),
+                resolution: Resolution::NullPointer,
+            },
+            FunctionRecord {
+                name: "C_GetInfo".into(),
+                resolution: Resolution::Resolved {
+                    object: 0,
+                    file_offset: first_executable_offset(path),
+                },
+            },
+        ],
+    };
+    let problems = p11scope::manifest_input::validate_structure(&manifest);
+    assert!(
+        problems.is_empty(),
+        "canonical unreadable prefix: {problems:?}"
+    );
+    assert!(p11scope::discovery::identity::pin_manifest_objects(&manifest).is_ok());
+    for mutation in [
+        "reorder",
+        "unknown",
+        "full-prefix",
+        "empty-detail",
+        "missing-object",
+        "non-ok",
+        "selection",
+    ] {
+        let mut changed = manifest.clone();
+        match mutation {
+            "reorder" => changed.surfaces[0].functions.swap(0, 1),
+            "unknown" => changed.surfaces[0].functions[1].name = "C_Unknown".into(),
+            "full-prefix" => {
+                changed.surfaces[0].functions = pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .map(|field| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: Resolution::NullPointer,
+                    })
+                    .collect()
+            }
+            "empty-detail" => {
+                changed.surfaces[0].walk = WalkOutcome::Unreadable {
+                    detail: String::new(),
+                }
+            }
+            "missing-object" => {
+                changed.surfaces[0].functions[2].resolution = Resolution::Resolved {
+                    object: 99,
+                    file_offset: 0,
+                }
+            }
+            "non-ok" => changed.surfaces[0].acquisition = Acquisition::Absent,
+            "selection" => {
+                changed.selection_evidence = queried_selection_matrix();
+                let query = &mut changed.selection_evidence.queries[8];
+                query.rv = 0;
+                query.result = Some(SelectionResult {
+                    name: SelectionNameClass::ExactStandard,
+                    version: SelectionVersionClass::V3_2,
+                    flags: 0,
+                });
+                query.inventory_matches = vec![SelectionInventoryMatch {
+                    surface: 0,
+                    name_agrees: false,
+                    version_agrees: true,
+                }];
+                query.authority = SelectionAuthority::Inventory;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !p11scope::manifest_input::validate_structure(&changed).is_empty(),
+            "{mutation} unexpectedly accepted"
+        );
+    }
+    for missing_metadata in [false, true] {
+        let mut prefix = manifest.clone();
+        if missing_metadata {
+            prefix.surfaces[0].version = None;
+        } else {
+            prefix.surfaces[0].walk = WalkOutcome::KnownPrefix;
+        }
+        assert!(p11scope::manifest_input::validate_structure(&prefix).is_empty());
+        let pins = p11scope::discovery::identity::pin_manifest_objects(&prefix).unwrap();
+        let plan = p11scope::plan::build_from_sources(&[], &[prefix], &pins);
+        assert_eq!(plan.entries_seen, 3);
+        assert_eq!(plan.slots.len(), 1);
+        assert_ne!(plan.surfaces[0].walk, "full");
+    }
+    let mut changed_hash = manifest.clone();
+    changed_hash.objects[0].identity.sha256 = Some("00".repeat(32));
+    changed_hash.provenance_objects[0].identity.sha256 = Some("00".repeat(32));
+    assert!(p11scope::discovery::identity::pin_manifest_objects(&changed_hash).is_err());
 }
 
 fn manifest_for(path: &Path) -> Manifest {
@@ -229,6 +536,7 @@ fn emitted_selection_fixtures_validate_as_v5_manifests() {
         "unknown-flags",
         "outside",
         "short-table",
+        "interface-only",
     ] {
         let provider = discover_fixture(mode);
         let manifest = discover_provider(&provider).unwrap();
@@ -483,13 +791,12 @@ fn selection_validation_rejects_review_mutations() {
     assert!(
         problems
             .iter()
-            .any(|problem| problem.contains("unsupported version"))
+            .any(|problem| problem.contains("no acquired function inventory"))
     );
-    assert!(problems.iter().any(|problem| problem.contains("full walk")));
     assert!(
         problems
             .iter()
-            .any(|problem| problem.contains("dependency object"))
+            .any(|problem| problem.contains("missing object"))
     );
     assert!(
         problems
@@ -672,6 +979,8 @@ fn helper_failure_cross_fields_are_exact() {
             (!matches!(
                 version,
                 SelectionVersionClass::Null
+                    | SelectionVersionClass::V2_40
+                    | SelectionVersionClass::Other
                     | SelectionVersionClass::V3_0
                     | SelectionVersionClass::V3_1
                     | SelectionVersionClass::V3_2
@@ -687,9 +996,7 @@ fn helper_failure_cross_fields_are_exact() {
         check(failure, null, none, None, None);
     }
     for failure in [
-        SelectionFailure::UnreadableTable,
         SelectionFailure::OutsideProvider,
-        SelectionFailure::UnresolvedFunction,
         SelectionFailure::ProviderChanged,
     ] {
         check(
@@ -698,6 +1005,18 @@ fn helper_failure_cross_fields_are_exact() {
             none,
             Some(0),
             Some("helper failure has a selection table"),
+        );
+    }
+    for failure in [
+        SelectionFailure::UnreadableTable,
+        SelectionFailure::UnresolvedFunction,
+    ] {
+        check(
+            failure,
+            null,
+            none,
+            Some(0),
+            Some("invalid selection-table authority"),
         );
     }
     for (failure, valid_result) in [
@@ -805,21 +1124,40 @@ fn scan_and_manifest_pins_merge_into_one_set() {
     let manifest_pins =
         p11scope::discovery::identity::pin_manifest_objects(&manifest_for(&so)).unwrap();
 
-    let (exe, modules) = scan_self();
-    let (mut pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
+    let child = ScannedChild::new("manifest_pinning_absorb_scan", None);
+    let exe = &child.exe;
+    let modules = child.scan();
+    let (mut pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        child.pid(),
         &modules,
-        &mut self_binary_budget(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
-    pinned.absorb(manifest_pins);
+    assert!(
+        skipped.is_empty(),
+        "scan pins refused before merge: {skipped:?}"
+    );
+    let scanned_id = pinned
+        .pinned()
+        .find(|pin| pin.path == exe.display().to_string())
+        .expect("the scanned object must be pinned before the merge")
+        .id;
+    let scanned_attach = pinned.attach_path_for(scanned_id).unwrap();
+    let merge_skips = pinned.absorb(manifest_pins);
+    assert!(
+        merge_skips.is_empty(),
+        "merge refused pins: {merge_skips:?}"
+    );
 
     assert!(
         pinned.pinned().any(|s| s.path == exe.display().to_string()),
         "the scanned object survives the merge"
     );
+    assert_eq!(pinned.attach_path_for(scanned_id).unwrap(), scanned_attach);
+    assert_eq!(pinned.pinned().count(), 2);
     let key = manifest_key(&so);
     let id = pinned.pinned().find(|pin| pin.key == key).unwrap().id;
+    assert_ne!(id, scanned_id, "the manifest receives a distinct local ID");
     let attach = pinned
         .attach_path_for(id)
         .expect("the manifest's object still resolves after the merge");
@@ -841,8 +1179,10 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
     let target_b = cc_so(&d, "target_b", "int target_b(void){return 3;}\n");
     let namespace = current_mount_namespace();
     let module = |view, name, target: &Path| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view,
         mount_namespace: namespace,
         key: manifest_key(&provider),
@@ -864,6 +1204,7 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     };
@@ -924,8 +1265,10 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
     let mut rejected_provider = manifest_key(&provider);
     rejected_provider.inode = rejected_provider.inode.wrapping_add(1);
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view_id,
         mount_namespace: current_mount_namespace(),
         key: rejected_provider,
@@ -955,6 +1298,7 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     };
@@ -1104,7 +1448,7 @@ fn proc_root_manifest_uses_its_exact_retained_process_view() {
 
 #[test]
 fn proc_root_manifest_rejects_ambiguous_spellings() {
-    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
 
     let d = tmpdir("manifest_pinning_proc_root_ambiguous");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1130,12 +1474,18 @@ fn proc_root_manifest_rejects_ambiguous_spellings() {
     for path in spellings {
         let mut manifest = base.clone();
         retarget_manifest(&mut manifest, path.clone());
-        let error = pin_manifest_objects_deferred_in_views(&manifest, std::slice::from_ref(&view))
-            .expect_err("ambiguous proc-root spelling must fail closed");
+        // Never-stop: an ambiguous spelling becomes a gap, not an abort.
+        let pinning =
+            pin_manifest_objects_deferred_in_views(&manifest, std::slice::from_ref(&view))
+                .expect("ambiguous spelling gaps the object");
+        assert_eq!(pinning.pins.pinned().count(), 0, "{path}");
+        assert_eq!(pinning.skipped.len(), 1, "{path}");
         assert!(
-            matches!(error, ManifestPinError::Fatal(ref errors)
-                if errors.iter().any(|error| error.contains("canonical /proc/<pid>/root"))),
-            "{path}: {error:?}"
+            pinning.skipped[0]
+                .reason
+                .contains("canonical /proc/<pid>/root"),
+            "{path}: {:?}",
+            pinning.skipped
         );
     }
 }
@@ -1181,45 +1531,61 @@ fn proc_root_prefix_alias_cannot_hide_an_erased_view_boundary() {
 
 #[test]
 fn proc_root_manifest_rejects_a_pid_not_in_the_retained_views() {
-    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
 
     let d = tmpdir("manifest_pinning_proc_root_wrong_view");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
     let locator = PathBuf::from(format!("/proc/{}/root{}", child.id(), so.display()));
     let manifest = manifest_for(&locator);
     let observer = ProcessView::open(ProcessViewId(19), std::process::id()).unwrap();
 
-    let error = pin_manifest_objects_deferred_in_views(&manifest, &[observer])
-        .expect_err("a different retained pid cannot authorize this locator");
+    // Never-stop: an unauthorized locator gaps the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[observer])
+        .expect("wrong-view locator gaps the object");
     child.kill().unwrap();
     child.wait().unwrap();
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("no exact retained process view"))),
-        "{error:?}"
+        pinning.skipped[0]
+            .reason
+            .contains("no exact retained process view"),
+        "{:?}",
+        pinning.skipped
     );
 }
 
 #[test]
 fn proc_root_manifest_rejects_a_stale_retained_process_view() {
-    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
 
     let d = tmpdir("manifest_pinning_proc_root_stale_view");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
     let locator = PathBuf::from(format!("/proc/{}/root{}", child.id(), so.display()));
     let manifest = manifest_for(&locator);
     let view = ProcessView::open(ProcessViewId(20), child.id()).unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
 
-    let error = pin_manifest_objects_deferred_in_views(&manifest, &[view])
-        .expect_err("a stale retained process generation must fail closed");
+    // Never-stop: a stale view gaps the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[view])
+        .expect("stale view gaps the object");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("exited"))),
-        "{error:?}"
+        pinning.skipped[0].reason.contains("exited"),
+        "{:?}",
+        pinning.skipped
     );
 }
 
@@ -1239,9 +1605,7 @@ fn ordinary_host_manifest_behavior_is_unchanged_with_retained_views() {
 
 #[test]
 fn ordinary_host_manifest_forwards_mountinfo_budget() {
-    use p11scope::discovery::identity::{
-        ManifestPinError, pin_manifest_objects_deferred_in_views_with_budget,
-    };
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views_with_budget;
 
     let d = tmpdir("manifest_pinning_host_mountinfo_budget");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1250,21 +1614,22 @@ fn ordinary_host_manifest_forwards_mountinfo_budget() {
         per_object_bytes: u64::MAX,
         total_bytes: 0,
     });
-    let error = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[], &mut budget)
-        .expect_err("observer mountinfo must share the exhausted capture budget");
+    // Never-stop: budget exhaustion gaps the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[], &mut budget)
+        .expect("exhausted budget gaps the object");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("attempted-I/O ceiling"))),
-        "{error:?}"
+        pinning.skipped[0].reason.contains("attempted-I/O ceiling"),
+        "{:?}",
+        pinning.skipped
     );
     assert_eq!(budget.attempted_io_bytes(), 0);
 }
 
 #[test]
 fn retained_view_manifest_forwards_mountinfo_budget() {
-    use p11scope::discovery::identity::{
-        ManifestPinError, pin_manifest_objects_deferred_in_views_with_budget,
-    };
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views_with_budget;
 
     let d = tmpdir("manifest_pinning_retained_mountinfo_budget");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1276,18 +1641,22 @@ fn retained_view_manifest_forwards_mountinfo_budget() {
         per_object_bytes: u64::MAX,
         total_bytes: 0,
     });
-    let error = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[view], &mut budget)
-        .expect_err("retained mountinfo must share the exhausted capture budget");
+    // Never-stop: budget exhaustion gaps the object, siblings continue.
+    let pinning =
+        pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[view], &mut budget)
+            .expect("exhausted budget gaps the object");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("attempted-I/O ceiling"))),
-        "{error:?}"
+        pinning.skipped[0].reason.contains("attempted-I/O ceiling"),
+        "{:?}",
+        pinning.skipped
     );
     assert_eq!(budget.attempted_io_bytes(), 0);
 }
 
 #[test]
-fn a_missing_locator_is_stale_but_malformed_and_other_open_failures_are_fatal() {
+fn a_missing_locator_is_stale_but_malformed_is_invalid_and_other_open_failures_are_gapped() {
     use p11scope::discovery::identity::{
         ManifestPinError, ManifestStaleReason, pin_manifest_objects_deferred,
     };
@@ -1313,10 +1682,10 @@ fn a_missing_locator_is_stale_but_malformed_and_other_open_failures_are_fatal() 
     non_regular.module_path = directory.display().to_string();
     non_regular.objects[0].path = directory.display().to_string();
     non_regular.provenance_objects[0].path = directory.display().to_string();
-    assert!(matches!(
-        pin_manifest_objects_deferred(&non_regular),
-        Err(ManifestPinError::Fatal(_))
-    ));
+    // Never-stop: a non-regular object gaps, siblings continue.
+    let pinning = pin_manifest_objects_deferred(&non_regular).expect("non-regular object gaps");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
 }
 
 #[test]
@@ -1416,7 +1785,7 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
         acquisition: Acquisition::Ok,
         version: Some(Version { major: 2, minor: 0 }),
         walk: WalkOutcome::Full,
-        functions: pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+        functions: pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()
             .map(|field| FunctionRecord {
                 name: field.name.into(),
@@ -1489,7 +1858,7 @@ fn reordered_or_unknown_standard_function_names_are_refused() {
         acquisition: Acquisition::Ok,
         version: Some(Version { major: 2, minor: 0 }),
         walk: WalkOutcome::Full,
-        functions: pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+        functions: pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()
             .enumerate()
             .map(|(index, field)| FunctionRecord {
@@ -1539,6 +1908,7 @@ fn every_supported_table_boundary_passes_structural_reuse_validation() {
         (3, 2, 104, false, false),
         (3, 9, 104, true, false),
         (3, 2, 104, true, true),
+        (4, 19, 68, true, false),
     ]
     .into_iter()
     .enumerate()
@@ -1587,7 +1957,7 @@ fn every_supported_table_boundary_passes_structural_reuse_validation() {
         acquisition: Acquisition::Ok,
         version: Some(Version { major: 2, minor: 0 }),
         walk: WalkOutcome::Full,
-        functions: all[..67]
+        functions: all[..68]
             .iter()
             .map(|name| FunctionRecord {
                 name: (*name).into(),
@@ -1798,6 +2168,7 @@ fn replacing_the_file_by_rename_keeps_the_pinned_inode_but_reports_a_change() {
 fn a_pid_pin_detects_process_exit() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pin = p11scope::process::PidPin::open(child.id()).expect("pin a live child");
@@ -1814,45 +2185,131 @@ fn a_pid_pin_detects_process_exit() {
     }
 }
 
-/// Our own executable is a file-backed mapping with a stable identity; scan our
-/// process with it as the hint, so the modules are the scan's real view of us.
-fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
-    use p11scope::discovery::hooks::HookRegistry;
-    use p11scope::discovery::scan::{ScanOutcome, ScanRequest, scan_pid};
+/// Scan an owned child's stable mappings. Scanning the test process itself races
+/// the observer's temporary ELF/identity mappings (including other test threads),
+/// correctly refusing changed mappings before pinning or merging can be tested.
+struct ScannedChild {
+    child: std::process::Child,
+    exe: PathBuf,
+}
 
-    let hooks = HookRegistry::builtin();
-    let exe = std::env::current_exe().unwrap();
-    let outcome = scan_pid(
-        &ScanRequest {
-            pid: std::process::id(),
-            hints: std::slice::from_ref(&exe),
-            hooks: &hooks,
-        },
-        &mut self_binary_budget(),
-    )
-    .unwrap();
-    let ScanOutcome::Scanned { modules, .. } = outcome else {
-        panic!("/proc/self/mem is always readable")
-    };
-    (exe, modules)
+impl ScannedChild {
+    fn new(name: &str, sparse_len: Option<u64>) -> Self {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::process::Stdio;
+
+        let dir = tmpdir(name);
+        let source = dir.join("hold.c");
+        let executable = dir.join("hold");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { char ready = 'R', stop; if (write(1, &ready, 1) != 1) return 2; return read(0, &stop, 1) == 1 ? 0 : 3; }\n",
+        )
+        .unwrap();
+        {
+            let _guard = CC_LOCK.lock().unwrap();
+            assert!(
+                Command::new("gcc")
+                    .arg("-o")
+                    .arg(&executable)
+                    .arg(&source)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        if let Some(len) = sparse_len {
+            // Extend before exec: the tail is outside the loaded ELF segments.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&executable)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+        let mut child = Self {
+            child: Command::new(&executable)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+            exe: executable,
+        };
+        let stdout = child.child.stdout.as_mut().unwrap();
+        let mut poll = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the child pipe stays open and poll borrows one initialized fd.
+        let ready_events = unsafe { libc::poll(&mut poll, 1, 5000) };
+        assert_eq!(ready_events, 1, "child readiness deadline or poll failure");
+        assert_ne!(poll.revents & libc::POLLIN, 0, "child closed before ready");
+        let mut ready = [0];
+        stdout.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'R']);
+        child.exe = std::fs::read_link(format!("/proc/{}/exe", child.pid())).unwrap();
+        child
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn scan(&self) -> Vec<p11scope::discovery::scan::ScannedModule> {
+        use p11scope::discovery::hooks::HookRegistry;
+        use p11scope::discovery::scan::{ScanOutcome, ScanRequest, scan_pid};
+
+        let outcome = scan_pid(
+            &ScanRequest {
+                pid: self.pid(),
+                hints: std::slice::from_ref(&self.exe),
+                hooks: &HookRegistry::builtin(),
+            },
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        let ScanOutcome::Scanned {
+            modules, skipped, ..
+        } = outcome
+        else {
+            panic!("the owned child's memory must be readable: {outcome:?}")
+        };
+        assert_eq!(
+            modules.len(),
+            1,
+            "the hinted child executable must be selected before testing pinning: {skipped:?}"
+        );
+        assert_eq!(modules[0].path, self.exe.display().to_string());
+        modules
+    }
+}
+
+impl Drop for ScannedChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
 fn scanned_objects_are_pinned_hashed_and_attachable() {
-    let (exe, modules) = scan_self();
+    let child = ScannedChild::new("manifest_pinning_scanned", None);
+    let exe = &child.exe;
+    let modules = child.scan();
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
+        child.pid(),
         &modules,
-        &mut self_binary_budget(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert!(
         skipped.is_empty(),
-        "nothing about our own process should be unpinnable: {skipped:?}"
+        "the stable child must be pinnable: {skipped:?}"
     );
-    // The hint is our own executable, so the scan always names at least that object.
-    // (Measured: it is the only one — the test binary maps no PKCS#11 table, so no
-    // table entry names a second object. Its identity resolves via "mountinfo".)
+    // The fixture has no function table, so the hint names exactly its executable.
     assert!(
         pinned.pinned().any(|s| s.path == exe.display().to_string()),
         "the hinted executable must be pinned"
@@ -1878,8 +2335,10 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     // reported. That is what a retargeted path looks like, and it must never be pinned.
     let exe = std::env::current_exe().unwrap();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key: ObjectKey {
@@ -1906,14 +2365,12 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
         skipped[0]
     );
     assert_eq!(skipped[0].subject, exe.display().to_string());
+}
 
-    // Force `mapping_file_key` to be unavailable: memfd's internal mount does not
-    // appear in /proc/self/mountinfo. The inode still agrees, while the mapping device
-    // deliberately does not. Incomparable identity must fail closed, never fall back
-    // to accepting the inode by itself.
+fn unlisted_memfd() -> std::fs::File {
     use std::ffi::CString;
-    use std::io::{Seek as _, Write as _};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
 
     let name = CString::new("p11scope-identity-unavailable").unwrap();
     // SAFETY: valid NUL-terminated name and supported memfd flags; success returns a
@@ -1921,20 +2378,24 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
     let mut memfd = unsafe { std::fs::File::from_raw_fd(fd) };
-    memfd.write_all(&std::fs::read(&exe).unwrap()).unwrap();
-    memfd.rewind().unwrap();
+    memfd.write_all(b"owned identity fixture").unwrap();
+    memfd
+}
+
+#[test]
+fn a_memfd_magic_link_is_refused_before_target_identity() {
+    use p11scope::discovery::scan::ScannedModule;
+    use p11scope_manifest::maps::{Device, ObjectKey};
+    use std::os::fd::AsRawFd as _;
+
+    let memfd = unlisted_memfd();
     let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
-    let opened = p11scope_manifest::identity::open_object(Path::new(&memfd_path)).unwrap();
-    let mapping_error = p11scope_manifest::identity::mapping_file_key(&opened)
-        .expect_err("memfd mount identity must be absent from mountinfo");
-    assert!(
-        mapping_error.contains("missing from the mount table"),
-        "{mapping_error}"
-    );
     let metadata = memfd.metadata().unwrap();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key: ObjectKey {
@@ -1964,49 +2425,44 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     assert_eq!(skipped.len(), 1, "{skipped:?}");
     assert_eq!(skipped[0].subject, memfd_path);
     assert!(
-        skipped[0].reason.contains("mapping identity") && skipped[0].reason.contains("unavailable"),
+        skipped[0]
+            .reason
+            .starts_with("opening object within retained target root:")
+            && skipped[0].reason.contains("os error 40"),
         "{:?}",
         skipped[0]
     );
 }
 
 #[test]
-fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
-    use p11scope::discovery::hooks::HookRegistry;
-    use p11scope::discovery::scan::{ScanLimits, ScanRequest, scan_pid};
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
-    use std::process::Stdio;
+fn an_unlisted_retained_memfd_never_uses_inode_only_identity() {
+    // The exact fd's internal mount is absent from mountinfo. Its real
+    // inode remains available, but it cannot supply a comparable maps key.
+    let memfd = unlisted_memfd();
+    assert_ne!(memfd.metadata().unwrap().ino(), 0);
+    let mapping_error = p11scope_manifest::identity::mapping_file_key(&memfd)
+        .expect_err("memfd mount identity must be absent from mountinfo");
+    assert!(
+        mapping_error.contains("missing from the mount table"),
+        "{mapping_error}"
+    );
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let error = p11scope::discovery::identity::retained_object_key(&view, &memfd, &mut budget)
+        .expect_err("an actual retained inode cannot replace a missing mount identity");
+    assert!(
+        error.starts_with("mapping identity unavailable:"),
+        "{error}"
+    );
+    assert!(error.contains("missing from the mount table"), "{error}");
+    assert!(
+        budget.attempted_io_bytes() > 0,
+        "the real target mount table was read"
+    );
+}
 
-    // The budget check needs a mapped object. A child owns stable mappings while
-    // other tests in this binary run, and is reaped even if an assertion fails.
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let dir = tmpdir("byte-budget-child");
-    let source = dir.join("hold.c");
-    let executable = dir.join("hold");
-    std::fs::write(
-        &source,
-        "#include <unistd.h>\nint main(void) { char ready = 'R', stop; if (write(1, &ready, 1) != 1) return 2; return read(0, &stop, 1) == 1 ? 0 : 3; }\n",
-    )
-    .unwrap();
-    {
-        let _guard = CC_LOCK.lock().unwrap();
-        assert!(
-            Command::new("gcc")
-                .arg("-o")
-                .arg(&executable)
-                .arg(&source)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
+#[test]
+fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
     // The per-object cap also bounds every mount-table read (read_mountinfo_with
     // caps a table at min(per_object_bytes, MAX_MOUNTINFO_BYTES)), and pinning
     // reads the child's mountinfo before it can judge the object. A ~16 KB
@@ -2021,54 +2477,11 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
             .contains("const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;"),
         "MOUNT_TABLE_CEILING must track scan.rs MAX_MOUNTINFO_BYTES"
     );
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&executable)
-        .unwrap()
-        .set_len(MOUNT_TABLE_CEILING + 2)
-        .unwrap();
-    let mut child = ChildGuard(
-        Command::new(&executable)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let stdout = child.0.stdout.as_mut().unwrap();
-    let mut poll = libc::pollfd {
-        fd: stdout.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the child pipe remains open and poll borrows one initialized fd.
-    let ready_events = unsafe { libc::poll(&mut poll, 1, 5000) };
-    assert_eq!(ready_events, 1, "child readiness deadline or poll failure");
-    assert_ne!(poll.revents & libc::POLLIN, 0, "child closed before ready");
-    let mut ready = [0];
-    stdout.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [b'R']);
-    let pid = child.0.id();
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
-    let hooks = HookRegistry::builtin();
-    let outcome = scan_pid(
-        &ScanRequest {
-            pid,
-            hints: std::slice::from_ref(&exe),
-            hooks: &hooks,
-        },
-        &mut self_binary_budget(),
-    )
-    .unwrap();
-    let modules = outcome.modules();
-    assert_eq!(
-        modules.len(),
-        1,
-        "the hinted child executable must be selected before testing pinning: {:?}",
-        outcome.skipped()
-    );
-    assert_eq!(modules[0].path, exe.display().to_string());
+    let child = ScannedChild::new("byte-budget-child", Some(MOUNT_TABLE_CEILING + 2));
+    let modules = child.scan();
+    let exe = &child.exe;
     // Sized from live data: one byte under the object the scan actually reported.
-    let len = std::fs::metadata(&exe).unwrap().len();
+    let len = std::fs::metadata(exe).unwrap().len();
     assert!(
         len - 1 > MOUNT_TABLE_CEILING,
         "hold was not extended: {len}"
@@ -2078,8 +2491,8 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
         total_bytes: u64::MAX,
     };
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        pid,
-        modules,
+        child.pid(),
+        &modules,
         &mut CaptureWorkBudget::new(limits),
     )
     .unwrap();
@@ -2102,32 +2515,19 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
 fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
     use p11scope::discovery::scan::ScanLimits;
 
-    // Flake hardening: a transient empty /proc/self/maps snapshot scans 0
-    // modules under parallel load. Retry bounded; a deterministically
-    // broken scan still fails the assertions below on the last scan.
-    let (exe, modules) = {
-        let mut scan = scan_self();
-        for _ in 0..49 {
-            if !scan.1.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            scan = scan_self();
-        }
-        scan
-    };
-    let len = std::fs::metadata(exe).unwrap().len();
+    // As in the per-object case, the budget must fit any allowed mount table
+    // before it can exercise the hash. The child's mappings remain small.
+    let child = ScannedChild::new("hash-prefix-child", Some(64 * 1024 * 1024 + 2));
+    let modules = child.scan();
+    let len = std::fs::metadata(&child.exe).unwrap().len();
     let total_bytes = len - 1;
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: len,
         total_bytes,
     });
-    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
-        &modules,
-        &mut budget,
-    )
-    .unwrap();
+    let (pinned, skipped) =
+        p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
+            .unwrap();
     assert_eq!(
         pinned.pinned().count(),
         0,
@@ -2148,28 +2548,14 @@ fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
 
 #[test]
 fn expired_deadline_refuses_pin_hash_before_reading() {
-    // Flake hardening: a transient empty /proc/self/maps snapshot scans 0
-    // modules under parallel load. Retry bounded; a deterministically
-    // broken scan still fails the assertions below on the last scan.
-    let (_, modules) = {
-        let mut scan = scan_self();
-        for _ in 0..49 {
-            if !scan.1.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            scan = scan_self();
-        }
-        scan
-    };
-    let mut budget = self_binary_budget();
+    let child = ScannedChild::new("hash-deadline-child", None);
+    let modules = child.scan();
+    let view = ProcessView::open(modules[0].view, child.pid()).unwrap();
+    let mut budget = CaptureWorkBudget::default();
     budget.set_deadline(Some(0));
-    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
-        &modules,
-        &mut budget,
-    )
-    .unwrap();
+    let (pinned, skipped) =
+        p11scope::discovery::identity::pin_scanned_view_objects(&view, &modules, &mut budget)
+            .unwrap();
     assert_eq!(pinned.pinned().count(), 0);
     assert_eq!(budget.attempted_io_bytes(), 0);
     assert!(
@@ -2178,6 +2564,34 @@ fn expired_deadline_refuses_pin_hash_before_reading() {
             .any(|skip| skip.reason.contains("capture discovery deadline")),
         "the refused hash must name the deadline: {skipped:?}"
     );
+}
+
+#[test]
+fn expired_deadline_refuses_pin_view_construction_before_reading() {
+    let child = ScannedChild::new("pin-construction-deadline-child", None);
+    let modules = child.scan();
+    let mut budget = CaptureWorkBudget::default();
+    budget.set_deadline(Some(0));
+    let error =
+        p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
+            .expect_err("an expired budget cannot construct a process view");
+    assert_eq!(
+        error,
+        "capture discovery deadline reached; remaining provider bytes were not scanned"
+    );
+    assert_eq!(budget.attempted_io_bytes(), 0);
+
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        child.pid(),
+        &modules,
+        &mut CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    assert!(
+        skipped.is_empty(),
+        "healthy construction/pinning: {skipped:?}"
+    );
+    assert_eq!(pinned.pinned().count(), 1);
 }
 
 #[test]
@@ -2193,8 +2607,10 @@ fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
     let len = std::fs::metadata(&valid).unwrap().len();
     assert_eq!(len, std::fs::metadata(&invalid).unwrap().len());
     let module = |path: &Path| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key: manifest_key(path),

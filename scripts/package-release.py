@@ -22,6 +22,15 @@ import tarfile
 sys.dont_write_bytecode = True
 ARTIFACTS = ("p11scope", "p11scope-discover", "p11scope-discover-glibc", "p11scope-discover-musl")
 LICENSES = ("LICENSE", "LICENSES/GPL-2.0-only.txt", "LICENSES/GPL-2.0-or-later.txt")
+# The trusted build-release.sh receipt covers one official selection per capture mode.
+OFFICIAL_P11SCOPE_FEATURES = {
+    "full": (),
+    "p0": ("stub-object-attributes",),
+}
+OFFICIAL_SCOPE = {
+    "full": "FULL official build with object-attribute capture enabled. Live capture requires a Multi-capable Linux x86-64 host (normally 6.6+ or working backports), BTF and privileges; safe scoped Singles is available on eligible hosts. Offline/helper commands do not require live capability. `--system` selects whole-machine scope. Consult release notes for qualified lanes and known limitations.",
+    "p0": "P0 official build with object-attribute capture disabled. Live capture requires a Multi-capable Linux x86-64 host (normally 6.6+ or working backports), BTF and privileges; safe scoped Singles is available on eligible hosts. Offline/helper commands do not require live capability. `--system` selects whole-machine scope. Consult release notes for qualified lanes and known limitations.",
+}
 
 
 def digest(data: bytes) -> str:
@@ -304,7 +313,10 @@ def write_archive(path: Path, prefix: str, payload):
     path.chmod(0o644)
 
 
-def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path):
+def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path,
+            capture_mode: str = "full"):
+    if capture_mode not in OFFICIAL_P11SCOPE_FEATURES:
+        raise ValueError(f"unknown capture mode: {capture_mode}")
     for path in (root, receipt, notices, source, output):
         if not path.is_absolute():
             raise ValueError("all paths must be absolute")
@@ -319,6 +331,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         raise ValueError("public output must be outside the source checkout")
     head, tree, version = source_identity(root)
     facts = receipt_facts(receipt, head, tree)
+    if facts.get("capture_mode") != capture_mode:
+        raise ValueError("receipt capture mode does not match --capture-mode")
     hashes, binaries = artifacts(receipt, facts["release_artifacts_sha256"])
     notices_files, notices_hash = notices_payload(root, notices, head, tree)
     source_data = source_archive(root, source, head)
@@ -328,8 +342,9 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         "build_receipt_status": 0, "release_artifacts_sha256": facts["release_artifacts_sha256"],
         "artifacts": hashes, "notices_manifest_sha256": notices_hash,
         "source": {"file": source_name, "sha256": digest(source_data), "format": "networked-source-export-v1"},
-        "p11scope_features": [], "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
-        "scope": "Safe-only official build. Consult the GitHub release notes for qualified kernels and lanes; system-wide tracing remains preview.",
+        "p11scope_features": list(OFFICIAL_P11SCOPE_FEATURES[capture_mode]),
+        "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
+        "scope": OFFICIAL_SCOPE[capture_mode],
     }
     public = encoded(provenance)
     common = {name: (regular(root / name), 0o644) for name in LICENSES}
@@ -373,9 +388,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("receipt", "notices", "source", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--capture-mode", choices=("full", "p0"), default="full")
     args = parser.parse_args()
     try:
-        result = package(Path(__file__).resolve().parents[1], args.receipt, args.notices, args.source, args.output)
+        result = package(Path(__file__).resolve().parents[1], args.receipt, args.notices, args.source, args.output,
+                         capture_mode=args.capture_mode)
         print(f"Public release packages ready: v{result['version']} at {result['head']}")
     except (ValueError, OSError, KeyError, TypeError, subprocess.CalledProcessError, tarfile.TarError) as error:
         print(f"package-release: {error}", file=sys.stderr)

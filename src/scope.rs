@@ -9,13 +9,17 @@ use aya::Ebpf;
 use aya::maps::{Array, CgroupArray, HashMap};
 use p11scope_ebpf_common::{
     CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_INVENTORY,
-    FLAG_SYSTEM_FILTER, valid_config, valid_inventory_config,
+    FLAG_SYSTEM_FILTER, FLAG_TRACK_SHORT_LIVED, valid_config, valid_inventory_config,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::Path;
 use std::sync::Arc;
+
+// The bounded inventory collector is wired by the cgroup integration packages.
+#[allow(dead_code)]
+pub(crate) mod inventory_cgroup;
 
 /// Opens and retains a cgroup directory for userspace walking and kernel publication.
 /// Every path component must be a real directory: symlinks are refused
@@ -204,8 +208,102 @@ pub(crate) fn publish(
     scope: &Scope,
     policy: CapturePolicy,
     generation_token: Option<u64>,
+    track_short_lived: bool,
+    pid_start: Option<u64>,
 ) -> Result<()> {
-    publish_detailed_with(scope, policy, generation_token, &mut EbpfScopeIo(ebpf))
+    publish_detailed_with(
+        scope,
+        policy,
+        generation_token,
+        track_short_lived,
+        pid_start,
+        &mut EbpfScopeIo(ebpf),
+    )
+}
+
+/// I4: the PID scope target's thread-group start tick (clock ticks since
+/// boot, the `/proc/PID/stat` field 22 the kernel compares), read while
+/// the target is alive at scope publication. `None` for cgroup/system
+/// scopes, which the witness never binds. When the caller holds the
+/// selected or owned pin, the fresh read must equal the pin's retained
+/// start time and the pin must still be the same process; anything else
+/// refuses loudly instead of binding a PID reused during the object
+/// load. Without a pin there is no earlier identity to contradict, so
+/// the fresh read stands. A dead target refuses loudly here instead of
+/// publishing a number-only scope for a marker build.
+pub(crate) fn pid_start_tick_of(
+    scope: &Scope,
+    pin: Option<&crate::process::PidPin>,
+) -> Result<Option<u64>> {
+    match scope {
+        Scope::Pid(pid) => {
+            // I4 minor: field 22 adds the reader's time-namespace
+            // boottime offset; a skewed reader would bind a tick the
+            // kernel never matches, so PID births refuse loudly here
+            // instead of failing closed silently.
+            if reader_timens_skews_boottime()? {
+                bail!(
+                    "refusing PID_START_TICK for PID scope target {pid}: nonzero time-namespace boottime offset (/proc/self/timens_offsets)"
+                );
+            }
+            let fresh = crate::process::process_start_time(*pid)
+                .with_context(|| format!("reading the start time of PID scope target {pid}"))?;
+            if let Some(pin) = pin {
+                if pin.start_time() != Some(fresh) {
+                    bail!(
+                        "refusing PID_START_TICK for PID scope target {pid}: the fresh start tick {fresh} differs from the pinned {:?}",
+                        pin.start_time()
+                    );
+                }
+                if !pin.still_the_same() {
+                    bail!(
+                        "refusing PID_START_TICK for PID scope target {pid}: the pinned process is no longer the same"
+                    );
+                }
+            }
+            Ok(Some(fresh))
+        }
+        Scope::Cgroup { .. } | Scope::System => Ok(None),
+    }
+}
+
+/// I4: whether publication reads the PID witness: only PID scope on an
+/// object carrying the witness map; anything else skips the read.
+pub(crate) fn reads_pid_witness(scope: &Scope, has_witness_map: bool) -> bool {
+    has_witness_map && matches!(scope, Scope::Pid(_))
+}
+
+/// I4 minor: whether `text` (the content of `/proc/self/timens_offsets`)
+/// shows a nonzero boottime offset. `/proc/PID/stat` field 22 adds the
+/// reader's time-namespace boottime offset, so a skewed reader would
+/// bind a tick the kernel never matches. `None` when the boottime line
+/// is missing or malformed; callers fail closed.
+fn timens_boottime_offset(text: &str) -> Option<bool> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("boottime"))?;
+    let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if fields.is_empty() {
+        return None;
+    }
+    let mut offset = false;
+    for field in fields {
+        offset |= field.parse::<i64>().ok()? != 0;
+    }
+    Some(offset)
+}
+
+/// I4 minor: whether this process's time namespace skews the boottime
+/// clock the PID witness reads through. An absent file (no
+/// time-namespace support) means no skew; anything unreadable fails
+/// closed toward refusal.
+fn reader_timens_skews_boottime() -> Result<bool> {
+    let text = match std::fs::read_to_string("/proc/self/timens_offsets") {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("reading /proc/self/timens_offsets"),
+    };
+    Ok(timens_boottime_offset(&text).unwrap_or(true))
 }
 
 pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
@@ -224,6 +322,8 @@ fn publish_detailed_with(
     scope: &Scope,
     policy: CapturePolicy,
     generation_token: Option<u64>,
+    track_short_lived: bool,
+    pid_start: Option<u64>,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
     if generation_token == Some(0) {
@@ -232,12 +332,37 @@ fn publish_detailed_with(
     if generation_token.is_some() && !matches!(scope, Scope::Pid(_)) {
         bail!("pause generation requires PID scope");
     }
+    // 6.14 Option B: the extensive CONFIG bit publishes for Detailed
+    // policies only; a counter policy refuses before any map writes.
+    if track_short_lived && !policy.allows_track_short_lived() {
+        bail!(
+            "--track-short-lived arms Detailed captures only; refusing it for counter mode {}",
+            policy
+                .counter_mode()
+                .expect("non-Detailed policy here is a counter policy")
+                .name()
+        );
+    }
     let pause_flag = generation_token.map_or(0, |_| FLAG_PAUSE_ENABLED);
-    let config = scope_flag(scope) | policy.config_bit() | pause_flag;
+    // 6.14 Option B: extensive mode arms the kernel exe-identity read
+    // on EXEC. Default off; inventory never sets this bit.
+    let extensive_flag = if track_short_lived {
+        FLAG_TRACK_SHORT_LIVED
+    } else {
+        0
+    };
+    let config = scope_flag(scope) | policy.config_bit() | pause_flag | extensive_flag;
     if !valid_config(config) {
         bail!("refusing invalid CONFIG {config:#x}");
     }
-    publish_validated_scope_with(scope, generation_token.unwrap_or(1), config, false, io)
+    publish_validated_scope_with(
+        scope,
+        generation_token.unwrap_or(1),
+        config,
+        false,
+        pid_start,
+        io,
+    )
 }
 
 fn publish_inventory_with(scope: &Scope, io: &mut impl ScopePublicationIo) -> Result<()> {
@@ -245,7 +370,9 @@ fn publish_inventory_with(scope: &Scope, io: &mut impl ScopePublicationIo) -> Re
     if !valid_inventory_config(config) {
         bail!("refusing invalid Inventory CONFIG {config:#x}");
     }
-    publish_validated_scope_with(scope, 1, config, true, io)
+    // Inventory objects never carry the witness map, so no witness is
+    // published here even for PID scope.
+    publish_validated_scope_with(scope, 1, config, true, None, io)
 }
 
 // Only the two mode-specific wrappers above construct the validated config.
@@ -255,9 +382,11 @@ fn publish_validated_scope_with(
     token: u64,
     config: u64,
     reserved_config_zero: bool,
+    pid_start: Option<u64>,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
     let mut expected_pids = BTreeMap::new();
+    let mut expected_starts = BTreeMap::new();
     match scope {
         Scope::Pid(pid) => {
             if *pid == 0 {
@@ -266,6 +395,17 @@ fn publish_validated_scope_with(
             io.insert_pid(*pid, token)
                 .context("publishing PID_FILTER")?;
             expected_pids.insert(*pid, token);
+            // I4: the witness rides next to the PID. Objects without
+            // the witness map (builds that carry no marker to bind)
+            // skip it; anything published reads back exactly, or the
+            // publication is refused rather than falling back.
+            if let Some(tick) = pid_start
+                && io
+                    .insert_pid_start(*pid, tick)
+                    .context("publishing PID_START_TICK")?
+            {
+                expected_starts.insert(*pid, tick);
+            }
         }
         Scope::Cgroup { dir, .. } => {
             // CgroupArray has no userspace lookup; its exact metadata and
@@ -277,6 +417,9 @@ fn publish_validated_scope_with(
     }
     if io.read_pids().context("reading PID_FILTER")? != expected_pids {
         bail!("PID_FILTER exact readback differs from the selected scope");
+    }
+    if io.read_pid_starts().context("reading PID_START_TICK")? != expected_starts {
+        bail!("PID_START_TICK exact readback differs from the selected scope");
     }
     io.write_config(CFG_FLAGS, config)
         .context("publishing CONFIG")?;
@@ -292,8 +435,16 @@ fn publish_validated_scope_with(
 
 trait ScopePublicationIo {
     fn insert_pid(&mut self, pid: u32, token: u64) -> Result<()>;
+    /// Publishes the PID witness, returning whether the object carries
+    /// the witness map. `Ok(false)` (no map, nothing published) is the
+    /// honest shape for builds without a marker to bind; a present but
+    /// misshapen map errors loudly instead of skipping.
+    fn insert_pid_start(&mut self, pid: u32, tick: u64) -> Result<bool>;
     fn insert_cgroup(&mut self, directory: File) -> Result<()>;
     fn read_pids(&mut self) -> Result<BTreeMap<u32, u64>>;
+    /// The exact witness contents: empty when the object carries no
+    /// witness map, exactly what was published otherwise.
+    fn read_pid_starts(&mut self) -> Result<BTreeMap<u32, u64>>;
     fn write_config(&mut self, index: u32, value: u64) -> Result<()>;
     fn read_config(&mut self, index: u32) -> Result<u64>;
 }
@@ -305,6 +456,16 @@ impl ScopePublicationIo for EbpfScopeIo<'_> {
             HashMap::try_from(self.0.map_mut("PID_FILTER").context("PID_FILTER map")?)?;
         map.insert(pid, token, 0)?;
         Ok(())
+    }
+
+    fn insert_pid_start(&mut self, pid: u32, tick: u64) -> Result<bool> {
+        let Some(map) = self.0.map_mut("PID_START_TICK") else {
+            return Ok(false);
+        };
+        let mut starts: HashMap<_, u32, u64> =
+            HashMap::try_from(map).context("PID_START_TICK map")?;
+        starts.insert(pid, tick, 0)?;
+        Ok(true)
     }
 
     fn insert_cgroup(&mut self, directory: File) -> Result<()> {
@@ -321,6 +482,14 @@ impl ScopePublicationIo for EbpfScopeIo<'_> {
         let map: HashMap<_, u32, u64> =
             HashMap::try_from(self.0.map("PID_FILTER").context("PID_FILTER map")?)?;
         Ok(map.iter().collect::<Result<_, _>>()?)
+    }
+
+    fn read_pid_starts(&mut self) -> Result<BTreeMap<u32, u64>> {
+        let Some(map) = self.0.map("PID_START_TICK") else {
+            return Ok(BTreeMap::new());
+        };
+        let starts: HashMap<_, u32, u64> = HashMap::try_from(map).context("PID_START_TICK map")?;
+        Ok(starts.iter().collect::<Result<_, _>>()?)
     }
 
     fn write_config(&mut self, index: u32, value: u64) -> Result<()> {
@@ -472,5 +641,294 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("a")).unwrap();
         assert_eq!(label(root.path(), 0xdead_beef), None);
+    }
+
+    /// I4 witness publication fake: models a marker object when
+    /// `witness_map` is set, a marker-less object otherwise.
+    #[derive(Default)]
+    struct WitnessMaps {
+        pids: BTreeMap<u32, u64>,
+        starts: BTreeMap<u32, u64>,
+        config: BTreeMap<u32, u64>,
+        witness_map: bool,
+        starts_readback: Option<BTreeMap<u32, u64>>,
+    }
+
+    impl ScopePublicationIo for WitnessMaps {
+        fn insert_pid(&mut self, pid: u32, token: u64) -> Result<()> {
+            self.pids.insert(pid, token);
+            Ok(())
+        }
+
+        fn insert_pid_start(&mut self, pid: u32, tick: u64) -> Result<bool> {
+            if !self.witness_map {
+                return Ok(false);
+            }
+            self.starts.insert(pid, tick);
+            Ok(true)
+        }
+
+        fn insert_cgroup(&mut self, directory: File) -> Result<()> {
+            let _ = directory;
+            Ok(())
+        }
+
+        fn read_pids(&mut self) -> Result<BTreeMap<u32, u64>> {
+            Ok(self.pids.clone())
+        }
+
+        fn read_pid_starts(&mut self) -> Result<BTreeMap<u32, u64>> {
+            if !self.witness_map {
+                return Ok(BTreeMap::new());
+            }
+            Ok(self
+                .starts_readback
+                .clone()
+                .unwrap_or_else(|| self.starts.clone()))
+        }
+
+        fn write_config(&mut self, index: u32, value: u64) -> Result<()> {
+            self.config.insert(index, value);
+            Ok(())
+        }
+
+        fn read_config(&mut self, index: u32) -> Result<u64> {
+            Ok(self.config.get(&index).copied().unwrap_or(0))
+        }
+    }
+
+    #[test]
+    fn pid_scope_publishes_the_start_tick_next_to_the_pid() {
+        let mut maps = WitnessMaps {
+            witness_map: true,
+            ..WitnessMaps::default()
+        };
+        publish_detailed_with(
+            &Scope::Pid(4242),
+            CapturePolicy::Allowlisted,
+            None,
+            false,
+            Some(777),
+            &mut maps,
+        )
+        .unwrap();
+        assert_eq!(maps.pids, BTreeMap::from([(4242, 1)]));
+        assert_eq!(maps.starts, BTreeMap::from([(4242, 777)]));
+        assert_eq!(
+            maps.config.get(&CFG_FLAGS),
+            Some(&(FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED))
+        );
+    }
+
+    #[test]
+    fn pid_scope_start_tick_readback_mismatch_is_refused_never_a_fallback() {
+        for actual in [
+            BTreeMap::new(),
+            BTreeMap::from([(4242, 778)]),
+            BTreeMap::from([(4243, 777)]),
+            BTreeMap::from([(4242, 777), (4243, 777)]),
+        ] {
+            let mut maps = WitnessMaps {
+                witness_map: true,
+                starts_readback: Some(actual),
+                ..WitnessMaps::default()
+            };
+            let error = publish_detailed_with(
+                &Scope::Pid(4242),
+                CapturePolicy::Allowlisted,
+                None,
+                false,
+                Some(777),
+                &mut maps,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("PID_START_TICK"),
+                "a witness mismatch must refuse loudly: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_scope_without_a_witness_map_skips_the_witness_and_succeeds() {
+        let mut maps = WitnessMaps::default();
+        publish_detailed_with(
+            &Scope::Pid(4242),
+            CapturePolicy::Allowlisted,
+            None,
+            false,
+            Some(777),
+            &mut maps,
+        )
+        .unwrap();
+        assert_eq!(maps.pids, BTreeMap::from([(4242, 1)]));
+        assert!(maps.starts.is_empty());
+    }
+
+    #[test]
+    fn non_pid_scopes_publish_no_witness() {
+        let root = tempfile::tempdir().unwrap();
+        for scope in [Scope::System, cgroup(root.path()).unwrap()] {
+            let mut maps = WitnessMaps {
+                witness_map: true,
+                ..WitnessMaps::default()
+            };
+            publish_detailed_with(
+                &scope,
+                CapturePolicy::Allowlisted,
+                None,
+                false,
+                pid_start_tick_of(&scope, None).unwrap(),
+                &mut maps,
+            )
+            .unwrap();
+            assert!(maps.starts.is_empty());
+        }
+    }
+
+    #[test]
+    fn pid_start_tick_of_reads_the_live_target_and_refuses_the_dead() {
+        let live = std::process::id();
+        assert_eq!(
+            pid_start_tick_of(&Scope::Pid(live), None).unwrap(),
+            Some(crate::process::process_start_time(live).unwrap())
+        );
+        assert_eq!(pid_start_tick_of(&Scope::System, None).unwrap(), None);
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            pid_start_tick_of(&cgroup(root.path()).unwrap(), None).unwrap(),
+            None
+        );
+        let error = pid_start_tick_of(&Scope::Pid(u32::MAX), None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("start time"),
+            "a dead target must refuse loudly: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_matching_pin_accepts() {
+        // I4: the bound witness accepts when the fresh read equals the
+        // selected pin and the pin is still the same process.
+        let live = std::process::id();
+        let pin = crate::process::PidPin::open(live).expect("pin self");
+        assert_eq!(
+            pid_start_tick_of(&Scope::Pid(live), Some(&pin)).expect("matching pin accepts"),
+            Some(crate::process::process_start_time(live).expect("read self tick"))
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_mismatched_pin_refuses() {
+        // I4: a PID reused between selection and publication carries
+        // another tick; the witness refuses instead of binding the reuser.
+        let live = std::process::id();
+        let pin = crate::process::PidPin::test_proc_only(live);
+        let error = pid_start_tick_of(&Scope::Pid(live), Some(&pin))
+            .expect_err("a mismatched pin must refuse");
+        assert!(
+            format!("{error:#}").contains("differs from the pinned"),
+            "mismatch refusal names both ticks: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_stale_pin_refuses() {
+        // I4: the target exits after selection but before publication (a
+        // zombie: its /proc stat still reads, with the pinned tick); the
+        // witness refuses instead of binding the dead number.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let pin = crate::process::PidPin::open(pid).expect("pin the child");
+        let pinned = pin.start_time().expect("the pin retains a start time");
+        child.kill().expect("kill the child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pin.still_the_same() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed child must exit promptly"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The zombie's stat still reads with the pinned tick: only the
+        // sameness check refuses, never a read failure.
+        assert_eq!(
+            crate::process::process_start_time(pid).expect("zombie stat reads"),
+            pinned
+        );
+        let result = pid_start_tick_of(&Scope::Pid(pid), Some(&pin));
+        child.wait().expect("reap the child");
+        let error = result.expect_err("a stale pin must refuse");
+        assert!(
+            format!("{error:#}").contains("no longer the same"),
+            "stale refusal names the cause: {error:#}"
+        );
+    }
+
+    #[test]
+    fn timens_boottime_offset_reads_the_boottime_line() {
+        // I4 minor: the offset detector fires on any nonzero field and
+        // stays quiet on zeros; a missing or malformed boottime line
+        // fails closed (None), never quiet.
+        for (text, expected) in [
+            (
+                "monotonic           0         0\nboottime            0         0\n",
+                Some(false),
+            ),
+            (
+                "monotonic           0         0\nboottime         3600         0\n",
+                Some(true),
+            ),
+            ("boottime            0         5\n", Some(true)),
+            ("boottime           -1         0\n", Some(true)),
+            ("monotonic           0         0\n", None),
+            ("boottime            0         x\n", None),
+            ("boottime\n", None),
+            ("", None),
+        ] {
+            assert_eq!(timens_boottime_offset(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn reader_timens_check_agrees_with_the_live_offsets_file() {
+        // I4 minor: the live check parses the same file the same way;
+        // self-consistent on any host, with or without an offset.
+        match std::fs::read_to_string("/proc/self/timens_offsets") {
+            Ok(text) => assert_eq!(
+                reader_timens_skews_boottime().expect("live check reads"),
+                timens_boottime_offset(&text).unwrap_or(true)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(!reader_timens_skews_boottime().expect("absent file means no skew"))
+            }
+            Err(error) => panic!("unexpected offsets read failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn witness_read_skips_scopes_and_objects_without_a_witness_map() {
+        // I4: publication reads the PID witness only for PID scope on an
+        // object carrying the witness map; anything else skips the read.
+        let root = tempfile::tempdir().unwrap();
+        let cgroup = cgroup(root.path()).unwrap();
+        for has_map in [false, true] {
+            assert_eq!(
+                reads_pid_witness(&Scope::Pid(4242), has_map),
+                has_map,
+                "PID scope reads exactly when the map exists (map {has_map})"
+            );
+            assert!(
+                !reads_pid_witness(&Scope::System, has_map),
+                "system scope never reads (map {has_map})"
+            );
+            assert!(
+                !reads_pid_witness(&cgroup, has_map),
+                "cgroup scope never reads (map {has_map})"
+            );
+        }
     }
 }

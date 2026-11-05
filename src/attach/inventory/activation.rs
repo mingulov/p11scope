@@ -215,8 +215,7 @@ pub(super) fn validate_capture_activation(
             );
             require_live_pid_custody(pin)?;
         }
-        Scope::System => {}
-        Scope::Cgroup { .. } => bail!("Inventory capture does not offer cgroup scope yet"),
+        Scope::System | Scope::Cgroup { .. } => {}
     }
     // Both backends: Multi loads the entries for uprobe-multi and attaches
     // them only through `attach_entry_group`.
@@ -811,6 +810,7 @@ impl InventoryState {
                     target,
                     handle: Some(fds),
                     quarantine: None,
+                    _leases: std::sync::Arc::default(),
                 }),
                 handle => {
                     let error = match &handle {
@@ -826,6 +826,7 @@ impl InventoryState {
                         target,
                         handle: None,
                         quarantine: Some(error),
+                        _leases: std::sync::Arc::default(),
                     });
                     // Opaque custody stays with its owning prepared object.
                     self.links.push(InventoryLinked { target, handle });
@@ -969,6 +970,52 @@ impl InventoryState {
 /// Read-side accessors the capture facade uses. None of them hands out
 /// links, programs, or a mutable object.
 impl InventoryState {
+    /// Concrete identity-only endpoint operation; no mutable object escapes.
+    pub(super) fn observe_caller_image(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        generation: u64,
+        original: &std::sync::Arc<PidPin>,
+        window: crate::attach::capture::ReadWindow,
+    ) -> Result<crate::attach::capture::CallerImageObservation> {
+        crate::attach::selected_detailed::baseline::observe_caller_image(
+            &mut self.prepared.ebpf,
+            domain,
+            generation,
+            original,
+            window,
+        )
+    }
+
+    /// Concrete pre-view identity operation; no mutable object escapes.
+    #[allow(clippy::too_many_arguments)] // Thin explicit-args forwarder mirroring baseline::query; bundling would churn both ends for no gain.
+    pub(super) fn query_promotion_baselines(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        generation: u64,
+        capture: crate::inventory_promotion::CaptureId,
+        presentation: std::sync::Arc<crate::inventory_present::Presentation>,
+        targets: &[crate::attach::selected_detailed::baseline::BaselineTarget],
+        window: crate::attach::capture::ReadWindow,
+        reserve: impl FnOnce(
+            usize,
+        ) -> std::result::Result<
+            crate::semantics_edge::resources::ResourceLease,
+            crate::semantics_edge::resources::SemanticResourceRefusal,
+        >,
+    ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
+        crate::attach::selected_detailed::baseline::query(
+            &mut self.prepared.ebpf,
+            domain,
+            generation,
+            capture,
+            presentation,
+            targets,
+            window,
+            reserve,
+        )
+    }
+
     pub(super) fn ebpf(&self) -> &Ebpf {
         &self.prepared.ebpf
     }
@@ -1101,7 +1148,7 @@ impl RetiringInventory {
 
     fn begin_with_close(
         mut state: InventoryState,
-        close: impl FnMut(&mut Vec<InventoryFd>) -> Result<()> + Send + 'static,
+        close: impl Fn(&mut Vec<InventoryFd>) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
         let work = state.take_retirement_work();
         let mut retiring = Self {
@@ -1478,7 +1525,7 @@ impl PreparedInventory {
 /// The capture facade's entry scope: `OneProcess` for PID scope (the same
 /// seam Detailed uses), so the kernel binds each entry to the original
 /// task and a reused PID never fires it; process-wide otherwise.
-fn capture_entry_scope(scope: &Scope) -> UProbeScope {
+pub(super) fn capture_entry_scope(scope: &Scope) -> UProbeScope {
     match scope {
         Scope::Pid(pid) => match std::num::NonZeroU32::new(*pid) {
             Some(pid) => UProbeScope::OneProcess(pid),

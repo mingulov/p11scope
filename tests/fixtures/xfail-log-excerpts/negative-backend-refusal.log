@@ -1,0 +1,11 @@
+# synthetic refusal log from the real lane-gate strings (must match no signature)
+
+running 1 test
+test discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head ... thread 'discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head' (100) panicked at src/discovery/pressure_native_tests.rs:2344:5:
+t8-live256: the live lane needs host vmlinux BTF
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+failures:
+    discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 0.02s

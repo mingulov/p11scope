@@ -28,19 +28,89 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 
 ## Event kinds
 
+- `instance_observed` (additive): the corresponding snapshot `instances[]`
+  row verbatim, keyed by capture-local `id` (`iN`).
+- `semantic_edge_observed` (additive): the corresponding snapshot
+  `semantic_edges[]` row verbatim, keyed by `instance`, referencing the same
+  caller/module IDs. `api_returns` and operation outcomes retain their separate
+  units; child `entries.count` is null and never copies a physical count.
+  No-call rows retain unknown labels and null details. Loss reasons and private
+  identity exclusions are defined in [inventory v1](inventory-v1.md#semantic-instances-additive-within-v1).
+  Both instance kinds stream change-driven, like `edge_observed`: one
+  tracked record per instance with a separate dirty flag per kind; a
+  commit writes a record for a row that is new or whose payload differs
+  from its last record (a row that changes again while it waits keeps
+  its single queue place and emits its current payload). At most 4,096
+  records of both kinds together per commit, first in first out; the
+  rest wait, counted in that commit's `instance_events_deferred` and
+  `semantic_edge_events_deferred` (with `instance_events` and
+  `semantic_edge_events` counting the records the commit wrote). The
+  exact sweep before `ended` writes every due or evicted row of both
+  kinds, then settles all three kinds together: `ended.instance_events`
+  and `ended.semantic_edge_events` count the sweep's records,
+  `ended.instances_unretained` and `ended.semantic_edges_unretained`
+  the rows whose last record retention deleted (0 unless the retention
+  cannot hold them; when all three unretained counts are 0, every last
+  retained record equals its snapshot row).
+
+- `object_observed` (additive): one object view as the snapshot
+  `objects[]` row verbatim, keyed by capture-local `object`:
+  `{revision, row}` plus the additive `version` (the H9 section
+  version governing the row's role/creation vocabularies; absent
+  means 1 — pre-6.07c producers emit v1 rows only). `revision` is
+  the publication revision of the row's last change; the pass
+  marker's `object_revision` names the current revision, and
+  unchanged rows persist client-side below it. Consumers dispatch
+  vocabularies per row version and refuse unknown versions.
+- `key_operations_observed` (additive): one proved-key aggregate or
+  unknown-key summary as the snapshot row verbatim:
+  `{revision, bucket, row}` plus the additive `version` (as in
+  `object_observed`: the row's H9 section version, absent means 1)
+  with `bucket` `known` (keyed by instance,
+  object, category, role and metadata label) or `unknown` (keyed by
+  category and reason). A revision bump alone re-emits nothing: rows
+  emit when their row digest changed since the stream last carried
+  them, or when their last record aged out of retention (rotation
+  backstop). Rows never delete and are never summed as deltas; a
+  greater revision replaces an older one. Sessions ride no stream
+  kind: session lifecycle reaches the stream through `object_observed`
+  rows' session attribution.
+  Both object kinds stream change-driven like `edge_observed`: at most
+  4,096 records of both kinds together per commit, first in first
+  out; the rest wait, counted in that commit's
+  `key_operation_events_deferred` (with `key_operation_events`
+  counting the records the commit wrote). The exact sweep before
+  `ended` writes every due or evicted row of both kinds, then settles
+  all four kinds together: `ended.key_operation_events` counts the
+  sweep's records and `ended.key_operations_unretained` the rows
+  whose last record retention deleted (0 unless the retention cannot
+  hold them; when all four unretained counts are 0, every last
+  retained record equals its snapshot row). Row shapes, enums, sort
+  orders and loss vocabulary are defined in [inventory
+  v1](inventory-v1.md#object-observations-additive-within-v1) and the
+  frozen
+  [object_observations schema](inventory-v1-object-observations.schema.json).
 - `started`: `{scope, clock: {basis, unit}, started_ns, limits:
   {callers, modules, edges, endpoints, inventory_endpoints,
-  inventory_attach_modules, semantic_state, retained_history}}`.
+  inventory_attach_modules, semantic_state, instance_semantic_resources,
+  retained_history}}`.
   First event of every run. `inventory_endpoints` and
   `inventory_attach_modules` (additive within v1) are the run's
   Inventory attach-set limits (`budgets.inventory_endpoints.limit`,
   `budgets.inventory_attach_modules.limit`).
+  `instance_semantic_resources` (additive) is the shared semantic allocation
+  pool's byte limit, `budgets.instance_semantic_resources.limit_bytes`.
 - `caller_event`: one caller-incarnation turnover —
   `{event: admitted, caller}`, `{event: exited, caller, reason}`,
+  `{event: retired, caller, reason}` (old incarnation only, no authorized successor),
   `{event: exec_retired, old, new}`, `{event: reused, old, new}`, or
   `{event: admit_failed, pid, reason, budget}` where `budget` is
   `{resource, limit, requested}` or null (the same budget shape
   snapshot gaps carry).
+  The additive `identity_context` has `version: 1` and `caller` for
+  admitted/exited/retired, or `old` and `new` for exec-retired/reused. Each subject
+  uses the compact caller projection below from the same publication revision.
+  `admit_failed` has no identity context or invented incarnation.
 - `gap_recorded`: `{index, caller, module, pid, subject, reason,
   budget}` — a snapshot `gaps[]` entry minus `repeats`, plus its
   ordinal `index` (equal to its snapshot `gaps[]` index): gap identity
@@ -70,8 +140,10 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   reads, the final lifecycle drain, the binder's finish): that commit's
   incarnation events and gaps precede one more `pass_committed` with the
   additive `final: true`, the last pass's `pass` number and zero scan
-  counts, so `new_gaps` still sums to every streamed gap. Absent `final`
-  means a scan pass.
+  counts, so `new_gaps` still sums to every streamed gap. A scan-only
+  run that ends with zero completed passes by stop/deadline (not error)
+  likewise streams its one diagnostic gap under a `final: true` marker
+  with `pass` 0 and zero scan counts. Absent `final` means a scan pass.
   Every `pass_committed` also carries `unbound_rows`: the native
   witness rows staged since the previous marker that bound to no caller
   incarnation, as `[{module, reason, rows}]` in (module, reason) order —
@@ -83,10 +155,20 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   Every `pass_committed` also carries `edge_events` (the `edge_observed`
   records the commit wrote just before it) and `edge_events_deferred`
   (changed edges still waiting past the per-pass cap; see
-  `edge_observed`).
+  `edge_observed`), plus `instance_events`, `instance_events_deferred`,
+  `semantic_edge_events` and `semantic_edge_events_deferred` — the
+  same accounting for the two instance kinds under their one shared
+  4,096-row per-commit quota — plus `key_operation_events` and
+  `key_operation_events_deferred`, the same accounting for the two
+  object row kinds under their one shared 4,096-row per-commit quota.
+  Every `pass_committed` also carries `object_revision` (the current
+  object publication revision; unchanged rows persist client-side
+  below it), `object_status` (that publication's status) and the
+  additive `object_version` (that publication's H9 section version;
+  absent means 1). Consumers refuse unknown versions.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
-  `activity` — computed from the same model the dashboard renders,
+  `activity` and additive `identity_context` — computed from the same model the dashboard renders,
   never new capture. Production streams emit it (both lanes, classic
   and `--dashboard` paths) change-driven:
   - During the run a commit writes a record for an edge that is new or
@@ -98,7 +180,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     count rose since the previous pass — except an in-flight edge, or
     one with active operations, which reads `operation initialized /
     in flight` instead: in-flight and operation state take precedence
-    over a rise). Other fields (mapping instants
+    over a rise). A change to compact identity context also makes the edge
+    due, including a metadata-only change with an unchanged count/class.
+    Both ordinary checks and changes that revert while queued compare this
+    context; a reverted queued record is omitted only when its class, count
+    and context are already carried and that record is still retained.
+    Other fields (mapping instants
     and interruptions, semantics) do not trigger a record by
     themselves. The recorded `activity` is window-free; only the
     dashboard display renders its own trailing 5 s `recently observed`
@@ -145,7 +232,8 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     fresh file to take it) and only that.
   - Replay guarantee: when `ended.edges_unretained` is 0, the last
     retained `edge_observed` per (`caller`, `module`) equals the
-    snapshot's `edges[]` entry (plus the three states) and every
+    snapshot's `edges[]` entry (plus the three states and the compact context
+    of the final immutable revision) and every
     snapshot edge has one. That always holds for a stream with no
     `retention_evicted`, where also
     `sum(pass_committed.edge_events) + ended.edge_events` equals the
@@ -159,17 +247,27 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     deleted (the loss is also accounted in `retention_evicted`); read
     the snapshot, or raise the retention. A stream without `ended` was
     cut short; its last records may lag the run's end.
-  - Volume: a record is typically 0.7–0.8 KiB, more with semantic
+  - Volume: the original edge facts are typically 0.7–0.8 KiB, more with semantic
     mechanisms and operations. A commit writes at most 4,096 records
-    (about 3 MB), which happens only while that many edges change class
+    (about 3 MB of the original edge facts, plus context), which happens
+    only while that many edges change class or identity context
     or drift past their 10 s count cadence every pass (for example
     repeated health regressions demoting and restarting every watch).
     The sweep writes up to one record per edge
-    (32,768 at the limit, about 24 MB), twice in the fallback above.
+    (32,768 at the limit, about 24 MB of the original edge facts, plus
+    context), twice in the fallback above.
     Size `--event-rotate-bytes` × (`--event-max-files` − 1) to at least
     the live edges × the record size, plus that margin, for the replay
     guarantee to hold under retention; the defaults (1 MiB × 5 files)
-    cover about 5,000 edges.
+    must be sized for the actual contextual records. Compact identity adds
+    at most 65,536 encoded bytes per emitted edge (typically much less);
+    this bound does not apply to the existing semantic edge facts. Escaping
+    and context bytes participate in the line-size, capacity, final-tail
+    reservation and exact `edges_unretained` accounting above.
+    The additional context bound alone permits up to 256 MiB per capped
+    commit or 2 GiB per 32,768-edge sweep, twice when a fallback dump is
+    required; these are limits, not typical volume or a bound on the full
+    existing semantic payload. Use actual line sizes when choosing retention.
   - The producer keeps one digest per edge, bounded by the edge limit.
   - Order: a commit writes its `caller_event` lines, its gap lines, its
     `edge_observed` records, then its `pass_committed`; at the end the
@@ -189,11 +287,56 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   (nothing covers the edge's usage), or `unknown` (no live mapping, or
   a watch that ended: its interval stays in `entries.coverage`). The
   dashboard shows a watch that ended as `entries ?`.
+
+### Compact identity context
+
+An edge's `identity_context` contains exactly `{version: 1, caller, module}`.
+Caller turnover contexts contain `{version: 1, caller}` or
+`{version: 1, old, new}`. The caller projection contains exactly
+`{id, pid, incarnation, start_time, authority, lifecycle, executable, status}`;
+`executable` is null or `{dev, ino, mtime_secs, mtime_nanos, path}`. Authority
+is `scan_pinned` or `native_exact`, never inferred from a path. Lifecycle is
+`mapped`, `exited`, `exec_retired`, or `unknown`, as of this revision. PID
+uses the existing observer `/proc` numbering; start time is the existing
+clock ticks since boot. The module projection contains exactly
+`{id, device_major, device_minor, inode, path, status}`. The IDs are the
+existing capture-local caller/module join keys; names and paths are display
+facts only.
+
+Each subject's status is `observed`, `unavailable`, `path_budget`, or
+`context_budget`. Only one path is included per subject: the caller's observed
+exe path or the lexicographically first retained module path. A path exceeding
+4,096 UTF-8 bytes before escaping becomes null with `path_budget`, preserving
+the physical metadata. An absent path/executable is null with `unavailable`;
+a missing subject retains its ID and makes its other fields null. If the
+whole encoded context would exceed 65,536 bytes, subjects retain only their
+IDs, with the other fields null and `context_budget`. No full module/caller
+record, path array, hash/build ID, reason/history, semantic tree or object graph
+is copied into context. No late live PID lookup fills missing identity.
+
+The context belongs to the same immutable revision as its record, including
+old/new caller retirement. It names a retained observation without depending
+on an earlier dictionary record. Production does not replay full caller/module
+dictionaries. A retained old edge cannot describe a later exit whose turnover
+was evicted. Contextless earlier v1 records require their matching snapshot
+for names; updated consumers must show unavailable rather than guessing, and
+older additive consumers may ignore the new context.
+
+A suffix with missing `started`/`ended`, evictions, a partial final line or
+nonzero `edges_unretained` does not prove complete history or final state.
+Order observations by `seq`, keep cumulative counts as lower bounds, and
+never sum successive cumulative records for an edge.
 - `caller_observed` / `module_observed`: full snapshot record shapes
   (test/sync emission only; production streams caller turnover as
   `caller_event` instead).
 - `snapshot`: `{scope, passes, budgets, gaps_suppressed}` (test/sync
   emission marker).
+  Its additive `budgets.instance_semantic_resources` is the same immutable
+  charge-and-occupancy object as the JSON snapshot, defined in
+  [inventory v1](inventory-v1.md#semantic-instances-additive-within-v1).
+  Its additive `object_observations` is the snapshot's
+  `object_observations` section verbatim, defined in [inventory
+  v1](inventory-v1.md#object-observations-additive-within-v1).
 - `rotated`: `{prior_file, prior_events, prior_bytes, rotation_seq}` —
   the new file's first line after every rotation. The boundary is
   explicit: the named prior file exists with exactly `prior_events`
@@ -207,11 +350,20 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   accounted (direct + covered) always equal emitted.
 - `ended`: `{ended_ns, passes, budgets, gaps_suppressed, stream:
   {rotations, evicted_events, evicted_bytes}, edge_events,
-  edges_unretained}` — terminal marker with final budgets plus stream
-  accounting; `edge_events` counts the final edge sweep's records and
-  `edges_unretained` the edges whose last record retention deleted (0
-  unless the retention cannot hold one record per edge; see
-  `edge_observed`).
+  edges_unretained, instance_events, instances_unretained,
+  semantic_edge_events, semantic_edges_unretained,
+  key_operation_events, key_operations_unretained}` — terminal marker
+  with final budgets plus stream accounting; `edge_events` counts the
+  final edge sweep's records and `edges_unretained` the edges whose
+  last record retention deleted (0 unless the retention cannot hold
+  one record per edge; see `edge_observed`). The instance pairs carry
+  the same accounting for the two instance kinds, settled together
+  with the physical edges over the one reserved `ended` line. The
+  key-operation pair carries the same accounting for the two object
+  row kinds, settled together with the other three.
+  The semantic resource budget uses this terminal presentation's current
+  charges, peak charges, refusals and occupancy; it never recomputes live
+  registry state while serializing the event.
 
 ## Transport and rotation
 
@@ -226,17 +378,46 @@ Retention keeps the live file plus `--event-max-files - 1` rotations
 `retention_evicted` record in the live file.
 
 Writes flush per event (SIGKILL-safe at the OS level) and sync on
-rotation and `ended`. A mid-run stream failure (full disk, lost file)
-is a hard run error, never a silent truncation.
+rotation and after appending `ended`. If a post-start append, rotation,
+flush or sync returns an error, inventory retires that writer, continues
+observation to its ordinary stop, and attempts its independent report and
+stdout. The command exits nonzero and identifies the failed sink. The
+stream may end with a partial line; a failed record and `ended` are never
+retried or fabricated. A visible `ended` does not prove successful sync:
+the append may have succeeded before sync returned an error. Event-file
+creation and the initial `started` append remain fail-fast.
 
 ## Privacy and loss accounting
 
 Privacy bounds and loss accounting apply EXACTLY as to snapshots:
-caller/module payloads carry exactly the snapshot caller/module keys;
-edge payloads add only the three derived states; gap payloads equal
+caller/module dictionary payloads carry exactly the snapshot caller/module keys;
+edge payloads add the three derived states and the reviewed compact identity
+projection from the same revision; gap payloads equal
 snapshot gaps' identity fields (`repeats` replays from `gap_repeated`); no new capture exists anywhere in the stream. Gap
 retention (`gaps_suppressed`) and budget refusals mirror the snapshot
 document pass for pass.
+Inline placement and bounded rotation lifetime are authorized by the
+[P5U amendment](../privacy/allowlist-v3.md#inline-inventory-identity-p5u-2026-10-09).
+It adds no reads or capture and publishes no command line, environment, `comm`,
+raw native tgid, task cookie or exec ID in these compact contexts.
+
+## Caller metadata (additive within v1)
+
+The opt-in source contract projects the shared `Presentation` revision.
+Installed qualification remains open. Existing rotation and write-failure
+accounting also applies to metadata events; there is no lossless metadata claim.
+
+The contract carries the same immutable frame metadata in
+snapshots, dashboards and the stream: JSON, snapshots and dashboard
+consume exactly one `Presentation` revision. The bounded
+`caller_metadata_changed` event is keyed by CallerId plus metadata
+`revision` and fires on semantic payload changes from that same frame;
+unchanged refreshes may update sample time in normal snapshots without
+one event per refresh, and baseline events contain current state.
+Migration, stale and historical transitions must reach all consumers;
+diff may display metadata changes separately but never uses metadata
+as a cross-capture caller/provider identity join or revises counters
+from it.
 
 ## Example (abridged)
 
@@ -254,3 +435,14 @@ document pass for pass.
            "totals": {"callers": 1, "modules": 1, "edges": 1}, "new_gaps": 1,
            "suppressed_delta": 0, "gaps_suppressed": 0}}
 ```
+
+`caller_metadata_changed.event` has `caller` (capture-local CallerId),
+`revision` (exact decimal string), and `metadata` (the snapshot object verbatim).
+A pass emits at most4096 metadata records. Equal semantic components/status
+with only changed time/revision need no changed event. Migration, stale,
+historical and failed refresh changes do emit. A final bounded baseline emits
+all current caller metadata before the existing final sweep and `ended`.
+Metadata records can rotate out under ordinary stream retention; the existing
+rotation/eviction counters remain authoritative. `started`, `pass_committed`
+and `ended` carry the current `caller_metadata` option/census; pass and ended
+markers include `caller_metadata_events` for records emitted there.

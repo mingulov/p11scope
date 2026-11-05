@@ -23,23 +23,28 @@ locations: mise data under `~/.local/share/mise`, rustup toolchains under
 `~/.rustup`, and Cargo state and installed tools under `~/.cargo`. Do not set
 project-specific `MISE_DATA_DIR`, `RUSTUP_HOME`, or `CARGO_HOME` values.
 
-The tracked `mise.toml` selects stable Rust 1.98.1 and Kind 0.33.0 for the
+The tracked `mise.toml` selects stable Rust 1.99.1 and Kind 0.33.0 for the
 later Kubernetes lane. The eBPF build also needs the exact nightly and linker
 used by CI:
 
 ```sh
-rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
 rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
 mise install
-mise exec -- cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
+mise exec -- cargo +1.99.1 install bpf-linker --version 0.10.4 --locked
 ```
 
-The release Rust version is single-sourced from `.release-rust-version`
-(currently 1.98.1): `mise.toml`, CI, and the shell/Python selectors all read
-that file, so a future bump starts there. The release compiler is the only
-supported toolchain; there is no older MSRV floor. When a new stable Rust
+The release Rust version is defined by `.release-rust-version` (currently
+1.99.1). CI and shell/Python selectors read that file; `mise.toml` and host
+manifest floors are kept in sync with it, so a future bump starts there. The
+release compiler is the only supported toolchain; there is no older MSRV
+floor. When a new stable Rust
 ships, adopt it: update `.release-rust-version`, `mise.toml`, and the crate
 `rust-version` fields (the release compiler's major.minor).
+
+The BPF comparison job additionally installs Rust 1.98.1 to rebuild its
+immutable historical baseline. Its candidate uses 1.99.1; the comparison
+records both exact compiler commits and keeps the shared BPF tools fixed.
 
 Keep `~/.cargo/bin` on `PATH` so Cargo-installed tools such as `bpf-linker`
 are directly discoverable. The later container lanes also require a working
@@ -75,22 +80,62 @@ test -r /dev/kvm && test -w /dev/kvm
 ```
 
 The active lane refuses another or mixed QEMU/qemu-img version. KVM device
-access is host policy; the QEMU packages do not grant it. The existing Linux
-5.15 guest/runtime qualification remains required even though the primary host
-has changed.
+access is host policy; the QEMU packages do not grant it. Current positive guest qualification uses Multi-capable hosts, normally 6.6+
+and working backports. One combined stock pre-Multi refusal guest verifies
+`uprobe-multi-required`, unchanged sinks, an unstarted workload and offline
+command availability; it supplies no positive load or headroom evidence.
+Historical 5.15/6.1 results retain their original outcomes.
 
-## Pinned Git dependency
+## Manual Docker runtime workflow
 
-The only Git dependency is
-[pkcs11-components](https://github.com/mingulov/pkcs11-components) (its
-`pkcs11-module` and `pkcs11-types` crates and their `pkcs11-abi` dependency),
-pinned to revision `d0a47c71d34294466bc41100ae6b5a5a329029d2` in every
-manifest that names it and in both lockfiles (`Cargo.lock`, `crates/ebpf/Cargo.lock`). The repository is
-public, so an ordinary networked fetch resolves it; no Git configuration or
-local mirror is needed:
+[Docker runtime](../.github/workflows/docker-runtime.yml) runs the existing
+minimum container capture directly on an `ubuntu-26.04` hosted VM, using its
+local Docker daemon. Supply `preview_run_id` for this exact source SHA from
+either a successful same-repository CI release-preview or a completed
+[package-preview](../.github/workflows/package-preview.yml) run. The latter
+requires successful `validate` and `package-full` jobs with their real gate
+steps in the selected attempt; an independently failed or absent P0 job does
+not invalidate FULL. Package-preview's validation already binds successful
+ordinary and coverage CI to that source. The consumer never guesses another
+covering CI run, and the CI release-preview route still requires overall success.
+
+The consumer verifies the recognized workflow identity, source/tree, attempt,
+FULL public package, compiler pins, checksums and static x86-64 observer. It
+requires artifact creation within the selected FULL producer job's execution
+interval, excluding artifacts left by earlier attempts of the same run. It
+rechecks the run's source, attempt and terminal state after package validation,
+before creating executable output. Absent, expired, mismatched or P0 artifacts
+fail. It neither starts a preview nor builds a replacement observer. This
+public package consumer does not provide default/WIDE libtest fanout artifacts.
+
+The job holds one owned privileged lane, uses private disk work directories,
+and checks actual Docker/cgroup/storage, BTF, resources, functional Multi,
+return-probe safety and embedded FULL capture before the unchanged
+`scripts/matrix/verify-docker.sh` body runs. Its original nine-function,
+226-call workload, bootstrap call, count multiset, clean metrics, provider
+identity and unprivileged diagnostics remain required. Missing records,
+UNRUN/nonzero status, loss and resource cleanup failures fail the job. The
+25-minute outer timeout is an initial scheduling budget, not a measurement.
+
+Source and stub checks do not establish runtime qualification. The ordinary
+scripts job still reports this live body UNRUN in that job; only an actual
+successful manual Docker runtime run supplies this minimum positive. D1
+shared-layer/copy-up, Kubernetes, Knative and performance qualification remain
+separate. The manual job retains its diagnostics for seven days, checks owned
+container/image/process and BPF link/program/map cleanup, and never prunes the daemon.
+
+## Pinned PKCS#11 crates
+
+There is no Git dependency. The
+[pkcs11-components](https://github.com/mingulov/pkcs11-components) crates
+(`pkcs11-module` and `pkcs11-types` and their `pkcs11-abi` dependency) come
+from crates.io, pinned to version `0.2.3` in every manifest that names them
+and in both lockfiles (`Cargo.lock`, `crates/ebpf/Cargo.lock`), with registry
+checksums. An ordinary networked fetch resolves them; no Git configuration
+or local mirror is needed:
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.98.1 fetch --locked
+mise exec -- ./scripts/cargo.sh +1.99.1 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
@@ -102,14 +147,35 @@ instead, which carries the complete Cargo dependency payload; see
 
 ## Canonical Rust gates
 
+Use the [verification tiers](../CONTRIBUTING.md#verification) while developing:
+focused tests for each subtask, affected checks for an integration batch, then
+these complete gates on the assembled candidate. A complete equivalent CI run
+at that revision can supply the host gate; do not automatically repeat it
+locally. BPF/live/package acceptance still needs its own applicable checks.
+
 Run repository commands through `scripts/cargo.sh`; invoking Cargo directly
 bypasses generated dependency preparation. Keep the existing toolchain
 selectors and gate flags. Set a private disk-backed `TMPDIR` as described
 in [contributor verification](../CONTRIBUTING.md#verification) before tests:
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.98.1 fmt --all -- --check
-mise exec -- ./scripts/cargo.sh +1.98.1 check --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
+mise exec -- ./scripts/cargo.sh +1.99.1 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.99.1 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.99.1 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.99.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
+
+## Build switches
+
+Three environment switches select optional build content. Each accepts unset
+(the default below), `0` for off, or `1` for on; anything else fails the build.
+
+- `P11SCOPE_JOURNAL`: builds the production journal object. On by default in
+  FULL and P0 builds; SMALL, WIDE and unsafe builds omit it silently, and
+  explicit `=1` there fails instead. `=0` omits it everywhere.
+- `P11SCOPE_BIRTH_MARKER`: compiles the birth marker into Detailed objects.
+  Unset follows the journal decision; `=0` omits it from Detailed objects, and
+  `=1` selects it on any Detailed build. The journal object always carries the
+  marker; `P11SCOPE_JOURNAL=0` removes it.
+- `P11SCOPE_LOADER_GATE`: compiles the experimental loader gate. Off by
+  default; leave it off unless a task explicitly asks for it.

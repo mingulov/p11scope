@@ -4,15 +4,49 @@
 //! (the lower bound of the containing bucket), which every renderer must
 //! state.
 
+// Staged private collector; Session acquisition and admission charging follow
+// separately. Existing readers and their public report layout stay unchanged.
+#[cfg_attr(not(test), allow(dead_code))]
+mod counter_collector;
+
+// Private, unselected native reader; runtime admission/activation is separate.
+#[cfg_attr(not(test), allow(dead_code))]
+mod counter_reader;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod counter_projection;
+
+// Selected-detail handoff→gate adapter (6.15 phase 2). Crate-visible
+// (unlike the private collector siblings) because the attach gate
+// shims and the future driver call into it; the banks-level seams
+// stay `pub(super)` so only metrics code handles raw reads.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod selected_detail;
+// 6.15 driver packet (this lane): CLI endpoint selection plus live
+// promotion/demotion orchestration over the adapter above. The host
+// composition calls the orchestration entries; the selection stage
+// and composer are production-live.
+pub(crate) mod selected_detail_driver;
+// K0 live cells (this lane): `--select-endpoint` detail on a real
+// SoftHSM workload, run by the controller on Fedora as root.
+#[cfg(test)]
+mod k0_live_cells;
+
+pub(crate) use counter_projection::{CaptureCollection, CaptureSnapshot, CounterCaptureInputs};
+
+#[cfg(test)]
+pub(crate) use counter_projection::tests::{ConsumerFault, ConsumerFixture};
+
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};
 use aya::maps::{Array, PerCpuArray, PerCpuHashMap};
 use p11scope_ebpf_common::{
-    EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
+    CounterMode, EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
-    EVIDENCE_UNREGISTERED_MECHANISMS, ImageIdentityControl, LATENCY_BUCKETS, OWNER_BAD_CONTROL,
+    EVIDENCE_UNREGISTERED_MECHANISMS, IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect,
+    ImageIdentityControl, LATENCY_BUCKETS, LOADER_GATE_SLOTS, LoaderGateControl, OWNER_BAD_CONTROL,
     OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED, OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED,
     OWNER_DIRECTORY_MISMATCH, OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED,
     OWNER_START_COUNT_MISMATCH, OWNER_START_KEY_MISMATCH, OWNER_START_ROW_MISSING,
@@ -39,6 +73,9 @@ pub struct SlotReport {
     /// endpoint whose post-mutation generation validation failed). Exclusive
     /// with `module_ambiguous` by construction.
     pub module_unresolved: bool,
+    /// Timing capability of the native counter cell used for this row,
+    /// independent of semantic authorization or requested CLI options.
+    pub mode: CounterMode,
     /// Completed calls (entry and return both observed).
     pub calls: u64,
     pub errors: u64,
@@ -74,6 +111,8 @@ fn slot_report(
         // The exclusive third case, derived from the other two rather than
         // from a second owner list that could drift out of step with them.
         module_unresolved: module.is_none() && !module_ambiguous,
+        // This constructor consumes the actual legacy SlotStats layout.
+        mode: CounterMode::Latency,
         calls: acc.returned,
         errors: acc.errors,
         in_flight: acc.entered.saturating_sub(acc.returned),
@@ -278,6 +317,100 @@ impl KernelControlEvidence {
     }
 }
 
+/// L4b loader transitions: capture-wide saturating u64 totals read from
+/// the session's single native loader-gate control cell. RED stub: the
+/// shapes below encode the approved counter contract; the mapping lands
+/// with the snapshot linkage.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct LoaderTransitions {
+    /// Successful gate admissions.
+    pub arms: u64,
+    /// Acknowledged row reclaims.
+    pub reclaims: u64,
+    /// Peak simultaneous retained rows.
+    pub retained_peak: u64,
+    /// Post-cutover counted refusals.
+    pub refusals: u64,
+    /// Accounting update losses (bounds, not exact facts, when nonzero).
+    pub update_losses: u64,
+}
+
+impl LoaderTransitions {
+    /// Map the gate control cell to published totals. `None` (map absent
+    /// or control malformed) stays `None`: a refused field never links,
+    /// and absence is never published as zero. Only the five approved
+    /// F1 totals leave this function; `limit`, `cutover`, `retired`
+    /// and `retained` stay private.
+    pub fn from_control(control: Option<LoaderGateControl>) -> Option<Self> {
+        let control = control?;
+        if control.limit != u64::from(LOADER_GATE_SLOTS) {
+            return None;
+        }
+        Some(Self {
+            arms: control.admitted,
+            reclaims: control.reclaims,
+            retained_peak: control.retained_peak,
+            refusals: control.refusals,
+            update_losses: control.update_losses,
+        })
+    }
+}
+
+/// L4b image transitions: capture-wide saturating u64 totals derived
+/// from the native image-bank selection cell plus the live per-bank
+/// watermarks, without spending a ticket. RED stub: the shapes below
+/// encode the approved counter contract; the derivation lands with the
+/// snapshot linkage.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ImageTransitions {
+    /// Allocated ticket-number watermark (folded plus live).
+    pub tickets_issued: u64,
+    /// Completed bank cuts.
+    pub bank_cuts: u64,
+    /// Bank quota refusals.
+    pub bank_refusals: u64,
+    /// Accounting update losses (bounds, not exact facts, when nonzero).
+    pub update_losses: u64,
+}
+
+impl ImageTransitions {
+    /// Derive the published totals. `None` unless the bank producer
+    /// (SELECT) and both bank controls are present and valid: a refused
+    /// field never links, and absence is never published as zero. The
+    /// issuance watermark adds the folded total to the live per-bank
+    /// watermarks without spending a ticket; a folded bank contributes
+    /// through the folded total only, never twice. Only the four
+    /// approved F2 totals leave this function.
+    pub fn from_cells(
+        select: Option<ImageBankSelect>,
+        bank_a: Option<ImageIdentityControl>,
+        bank_b: Option<ImageIdentityControl>,
+    ) -> Option<Self> {
+        let select = select?;
+        let bank_a = bank_a?;
+        let bank_b = bank_b?;
+        for bank in [&bank_a, &bank_b] {
+            if bank.limit != IMAGE_IDENTITY_TICKET_LIMIT || bank.next_ticket > bank.limit {
+                return None;
+            }
+        }
+        let live = |folded: u64, next_ticket: u64| {
+            if folded == 0 { next_ticket } else { 0 }
+        };
+        let tickets_issued = select
+            .folded_issued
+            .saturating_add(live(select.folded[0], bank_a.next_ticket));
+        let tickets_issued =
+            tickets_issued.saturating_add(live(select.folded[1], bank_b.next_ticket));
+        Some(Self {
+            tickets_issued,
+            bank_cuts: select.cuts,
+            bank_refusals: select.refusals,
+            update_losses: select.update_losses,
+        })
+    }
+}
+
 /// One `Array` control cell, when the loaded object carries it.
 fn control_cell<T: aya::Pod>(session: &Session, name: &str) -> Result<Option<T>> {
     let Some(map) = session.ebpf.map(name) else {
@@ -340,6 +473,27 @@ pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
         abi_refusals: read(EVIDENCE_ABI_REFUSALS)?,
         control,
     })
+}
+
+/// L4b loader snapshot from a live session: the gate control cell mapped
+/// through the approved counter contract. `None` when this build carries
+/// no gate, the map is absent, or the cell is unpublished or malformed.
+/// Staged read path; no evidence linkage.
+pub fn loader_transitions(session: &Session) -> Result<Option<LoaderTransitions>> {
+    Ok(LoaderTransitions::from_control(
+        session.loader_gate_control()?,
+    ))
+}
+
+/// L4b image snapshot from a live session: the bank-select word plus both
+/// bank watermarks, derived without spending a ticket. `None` unless the
+/// producer and both controls are present and valid. Staged read path; no
+/// evidence linkage.
+pub fn image_transitions(session: &Session) -> Result<Option<ImageTransitions>> {
+    let select = session.image_bank_select()?;
+    let bank_a = control_cell::<ImageIdentityControl>(session, "COOKIE_CTL")?;
+    let bank_b = session.bank_b_control()?;
+    Ok(ImageTransitions::from_cells(select, bank_a, bank_b))
 }
 
 /// Sum of counter cells (per-CPU values, histogram buckets), saturating at
@@ -692,9 +846,13 @@ mod tests {
             object,
             entry_objects: vec![vec![object; 3]],
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -719,6 +877,7 @@ mod tests {
                     file_offset: Some(0x100),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![],
             },
@@ -981,5 +1140,347 @@ mod tests {
 
         plan.extend_exact(candidate).unwrap();
         assert_eq!(plan.module_of_slot(0), None);
+    }
+
+    fn gate_control() -> LoaderGateControl {
+        LoaderGateControl {
+            limit: 256,
+            cutover: 1,
+            admitted: 11,
+            refusals: 2,
+            retired: 7,
+            reclaims: 5,
+            retained: 6,
+            retained_peak: 9,
+            update_losses: 1,
+        }
+    }
+
+    fn bank_select() -> ImageBankSelect {
+        ImageBankSelect {
+            bank: 0,
+            prepared: [1, 0],
+            cuts: 1,
+            refusals: 2,
+            incarnation: [0, 0],
+            folded: [0, 0],
+            folds: 0,
+            folded_issued: 100,
+            update_losses: 0,
+        }
+    }
+
+    fn bank_control(next_ticket: u64) -> ImageIdentityControl {
+        ImageIdentityControl {
+            limit: 16_384,
+            next_ticket,
+            unavailable: 0,
+            create_failures: 0,
+            retry_exhausted: 0,
+        }
+    }
+
+    fn json_keys(value: &serde_json::Value) -> std::collections::BTreeSet<&str> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn loader_transitions_link_present_control_and_refuse_absence() {
+        assert_eq!(LoaderTransitions::from_control(None), None);
+        assert_eq!(
+            LoaderTransitions::from_control(Some(gate_control())),
+            Some(LoaderTransitions {
+                arms: 11,
+                reclaims: 5,
+                retained_peak: 9,
+                refusals: 2,
+                update_losses: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn loader_transitions_absent_is_never_zero() {
+        // Absence is None, never a zero-filled struct: without the
+        // producer there is nothing to report, not a quiet capture.
+        assert_eq!(LoaderTransitions::from_control(None), None);
+        assert_ne!(
+            LoaderTransitions::from_control(None),
+            Some(LoaderTransitions::default())
+        );
+    }
+
+    #[test]
+    fn loader_transitions_publish_exactly_five_u64_cells() {
+        let expected = std::collections::BTreeSet::from([
+            "arms",
+            "reclaims",
+            "refusals",
+            "retained_peak",
+            "update_losses",
+        ]);
+        let default_json = serde_json::to_value(LoaderTransitions::default()).unwrap();
+        assert_eq!(json_keys(&default_json), expected);
+        let linked = LoaderTransitions::from_control(Some(gate_control())).unwrap();
+        let json = serde_json::to_value(&linked).unwrap();
+        assert_eq!(json_keys(&json), expected);
+        assert_eq!(json["arms"], 11);
+        assert_eq!(json["reclaims"], 5);
+        assert_eq!(json["retained_peak"], 9);
+        assert_eq!(json["refusals"], 2);
+        assert_eq!(json["update_losses"], 1);
+        for key in expected {
+            assert!(json[key].is_u64(), "{key} must be a u64, not a bool");
+        }
+    }
+
+    #[test]
+    fn loader_transitions_hide_private_gate_words() {
+        let control = LoaderGateControl {
+            limit: 256,
+            cutover: 9001,
+            retired: 7001,
+            retained: 3001,
+            ..gate_control()
+        };
+        let linked = LoaderTransitions::from_control(Some(control)).unwrap();
+        let text = serde_json::to_value(&linked).unwrap().to_string();
+        for private in ["256", "9001", "7001", "3001"] {
+            assert!(!text.contains(private), "{private} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn loader_transitions_refuse_malformed_control() {
+        for limit in [0, 1, 255, 257, 512, u64::MAX] {
+            let control = LoaderGateControl {
+                limit,
+                ..gate_control()
+            };
+            assert_eq!(
+                LoaderTransitions::from_control(Some(control)),
+                None,
+                "limit={limit} is malformed and must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn image_transitions_derive_issuance_and_refuse_absence() {
+        assert_eq!(ImageTransitions::from_cells(None, None, None), None);
+        // folded_issued plus both live watermarks, saturating.
+        let linked = ImageTransitions::from_cells(
+            Some(bank_select()),
+            Some(bank_control(10)),
+            Some(bank_control(20)),
+        )
+        .unwrap();
+        assert_eq!(
+            linked,
+            ImageTransitions {
+                tickets_issued: 130,
+                bank_cuts: 1,
+                bank_refusals: 2,
+                update_losses: 0,
+            }
+        );
+        // A retired-pending bank contributes through folded_issued, so
+        // its still-intact watermark is excluded, never double counted.
+        let folding = ImageBankSelect {
+            folded: [1, 0],
+            folded_issued: 100,
+            ..bank_select()
+        };
+        let linked = ImageTransitions::from_cells(
+            Some(folding),
+            Some(bank_control(10)),
+            Some(bank_control(20)),
+        )
+        .unwrap();
+        assert_eq!(linked.tickets_issued, 120);
+        // Saturation at the ceiling, never a wrap to a small count.
+        let full = ImageBankSelect {
+            folded_issued: u64::MAX,
+            ..bank_select()
+        };
+        let linked = ImageTransitions::from_cells(
+            Some(full),
+            Some(bank_control(10)),
+            Some(bank_control(20)),
+        )
+        .unwrap();
+        assert_eq!(linked.tickets_issued, u64::MAX);
+    }
+
+    #[test]
+    fn image_transitions_absent_is_never_zero() {
+        assert_eq!(ImageTransitions::from_cells(None, None, None), None);
+        assert_ne!(
+            ImageTransitions::from_cells(None, None, None),
+            Some(ImageTransitions::default())
+        );
+        // Any missing input refuses the whole field, never a partial sum.
+        let select = Some(bank_select());
+        let control = Some(bank_control(10));
+        assert_eq!(ImageTransitions::from_cells(None, control, control), None);
+        assert_eq!(ImageTransitions::from_cells(select, None, control), None);
+        assert_eq!(ImageTransitions::from_cells(select, control, None), None);
+    }
+
+    #[test]
+    fn image_transitions_publish_exactly_four_u64_cells() {
+        let expected = std::collections::BTreeSet::from([
+            "bank_cuts",
+            "bank_refusals",
+            "tickets_issued",
+            "update_losses",
+        ]);
+        let default_json = serde_json::to_value(ImageTransitions::default()).unwrap();
+        assert_eq!(json_keys(&default_json), expected);
+        let linked = ImageTransitions::from_cells(
+            Some(bank_select()),
+            Some(bank_control(10)),
+            Some(bank_control(20)),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&linked).unwrap();
+        assert_eq!(json_keys(&json), expected);
+        assert_eq!(json["tickets_issued"], 130);
+        assert_eq!(json["bank_cuts"], 1);
+        assert_eq!(json["bank_refusals"], 2);
+        assert_eq!(json["update_losses"], 0);
+        for key in expected {
+            assert!(json[key].is_u64(), "{key} must be a u64, not a bool");
+        }
+    }
+
+    #[test]
+    fn image_transitions_hide_private_bank_words() {
+        let select = ImageBankSelect {
+            bank: 1,
+            prepared: [0, 1],
+            incarnation: [6001, 6002],
+            folded: [0, 1],
+            folds: 6003,
+            ..bank_select()
+        };
+        let linked = ImageTransitions::from_cells(
+            Some(select),
+            Some(bank_control(10)),
+            Some(bank_control(20)),
+        )
+        .unwrap();
+        let text = serde_json::to_value(&linked).unwrap().to_string();
+        for private in ["6001", "6002", "6003"] {
+            assert!(!text.contains(private), "{private} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn image_transitions_refuse_invalid_controls() {
+        let select = Some(bank_select());
+        let good = Some(bank_control(10));
+        // A watermark past the budget or a wrong limit fails closed.
+        for bad in [
+            bank_control(16_385),
+            bank_control(u64::MAX),
+            ImageIdentityControl {
+                limit: 0,
+                ..bank_control(10)
+            },
+            ImageIdentityControl {
+                limit: u64::MAX,
+                ..bank_control(10)
+            },
+        ] {
+            assert_eq!(
+                ImageTransitions::from_cells(select, Some(bad), good),
+                None,
+                "bank A {bad:?} must refuse"
+            );
+            assert_eq!(
+                ImageTransitions::from_cells(select, good, Some(bad)),
+                None,
+                "bank B {bad:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn production_build_selects_loader_gate_behind_env_switch() {
+        let source = include_str!("../build.rs");
+        // Unset/0 = inactive default, 1 = production wiring, else refuse.
+        assert!(
+            source.contains("P11SCOPE_LOADER_GATE"),
+            "build.rs selects no loader gate switch"
+        );
+        assert!(
+            source.contains("cargo:rerun-if-env-changed=P11SCOPE_LOADER_GATE"),
+            "the gate switch must invalidate the build cache"
+        );
+        assert!(
+            source.contains("P11SCOPE_LOADER_GATE_ENABLED"),
+            "the gate selection must be an emitted contract"
+        );
+    }
+
+    #[test]
+    fn production_flavors_compile_gate_unit_with_define() {
+        let source = include_str!("../build.rs");
+        assert!(
+            source.contains("\"loader_gate\""),
+            "no flavor compiles the gate unit"
+        );
+        assert_eq!(
+            source.matches("-DP11SCOPE_LOADER_GATE").count(),
+            1,
+            "exactly one production gate define"
+        );
+        assert!(
+            source.contains("--cfg=p11scope_loader_gate"),
+            "the Rust gate maps need their cfg"
+        );
+        // Quote-terminated: LOADER_GATE must not match LOADER_GATE_CTL.
+        assert_eq!(
+            source.matches("link-arg=--export=LOADER_GATE\"").count(),
+            1,
+            "the rows map must survive the native link"
+        );
+        assert_eq!(
+            source
+                .matches("link-arg=--export=LOADER_GATE_CTL\"")
+                .count(),
+            1,
+            "the control map must survive the native link"
+        );
+        for unit in ["loader_gate.c", "loader_gate.h"] {
+            assert!(
+                source.contains(&format!("cargo:rerun-if-changed=crates/ebpf/native/{unit}")),
+                "native {unit} edits must invalidate the build cache"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_gate_compiles_keep_their_own_define() {
+        // The three harness -D sites stay exactly as they are; the
+        // production wiring adds a new define, never moves theirs.
+        let standalone = include_str!("../tests/loader_gate_standalone.rs");
+        let retirement = include_str!("../tests/task_owner_contracts.rs");
+        assert_eq!(
+            standalone.matches("-DP11SCOPE_LOADER_GATE").count(),
+            2,
+            "standalone harness compiles must keep both -D sites"
+        );
+        assert_eq!(
+            retirement.matches("-DP11SCOPE_LOADER_GATE").count(),
+            1,
+            "retirement fixture compile must keep its -D site"
+        );
     }
 }

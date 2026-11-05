@@ -10,6 +10,7 @@ from what the oracle accepts.
 Run: python3 -I tests/python/test_schema_json.py -v
 """
 
+import copy
 import json
 import runpy
 import unittest
@@ -29,15 +30,712 @@ def evidence_schema():
 
 
 class SchemaOracleAgreement(unittest.TestCase):
+    def metrics_document(self):
+        return CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+
+    def counter_document(self, *, mode="counts", failure=None, discontinuity=False):
+        document = self.metrics_document()
+        evidence = document["evidence"]
+        evidence["counter_collection"] = {
+            "mode": mode,
+            "generation": 2,
+            "read_window": {"started_ns": 10, "finished_ns": 20},
+            "status": "fresh" if failure is None else "stale",
+            "health": {"saturated": False, "contended": False} if failure is None else None,
+            "discontinuity": discontinuity,
+            "failure": failure,
+        }
+        if failure is not None or discontinuity:
+            evidence["completeness"] = "PARTIAL"
+            evidence["verdict_detail"] = "concrete_gap"
+            observation = evidence["gap_classes"]["observation"]
+            observation["status"] = "lossy"
+            observation["causes"].append("counter_collection")
+        return document
+
+    def selected_document(self, *, selection="resolved", events=(), mode="counts",
+                          with_close_products=False):
+        """A metrics document carrying the 6.15 selection envelope. The
+        default mirrors the R1 root positive shape: the resolved slot
+        plus the honest host-seam refusal and no window yet. Selection
+        "unresolved" mirrors the named-refusal record; "omitted" drops
+        the record (a close-only ledger)."""
+        document = self.metrics_document()
+        section = {"events": list(events)}
+        if selection == "resolved":
+            section["selection"] = {
+                "endpoint": "counter_bank_growth_e0007",
+                "slot": 7,
+                "file_offset": 0x120,
+                "names": ["counter_bank_growth_e0007"],
+                "refusal": "bundle_unavailable",
+            }
+        elif selection == "unresolved":
+            section["selection"] = {
+                "endpoint": "C_Missing",
+                "refusal": "endpoint_unknown",
+            }
+        elif selection != "omitted":
+            raise AssertionError(f"unknown selection shape: {selection!r}")
+        if with_close_products:
+            section["lineage"] = self.selected_lineage()
+            section["aggregate"] = self.selected_bracket(detail=False, mode=mode)
+            section["detail"] = self.selected_bracket(detail=True, mode=mode)
+        document["evidence"]["selected_detail"] = section
+        return document
+
+    @staticmethod
+    def selected_mark(seq):
+        return {
+            "seq": seq,
+            "generation": 7,
+            "indices": [0, 1, 2, 3],
+            "bank_ids": [[0, 0], [1, 0]],
+            "transaction": None,
+        }
+
+    def selected_lineage(self):
+        return {
+            "request": 3,
+            "caller": 3,
+            "provider": 5,
+            "view": 11,
+            "endpoint_offset": 144,
+            "broad_original_index": 1,
+            "broad_generation": 7,
+            "detail_generation": 9,
+            "broad_read_seq_before": 1,
+            "broad_read_seq_after": 2,
+            "broad_mark_before": self.selected_mark(1),
+            "broad_mark_after": self.selected_mark(2),
+            "drift": None,
+            "after_read": "matched",
+        }
+
+    @staticmethod
+    def selected_row(mode, slot=0):
+        row = {
+            "slot": slot,
+            "object": 1,
+            "file_offset": 128 + slot * 16,
+            "entered": 3,
+            "returned": 3,
+            "errors": 0,
+            "rv_counts": {"0": 3},
+        }
+        if mode in ("timestamps", "latency"):
+            row["total_ns"] = 30
+            row["max_ns"] = 10
+        if mode == "latency":
+            row["buckets"] = [0] * 32
+        return row
+
+    def selected_bracket(self, *, detail, mode="counts"):
+        fragment = {
+            "scope": "detail" if detail else "broad",
+            "unit": "calls",
+            "mode": mode,
+            "mode_mixed": False,
+            "rows": [self.selected_row(mode, slot) for slot in (0, 1)],
+        }
+        if detail:
+            fragment["detail_generation"] = 9
+        else:
+            fragment["seq_before"] = 1
+            fragment["seq_after"] = 2
+        return fragment
+
+    @staticmethod
+    def selected_events_covering_every_row():
+        return [
+            {"event": "reserved", "request": 3, "caller": 3, "provider": 5,
+             "seq": 1, "note": "selected 0x80"},
+            {"event": "bound", "request": 3, "caller": 3, "provider": 5, "seq": 1},
+            {"event": "cas_won", "request": 3, "caller": 3, "provider": 5, "seq": 1},
+            {"event": "cas_refused", "request": 3, "caller": 3, "provider": 5, "seq": 1},
+            {"event": "closed", "request": 3, "caller": 3, "provider": 5, "seq": 2},
+            {"event": "cancelled_unactivated", "request": 4, "caller": 3,
+             "provider": 5, "seq": 2, "note": "cancelled before delivery"},
+            {"event": "close_refused", "request": 4, "caller": 3, "provider": 5,
+             "view": 11, "endpoint_offset": 128, "refusal": "quarantined"},
+            {"event": "reserve_refused", "request": 5, "caller": 3, "provider": 5,
+             "refusal": "window_active", "seq": None},
+            {"event": "reserve_refused", "request": 6, "caller": 3, "provider": 5,
+             "refusal": "child_shape", "seq": 2},
+            {"event": "start_refused", "request": 7, "caller": 3, "provider": 5,
+             "reason": "ambiguous endpoints"},
+            {"event": "promotion_outcome", "request": 3, "outcome": "refused",
+             "reason": "preparation failed"},
+            {"event": "promotion_outcome", "request": 4, "outcome": "ended",
+             "reason": "run stopped"},
+            {"event": "promotion_outcome", "request": 5, "outcome": "active",
+             "caller": 3, "provider": 5},
+        ]
+
+    def test_counter_collection_optional_fresh_modes_and_unknown_window(self):
+        legacy = self.metrics_document()
+        CHECKER["exact_metrics_schema"](legacy)
+        self.assertNotIn("counter_collection", legacy["evidence"])
+        for mode in ("counts", "timestamps", "latency"):
+            with self.subTest(mode=mode):
+                document = self.counter_document(mode=mode)
+                CHECKER["exact_metrics_schema"](document)
+                document["evidence"]["counter_collection"]["read_window"] = None
+                CHECKER["exact_metrics_schema"](document)
+
+    def test_counter_collection_stale_and_discontinuity_require_concrete_gap(self):
+        for failure in ("read_rvs", "saturated", "contended"):
+            with self.subTest(failure=failure):
+                document = self.counter_document(failure=failure)
+                CHECKER["exact_metrics_schema"](document)
+                for field, value in (("completeness", "COMPLETE"),
+                                     ("verdict_detail", "clean_proven")):
+                    invalid = copy.deepcopy(document)
+                    invalid["evidence"][field] = value
+                    with self.assertRaises(AssertionError):
+                        CHECKER["exact_metrics_schema"](invalid)
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["gap_classes"]["observation"]["causes"].remove("counter_collection")
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        document = self.counter_document(discontinuity=True)
+        CHECKER["exact_metrics_schema"](document)
+        document["evidence"]["counter_collection"]["discontinuity"] = False
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](document)
+
+    def test_counter_collection_closed_shape_and_consistency_twins(self):
+        healthy = self.counter_document()
+        stale = self.counter_document(failure="read_rvs")
+        invalid_values = (
+            (healthy, {"extra": 1}),
+            (healthy, {"mode": "requested"}),
+            (healthy, {"generation": 0}),
+            (healthy, {"generation": True}),
+            (healthy, {"generation": 2**64}),
+            (healthy, {"read_window": {"started_ns": 20, "finished_ns": 10}}),
+            (healthy, {"read_window": {"started_ns": True, "finished_ns": 20}}),
+            (healthy, {"read_window": {"started_ns": 10, "finished_ns": 20, "extra": 0}}),
+            (healthy, {"status": "cached"}),
+            (healthy, {"discontinuity": 1}),
+            (healthy, {"failure": "read_rvs"}),
+            (healthy, {"health": None}),
+            (healthy, {"health": {"saturated": True, "contended": False}}),
+            (healthy, {"health": {"saturated": False, "contended": 0}}),
+            (healthy, {"health": {"saturated": False, "contended": False, "extra": False}}),
+            (stale, {"failure": None}),
+            (stale, {"failure": "arbitrary"}),
+            (stale, {"health": {"saturated": False, "contended": False}}),
+        )
+        for document, patch in invalid_values:
+            with self.subTest(patch=patch):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["counter_collection"].update(patch)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for field in healthy["evidence"]["counter_collection"]:
+            with self.subTest(missing=field):
+                invalid = copy.deepcopy(healthy)
+                del invalid["evidence"]["counter_collection"][field]
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        historical["evidence"]["counter_collection"] = healthy["evidence"]["counter_collection"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_counter_collection_schema_matches_finite_oracle_shape(self):
+        collection = evidence_schema()["properties"]["counter_collection"]
+        keys = {"mode", "generation", "read_window", "status", "health", "discontinuity", "failure"}
+        self.assertEqual(set(collection["required"]), keys)
+        self.assertEqual(set(collection["properties"]), keys)
+        self.assertFalse(collection["additionalProperties"])
+        self.assertNotIn("counter_collection", evidence_schema()["required"])
+        failure = collection["properties"]["failure"]["enum"]
+        self.assertEqual(set(failure) - {None}, set(CHECKER["COUNTER_COLLECTION_FAILURES"]))
+        self.assertIn(None, failure)
+
+    def test_counter_mode_agrees_with_function_timing_in_both_document_lanes(self):
+        timestamp = {"approximate": False, "p50": None, "p95": None, "p99": None,
+                     "total": 0, "max": 0}
+        histogram_zero = {**timestamp, "approximate": True, "p50": 0, "p95": 0, "p99": 0}
+        histogram_empty = {**timestamp, "approximate": True}
+        for profile in (False, True):
+            for mode, timing in (("counts", None), ("timestamps", timestamp),
+                                 ("latency", histogram_zero), ("latency", histogram_empty)):
+                with self.subTest(profile=profile, mode=mode, timing=timing):
+                    document = self.counter_document(mode=mode)
+                    check = CHECKER["exact_metrics_schema"]
+                    if profile:
+                        document = CHECKER["document_fixture"](document["evidence"])
+                        check = CHECKER["exact_profile_v3_selection"]
+                    row = {
+                        "names": ["C_Sign"], "aliased": False, "module": None,
+                        "module_ambiguous": False, "module_unresolved": True,
+                        "target": {"object": None, "file_offset": 16}, "ordinals": [],
+                        "calls": 0, "errors": 0, "pending_returns": 0, "in_flight": 0,
+                        "rv_counts": {}, "latency_ns": timing,
+                    }
+                    document["functions"] = [row]
+                    check(document)
+                    contradictions = (timestamp, histogram_zero) if mode == "counts" else (
+                        (None, histogram_zero) if mode == "timestamps" else (None, timestamp))
+                    for contradiction in contradictions:
+                        invalid = copy.deepcopy(document)
+                        invalid["functions"][0]["latency_ns"] = contradiction
+                        with self.assertRaises(AssertionError):
+                            check(invalid)
+                    missing = copy.deepcopy(document)
+                    del missing["functions"][0]["latency_ns"]
+                    with self.assertRaises(AssertionError):
+                        check(missing)
+                    if mode != "counts":
+                        for patch in ({"extra": 1}, {"total": True}, {"max": -1},
+                                      {"total": 2**64}, {"p95": False}):
+                            invalid = copy.deepcopy(document)
+                            invalid["functions"][0]["latency_ns"].update(patch)
+                            with self.assertRaises(AssertionError):
+                                check(invalid)
+
+    def test_counter_mode_schema_selects_the_existing_timing_shapes(self):
+        by_mode = {}
+        for branch in SCHEMA["allOf"]:
+            evidence = branch["if"].get("properties", {}).get("evidence", {})
+            collection = evidence.get("properties", {}).get("counter_collection")
+            if collection is None:
+                continue
+            mode = collection["properties"]["mode"]["const"]
+            self.assertEqual(evidence["required"], ["counter_collection"])
+            row = branch["then"]["properties"]["functions"]["items"]
+            self.assertEqual(row["required"], ["latency_ns"])
+            pointer = row["properties"]["latency_ns"]["$ref"]
+            shape = SCHEMA
+            for key in pointer.removeprefix("#/").split("/"):
+                shape = shape[int(key)] if isinstance(shape, list) else shape[key]
+            by_mode[mode] = shape
+        self.assertEqual(set(by_mode), {"counts", "timestamps", "latency"})
+        self.assertEqual(by_mode["counts"], {"type": "null"})
+        for mode, approximate in (("timestamps", False), ("latency", True)):
+            shape = by_mode[mode]
+            self.assertEqual(shape["type"], "object")
+            self.assertIs(shape["properties"]["approximate"]["const"], approximate)
+            for field in ("total", "max"):
+                self.assertEqual(shape["properties"][field]["type"], "integer")
+            for field in ("p50", "p95", "p99"):
+                self.assertEqual(shape["properties"][field]["type"],
+                                 "null" if mode == "timestamps" else ["integer", "null"])
+
+    def test_selected_detail_optional_legacy_omission_and_resolved_positive(self):
+        """Legacy captures omit the envelope; the R1 root-positive shape
+        (resolved slot plus the honest host-seam refusal) passes the
+        real metrics consumer, in the metrics lane and the shared
+        profile-lane evidence path (the producer's CLI policy gates the
+        lane; the consumer enforces the closed shape in both)."""
+        legacy = self.metrics_document()
+        self.assertNotIn("selected_detail", legacy["evidence"])
+        CHECKER["exact_metrics_schema"](legacy)
+        resolved = self.selected_document()
+        CHECKER["exact_metrics_schema"](resolved)
+        profile = CHECKER["document_fixture"](resolved["evidence"])
+        CHECKER["exact_profile_v3_selection"](profile)
+
+    def test_selected_detail_unresolved_and_driver_refusal_shapes(self):
+        unresolved = self.selected_document(selection="unresolved")
+        CHECKER["exact_metrics_schema"](unresolved)
+        for refusal in ("promotion_activation_failed", "promotion_scope_unsupported",
+                        "broad_plan_topology", "window_active", "endpoint_unknown",
+                        "bundle_unavailable"):
+            with self.subTest(refusal=refusal):
+                document = self.selected_document(selection="unresolved")
+                document["evidence"]["selected_detail"]["selection"]["refusal"] = refusal
+                CHECKER["exact_metrics_schema"](document)
+        omitted = self.selected_document(
+            selection="omitted", events=[{"event": "closed", "request": 3, "caller": 3,
+                                                  "provider": 5, "seq": 2}],
+            with_close_products=True)
+        CHECKER["exact_metrics_schema"](omitted)
+
+    def test_selected_detail_close_products_shape(self):
+        """Every ledger row kind plus lineage and both brackets pass in
+        each counter mode; drift variants and mismatch words pass."""
+        for mode in ("counts", "timestamps", "latency"):
+            with self.subTest(mode=mode):
+                document = self.selected_document(
+                    events=self.selected_events_covering_every_row(),
+                    mode=mode, with_close_products=True)
+                CHECKER["exact_metrics_schema"](document)
+        drifts = (None,
+                  {"kind": "generation", "before": 7, "after": 9},
+                  {"kind": "indices", "before": [0, 1], "after": [0, 1, 2]},
+                  {"kind": "bank_ids", "bank": 1, "before": 0, "after": None},
+                  {"kind": "transaction", "before": None, "after": 12})
+        for drift in drifts:
+            with self.subTest(drift=drift):
+                document = self.selected_document(with_close_products=True)
+                document["evidence"]["selected_detail"]["lineage"]["drift"] = drift
+                CHECKER["exact_metrics_schema"](document)
+        for after_read in ("matched", "unavailable", "mismatched:generation",
+                           "mismatched:rows", "mismatched:rejected"):
+            with self.subTest(after_read=after_read):
+                document = self.selected_document(with_close_products=True)
+                document["evidence"]["selected_detail"]["lineage"]["after_read"] = after_read
+                CHECKER["exact_metrics_schema"](document)
+
+    def test_selected_detail_rejects_forbidden_identities(self):
+        """No raw PID/TID anywhere in the envelope: the removed
+        `original_pid` publication and any pid-shaped extra key fail the
+        closed-key checks, in the selection record and every nested row."""
+        resolved = self.selected_document()
+        resolved["evidence"]["selected_detail"]["selection"]["original_pid"] = 4242
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](resolved)
+        full = self.selected_document(
+            events=self.selected_events_covering_every_row(),
+            with_close_products=True)
+        section = full["evidence"]["selected_detail"]
+        section["original_pid"] = 4242
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](full)
+        del section["original_pid"]
+        section["events"][0]["original_pid"] = 4242
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](full)
+        del section["events"][0]["original_pid"]
+        section["lineage"]["original_pid"] = 4242
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](full)
+        del section["lineage"]["original_pid"]
+        section["aggregate"]["rows"][0]["original_pid"] = 4242
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](full)
+
+    def test_selected_detail_rejects_unknown_nested_fields(self):
+        """Every nested object is closed: one unknown field at each level
+        fails, and the historical lane rejects the whole envelope."""
+        full = self.selected_document(
+            events=self.selected_events_covering_every_row(),
+            with_close_products=True)
+        mutations = [
+            ("envelope", []),
+            ("selection", ["selection"]),
+            ("window row", ["events", 0]),
+            ("close_refused row", ["events", 6]),
+            ("reserve_refused row", ["events", 7]),
+            ("start_refused row", ["events", 9]),
+            ("outcome row", ["events", 10]),
+            ("lineage", ["lineage"]),
+            ("mark", ["lineage", "broad_mark_before"]),
+            ("aggregate", ["aggregate"]),
+            ("detail", ["detail"]),
+            ("cell row", ["aggregate", "rows", 0]),
+        ]
+        for label, path in mutations:
+            with self.subTest(level=label):
+                invalid = copy.deepcopy(full)
+                node = invalid["evidence"]["selected_detail"]
+                for key in path:
+                    node = node[key]
+                node["unexpected_field"] = 1
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        historical["evidence"]["selected_detail"] = full["evidence"]["selected_detail"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_selected_detail_rejects_bad_vocabularies(self):
+        """Finite words only: bad refusals, labels, outcomes, modes and
+        mode-conditional row keys fail, as do uncorrelated slot/offset
+        and empty endpoint/names."""
+        full = self.selected_document(
+            events=self.selected_events_covering_every_row(),
+            with_close_products=True)
+        cases = [
+            ("selection", {"refusal": "no_such_refusal"}),
+            ("selection", {"refusal": "preparation failed"}),
+            ("selection", {"endpoint": ""}),
+            ("selection", {"names": []}),
+            ("selection", {"names": [""]}),
+            ("selection", {"slot": True}),
+            ("events.6", {"refusal": "window_active"}),
+            ("events.7", {"refusal": "no_such_word"}),
+            ("events.7", {"seq": True}),
+            ("events.9", {"reason": "no such reason"}),
+            ("events.10", {"reason": "run stopped"}),
+            ("events.11", {"reason": "preparation failed"}),
+            ("events.12", {"reason": "run stopped"}),
+            ("events.10", {"outcome": "active"}),
+            ("events.12", {"outcome": "refused"}),
+            ("lineage", {"after_read": "mismatched:nope"}),
+            ("lineage", {"after_read": "matched "}),
+            ("lineage", {"broad_generation": 0}),
+            ("lineage", {"drift": {"kind": "nope", "before": 1, "after": 2}}),
+            ("lineage", {"drift": {"kind": "generation", "before": 0, "after": 2}}),
+            ("aggregate", {"scope": "detail"}),
+            ("aggregate", {"mode": "requested"}),
+            ("aggregate", {"mode_mixed": 0}),
+            ("detail", {"scope": "broad"}),
+        ]
+        for path, patch in cases:
+            with self.subTest(path=path, patch=patch):
+                invalid = copy.deepcopy(full)
+                node = invalid["evidence"]["selected_detail"]
+                for key in path.split("."):
+                    node = node[int(key) if key.isdigit() else key]
+                node.update(patch)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for lonely in ({"slot": 7}, {"file_offset": 144}):
+            with self.subTest(lonely=lonely):
+                document = self.selected_document(selection="unresolved")
+                document["evidence"]["selected_detail"]["selection"].update(lonely)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](document)
+        row_cases = [
+            ("counts", {"total_ns": 30}),
+            ("counts", {"buckets": [0] * 32}),
+            ("timestamps", {"buckets": [0] * 32}),
+            ("timestamps", {"total_ns": None}),
+            ("latency", {"total_ns": None}),
+            ("latency", {"buckets": [0] * 31}),
+            ("latency", {"buckets": [0] * 32 + [True]}),
+            ("counts", {"rv_counts": {"0x0": 3}}),
+            ("counts", {"rv_counts": {"007": 3}}),
+            ("counts", {"rv_counts": {"0": True}}),
+            ("counts", {"object": 2**32}),
+        ]
+        for mode, patch in row_cases:
+            with self.subTest(mode=mode, patch=patch):
+                document = self.selected_document(with_close_products=True, mode=mode)
+                document["evidence"]["selected_detail"]["aggregate"]["rows"][0].update(patch)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](document)
+
+    def test_selected_detail_schema_matches_finite_oracle_shape(self):
+        """The machine schema carries the same closed envelope the oracle
+        enforces: key sets, required keys, finite vocabularies and the
+        mode-linked row shapes resolve to the shared $defs."""
+        section = evidence_schema()["properties"]["selected_detail"]
+        self.assertEqual(set(section["properties"]), set(CHECKER["SELECTED_DETAIL_KEYS"]))
+        self.assertEqual(set(section["required"]), set(CHECKER["SELECTED_DETAIL_REQUIRED"]))
+        self.assertFalse(section["additionalProperties"])
+        self.assertNotIn("selected_detail", evidence_schema()["required"])
+        selection = section["properties"]["selection"]
+        self.assertEqual(set(selection["properties"]),
+                         set(CHECKER["SELECTED_DETAIL_SELECTION_KEYS"]))
+        self.assertEqual(set(selection["required"]),
+                         set(CHECKER["SELECTED_DETAIL_SELECTION_REQUIRED"]))
+        self.assertEqual(set(selection["properties"]["refusal"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_SELECTION_REFUSALS"]))
+        branches = section["properties"]["events"]["items"]["anyOf"]
+        self.assertEqual(len(branches), 7)
+        window = next(branch for branch in branches
+                      if "enum" in branch["properties"]["event"])
+        self.assertEqual(set(window["properties"]["event"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_WINDOW_EVENTS"]))
+        by_event = {branch["properties"]["event"]["const"]: branch
+                    for branch in branches
+                    if "const" in branch["properties"]["event"]}
+        self.assertEqual(set(window["required"]),
+                         set(CHECKER["SELECTED_DETAIL_WINDOW_ROW_KEYS"]))
+        self.assertEqual(
+            set(window["properties"]),
+            set(CHECKER["SELECTED_DETAIL_WINDOW_ROW_KEYS"]) | {"note"})
+        self.assertEqual(set(by_event["close_refused"]["required"]),
+                         set(CHECKER["SELECTED_DETAIL_CLOSE_REFUSED_KEYS"]))
+        self.assertEqual(set(by_event["close_refused"]["properties"]["refusal"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_GATE_WORDS"]))
+        self.assertEqual(set(by_event["reserve_refused"]["required"]),
+                         set(CHECKER["SELECTED_DETAIL_RESERVE_REFUSED_KEYS"]))
+        self.assertEqual(set(by_event["reserve_refused"]["properties"]["refusal"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_ADAPTER_WORDS"]))
+        self.assertEqual(set(by_event["start_refused"]["required"]),
+                         set(CHECKER["SELECTED_DETAIL_START_REFUSED_KEYS"]))
+        self.assertEqual(set(by_event["start_refused"]["properties"]["reason"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_REFUSAL_LABELS"]))
+        outcomes = [branch for branch in branches
+                    if branch["properties"]["event"].get("const") == "promotion_outcome"]
+        self.assertEqual(len(outcomes), 3)
+        by_outcome = {branch["properties"]["outcome"]["const"]: branch
+                      for branch in outcomes}
+        self.assertEqual(set(by_outcome), set(CHECKER["SELECTED_DETAIL_OUTCOMES"]))
+        self.assertEqual(set(by_outcome["refused"]["properties"]["reason"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_REFUSAL_LABELS"]))
+        self.assertEqual(set(by_outcome["ended"]["properties"]["reason"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_END_LABELS"]))
+        self.assertEqual(set(by_outcome["active"]["required"]),
+                         {"event", "request", "outcome", "caller", "provider"})
+        lineage = section["properties"]["lineage"]
+        self.assertEqual(set(lineage["required"]),
+                         set(CHECKER["SELECTED_DETAIL_LINEAGE_KEYS"]))
+        self.assertEqual(set(lineage["properties"]["after_read"]["enum"]),
+                         set(CHECKER["SELECTED_DETAIL_AFTER_READS"]))
+        drifts = lineage["properties"]["drift"]["anyOf"]
+        self.assertIn({"type": "null"}, drifts)
+        self.assertEqual({branch["properties"]["kind"]["const"] for branch in drifts
+                          if branch.get("type") == "object"},
+                         set(CHECKER["SELECTED_DETAIL_DRIFT_KINDS"]))
+        for fragment, keys in (("aggregate", CHECKER["SELECTED_DETAIL_AGGREGATE_KEYS"]),
+                               ("detail", CHECKER["SELECTED_DETAIL_DETAIL_KEYS"])):
+            with self.subTest(fragment=fragment):
+                shape = section["properties"][fragment]
+                self.assertEqual(set(shape["required"]), set(keys))
+                self.assertEqual(set(shape["properties"]), set(keys))
+                self.assertEqual(set(shape["properties"]["mode"]["enum"]),
+                                 set(CHECKER["SELECTED_DETAIL_MODES"]))
+                linked = {}
+                for clause in shape["allOf"]:
+                    mode = clause["if"]["properties"]["mode"]["const"]
+                    pointer = clause["then"]["properties"]["rows"]["items"]["$ref"]
+                    row = SCHEMA
+                    for key in pointer.removeprefix("#/").split("/"):
+                        row = row[key]
+                    linked[mode] = row
+                self.assertEqual(set(linked), set(CHECKER["SELECTED_DETAIL_MODES"]))
+                self.assertEqual(
+                    set(linked["counts"]["required"]),
+                    set(CHECKER["SELECTED_DETAIL_ROW_BASE_KEYS"]))
+                self.assertEqual(
+                    set(linked["timestamps"]["required"]) -
+                    set(CHECKER["SELECTED_DETAIL_ROW_BASE_KEYS"]),
+                    {"total_ns", "max_ns"})
+                self.assertEqual(
+                    set(linked["latency"]["required"]) -
+                    set(CHECKER["SELECTED_DETAIL_ROW_BASE_KEYS"]),
+                    {"total_ns", "max_ns", "buckets"})
+                buckets = linked["latency"]["properties"]["buckets"]
+                self.assertEqual(buckets["minItems"], CHECKER["SELECTED_DETAIL_LATENCY_BUCKETS"])
+                self.assertEqual(buckets["maxItems"], CHECKER["SELECTED_DETAIL_LATENCY_BUCKETS"])
+        mark = SCHEMA["$defs"]["selected_detail_bracket_mark"]
+        self.assertEqual(set(mark["required"]), set(CHECKER["SELECTED_DETAIL_MARK_KEYS"]))
+        self.assertEqual(set(mark["properties"]), set(CHECKER["SELECTED_DETAIL_MARK_KEYS"]))
+
+    def test_current_metrics_requires_backend_but_historical_shape_excludes_it(self):
+        current = self.metrics_document()
+        self.assertEqual(current["evidence"].get("attach_backend"),
+                         {"selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf"})
+        CHECKER["exact_metrics_schema"](current)
+        missing = copy.deepcopy(current)
+        missing["evidence"].pop("attach_backend")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](missing)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        self.assertNotIn("attach_backend", historical["evidence"])
+        CHECKER["exact_historical_metrics_schema"](historical)
+        historical["evidence"]["attach_backend"] = current["evidence"]["attach_backend"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_metrics_backend_shape_and_scope_twins(self):
+        document = self.metrics_document()
+        document["evidence"]["attach_backend"] = {
+            "selection": "multi", "fallback": None, "scope_filter": "kernel-pid+bpf"}
+        for scope in ("pid", "system", "cgroup"):
+            with self.subTest(scope=scope):
+                valid = copy.deepcopy(document)
+                valid["capture"]["scope"] = scope
+                valid["evidence"]["attach_backend"]["scope_filter"] = (
+                    "kernel-pid+bpf" if scope == "pid" else None)
+                CHECKER["exact_metrics_schema"](valid)
+                invalid = copy.deepcopy(valid)
+                invalid["evidence"]["attach_backend"]["scope_filter"] = (
+                    None if scope == "pid" else "kernel-pid+bpf")
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for field in ("selection", "fallback", "scope_filter"):
+            with self.subTest(missing=field):
+                invalid = copy.deepcopy(document)
+                del invalid["evidence"]["attach_backend"][field]
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for values in ({"extra": 1}, {"selection": "always"}, {"fallback": "failed"},
+                       {"scope_filter": "kernel-pid"}):
+            with self.subTest(values=values):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["attach_backend"].update(values)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
+    def test_current_metrics_requires_object_capture_but_historical_shape_excludes_it(self):
+        current = self.metrics_document()
+        self.assertEqual(current["evidence"].get("object_capture"),
+                         {"available": True, "reason": None})
+        CHECKER["exact_metrics_schema"](current)
+        missing = copy.deepcopy(current)
+        missing["evidence"].pop("object_capture")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](missing)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        self.assertNotIn("object_capture", historical["evidence"])
+        CHECKER["exact_historical_metrics_schema"](historical)
+        historical["evidence"]["object_capture"] = current["evidence"]["object_capture"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_object_capture_shape_twins(self):
+        document = self.metrics_document()
+        for value in ({"available": True, "reason": None},
+                      {"available": False, "reason": "not_enabled"}):
+            with self.subTest(value=value):
+                valid = copy.deepcopy(document)
+                valid["evidence"]["object_capture"] = value
+                CHECKER["exact_metrics_schema"](valid)
+        for value in ({"available": True, "reason": "not_enabled"},
+                      {"available": False, "reason": None},
+                      {"available": "yes", "reason": None},
+                      {"available": True}):
+            with self.subTest(value=value):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["object_capture"] = value
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
     def test_evidence_keys_match_oracle_closed_sets(self):
         """Schema evidence properties are exactly the oracle's closed key
-        universe: base keys + profile-only keys + run-only child flag."""
+        universe: base keys + profile-only keys + run-only child flag +
+        the optional additive envelopes (counter, selection, excludes)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
-            | {"child_still_running"}
+            | {"child_still_running", "counter_collection", "selected_detail",
+               "excluded_modules", "unmatched_excludes"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
+
+    def test_excluded_modules_shape_twins(self):
+        document = self.metrics_document()
+        valid = copy.deepcopy(document)
+        valid["evidence"]["excluded_modules"] = [
+            {"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3}
+        ]
+        valid["evidence"]["unmatched_excludes"] = ["nope.so"]
+        CHECKER["exact_metrics_schema"](valid)
+        for excluded, unmatched in (
+            ([{"path": "", "dev": 8, "ino": 42, "processes": 3}], ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 0}],
+             ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42}], ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3,
+               "extra": 1}], ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3}],
+             [42]),
+        ):
+            with self.subTest(excluded=excluded, unmatched=unmatched):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["excluded_modules"] = excluded
+                invalid["evidence"]["unmatched_excludes"] = unmatched
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
 
     def test_metrics_required_is_oracle_base(self):
         """Metrics requires exactly the oracle base key set."""
@@ -85,6 +783,35 @@ class SchemaOracleAgreement(unittest.TestCase):
             row["ordinals"]["items"]["properties"]["ordinal"]["maximum"] + 1,
             CHECKER["MAX_FUNCTION_ORDINALS"],
         )
+
+    def test_function_timing_availability_has_three_closed_shapes(self):
+        row = SCHEMA["properties"]["functions"]["items"]["properties"]
+        self.assertIn("latency_ns", row, "function timing needs an explicit consumer contract")
+        shapes = row["latency_ns"]["oneOf"]
+        self.assertEqual(len(shapes), 3)
+        self.assertIn({"type": "null"}, shapes)
+        objects = [shape for shape in shapes if shape.get("type") == "object"]
+        self.assertEqual(len(objects), 2)
+        for shape in objects:
+            self.assertIs(type(shape["properties"]["approximate"]["const"]), bool)
+        by_approximation = {shape["properties"]["approximate"]["const"]: shape
+                            for shape in objects}
+        self.assertEqual(set(by_approximation), {True, False})
+        fields = {"approximate", "p50", "p95", "p99", "total", "max"}
+        for approximate, shape in by_approximation.items():
+            with self.subTest(approximate=approximate):
+                self.assertFalse(shape["additionalProperties"])
+                self.assertEqual(set(shape["required"]), fields)
+                self.assertEqual(set(shape["properties"]), fields)
+                for field in ("total", "max"):
+                    self.assertEqual(shape["properties"][field],
+                                     {"type": "integer", "minimum": 0, "maximum": 2**64 - 1})
+                for field in ("p50", "p95", "p99"):
+                    self.assertEqual(
+                        shape["properties"][field],
+                        {"type": ["integer", "null"], "minimum": 0, "maximum": 2**64 - 1}
+                        if approximate else {"type": "null"},
+                    )
 
     def test_pid_namespace_shape_matches_oracle(self):
         """`evidence.pid_namespace` is the oracle's closed object (DR-K8S-2)."""
@@ -166,6 +893,210 @@ class SchemaOracleAgreement(unittest.TestCase):
         self.assertEqual(
             set(scheduling["properties"]["phase_ms"]["properties"]),
             set(CHECKER["SCHEDULING_PHASE_KEYS"]),
+        )
+
+
+class PrearmOracleAgreement(unittest.TestCase):
+    """Packet 6.13: the oracle admits the prearm source shapes and checks
+    the additive watch keys."""
+
+    def evidence(self, sources):
+        return CHECKER["evidence_fixture"]({}, sources)
+
+    def test_prearm_source_shapes_admitted(self):
+        for sources in (
+            ("prearm",),
+            ("scan", "prearm"),
+            ("manifest", "prearm"),
+            ("scan", "manifest", "prearm"),
+        ):
+            evidence = self.evidence(sources)
+            CHECKER["exact_discovery_semantics"](evidence)
+
+    def test_prearm_only_reads_uncorroborated(self):
+        evidence = self.evidence(("prearm",))
+        module = evidence["discovery"][0]
+        self.assertEqual(module["corroboration"], ["uncorroborated"])
+        self.assertFalse(module["corroborated"])
+        self.assertEqual(evidence["discovery_uncorroborated"], 1)
+
+    def test_prearm_fixture_carries_no_tables(self):
+        evidence = self.evidence(("prearm",))
+        self.assertEqual(evidence["discovery"][0]["tables"], [])
+
+    def test_watch_keys_accepted_and_rejected(self):
+        evidence = self.evidence(("prearm",))
+        module = evidence["discovery"][0]
+        module["watch"] = {"since_ns": None, "state": "pinned_unarmed"}
+        module["attached_at_ns"] = None
+        CHECKER["exact_discovery_semantics"](evidence)
+        module["watch"] = {
+            "since_ns": 100,
+            "state": "ended",
+            "until_ns": 300,
+            "ended_by": "object_changed",
+            "changed": {
+                "last_ok_ns": 200,
+                "detected_ns": 300,
+                "previous_ino": 42,
+            },
+        }
+        module["attached_at_ns"] = 900
+        module["unobserved_windows"] = [
+            {"start_ns": 50, "end_ns": 900, "reason": "pre_attach"}
+        ]
+        CHECKER["exact_discovery_semantics"](evidence)
+        for bad in (
+            {"since_ns": None, "state": "watched"},
+            {"since_ns": None, "state": "armed", "ended_by": "cancel"},
+            {
+                "since_ns": 100,
+                "state": "ended",
+                "changed": {
+                    "last_ok_ns": 300,
+                    "detected_ns": 200,
+                    "previous_ino": 42,
+                },
+            },
+        ):
+            broken = copy.deepcopy(evidence)
+            broken["discovery"][0]["watch"] = bad
+            with self.assertRaises(AssertionError):
+                CHECKER["exact_discovery_semantics"](broken)
+        broken = copy.deepcopy(evidence)
+        broken["discovery"][0]["unobserved_windows"] = [
+            {"start_ns": 50, "end_ns": 900, "reason": "missed_calls"}
+        ]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_discovery_semantics"](broken)
+
+    def test_watch_shapes_enforce_keys_ordering_and_coherence(self):
+        """Residual 6.13 review: the oracle closes watch/window shapes."""
+        changed = {
+            "last_ok_ns": 200,
+            "detected_ns": 300,
+            "previous_ino": 42,
+        }
+        valid = (
+            {"since_ns": None, "state": "pinned_unarmed"},
+            {"since_ns": None, "state": "unavailable"},
+            {"since_ns": 100, "state": "armed"},
+            {"since_ns": 100, "state": "armed_idle"},
+            # Legitimate clock-unknown end: latched cause, no invented stamps.
+            {"since_ns": None, "state": "ended", "ended_by": "attached"},
+            # Never-mapped cancel and natural closes.
+            {
+                "since_ns": None,
+                "state": "ended",
+                "until_ns": 300,
+                "ended_by": "scope_end",
+            },
+            {
+                "since_ns": 100,
+                "state": "armed_idle",
+                "until_ns": 300,
+                "ended_by": "scope_end",
+            },
+            {
+                "since_ns": 100,
+                "state": "ended",
+                "until_ns": 300,
+                "ended_by": "object_changed",
+                "changed": dict(changed),
+            },
+        )
+        for watch in valid:
+            evidence = self.evidence(("prearm",))
+            evidence["discovery"][0]["watch"] = copy.deepcopy(watch)
+            CHECKER["exact_discovery_semantics"](evidence)
+        invalid = (
+            # Reversed interval, idle without arm, ended without cause,
+            # synthetic extra key.
+            {
+                "since_ns": 300,
+                "state": "armed_idle",
+                "until_ns": 100,
+                "ended_by": "scope_end",
+            },
+            {"since_ns": None, "state": "armed_idle"},
+            {"since_ns": 100, "state": "ended", "until_ns": 200},
+            {
+                "since_ns": 100,
+                "state": "armed_idle",
+                "until_ns": 200,
+                "ended_by": "scope_end",
+                "raw_pin": "SYNTHETIC",
+            },
+            # Coherence: end causes only on ended/preserved-idle, a natural
+            # close alone preserves idle, until implies an end, changed
+            # implies object_changed, unarmed waits carry no arm instant.
+            {"since_ns": 100, "state": "armed", "ended_by": "scope_end"},
+            {"since_ns": 100, "state": "armed_idle", "ended_by": "health_loss"},
+            {"since_ns": 100, "state": "armed", "until_ns": 200},
+            {
+                "since_ns": 100,
+                "state": "ended",
+                "until_ns": 200,
+                "ended_by": "scope_end",
+                "changed": dict(changed),
+            },
+            {"since_ns": 100, "state": "pinned_unarmed"},
+            {"since_ns": 100, "state": "unavailable"},
+        )
+        for watch in invalid:
+            broken = self.evidence(("prearm",))
+            broken["discovery"][0]["watch"] = copy.deepcopy(watch)
+            with self.assertRaises(
+                AssertionError, msg=f"oracle accepted {watch!r}"
+            ):
+                CHECKER["exact_discovery_semantics"](broken)
+        # Windows close their keys and order their bounds too.
+        evidence = self.evidence(("prearm",))
+        evidence["discovery"][0]["unobserved_windows"] = [
+            {"start_ns": 50, "end_ns": 900, "reason": "pre_attach", "extra": 1}
+        ]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_discovery_semantics"](evidence)
+        evidence["discovery"][0]["unobserved_windows"] = [
+            {"start_ns": 900, "end_ns": 50, "reason": "pre_attach"}
+        ]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_discovery_semantics"](evidence)
+
+
+class InitializationRowAgreement(unittest.TestCase):
+    """functions[].initialization: the optional v3-additive Initialize claim.
+
+    The release oracle does not close functions[] row keys (subset checks
+    only), so there is no oracle vocabulary to agree with here: these pins
+    lock the machine schema's additive shape instead — optional, closed
+    sub-object, finite outcome words, likelihood true-only.
+    """
+
+    def row_schema(self):
+        return SCHEMA["properties"]["functions"]["items"]
+
+    def test_initialization_is_optional_with_finite_outcome(self):
+        row = self.row_schema()
+        self.assertIn("initialization", row["properties"])
+        self.assertNotIn("initialization", row["required"])
+        init = row["properties"]["initialization"]
+        self.assertFalse(init["additionalProperties"])
+        self.assertEqual(set(init["required"]), {"outcome"})
+        self.assertEqual(
+            set(init["properties"]["outcome"]["enum"]),
+            {"ok", "already_initialized", "error", "mixed"},
+        )
+
+    def test_initialization_potential_provider_is_true_only(self):
+        row = self.row_schema()
+        self.assertIn("initialization", row["properties"])
+        init = row["properties"]["initialization"]
+        self.assertEqual(
+            set(init["properties"]), {"outcome", "potential_provider"}
+        )
+        self.assertEqual(
+            init["properties"]["potential_provider"], {"const": True}
         )
 
 

@@ -3,12 +3,20 @@
 //! that lost information never reads as complete.
 
 use crate::attach::CapturePolicy;
-use crate::discovery::scan::Skipped;
+use crate::discovery::elf_needed::{
+    GapExeHints, STATIC_HINT_LABEL, STATIC_HINT_SCOPE_D_TRANSITIVE,
+};
+use crate::discovery::scan::{ExcludedRecord, Skipped};
 use crate::kinds;
+use crate::mechanism_names::mechanism_name;
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
+use crate::semantic_capture::InstanceReloadNotExcluded;
+use crate::semantics::MechStat;
+use p11scope_ebpf_common::CounterMode;
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Target-controlled bytes reach a terminal here. Only control characters —
@@ -86,6 +94,13 @@ pub struct LoaderDiscovery {
     /// Scoped BPF debug-state hit counter, incremented before ring
     /// reservation. Never derived from received-record counts.
     pub hits: u64,
+    /// Loader hits whose records resolved benignly: accepted, scan
+    /// complete, no new provider module, no suspicious close — or
+    /// pause-protected (the pause, not the scan, is the proof). A hit
+    /// is exonerated only when its record is fully accounted; see
+    /// `complete`. Never above `hits`: the checker refuses the report
+    /// when it is.
+    pub benign_hits: u64,
     /// The separate BPF counter for `_r_debug.r_state` reads. There is no
     /// second public copy of it.
     pub state_read_failures: u64,
@@ -97,16 +112,20 @@ impl LoaderDiscovery {
     /// `pause_protected`, and `initial_set_capture.eligible` /
     /// `.pause_protected` are neutral (design §9.2).
     ///
-    /// A dlopen timing class is a gap only once a load happened. Every hit
-    /// of a bound context is counted before its record is reserved, so zero
-    /// `hits` proves no load occurred during the capture: an armed loader
-    /// that never fired cannot have missed a late provider's first call. An
-    /// unbound context counts nothing, so `unavailable` stays a gap on its
-    /// own.
+    /// A dlopen timing class is a gap only while a hit is unaccounted.
+    /// Every hit of a bound context is counted before its record is
+    /// reserved, so zero `hits` proves no load occurred during the
+    /// capture: an armed loader that never fired cannot have missed a
+    /// late provider's first call. A hit whose record resolved benignly
+    /// (accepted, scan complete, no new provider, no suspicious close)
+    /// loaded nothing the capture could have missed calls through, so
+    /// fully benign hits do not gate exactness even with unproven
+    /// timing. An unbound context counts nothing, so `unavailable`
+    /// stays a gap on its own.
     fn complete(&self) -> bool {
         self.strategies.dlopen_return == 0
             && self.strategies.unavailable == 0
-            && (self.hits == 0 || self.dlopen_timing.gaps() == 0)
+            && (self.benign_hits == self.hits || self.dlopen_timing.gaps() == 0)
             && self.initial_set_timing.gaps() == 0
             && self.initial_set_capture.none == 0
             && self.state_read_failures == 0
@@ -308,6 +327,17 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
+    /// The exit-ended subset of `discovery_truncated`: loader scans
+    /// and loader rejects settled at a proven process exit. Not a
+    /// fifth loss lane — K0 subtracts it from the total when it
+    /// compares its window snapshots. In cgroup and system scopes a
+    /// scope departure settles here too, but K0 refuses those scopes
+    /// by name, so no consumer reads it there.
+    pub(crate) exit_ended_truncations: u64,
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends, loader rejects, zero-state ends].
+    /// Not serialized; the live cells parse it off stderr.
+    pub(crate) exit_ended_by_route: [u64; 3],
     pub(crate) task_uprobe_link_losses: u64,
 }
 
@@ -359,6 +389,21 @@ impl CaptureFacts {
         ]
     }
 
+    /// Loader scans and loader rejects settled at a proven process
+    /// exit: the exit-only subset of the truncation total. K0's
+    /// window rule compares the total minus this count. In cgroup and
+    /// system scopes a scope departure settles here too, but K0
+    /// refuses those scopes by name, so no consumer reads it there.
+    pub fn exit_ended_truncations(&self) -> u64 {
+        self.exit_ended_truncations
+    }
+
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends, loader rejects, zero-state ends].
+    pub fn exit_ended_by_route(&self) -> [u64; 3] {
+        self.exit_ended_by_route
+    }
+
     /// Task-uprobe links that disappeared while their retained process group
     /// still had a live member, counted once per affected process view.
     pub fn task_uprobe_link_losses(&self) -> u64 {
@@ -383,7 +428,7 @@ impl CaptureFacts {
 
 /// How the classic session attached its static probes (DR-CLASSIC-PID0),
 /// as the native inventory lane's `observation.attach` spells it.
-/// Profile lane only (`evidence.attach_backend`).
+/// Profile and metrics lanes (`evidence.attach_backend`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AttachBackendEvidence {
     /// The operator's `--attach-backend`: `auto`, `multi` or `singles`.
@@ -405,6 +450,42 @@ impl Default for AttachBackendEvidence {
             selection: "auto",
             fallback: None,
             scope_filter: None,
+        }
+    }
+}
+
+/// Object-attribute capture availability: build scope, identical for
+/// every capture of this binary. Stubbed (P0)
+/// builds report `available: false` with the finite `not_enabled`
+/// reason; FULL builds report `available: true`. Never gates the
+/// verdict — P0 scope is complete when P0 facts are complete; this
+/// disclaims attribute coverage instead of claiming it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ObjectCaptureEvidence {
+    /// Whether this build captures object attributes.
+    pub available: bool,
+    /// Finite machine reason when unavailable, else `None`.
+    pub reason: Option<&'static str>,
+}
+
+impl ObjectCaptureEvidence {
+    /// The one P0 unavailability reason: the stub feature compiled
+    /// attribute capture out.
+    pub const NOT_ENABLED: &'static str = "not_enabled";
+
+    /// Structured status for a build flavor: `stubbed` names the probed
+    /// byte state, true when the embedded object's attribute capture is stubbed.
+    pub const fn for_build(stubbed: bool) -> Self {
+        if stubbed {
+            Self {
+                available: false,
+                reason: Some(Self::NOT_ENABLED),
+            }
+        } else {
+            Self {
+                available: true,
+                reason: None,
+            }
         }
     }
 }
@@ -438,10 +519,12 @@ impl InterfaceSelection {
                 .providers
                 .iter()
                 .all(|provider| matches!(provider.coverage, "observed" | "absent_covered"))
-            && self
-                .standard_exports
-                .iter()
-                .all(|export| matches!(export.status, "present" | "legacy_absent"))
+            && self.standard_exports.iter().all(|export| {
+                matches!(
+                    export.status,
+                    "present" | "legacy_absent" | "required_absent"
+                )
+            })
             && self.tuples.iter().all(|tuple| {
                 !(tuple.rv == 0
                     && tuple.result.is_some()
@@ -577,6 +660,90 @@ pub struct DiscoveryEvidence {
     /// `Some("ptrace")` when the memory scan could not run.
     pub scan_unavailable: Option<String>,
     pub scan_ms: u64,
+    /// Files skipped by `--exclude-module`, one record per distinct file
+    /// (device + inode) with the number of in-scope processes that mapped
+    /// it. A declared operator choice, never a loss: excluded files get no
+    /// probes and use no slots, and the rest of the capture can still be
+    /// `exact`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_modules: Vec<ExcludedOut>,
+    /// `--exclude-module` inputs that matched no mapped file. Omitted when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_excludes: Vec<String>,
+    /// 6.14 Option A exit-time mapping split, `None` unless extensive
+    /// mode armed. Serde-skipped carrier: the profile lane hoists it to
+    /// the top-level `gap_exit_mappings` key in `versioned_evidence`;
+    /// metrics embeds `Evidence` directly and never sees it, while
+    /// trace shares the hoist but never arms, so the key is absent in
+    /// both. Stamped from live engine state on every `capture_facts()`.
+    #[serde(skip)]
+    pub gap_exit_mappings: Option<GapExitMappings>,
+}
+
+/// 6.14 Option A exit-time split of the novel unmatched-exit
+/// subpopulation: leaders for which the kernel recorded a localized
+/// mapping of a watched provider file at some point while watched
+/// (`mapped`; the cells persist across unmap and exec, so this never
+/// means the file was still mapped at the exit instant) vs every
+/// other shape (`unknown`). Nominally `pub` for the
+/// `DiscoveryEvidence` carrier; only the two counts render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GapExitMappings {
+    pub mapped: u64,
+    pub unknown: u64,
+}
+
+/// One `--exclude-module` hit for the report: the file's target-view path,
+/// its fstat identity, and how many in-scope processes mapped it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExcludedOut {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub processes: usize,
+}
+
+/// Aggregate per-(pid, file) exclusion records into per-file report rows
+/// plus the inputs that matched nothing. Files group by (device, inode);
+/// processes counts distinct pids; rows sort by path for stable output.
+/// Unmatched inputs keep operator order.
+pub(crate) fn aggregate_excluded(
+    records: &[ExcludedRecord],
+    excludes: &[std::path::PathBuf],
+) -> (Vec<ExcludedOut>, Vec<String>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_file: BTreeMap<(u64, u64), (String, BTreeSet<u32>)> = BTreeMap::new();
+    let mut matched: BTreeSet<&std::path::PathBuf> = BTreeSet::new();
+    for record in records {
+        matched.insert(&record.via);
+        by_file
+            .entry((record.dev, record.ino))
+            .and_modify(|(_, pids)| {
+                pids.insert(record.pid);
+            })
+            .or_insert_with(|| {
+                let mut pids = BTreeSet::new();
+                pids.insert(record.pid);
+                (record.path.clone(), pids)
+            });
+    }
+    let mut excluded: Vec<ExcludedOut> = by_file
+        .into_iter()
+        .map(|((dev, ino), (path, pids))| ExcludedOut {
+            path,
+            dev,
+            ino,
+            processes: pids.len(),
+        })
+        .collect();
+    excluded.sort_by(|a, b| a.path.cmp(&b.path));
+    let unmatched: Vec<String> = excludes
+        .iter()
+        .filter(|input| !matched.contains(*input))
+        .map(|input| input.display().to_string())
+        .collect();
+    (excluded, unmatched)
 }
 
 impl Default for DiscoveryEvidence {
@@ -592,6 +759,9 @@ impl Default for DiscoveryEvidence {
             manifest_object_fallbacks: Vec::new(),
             scan_unavailable: None,
             scan_ms: 0,
+            excluded_modules: Vec::new(),
+            unmatched_excludes: Vec::new(),
+            gap_exit_mappings: None,
         }
     }
 }
@@ -635,6 +805,107 @@ pub struct ObjectSummary {
     pub sources: Vec<&'static str>,
 }
 
+/// Pre-arm watch state for one `--prearm-module` object (packet 6.13, merged
+/// D1 contract R2-D1-4). Finite vocabulary, serialized snake_case; stdout and
+/// docs say "armed (not yet mapped)" once armed, never "watched/observed"
+/// for `pinned_unarmed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrearmWatchState {
+    /// Pinned; required links, scope or feed not yet ready. A pin is custody,
+    /// never coverage: absence of a mapping proves nothing about links.
+    PinnedUnarmed,
+    /// Links installed on the whole declared endpoint set; mapping not
+    /// required. Partial attachment stays unarmed for the declared set.
+    Armed,
+    /// Armed, plus clean observation health and no observed use over the
+    /// stated interval — over the declared proved set only.
+    ArmedIdle,
+    /// No proved offset, or attach/scope failure: arming is impossible.
+    Unavailable,
+    /// The watch ended; `until_ns`/`ended_by` say when and why.
+    Ended,
+}
+
+/// Why a pre-arm watch ended (R2-D1-7). Set only when the end actually
+/// happened — never a static policy datum — and set exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrearmWatchEnd {
+    /// The unarmed wait discharged: the declared set fully attached, but no
+    /// armed interval is claimable (the arm instant is unknown).
+    Attached,
+    /// The capture scope ended; the watch is cancelled with it.
+    ScopeEnd,
+    /// The operator stopped the capture.
+    Stop,
+    /// The retained object changed under its pin (see `changed`).
+    ObjectChanged,
+    /// Observation health regressed; the clean claim truncates at its last
+    /// proven-clean bound.
+    HealthLoss,
+    /// Scope membership went uncertain; same truncation as health loss.
+    ScopeUncertain,
+}
+
+/// The uncertainty bracket of a retained-object change (R2-D1-8,
+/// `pinned_object_changed` in prose): the change landed after `last_ok_ns`
+/// and at or before `detected_ns`. A bracket, never a point instant, from
+/// per-object held-fd `(ino, size, ctime)` checks — never retargeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrearmObjectChange {
+    pub last_ok_ns: u64,
+    pub detected_ns: u64,
+    pub previous_ino: u64,
+}
+
+/// The pre-arm watch interval on one discovery module record (R2-D1-4/5/7/8).
+/// Discovery emits only this; `attached_at_ns`/`unobserved_windows` merge
+/// later from real attach stamps at evidence assembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrearmWatch {
+    /// The arm instant (declared set's links ready), `CLOCK_MONOTONIC`.
+    /// Always emitted: null until armed. Never pin time.
+    pub since_ns: Option<u64>,
+    pub state: PrearmWatchState,
+    /// Coverage-claim end, set exactly once at the first of scope end, stop,
+    /// or truncation. No probe for this module attaches after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<PrearmWatchEnd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<PrearmObjectChange>,
+}
+
+/// Why one interval went unobserved (R2-D1-5). Finite; every window carries
+/// conservative outer bounds, never a missed-call estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnobservedReason {
+    /// Before this module's probes attached: `[scope_start_ns, attached_at_ns]`.
+    PreAttach,
+    /// Generic provider discovered after scope start (outer bound starts at
+    /// scope start: it may have existed and been called before discovery).
+    LateDiscovery,
+    /// Mapped but unattached endpoints outside the declared set.
+    MappedUnattached,
+    /// Observation health regressed over the tail interval.
+    HealthLoss,
+    /// Scope membership was uncertain over the tail interval.
+    ScopeUncertain,
+}
+
+/// One explicitly unobserved interval on a discovery module record. Key
+/// presence never proves exactness; only an explicitly empty list with an
+/// R2-D1-6 proof behind it reads as exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct UnobservedWindow {
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub reason: UnobservedReason,
+}
+
 /// One module discovery found, with everything known about how it was found.
 /// Same path caveat as `ObjectSummary`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -653,7 +924,7 @@ pub struct DiscoveredModule {
     /// entry lands in a dependency, not in the module that published it. An
     /// entry that never became a slot is in `skipped`, not here.
     pub objects: Vec<ObjectSummary>,
-    /// `"scan"`, `"manifest"`, or both.
+    /// `"scan"`, `"manifest"`, `"prearm"`, or a `+`-joined combination.
     pub sources: Vec<&'static str>,
     /// A second source described the same targets (spec §4.12).
     pub corroborated: bool,
@@ -675,6 +946,22 @@ pub struct DiscoveredModule {
     pub interfaces: usize,
     /// This module's own unattachable entries, and why.
     pub skipped: Vec<SkippedOut>,
+    /// Pre-arm watch interval (packet 6.13). `None` — and absent on the wire —
+    /// for every module no `--prearm-module` named. Discovery emits only this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch: Option<PrearmWatch>,
+    /// Per-module attach instant, `CLOCK_MONOTONIC`, merged at evidence
+    /// assembly from real attach-complete stamps (never the once-only session
+    /// stamp). Triple-state: absent before assembly, null when assembled
+    /// with nothing attached, otherwise the max over the declared set's
+    /// real stamps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_at_ns: Option<Option<u64>>,
+    /// Explicit unobserved intervals, merged at evidence assembly. Absent
+    /// means undisclosed (never-mapped pre-arm, unattached modules); an
+    /// explicitly empty list reads as exact only with an R2-D1-6 proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unobserved_windows: Option<Vec<UnobservedWindow>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -734,6 +1021,12 @@ pub struct Evidence {
     pub abi_refusals: u64,
     pub semantic_capture_failures: u64,
     pub unregistered_mechanisms: u64,
+    /// Approved mechanism ids the `MECH_SHAPE` publication could not fit
+    /// (ruling JK-22a): the official-first subset published instead of
+    /// refusing the session, and these stayed unpublished, counting
+    /// through the unregistered path. Zero unless the approval union
+    /// exceeded the map.
+    pub unpublished_mechanisms: u64,
     pub template_tail_failures: u64,
     pub process_tracking_fallbacks: u64,
     pub process_tracking_failures: u64,
@@ -798,6 +1091,9 @@ pub struct Evidence {
     pub pause_attempts: u64,
     pub pause_confirmed: u64,
     pub pause_partial: u64,
+    /// `--pause always` degrades that collected unpaused instead of
+    /// aborting (never-stop). Each forces `PARTIAL`.
+    pub pause_unavailable: u64,
     /// Present only for `run`: true only when capture ended while the owned
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -826,12 +1122,24 @@ pub struct Evidence {
     pub interface_selection: InterfaceSelection,
     #[serde(skip)]
     pub attach_mechanisms: Vec<&'static str>,
-    #[serde(skip)]
     pub attach_backend: AttachBackendEvidence,
+    /// Object-attribute capture availability in this build (P0-only ship
+    /// vehicle): always present, queryable, never inferred from absence.
+    pub object_capture: ObjectCaptureEvidence,
     #[serde(skip)]
     pub pid_descendant_gaps: u64,
     #[serde(skip)]
     pub multi_rebuild_gaps: u64,
+    /// 6.14 Option B extensive-mode split of the novel unmatched-exit
+    /// subpopulation, `None` unless armed. Manually serialized beside
+    /// the gap counts; never part of shares or verdicts.
+    #[serde(skip)]
+    pub gap_exe_hints: Option<GapExeHints>,
+    /// B17 W2 per-identity reload disclosure, `None` without a
+    /// producer. Manually serialized beside the gap counts into the
+    /// profile lane only; never part of shares or verdicts.
+    #[serde(skip)]
+    pub instance_reload_not_excluded: Option<InstanceReloadNotExcluded>,
     /// Whether a live window (design §5.7: a first required attach key learned
     /// from a live loader or export event) went unprotected by a confirmed
     /// pause owner: 0 or 1, inferred as `loader_discovery.hits > 0` and
@@ -1201,12 +1509,71 @@ const PHYSICAL_IDENTITY_AMBIGUITY: &str =
     "physical identity is ambiguous; the collision group was not attached";
 const UNSUPPORTED_TABLE_VERSION: &str =
     "unsupported function-table version; the scanner does not walk this layout";
+const STATIC_GAP_INCOMPLETE: &str = "static probe coverage gap incomplete";
+const STATIC_GAP_RECOVERED: &str = "static probes detached and exact pairs reattached";
+const PROCESS_VIEW_CAPACITY_EXHAUSTED: &str =
+    "capture process-view capacity was exhausted; remaining generations were not scanned";
+const LOADER_CONTEXT_CAPACITY_EXHAUSTED: &str = "loader context capacity 256 is exhausted";
+const LOADER_SCAN_LEDGER_EXCEEDED: &str =
+    "a deferred loader memory scan exceeded the bounded loader-context ledger";
+const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was full";
+const MANIFEST_OBJECT_UNAVAILABLE: &str = "manifest object unavailable";
+const PREARM_OBJECT_UNAVAILABLE: &str = "prearm object unavailable";
+const DISCOVERY_TRANSPORT_UNAVAILABLE: &str = "discovery transport unavailable";
+
+/// The engine's view-capacity sentence with its configured limit value
+/// still in place: exact prefix, ASCII digits, exact suffix, whole string
+/// consumed. Anything appended, prepended or non-numeric fails — a path
+/// can never satisfy this, so the value that normalizes out is the
+/// product limit alone, never target data.
+fn is_view_capacity_exhaustion(reason: &str) -> bool {
+    const PREFIX: &str = "capture process-view capacity ";
+    const SUFFIX: &str = " was exhausted; remaining generations were not scanned";
+    let Some(rest) = reason.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some(value) = rest.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Closed allowlist of fixed product-limit skips (OD34/E1): the user must
+/// read WHICH limit was hit. Each entry matches an exact internal
+/// (subject, reason) pair whose text is fixed product wording with no
+/// target-derived data (no path, pid, name or bytes) and maps it to its
+/// finite public reason. Everything else keeps today's redaction.
+fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
+    if subject == "process view" && is_view_capacity_exhaustion(reason) {
+        return Some(PROCESS_VIEW_CAPACITY_EXHAUSTED);
+    }
+    if (subject == "live loader arming" || subject == "owned initial-set discovery")
+        && reason == LOADER_CONTEXT_CAPACITY_EXHAUSTED
+    {
+        return Some(LOADER_CONTEXT_CAPACITY_EXHAUSTED);
+    }
+    if subject == "live loader memory discovery" && reason == LOADER_SCAN_LEDGER_EXCEEDED {
+        return Some(LOADER_SCAN_LEDGER_EXCEEDED);
+    }
+    if subject == "post-arm provider discovery" && reason == LOADER_ARM_LEDGER_FULL {
+        return Some(LOADER_ARM_LEDGER_FULL);
+    }
+    None
+}
 
 /// Convert an untyped internal discovery loss into the finite public capture
 /// record. Detailed paths, process identities, and error chains remain in
 /// diagnostics; capture output keeps only the categorical loss needed to make
 /// completeness honest.
 pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
+    // Fixed product-limit skips name their limit; the allowlist holds
+    // exact pairs only, disjoint from function subjects and the gated null.
+    if let Some(reason) = limit_skip_reason(&s.subject, &s.reason) {
+        return SkippedOut {
+            name: DISCOVERY_SUBJECT.into(),
+            reason: reason.into(),
+        };
+    }
     let function = kinds::function_id(&s.subject).is_some();
     // A gated null fact: the mislabel guard renamed an unlinked table's null
     // slot to `unknown`, and the nullness itself is still evidence worth
@@ -1220,6 +1587,16 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         }
     } else if gated_null {
         "null pointer"
+    } else if s.subject == "physical static probe gap"
+        && s.reason
+            == "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete"
+    {
+        STATIC_GAP_INCOMPLETE
+    } else if s.subject == "physical static probe gap"
+        && s.reason
+            == "static probes detached and final exact pairs reattached; the physical coverage interval remains in history"
+    {
+        STATIC_GAP_RECOVERED
     } else if s
         .reason
         .contains("cannot prove physical identity across overlay instances")
@@ -1236,6 +1613,14 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             .contains("no function table was found in its file-backed data")
     {
         TABLE_UNAVAILABLE
+    } else if s.reason.starts_with("manifest object unavailable") {
+        MANIFEST_OBJECT_UNAVAILABLE
+    } else if s.reason.starts_with("prearm object unavailable") {
+        PREARM_OBJECT_UNAVAILABLE
+    } else if s.reason.starts_with("discovery transport unavailable")
+        || (s.subject == "live discovery transport" && s.reason.contains("transport failure"))
+    {
+        DISCOVERY_TRANSPORT_UNAVAILABLE
     } else {
         DISCOVERY_UNAVAILABLE
     };
@@ -1246,6 +1631,80 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             DISCOVERY_SUBJECT.into()
         },
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_gap_category_requires_exact_internal_subject_and_description() {
+    for description in [
+        "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete",
+        "static probes detached and final exact pairs reattached; the physical coverage interval remains in history",
+    ] {
+        for (subject, reason) in [
+            ("discovery subject".to_string(), description.to_string()),
+            (
+                "physical static probe gap PRIVATE_SUBJECT_SENTINEL".to_string(),
+                description.to_string(),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                format!("{description} PRIVATE_REASON_SENTINEL"),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                description.to_uppercase(),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                format!(" {description}"),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                "static probes detached and exact pairs reattached".to_string(),
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped { subject, reason });
+            assert_eq!(projected.name, "discovery subject");
+            assert_eq!(projected.reason, "discovery unavailable");
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("PRIVATE_")
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn never_stop_gaps_project_to_finite_reasons_without_paths() {
+    for (subject, reason, expected) in [
+        (
+            "/opt/secret/provider.so",
+            "manifest object unavailable: cannot open the file now (os error 13)",
+            "manifest object unavailable",
+        ),
+        (
+            "/opt/secret/prearm.so",
+            "prearm object unavailable: the pre-arm file locator no longer resolves",
+            "prearm object unavailable",
+        ),
+        (
+            "live discovery transport",
+            "discovery transport unavailable: dequeue failed after 2 records",
+            "discovery transport unavailable",
+        ),
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject");
+        assert_eq!(projected.reason, expected);
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("/opt/secret"), "{json}");
+        assert!(!json.contains("os error"), "{json}");
     }
 }
 
@@ -1393,6 +1852,7 @@ impl Evidence {
             self.task_uprobe_link_losses > 0,
         );
         cause(o, "pause_partial", self.pause_partial > 0);
+        cause(o, "pause_unavailable", self.pause_unavailable > 0);
         cause(o, "loader_discovery", !self.loader_discovery.complete());
         cause(
             o,
@@ -1434,6 +1894,7 @@ impl Evidence {
             "unregistered_mechanisms",
             self.unregistered_mechanisms > 0,
         );
+        cause(a, "unpublished_mechanisms", self.unpublished_mechanisms > 0);
         cause(a, "discovery_conflicts", self.discovery.conflicts > 0);
         cause(
             a,
@@ -1594,8 +2055,280 @@ pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
     }
 }
 
-/// One refreshing screen. Rows with no activity are omitted; the evidence
-/// line is always present.
+fn scope_label(scope: &str) -> &'static str {
+    match scope {
+        "pid" => "PID",
+        "cgroup" => "cgroup",
+        "system" => "system",
+        _ => "selected",
+    }
+}
+
+/// Named module gaps shown in the terminal summary: at most this many
+/// `modules_skipped` lines plus an "and K more" line.
+pub(crate) const MODULE_GAPS_SHOWN: usize = 5;
+
+/// Attached providers named inside one closure-array gap line: the top
+/// three by counted calls plus an "and K more" suffix.
+const GAP_PROVIDERS_SHOWN: usize = 3;
+
+/// The named module gaps behind a PARTIAL verdict: every refused or
+/// partially covered module with its reason in plain words, what is still
+/// counted, and the hint. Empty when nothing was refused. Paths and reasons
+/// come from target-namespace labels, so every one is control-escaped.
+fn module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
+    let total = ev.discovery.modules_skipped.len();
+    if total == 0 {
+        return String::new();
+    }
+    let shown = total.min(MODULE_GAPS_SHOWN);
+    let mut out = format!("Module gaps (showing {shown} of {total}):\n");
+    for skipped in ev.discovery.modules_skipped.iter().take(shown) {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            escape_controls(&skipped.name),
+            gap_line_body(ev, reports, skipped)
+        ));
+    }
+    if total > shown {
+        out.push_str(&format!("  and {} more\n", total - shown));
+    }
+    out
+}
+
+/// Files the operator excluded with `--exclude-module`, never silent: each
+/// with its path, identity, and mapping process count, plus any inputs that
+/// matched nothing. A declared choice, not a loss — calls into excluded
+/// files were not observed, and the rest of the capture can still be exact.
+fn excluded_lines(ev: &Evidence) -> String {
+    let mut out = String::new();
+    let total = ev.discovery.excluded_modules.len();
+    if total > 0 {
+        out.push_str(&format!("Excluded by you ({total} files):\n"));
+        for excluded in &ev.discovery.excluded_modules {
+            let processes = if excluded.processes == 1 {
+                "1 process mapped it".to_string()
+            } else {
+                format!("{} processes mapped it", excluded.processes)
+            };
+            out.push_str(&format!(
+                "  {}: excluded by you (device {} inode {}, {processes}); calls into this file were not observed\n",
+                escape_controls(&excluded.path),
+                excluded.dev,
+                excluded.ino,
+            ));
+        }
+    }
+    if !ev.discovery.unmatched_excludes.is_empty() {
+        out.push_str(&format!(
+            "Unmatched exclusions ({}): {}\n",
+            ev.discovery.unmatched_excludes.len(),
+            ev.discovery
+                .unmatched_excludes
+                .iter()
+                .map(|input| escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
+/// One named gap line's body: the status, the planner's reason, and the
+/// hint. A refused proxy layer points at the attached providers that count
+/// its forwarded calls; a prefix-admitted proxy layer names its covered
+/// templates with no further hint; a refused provider points at `--module`
+/// (unless the reason already carries that hint, as shared-scope refusals do).
+fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
+    let status = if crate::plan::is_growth_omission(&skipped.reason)
+        || crate::plan::is_closure_array_prefix(&skipped.reason)
+        || crate::plan::is_provider_prefix(&skipped.reason)
+    {
+        "partially covered"
+    } else {
+        "not attached"
+    };
+    let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
+    if crate::plan::is_closure_array_refusal(&skipped.reason) {
+        body.push_str(&closure_forwarding_hint(ev, reports));
+    } else if crate::plan::is_closure_array_prefix(&skipped.reason) {
+        // The reason already names the covered templates; no hint.
+    } else if !skipped.reason.contains("--module") {
+        body.push_str(&format!(
+            "; capture it alone with --module {}",
+            escape_controls(&skipped.name)
+        ));
+    }
+    body
+}
+
+/// Where a refused proxy layer's forwarded calls are counted: the attached
+/// providers with their completed calls, top three plus "and K more" — or,
+/// when nothing below it counted, an explicit statement to that effect.
+fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
+    let mut calls = std::collections::BTreeMap::<ModuleId, u64>::new();
+    for report in reports {
+        if let Some(module) = report.module {
+            let total = calls
+                .get(&module)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(report.calls);
+            calls.insert(module, total);
+        }
+    }
+    let mut providers: Vec<(&str, u64)> = calls
+        .iter()
+        .filter(|(_, calls)| **calls > 0)
+        .filter_map(|(id, calls)| {
+            ev.discovery
+                .modules
+                .iter()
+                .find(|module| module.id == *id)
+                .map(|module| (module.path.as_str(), *calls))
+        })
+        .collect();
+    providers.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    if providers.is_empty() {
+        if ev.discovery.modules.is_empty() {
+            return "; no provider below it was captured".into();
+        }
+        return "; the attached providers counted 0 calls".into();
+    }
+    let mut list: Vec<String> = providers
+        .iter()
+        .take(GAP_PROVIDERS_SHOWN)
+        .map(|(path, calls)| {
+            format!(
+                "{}: {calls} call{}",
+                escape_controls(path),
+                if *calls == 1 { "" } else { "s" }
+            )
+        })
+        .collect();
+    let more = providers.len().saturating_sub(GAP_PROVIDERS_SHOWN);
+    if more > 0 {
+        list.push(format!("and {more} more"));
+    }
+    format!(
+        "; calls it forwards are counted at the attached providers ({})",
+        list.join(", ")
+    )
+}
+
+/// True when at least one mapped provider has no manifest source at all.
+fn has_unattested_provider(ev: &Evidence) -> bool {
+    !ev.discovery.modules.is_empty()
+        && ev
+            .discovery
+            .modules
+            .iter()
+            .any(|module| !module.sources.contains(&"manifest"))
+}
+
+/// Plain-words companion to the `semantic_unverified_slots` verdict
+/// fragment: how many mapped providers have no manifest at all, by name.
+/// Prints only when unverified slots remain and at least one mapped
+/// provider lacks any manifest source; partial manifest coverage keeps
+/// the machine fragment alone. Human text only; the JSON is unchanged.
+fn unattributed_provider_line(ev: &Evidence) -> String {
+    if ev.semantic_unverified_slots == 0 || !has_unattested_provider(ev) {
+        return String::new();
+    }
+    let modules = &ev.discovery.modules;
+    let mut unattested: Vec<String> = modules
+        .iter()
+        .filter(|module| !module.sources.contains(&"manifest"))
+        .map(|module| {
+            std::path::Path::new(&module.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| module.path.clone())
+        })
+        .collect();
+    if unattested.is_empty() {
+        return String::new();
+    }
+    unattested.sort();
+    let shown: Vec<&str> = unattested.iter().take(3).map(String::as_str).collect();
+    let names = if unattested.len() > 3 {
+        format!("{}, and {} more", shown.join(", "), unattested.len() - 3)
+    } else {
+        shown.join(", ")
+    };
+    format!(
+        "Attribution: {} of {} mapped provider{} {} no manifest ({}); counts are exact, \
+         names are withheld — rerun with --manifest for each mapped provider.\n",
+        unattested.len(),
+        modules.len(),
+        if modules.len() == 1 { "" } else { "s" },
+        if unattested.len() == 1 { "has" } else { "have" },
+        escape_controls(&names),
+    )
+}
+
+/// Human context from aggregate map rows and the existing evidence verdict.
+/// Scope is a kind, never a target PID, path or application identity.
+pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> String {
+    let sum = |field: fn(&SlotReport) -> u64| {
+        reports
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(field(row)))
+    };
+    let calls = sum(|row| row.calls);
+    let errors = sum(|row| row.errors);
+    let open = sum(|row| row.in_flight);
+    let mut text = format!("Scope: {} scope\n", scope_label(scope));
+    if scope != "pid" {
+        text.push_str("Aggregate across the selected scope; counts are not per application.\n");
+    }
+    if calls == 0 {
+        text.push_str(if ev.completeness == "COMPLETE" {
+            "No completed calls observed during this window.\n"
+        } else {
+            "No completed calls observed; coverage incomplete.\n"
+        });
+    }
+    text.push_str(&format!(
+        "{calls} completed calls; {errors} returned errors; {open} entries without an observed return.\n"
+    ));
+    text.push_str(&format!(
+        "Coverage {}{}\n",
+        escape_controls(ev.completeness),
+        escape_controls(&verdict_reasons(ev)),
+    ));
+    text.push_str(&unattributed_provider_line(ev));
+    if ev.event_loss > 0 {
+        text.push_str(
+            "Coverage partial: event detail was lost. Aggregate counts use the counter maps.\n",
+        );
+    }
+    text.push_str(&module_gap_lines(ev, reports));
+    text.push_str(&excluded_lines(ev));
+    for (has_owner_gap, total, description) in [
+        (
+            reports.iter().any(|row| row.module_ambiguous),
+            sum(|row| if row.module_ambiguous { row.calls } else { 0 }),
+            "ambiguous",
+        ),
+        (
+            reports.iter().any(|row| row.module_unresolved),
+            sum(|row| if row.module_unresolved { row.calls } else { 0 }),
+            "unresolved",
+        ),
+    ] {
+        if has_owner_gap {
+            text.push_str(&format!(
+                "{total} completed calls have {description} module ownership.\n"
+            ));
+        }
+    }
+    text
+}
+
+/// One refreshing screen for consumers without a retained scope kind.
+/// Rows with no activity are omitted; the evidence line is always present.
+/// Mechanism rows are never shown here; `live_scoped` renders them.
 pub fn live(
     reports: &[SlotReport],
     ev: &Evidence,
@@ -1604,14 +2337,94 @@ pub fn live(
     mode: &str,
     policy: CapturePolicy,
 ) -> String {
+    live_scoped(
+        reports,
+        ev,
+        elapsed,
+        module,
+        mode,
+        policy,
+        "selected",
+        &BTreeMap::new(),
+    )
+}
+
+/// Derive the extra observation gap from the protected snapshot. This is
+/// reapplied after terminal verdict recomputation, without changing the
+/// existing Evidence layout or the legacy cause/class accounting.
+pub(crate) fn apply_counter_snapshot(
+    ev: &mut Evidence,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) {
+    if snapshot.has_counter_gap() {
+        let observation = &mut ev.gap_classes.observation;
+        if !observation.causes.contains(&"counter_collection") {
+            observation.causes.push("counter_collection");
+        }
+        observation.status = "lossy";
+        ev.completeness = "PARTIAL";
+        ev.verdict_detail = VERDICT_CONCRETE_GAP;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_snapshot_scoped(
+    snapshot: &crate::metrics::CaptureSnapshot,
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
+) -> String {
+    let mut frame = live_scoped(
+        snapshot.reports(),
+        ev,
+        elapsed,
+        module,
+        mode,
+        policy,
+        scope,
+        mechanisms,
+    );
+    if let Some(summary) = snapshot.counter_summary() {
+        frame.push_str(&summary);
+    }
+    frame
+}
+
+/// The capture renderer receives only the validated scope kind.
+/// `mechanisms` is the same per-id map the JSON `mechanisms[]` carries
+/// (`State::mechanisms`): a nonempty map renders a compact name/calls/errors
+/// table under the function table, while an empty map with observed calls
+/// renders one plain line saying why no mechanisms are named. No parameters
+/// are shown, so no decoder policy applies here.
+#[allow(clippy::too_many_arguments)]
+pub fn live_scoped(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
+) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "p11scope — {module} — up {:02}:{:02}:{:02} — mode {mode} — privacy={}\n",
+        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {} — privacy={} — {}\n",
+        scope_label(scope),
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
         elapsed.as_secs() % 60,
+        escape_controls(mode),
         policy.privacy_mode(),
+        escape_controls(module),
     ));
+    s.push_str(&scope_summary(scope, reports, ev));
+    s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
+    s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
     s.push_str(&format!(
         "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
         "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
@@ -1622,18 +2435,70 @@ pub fn live(
         .collect();
     rows.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.names.cmp(&b.names)));
     for r in rows {
+        let percentiles = if r.mode.has_histogram() {
+            [
+                percentile_ns(&r.buckets, 0.50),
+                percentile_ns(&r.buckets, 0.95),
+                percentile_ns(&r.buckets, 0.99),
+            ]
+        } else {
+            [None; 3]
+        };
+        let mut name = label(r);
+        if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
+            name.push_str(init.text_suffix());
+        }
         s.push_str(&format!(
             "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            label(r),
+            escape_controls(&name),
             r.calls,
             r.errors,
-            fmt_ns(percentile_ns(&r.buckets, 0.50)),
-            fmt_ns(percentile_ns(&r.buckets, 0.95)),
-            fmt_ns(percentile_ns(&r.buckets, 0.99)),
+            fmt_ns(percentiles[0]),
+            fmt_ns(percentiles[1]),
+            fmt_ns(percentiles[2]),
             r.in_flight
         ));
     }
     s.push_str("(~ = log2-bucket approximation, lower bound)\n");
+    if !mechanisms.is_empty() {
+        s.push_str(&format!(
+            "{:<28} {:>8} {:>6}\n",
+            "MECHANISM", "CALLS", "ERR"
+        ));
+        let mut rows: Vec<(&u64, &MechStat)> = mechanisms.iter().collect();
+        rows.sort_by(|(a_id, a), (b_id, b)| b.calls.cmp(&a.calls).then(a_id.cmp(b_id)));
+        for (id, stat) in rows {
+            let name = mechanism_name(*id)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("0x{id:x}"));
+            s.push_str(&format!(
+                "{:<28} {:>8} {:>6}\n",
+                escape_controls(&name),
+                stat.calls,
+                stat.errors
+            ));
+        }
+    } else if reports.iter().any(|r| r.calls > 0 || r.in_flight > 0) {
+        // No attributed mechanisms despite observed calls: name the gap in
+        // one plain line instead of omitting the section. Count-only slots
+        // never carry mechanism attribution; anything else simply records
+        // none for the observed calls. The manifest remedy prints only
+        // while a mapped provider actually lacks one.
+        if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
+            s.push_str(&format!(
+                "Mechanisms: none attributed — {} semantics-unverified/count-only slot{}; \
+                 add --manifest for each mapped provider (see Coverage).\n",
+                ev.semantic_unverified_slots,
+                if ev.semantic_unverified_slots == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
+        } else {
+            s.push_str("Mechanisms: none recorded for the observed calls.\n");
+        }
+    }
     let mut evidence_line = format!(
         "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
         ev.attached_probes,
@@ -1671,7 +2536,8 @@ pub fn live(
     // F-13: why the verdict is what it is, from the classes the verdict used,
     // so a gate can never force PARTIAL without being named here.
     evidence_line.push_str(&format!(" → {}{}\n", ev.completeness, verdict_reasons(ev)));
-    s.push_str(&evidence_line);
+    s.push_str(&escape_controls(evidence_line.trim_end()));
+    s.push('\n');
     s
 }
 
@@ -1753,11 +2619,16 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "modules_skipped" => {
                 // A module still attached on the endpoints it had when its
                 // growth did not fit is partially covered, not refused (G-03).
+                // A Part 0 prefix-admitted closure array is likewise partial.
                 let partially_covered = ev
                     .discovery
                     .modules_skipped
                     .iter()
-                    .filter(|module| crate::plan::is_growth_omission(&module.reason))
+                    .filter(|module| {
+                        crate::plan::is_growth_omission(&module.reason)
+                            || crate::plan::is_closure_array_prefix(&module.reason)
+                            || crate::plan::is_provider_prefix(&module.reason)
+                    })
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
                 for (n, label) in [
@@ -1771,13 +2642,34 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                 continue;
             }
             "attach_failures" => count(ev.attach_failures.len() as u64, "attach failures"),
-            "skipped" => count(
-                ev.skipped
-                    .iter()
-                    .filter(|skip| skip.reason != NULL_POINTER_REASON)
-                    .count() as u64,
-                "entries skipped",
-            ),
+            "skipped" => {
+                fragments.push(count(
+                    ev.skipped
+                        .iter()
+                        .filter(|skip| skip.reason != NULL_POINTER_REASON)
+                        .count() as u64,
+                    "entries skipped",
+                ));
+                // One histogram line per named limit present, in canonical
+                // order; the labels are the finite public reasons, never
+                // raw skip text, so no target data can reach this line.
+                for reason in [
+                    PROCESS_VIEW_CAPACITY_EXHAUSTED,
+                    LOADER_CONTEXT_CAPACITY_EXHAUSTED,
+                    LOADER_SCAN_LEDGER_EXCEEDED,
+                    LOADER_ARM_LEDGER_FULL,
+                ] {
+                    let hits = ev
+                        .skipped
+                        .iter()
+                        .filter(|skip| skip.reason == reason)
+                        .count() as u64;
+                    if hits > 0 {
+                        fragments.push(format!("{reason}: {hits}"));
+                    }
+                }
+                continue;
+            }
             "in_flight_at_end" => count(ev.in_flight_at_end, "calls in flight"),
             "surfaces" => count(
                 ev.surfaces
@@ -1797,6 +2689,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "malformed_records" => count(ev.malformed_records, "malformed records"),
             "provider_changed" => "provider changed".to_string(),
             "trace_truncated" => "trace truncated at its event cap".to_string(),
+            "counter_collection" => "counter collection incomplete".to_string(),
             "proc_namespace_mismatch" => {
                 "/proc numbering foreign: kernel PIDs unresolvable".to_string()
             }
@@ -1817,7 +2710,22 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                 count(ev.task_uprobe_link_losses, "task-uprobe links lost")
             }
             "pause_partial" => count(ev.pause_partial, "partial pauses"),
-            "loader_discovery" => "live loader timing unproven".to_string(),
+            "pause_unavailable" => count(
+                ev.pause_unavailable,
+                "pause unavailable (collected unpaused)",
+            ),
+            "loader_discovery" => {
+                let loader = &ev.loader_discovery;
+                if loader.hits == 0 && loader.strategies.debug_state_every_hit == 1 {
+                    "loader BPF delivery failure suspected (0 hits, no EXEC acknowledgment)"
+                        .to_string()
+                } else if loader.hits == 0 && loader.strategies.debug_state_every_hit >= 2 {
+                    "loader uprobe never fired despite EXEC processing (uprobe miss suspected)"
+                        .to_string()
+                } else {
+                    "live loader timing unproven".to_string()
+                }
+            }
             "scheduling.terminal_drain_truncated" => "terminal drain truncated".to_string(),
             "scheduling.sink_dropped_bytes" => {
                 count(ev.scheduling.sink_dropped_bytes, "output bytes dropped")
@@ -1840,6 +2748,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "unregistered_mechanisms" => {
                 count(ev.unregistered_mechanisms, "unregistered mechanisms")
             }
+            "unpublished_mechanisms" => count(ev.unpublished_mechanisms, "unpublished mechanisms"),
             "discovery_conflicts" => count(ev.discovery.conflicts, "discovery conflicts"),
             "discovery_uncorroborated" => {
                 count(ev.discovery.uncorroborated, "uncorroborated modules")
@@ -1912,13 +2821,18 @@ struct FunctionOut {
     errors: u64,
     pending_returns: u64,
     in_flight: u64,
-    latency_ns: LatencyOut,
+    latency_ns: Option<LatencyOut>,
     rv_counts: std::collections::BTreeMap<String, u64>,
+    /// The Initialize claim, present only on rows that name `C_Initialize`
+    /// with at least one positively counted return; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initialization: Option<InitializationOut>,
 }
 
 #[derive(Serialize)]
 struct LatencyOut {
-    /// Bucket-approximated; exact values are total/max.
+    /// Whether percentiles are bucket-approximated. Total/max retain their
+    /// source's measurement and loss limits.
     approximate: bool,
     p50: Option<u64>,
     p95: Option<u64>,
@@ -1940,6 +2854,111 @@ fn latency_out(
         total,
         max,
     }
+}
+
+/// Availability follows the actual row's counter capability, never its values.
+fn latency_out_for_mode(report: &SlotReport) -> Option<LatencyOut> {
+    match report.mode {
+        CounterMode::Counts => None,
+        CounterMode::Timestamps => Some(LatencyOut {
+            approximate: false,
+            p50: None,
+            p95: None,
+            p99: None,
+            total: report.total_ns,
+            max: report.max_ns,
+        }),
+        CounterMode::Latency => Some(latency_out(&report.buckets, report.total_ns, report.max_ns)),
+    }
+}
+
+/// The per-row Initialize claim: the outcome class over the row's own
+/// completed calls plus the potential-provider likelihood. Render-time
+/// only, from `rv_counts` already on the row — no new read, no new
+/// retention. Absent (never null or false) unless the row names
+/// `C_Initialize` with at least one positively counted return.
+#[derive(Serialize)]
+struct InitializationOut {
+    /// `ok`, `already_initialized`, `error`, or `mixed` (more than one
+    /// class over the row's completed calls).
+    outcome: InitializationOutcome,
+    /// Present and true exactly when at least one completed call returned
+    /// CKR_OK or CKR_CRYPTOKI_ALREADY_INITIALIZED: a likelihood that the
+    /// row's module behaves as a Cryptoki provider, never proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    potential_provider: Option<bool>,
+}
+
+/// The closed outcome vocabulary, shared by the JSON row and the live
+/// marker so both stay exhaustive.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InitializationOutcome {
+    Ok,
+    AlreadyInitialized,
+    Error,
+    Mixed,
+}
+
+impl InitializationOut {
+    /// The live-table marker uses the same words as the JSON row.
+    fn text_suffix(&self) -> &'static str {
+        match self.outcome {
+            InitializationOutcome::Ok => " [init: ok, potential provider]",
+            InitializationOutcome::AlreadyInitialized => {
+                " [init: already_initialized, potential provider]"
+            }
+            InitializationOutcome::Mixed => " [init: mixed, potential provider]",
+            InitializationOutcome::Error => " [init: error]",
+        }
+    }
+}
+
+/// Derives the Initialize claim from the row's own `rv_counts` alone.
+/// Every positively counted return maps to exactly one class: CKR_OK is
+/// `ok`, CKR_CRYPTOKI_ALREADY_INITIALIZED is `already_initialized`, and
+/// anything else — including CKR_PENDING, for which the outcome
+/// vocabulary has no word — is `error`. Zero counts assert nothing and
+/// are ignored.
+fn initialization_out(
+    names: &[String],
+    rv_counts: &std::collections::BTreeMap<u64, u64>,
+) -> Option<InitializationOut> {
+    if !names.iter().any(|name| name == "C_Initialize") {
+        return None;
+    }
+    let mut ok = false;
+    let mut already = false;
+    let mut error = false;
+    for (&rv, &count) in rv_counts {
+        if count == 0 {
+            continue;
+        }
+        if rv == pkcs11_types::CkRv::OK.0 {
+            ok = true;
+        } else if rv == pkcs11_types::CkRv::CRYPTOKI_ALREADY_INITIALIZED.0 {
+            already = true;
+        } else {
+            error = true;
+        }
+    }
+    let classes = [ok, already, error].into_iter().filter(|&b| b).count();
+    if classes == 0 {
+        return None;
+    }
+    let outcome = if classes > 1 {
+        InitializationOutcome::Mixed
+    } else if ok {
+        InitializationOutcome::Ok
+    } else if already {
+        InitializationOutcome::AlreadyInitialized
+    } else {
+        InitializationOutcome::Error
+    };
+    Some(InitializationOut {
+        outcome,
+        potential_provider: (ok || already).then_some(true),
+    })
 }
 
 /// Per-name call/error/latency counts from the **aggregate BPF maps** —
@@ -1978,12 +2997,13 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
                 .copied()
                 .unwrap_or(0),
             in_flight: r.in_flight,
-            latency_ns: latency_out(&r.buckets, r.total_ns, r.max_ns),
+            latency_ns: latency_out_for_mode(r),
             rv_counts: r
                 .rv_counts
                 .iter()
                 .map(|(rv, n)| (format!("0x{rv:016x}"), *n))
                 .collect(),
+            initialization: initialization_out(&r.names, &r.rv_counts),
         })
         .collect()
 }
@@ -2024,6 +3044,21 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "evidence": ev,
         "functions": functions_out(reports, &ev.discovery.modules),
     })
+}
+
+/// Only a protected accepted snapshot can supply this optional derived data.
+/// Ordinary capture/trace evidence and all existing initializers stay intact.
+pub(crate) fn with_counter_snapshot(
+    mut document: serde_json::Value,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) -> serde_json::Value {
+    if let Some(collection) = snapshot.counter_collection() {
+        document["evidence"]
+            .as_object_mut()
+            .expect("capture renderer emits an evidence object")
+            .insert("counter_collection".into(), collection);
+    }
+    document
 }
 
 /// Type-enforced versioned evidence (SYSPLAN residual F-08): the only input
@@ -2069,6 +3104,56 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
     );
     object.insert("pid_descendant_gaps".into(), ev.pid_descendant_gaps.into());
     object.insert("multi_rebuild_gaps".into(), ev.multi_rebuild_gaps.into());
+    // 6.14 Option B: present if and only if extensive mode armed. The
+    // label and scope ride every publication (Row C); the counts never
+    // feed shares, verdicts, or completeness.
+    if let Some(hints) = ev.gap_exe_hints {
+        object.insert(
+            "gap_exe_hints".into(),
+            serde_json::json!({
+                "label": STATIC_HINT_LABEL,
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": hints.links_provider,
+                "links_pkcs11_loader": hints.links_pkcs11_loader,
+                "no_static_link_within_scope": hints.no_static_link_within_scope,
+                "unknown": hints.unknown,
+            }),
+        );
+    }
+    // 6.14 Option A: present if and only if extensive mode armed. A
+    // kernel exit-time observation, not a hint: no label or scope
+    // rides it, only the two counts, which never feed shares,
+    // verdicts, or completeness.
+    if let Some(split) = ev.discovery.gap_exit_mappings {
+        object.insert(
+            "gap_exit_mappings".into(),
+            serde_json::json!({
+                "mapped": split.mapped,
+                "unknown": split.unknown,
+            }),
+        );
+    }
+    // B17 W2: present whenever the capture produced reload evidence:
+    // a disclosed tainted identity, or nonzero count snapshots with
+    // an empty identities list (mint exhaustion). Per-identity
+    // entries plus the capture counts; the private image key never
+    // renders, and the key never feeds shares, verdicts, or
+    // completeness.
+    if let Some(reload) = ev.instance_reload_not_excluded.as_ref() {
+        let identities: Vec<serde_json::Value> = reload
+            .identities
+            .iter()
+            .map(|entry| serde_json::json!({"file_slot": entry.file_slot, "ids": entry.ids}))
+            .collect();
+        object.insert(
+            "instance_reload_not_excluded".into(),
+            serde_json::json!({
+                "continued_across_global": reload.continued_across_global,
+                "joined_across_global": reload.joined_across_global,
+                "identities": identities,
+            }),
+        );
+    }
     evidence
 }
 
@@ -2080,6 +3165,11 @@ struct MechanismOut {
     /// Verbatim id — vendor ids survive unchanged, never renamed or dropped.
     mechanism: u64,
     mechanism_hex: String,
+    /// The BPF return path found this id in `MECH_SHAPE` (registry
+    /// membership, parameter shape published). `false` marks an
+    /// unregistered publication: numeric id plus call/error counts
+    /// only, never decoded, never named.
+    registered: bool,
     /// Operation categories (`"sign"`, `"encrypt"`, ...) this id was seen
     /// initializing. Empty when only ever seen as an orphan operational
     /// call (no `*Init` observed in this capture).
@@ -2262,6 +3352,11 @@ struct SessionsOut {
 struct CgroupMechOut {
     mechanism: u64,
     mechanism_hex: String,
+    /// The BPF return path found this id in `MECH_SHAPE` (registry
+    /// membership). `false` marks an unregistered publication:
+    /// numeric id plus call/error counts only, never decoded, never
+    /// named — the same flag as the top-level `mechanisms[]` rows.
+    registered: bool,
     calls: u64,
     errors: u64,
 }
@@ -2306,6 +3401,7 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
                 .map(|(&mechanism, m)| CgroupMechOut {
                     mechanism,
                     mechanism_hex: format!("0x{mechanism:x}"),
+                    registered: !m.unregistered,
                     calls: m.calls,
                     errors: m.errors,
                 })
@@ -2393,6 +3489,7 @@ pub fn profile_json(
             MechanismOut {
                 mechanism: *id,
                 mechanism_hex: format!("0x{id:x}"),
+                registered: !m.unregistered,
                 ops: m.ops.iter().cloned().collect(),
                 calls: m.calls,
                 errors: m.errors,
@@ -2465,7 +3562,7 @@ pub fn profile_json(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
+    use p11scope_ebpf_common::{CounterMode, LATENCY_BUCKETS, shape};
 
     /// One evidence mutation for the table-driven gate pins below.
     type EvidenceMutation = fn(&mut Evidence);
@@ -2497,6 +3594,7 @@ pub(crate) mod tests {
             module: None,
             module_ambiguous: false,
             module_unresolved: false,
+            mode: CounterMode::Latency,
             calls,
             errors: 0,
             in_flight,
@@ -2505,6 +3603,298 @@ pub(crate) mod tests {
             buckets: [0; LATENCY_BUCKETS],
             rv_counts: Default::default(),
         }
+    }
+
+    #[test]
+    fn counter_modes_render_their_timing_availability() {
+        use p11scope_ebpf_common::bucket_of;
+        let capture = CaptureMeta {
+            policy: CapturePolicy::AggregateOnly,
+            ..capture_fixture()
+        };
+        for (mode, latency) in [
+            (CounterMode::Counts, serde_json::Value::Null),
+            (
+                CounterMode::Timestamps,
+                serde_json::json!({
+                    "approximate": false, "p50": null, "p95": null, "p99": null,
+                    "total": 2_500, "max": 100,
+                }),
+            ),
+            (
+                CounterMode::Latency,
+                serde_json::json!({
+                    "approximate": true, "p50": 64, "p95": 64, "p99": 64,
+                    "total": 2_500, "max": 100,
+                }),
+            ),
+        ] {
+            let mut row = report("C_Sign", 25, 2, false);
+            row.mode = mode;
+            row.errors = 3;
+            row.total_ns = 2_500;
+            row.max_ns = 100;
+            row.buckets[bucket_of(100) as usize] = 25;
+            row.rv_counts.insert(0, 22);
+            row.rv_counts.insert(5, 3);
+            let output = json(&[row], &evidence(), &capture);
+            let functions = output["functions"].as_array().unwrap();
+            assert_eq!(functions.len(), 1);
+            assert_eq!(functions[0]["latency_ns"], latency, "{mode:?}");
+            assert_eq!(functions[0]["calls"], 25);
+            assert_eq!(functions[0]["errors"], 3);
+            assert_eq!(functions[0]["in_flight"], 2);
+            assert_eq!(
+                functions[0]["rv_counts"],
+                serde_json::json!({"0x0000000000000000": 22, "0x0000000000000005": 3})
+            );
+        }
+    }
+
+    #[test]
+    fn counter_timing_ignores_unavailable_fields_and_preserves_measured_zero() {
+        use p11scope_ebpf_common::bucket_of;
+        let capture = CaptureMeta {
+            policy: CapturePolicy::AggregateOnly,
+            ..capture_fixture()
+        };
+        let mut row = report("C_Sign", 25, 0, false);
+        row.mode = CounterMode::Counts;
+        row.total_ns = u64::MAX;
+        row.max_ns = u64::MAX;
+        row.buckets[bucket_of(100) as usize] = 25;
+        assert!(
+            json(&[row.clone()], &evidence(), &capture)["functions"][0]["latency_ns"].is_null()
+        );
+
+        row.mode = CounterMode::Timestamps;
+        row.total_ns = 0;
+        row.max_ns = 0;
+        assert_eq!(
+            json(&[row.clone()], &evidence(), &capture)["functions"][0]["latency_ns"],
+            serde_json::json!({
+                "approximate": false, "p50": null, "p95": null, "p99": null,
+                "total": 0, "max": 0,
+            })
+        );
+
+        row.mode = CounterMode::Latency;
+        row.buckets = [0; LATENCY_BUCKETS];
+        row.buckets[0] = 25;
+        assert_eq!(
+            json(&[row], &evidence(), &capture)["functions"][0]["latency_ns"],
+            serde_json::json!({
+                "approximate": true, "p50": 0, "p95": 0, "p99": 0,
+                "total": 0, "max": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn human_counter_percentiles_follow_capability_with_poisoned_buckets() {
+        use p11scope_ebpf_common::bucket_of;
+        for (mode, expected) in [
+            (CounterMode::Counts, "—"),
+            (CounterMode::Timestamps, "—"),
+            (CounterMode::Latency, "64ns"),
+        ] {
+            let mut row = report("C_Sign", 25, 2, false);
+            row.mode = mode;
+            row.errors = 3;
+            row.buckets[bucket_of(100) as usize] = 25;
+            let output = live(
+                &[row],
+                &evidence(),
+                Duration::from_secs(1),
+                "/owned/provider.so",
+                "metrics",
+                CapturePolicy::AggregateOnly,
+            );
+            let fields: Vec<_> = output
+                .lines()
+                .find(|line| line.starts_with("C_Sign "))
+                .unwrap()
+                .split_whitespace()
+                .collect();
+            assert_eq!(
+                fields,
+                ["C_Sign", "25", "3", expected, expected, expected, "2"],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_counter_snapshot_adapters_preserve_legacy_outputs() {
+        for profile in [false, true] {
+            let snapshot = crate::metrics::ConsumerFixture::ordinary_snapshot(profile);
+            let mut ev = evidence();
+            ev.verdict_with_selection(profile);
+            let before = serde_json::to_value(&ev).unwrap();
+            apply_counter_snapshot(&mut ev, &snapshot);
+            assert_eq!(serde_json::to_value(&ev).unwrap(), before);
+            let capture = capture_fixture();
+            let document = if profile {
+                profile_json(
+                    snapshot.reports(),
+                    VersionedEvidence::wrap(&ev),
+                    &state_fixture(),
+                    &capture,
+                )
+            } else {
+                json(snapshot.reports(), &ev, &capture)
+            };
+            assert_eq!(with_counter_snapshot(document.clone(), &snapshot), document);
+            assert_eq!(
+                live_snapshot_scoped(
+                    &snapshot,
+                    &ev,
+                    Duration::ZERO,
+                    "owned",
+                    "profile",
+                    capture.policy,
+                    "pid",
+                    &BTreeMap::new()
+                ),
+                live_scoped(
+                    snapshot.reports(),
+                    &ev,
+                    Duration::ZERO,
+                    "owned",
+                    "profile",
+                    capture.policy,
+                    "pid",
+                    &BTreeMap::new()
+                ),
+            );
+            assert!(
+                !versioned_evidence(&ev)
+                    .as_object()
+                    .unwrap()
+                    .contains_key("counter_collection")
+            );
+        }
+    }
+
+    #[test]
+    fn protected_counter_snapshot_metadata_uses_actual_modes_and_aggregate_totals() {
+        let mut detail =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+        event.cgroup_id = 111;
+        detail.observe(&event);
+        detail.observe(&event);
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let mut fixture = crate::metrics::ConsumerFixture::new();
+            let snapshot = fixture.fresh(mode, 1, 5, None).unwrap();
+            let mut ev = evidence();
+            ev.verdict_with_selection(false);
+            let before = serde_json::to_value(&ev).unwrap();
+            apply_counter_snapshot(&mut ev, &snapshot);
+            assert_eq!(serde_json::to_value(&ev).unwrap(), before);
+            for profile in [false, true] {
+                let capture = capture_fixture();
+                let document = if profile {
+                    profile_json(
+                        snapshot.reports(),
+                        VersionedEvidence::wrap(&ev),
+                        &detail,
+                        &capture,
+                    )
+                } else {
+                    json(snapshot.reports(), &ev, &capture)
+                };
+                let document = with_counter_snapshot(document, &snapshot);
+                assert_eq!(
+                    document["evidence"]["counter_collection"],
+                    snapshot.counter_collection().unwrap()
+                );
+                assert_eq!(
+                    document["evidence"]["counter_collection"]["mode"],
+                    mode.name()
+                );
+                assert_eq!(document["functions"][0]["calls"], 5);
+                if profile {
+                    assert_eq!(
+                        document["cgroups"][0]["calls"], 2,
+                        "selected detail is nonempty"
+                    );
+                }
+                let timing = &document["functions"][0]["latency_ns"];
+                if mode == CounterMode::Counts {
+                    assert!(timing.is_null());
+                } else if mode == CounterMode::Timestamps {
+                    assert_eq!(timing["total"], 500);
+                    assert!(timing["p50"].is_null());
+                } else {
+                    assert_eq!(timing["total"], 500);
+                    assert!(!timing["p50"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protected_counter_failures_and_discontinuity_cannot_render_complete() {
+        for fault in [
+            crate::metrics::ConsumerFault::Saturated,
+            crate::metrics::ConsumerFault::Contended,
+        ] {
+            let mut fixture = crate::metrics::ConsumerFixture::new();
+            fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+            let stale = fixture
+                .fresh(CounterMode::Counts, 1, 8, Some(fault))
+                .unwrap();
+            let mut ev = evidence();
+            ev.verdict_with_selection(false);
+            let attribution = ev.gap_classes.attribution.clone();
+            let semantics = ev.gap_classes.semantics.clone();
+            apply_counter_snapshot(&mut ev, &stale);
+            apply_counter_snapshot(&mut ev, &stale);
+            assert_eq!(ev.completeness, "PARTIAL");
+            assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+            assert_eq!(
+                ev.gap_classes
+                    .observation
+                    .causes
+                    .iter()
+                    .filter(|&&cause| cause == "counter_collection")
+                    .count(),
+                1
+            );
+            assert_eq!(ev.gap_classes.attribution, attribution);
+            assert_eq!(ev.gap_classes.semantics, semantics);
+            let frame = live_snapshot_scoped(
+                &stale,
+                &ev,
+                Duration::ZERO,
+                "owned",
+                "metrics",
+                CapturePolicy::AggregateOnly,
+                "pid",
+                &BTreeMap::new(),
+            );
+            assert!(frame.contains("last read stale"), "{frame}");
+            assert!(frame.contains("PARTIAL"), "{frame}");
+            let document =
+                with_counter_snapshot(json(stale.reports(), &ev, &capture_fixture()), &stale);
+            assert!(document["evidence"]["counter_collection"]["health"].is_null());
+            assert_eq!(document["functions"][0]["calls"], 5);
+        }
+        let mut fixture = crate::metrics::ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let changed = fixture.terminal(CounterMode::Counts, 2, 8, None).unwrap();
+        let mut ev = evidence();
+        ev.settle_terminal(false);
+        apply_counter_snapshot(&mut ev, &changed);
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        assert_eq!(changed.counter_collection().unwrap()["status"], "fresh");
+        assert_eq!(changed.counter_collection().unwrap()["discontinuity"], true);
     }
 
     fn ok_surface() -> crate::plan::SurfaceSummary {
@@ -2538,6 +3928,7 @@ pub(crate) mod tests {
             abi_refusals: 0,
             semantic_capture_failures: 0,
             unregistered_mechanisms: 0,
+            unpublished_mechanisms: 0,
             template_tail_failures: 0,
             process_tracking_fallbacks: 0,
             process_tracking_failures: 0,
@@ -2566,6 +3957,7 @@ pub(crate) mod tests {
             pause_attempts: 0,
             pause_confirmed: 0,
             pause_partial: 0,
+            pause_unavailable: 0,
             child_still_running: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
@@ -2577,8 +3969,11 @@ pub(crate) mod tests {
             interface_selection: InterfaceSelection::default(),
             attach_mechanisms: vec![],
             attach_backend: Default::default(),
+            object_capture: ObjectCaptureEvidence::for_build(false),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
+            gap_exe_hints: None,
+            instance_reload_not_excluded: None,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
@@ -2652,18 +4047,484 @@ pub(crate) mod tests {
         );
         assert_eq!(profile["evidence"]["pid_descendant_gaps"], 0);
         assert_eq!(profile["evidence"]["multi_rebuild_gaps"], 0);
+        // Disarmed: the split key is absent, never null.
+        assert!(profile["evidence"].get("gap_exe_hints").is_none());
 
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
         assert_eq!(metrics["schema"], "p11scope/observed-profile/v3-metrics");
+        assert_eq!(
+            metrics["evidence"]["attach_backend"],
+            profile["evidence"]["attach_backend"]
+        );
         for field in [
             "interface_selection",
             "attach_mechanisms",
-            "attach_backend",
             "pid_descendant_gaps",
             "multi_rebuild_gaps",
         ] {
             assert!(metrics["evidence"].get(field).is_none(), "{field}");
         }
+    }
+
+    #[test]
+    fn profile_v3_gap_exe_hints_split_is_exact_when_armed() {
+        let mut ev = evidence();
+        ev.gap_exe_hints = Some(GapExeHints {
+            links_provider: 2,
+            links_pkcs11_loader: 1,
+            no_static_link_within_scope: 4,
+            unknown: 3,
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["gap_exe_hints"],
+            serde_json::json!({
+                "label": "STATIC HINT",
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": 2,
+                "links_pkcs11_loader": 1,
+                "no_static_link_within_scope": 4,
+                "unknown": 3,
+            })
+        );
+        // The metrics lane embeds `Evidence` directly: profile-only
+        // fields stay absent even when armed.
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert!(metrics["evidence"].get("gap_exe_hints").is_none());
+    }
+
+    // 614b P2#5: the shares-unchanged twin over a nonzero observed
+    // call/attribution surface. Both sides observe the same calls
+    // through the semantic state machine and render the same slot
+    // aggregates; only the hint evidence differs, so every rendered
+    // call, mechanism, cgroup-attribution, verdict and completeness
+    // surface must be identical.
+    #[test]
+    fn profile_v3_gap_exe_hints_do_not_move_call_or_attribution_surfaces() {
+        use p11scope_ebpf_common::shape;
+
+        let observed_state = || {
+            let mut state =
+                crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+            let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+            event.cgroup_id = 111;
+            state.observe(&event);
+            state.observe(&event);
+            state.observe(&event);
+            state
+        };
+        let reports = || {
+            let mut sign = report("C_Sign", 25, 2, false);
+            sign.module = Some(crate::plan::ModuleId(0));
+            sign.errors = 3;
+            sign.total_ns = 2_500;
+            sign.max_ns = 100;
+            sign.rv_counts.insert(0, 22);
+            sign.rv_counts.insert(5, 3);
+            let mut encrypt = report("C_Encrypt", 7, 0, false);
+            encrypt.module = Some(crate::plan::ModuleId(0));
+            encrypt.rv_counts.insert(0, 7);
+            vec![sign, encrypt]
+        };
+        let mut plain_ev = evidence();
+        plain_ev.pid_descendant_gaps = 2;
+        let mut armed_ev = evidence();
+        armed_ev.pid_descendant_gaps = 2;
+        armed_ev.gap_exe_hints = Some(GapExeHints {
+            links_provider: 1,
+            links_pkcs11_loader: 0,
+            no_static_link_within_scope: 0,
+            unknown: 1,
+        });
+
+        let plain = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&plain_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+        let mut armed = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&armed_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+
+        // Both controls really carry calls and attribution, and only
+        // the armed side carries a nonzero hint split.
+        let total_calls: u64 = plain["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|function| function["calls"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total_calls, 32, "twin must observe nonzero calls");
+        assert_eq!(plain["mechanisms"][0]["calls"], 3);
+        assert_eq!(plain["cgroups"][0]["calls"], 3);
+        assert_eq!(plain["cgroups"][0]["mechanisms"][0]["calls"], 3);
+        assert!(plain["evidence"].get("gap_exe_hints").is_none());
+        assert_eq!(armed["evidence"]["gap_exe_hints"]["links_provider"], 1);
+        assert_eq!(armed["evidence"]["gap_exe_hints"]["unknown"], 1);
+
+        // Call/attribution surfaces match exactly, field by field.
+        for surface in ["functions", "mechanisms", "sessions", "logins", "cgroups"] {
+            assert_eq!(armed[surface], plain[surface], "{surface} must not move");
+        }
+        assert_eq!(
+            armed["evidence"]["completeness"], plain["evidence"]["completeness"],
+            "completeness must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["verdict_detail"], plain["evidence"]["verdict_detail"],
+            "verdict must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["pid_descendant_gaps"],
+            plain["evidence"]["pid_descendant_gaps"]
+        );
+
+        // With the hint split removed, the whole documents are equal:
+        // the hint evidence is the only difference anywhere.
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gap_exe_hints");
+        assert_eq!(armed, plain);
+    }
+
+    #[test]
+    fn profile_v3_gap_exit_mappings_split_is_exact_when_armed() {
+        let mut ev = evidence();
+        ev.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 2,
+            unknown: 3,
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["gap_exit_mappings"],
+            serde_json::json!({"mapped": 2, "unknown": 3})
+        );
+        // The metrics lane embeds `Evidence` directly: the
+        // serde-skipped carrier keeps this profile-only key absent
+        // even when armed.
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert!(metrics["evidence"].get("gap_exit_mappings").is_none());
+    }
+
+    #[test]
+    fn profile_v3_gap_exit_mappings_absent_unless_armed() {
+        let ev = evidence();
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert!(profile["evidence"].get("gap_exit_mappings").is_none());
+    }
+
+    // The trace lane renders through the shared `versioned_evidence`
+    // hoist (not a direct `Evidence` embed like metrics), so an armed
+    // `Evidence` publishes the split key in a trace terminal record
+    // too; absence in real traces holds only via the arming gate
+    // (trace never arms: `extensive_effective` requires
+    // `Kind::Profile`).
+    #[test]
+    fn trace_evidence_line_hoists_armed_gap_exit_mappings() {
+        let line_for = |ev: &Evidence| {
+            let line = crate::trace::evidence_line(ev, crate::attach::CapturePolicy::Allowlisted);
+            serde_json::from_str::<serde_json::Value>(line.strip_prefix("EVIDENCE ").unwrap())
+                .unwrap()
+        };
+        let mut armed = evidence();
+        armed.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 1,
+            unknown: 2,
+        });
+        assert_eq!(
+            line_for(&armed)["gap_exit_mappings"],
+            serde_json::json!({"mapped": 1, "unknown": 2})
+        );
+        assert!(
+            line_for(&evidence()).get("gap_exit_mappings").is_none(),
+            "unarmed evidence omits the key in trace too"
+        );
+    }
+
+    // The exit-mapping split is informational, never a call, share,
+    // verdict, or completeness input: armed and plain renders of one
+    // observed surface differ only in the split key itself.
+    #[test]
+    fn profile_v3_gap_exit_mappings_do_not_move_call_or_attribution_surfaces() {
+        use p11scope_ebpf_common::shape;
+
+        let observed_state = || {
+            let mut state =
+                crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+            let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+            event.cgroup_id = 111;
+            state.observe(&event);
+            state.observe(&event);
+            state.observe(&event);
+            state
+        };
+        let reports = || {
+            let mut sign = report("C_Sign", 25, 2, false);
+            sign.module = Some(crate::plan::ModuleId(0));
+            sign.errors = 3;
+            sign.total_ns = 2_500;
+            sign.max_ns = 100;
+            sign.rv_counts.insert(0, 22);
+            sign.rv_counts.insert(5, 3);
+            let mut encrypt = report("C_Encrypt", 7, 0, false);
+            encrypt.module = Some(crate::plan::ModuleId(0));
+            encrypt.rv_counts.insert(0, 7);
+            vec![sign, encrypt]
+        };
+        let mut plain_ev = evidence();
+        plain_ev.pid_descendant_gaps = 2;
+        let mut armed_ev = evidence();
+        armed_ev.pid_descendant_gaps = 2;
+        armed_ev.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 1,
+            unknown: 1,
+        });
+
+        let plain = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&plain_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+        let mut armed = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&armed_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+
+        let total_calls: u64 = plain["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|function| function["calls"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total_calls, 32, "twin must observe nonzero calls");
+        assert!(plain["evidence"].get("gap_exit_mappings").is_none());
+        assert_eq!(armed["evidence"]["gap_exit_mappings"]["mapped"], 1);
+        assert_eq!(armed["evidence"]["gap_exit_mappings"]["unknown"], 1);
+
+        for surface in ["functions", "mechanisms", "sessions", "logins", "cgroups"] {
+            assert_eq!(armed[surface], plain[surface], "{surface} must not move");
+        }
+        assert_eq!(
+            armed["evidence"]["completeness"], plain["evidence"]["completeness"],
+            "completeness must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["verdict_detail"], plain["evidence"]["verdict_detail"],
+            "verdict must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["pid_descendant_gaps"],
+            plain["evidence"]["pid_descendant_gaps"]
+        );
+
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gap_exit_mappings");
+        assert_eq!(armed, plain);
+    }
+
+    // B17 W2 RED: the v3 profile lane renders the ruled per-identity
+    // disclosure key with the exact closed shape, without moving the
+    // verdict: the disclosure is informational, never a PARTIAL cause.
+    // The metrics lane stays blind to it (profile-only, like the hint
+    // split above).
+    #[test]
+    fn profile_v3_reload_disclosure_renders_exact_shape_and_holds_complete() {
+        use crate::semantic_capture::ReloadNotExcludedIdentity;
+
+        let mut ev = evidence();
+        ev.drain_proven = true;
+        ev.instance_reload_not_excluded = Some(InstanceReloadNotExcluded {
+            continued_across_global: 1,
+            joined_across_global: 1,
+            identities: vec![ReloadNotExcludedIdentity {
+                file_slot: 0,
+                ids: vec![1],
+            }],
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert_eq!(ev.verdict_detail, VERDICT_CLEAN_PROVEN);
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 1,
+                "identities": [{"file_slot": 0, "ids": [1]}],
+            })
+        );
+        assert_eq!(profile["evidence"]["completeness"], "COMPLETE");
+        assert_eq!(profile["evidence"]["verdict_detail"], "clean_proven");
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert!(
+            metrics["evidence"]
+                .get("instance_reload_not_excluded")
+                .is_none()
+        );
+    }
+
+    // B17 W2 control twin: without a producer the key is absent, never
+    // zero or null.
+    #[test]
+    fn profile_v3_reload_disclosure_absent_without_producer() {
+        let ev = evidence();
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert!(
+            profile["evidence"]
+                .get("instance_reload_not_excluded")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn metrics_serializes_actual_attach_backend_metadata() {
+        let pid_fallback = crate::attach::select_session_backend(
+            crate::attach::BackendSelection::Auto,
+            true,
+            || panic!("PID scope must use the PID-filter probe"),
+            || Err("not supported".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(pid_fallback.backend, crate::attach::AttachBackend::Singles);
+        for (scope, selection, fallback, scope_filter, expected) in [
+            (
+                "pid",
+                "singles",
+                None,
+                Some("perf-task+bpf"),
+                serde_json::json!({"selection": "singles", "fallback": null, "scope_filter": "perf-task+bpf"}),
+            ),
+            (
+                "pid",
+                "multi",
+                None,
+                Some("kernel-pid+bpf"),
+                serde_json::json!({"selection": "multi", "fallback": null, "scope_filter": "kernel-pid+bpf"}),
+            ),
+            (
+                "pid",
+                "auto",
+                pid_fallback.fallback.as_deref(),
+                Some("perf-task+bpf"),
+                serde_json::json!({"selection": "auto", "fallback": "uprobe-multi under --pid needs a proven kernel pid filter: not supported", "scope_filter": "perf-task+bpf"}),
+            ),
+            (
+                "system",
+                "multi",
+                None,
+                None,
+                serde_json::json!({"selection": "multi", "fallback": null, "scope_filter": null}),
+            ),
+            (
+                "cgroup",
+                "singles",
+                None,
+                None,
+                serde_json::json!({"selection": "singles", "fallback": null, "scope_filter": null}),
+            ),
+        ] {
+            let mut ev = evidence();
+            ev.attach_backend = AttachBackendEvidence {
+                selection,
+                fallback: fallback.map(str::to_owned),
+                scope_filter,
+            };
+            let capture = CaptureMeta {
+                scope,
+                ..capture_fixture()
+            };
+            let document = json(&reports_fixture(), &ev, &capture);
+            assert_eq!(document["evidence"]["attach_backend"], expected);
+        }
+    }
+
+    /// P0-only ship vehicle: the build flavor maps to a structured
+    /// availability status, both directions. Stubbed builds disclaim
+    /// attribute coverage with the finite `not_enabled` reason; FULL
+    /// builds report available with no reason.
+    #[test]
+    fn object_capture_status_for_build_both_directions() {
+        let stubbed = ObjectCaptureEvidence::for_build(true);
+        assert!(!stubbed.available);
+        assert_eq!(stubbed.reason, Some("not_enabled"));
+        let wired = ObjectCaptureEvidence::for_build(false);
+        assert!(wired.available);
+        assert_eq!(wired.reason, None);
+    }
+
+    /// The profile document carries object-capture status as structured
+    /// evidence, both directions; the production builder wires the
+    /// session source (pinned alongside, since fixtures pin FULL).
+    #[test]
+    fn profile_carries_object_capture_status() {
+        for stubbed in [false, true] {
+            let mut ev = evidence();
+            ev.object_capture = ObjectCaptureEvidence::for_build(stubbed);
+            let document = json(&reports_fixture(), &ev, &capture_fixture());
+            let expected = if stubbed {
+                serde_json::json!({"available": false, "reason": "not_enabled"})
+            } else {
+                serde_json::json!({"available": true, "reason": null})
+            };
+            assert_eq!(document["evidence"]["object_capture"], expected);
+        }
+        let source = include_str!("run.rs");
+        assert!(
+            source.contains("session.object_capture_evidence()"),
+            "evidence_for must wire the session status"
+        );
+        assert!(
+            source.contains("context.1.object_capture_evidence()"),
+            "evidence_for must wire the session status"
+        );
+        assert!(
+            !source.contains("Session::object_capture_evidence()"),
+            "output evidence never re-reads the global cache"
+        );
+        let fence = include_str!("run/root_fence_runtime.rs");
+        assert!(
+            fence.contains("session.object_capture_evidence()"),
+            "evidence_for must wire the session status"
+        );
+        assert!(
+            !fence.contains("Session::object_capture_evidence()"),
+            "output evidence never re-reads the global cache"
+        );
     }
 
     #[test]
@@ -2935,6 +4796,7 @@ pub(crate) mod tests {
         let mut baseline = evidence();
         baseline.verdict_with_selection(false);
         let expected = baseline.completeness;
+        let expected_json = json(&reports_fixture(), &baseline, &capture_fixture());
 
         baseline.interface_selection.selection_truncated = true;
         baseline
@@ -2946,6 +4808,11 @@ pub(crate) mod tests {
             });
         baseline.verdict_with_selection(false);
         assert_eq!(baseline.completeness, expected);
+        assert_eq!(
+            json(&reports_fixture(), &baseline, &capture_fixture()),
+            expected_json,
+            "selection-only state must not change metrics output or verdict"
+        );
         assert!(
             json(&reports_fixture(), &baseline, &capture_fixture())["evidence"]
                 .get("interface_selection")
@@ -2978,6 +4845,9 @@ pub(crate) mod tests {
             sources: vec!["scan"],
             corroborated: false,
             corroboration: vec!["single_source"],
+            watch: None,
+            attached_at_ns: None,
+            unobserved_windows: None,
             tables: vec![crate::plan::TableSummary {
                 version: (2, 40),
                 entries: 68,
@@ -3013,6 +4883,295 @@ pub(crate) mod tests {
         let out = functions_out(&[report], &[b, c]);
 
         assert_eq!(out[0].module.as_ref().unwrap().ino, 22);
+    }
+
+    /// WU-15 round 2: an Initialize row whose completed calls all returned
+    /// CKR_OK reports `ok` with the potential-provider likelihood.
+    #[test]
+    fn initialize_row_with_ok_returns_reports_ok_and_potential_provider() {
+        let mut row = report("C_Initialize", 3, 0, false);
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 3);
+        let ev = evidence();
+        let state = state_fixture();
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["functions"][0]["initialization"],
+            serde_json::json!({"outcome": "ok", "potential_provider": true})
+        );
+    }
+
+    /// The ALREADY class is its own outcome, and it still evidences a
+    /// responding Cryptoki: the likelihood is present.
+    #[test]
+    fn initialize_row_with_already_returns_reports_already_and_potential_provider() {
+        let mut row = report("C_Initialize", 2, 0, false);
+        row.rv_counts
+            .insert(pkcs11_types::CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 2);
+        let ev = evidence();
+        let state = state_fixture();
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["functions"][0]["initialization"],
+            serde_json::json!({"outcome": "already_initialized", "potential_provider": true})
+        );
+    }
+
+    /// Error-only rows report `error` with no likelihood key: one error RV,
+    /// two distinct error RVs (still one class, never `mixed`), and a
+    /// PENDING-only row (a non-success return for a synchronous lifecycle
+    /// call; the outcome vocabulary has no pending word, and the row
+    /// evidenced no successful initialization).
+    #[test]
+    fn initialize_row_with_errors_only_reports_error_without_potential() {
+        use pkcs11_types::CkRv;
+        for rvs in [
+            vec![(CkRv::GENERAL_ERROR.0, 4)],
+            vec![(CkRv::GENERAL_ERROR.0, 2), (CkRv::DEVICE_ERROR.0, 1)],
+            vec![(CkRv::PENDING.0, 2)],
+        ] {
+            let mut row = report("C_Initialize", 4, 0, false);
+            row.rv_counts = rvs.into_iter().collect();
+            let ev = evidence();
+            let state = state_fixture();
+            let profile = profile_json(
+                &[row],
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert_eq!(
+                profile["functions"][0]["initialization"],
+                serde_json::json!({"outcome": "error"}),
+            );
+        }
+    }
+
+    /// More than one outcome class over the row's completed calls is
+    /// `mixed`. Every mixed pair contains `ok` or `already_initialized`
+    /// (a lone `error` class cannot mix with itself), so the likelihood
+    /// is always present.
+    #[test]
+    fn initialize_row_with_mixed_classes_reports_mixed() {
+        use pkcs11_types::CkRv;
+        for rvs in [
+            vec![(CkRv::OK.0, 1), (CkRv::GENERAL_ERROR.0, 1)],
+            vec![
+                (CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 2),
+                (CkRv::GENERAL_ERROR.0, 1),
+            ],
+            vec![(CkRv::OK.0, 1), (CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 1)],
+        ] {
+            let mut row = report("C_Initialize", 2, 0, false);
+            row.rv_counts = rvs.into_iter().collect();
+            let ev = evidence();
+            let state = state_fixture();
+            let profile = profile_json(
+                &[row],
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert_eq!(
+                profile["functions"][0]["initialization"],
+                serde_json::json!({"outcome": "mixed", "potential_provider": true}),
+            );
+        }
+    }
+
+    /// No completed-call evidence, no claim: an idle row, a row whose only
+    /// RV entry carries a zero count, and a row with lost RV detail
+    /// (`calls > 0` but empty `rv_counts`) all omit the object. The claim
+    /// derives only from `rv_counts`, never from `calls`.
+    #[test]
+    fn initialize_row_without_completed_calls_omits_initialization() {
+        let ev = evidence();
+        let state = state_fixture();
+        let idle = report("C_Initialize", 0, 0, false);
+        let profile = profile_json(
+            std::slice::from_ref(&idle),
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert!(
+            profile["functions"][0].get("initialization").is_none(),
+            "idle row must omit the claim: {}",
+            profile["functions"][0]
+        );
+
+        let mut zeroed = report("C_Initialize", 0, 0, false);
+        zeroed.rv_counts.insert(pkcs11_types::CkRv::OK.0, 0);
+        let metrics = json(std::slice::from_ref(&zeroed), &ev, &capture_fixture());
+        assert!(
+            metrics["functions"][0].get("initialization").is_none(),
+            "zero-count RVs assert nothing observed: {}",
+            metrics["functions"][0]
+        );
+
+        let lost = report("C_Initialize", 3, 0, false);
+        let metrics = json(std::slice::from_ref(&lost), &ev, &capture_fixture());
+        assert!(
+            metrics["functions"][0].get("initialization").is_none(),
+            "calls without RV detail stay unknown: {}",
+            metrics["functions"][0]
+        );
+    }
+
+    /// Only rows that name exactly `C_Initialize` carry the claim, however
+    /// successful their own calls were.
+    #[test]
+    fn non_initialize_row_omits_initialization() {
+        let ev = evidence();
+        let state = state_fixture();
+        for name in ["C_Sign", "unknown", "c_initialize"] {
+            let mut row = report(name, 5, 0, false);
+            row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 5);
+            let profile = profile_json(
+                std::slice::from_ref(&row),
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert!(
+                profile["functions"][0].get("initialization").is_none(),
+                "{name} must omit the claim: {}",
+                profile["functions"][0]
+            );
+        }
+    }
+
+    /// The claim renders identically in the metrics lane and under every
+    /// counter mode: one shared row builder feeds both lanes, and the
+    /// counter mode only selects the timing shape beside it.
+    #[test]
+    fn initialization_claim_renders_in_metrics_lane_and_all_counter_modes() {
+        let ev = evidence();
+        let state = state_fixture();
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let mut row = report("C_Initialize", 2, 0, false);
+            row.mode = mode;
+            row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
+            let wanted = serde_json::json!({"outcome": "ok", "potential_provider": true});
+            let metrics = json(std::slice::from_ref(&row), &ev, &capture_fixture());
+            assert_eq!(
+                metrics["functions"][0]["initialization"], wanted,
+                "{mode:?}"
+            );
+            let profile = profile_json(
+                std::slice::from_ref(&row),
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert_eq!(
+                profile["functions"][0]["initialization"], wanted,
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// The claim is row-scoped: an aliased row that names `C_Initialize`
+    /// among its names reports the row's own outcomes (aliased counts are
+    /// never split into guessed per-name shares).
+    #[test]
+    fn initialize_claim_covers_aliased_rows_by_row_outcomes() {
+        let mut row = report("C_Initialize", 2, 0, true);
+        row.names.push("C_GetFunctionList".into());
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
+        let ev = evidence();
+        let state = state_fixture();
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["functions"][0]["initialization"],
+            serde_json::json!({"outcome": "ok", "potential_provider": true})
+        );
+    }
+
+    /// The live function table marks qualifying Initialize rows with the
+    /// same outcome and likelihood words the JSON row carries; other rows
+    /// and rows without completed calls carry no marker.
+    #[test]
+    fn live_view_marks_initialize_rows_with_outcome_and_potential() {
+        use pkcs11_types::CkRv;
+        let mut ok = report("C_Initialize", 2, 0, false);
+        ok.rv_counts.insert(CkRv::OK.0, 2);
+        let mut already = report("C_Initialize", 1, 0, false);
+        already
+            .rv_counts
+            .insert(CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 1);
+        let mut error = report("C_Initialize", 1, 0, false);
+        error.rv_counts.insert(CkRv::GENERAL_ERROR.0, 1);
+        let mut mixed = report("C_Initialize", 2, 0, false);
+        mixed.rv_counts.insert(CkRv::OK.0, 1);
+        mixed.rv_counts.insert(CkRv::GENERAL_ERROR.0, 1);
+        let mut other = report("C_Sign", 5, 0, false);
+        other.rv_counts.insert(CkRv::OK.0, 5);
+        let uncompleted = report("C_Initialize", 0, 1, false);
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live(
+            &[ok, already, error, mixed, other, uncompleted],
+            &ev,
+            Duration::from_secs(65),
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        let init_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.contains("C_Initialize"))
+            .collect();
+        assert_eq!(init_lines.len(), 5, "{out}");
+        for marker in [
+            "[init: ok, potential provider]",
+            "[init: already_initialized, potential provider]",
+            "[init: mixed, potential provider]",
+        ] {
+            assert!(
+                init_lines.iter().any(|line| line.contains(marker)),
+                "missing {marker} in:\n{out}"
+            );
+        }
+        let error_line = init_lines
+            .iter()
+            .find(|line| line.contains("[init: error]"))
+            .expect("error row carries [init: error]");
+        assert!(
+            !error_line.contains("potential provider"),
+            "error row must not claim the likelihood: {error_line}"
+        );
+        let sign_line = out
+            .lines()
+            .find(|line| line.contains("C_Sign"))
+            .expect("C_Sign row renders");
+        assert!(
+            !sign_line.contains("[init:"),
+            "non-Initialize row must carry no marker: {sign_line}"
+        );
+        let unmarked = init_lines
+            .iter()
+            .filter(|line| !line.contains("[init:"))
+            .count();
+        assert_eq!(unmarked, 1, "only the in-flight row lacks a marker:\n{out}");
     }
 
     fn state_fixture() -> crate::semantics::State {
@@ -3149,6 +5308,7 @@ pub(crate) mod tests {
             ("unregistered_mechanisms", |ev| {
                 ev.unregistered_mechanisms = 1
             }),
+            ("unpublished_mechanisms", |ev| ev.unpublished_mechanisms = 1),
         ] {
             let mut ev = evidence();
             mutate(&mut ev);
@@ -3356,11 +5516,15 @@ pub(crate) mod tests {
         let object = crate::plan::TEST_PINNED_OBJECT;
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object,
             entry_objects: vec![vec![object, object], vec![object]],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -3381,6 +5545,7 @@ pub(crate) mod tests {
                         file_offset: Some(0x100),
                         live_return: false,
                         manifest_supported: false,
+                        extension_impossible: false,
                     },
                     ScannedTable {
                         version: (2, 40),
@@ -3392,6 +5557,7 @@ pub(crate) mod tests {
                         file_offset: Some(0x200),
                         live_return: false,
                         manifest_supported: false,
+                        extension_impossible: false,
                     },
                 ],
                 interfaces: vec![ScannedInterface {
@@ -3462,11 +5628,15 @@ pub(crate) mod tests {
         };
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -3491,6 +5661,7 @@ pub(crate) mod tests {
                     file_offset: Some(0),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![],
             },
@@ -3628,7 +5799,9 @@ pub(crate) mod tests {
             let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
-                format!(" pid 100 tid 1 unknown#{ordinal} [semantics unverified] → {rv} 100ns"),
+                format!(
+                    " Unknown executable (PID 100, TID 1) unknown#{ordinal} [semantics unverified] → {rv} 100ns"
+                ),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }
@@ -4099,6 +6272,398 @@ pub(crate) mod tests {
         );
     }
 
+    /// The terminal summary names a refused module with its reason in plain
+    /// words and the way to capture it alone.
+    #[test]
+    fn scope_summary_names_a_refused_module_with_its_hint() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/p11-kit-trust.so".into(),
+            reason: "module needs 68 more; only 512 attach slots are available; 480 are in use \
+                 (480 active, 0 retired; held by /opt/other.so 480) — refusing to attach a prefix"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules refused"), "{text}");
+        assert!(text.contains("Module gaps (showing 1 of 1):"), "{text}");
+        assert!(
+            text.contains("/opt/p11-kit-trust.so: not attached — "),
+            "{text}"
+        );
+        assert!(text.contains("module needs 68 more"), "{text}");
+        assert!(
+            text.contains("capture it alone with --module /opt/p11-kit-trust.so"),
+            "{text}"
+        );
+    }
+
+    /// The terminal summary explains withheld attribution in plain words:
+    /// how many mapped providers have no manifest at all, naming them, so
+    /// PARTIAL coverage reads as a cause rather than an alarm.
+    #[test]
+    fn scope_summary_names_providers_without_manifests() {
+        let mut softhsm = discovered_fixture();
+        softhsm.path = "/usr/lib64/pkcs11/libsofthsm2.so".into();
+        softhsm.sources = vec!["scan", "manifest"];
+        let mut nss = discovered_fixture();
+        nss.id = ModuleId(1);
+        nss.ino = 22;
+        nss.path = "/opt/firefox/libsoftokn3.so".into();
+        nss.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![softhsm, nss];
+        ev.semantic_unverified_slots = 212;
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains(
+                "Attribution: 1 of 2 mapped providers has no manifest (libsoftokn3.so); \
+                 counts are exact, names are withheld"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("rerun with --manifest for each mapped provider"),
+            "{text}"
+        );
+    }
+
+    /// Plural twin: two unattested providers read as "have", naming both.
+    #[test]
+    fn scope_summary_names_providers_without_manifests_plural() {
+        let mut a = discovered_fixture();
+        a.path = "/opt/a.so".into();
+        a.sources = vec!["scan"];
+        let mut b = discovered_fixture();
+        b.id = ModuleId(1);
+        b.ino = 22;
+        b.path = "/opt/b.so".into();
+        b.sources = vec!["scan", "prearm"];
+        let mut c = discovered_fixture();
+        c.id = ModuleId(2);
+        c.ino = 33;
+        c.path = "/opt/c.so".into();
+        c.sources = vec!["scan", "manifest"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![a, b, c];
+        ev.semantic_unverified_slots = 9;
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains(
+                "Attribution: 2 of 3 mapped providers have no manifest (a.so, b.so); \
+                 counts are exact, names are withheld"
+            ),
+            "{text}"
+        );
+    }
+
+    /// PID scope covers one process: the aggregate note stays silent while
+    /// the scope line still names it.
+    #[test]
+    fn scope_summary_for_pid_scope_omits_the_aggregate_note() {
+        let mut ev = evidence();
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("Scope: PID scope"), "{text}");
+        assert!(!text.contains("not per application"), "{text}");
+    }
+
+    /// Wider scopes keep the aggregate note: counts are not per application.
+    #[test]
+    fn scope_summary_for_wider_scopes_keeps_the_aggregate_note() {
+        let mut ev = evidence();
+        ev.verdict();
+        for scope in ["cgroup", "system", "selected"] {
+            let text = scope_summary(scope, &reports_fixture(), &ev);
+            assert!(
+                text.contains(
+                    "Aggregate across the selected scope; counts are not per application."
+                ),
+                "{scope}: {text}"
+            );
+        }
+    }
+
+    /// No unverified slots, or every mapped provider attested (partial
+    /// manifest coverage): the machine fragment alone stands, with no
+    /// provider-manifest note.
+    #[test]
+    fn scope_summary_without_unattested_providers_shows_no_attribution_note() {
+        let mut attested = discovered_fixture();
+        attested.sources = vec!["scan", "manifest"];
+        for unverified in [0, 5] {
+            let mut ev = evidence();
+            ev.discovery.modules = vec![attested.clone()];
+            ev.semantic_unverified_slots = unverified;
+            ev.verdict();
+            let text = scope_summary("pid", &reports_fixture(), &ev);
+            assert!(!text.contains("has no manifest"), "{text}");
+            assert!(!text.contains("have no manifest"), "{text}");
+        }
+    }
+
+    /// The terminal summary names a partially covered module: kept endpoints
+    /// stay counted, and the omission says what did not fit.
+    #[test]
+    fn scope_summary_names_a_partially_covered_module() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/grown.so".into(),
+            reason: GROWTH_OMISSION_RECORD.into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules partially covered"), "{text}");
+        assert!(
+            text.contains("/opt/grown.so: partially covered — "),
+            "{text}"
+        );
+        assert!(text.contains("kept its 511 attached endpoints"), "{text}");
+        assert!(
+            text.contains("capture it alone with --module /opt/grown.so"),
+            "{text}"
+        );
+    }
+
+    /// The terminal summary names a refused proxy closure array with its
+    /// lookalike reason and where its forwarded calls are counted.
+    #[test]
+    fn scope_summary_names_a_refused_closure_array_with_its_counted_providers() {
+        let mut trust = discovered_fixture();
+        trust.id = ModuleId(1);
+        trust.ino = 21;
+        trust.path = "/opt/p11-kit-trust.so".into();
+        let mut row = report("C_FindObjects", 744, 0, false);
+        row.module = Some(ModuleId(1));
+        let mut ev = evidence();
+        ev.discovery.modules.push(trust);
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+                 (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
+                 prefix of its 64 lookalike function tables (a proxy closure array is admitted \
+                 whole, as a prefix when mapped before the capture's first plan, or as published \
+                 tables)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[row], &ev);
+        assert!(
+            text.contains("/opt/libp11-kit.so: not attached — "),
+            "{text}"
+        );
+        assert!(text.contains("64 lookalike function tables"), "{text}");
+        assert!(
+            text.contains(
+                "calls it forwards are counted at the attached providers \
+                 (/opt/p11-kit-trust.so: 744 calls)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// Part 0: a prefix-admitted closure array names its covered templates
+    /// as partially covered, with no `--module` hint (the prefix already
+    /// counts; narrowing to it alone changes nothing).
+    #[test]
+    fn scope_summary_names_a_prefix_admitted_closure_array() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/p11-kit-client.so".into(),
+            reason: "4 of 64 template tables attached; calls through the others are not counted"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules partially covered"), "{text}");
+        assert!(
+            text.contains("/opt/p11-kit-client.so: partially covered — "),
+            "{text}"
+        );
+        assert!(text.contains("4 of 64 template tables attached"), "{text}");
+        assert!(!text.contains("--module"), "{text}");
+    }
+
+    /// JK-22a: a prefix-admitted ordinary provider names its attached
+    /// endpoints as partially covered, counted under "modules partially
+    /// covered" rather than "modules refused".
+    #[test]
+    fn scope_summary_names_a_prefix_admitted_provider() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/mixed.so".into(),
+            reason: "100 of 150 endpoints attached; calls through the others are not counted (provider_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules partially covered"), "{text}");
+        assert!(
+            text.contains("/opt/mixed.so: partially covered — "),
+            "{text}"
+        );
+        assert!(text.contains("100 of 150 endpoints attached"), "{text}");
+    }
+
+    /// A whole refusal whose holder path names `(provider_prefix)` still
+    /// renders as refused, never as partially covered.
+    #[test]
+    fn scope_summary_treats_holder_path_naming_provider_prefix_as_whole_refusal() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/crowded.so".into(),
+            reason: "module needs 150 more; only 512 attach slots are available; 400 are in use \
+                 (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+                 a prefix; to capture one provider, name it with --module <path>; to free slots, exclude \
+                 an unneeded module with --exclude-module <name>"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules refused"), "{text}");
+        assert!(!text.contains("modules partially covered"), "{text}");
+        assert!(text.contains("/opt/crowded.so: not attached — "), "{text}");
+        assert!(!text.contains("partially covered"), "{text}");
+    }
+
+    /// `--exclude-module` files are listed as "excluded by you" with path,
+    /// identity, and process count, plus unmatched inputs; a capture whose
+    /// only skips are excluded stays exact.
+    #[test]
+    fn scope_summary_lists_excluded_modules_and_unmatched_inputs() {
+        let mut ev = evidence();
+        ev.discovery.excluded_modules.push(ExcludedOut {
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            processes: 3,
+        });
+        ev.discovery.unmatched_excludes.push("nope.so".into());
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("Excluded by you (1 files):"), "{text}");
+        assert!(
+            text.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 3 processes mapped it)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("calls into this file were not observed"),
+            "{text}"
+        );
+        assert!(text.contains("Unmatched exclusions (1): nope.so"), "{text}");
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["excluded_modules"][0]["path"],
+            "/opt/libp11-kit.so.0.4.8"
+        );
+        assert_eq!(json["excluded_modules"][0]["processes"], 3);
+        assert_eq!(json["unmatched_excludes"][0], "nope.so");
+    }
+
+    #[test]
+    fn aggregate_excluded_groups_by_file_and_names_unmatched_inputs() {
+        use crate::discovery::scan::ExcludedRecord;
+        use std::path::PathBuf;
+        let records = vec![
+            ExcludedRecord {
+                pid: 10,
+                path: "/opt/liba.so".into(),
+                dev: 7,
+                ino: 100,
+                via: PathBuf::from("liba.so"),
+            },
+            ExcludedRecord {
+                pid: 11,
+                path: "/opt/liba.so".into(),
+                dev: 7,
+                ino: 100,
+                via: PathBuf::from("liba.so"),
+            },
+            ExcludedRecord {
+                pid: 10,
+                path: "/snap/liba.so".into(),
+                dev: 8,
+                ino: 200,
+                via: PathBuf::from("liba.so"),
+            },
+        ];
+        let excludes = vec![PathBuf::from("liba.so"), PathBuf::from("nope.so")];
+        let (excluded, unmatched) = aggregate_excluded(&records, &excludes);
+        assert_eq!(excluded.len(), 2);
+        assert_eq!(excluded[0].path, "/opt/liba.so");
+        assert_eq!(excluded[0].processes, 2);
+        assert_eq!(excluded[1].path, "/snap/liba.so");
+        assert_eq!(excluded[1].processes, 1);
+        assert_eq!(unmatched, vec!["nope.so".to_string()]);
+    }
+
+    /// A refused closure array with nothing captured below it says so: its
+    /// calls are not counted anywhere.
+    #[test]
+    fn scope_summary_names_a_refused_closure_array_with_nothing_below_it() {
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
+                 (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
+                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
+                 the capture's first plan, or as published tables)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[], &ev);
+        assert!(
+            text.contains("/opt/libp11-kit.so: not attached — "),
+            "{text}"
+        );
+        assert!(text.contains("no provider below it was captured"), "{text}");
+    }
+
+    /// A refused closure array above attached-but-quiet providers says the
+    /// providers counted nothing, rather than naming a count.
+    #[test]
+    fn scope_summary_names_a_refused_closure_array_above_quiet_providers() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+                 (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
+                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
+                 the capture's first plan, or as published tables)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[], &ev);
+        assert!(!ev.discovery.modules.is_empty());
+        assert!(
+            text.contains("the attached providers counted 0 calls"),
+            "{text}"
+        );
+    }
+
+    /// The named gap list is bounded: at most five lines plus "and K more".
+    #[test]
+    fn scope_summary_bounds_the_named_gap_list() {
+        let mut ev = evidence();
+        for index in 0..7 {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: format!("/opt/refused{index}.so"),
+                reason: "module needs 1 more".into(),
+            });
+        }
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("Module gaps (showing 5 of 7):"), "{text}");
+        assert!(text.contains("/opt/refused0.so: not attached — "), "{text}");
+        assert!(text.contains("/opt/refused4.so: not attached — "), "{text}");
+        assert!(!text.contains("/opt/refused5.so"), "{text}");
+        assert!(text.contains("and 2 more"), "{text}");
+    }
+
     #[test]
     fn provider_change_forces_partial_and_is_shown_live() {
         let mut ev = evidence();
@@ -4410,6 +6975,178 @@ pub(crate) mod tests {
         assert!(out.contains("approximation"));
     }
 
+    fn mech_stat(calls: u64, errors: u64) -> crate::semantics::MechStat {
+        crate::semantics::MechStat {
+            calls,
+            errors,
+            ..Default::default()
+        }
+    }
+
+    /// Demo journey 2: the human `profile` text names the mechanisms the
+    /// capture observed, under the function table — the same ids the JSON
+    /// `mechanisms[]` carries, with calls/errors and no parameters.
+    #[test]
+    fn live_view_lists_mechanisms_under_the_function_table() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0x250, mech_stat(8, 1)), (0x9999, mech_stat(2, 0))]
+                .into_iter()
+                .collect();
+        let out = live_scoped(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(out.contains("MECHANISM"), "{out}");
+        assert!(out.contains("CKM_SHA256"), "{out}");
+        assert!(out.contains("0x9999"), "{out}");
+        let function = out.find("FUNCTION").expect("function table");
+        let mechanism = out.find("MECHANISM").expect("mechanism table");
+        let evidence = out.find("Evidence:").expect("evidence line");
+        assert!(
+            function < mechanism && mechanism < evidence,
+            "mechanisms render under the function table: {out}"
+        );
+    }
+
+    #[test]
+    fn live_view_without_mechanisms_shows_no_table() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(!out.contains("MECHANISM"), "{out}");
+    }
+
+    /// Demo journey 2, empty side: with observed calls but no attributed
+    /// mechanisms, the human view says so in one plain line naming the
+    /// count-only gap and how to get mechanisms, instead of omitting the
+    /// section. The line sits under the function table, above Evidence.
+    #[test]
+    fn live_view_without_mechanisms_names_the_attribution_gap() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 212;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_SignInit", 2, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            out.contains(
+                "Mechanisms: none attributed — 212 semantics-unverified/count-only slots; \
+                 add --manifest for each mapped provider (see Coverage)."
+            ),
+            "{out}"
+        );
+        let function = out.find("FUNCTION").expect("function table");
+        let note = out
+            .find("Mechanisms: none attributed")
+            .expect("mechanisms note");
+        let evidence = out.find("Evidence:").expect("evidence line");
+        assert!(
+            function < note && note < evidence,
+            "mechanisms note renders under the function table: {out}"
+        );
+    }
+
+    /// Unverified slots with every mapped provider attested (partial
+    /// manifest coverage, e.g. a manifest/scan conflict): the manifest
+    /// remedy would mislead, so the note records the bare fact.
+    #[test]
+    fn live_view_without_mechanisms_on_partial_coverage_says_none_recorded() {
+        let mut attested = discovered_fixture();
+        attested.sources = vec!["scan", "manifest"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![attested];
+        ev.semantic_unverified_slots = 106;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_GenerateRandom", 6, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            out.contains("Mechanisms: none recorded for the observed calls."),
+            "{out}"
+        );
+        assert!(!out.contains("--manifest"), "{out}");
+    }
+
+    /// Empty mechanisms with fully attested slots: none of the observed
+    /// calls carried an attributed mechanism, so the note says exactly
+    /// that and offers no manifest remedy.
+    #[test]
+    fn live_view_without_mechanisms_on_verified_slots_says_none_recorded() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_GetInfo", 1, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            out.contains("Mechanisms: none recorded for the observed calls."),
+            "{out}"
+        );
+        assert!(!out.contains("--manifest"), "{out}");
+    }
+
+    /// No completed or in-flight calls: the scope summary already says no
+    /// calls were observed, so no mechanisms note is added.
+    #[test]
+    fn live_view_without_calls_shows_no_mechanism_note() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 212;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_Sign", 0, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(!out.contains("Mechanisms:"), "{out}");
+    }
+
     /// U-14: the live evidence line must show the plan's currently-active
     /// endpoint count next to the ever-growing allocation total, not just
     /// the allocation total alone.
@@ -4711,6 +7448,639 @@ pub(crate) mod tests {
         assert!(!out.contains("unsupported function-table"), "{out}");
     }
 
+    fn fedora_fixture_maps() -> Vec<p11scope_manifest::maps::MapEntry> {
+        p11scope_manifest::maps::parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap()
+    }
+
+    fn fedora_shaped_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..69 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 69..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    fn decode_table_with_maps(
+        snapshot: &[u8],
+        maps: &[p11scope_manifest::maps::MapEntry],
+    ) -> crate::discovery::scan::ScannedTable {
+        use crate::discovery::scan::{CaptureWorkBudget, decode_exact_table};
+        use p11scope_manifest::maps::MapIndex;
+
+        let map_index = MapIndex::new(maps).unwrap();
+        decode_exact_table(
+            snapshot,
+            0x7000,
+            pkcs11_module::LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the table")
+        .expect("the fixture table must decode")
+    }
+
+    fn decode_fedora_table(snapshot: &[u8]) -> crate::discovery::scan::ScannedTable {
+        decode_table_with_maps(snapshot, &fedora_fixture_maps())
+    }
+
+    /// The Fedora shape plus the four first-failure kinds: executable
+    /// anonymous memory, an executable `(deleted)` mapping, writable
+    /// anonymous data, and unmapped space (no range covers `0xdead000`).
+    fn structural_failure_maps() -> Vec<p11scope_manifest::maps::MapEntry> {
+        p11scope_manifest::maps::parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n\
+              a000-b000 r-xp 00000000 00:00 0\n\
+              c000-d000 r-xp 00000000 08:01 7 /lib/provider.so (deleted)\n\
+              e000-f000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap()
+    }
+
+    fn shaped_snapshot_with_tail(failure: u64) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..69 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 69..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&failure.to_le_bytes());
+        }
+        snapshot
+    }
+
+    fn observation_for_decoded_table(
+        snapshot: &[u8],
+        exports: std::sync::Arc<[(String, u64)]>,
+        hook_exports: Vec<String>,
+        expect_walk: &str,
+    ) -> GapClasses {
+        let table = decode_fedora_table(snapshot);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(
+            table.walk, "known_prefix",
+            "the scan keeps the mislabelling quirk label"
+        );
+        observation_for_table(table, exports, hook_exports, expect_walk, false, false)
+    }
+
+    fn observation_for_table(
+        table: crate::discovery::scan::ScannedTable,
+        exports: std::sync::Arc<[(String, u64)]>,
+        hook_exports: Vec<String>,
+        expect_walk: &str,
+        getter_present: bool,
+        witness_fault: bool,
+    ) -> GapClasses {
+        use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
+        use crate::discovery::scan::ScannedModule;
+        use crate::plan::build_from_reconciled_modules;
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::elf::ElfAbi;
+
+        let key = table.entries[0].object;
+        let object = PinnedObjectId(0);
+        let entry_count = table.entries.len();
+        let scanned = ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            view: ProcessViewId(0),
+            mount_namespace: MountNamespaceId {
+                device: 1,
+                inode: 1,
+            },
+            key,
+            double_loaded: false,
+            same_file_loads: 1,
+            path: "/lib/provider.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: hook_exports,
+            tables: vec![table],
+            interfaces: vec![],
+        };
+        let reconciled = ReconciledModule {
+            scanned,
+            object,
+            entry_objects: vec![vec![object; entry_count]],
+            exports,
+            getter_present,
+            witness_fault,
+        };
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
+        assert_eq!(plan.surfaces.len(), 1);
+        assert_eq!(plan.surfaces[0].walk, expect_walk);
+        assert_eq!(plan.surfaces[0].acquisition, "ok");
+        assert_eq!(plan.surfaces[0].functions, 68);
+        let mut ev = evidence();
+        ev.surfaces = plan.surfaces.clone();
+        ev.gap_classes(true)
+    }
+
+    fn fedora_exports_without_interface_getters() -> std::sync::Arc<[(String, u64)]> {
+        (0..68)
+            .map(|ordinal| {
+                (
+                    pkcs11_module::function_name(ordinal).unwrap().to_string(),
+                    0x500,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fedora_shaped_68_slot_prefix_under_32_label_is_exact() {
+        let exports = fedora_exports_without_interface_getters();
+        assert!(
+            !exports
+                .iter()
+                .any(|(name, _)| name == "C_GetInterface" || name == "C_GetInterfaceList"),
+            "the Fedora shape exports no 3.x interface getter"
+        );
+        let classes = observation_for_decoded_table(
+            &fedora_shaped_snapshot(),
+            exports,
+            vec!["C_GetFunctionList".into()],
+            "full",
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a complete 68-slot prefix with an impossible extension and no \
+             interface getters is the full reachable surface: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_an_interface_getter_export_stays_lossy() {
+        let mut names: Vec<(String, u64)> = fedora_exports_without_interface_getters().to_vec();
+        names.push(("C_GetInterface".into(), 0x600));
+        let classes = observation_for_decoded_table(
+            &fedora_shaped_snapshot(),
+            names.into(),
+            vec!["C_GetFunctionList".into(), "C_GetInterface".into()],
+            "known_prefix",
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an exported 3.x getter keeps a 3.x route reachable: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_a_truncated_extension_stays_lossy() {
+        let mut truncated = fedora_shaped_snapshot();
+        truncated.truncate(8 + 68 * 8);
+        let classes = observation_for_decoded_table(
+            &truncated,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an unreadable extension cannot prove completeness: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_incomplete_export_evidence_stays_lossy() {
+        let mut names: Vec<(String, u64)> = fedora_exports_without_interface_getters().to_vec();
+        names.pop();
+        assert_eq!(names.len(), 67);
+        let classes = observation_for_decoded_table(
+            &fedora_shaped_snapshot(),
+            names.into(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "export agreement must cover every decoded slot: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    fn extension_failure_at_92_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..92 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 92..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    fn extension_failure_at_68_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..68 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 68..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn extension_failure_past_the_refutation_range_stays_lossy() {
+        // Slots 68..91 are real functions, so the table may be a genuine
+        // 92-wide 3.0/3.1 table mislabelled 3.2; the failure at 92 refutes
+        // nothing and the 68-slot prefix stays unproven.
+        let table = decode_fedora_table(&extension_failure_at_92_snapshot());
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            !table.extension_impossible,
+            "a failure at 92 is outside 68..92 and proves nothing"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an unrefuted 92-wide hypothesis keeps surfaces lossy: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_at_the_first_refutation_ordinal_is_exact() {
+        // The failure at exactly 68 refutes the 92-wide hypothesis, so the
+        // proven prefix reports full: the lower bound of 68..92 is inclusive.
+        let table = decode_fedora_table(&extension_failure_at_68_snapshot());
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table.extension_impossible,
+            "a failure exactly at 68 is inside 68..92"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "full",
+            false,
+            false,
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a failure at 68 proves the prefix complete: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_executable_anonymous_memory_stays_lossy() {
+        // Executable anonymous memory (JIT, trampolines) may hold a real
+        // extension the scanner cannot attach, so the failure refutes
+        // nothing and the prefix stays unproven.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xa500), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            !table.extension_impossible,
+            "executable anonymous memory is not a structural refutation"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an attachable-but-unusable extension keeps surfaces lossy: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_an_executable_deleted_mapping_stays_lossy() {
+        // An executable `(deleted)` mapping may hold real code reached
+        // through a path the scanner cannot use, so the failure refutes
+        // nothing and the prefix stays unproven.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xc500), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            !table.extension_impossible,
+            "an executable unusable path is not a structural refutation"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an attachable-but-unusable extension keeps surfaces lossy: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_writable_anonymous_data_is_exact() {
+        // Anonymous memory without execute permission cannot hold the
+        // extension, so the failure refutes the wider layouts.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xe500), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table.extension_impossible,
+            "non-executable anonymous memory refutes the wider layouts"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "full",
+            false,
+            false,
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a structural failure proves the prefix complete: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_unmapped_space_is_exact() {
+        // A slot pointing nowhere cannot be a function, so the failure
+        // refutes the wider layouts.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xdead000), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table.extension_impossible,
+            "unmapped space refutes the wider layouts"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "full",
+            false,
+            false,
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a structural failure proves the prefix complete: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_an_unpinned_entry_stays_lossy() {
+        use crate::discovery::scan::Skipped;
+
+        // A stripped-provider shape: one entry could not be pinned (its
+        // target lies in an object reconciliation could not open), so it
+        // moved to `unpinned` under its ordinal label while the witness
+        // lacks that name. Every pinned entry agrees; only the unpinned
+        // record refuses the proof.
+        let mut table = decode_fedora_table(&fedora_shaped_snapshot());
+        let moved = table.entries.pop().expect("68 decoded entries");
+        table.unpinned.push(Skipped {
+            subject: moved.name.to_string(),
+            reason: "/lib/dep.so could not be reconciled to a comparable pinned object; \
+                     entry was not attached"
+                .into(),
+        });
+        assert_eq!(table.decoded_slot_count(), 68);
+        let mut names: Vec<(String, u64)> = fedora_exports_without_interface_getters().to_vec();
+        names.retain(|(name, _)| *name != moved.name);
+        assert_eq!(names.len(), 67);
+        let classes = observation_for_table(
+            table,
+            names.into(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an unpinned entry keeps the surface unproven: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_a_fileless_table_stays_lossy() {
+        // An anonymous/heap table has no file owner, so export agreement
+        // cannot authorize it: a missing file offset refuses the proof.
+        let mut table = decode_fedora_table(&fedora_shaped_snapshot());
+        table.file_offset = None;
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "a fileless table keeps the surface unproven: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_an_ifunc_interface_getter_stays_lossy() {
+        // The witness lists definitions only, so an IFUNC (or absolute)
+        // getter is absent from `symbols`; the presence bit records it
+        // anyway and refuses the proof: a 3.x route may exist.
+        let exports = fedora_exports_without_interface_getters();
+        assert!(
+            !exports
+                .iter()
+                .any(|(name, _)| name == "C_GetInterface" || name == "C_GetInterfaceList"),
+            "an IFUNC getter leaves no definition in the witness"
+        );
+        let classes = observation_for_table(
+            decode_fedora_table(&fedora_shaped_snapshot()),
+            exports,
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            true,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "a getter in any symbol type keeps a 3.x route reachable: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_a_faulted_exports_walk_stays_lossy() {
+        // The exports walk skipped a symbol it could not read or
+        // translate, so the witness may be incomplete: the sticky fault
+        // refuses the proof.
+        let classes = observation_for_table(
+            decode_fedora_table(&fedora_shaped_snapshot()),
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            true,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "a faulted walk cannot prove getter absence: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn genuine_104_slot_32_table_stays_full() {
+        use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
+        use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, decode_exact_table};
+        use crate::plan::build_from_reconciled_modules;
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::elf::ElfAbi;
+        use p11scope_manifest::maps::MapIndex;
+
+        let maps = fedora_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            pkcs11_module::LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget")
+        .expect("a genuine 104-slot table must decode");
+        assert_eq!(table.version, (3, 2));
+        assert_eq!(table.walk, "full");
+        assert_eq!(table.decoded_slot_count(), 104);
+        let key = table.entries[0].object;
+        let object = PinnedObjectId(0);
+        let exports: std::sync::Arc<[(String, u64)]> = (0..104)
+            .map(|ordinal| {
+                (
+                    pkcs11_module::function_name(ordinal).unwrap().to_string(),
+                    0x500,
+                )
+            })
+            .collect();
+        let scanned = ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            view: ProcessViewId(0),
+            mount_namespace: MountNamespaceId {
+                device: 1,
+                inode: 1,
+            },
+            key,
+            double_loaded: false,
+            same_file_loads: 1,
+            path: "/lib/provider.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![table],
+            interfaces: vec![],
+        };
+        let reconciled = ReconciledModule {
+            scanned,
+            object,
+            entry_objects: vec![vec![object; 104]],
+            exports,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
+        assert_eq!(plan.surfaces.len(), 1);
+        assert_eq!(plan.surfaces[0].walk, "full");
+        let mut ev = evidence();
+        ev.surfaces = plan.surfaces.clone();
+        let classes = ev.gap_classes(true);
+        assert_eq!(classes.observation.status, "exact");
+        assert!(
+            !classes.observation.causes.contains(&"surfaces"),
+            "a full walk is unchanged: {:?}",
+            classes.observation.causes
+        );
+    }
+
     #[test]
     fn json_marks_latency_approximate_and_hex_rvs() {
         let mut ev = evidence();
@@ -4954,6 +8324,146 @@ pub(crate) mod tests {
         );
         assert_eq!(value["evidence"]["shape_decode_total_failures"], 0);
         assert_eq!(value["evidence"]["completeness"], "COMPLETE");
+    }
+
+    /// Unassigned NSS vendor gap (`CKM_NSS` + 89), the codebase's
+    /// unknown-vendor sentinel: exact registry membership never admits
+    /// it (see `vendor_mechanisms::unassigned_vendor_ids_stay_out_of_the_approval_union`).
+    const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
+
+    fn profile_mechanisms(state: &crate::semantics::State) -> serde_json::Value {
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        profile_json(&[], VersionedEvidence::wrap(&ev), state, &capture)["mechanisms"].clone()
+    }
+
+    #[test]
+    fn profile_json_lists_unregistered_mechanism_id_with_registered_false() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut first = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
+        first.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        let mut second = first;
+        second.duration_ns = 200;
+        state.observe(&first);
+        state.observe(&second);
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        let row = &mechanisms[0];
+        assert_eq!(row["mechanism"], UNREGISTERED_SENTINEL);
+        assert_eq!(row["mechanism_hex"], "0xce5343a9");
+        assert_eq!(row["calls"], 2);
+        assert_eq!(row["errors"], 0);
+        assert_eq!(row["registered"], false);
+    }
+
+    #[test]
+    fn profile_json_lists_registered_mechanism_id_with_registered_true() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        state.observe(&init_event(0, 0x0D, shape::NONE, 0, 0, 0));
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        let row = &mechanisms[0];
+        assert_eq!(row["mechanism"], 0x0D);
+        assert_eq!(row["calls"], 1);
+        assert_eq!(row["registered"], true);
+    }
+
+    /// Two slots on module 0: `C_SignInit` (index 0) binds a mechanism
+    /// id, `C_Sign` (index 1) attributes to that binding.
+    fn init_sign_plan() -> crate::plan::AttachPlan {
+        crate::plan::AttachPlan::from_slots(vec![
+            crate::plan::Slot {
+                index: 0,
+                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+                object: crate::plan::TEST_PINNED_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+                names: vec!["C_SignInit".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            },
+            crate::plan::Slot {
+                index: 1,
+                descriptor_index: crate::kinds::function_id("C_Sign").unwrap() + 1,
+                object: crate::plan::TEST_PINNED_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x20,
+                names: vec!["C_Sign".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_Sign").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            },
+        ])
+    }
+
+    /// An operational `C_Sign` call on slot 1 of [`init_sign_plan`]: no
+    /// mechanism of its own, attributed through the session binding.
+    fn sign_op_event() -> p11scope_ebpf_common::Event {
+        let mut op = init_event(1, p11scope_ebpf_common::MECH_NONE, shape::NONE, 0, 0, 0);
+        op.capture = p11scope_ebpf_common::capture::MECHANISM_NONE;
+        op
+    }
+
+    #[test]
+    fn profile_json_operation_attributed_call_keeps_unregistered_flag() {
+        // The Init binds the unregistered id, the operational call
+        // attributes to that binding. Both land on one row that stays
+        // unregistered.
+        let mut state = crate::semantics::State::with_policy(
+            &init_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut init = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
+        init.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&init);
+        state.observe(&sign_op_event());
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        assert_eq!(mechanisms[0]["mechanism"], UNREGISTERED_SENTINEL);
+        assert_eq!(mechanisms[0]["calls"], 2);
+        assert_eq!(mechanisms[0]["registered"], false);
+    }
+
+    #[test]
+    fn profile_json_binding_recreated_row_stays_unregistered_after_purge() {
+        // `purge_modules` clears mechanism rows capture-wide but keeps
+        // another module's bindings: the next attributed call recreates
+        // the row from the binding, which must carry the flag along.
+        let mut state = crate::semantics::State::with_policy(
+            &init_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut init = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
+        init.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&init);
+        let mut modules = std::collections::BTreeSet::new();
+        modules.insert(crate::plan::ModuleId(99));
+        state.purge_modules(&modules);
+        assert!(state.mechanisms().is_empty());
+        state.observe(&sign_op_event());
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        assert_eq!(mechanisms[0]["mechanism"], UNREGISTERED_SENTINEL);
+        assert_eq!(mechanisms[0]["calls"], 1);
+        assert_eq!(mechanisms[0]["registered"], false);
     }
 
     #[test]
@@ -5511,6 +9021,49 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn profile_json_cgroup_mechanism_rows_carry_registered_flag() {
+        // The cgroup breakdown names the same registry membership as
+        // the top-level rows: system scope is the main surface, and an
+        // unregistered id there used to render with no flag at all. A
+        // later observation without the bit must not clear it —
+        // membership is fixed per capture, so the flag is sticky.
+        let mut state = crate::semantics::State::new(&init_plan());
+        let mut flagged = init_event(0, UNREGISTERED_SENTINEL, 0, 0, 0, 0);
+        flagged.cgroup_id = 111;
+        flagged.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&flagged);
+        let mut plain = init_event(0, UNREGISTERED_SENTINEL, 0, 0, 0, 0);
+        plain.cgroup_id = 111;
+        state.observe(&plain);
+        let mut registered = init_event(0, 0x0D, 0, 0, 0, 0);
+        registered.cgroup_id = 111;
+        state.observe(&registered);
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+
+        let cgroups = v["cgroups"].as_array().unwrap();
+        assert_eq!(cgroups.len(), 1);
+        let rows = cgroups[0]["mechanisms"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let unreg = rows
+            .iter()
+            .find(|row| row["mechanism"] == UNREGISTERED_SENTINEL)
+            .expect("unregistered cgroup row present");
+        assert_eq!(unreg["mechanism_hex"], "0xce5343a9");
+        assert_eq!(unreg["calls"], 2);
+        assert_eq!(unreg["registered"], false);
+        let reg = rows
+            .iter()
+            .find(|row| row["mechanism"] == 0x0D)
+            .expect("registered cgroup row present");
+        assert_eq!(reg["calls"], 1);
+        assert_eq!(reg["registered"], true);
+    }
+
     // ---- Slice 1b-2 public evidence contract (design §5.5–§5.7, §9) -------
     //
     // These freeze the exact published vocabulary. Every key below is named by
@@ -5628,12 +9181,12 @@ pub(crate) mod tests {
                 assert!(object[key].is_u64(), "{group}.{key} is not a u64 count");
             }
         }
-        for key in ["hits", "state_read_failures"] {
+        for key in ["hits", "benign_hits", "state_read_failures"] {
             assert!(aggregate[key].is_u64(), "{key} is not a u64 count");
         }
         assert_eq!(
             aggregate.as_object().unwrap().len(),
-            6,
+            7,
             "loader_discovery grew a key: {aggregate}"
         );
         // No second public copy of an internal counter, no proof/identity, no
@@ -5714,6 +9267,318 @@ pub(crate) mod tests {
             ev.discovery.module_ambiguous, 0,
             "an unresolved owner must not be counted as ambiguity"
         );
+    }
+
+    /// OD34: a spent 16,384 image budget on a Detailed capture is a named,
+    /// counted gap: identity refusals plus the budget-exhausted flag force
+    /// PARTIAL with the `kernel_control` cause, and the JSON keeps the
+    /// exact counts. The twin pins that a clean control stays silent.
+    #[test]
+    fn kernel_control_identity_refusals_force_partial_with_counts() {
+        let mut clean = evidence();
+        clean.verdict();
+        assert!(clean.gap_classes.observation.causes.is_empty());
+        let mut ev = evidence();
+        ev.kernel_control.identity_unavailable = 7;
+        ev.kernel_control.identity_budget_exhausted = true;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["kernel_control"]);
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kernel_control"]["identity_unavailable"], 7);
+        assert_eq!(json["kernel_control"]["identity_budget_exhausted"], true);
+    }
+
+    /// OD34/E1: the 256 process-view limit is named in the user's report.
+    /// The exact view-capacity skip projects to a finite named reason (not
+    /// the redacted pair), forces PARTIAL with the `skipped` cause, and the
+    /// text names the limit with its count. The twin pins that a clean
+    /// control stays silent.
+    #[test]
+    fn view_capacity_skip_names_the_limit_in_text_and_json() {
+        use crate::discovery::scan::Skipped;
+        let mut clean = evidence();
+        clean.verdict();
+        assert!(clean.gap_classes.observation.causes.is_empty());
+        let internal = Skipped {
+            subject: "process view".into(),
+            reason: "capture process-view capacity 256 was exhausted; remaining generations were not scanned".into(),
+        };
+        let mut ev = evidence();
+        ev.skipped = vec![capture_skipped_out(&internal)];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["skipped"]);
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            assert_eq!(document["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(
+                document["evidence"]["skipped"],
+                serde_json::json!([{
+                    "name": "discovery subject",
+                    "reason": "capture process-view capacity was exhausted; remaining generations were not scanned",
+                }])
+            );
+        }
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 entries skipped"), "{text}");
+        assert!(
+            text.contains(
+                "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            verdict_reasons(&ev).contains(
+                "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
+            ),
+            "{text}"
+        );
+    }
+
+    /// The fixed loader-limit skips name their limit too: both 256-context
+    /// arm paths share the capacity reason, and the two bounded-ledger
+    /// losses keep their fixed sentences. Every pair projects to its named
+    /// reason; PARTIAL with the count in text and JSON.
+    #[test]
+    fn loader_limit_skips_name_the_limit_for_every_arm_path() {
+        use crate::discovery::scan::Skipped;
+        // L1 formats the preflight refusal through `{error:#}` (the live
+        // arm path); a single-message error renders verbatim.
+        let live_reason = format!(
+            "{:#}",
+            anyhow::anyhow!("loader context capacity 256 is exhausted")
+        );
+        let internals: [(&str, &str, &str); 4] = [
+            (
+                "live loader arming",
+                &live_reason,
+                "loader context capacity 256 is exhausted",
+            ),
+            (
+                "owned initial-set discovery",
+                "loader context capacity 256 is exhausted",
+                "loader context capacity 256 is exhausted",
+            ),
+            (
+                "live loader memory discovery",
+                "a deferred loader memory scan exceeded the bounded loader-context ledger",
+                "a deferred loader memory scan exceeded the bounded loader-context ledger",
+            ),
+            (
+                "post-arm provider discovery",
+                "the bounded loader-arm catch-up ledger was full",
+                "the bounded loader-arm catch-up ledger was full",
+            ),
+        ];
+        for (subject, reason, public) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(projected.reason, *public, "{subject} {reason}");
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason, _)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["skipped"]);
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            document["evidence"]["skipped"],
+            serde_json::json!([
+                {"name": "discovery subject", "reason": "loader context capacity 256 is exhausted"},
+                {"name": "discovery subject", "reason": "loader context capacity 256 is exhausted"},
+                {"name": "discovery subject", "reason": "a deferred loader memory scan exceeded the bounded loader-context ledger"},
+                {"name": "discovery subject", "reason": "the bounded loader-arm catch-up ledger was full"},
+            ])
+        );
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("4 entries skipped"), "{text}");
+        for fragment in [
+            "loader context capacity 256 is exhausted: 2",
+            "a deferred loader memory scan exceeded the bounded loader-context ledger: 1",
+            "the bounded loader-arm catch-up ledger was full: 1",
+        ] {
+            assert!(text.contains(fragment), "{text}");
+        }
+    }
+
+    /// Twins: the same subjects with target-derived reasons stay redacted —
+    /// subject-only matching would leak paths through the allowlisted names,
+    /// so the allowlist matches exact (subject, reason) pairs.
+    #[test]
+    fn path_carrying_skip_reasons_stay_redacted() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "process view",
+                "member /private/PATH_VIEW could not be scanned: ESRCH",
+            ),
+            (
+                "live loader arming",
+                "arm failed for /private/PATH_ARM: no such process",
+            ),
+            (
+                "live loader memory discovery",
+                "scan of /private/PATH_SCAN unresolved: /proc/9999 gone",
+            ),
+            (
+                "owned initial-set discovery",
+                "preflight refused: mapping /private/PATH_OWNED changed",
+            ),
+            (
+                "post-arm provider discovery",
+                "catch-up for /private/PATH_CATCHUP skipped: budget spent",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            let rendered = document.to_string();
+            assert!(!rendered.contains("PRIVATE_"), "{rendered}");
+            assert!(!rendered.contains("/private/"), "{rendered}");
+        }
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!text.contains("PRIVATE_"), "{text}");
+        assert!(text.contains("5 entries skipped"), "{text}");
+    }
+
+    /// Twins: reasons that merely start with an allowlisted sentence but
+    /// carry more (a path, a detail suffix, wrong case or spacing) stay
+    /// redacted — the allowlist is exact, never prefix or substring. The
+    /// normalized view sentence without a value is not an engine form and
+    /// stays redacted too.
+    #[test]
+    fn allowlisted_prefix_plus_detail_stays_redacted() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "process view",
+                "capture process-view capacity 256 was exhausted; remaining generations were not scanned; extra /private/PATH_SUFFIX",
+            ),
+            (
+                "process view",
+                "capture process-view capacity 256 was exhausted",
+            ),
+            (
+                "process view",
+                "capture process-view capacity was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "process view",
+                "capture process-view capacity many was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "process view",
+                " capture process-view capacity 256 was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "process view",
+                "Capture process-view capacity 256 was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "live loader arming",
+                "loader context capacity 256 is exhausted: /private/PATH_DETAIL",
+            ),
+            (
+                "live loader arming",
+                "loader context capacity 256 is exhausted ",
+            ),
+            (
+                "live loader memory discovery",
+                "a deferred loader memory scan exceeded the bounded loader-context ledger (pid /private/X)",
+            ),
+            (
+                "post-arm provider discovery",
+                "the bounded loader-arm catch-up ledger was full; see /private/Y",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let rendered = document.to_string();
+        assert!(!rendered.contains("PRIVATE_"), "{rendered}");
+        assert!(!rendered.contains("/private/"), "{rendered}");
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!text.contains("PRIVATE_"), "{text}");
+        assert!(text.contains("10 entries skipped"), "{text}");
     }
 
     /// With the compiled-in timing catalog empty (D3), debug-state discovery
@@ -5803,6 +9668,116 @@ pub(crate) mod tests {
         );
     }
 
+    /// A `run` whose loader hook never fired and whose initial set was
+    /// never validated either (the 0-hit ghost): zero hits prove nothing
+    /// when the initial context itself is unproven, so the report names
+    /// the loader gap and stays PARTIAL.
+    #[test]
+    fn a_never_fired_loader_with_unproven_initial_set_is_an_observation_gap() {
+        let mut ghost = evidence();
+        ghost.loader_discovery.strategies.debug_state_every_hit = 1;
+        ghost.loader_discovery.hits = 0;
+        ghost.loader_discovery.initial_set_timing.unproven = 1;
+        ghost.loader_discovery.initial_set_capture.none = 1;
+        ghost.pause_partial = 1;
+        ghost.verdict();
+        assert!(
+            ghost
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            ghost.gap_classes(true)
+        );
+        assert_eq!(ghost.completeness, "PARTIAL");
+    }
+
+    /// The 0-hit ghost with a single initial-set context never saw its EXEC
+    /// acknowledged (a second live context would exist otherwise), so BPF
+    /// delivered no loader or lifecycle records for the run. The report names
+    /// that delivery failure instead of generic unproven timing.
+    #[test]
+    fn a_never_fired_single_context_loader_names_bpf_delivery_failure() {
+        let mut ghost = evidence();
+        ghost.loader_discovery.strategies.debug_state_every_hit = 1;
+        ghost.loader_discovery.hits = 0;
+        ghost.loader_discovery.initial_set_timing.unproven = 1;
+        ghost.loader_discovery.initial_set_capture.none = 1;
+        ghost.pause_partial = 1;
+        ghost.verdict();
+        let reasons = verdict_reasons(&ghost);
+        assert!(
+            reasons.contains("BPF delivery failure")
+                && reasons.contains("no EXEC acknowledgment")
+                && reasons.contains("suspected"),
+            "ghost names the delivery failure, got: {reasons:?}",
+        );
+    }
+
+    /// Zero hits with two bound contexts means the EXEC was processed (a
+    /// second live context exists via acknowledgment or immediate re-arm)
+    /// but the loader uprobe itself never fired: a loader-specific miss,
+    /// not a silent run. The report names that.
+    #[test]
+    fn a_never_fired_processed_loader_names_uprobe_miss() {
+        let mut miss = evidence();
+        miss.loader_discovery.strategies.debug_state_every_hit = 2;
+        miss.loader_discovery.hits = 0;
+        miss.loader_discovery.dlopen_timing.unproven = 1;
+        miss.loader_discovery.initial_set_timing.unproven = 1;
+        miss.loader_discovery.initial_set_capture.none = 1;
+        miss.pause_partial = 1;
+        miss.verdict();
+        assert!(
+            miss.gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            miss.gap_classes(true)
+        );
+        let reasons = verdict_reasons(&miss);
+        assert!(
+            reasons.contains("uprobe miss")
+                && reasons.contains("EXEC processing")
+                && reasons.contains("suspected"),
+            "processed 0-hit loader names the uprobe miss, got: {reasons:?}",
+        );
+    }
+
+    /// A loader that fired keeps the generic unproven-timing text: the
+    /// delivery-failure and uprobe-miss arms are 0-hit only.
+    #[test]
+    fn a_fired_loader_keeps_generic_unproven_timing_text() {
+        let mut fired = evidence();
+        fired.loader_discovery.strategies.debug_state_every_hit = 2;
+        fired.loader_discovery.hits = 2;
+        fired.loader_discovery.dlopen_timing.unproven = 1;
+        fired.loader_discovery.initial_set_timing.unproven = 1;
+        fired.loader_discovery.initial_set_capture.none = 1;
+        fired.pause_partial = 1;
+        fired.verdict();
+        assert!(
+            fired
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            fired.gap_classes(true)
+        );
+        let reasons = verdict_reasons(&fired);
+        assert!(
+            reasons.contains("live loader timing unproven"),
+            "fired loader keeps generic text, got: {reasons:?}",
+        );
+        assert!(
+            !reasons.contains("BPF delivery failure") && !reasons.contains("uprobe miss"),
+            "fired loader names no 0-hit cause, got: {reasons:?}",
+        );
+    }
+
     /// An owned run whose pause held every loader hit and table publication
     /// until the probes were attached is not an observation gap for its
     /// loader timing, even with the empty catalog; the same run with one
@@ -5839,6 +9814,70 @@ pub(crate) mod tests {
         assert!(
             lossy
                 .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery")
+        );
+    }
+
+    /// A loader hit whose record resolved benignly (accepted, scan
+    /// complete, no new provider, no suspicious close) loaded nothing the
+    /// capture could have missed calls through — not even with unproven
+    /// timing. The SoftHSM `rdrand` engine probe (a failed dlopen that
+    /// fires one debug-state hit with no mapping change) is the live
+    /// shape: exact counts with a lossy observation until this lands.
+    #[test]
+    fn benign_loader_hits_do_not_gate_exactness() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.hits = 1;
+        ev.loader_discovery.benign_hits = 1;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert!(
+            !ev.gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "a fully benign loader hit must not name loader_discovery: {:?}",
+            ev.gap_classes(true).observation.causes
+        );
+    }
+
+    /// Benign resolution is per-hit: one unresolved hit keeps the
+    /// capture lossy.
+    #[test]
+    fn partially_benign_loader_hits_stay_lossy() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.hits = 2;
+        ev.loader_discovery.benign_hits = 1;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert!(
+            ev.gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery")
+        );
+    }
+
+    /// A benign count above the hit count is inconsistent evidence,
+    /// never an exoneration: without pause proof the capture stays
+    /// lossy (and the checker refuses the report outright).
+    #[test]
+    fn benign_hits_above_hits_stays_lossy_without_pause_proof() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.hits = 1;
+        ev.loader_discovery.benign_hits = 2;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert!(
+            ev.gap_classes(true)
                 .observation
                 .causes
                 .contains(&"loader_discovery")
@@ -5964,14 +10003,6 @@ pub(crate) mod tests {
                     coverage: "absent_uncovered",
                 })
             }),
-            ("required standard export absent", |ev| {
-                ev.interface_selection
-                    .standard_exports
-                    .push(StandardExport {
-                        module: 0,
-                        status: "required_absent",
-                    })
-            }),
             ("standard export outside module", |ev| {
                 ev.interface_selection
                     .standard_exports
@@ -6083,6 +10114,14 @@ pub(crate) mod tests {
                     .push(StandardExport {
                         module: 0,
                         status: "legacy_absent",
+                    })
+            }),
+            ("historical required absent", |ev| {
+                ev.interface_selection
+                    .standard_exports
+                    .push(StandardExport {
+                        module: 0,
+                        status: "required_absent",
                     })
             }),
             ("nonzero rv", |ev| {
@@ -6506,3 +10545,7 @@ pub(crate) mod tests {
         assert_eq!(metrics["lane"], "metrics");
     }
 }
+
+#[cfg(test)]
+#[path = "render_lossless_tests.rs"]
+mod render_lossless_tests;

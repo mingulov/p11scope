@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Compiled ELF fixtures exercise the production map inventory decoder."""
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -23,10 +24,16 @@ class MapDefsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="p11scope-map-defs-")
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.object = Path(cls.temp.name) / "mixed.o"
-        subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-c",
-                        str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"),
-                        "-o", str(cls.object)], check=True, capture_output=True)
+        cls.fixture_object = Path(cls.temp.name) / "mixed.o"
+
+    @property
+    def object(self):
+        # Prebuilt ia32 mutations do not consume the generic decoder fixture.
+        if not self.fixture_object.exists():
+            subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-c",
+                            str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"),
+                            "-o", str(self.fixture_object)], check=True, capture_output=True)
+        return self.fixture_object
 
     def mutate(self, changes, source=None):
         body = bytearray((source or self.object).read_bytes())
@@ -54,8 +61,8 @@ class MapDefsTests(unittest.TestCase):
 
         BPF_OBJ_NAME_LEN truncates map names to 15 chars; the stopped
         canary compares those truncated names against FROZEN_INVENTORY.
-        Only task_storage names have a canonical remap
-        (dump-owned-bpf-maps.canonical_map_name), so every other frozen
+        Only the exact task-storage, private image-hash and object-array
+        names have a canonical remap, so every other frozen
         name must fit, and no two names in a flavor may share a prefix.
         """
         dumper = load_path(ROOT / "scripts/dump-owned-bpf-maps.py", "map_dumper")
@@ -64,10 +71,11 @@ class MapDefsTests(unittest.TestCase):
                 prefixes = {}
                 for name in maps:
                     if len(name) > 15:
-                        self.assertIn(name, dumper.TASK_STORAGE_NAMES,
+                        canonical_type = ("task_storage" if maps[name]["type"] == 29 else
+                                          "hash" if maps[name]["type"] == 1 else
+                                          "array" if maps[name]["type"] == 2 else "other")
+                        self.assertEqual(name, dumper.canonical_map_name({"name": name[:15], "type": canonical_type}),
                                       f"{name} exceeds 15 chars without a canonical remap")
-                        # The remap only fires for task_storage rows.
-                        self.assertEqual(maps[name]["type"], 29, f"{name} remap needs task_storage type")
                     truncated = name[:15]
                     self.assertNotIn(truncated, prefixes,
                                      f"{name} collides with {prefixes.get(truncated)}")
@@ -193,7 +201,10 @@ class MapDefsTests(unittest.TestCase):
                        check=True, capture_output=True)
         _, programs, symbols = checker.inspect(obj)
         self.assertEqual(programs, {"probe", "task_newtask", "sched_process_exec", "sched_process_exit",
-                                   "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"})
+                                   "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
+                                   "p11_inst_vma_retcopy",
+                                   "p11_image_exec_release", "p11_image_mmap_release",
+                                   "p11_image_query"})
         self.assertTrue(checker.REQUIRED_GLOBAL_HELPERS <= symbols)
         body, elf, _ = self.metadata(obj)
         symbase = elf.sections[".symtab"][0][4]
@@ -222,6 +233,151 @@ class MapDefsTests(unittest.TestCase):
         hook = next(i for i, s in enumerate(elf.symbols) if s[0] == "task_newtask")
         with self.assertRaisesRegex(RuntimeError, "unclassified"):
             checker.inspect(self.mutate([(symbase + hook * 24 + 6, "H", elf.indices["uprobe"])], obj))
+
+    def test_exec_cookie_helper_boundary(self):
+        obj = Path(self.temp.name) / "exec-cookie.o"
+        command = ["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-DEXEC_COOKIE", "-c",
+                   str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)]
+        subprocess.run(command, check=True, capture_output=True)
+        try:
+            checker.inspect(obj)
+        except RuntimeError as error:
+            self.fail(f"healthy EXEC cookie helper was rejected: {error}")
+        body, elf, btf = self.metadata(obj)
+        checker.validate_exec_cookie_helper(elf)
+        checker.validate_exec_cookie_helper(elf, inventory=True, callers=True)
+        checker.validate_exec_cookie_helper(self.metadata()[1], inventory=True)
+        with self.assertRaisesRegex(RuntimeError, "InventoryGlobal.*EXEC cookie"):
+            checker.validate_exec_cookie_helper(elf, inventory=True)
+        missing = Path(self.temp.name) / "exec-cookie-missing.o"
+        command = command[:-2] + ["-DEXEC_COOKIE_MISSING", "-o", str(missing)]
+        subprocess.run(command, check=True, capture_output=True)
+        with self.assertRaisesRegex(RuntimeError, "missing.*EXEC cookie"):
+            checker.validate_exec_cookie_helper(checker.Elf(missing.read_bytes()))
+        helper_index = next(i for i, symbol in enumerate(elf.symbols)
+                            if symbol[0] == "p11_link_current_cookie")
+        symbol_at = elf.sections[".symtab"][0][4] + helper_index * 24
+        function = next(node for node in btf.types[1:]
+                        if node[:2] == (12, "p11_link_current_cookie"))
+        base = elf.sections[".BTF"][0][4]
+        function_at = base + function[6]
+        proto = btf.types[function[2]]
+        proto_at = base + proto[6]
+        scalar = btf.resolve(proto[2])
+        u32_type = next(node[2] for node in btf.types[1:]
+                        if node[:2] == (12, "p11_exec_dumpability"))
+        u32_result = btf.types[u32_type][2]
+        pointer_proto = next(node[2] for node in btf.types[1:]
+                             if node[:2] == (12, "p11_owner_cleanup"))
+        pointer_at = base + btf.types[pointer_proto][6]
+        cases = {
+            "local": ([(symbol_at + 4, "B", 2)], "EXEC cookie.*GLOBAL"),
+            "hidden": ([(symbol_at + 5, "B", 2)], "EXEC cookie.*GLOBAL"),
+            "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])], "EXEC cookie.*GLOBAL"),
+            "static_btf": ([(function_at + 4, "I", 12 << 24)], "EXEC cookie.*GLOBAL"),
+            "u32_result": ([(proto_at + 8, "I", u32_result)], "no-argument scalar|unsigned u64"),
+            "extra_argument": ([(function_at + 8, "I", pointer_proto),
+                                 (pointer_at + 8, "I", proto[2])], "no-argument scalar"),
+            "signed_result": ([(base + scalar[6] + 12, "I", (1 << 24) | 64)], "unsigned u64"),
+        }
+        for name, (changes, message) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                checker.validate_exec_cookie_helper(checker.Elf(self.mutate(changes, obj).read_bytes()))
+
+    def test_exec_predicate_boundary(self):
+        obj = Path(self.temp.name) / "exec-linkage.o"
+        subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-c",
+                        str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)],
+                       check=True, capture_output=True)
+        checker.inspect(obj)
+        body, elf, btf = self.metadata(obj)
+        helper_index = next(i for i, symbol in enumerate(elf.symbols)
+                            if symbol[0] == "p11_exec_dumpability")
+        helper = elf.symbols[helper_index]
+        symbol_at = elf.sections[".symtab"][0][4] + helper_index * 24
+        function = next(node for node in btf.types[1:]
+                        if node[:2] == (12, "p11_exec_dumpability"))
+        function_at = elf.sections[".BTF"][0][4] + function[6]
+        scalar = btf.resolve(btf.types[function[2]][2])
+        pointer_proto = next(node[2] for node in btf.types[1:]
+                             if node[:2] == (12, "p11_owner_cleanup"))
+        raw = elf.sections[".text"][1][helper[4]:helper[4] + helper[5]]
+        read_at = [elf.sections[".text"][0][4] + helper[4] + pos
+                   for pos in range(0, len(raw), 8)
+                   if raw[pos] == 0x85 and struct.unpack_from("<i", raw, pos + 4)[0] == 113]
+        self.assertEqual(len(read_at), 1)
+        row, relocations = elf.sections[".relraw_tp/sched_process_exec"]
+        calls = []
+        for pos in range(0, len(relocations), 16):
+            address, info = struct.unpack_from("<QQ", relocations, pos)
+            if elf.symbols[info >> 32][0] == helper[0]:
+                calls.append(elf.sections["raw_tp/sched_process_exec"][0][4] + address)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(body[calls[0]:calls[0] + 2], b"\x85\x10")
+        cases = {
+            "local": ([(symbol_at + 4, "B", 2)], "EXEC.*GLOBAL"),
+            "hidden": ([(symbol_at + 5, "B", 2)], "EXEC.*GLOBAL"),
+            "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])], "EXEC.*GLOBAL"),
+            "static_btf": ([(function_at + 4, "I", 12 << 24)], "EXEC.*GLOBAL"),
+            "pointer_argument": ([(function_at + 8, "I", pointer_proto)], "no-argument scalar"),
+            "signed_result": ([(elf.sections[".BTF"][0][4] + scalar[6] + 12,
+                                "I", (1 << 24) | 32)], "unsigned u32"),
+            "user_read": ([(read_at[0] + 4, "i", 112)], "only current-task and kernel-read"),
+            "map_lookup": ([(read_at[0] + 4, "i", 1)], "only current-task and kernel-read"),
+            "uncalled": ([(calls[0], "H", 0xb7)], "no reachable call boundary"),
+        }
+        for name, (changes, message) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                checker.validate_exec_helpers(checker.Elf(self.mutate(changes, obj).read_bytes()))
+
+    def test_exe_identity_boundary(self):
+        # 6.14 Option B: the exe-identity helper keeps its own exact
+        # boundary (two out-word pointers, u32 result, checked-helper
+        # body) outside the no-argument EXEC namespace.
+        obj = Path(self.temp.name) / "exe-linkage.o"
+        subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-c",
+                        str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)],
+                       check=True, capture_output=True)
+        checker.inspect(obj)
+        body, elf, btf = self.metadata(obj)
+        helper_index = next(i for i, symbol in enumerate(elf.symbols)
+                            if symbol[0] == "p11_exe_identity")
+        helper = elf.symbols[helper_index]
+        symbol_at = elf.sections[".symtab"][0][4] + helper_index * 24
+        function = next(node for node in btf.types[1:]
+                        if node[:2] == (12, "p11_exe_identity"))
+        function_at = elf.sections[".BTF"][0][4] + function[6]
+        scalar = btf.resolve(btf.types[function[2]][2])
+        noarg_proto = next(node[2] for node in btf.types[1:]
+                           if node[:2] == (12, "p11_exec_dumpability"))
+        raw = elf.sections[".text"][1][helper[4]:helper[4] + helper[5]]
+        read_at = [elf.sections[".text"][0][4] + helper[4] + pos
+                   for pos in range(0, len(raw), 8)
+                   if raw[pos] == 0x85 and struct.unpack_from("<i", raw, pos + 4)[0] == 113]
+        self.assertEqual(len(read_at), 1)
+        row, relocations = elf.sections[".relraw_tp/sched_process_exec"]
+        calls = []
+        for pos in range(0, len(relocations), 16):
+            address, info = struct.unpack_from("<QQ", relocations, pos)
+            if elf.symbols[info >> 32][0] == helper[0]:
+                calls.append(elf.sections["raw_tp/sched_process_exec"][0][4] + address)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(body[calls[0]:calls[0] + 2], b"\x85\x10")
+        cases = {
+            "local": ([(symbol_at + 4, "B", 2)], "EXE identity.*GLOBAL"),
+            "hidden": ([(symbol_at + 5, "B", 2)], "EXE identity.*GLOBAL"),
+            "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])], "EXE identity.*GLOBAL"),
+            "static_btf": ([(function_at + 4, "I", 12 << 24)], "EXE identity.*GLOBAL"),
+            "noarg_proto": ([(function_at + 8, "I", noarg_proto)], "exact documented FUNC_PROTO"),
+            "signed_result": ([(elf.sections[".BTF"][0][4] + scalar[6] + 12,
+                                "I", (1 << 24) | 32)], "unsigned u32"),
+            "user_read": ([(read_at[0] + 4, "i", 112)], "only current-task and kernel-read"),
+            "map_lookup": ([(read_at[0] + 4, "i", 1)], "only current-task and kernel-read"),
+            "uncalled": ([(calls[0], "H", 0xb7)], "no reachable call boundary"),
+        }
+        for name, (changes, message) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                checker.validate_exe_helpers(checker.Elf(self.mutate(changes, obj).read_bytes()))
 
     def test_classic_uprobe_kernel_stack(self):
         """A classic uprobe program with a frame must carry a tail call (the
@@ -353,6 +509,10 @@ class MapDefsTests(unittest.TestCase):
         func = btf.types[func_id]
         fb = elf.sections[".BTF"][0][4] + func[6]
         other = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_start_get")
+        seeded = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_start_begin")
+        seeded_at = sb + seeded * 24
+        seeded_name = struct.unpack_from("<I", body, seeded_at)[0]
+        seeded_func = next(n for n in btf.types[1:] if n[:2] == (12, "p11_owner_start_begin"))
         global_owner_helpers = {"p11_owner_lease", "p11_owner_refund"}
         exported = {
             name: next(i for i, s in enumerate(elf.symbols) if s[0] == name)
@@ -404,8 +564,26 @@ class MapDefsTests(unittest.TestCase):
             row, code = elf.sections[section]
             remove_calls.extend((row[4] + i, "H", 0xb7) for i in range(0, len(code), 8)
                                 if code[i:i+2] == b"\x85\x10")
-        self.assertEqual(len(remove_calls), 3)
+        # 6.14 Option B: sched_process_exec also calls p11_exe_identity.
+        self.assertEqual(len(remove_calls), 5)
+        seeded_calls = []
+        seeded_row, seeded_code = elf.sections["tp_btf/task_newtask"]
+        for key, symbol in bodies.items():
+            if key[0] != elf.indices["tp_btf/task_newtask"]:
+                continue
+            for address in range(symbol[4], symbol[4] + symbol[5], 8):
+                relocation = call_relocations.get((key[0], address))
+                if relocation:
+                    kind, target = relocation
+                    immediate = struct.unpack_from("<i", seeded_code, address + 4)[0]
+                    if kind == 10 and (target[3], target[4] + (immediate + 1) * 8) == (elf.symbols[seeded][3], elf.symbols[seeded][4]):
+                        seeded_calls.append((seeded_row[4] + address, "H", 0xb7))
+        self.assertEqual(len(seeded_calls), 1)
         cases = {
+            "seeded_missing": ([(elf.sections[".strtab"][0][4] + seeded_name, "B", 0)], "missing required owner"),
+            "seeded_public": ([(seeded_at + 4, "B", 0x12)], "owner.*LOCAL"),
+            "seeded_btf_global": ([(elf.sections[".BTF"][0][4] + seeded_func[6] + 4, "I", (12 << 24) | 1)], "owner.*STATIC"),
+            "seeded_uncalled": (seeded_calls, "no reachable call boundary"),
             "public": ([(at + 4, "B", 0x12)], "owner.*LOCAL"),
             "hidden_only": ([(at + 5, "B", 2)], "owner.*LOCAL"),
             "public_healthy": ([(sb + healthy * 24 + 4, "B", 0x12)], "owner.*LOCAL"),
@@ -569,10 +747,15 @@ class MapDefsTests(unittest.TestCase):
         span_guard, _, _, span_offset, _ = next(
             insn for insn in instructions if insn[1:3] == (0x2d, 0x13)
         )
-        payload = next(pc for pc, op, reg, _, _ in instructions
-                       if op == 0x61 and reg & 15 == 0 and pc > read_call)
-        rejection_sentinel = max(pc for pc, op, reg, _, imm in instructions
-                                 if op == 0x18 and reg == 0 and imm == 0)
+        payload_loads = [pc for pc, op, _, _, _ in instructions
+                         if op == 0x61 and pc > read_call]
+        self.assertEqual(len(payload_loads), 1, "one real post-read four-byte payload")
+        payload = payload_loads[0]
+        saved_copies = [(pc, reg) for pc, op, reg, _, _ in instructions
+                        if op == 0xbf and reg & 15 == 0 and reg >> 4 in range(6, 10)]
+        rejection_sentinel = max(
+            [pc for pc, op, reg, _, imm in instructions if op == 0x18 and reg == 0 and imm == 0]
+            + [pc for pc, _ in saved_copies])
         self.assertGreater(span_offset, 0)
         # The alternate real sentinel block is also a valid rejection target.
         checker.inspect(self.mutate([(text_row[4] + span_guard + 2, "h",
@@ -689,6 +872,14 @@ class MapDefsTests(unittest.TestCase):
             "unreachable_decoy": (remove_entry_calls, "entry.*reachable"),
             "discovery_only": (remove_entry_calls + [discovery_call], "entry.*reachable"),
         }
+        for pc, reg in saved_copies:
+            cases[f"saved_sentinel_narrowed_{pc}"] = (
+                [(text_row[4] + pc, "B", 0xbc)], "span.*sentinel")
+            cases[f"saved_sentinel_unknown_{pc}"] = (
+                [(text_row[4] + pc + 1, "B", 0x90 if reg >> 4 != 9 else 0x80)], "span.*sentinel")
+            for width in (8, 16, 32):
+                cases[f"saved_sentinel_sign_extended_{width}_{pc}"] = (
+                    [(text_row[4] + pc + 2, "h", width)], "span.*sentinel")
         for name, (changes, reason) in cases.items():
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, reason):
                 checker.inspect(self.mutate(changes, obj), allowed)
@@ -753,6 +944,755 @@ class MapDefsTests(unittest.TestCase):
         for selection in ([], ["MapDefsTests.test_missing"]):
             result = subprocess.run([sys.executable, "-I", __file__, *selection], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class JournalMarkerInventoryTests(unittest.TestCase):
+    """R52 releases omit marker state; retained native marker models stay strict."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="p11scope-marker-freeze-")
+        cls.addClassCleanup(cls.temp.cleanup)
+
+    def detailed_symbols(self, missing=frozenset()):
+        return (
+            {"p11_entry"}
+            | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_HELPERS
+            | checker.REQUIRED_GLOBAL_EXE_HELPERS
+            | checker.SELECTED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_MARKER_HELPERS
+            | {"JOURNAL_MARKER_CTL"}
+        ) - set(missing)
+
+    def journal_symbols(self, missing=frozenset()):
+        return (
+            {"p11_entry_journal"}
+            | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_HELPERS
+            | checker.REQUIRED_GLOBAL_EXE_HELPERS
+            | checker.SELECTED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_MARKER_HELPERS
+            | {"JOURNAL_MARKER_CTL"}
+        ) - set(missing)
+
+    def quiet(self, func, *args):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            try:
+                func(*args)
+            except RuntimeError as error:
+                raise AssertionError(f"unexpected refusal: {error}") from error
+        return errors.getvalue()
+
+    def refused(self, func, *args):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaises(RuntimeError):
+            func(*args)
+        return errors.getvalue()
+
+    def test_release_detailed_marker_absence_accepts(self):
+        # The PID-scope birth witness ships only with the marker birth.
+        maps = {name: value for name, value in checker.SAFE_MAPS.items()
+                if name not in {"JOURNAL_MARKER_CTL", "PID_START_TICK"}}
+        symbols = self.detailed_symbols(missing=set(checker.REQUIRED_GLOBAL_MARKER_HELPERS)
+                                        | {"JOURNAL_MARKER_CTL"})
+        self.quiet(checker.validate_inventory, "default-no-marker", maps,
+                   checker.SAFE_PROGRAMS, symbols)
+        reason = self.refused(checker.validate_inventory, "default-no-marker",
+                              maps | {"PID_START_TICK": checker.SAFE_MAPS["PID_START_TICK"]},
+                              checker.SAFE_PROGRAMS, symbols)
+        self.assertIn("map added: PID_START_TICK", reason)
+        with self.assertRaisesRegex(RuntimeError, "forbidden birth marker symbols"):
+            checker.validate_inventory("default-no-marker", maps,
+                                       checker.SAFE_PROGRAMS,
+                                       symbols | {"p11_instance_scope_gap"})
+
+    def test_release_detailed_marker_presence_accepts(self):
+        self.quiet(checker.validate_inventory, "default", checker.SAFE_MAPS,
+                   checker.SAFE_PROGRAMS, self.detailed_symbols())
+
+    def test_gate_variant_accepts_gate_maps_with_markers(self):
+        # The loader-gate object carries the five gate maps with the
+        # default programs and symbols; like default it requires the
+        # birth marker symbols, and the default maps alone are not a
+        # gate object.
+        self.quiet(checker.validate_inventory, "default-gate",
+                   checker.GATE_MAPS, checker.SAFE_PROGRAMS,
+                   self.detailed_symbols())
+        maps = {name: value for name, value in checker.GATE_MAPS.items()
+                if name != "TASK_COOKIE_B"}
+        reason = self.refused(checker.validate_inventory, "default-gate",
+                              maps, checker.SAFE_PROGRAMS,
+                              self.detailed_symbols())
+        self.assertIn("map removed: TASK_COOKIE_B", reason)
+        reason = self.refused(checker.validate_inventory, "default-gate",
+                              checker.SAFE_MAPS, checker.SAFE_PROGRAMS,
+                              self.detailed_symbols())
+        self.assertIn("map removed: TASK_COOKIE_B", reason)
+        full = set(checker.REQUIRED_GLOBAL_MARKER_HELPERS) | {"JOURNAL_MARKER_CTL"}
+        with self.assertRaisesRegex(RuntimeError,
+                                    "lacks required birth marker symbols"):
+            checker.validate_inventory(
+                "default-gate", checker.GATE_MAPS, checker.SAFE_PROGRAMS,
+                self.detailed_symbols(missing=full))
+
+    def test_release_detailed_stale_marker_inventory_refused(self):
+        maps = {name: value for name, value in checker.SAFE_MAPS.items()
+                if name != "JOURNAL_MARKER_CTL"}
+        reason = self.refused(checker.validate_inventory, "default", maps,
+                              checker.SAFE_PROGRAMS, self.detailed_symbols())
+        self.assertIn("map removed: JOURNAL_MARKER_CTL", reason)
+        reason = self.refused(checker.validate_inventory, "default-no-marker",
+                              checker.SAFE_MAPS, checker.SAFE_PROGRAMS,
+                              self.detailed_symbols())
+        self.assertIn("map added: JOURNAL_MARKER_CTL", reason)
+
+    def test_release_half_linked_marker_globals_refused(self):
+        full = set(checker.REQUIRED_GLOBAL_MARKER_HELPERS) | {"JOURNAL_MARKER_CTL"}
+        for missing in ({"JOURNAL_MARKER_CTL"},
+                        {"p11_instance_exec_birth"},
+                        {"p11_instance_scope_gap"},
+                        full):
+            with self.subTest(missing=sorted(missing)):
+                with self.assertRaisesRegex(RuntimeError, "lacks required birth marker symbols") as raised:
+                    checker.validate_inventory("default", checker.SAFE_MAPS,
+                                               checker.SAFE_PROGRAMS,
+                                               self.detailed_symbols(missing=missing))
+                for name in sorted(missing):
+                    self.assertIn(name, str(raised.exception))
+
+    def test_release_diagnostic_and_wide_variants_forbid_marker(self):
+        marked = self.detailed_symbols() | {"JOURNAL_MARKER_CTL"}
+        for variant, maps, programs in (
+            ("diagnostic", checker.UNSAFE_MAPS, checker.UNSAFE_PROGRAMS),
+            ("wide-default", checker.WIDE_MAPS, checker.SAFE_PROGRAMS),
+            ("wide-diagnostic", checker.WIDE_UNSAFE_MAPS, checker.UNSAFE_PROGRAMS),
+        ):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(RuntimeError, "forbidden birth marker symbols"):
+                    checker.validate_inventory(variant, maps, programs, marked)
+
+    def test_inventory_with_marker_map_refused(self):
+        maps = dict(checker.INVENTORY_MAPS)
+        maps["JOURNAL_MARKER_CTL"] = checker.map_def(2, 4, 16, 1)
+        reason = self.refused(
+            checker.validate_inventory,
+            "inventory",
+            maps,
+            checker.INVENTORY_PROGRAMS,
+            set(),
+        )
+        self.assertIn("map added: JOURNAL_MARKER_CTL", reason)
+
+    def test_inventory_with_marker_symbols_refused(self):
+        symbols = (
+            set(checker.REQUIRED_GLOBAL_OWNER_HELPERS)
+            | set(checker.REQUIRED_GLOBAL_SCALAR_HELPERS)
+            | set(checker.REQUIRED_GLOBAL_EXEC_HELPERS)
+            | {"JOURNAL_MARKER_CTL", "p11_instance_exec_birth", "p11_instance_scope_gap"}
+        )
+        with self.assertRaisesRegex(RuntimeError, "forbidden detailed symbols"):
+            checker.validate_inventory(
+                "inventory",
+                checker.INVENTORY_MAPS,
+                checker.INVENTORY_PROGRAMS,
+                symbols,
+            )
+
+    def test_release_stale_marker_wrong_abi_refused(self):
+        maps = dict(checker.SAFE_MAPS)
+        maps["JOURNAL_MARKER_CTL"] = checker.map_def(2, 4, 8, 1)
+        reason = self.refused(
+            checker.validate_inventory,
+            "default",
+            maps,
+            checker.SAFE_PROGRAMS,
+            self.detailed_symbols(),
+        )
+        self.assertIn("JOURNAL_MARKER_CTL.value_size: object=8 frozen=16", reason)
+
+    def test_core_instance_helper_missing_still_refused(self):
+        for missing in ("p11_instance_entry", "p11_instance_return", "p11_instance_exec"):
+            with self.subTest(missing=missing), \
+                    self.assertRaisesRegex(RuntimeError, "missing required \\.text helpers.*" + missing):
+                checker.validate_inventory("default", checker.SAFE_MAPS,
+                                           checker.SAFE_PROGRAMS,
+                                           self.detailed_symbols(missing={missing}))
+
+    def test_journal_variant_accepts_frozen_inventory(self):
+        self.quiet(checker.validate_inventory, "journal", checker.JOURNAL_MAPS,
+                   checker.JOURNAL_PROGRAMS, self.journal_symbols())
+
+    def test_journal_variant_requires_birth_gap_and_map(self):
+        full = set(checker.REQUIRED_GLOBAL_MARKER_HELPERS) | {"JOURNAL_MARKER_CTL"}
+        for missing in ({"JOURNAL_MARKER_CTL"},
+                        {"p11_instance_exec_birth"},
+                        {"p11_instance_scope_gap"},
+                        full):
+            with self.subTest(missing=sorted(missing)):
+                with self.assertRaisesRegex(RuntimeError, "lacks required marker symbols") as raised:
+                    checker.validate_inventory("journal", checker.JOURNAL_MAPS,
+                                               checker.JOURNAL_PROGRAMS,
+                                               self.journal_symbols(missing=missing))
+                for name in sorted(missing):
+                    self.assertIn(name, str(raised.exception))
+
+    def test_journal_variant_refuses_inventory_map_and_drift(self):
+        maps = dict(checker.JOURNAL_MAPS)
+        maps["USAGE"] = checker.INVENTORY_MAPS["USAGE"]
+        reason = self.refused(checker.validate_inventory, "journal", maps,
+                              checker.JOURNAL_PROGRAMS, self.journal_symbols())
+        self.assertIn("map added: USAGE", reason)
+        maps = dict(checker.JOURNAL_MAPS)
+        maps["JOURNAL_CTL"] = checker.map_def(2, 4, 25, 1)
+        reason = self.refused(checker.validate_inventory, "journal", maps,
+                              checker.JOURNAL_PROGRAMS, self.journal_symbols())
+        self.assertIn("JOURNAL_CTL.value_size: object=25 frozen=24", reason)
+
+    def marker_fixture(self, name):
+        source = Path(self.temp.name) / f"{name}.c"
+        obj = Path(self.temp.name) / f"{name}.o"
+        source.write_text(
+            "#define SEC(n) __attribute__((section(n), used))\n"
+            "#define LOOKUP(map, key) ((void *(*)(void *, void *))1)((map), (key))\n"
+            "#define STORAGE(map, task, value, flags) \\\n"
+            "    ((void *(*)(void *, void *, void *, unsigned long long))156)( \\\n"
+            "        (map), (task), (value), (flags))\n"
+            "#define CURRENT() ((void *(*)(void))158)()\n"
+            "#define BODY() \\\n"
+            "    unsigned key = 0; void *map = 0; \\\n"
+            "    void *found = LOOKUP(map, &key); \\\n"
+            "    void *task = CURRENT(); \\\n"
+            "    void *row = STORAGE(map, task, 0, 0); \\\n"
+            "    return (found != 0) + (task != 0) + (row != 0);\n"
+            "__attribute__((noinline, used)) unsigned p11_instance_exec_birth(void) { BODY() }\n"
+            "__attribute__((noinline, used)) unsigned p11_instance_scope_gap(void) { BODY() }\n"
+            'char LICENSE[] SEC("license") = "GPL";\n'
+        )
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        return obj
+
+    def test_marker_helper_boundary(self):
+        """Healthy twin: two globals using only {1, 156, 158} validate."""
+        obj = self.marker_fixture("marker-boundary")
+        checker.validate_marker_helpers(checker.Elf(obj.read_bytes()))
+
+    def test_marker_helper_boundary_refuses_user_read(self):
+        """Named mutant: a user-memory read (112) in one body is refused."""
+        obj = self.marker_fixture("marker-mutant")
+        body = bytearray(obj.read_bytes())
+        elf = checker.Elf(bytes(body))
+        victim = next(
+            symbol for symbol in elf.symbols if symbol[0] == "p11_instance_scope_gap"
+        )
+        text_at = elf.sections[".text"][0][4] + victim[4]
+        patched = 0
+        for pos in range(0, victim[5], 8):
+            op, reg, _, imm = struct.unpack_from("<BBhi", body, text_at + pos)
+            if op == 0x85 and reg >> 4 == 0 and imm == 156:
+                struct.pack_into("<i", body, text_at + pos + 4, 112)
+                patched += 1
+                break
+        self.assertEqual(patched, 1, "the fixture must carry a storage call to mutate")
+        with self.assertRaisesRegex(RuntimeError, "only map lookup"):
+            checker.validate_marker_helpers(checker.Elf(bytes(body)))
+
+    def test_marker_single_global_refused(self):
+        """One global without its sibling is refused."""
+        source = Path(self.temp.name) / "marker-single.c"
+        obj = Path(self.temp.name) / "marker-single.o"
+        source.write_text(
+            "#define SEC(n) __attribute__((section(n), used))\n"
+            "__attribute__((noinline, used)) unsigned p11_instance_exec_birth(void) {\n"
+            "    unsigned key = 0; void *map = 0;\n"
+            "    void *found = ((void *(*)(void *, void *))1)(map, &key);\n"
+            "    void *task = ((void *(*)(void))158)();\n"
+            "    void *row = ((void *(*)(void *, void *, void *, "
+            "unsigned long long))156)(map, task, 0, 0);\n"
+            "    return (found != 0) + (task != 0) + (row != 0);\n}\n"
+            'char LICENSE[] SEC("license") = "GPL";\n'
+        )
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "complete unique set"):
+            checker.validate_marker_helpers(checker.Elf(obj.read_bytes()))
+
+
+class JournalMarkerCallSiteTests(unittest.TestCase):
+    """H8-D birth marker call sites: every defined Detailed root that can
+    birth or gap must call its marker global. Core roots (entry, return,
+    exec, exit) must exist; unsafe-only roots (ia32 entry, template
+    continuation) must call when defined."""
+
+    ROOTS = (
+        ("p11_entry", "uprobe", "p11_instance_scope_gap"),
+        ("p11_entry_ia32", "uprobe", "p11_instance_scope_gap"),
+        ("p11_return", "uretprobe", "p11_instance_scope_gap"),
+        ("p11_entry_template", "uprobe", "p11_instance_scope_gap"),
+        ("p11_entry_template_types", "uprobe", "p11_instance_scope_gap"),
+        ("p11_entry_template_pair", "uprobe", "p11_instance_scope_gap"),
+        ("p11_entry_template_second", "uprobe", "p11_instance_scope_gap"),
+        ("sched_process_exec", "raw_tp/sched_process_exec", "p11_instance_exec_birth"),
+        ("sched_process_exit", "raw_tp/sched_process_exit", "p11_instance_scope_gap"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="p11scope-marker-calls-")
+        cls.addClassCleanup(cls.temp.cleanup)
+
+    def calls_fixture(self, name, wired, roots=None, markers=True):
+        """Compile roots that call (or drop) their marker global.
+
+        wired: root names that call; roots: names to emit (default all
+        nine); markers: emit the two marker globals. Each body is
+        textually distinct so the optimizer cannot merge two roots.
+        """
+        roots = [root for root in self.ROOTS if roots is None or root[0] in roots]
+        lines = [
+            '#define SEC(n) __attribute__((section(n), used))\n',
+            '#define LOOKUP(map, key) ((void *(*)(void *, void *))1)((map), (key))\n',
+            '#define STORAGE(map, task, value, flags) \\\n',
+            '    ((void *(*)(void *, void *, void *, unsigned long long))156)( \\\n',
+            '        (map), (task), (value), (flags))\n',
+            '#define CURRENT() ((void *(*)(void))158)()\n',
+            '#define BODY() \\\n',
+            '    unsigned key = 0; void *map = 0; \\\n',
+            '    void *found = LOOKUP(map, &key); \\\n',
+            '    void *task = CURRENT(); \\\n',
+            '    void *row = STORAGE(map, task, 0, 0); \\\n',
+            '    return (found != 0) + (task != 0) + (row != 0);\n',
+        ]
+        if markers:
+            lines += [
+                '__attribute__((noinline, used)) unsigned p11_instance_exec_birth(void)'
+                ' { BODY() }\n',
+                '__attribute__((noinline, used)) unsigned p11_instance_scope_gap(void)'
+                ' { BODY() }\n',
+            ]
+        else:
+            lines += [
+                'unsigned p11_instance_exec_birth(void);\n',
+                'unsigned p11_instance_scope_gap(void);\n',
+            ]
+        shapes = {
+            "p11_entry": "return (int)MARKER();",
+            "p11_entry_ia32": "{ unsigned r = MARKER(); return (int)(r & 255); }",
+            "p11_return": "{ unsigned r = MARKER(); return (int)(r | 256); }",
+            "p11_entry_template": "{ unsigned r = MARKER(); return (int)(r + 2048); }",
+            "p11_entry_template_types": "{ unsigned r = MARKER(); return (int)(r + 4096); }",
+            "p11_entry_template_pair": "{ unsigned r = MARKER(); return (int)(r + 6144); }",
+            "p11_entry_template_second": "{ unsigned r = MARKER(); return (int)(r ^ 512); }",
+            "sched_process_exec": "return (int)MARKER();",
+            "sched_process_exit": "{ unsigned r = MARKER(); return (int)(r & 1023); }",
+        }
+        for index, (root, section, marker) in enumerate(roots):
+            if root in wired:
+                body = shapes[root].replace("MARKER()", f"{marker}()")
+            else:
+                body = f"{{ (void)ctx; return {100 + index}; }}"
+            lines.append(f'SEC("{section}") int {root}(void *ctx) {{ (void)ctx; {body} }}\n')
+        lines.append('char LICENSE[] SEC("license") = "GPL";\n')
+        source = Path(self.temp.name) / f"{name}.c"
+        obj = Path(self.temp.name) / f"{name}.o"
+        source.write_text("".join(lines))
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        return obj
+
+    def check_calls(self, name, wired, roots=None, markers=True):
+        obj = self.calls_fixture(name, wired, roots, markers)
+        return checker.validate_marker_call_sites(checker.Elf(obj.read_bytes()))
+
+    def test_marker_calls_healthy_diagnostic(self):
+        """Healthy twin: all nine roots wired validates."""
+        self.check_calls(
+            "marker-calls-healthy",
+            {root for root, _, _ in self.ROOTS},
+        )
+
+    def test_marker_calls_healthy_default(self):
+        """Healthy twin: the four core roots wired validates when the
+        unsafe-only roots are absent."""
+        self.check_calls(
+            "marker-calls-default",
+            {"p11_entry", "p11_return", "sched_process_exec", "sched_process_exit"},
+            roots={"p11_entry", "p11_return", "sched_process_exec", "sched_process_exit"},
+        )
+
+    def test_marker_calls_without_markers_skipped(self):
+        """Healthy twin: an object without the globals skips the check."""
+        self.check_calls("marker-calls-skip", set(), markers=False)
+
+    def test_marker_call_dropped_from_entry_refused(self):
+        """Named mutant: entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-entry",
+                {"p11_entry_ia32", "p11_return", "p11_entry_template",
+                 "p11_entry_template_types", "p11_entry_template_pair",
+                 "p11_entry_template_second", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_ia32_entry_refused(self):
+        """Named mutant: the ia32 entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_ia32 must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-ia32",
+                {"p11_entry", "p11_return", "p11_entry_template",
+                 "p11_entry_template_types", "p11_entry_template_pair",
+                 "p11_entry_template_second", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_return_refused(self):
+        """Named mutant: return without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_return must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-return",
+                {"p11_entry", "p11_entry_ia32", "p11_entry_template",
+                 "p11_entry_template_types", "p11_entry_template_pair",
+                 "p11_entry_template_second", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_template_continuation_refused(self):
+        """Named mutant: the template continuation without its gap call
+        is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_template_second must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-second",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template", "p11_entry_template_types",
+                 "p11_entry_template_pair", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_exec_refused(self):
+        """Named mutant: exec without its birth call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed sched_process_exec must call p11_instance_exec_birth"
+        ):
+            self.check_calls(
+                "marker-calls-drop-exec",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template", "p11_entry_template_types",
+                 "p11_entry_template_pair", "p11_entry_template_second",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_exit_refused(self):
+        """Named mutant: exit without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed sched_process_exit must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-exit",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template", "p11_entry_template_types",
+                 "p11_entry_template_pair", "p11_entry_template_second",
+                 "sched_process_exec"},
+            )
+
+    def test_marker_call_dropped_from_template_refused(self):
+        """Named mutant: the template entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_template must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-template",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template_types", "p11_entry_template_pair",
+                 "p11_entry_template_second", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_template_types_refused(self):
+        """Named mutant: the template types entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_template_types must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-template-types",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template", "p11_entry_template_pair",
+                 "p11_entry_template_second", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_template_pair_refused(self):
+        """Named mutant: the template pair entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_template_pair must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-template-pair",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template", "p11_entry_template_types",
+                 "p11_entry_template_second", "sched_process_exec",
+                 "sched_process_exit"},
+            )
+
+
+class Ia32SpanProofTests(unittest.TestCase):
+    def test_saved_sentinel_requires_proven_full_width_register_flow(self):
+        def reader(saved, suffix, high=1):
+            return [(0x18, saved, 0, 0), (0, 0, 0, high), (0x2d, 0x13, 2, 0),
+                    (0x85, 0, 0, 112), (0x95, 0, 0, 0), *suffix]
+
+        copy = (0xbf, 0x60, 0, 0)
+        exit = (0x95, 0, 0, 0)
+        checker.validate_ia32_raw_span(reader(6, [copy, exit]), 3)
+        # A helper preserves r6, but must destroy an otherwise identical r5 fact.
+        checker.validate_ia32_raw_span(reader(6, [(0x85, 0, 0, 5), copy, exit]), 3)
+        mutants = {
+            "wrong_value": reader(6, [copy, exit], high=2),
+            "narrowed_copy": reader(6, [(0xbc, 0x60, 0, 0), exit]),
+            "unknown_write": reader(6, [(0x61, 0xa6, -4, 0), copy, exit]),
+            "atomic_fetch_write": reader(6, [(0xdb, 0x6a, -8, 1), copy, exit]),
+            "pseudo_address": reader(0x16, [copy, exit]),
+            "caller_saved_clobber": reader(5, [(0x85, 0, 0, 5), (0xbf, 0x50, 0, 0), exit]),
+            "unsafe_merge": reader(6, [(0x15, 7, 1, 0), (0xb7, 6, 0, 0), copy, exit]),
+        }
+        mutants.update({f"sign_extended_copy_{width}": reader(6, [(0xbf, 0x60, width, 0), exit])
+                        for width in (8, 16, 32)})
+        for name, instructions in mutants.items():
+            with self.subTest(mutation=name), self.assertRaisesRegex(RuntimeError, "span.*sentinel"):
+                checker.validate_ia32_raw_span(instructions, 3)
+
+
+class ObjectCaptureGlobalsTests(unittest.TestCase):
+    """Prebuilt-only checks: selecting this class never compiles a fixture."""
+
+    def setUp(self):
+        self.object = Path(os.environ["P11SCOPE_OBJECT_CAPTURE_OBJECT"])
+        self.assertTrue(self.object.is_file(), "a real compiled object is required")
+        self.temp = tempfile.TemporaryDirectory(prefix="p11scope-object-globals-")
+        self.addCleanup(self.temp.cleanup)
+
+    def mutated(self, changes):
+        body = bytearray(self.object.read_bytes())
+        for offset, fmt, value in changes:
+            struct.pack_into(fmt, body, offset, value)
+        return checker.Elf(bytes(body))
+
+    def sixth_argument(self, elf, btf, function, proto):
+        """Append a valid six-argument BTF prototype without corrupting types."""
+        body = bytearray(self.object.read_bytes())
+        raw = bytearray(elf.sections[".BTF"][1])
+        hlen, _, tlen, soff, _ = struct.unpack_from("<IIIII", raw, 4)
+        record = struct.pack("<III", 0, (13 << 24) | 6, proto[2])
+        record += struct.pack("<12I", *proto[5], 0, proto[5][1])
+        struct.pack_into("<I", raw, function[6] + 8, len(btf.types))
+        raw = raw[:hlen + tlen] + record + raw[hlen + tlen:]
+        struct.pack_into("<II", raw, 12, tlen + len(record), soff + len(record))
+        body += b"\0" * (-len(body) % 8)
+        at = len(body)
+        body += raw
+        section_headers = struct.unpack_from("<Q", body, 40)[0]
+        section = section_headers + 64 * elf.indices[".BTF"]
+        struct.pack_into("<QQ", body, section + 24, at, len(raw))
+        return checker.Elf(bytes(body))
+
+    def test_object_capture_globals_linkage_signature_and_calls(self):
+        elf = checker.Elf(self.object.read_bytes())
+        expected = {"p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell"}
+        self.assertTrue(expected <= {symbol[0] for symbol in elf.symbols},
+                        "the actual compiled object must retain all four scalar globals")
+        checker.validate_object_capture_globals(elf)
+        full = os.environ.get("P11SCOPE_OBJECT_CAPTURE_FULL", "1")
+        self.assertIn(full, ("0", "1"))
+        checker.validate_object_capture_reachability(elf, full=full == "1")
+        with self.assertRaisesRegex(RuntimeError, "Inventory"):
+            checker.validate_object_capture_globals(elf, inventory=True)
+
+        btf = checker.Btf(elf.sections[".BTF"][1])
+        btf_base = elf.sections[".BTF"][0][4]
+        pointer = next(i for i, node in enumerate(btf.types) if node and node[0] == 2)
+        u32_type = next(i for i, node in enumerate(btf.types)
+                       if node and node[0] == 1 and node[2] == 4 and node[5] == (32,))
+        for name in sorted(expected):
+            symbol_index, symbol = next((i, symbol) for i, symbol in enumerate(elf.symbols)
+                                        if symbol[0] == name)
+            symbol_at = elf.sections[".symtab"][0][4] + 24 * symbol_index
+            function = next(node for node in btf.types if node and node[:2] == (12, name))
+            function_at = btf_base + function[6]
+            proto = btf.types[function[2]]
+            proto_at = btf_base + proto[6]
+            cases = {
+                "missing_name": ([(symbol_at, "I", 0)], "complete.*globals"),
+                "local": ([(symbol_at + 4, "B", 0x02)], "GLOBAL DEFAULT"),
+                "hidden": ([(symbol_at + 5, "B", 2)], "GLOBAL DEFAULT"),
+                "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])],
+                                  "GLOBAL DEFAULT"),
+                "empty_body": ([(symbol_at + 16, "Q", 0)], "body"),
+                "static_btf": ([(function_at + 4, "I", 12 << 24)], "GLOBAL BTF"),
+                "pointer_return": ([(proto_at + 8, "I", pointer)], "return.*u64"),
+                "narrow_return": ([(proto_at + 8, "I", u32_type)], "return.*u64"),
+            }
+            for argument in range(5):
+                cases[f"pointer_argument_{argument}"] = (
+                    [(proto_at + 16 + argument * 8, "I", pointer)], "argument.*u64")
+                cases[f"narrow_argument_{argument}"] = (
+                    [(proto_at + 16 + argument * 8, "I", u32_type)], "argument.*u64")
+            for mutation, (changes, reason) in cases.items():
+                with self.subTest(helper=name, mutation=mutation), self.assertRaisesRegex(RuntimeError, reason):
+                    checker.validate_object_capture_globals(self.mutated(changes))
+            with self.subTest(helper=name, mutation="sixth_argument"):
+                mutant = self.sixth_argument(elf, btf, function, proto)
+                parsed = checker.Btf(mutant.sections[".BTF"][1])
+                changed = next(node for node in parsed.types if node and node[:2] == (12, name))
+                self.assertEqual(parsed.types[changed[2]][3], 6)
+                with self.assertRaisesRegex(RuntimeError, "exactly five"):
+                    checker.validate_object_capture_globals(mutant)
+
+        bodies, edges, calls = checker.bpf_call_graph(elf)
+        roots = {symbol[0]: key for key, symbol in bodies.items()
+                 if symbol[0] == "p11_return" or symbol[0].startswith("p11_entry")}
+        if full == "1":
+            for name in sorted(expected):
+                target = next(key for key, symbol in bodies.items() if symbol[0] == name)
+                reaches = {target}
+                while True:
+                    expanded = reaches | {caller for caller, destinations in edges.items()
+                                          if destinations & reaches}
+                    if expanded == reaches:
+                        break
+                    reaches = expanded
+                for root_name, root in roots.items():
+                    if root_name == "p11_entry_template_second":
+                        continue
+                    required = ({"p11_stable_cell", "p11_alias_capacity"}
+                                if root_name == "p11_return"
+                                else {"p11_stable_cell", "p11_alias_scan", "p11_request_cell"})
+                    if name not in required:
+                        continue
+                    changes = [change for caller, destination, at in calls
+                               if caller == root and destination in reaches
+                               for change in [(at, "B", 0xb7), (at + 1, "B", 0)]]
+                    self.assertTrue(changes, f"actual {root_name} must reach {name}")
+                    with self.subTest(root=root_name, helper=name, mutation="unreachable_global"), \
+                            self.assertRaisesRegex(RuntimeError, "reachable"):
+                        checker.validate_object_capture_reachability(self.mutated(changes), full=True)
+        else:
+            with self.assertRaisesRegex(RuntimeError, "reachable"):
+                checker.validate_object_capture_reachability(elf, full=True)
+
+        if full == "1":
+            # Return keeps its ordinary/object capture paths intact, but may
+            # never gain the entry-only request reader through another call.
+            target = next(key for key, symbol in bodies.items() if symbol[0] == "p11_request_cell")
+            caller, destination, call_at = next(call for call in calls
+                if call[0] == roots["p11_return"] and bodies[call[1]][0] == "p11_owner_start_get")
+            immediate = struct.unpack_from("<i", self.object.read_bytes(), call_at + 4)[0]
+            mutant = self.mutated([(call_at + 4, "i", immediate + (target[1] - destination[1]) // 8)])
+            _, mutated_edges, _ = checker.bpf_call_graph(mutant)
+            self.assertIn(target, mutated_edges[caller], "return mutant must reach request cell")
+            with self.subTest(root="p11_return", mutation="entry_reader_on_return"), \
+                    self.assertRaisesRegex(RuntimeError, "reachable"):
+                checker.validate_object_capture_reachability(mutant, full=True)
+
+        continuation = roots.get("p11_entry_template_second")
+        if continuation is not None:
+            symbol_index, symbol = next((i, symbol) for i, symbol in enumerate(elf.symbols)
+                                        if symbol[0] == "p11_entry_template_second")
+            symbol_at = elf.sections[".symtab"][0][4] + 24 * symbol_index
+            for mutation, change in {
+                "local_continuation": (symbol_at + 4, "B", 0x02),
+                "hidden_continuation": (symbol_at + 5, "B", 2),
+            }.items():
+                with self.subTest(mutation=mutation), self.assertRaisesRegex(RuntimeError, "GLOBAL DEFAULT.*root"):
+                    checker.validate_object_capture_reachability(self.mutated([change]), full=full == "1")
+            if full == "1":
+                name_offset = struct.unpack_from("<I", self.object.read_bytes(), symbol_at)[0]
+                strings_index = elf.sections[".symtab"][0][6]
+                strings = next(row for label, (row, _) in elf.sections.items()
+                               if elf.indices[label] == strings_index)
+                # A capture-free root with a merely similar name is not the
+                # second-template continuation and must not gain its role.
+                renamed = self.mutated([(strings[4] + name_offset + len(symbol[0]) - 1, "B", ord("x"))])
+                with self.subTest(mutation="similar_continuation_name"), self.assertRaisesRegex(RuntimeError, "reachable"):
+                    checker.validate_object_capture_reachability(renamed, full=True)
+            # The second-template tail continuation consumes an existing START;
+            # its parent has already run the object-attribute capture path.
+            # Redirect a real pseudo-call, retaining its relocation, to prove
+            # the exact continuation must still reject capture-global reach.
+            target = next(key for key, symbol in bodies.items() if symbol[0] == "p11_stable_cell")
+            _, destination, call_at = next(call for call in calls
+                                           if call[0] == continuation and call[1][0] == target[0])
+            immediate = struct.unpack_from("<i", self.object.read_bytes(), call_at + 4)[0]
+            mutant = self.mutated([(call_at + 4, "i", immediate + (target[1] - destination[1]) // 8)])
+            _, mutated_edges, _ = checker.bpf_call_graph(mutant)
+            self.assertIn(target, mutated_edges[continuation], "mutation must reach the actual scalar global")
+            with self.subTest(root="p11_entry_template_second", mutation="unexpected_capture_global"), \
+                    self.assertRaisesRegex(RuntimeError, "reachable"):
+                checker.validate_object_capture_reachability(mutant, full=full == "1")
+
+        text_row, text = elf.sections[".text"]
+        for name in sorted(expected - {"p11_alias_capacity"}):
+            symbol = next(symbol for symbol in elf.symbols if symbol[0] == name)
+            read_at = next(at for at in range(symbol[4], symbol[4] + symbol[5], 8)
+                           if struct.unpack_from("<BBhi", text, at) == (0x85, 0, 0, 112))
+            with self.subTest(helper=name, mutation="global_reserves_ring"), \
+                    self.assertRaisesRegex(RuntimeError, "non-read helper"):
+                checker.validate_object_capture_reachability(
+                    self.mutated([(text_row[4] + read_at + 4, "i", 131)]), full=full == "1")
+
+        map_at = None
+        for row, relocations in elf.sections.values():
+            if row[1] != 9 or row[7] != elf.indices[".text"]:
+                continue
+            map_at = next((at for at in range(0, len(relocations), 16)
+                           if struct.unpack_from("<Q", relocations, at + 8)[0] & 0xffffffff == 1), None)
+            if map_at is not None:
+                break
+        self.assertIsNotNone(map_at, "real object must provide a map relocation mutation")
+        for name in sorted(expected):
+            symbol = next(symbol for symbol in elf.symbols if symbol[0] == name)
+            with self.subTest(helper=name, mutation="global_references_map"), \
+                    self.assertRaisesRegex(RuntimeError, "map/state"):
+                checker.validate_object_capture_reachability(
+                    self.mutated([(row[4] + map_at, "Q", symbol[4])]), full=full == "1")
+
+    def test_object_capture_journal_roots_require_journal_programs(self):
+        elf = checker.Elf(self.object.read_bytes())
+        with self.assertRaisesRegex(RuntimeError, "journal entry/return roots"):
+            checker.validate_object_capture_reachability(elf, full=True, journal=True)
+
+    def test_object_capture_journal_elf_matches_detailed_capture(self):
+        journal = Path(os.environ["P11SCOPE_OBJECT_CAPTURE_JOURNAL_OBJECT"])
+        self.assertTrue(journal.is_file(), "a real compiled journal object is required")
+        elf = checker.Elf(journal.read_bytes())
+        expected = {"p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell"}
+        self.assertTrue(expected <= {symbol[0] for symbol in elf.symbols},
+                        "the actual journal object must retain all four scalar globals")
+        full = os.environ.get("P11SCOPE_OBJECT_CAPTURE_FULL", "1")
+        self.assertIn(full, ("0", "1"))
+        checker.validate_object_capture_reachability(elf, full=full == "1", journal=True)
+        with self.assertRaisesRegex(RuntimeError, "reachable"):
+            checker.validate_object_capture_reachability(elf, full=full != "1", journal=True)
 
 
 def run_suite(suite, stream=None):

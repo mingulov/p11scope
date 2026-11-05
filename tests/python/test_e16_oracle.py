@@ -38,7 +38,13 @@ OFFSET = 0x1130
 KERNEL_CONTROL = {"capture_halted": False, "owner_poison": [], "owner_admission_failures": 0,
                   "identity_unavailable": 0, "identity_budget_exhausted": False,
                   "root_affiliation_failures": []}
-FAKE_RUSTC = b"rustc version 1.98.1 (0123456789 2026-09-01)"
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text().strip()
+[RELEASE_TOOLCHAIN] = [
+    item for item in json.loads((ROOT / "third-party/licenses/sources.json").read_text())["toolchains"]
+    if item["name"] == RELEASE_RUST
+]
+FAKE_RUSTC = RELEASE_TOOLCHAIN["rustc_verbose_version"].splitlines()[0].replace(
+    "rustc ", "rustc version ", 1).encode("ascii")
 FAKE_BPF = b"\x7fELF-fake-bpf-object-" + bytes(range(256)) * 4
 
 
@@ -227,6 +233,13 @@ class H3ObserverProvenance(unittest.TestCase):
             result = E16.validate_provenance(manifest, binary.read_bytes(), check_sources=False)
             self.assertEqual(result["revision"], "0123456789abcdef0123456789abcdef01234567")
 
+    def test_historical_or_missing_compiler_banner_is_refused(self):
+        for banner in (b"rustc version 1.98.1 (48a229cea 2026-09-01)", b""):
+            with self.subTest(banner=banner), tempfile.TemporaryDirectory() as raw:
+                binary, manifest = self.manifest(Path(raw), rustc=banner)
+                with self.assertRaisesRegex(Unknown, "release compiler"):
+                    E16.validate_provenance(manifest, binary.read_bytes(), check_sources=False)
+
     def test_unrelated_or_changed_binary_is_refused(self):
         with tempfile.TemporaryDirectory() as raw:
             binary, manifest = self.manifest(Path(raw))
@@ -290,6 +303,87 @@ class H3ObserverProvenance(unittest.TestCase):
                 mutate(broken)
                 with self.subTest(message=message), self.assertRaisesRegex(Unknown, message):
                     E16.validate_provenance(broken, binary.read_bytes(), check_sources=False)
+
+
+class ObserverPathSelection(unittest.TestCase):
+    """Packaged runs select the observer by absolute path only.
+
+    The provenance receipt records the exact resolved path and digest;
+    relative names are refused rather than resolved against the working
+    directory or PATH.
+    """
+
+    def fake_pair(self, base):
+        first = base / "pkg-a"
+        first.mkdir()
+        binary, obj = fake_observer_binary(first)
+        second = base / "pkg-b"
+        second.mkdir()
+        other = second / "observer"
+        other.write_bytes(b"\x7fELF" + b"\x01" * 64 + FAKE_RUSTC + b"\x00" + FAKE_BPF
+                          + b"\x00" * 63 + b"Z")
+        return (binary, obj), other
+
+    def test_absolute_packaged_path_is_bound_with_path_and_digest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            (binary, obj), other = self.fake_pair(base)
+            manifest = E16.make_provenance(binary, [obj], git=clean_git)
+            self.assertEqual(manifest["observer"]["path"], str(binary.resolve()))
+            self.assertEqual(manifest["observer"]["sha256"],
+                             hashlib.sha256(binary.read_bytes()).hexdigest())
+            # Negative control: the other packaged bytes bind their own
+            # path and digest, so the receipt tracks the selected file.
+            swapped = E16.make_provenance(other, [obj], git=clean_git)
+            self.assertEqual(swapped["observer"]["path"], str(other.resolve()))
+            self.assertEqual(swapped["observer"]["sha256"],
+                             hashlib.sha256(other.read_bytes()).hexdigest())
+            self.assertNotEqual(swapped["observer"]["sha256"],
+                                manifest["observer"]["sha256"])
+            E16.validate_provenance(manifest, binary.read_bytes(), check_sources=False)
+
+    def test_relative_observer_is_refused_without_cwd_or_path_fallback(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            binary, obj = fake_observer_binary(base)
+            trap = base / "trap-cwd"
+            (trap / "sub").mkdir(parents=True)
+            for name in (trap / "observer", trap / "sub" / "observer"):
+                name.write_bytes(binary.read_bytes())
+            decoy_dir = base / "decoy-bin"
+            decoy_dir.mkdir()
+            decoy = decoy_dir / "observer"
+            decoy_log = base / "decoy.log"
+            decoy.write_text(f"#!/bin/sh\necho HIT >> '{decoy_log}'\n")
+            decoy.chmod(0o755)
+            previous_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(decoy_dir) + os.pathsep + previous_path
+            previous_cwd = os.getcwd()
+            os.chdir(trap)
+            try:
+                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(decoy_dir))
+                with self.assertRaisesRegex(Unknown, "not absolute"):
+                    E16.resolve_observer("observer")
+                with self.assertRaisesRegex(Unknown, "not absolute"):
+                    E16.resolve_observer("sub/observer")
+                with self.assertRaisesRegex(Unknown, "not absolute"):
+                    E16.make_provenance("observer", [obj], git=clean_git)
+            finally:
+                os.chdir(previous_cwd)
+                os.environ["PATH"] = previous_path
+            self.assertFalse(decoy_log.exists())
+
+    def test_missing_or_non_file_observer_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            binary, obj = fake_observer_binary(base)
+            missing = base / "no-such-observer"
+            with self.assertRaisesRegex(Unknown, "not available"):
+                E16.resolve_observer(missing)
+            with self.assertRaisesRegex(Unknown, "not available"):
+                E16.make_provenance(missing, [obj], git=clean_git)
+            with self.assertRaisesRegex(Unknown, "regular file"):
+                E16.resolve_observer(base)
 
 
 class H4BoundedReads(unittest.TestCase):
@@ -559,7 +653,9 @@ for member in spec:
         subject = member["hint"] + (".FOREIGN.so" if mode == "foreign-diagnostic" else "")
         err.write("p11scope: discovery: other: discovery skipped " + subject + " — matched a "
                   "--module hint; no function table was found in its file-backed data; a table "
-                  "built at run time is outside the memory scan's reach\n")
+                  "built at run time in .bss or on the heap is outside the memory scan's reach; "
+                  "to observe it, run p11scope-discover --module " + subject + " -o <manifest.json> "
+                  "and pass --manifest <manifest.json>\n")
 err.write("p11scope: capturing: 2 probe(s) attached; stop with Ctrl-C\n")
 err.flush()
 if mode == "exit-after-ready":
@@ -569,6 +665,8 @@ if mode == "hang":
 time.sleep(float(duration))
 rows, modules, skipped = [], [], []
 for member in spec:
+    if mode == "drop-proxy" and member["name"] == "proxy":
+        continue
     if member["expect"] in ("supported", "foreign"):
         endpoint = member["endpoint"]
         for line in open(f"/proc/{member['pid']}/maps"):
@@ -829,6 +927,52 @@ class SystemMixedCampaign(LifecycleBase):
                             for reason in cells["control"]["reasons"]))
         with self.assertRaises(Unknown):
             self.verify(record, files)
+
+    def test_system_mixed_requires_positive_control_and_proxy(self):
+        # Gap-shaped silence satisfies an unhinted-gap cell, never a
+        # supported one: both control and proxy need their exact counts.
+        silent = capture([])
+        self.assertEqual(judge(silent, expect="unhinted-gap", name="static",
+                               mode="system-unhinted", calls=3), [])
+        for name in ("control", "proxy"):
+            with self.subTest(name=name):
+                reasons = judge(silent, expect="supported", name=name,
+                                mode="system-unhinted", calls=3)
+                self.assertTrue(any("0 report rows" in reason for reason in reasons),
+                                reasons)
+        self.assertEqual(judge(capture([row(OWNED, OFFSET, 3)]), expect="supported",
+                               name="proxy", mode="system-unhinted", calls=3), [])
+        # Campaign level: an unrun proxy keeps its UNKNOWN while control
+        # and the expected gaps still pass, and no aggregate PASS hides
+        # the missing required positive.
+        _, record, files = self.campaign("system-mixed", mode="drop-proxy")
+        cells = {cell["name"]: cell for cell in record["cells"]}
+        self.assertEqual(cells["proxy"]["verdict"], "UNKNOWN")
+        self.assertTrue(any("0 report rows" in reason
+                            for reason in cells["proxy"]["reasons"]),
+                        cells["proxy"]["reasons"])
+        self.assertEqual(cells["control"]["verdict"], "PASS")
+        for name in E16.UNHINTED_GAPS:
+            self.assertEqual(cells[name]["verdict"], "PASS")
+        with self.assertRaisesRegex(Unknown, "cell proxy"):
+            self.verify(record, files)
+
+    def test_system_mixed_manifest_refuses_omitted_or_relabeled_cells(self):
+        _, record, files = self.campaign("system-mixed")
+        self.assertEqual(self.verify(record, files)["status"], "PASS")
+        good = copy.deepcopy(record)
+        mutations = (
+            lambda r: r["cells"].pop(1),
+            lambda r: r["cells"][1].update(expect="unhinted-gap"),
+            lambda r: r["cells"][0].update(name="proxy"),
+            lambda r: r["runs"][0]["participants"].pop(1),
+            lambda r: r.update(campaign="hinted"),
+        )
+        for index, mutate in enumerate(mutations):
+            mutated = copy.deepcopy(good)
+            mutate(mutated)
+            with self.subTest(index=index), self.assertRaisesRegex(Unknown, "campaign manifest"):
+                self.verify(mutated, files)
 
 
 class HintedRefusalBinding(LifecycleBase):

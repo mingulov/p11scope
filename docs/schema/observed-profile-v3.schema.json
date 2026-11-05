@@ -28,7 +28,7 @@
       "required": [
         "abi_refusals", "active_slots",
         "aliased", "async_duplicates", "async_evictions",
-        "async_orphans", "async_target_failures", "attach_failures",
+        "async_orphans", "async_target_failures", "attach_backend", "attach_failures",
         "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
         "authority", "cgroup_scope_failures", "completeness", "discovery",
         "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
@@ -38,9 +38,10 @@
         "handoff_child_pid", "in_flight_at_end", "interface_list",
         "kernel_control",
         "loader_discovery", "malformed_records", "manifest_object_fallbacks",
-        "module_ambiguous", "module_unresolved_slots", "modules_skipped", "operation_state_imports",
+        "module_ambiguous", "module_unresolved_slots", "modules_skipped", "object_capture",
+        "operation_state_imports",
         "orphan_ops", "p11scope_env", "pause", "pause_attempts", "pid_namespace",
-        "pause_confirmed", "pause_partial", "pending_at_end",
+        "pause_confirmed", "pause_partial", "pause_unavailable", "pending_at_end",
         "process_tracking_evictions", "process_tracking_failures",
         "process_tracking_fallbacks", "provider_changed", "rv_update_failures",
         "scan_ms", "scan_unavailable", "scheduling",
@@ -53,6 +54,7 @@
         "table_entries", "task_uprobe_link_losses", "template_tail_failures",
         "templates_truncated", "unmatched_closes", "unmatched_returns",
         "unprotected_live_windows",
+        "unpublished_mechanisms",
         "unregistered_mechanisms", "uretprobe_override", "vendor_interfaces",
         "verdict_detail"
       ],
@@ -72,6 +74,59 @@
         "cgroup_scope_failures": {"type": "integer", "minimum": 0},
         "child_still_running": {"type": "boolean"},
         "completeness": {"enum": ["COMPLETE", "PARTIAL"]},
+        "counter_collection": {
+          "description": "Optional availability of the accepted cumulative counter snapshot. Cached ticks retain its original read window; failed attempts retain its mode and generation.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "generation", "read_window", "status", "health", "discontinuity", "failure"],
+          "properties": {
+            "mode": {"enum": ["counts", "timestamps", "latency"]},
+            "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+            "read_window": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["started_ns", "finished_ns"],
+                  "properties": {
+                    "started_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                    "finished_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                  }
+                }
+              ]
+            },
+            "status": {"enum": ["fresh", "stale"]},
+            "health": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["saturated", "contended"],
+                  "properties": {
+                    "saturated": {"const": false},
+                    "contended": {"const": false}
+                  }
+                }
+              ]
+            },
+            "discontinuity": {"type": "boolean"},
+            "failure": {"enum": [
+              null, "read_shape", "read_budget", "read_stats", "read_rvs", "read_health",
+              "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
+              "mode", "generation_rollback", "limits", "saturated", "contended",
+              "kernel_evidence", "fold_overflow", "regressed", "projection"
+            ]}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"status": {"const": "fresh"}}},
+              "then": {"properties": {"failure": {"type": "null"}, "health": {"type": "object"}}},
+              "else": {"properties": {"failure": {"type": "string"}, "health": {"type": "null"}}}
+            }
+          ]
+        },
         "discovery": {"type": "array"},
         "discovery_conflicts": {"type": "integer", "minimum": 0},
         "discovery_read_failures": {"type": "integer", "minimum": 0},
@@ -146,6 +201,7 @@
               }
             },
             "hits": {"type": "integer", "minimum": 0},
+            "benign_hits": {"type": "integer", "minimum": 0},
             "state_read_failures": {"type": "integer", "minimum": 0}
           }
         },
@@ -178,6 +234,24 @@
             }
           }
         },
+        "excluded_modules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "dev", "ino", "processes"],
+            "properties": {
+              "path": {"type": "string"},
+              "dev": {"type": "integer", "minimum": 0},
+              "ino": {"type": "integer", "minimum": 0},
+              "processes": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        "unmatched_excludes": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
         "operation_state_imports": {"type": "integer", "minimum": 0},
         "orphan_ops": {"type": "integer", "minimum": 0},
         "p11scope_env": {
@@ -197,6 +271,7 @@
         "pause_attempts": {"type": "integer", "minimum": 0},
         "pause_confirmed": {"type": "integer", "minimum": 0},
         "pause_partial": {"type": "integer", "minimum": 0},
+        "pause_unavailable": {"type": "integer", "minimum": 0},
         "pending_at_end": {"type": "integer", "minimum": 0},
         "process_tracking_evictions": {"type": "integer", "minimum": 0},
         "process_tracking_failures": {"type": "integer", "minimum": 0},
@@ -375,7 +450,16 @@
                   "discovery unavailable",
                   "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved",
                   "physical identity is ambiguous; the collision group was not attached",
-                  "unsupported function-table version; the scanner does not walk this layout"
+                  "unsupported function-table version; the scanner does not walk this layout",
+                  "static probe coverage gap incomplete",
+                  "static probes detached and exact pairs reattached",
+                  "capture process-view capacity was exhausted; remaining generations were not scanned",
+                  "loader context capacity 256 is exhausted",
+                  "a deferred loader memory scan exceeded the bounded loader-context ledger",
+                  "the bounded loader-arm catch-up ledger was full",
+                  "manifest object unavailable",
+                  "prearm object unavailable",
+                  "discovery transport unavailable"
                 ]
               }
             }
@@ -404,6 +488,7 @@
         "templates_truncated": {"type": "boolean"},
         "unmatched_closes": {"type": "integer", "minimum": 0},
         "unmatched_returns": {"type": "integer", "minimum": 0},
+        "unpublished_mechanisms": {"type": "integer", "minimum": 0},
         "unregistered_mechanisms": {"type": "integer", "minimum": 0},
         "uretprobe_override": {
           "type": ["object", "null"],
@@ -551,8 +636,258 @@
             "scope_filter": {"enum": ["kernel-pid+bpf", "perf-task+bpf", null]}
           }
         },
+        "object_capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["available", "reason"],
+          "properties": {
+            "available": {"type": "boolean"},
+            "reason": {"enum": ["not_enabled", null]}
+          }
+        },
         "pid_descendant_gaps": {"type": "integer", "minimum": 0},
-        "multi_rebuild_gaps": {"type": "integer", "minimum": 0}
+        "multi_rebuild_gaps": {"type": "integer", "minimum": 0},
+        "selected_detail": {
+          "description": "Optional additive 6.15 endpoint-selection envelope (--select-endpoint beside counter captures). Closed nested shape; the release oracle is the enforcement behind this file. Never carries process identity.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["events"],
+          "properties": {
+            "selection": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["endpoint"],
+              "properties": {
+                "endpoint": {"type": "string", "minLength": 1},
+                "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "names": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                "refusal": {"enum": [
+                  "promotion_disabled", "promotion_busy", "promotion_duplicate",
+                  "promotion_already_detailed", "promotion_exhausted",
+                  "promotion_foreign_capture", "promotion_stale_view",
+                  "promotion_unknown_caller", "promotion_caller_retired",
+                  "promotion_caller_changed", "promotion_provider_changed",
+                  "promotion_provider_unloaded", "promotion_manifest_unavailable",
+                  "promotion_endpoint_ambiguous", "promotion_endpoint_dependency",
+                  "promotion_scope_ended", "promotion_scope_unsupported",
+                  "promotion_preparation_failed", "promotion_activation_failed",
+                  "promotion_capacity", "broad_not_counter", "broad_stopping",
+                  "child_shape", "not_published", "foreign", "changed",
+                  "quarantined", "budget", "endpoint_unresolved",
+                  "child_foreign_slot", "broad_plan_topology", "window_active",
+                  "endpoint_unknown", "bundle_unavailable"
+                ]}
+              },
+              "allOf": [
+                {"if": {"required": ["slot"]}, "then": {"required": ["endpoint", "slot", "file_offset"]}},
+                {"if": {"required": ["file_offset"]}, "then": {"required": ["endpoint", "slot", "file_offset"]}}
+              ]
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "seq"],
+                    "properties": {
+                      "event": {"enum": ["reserved", "bound", "cas_won", "cas_refused", "closed", "cancelled_unactivated"]},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "note": {"type": "string"}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "view", "endpoint_offset", "refusal"],
+                    "properties": {
+                      "event": {"const": "close_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "view": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "endpoint_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "refusal": {"enum": ["broad_not_counter", "broad_stopping", "child_shape", "not_published", "foreign", "changed", "quarantined", "budget"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "refusal", "seq"],
+                    "properties": {
+                      "event": {"const": "reserve_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "refusal": {"enum": ["broad_not_counter", "broad_stopping", "child_shape", "not_published", "foreign", "changed", "quarantined", "budget", "endpoint_unresolved", "child_foreign_slot", "broad_plan_topology", "window_active"]},
+                      "seq": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "reason"],
+                    "properties": {
+                      "event": {"const": "start_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "reason": {"enum": ["control disabled", "another promotion is outstanding", "same pair already requested", "pair already detailed", "request serials exhausted", "foreign capture", "view expired", "unknown caller", "caller retired", "caller identity changed", "provider changed", "provider unloaded", "no manifest permission", "ambiguous endpoints", "dependency endpoints outside closure", "parent scope ended", "parent scope unsupported", "preparation failed", "activation failed", "install capacity unavailable"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "reason"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "refused"},
+                      "reason": {"enum": ["control disabled", "another promotion is outstanding", "same pair already requested", "pair already detailed", "request serials exhausted", "foreign capture", "view expired", "unknown caller", "caller retired", "caller identity changed", "provider changed", "provider unloaded", "no manifest permission", "ambiguous endpoints", "dependency endpoints outside closure", "parent scope ended", "parent scope unsupported", "preparation failed", "activation failed", "install capacity unavailable"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "reason"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "ended"},
+                      "reason": {"enum": ["cancelled by operator", "run stopped", "lane closed"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "caller", "provider"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "active"},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+                    }
+                  }
+                ]
+              }
+            },
+            "lineage": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["request", "caller", "provider", "view", "endpoint_offset", "broad_original_index", "broad_generation", "detail_generation", "broad_read_seq_before", "broad_read_seq_after", "broad_mark_before", "broad_mark_after", "drift", "after_read"],
+              "properties": {
+                "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "view": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "endpoint_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_original_index": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "broad_generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+                "detail_generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_read_seq_before": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_read_seq_after": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_mark_before": {"$ref": "#/$defs/selected_detail_bracket_mark"},
+                "broad_mark_after": {"$ref": "#/$defs/selected_detail_bracket_mark"},
+                "drift": {
+                  "anyOf": [
+                    {"type": "null"},
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "generation"},
+                        "before": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+                        "after": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "indices"},
+                        "before": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+                        "after": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "bank", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "bank_ids"},
+                        "bank": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                        "before": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+                        "after": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "transaction"},
+                        "before": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615},
+                        "after": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615}
+                      }
+                    }
+                  ]
+                },
+                "after_read": {"enum": ["matched", "unavailable", "mismatched:generation", "mismatched:mode", "mismatched:read_failed", "mismatched:health", "mismatched:kernel", "mismatched:rows", "mismatched:rejected"]}
+              }
+            },
+            "aggregate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scope", "unit", "mode", "seq_before", "seq_after", "mode_mixed", "rows"],
+              "properties": {
+                "scope": {"const": "broad"},
+                "unit": {"const": "calls"},
+                "mode": {"enum": ["counts", "timestamps", "latency"]},
+                "seq_before": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "seq_after": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "mode_mixed": {"type": "boolean"},
+                "rows": {
+                  "type": "array",
+                  "items": {"anyOf": [{"$ref": "#/$defs/selected_detail_row_counts"}, {"$ref": "#/$defs/selected_detail_row_timestamps"}, {"$ref": "#/$defs/selected_detail_row_latency"}]}
+                }
+              },
+              "allOf": [
+                {"if": {"properties": {"mode": {"const": "counts"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_counts"}}}}},
+                {"if": {"properties": {"mode": {"const": "timestamps"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_timestamps"}}}}},
+                {"if": {"properties": {"mode": {"const": "latency"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_latency"}}}}}
+              ]
+            },
+            "detail": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scope", "unit", "mode", "detail_generation", "mode_mixed", "rows"],
+              "properties": {
+                "scope": {"const": "detail"},
+                "unit": {"const": "calls"},
+                "mode": {"enum": ["counts", "timestamps", "latency"]},
+                "detail_generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "mode_mixed": {"type": "boolean"},
+                "rows": {
+                  "type": "array",
+                  "items": {"anyOf": [{"$ref": "#/$defs/selected_detail_row_counts"}, {"$ref": "#/$defs/selected_detail_row_timestamps"}, {"$ref": "#/$defs/selected_detail_row_latency"}]}
+                }
+              },
+              "allOf": [
+                {"if": {"properties": {"mode": {"const": "counts"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_counts"}}}}},
+                {"if": {"properties": {"mode": {"const": "timestamps"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_timestamps"}}}}},
+                {"if": {"properties": {"mode": {"const": "latency"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_latency"}}}}}
+              ]
+            }
+          }
+        }
       }
     },
     "functions": {
@@ -562,6 +897,38 @@
         "required": ["names", "aliased", "target", "ordinals", "module", "module_ambiguous", "module_unresolved", "calls"],
         "properties": {
           "names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "latency_ns": {
+            "description": "Timing availability from the measured counter capability. Null is unmeasured; numeric zero remains a measured value.",
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["approximate", "p50", "p95", "p99", "total", "max"],
+                "properties": {
+                  "approximate": {"const": true},
+                  "p50": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+                  "p95": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+                  "p99": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+                  "total": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                  "max": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["approximate", "p50", "p95", "p99", "total", "max"],
+                "properties": {
+                  "approximate": {"const": false},
+                  "p50": {"type": "null"},
+                  "p95": {"type": "null"},
+                  "p99": {"type": "null"},
+                  "total": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                  "max": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                }
+              }
+            ]
+          },
           "target": {
             "type": "object",
             "additionalProperties": false,
@@ -591,6 +958,16 @@
                 "ordinal": {"type": "integer", "minimum": 0, "maximum": 103}
               }
             }
+          },
+          "initialization": {
+            "description": "Optional v3-additive Initialize claim, present only on rows that name C_Initialize with at least one positively counted return. The outcome class over the row's own completed calls; potential_provider is a true-only likelihood, never proof. Absent means Initialize was not observed on this row.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": {"enum": ["ok", "already_initialized", "error", "mixed"]},
+              "potential_provider": {"const": true}
+            }
           }
         }
       }
@@ -603,7 +980,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "attach_backend", "pid_descendant_gaps", "multi_rebuild_gaps"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
@@ -619,13 +996,54 @@
               "anyOf": [
                 {"required": ["interface_selection"]},
                 {"required": ["attach_mechanisms"]},
-                {"required": ["attach_backend"]},
                 {"required": ["pid_descendant_gaps"]},
                 {"required": ["multi_rebuild_gaps"]}
               ]
             }
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "counts"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/0"}}
+        }}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "timestamps"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/2"}}
+        }}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "latency"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/1"}}
+        }}}
       }
     }
   ],
@@ -673,6 +1091,80 @@
         "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
         "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
         "flags": {"enum": ["zero", "fork_safe", "other"]}
+      }
+    },
+    "selected_detail_bracket_mark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "generation", "indices", "bank_ids", "transaction"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "indices": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+        "bank_ids": {
+          "type": "array",
+          "items": {
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+          }
+        },
+        "transaction": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615}
+      }
+    },
+    "selected_detail_rv_counts": {
+      "description": "Return-value rows keyed by the canonical decimal u64 the collector renders; possibly empty.",
+      "type": "object",
+      "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+      "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+    },
+    "selected_detail_row_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"}
+      }
+    },
+    "selected_detail_row_timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts", "total_ns", "max_ns"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"},
+        "total_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "max_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      }
+    },
+    "selected_detail_row_latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts", "total_ns", "max_ns", "buckets"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"},
+        "total_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "max_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "buckets": {
+          "type": "array", "minItems": 32, "maxItems": 32,
+          "items": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+        }
       }
     }
   }

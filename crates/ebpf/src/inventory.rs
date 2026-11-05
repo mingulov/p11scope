@@ -3,9 +3,9 @@
 //! records exact image/object witnesses. No ordinary arguments or returns.
 use super::*;
 use p11scope_ebpf_common::{
-    inventory_cookie_endpoint, inventory_mark_used_with, InventoryUsageConfig,
-    USAGE_EVIDENCE_CELLS, USAGE_EVIDENCE_INVALID_CONFIG, USAGE_EVIDENCE_INVALID_COOKIE,
-    USAGE_EVIDENCE_INVALID_STATE,
+    InventoryUsageConfig, USAGE_EVIDENCE_CELLS, USAGE_EVIDENCE_INVALID_CONFIG,
+    USAGE_EVIDENCE_INVALID_COOKIE, USAGE_EVIDENCE_INVALID_STATE, inventory_cookie_endpoint,
+    inventory_mark_used_with,
 };
 
 /// Placeholder only: the loader must set the approved nonzero N before load.

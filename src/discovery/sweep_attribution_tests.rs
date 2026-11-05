@@ -5,6 +5,7 @@
 use super::*;
 use crate::discovery::engine::select_deep_scan_candidates;
 use crate::discovery::proof_stats::{MAX_PROOF_STAT_THREADS, MIN_PARALLEL_BATCH};
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_manifest::maps::Device;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -100,9 +101,12 @@ struct Checks {
     changed: BTreeSet<PinnedObjectId>,
     checked: RefCell<Vec<PinnedObjectId>>,
     identities: BTreeMap<PinnedObjectId, Result<FileIdentity, String>>,
-    /// The filesystem magic of an object's self-mapping (default: none
-    /// read, so every key keeps the per-range proof).
-    fs_magic: BTreeMap<PinnedObjectId, u64>,
+    /// The filesystem magic of an object's self-mapping: absent means an
+    /// ordinary non-allowlisted filesystem (tmpfs), so existing keys keep
+    /// their per-range proof and userspace fallback; `None` entries script
+    /// an unproven filesystem, which refuses the userspace fallback like
+    /// overlayfs.
+    fs_magic: BTreeMap<PinnedObjectId, Option<u64>>,
 }
 
 impl ObjectChecks for Checks {
@@ -123,7 +127,11 @@ impl ObjectChecks for Checks {
             .unwrap_or(Ok(vm_file(PROVIDER)))?;
         Ok(MappedFile {
             identity,
-            fs_magic: self.fs_magic.get(&object).copied(),
+            fs_magic: self
+                .fs_magic
+                .get(&object)
+                .copied()
+                .unwrap_or(Some(0x01021994)),
         })
     }
 }
@@ -170,7 +178,10 @@ impl Probe {
             .into_iter()
             .map(|range| {
                 if self.denied.contains(&pid) {
-                    return (range, Err("Operation not permitted (os error 1)".into()));
+                    return (
+                        range,
+                        RangeProof::Unavailable("Operation not permitted (os error 1)".into()),
+                    );
                 }
                 let found = known
                     .and_then(|mapped| mapped.get(&range))
@@ -182,8 +193,12 @@ impl Probe {
                                     .iter()
                                     .find(|entry| (entry.start, entry.end) == range)
                             })
-                            .map(|entry| vm_file(entry.inode))
-                            .ok_or_else(|| "No such file or directory (os error 2)".into())
+                            .map(|entry| RangeProof::MapFiles(vm_file(entry.inode)))
+                            .unwrap_or_else(|| {
+                                RangeProof::Unavailable(
+                                    "No such file or directory (os error 2)".into(),
+                                )
+                            })
                     });
                 (range, found)
             })
@@ -852,6 +867,7 @@ fn loss_labels_are_stable_and_distinct() {
     assert_eq!(labels.len(), AttributionLoss::ALL.len());
     assert!(labels.contains("deleted_mapping"));
     assert!(labels.contains("inode_not_unique"));
+    assert!(labels.contains("overlay_kernel_unavailable"));
 }
 
 // ---- Review fix (Critical 1): a maps key is not one file ----
@@ -862,7 +878,7 @@ fn ranges_reading(entries: &[MapEntry], inode: u64, identity: FileIdentity) -> M
     entries
         .iter()
         .filter(|entry| entry.inode == inode)
-        .map(|entry| ((entry.start, entry.end), Ok(identity)))
+        .map(|entry| ((entry.start, entry.end), RangeProof::MapFiles(identity)))
         .collect()
 }
 
@@ -912,7 +928,7 @@ fn every_range_of_a_matched_group_must_be_the_held_file() {
         10_001,
         MappedIdentities::from([(
             (text.start, text.end),
-            Ok(FileIdentity {
+            RangeProof::MapFiles(FileIdentity {
                 dev: 47,
                 ino: PROVIDER,
             }),
@@ -1056,7 +1072,7 @@ fn the_confirmation_reads_map_files_for_requested_keys_inside_the_pin() {
     assert!(
         read.mapped
             .values()
-            .all(|identity| identity == &Ok(vm_file(PROVIDER)))
+            .all(|identity| identity == &RangeProof::MapFiles(vm_file(PROVIDER)))
     );
 
     let mut turned = Io {
@@ -1242,7 +1258,7 @@ fn an_identity_key_skips_the_range_proof_only_on_an_allowlisted_filesystem() {
     let sweep = vec![(10_001, provider_caller())];
     let checks_on = |magic| Checks {
         identities: BTreeMap::from([(OBJECT, Ok(key_device_identity(PROVIDER)))]),
-        fs_magic: BTreeMap::from([(OBJECT, magic)]),
+        fs_magic: BTreeMap::from([(OBJECT, Some(magic))]),
         ..Checks::default()
     };
 
@@ -1276,7 +1292,7 @@ fn an_identity_key_skips_the_range_proof_only_on_an_allowlisted_filesystem() {
     // On ext4 but the identity is not the key (btrfs-style anon device):
     // still proves.
     let other = Checks {
-        fs_magic: BTreeMap::from([(OBJECT, EXT4_MAGIC)]),
+        fs_magic: BTreeMap::from([(OBJECT, Some(EXT4_MAGIC))]),
         ..Checks::default()
     };
     let index = provider_index(&other);
@@ -1334,6 +1350,11 @@ fn create_subvolume(parent: &std::path::Path, name: &str) {
         fd: i64,
         name: [u8; 4088],
     }
+    // musl `ioctl` takes a c_int request, glibc a c_ulong one; the
+    // number fits both.
+    #[cfg(target_env = "musl")]
+    const BTRFS_IOC_SUBVOL_CREATE: libc::c_int = 0x5000_940e;
+    #[cfg(not(target_env = "musl"))]
     const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
     let dir = std::fs::File::open(parent).unwrap();
     let mut args = VolArgs {
@@ -1360,6 +1381,142 @@ struct SwapChild {
     reply: std::os::fd::OwnedFd,
     address: u64,
     addresses: Vec<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BindSetupError {
+    stage: &'static str,
+    errno: i32,
+}
+
+/// Child-local reply: stage, errno, address, actual opened-file dev and ino.
+/// All words are initialized integers; this is private to one fork's pipe.
+fn decode_bind_ready(words: [u64; 5]) -> Result<(u64, FileIdentity), BindSetupError> {
+    let protocol = || BindSetupError {
+        stage: "reply",
+        errno: libc::EPROTO,
+    };
+    if words[0] != 0 {
+        let stage = match words[0] {
+            1 => "unshare",
+            2 => "make-private",
+            3 => "bind",
+            4 => "open-alias",
+            5 => "stat-alias",
+            6 => "stat-held-source",
+            7 => "source-identity",
+            8 => "mmap",
+            9 => "stat-child-namespace",
+            10 => "namespace-unchanged",
+            _ => return Err(protocol()),
+        };
+        let errno = i32::try_from(words[1])
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(protocol)?;
+        return Err(BindSetupError { stage, errno });
+    }
+    if words[1] != 0 || words[2] == 0 || words[2].checked_add(4096).is_none() || words[4] == 0 {
+        return Err(protocol());
+    }
+    Ok((
+        words[2],
+        FileIdentity {
+            dev: words[3],
+            ino: words[4],
+        },
+    ))
+}
+
+fn read_bind_ready(fd: std::os::fd::BorrowedFd<'_>) -> Result<(u64, FileIdentity), BindSetupError> {
+    use std::os::fd::AsRawFd as _;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut bytes = [0u8; 40];
+    let mut have = 0;
+    while have < bytes.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(BindSetupError {
+                stage: "ready-deadline",
+                errno: libc::ETIMEDOUT,
+            });
+        }
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, followed by a read into the owned buffer.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, remaining.as_millis().max(1) as i32) };
+        if ready < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if errno == libc::EINTR {
+                continue;
+            }
+            return Err(BindSetupError {
+                stage: "ready-poll",
+                errno,
+            });
+        }
+        if ready == 0 {
+            continue;
+        }
+        // SAFETY: the remaining slice is writable and the polled descriptor is live.
+        let got = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                bytes[have..].as_mut_ptr().cast(),
+                bytes.len() - have,
+            )
+        };
+        if got <= 0 {
+            let errno = if got == 0 {
+                libc::EPIPE
+            } else {
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            };
+            if errno == libc::EINTR {
+                continue;
+            }
+            return Err(BindSetupError {
+                stage: "ready-read",
+                errno,
+            });
+        }
+        have += got as usize;
+    }
+    decode_bind_ready(std::array::from_fn(|index| {
+        u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+    }))
+}
+
+fn reap_owned_swap_child(pid: libc::pid_t) {
+    // SAFETY: this PID is an owned, unreaped fork child, including startup failures.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        loop {
+            if libc::waitpid(pid, std::ptr::null_mut(), 0) >= 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+    }
+}
+
+struct PendingBindChild(Option<libc::pid_t>);
+
+impl Drop for PendingBindChild {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            reap_owned_swap_child(pid);
+        }
+    }
 }
 
 impl SwapChild {
@@ -1454,6 +1611,197 @@ impl SwapChild {
         }
     }
 
+    /// One child-private bind mount and mapping. The parent never enters the
+    /// namespace or mounts anything. Setup errors are returned, never a skip.
+    fn spawn_private_bind(
+        source: &std::path::Path,
+        held_source: &std::fs::File,
+        alias: &std::path::Path,
+        executable: bool,
+    ) -> Result<(Self, FileIdentity), BindSetupError> {
+        use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::fs::MetadataExt as _;
+        let path = |path: &std::path::Path| {
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+                BindSetupError {
+                    stage: "path",
+                    errno: libc::EINVAL,
+                }
+            })
+        };
+        let source = path(source)?;
+        let alias = path(alias)?;
+        let parent_namespace =
+            std::fs::metadata("/proc/self/ns/mnt").map_err(|error| BindSetupError {
+                stage: "stat-parent-namespace",
+                errno: error.raw_os_error().unwrap_or(libc::EIO),
+            })?;
+        let parent_namespace = (parent_namespace.dev(), parent_namespace.ino());
+        let pipe = || -> Result<(OwnedFd, OwnedFd), BindSetupError> {
+            let mut fds = [0; 2];
+            // SAFETY: pipe2 initializes two new owned descriptors on success.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(BindSetupError {
+                    stage: "pipe",
+                    errno: std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                });
+            }
+            // SAFETY: successful pipe2 returned two new, independently owned fds.
+            Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+        };
+        let (down_read, down_write) = pipe()?;
+        let (up_read, up_write) = pipe()?;
+        let protection = libc::PROT_READ | if executable { libc::PROT_EXEC } else { 0 };
+        // SAFETY: child uses only raw syscalls, fixed stack buffers and paths
+        // allocated before fork; it never returns into the Rust test harness.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(BindSetupError {
+                stage: "fork",
+                errno: std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            });
+        }
+        if pid == 0 {
+            // SAFETY: syscall arguments refer to inherited live fds/paths or
+            // initialized stack buffers. Every error reports and calls _exit.
+            unsafe {
+                libc::close(down_write.as_raw_fd());
+                libc::close(up_read.as_raw_fd());
+                let report = |words: [u64; 5]| {
+                    let mut sent = 0;
+                    while sent < 40 {
+                        let got = libc::write(
+                            up_write.as_raw_fd(),
+                            words.as_ptr().cast::<u8>().add(sent).cast(),
+                            40 - sent,
+                        );
+                        if got < 0 && *libc::__errno_location() == libc::EINTR {
+                            continue;
+                        }
+                        if got <= 0 {
+                            libc::_exit(99);
+                        }
+                        sent += got as usize;
+                    }
+                };
+                let fail = |stage: u64, errno: i32| -> ! {
+                    report([stage, errno as u64, 0, 0, 0]);
+                    libc::_exit(100 + stage as i32);
+                };
+                if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWNS) != 0 {
+                    fail(1, *libc::__errno_location());
+                }
+                let mut namespace = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::stat(c"/proc/self/ns/mnt".as_ptr(), namespace.as_mut_ptr()) != 0 {
+                    fail(9, *libc::__errno_location());
+                }
+                let namespace = namespace.assume_init();
+                if (namespace.st_dev, namespace.st_ino) == parent_namespace {
+                    fail(10, libc::EXDEV);
+                }
+                if libc::syscall(
+                    libc::SYS_mount,
+                    std::ptr::null::<libc::c_char>(),
+                    c"/".as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null::<libc::c_void>(),
+                ) != 0
+                {
+                    fail(2, *libc::__errno_location());
+                }
+                // Resolve this owned source in the new namespace. An inherited
+                // /proc/self/fd source still belongs to the parent's mount tree.
+                if libc::syscall(
+                    libc::SYS_mount,
+                    source.as_ptr(),
+                    alias.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                    libc::MS_BIND,
+                    std::ptr::null::<libc::c_void>(),
+                ) != 0
+                {
+                    fail(3, *libc::__errno_location());
+                }
+                let fd = libc::open(
+                    alias.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                );
+                if fd < 0 {
+                    fail(4, *libc::__errno_location());
+                }
+                let mut mapped = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::fstat(fd, mapped.as_mut_ptr()) != 0 {
+                    fail(5, *libc::__errno_location());
+                }
+                if libc::fstat(held_source.as_raw_fd(), held.as_mut_ptr()) != 0 {
+                    fail(6, *libc::__errno_location());
+                }
+                let (mapped, held) = (mapped.assume_init(), held.assume_init());
+                if (mapped.st_dev, mapped.st_ino) != (held.st_dev, held.st_ino) {
+                    fail(7, libc::EXDEV);
+                }
+                let first = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    protection,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    0,
+                );
+                let map_errno = *libc::__errno_location();
+                libc::close(fd);
+                if first == libc::MAP_FAILED {
+                    fail(8, map_errno);
+                }
+                report([0, 0, first as u64, mapped.st_dev, mapped.st_ino]);
+                let mut command = 0u8;
+                loop {
+                    let got = libc::read(down_read.as_raw_fd(), (&raw mut command).cast(), 1);
+                    if got < 0 && *libc::__errno_location() == libc::EINTR {
+                        continue;
+                    }
+                    if got != 1 || command != b's' {
+                        break;
+                    }
+                    libc::munmap(first, 4096);
+                    let fd = libc::open(alias.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                    let again = libc::mmap(
+                        first,
+                        4096,
+                        protection,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE,
+                        fd,
+                        0,
+                    );
+                    libc::close(fd);
+                    let ok = u8::from(again == first);
+                    if libc::write(up_write.as_raw_fd(), (&raw const ok).cast(), 1) != 1 {
+                        break;
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        let mut pending = PendingBindChild(Some(pid));
+        drop((down_read, up_write));
+        let (address, identity) = read_bind_ready(up_read.as_fd())?;
+        let child = Self {
+            pid,
+            command: down_write,
+            reply: up_read,
+            address,
+            addresses: vec![address],
+        };
+        pending.0 = None;
+        Ok((child, identity))
+    }
+
     fn remap(&self) {
         use std::os::fd::AsRawFd as _;
         let mut ok = 0u8;
@@ -1484,11 +1832,139 @@ impl SwapChild {
 
 impl Drop for SwapChild {
     fn drop(&mut self) {
-        // SAFETY: our own child; reaped here.
+        reap_owned_swap_child(self.pid);
+    }
+}
+
+#[test]
+fn d4_bind_startup_reply_requires_success_and_a_valid_mapping() {
+    let healthy = [0, 0, 0x1000, 37, 123];
+    let expected = (0x1000, FileIdentity { dev: 37, ino: 123 });
+    assert_eq!(decode_bind_ready(healthy), Ok(expected));
+    assert_eq!(
+        decode_bind_ready([1, libc::EPERM as u64, 0, 0, 0]),
+        Err(BindSetupError {
+            stage: "unshare",
+            errno: libc::EPERM
+        })
+    );
+    assert_eq!(
+        decode_bind_ready([3, libc::EACCES as u64, 0, 0, 0]),
+        Err(BindSetupError {
+            stage: "bind",
+            errno: libc::EACCES
+        })
+    );
+    assert_eq!(
+        decode_bind_ready([7, libc::EXDEV as u64, 0, 0, 0]),
+        Err(BindSetupError {
+            stage: "source-identity",
+            errno: libc::EXDEV
+        })
+    );
+    for invalid in [
+        [0, 1, 0x1000, 37, 123],
+        [0, 0, 0, 37, 123],
+        [0, 0, u64::MAX, 37, 123],
+        [0, 0, 0x1000, 37, 0],
+        [11, 1, 0, 0, 0],
+    ] {
+        assert!(decode_bind_ready(invalid).is_err());
+        assert_eq!(decode_bind_ready(healthy), Ok(expected));
+    }
+}
+
+#[test]
+fn d4_bind_startup_eof_reaps_the_owned_child() {
+    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two newly owned descriptors into the live array.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: successful pipe2 returned both fds, each adopted once.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: the child only closes raw fds and exits without entering Rust.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        // SAFETY: only inherited descriptors and _exit in the fork child.
         unsafe {
-            libc::kill(self.pid, libc::SIGKILL);
-            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            libc::_exit(0);
         }
+    }
+    let pending = PendingBindChild(Some(pid));
+    drop(write);
+    assert_eq!(
+        read_bind_ready(read.as_fd()),
+        Err(BindSetupError {
+            stage: "ready-read",
+            errno: libc::EPIPE
+        })
+    );
+    drop(pending);
+    // SAFETY: querying only this test's PID; the guard must already have reaped it.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+fn d4_private_bind_mount(mountinfo: &str, alias: &std::path::Path) -> Result<(), &'static str> {
+    let escaped = alias
+        .to_str()
+        .ok_or("non-UTF8 fixture path")?
+        .replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012");
+    let mut found = false;
+    for line in mountinfo.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.get(4) != Some(&escaped.as_str()) {
+            continue;
+        }
+        if found {
+            return Err("duplicate alias mount");
+        }
+        let separator = fields
+            .iter()
+            .position(|field| *field == "-")
+            .ok_or("malformed alias mount")?;
+        if separator < 6 || fields.get(separator + 1) != Some(&"btrfs") {
+            return Err("alias is not a Btrfs mount");
+        }
+        if fields[6..separator].iter().any(|field| {
+            field.starts_with("shared:")
+                || field.starts_with("master:")
+                || field.starts_with("propagate_from:")
+        }) {
+            return Err("alias mount propagates");
+        }
+        found = true;
+    }
+    if found { Ok(()) } else { Err("no alias mount") }
+}
+
+#[test]
+fn d4_bind_mountinfo_requires_one_private_btrfs_alias() {
+    let alias = std::path::Path::new("/owned/libalias.so");
+    let healthy =
+        "72 25 0:47 /owned/liboriginal.so /owned/libalias.so rw - btrfs /dev/fixture rw\n";
+    assert_eq!(d4_private_bind_mount(healthy, alias), Ok(()));
+    for bad in [
+        healthy.replace(" rw -", " rw shared:1 -"),
+        healthy.replace(" rw -", " rw master:1 -"),
+        healthy.replace("btrfs", "tmpfs"),
+        healthy.replace("/owned/libalias.so", "/other/libalias.so"),
+        format!("{healthy}{healthy}"),
+    ] {
+        assert!(d4_private_bind_mount(&bad, alias).is_err());
+        assert_eq!(d4_private_bind_mount(healthy, alias), Ok(()));
     }
 }
 
@@ -1499,7 +1975,7 @@ fn index_binding(key: ObjectKey, identity: FileIdentity, magic: Option<u64>) -> 
     let checks = Checks {
         identities: BTreeMap::from([(OBJECT, Ok(identity))]),
         fs_magic: magic
-            .map(|magic| BTreeMap::from([(OBJECT, magic)]))
+            .map(|magic| BTreeMap::from([(OBJECT, Some(magic))]))
             .unwrap_or_default(),
         ..Checks::default()
     };
@@ -1517,8 +1993,12 @@ fn attribute_child(
     snapshot: Vec<MapEntry>,
     index: &KnownKeyIndex,
 ) -> SweepAttribution {
+    attribute_pid(child.pid as u32, snapshot, index)
+}
+
+fn attribute_pid(pid: u32, snapshot: Vec<MapEntry>, index: &KnownKeyIndex) -> SweepAttribution {
     attribute_unselected(
-        &[(child.pid as u32, snapshot)],
+        &[(pid, snapshot)],
         &BTreeSet::new(),
         &BTreeSet::new(),
         index,
@@ -1547,6 +2027,8 @@ fn privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file(
         0
     );
     // SAFETY: initialized by the successful statfs.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
     create_subvolume(parent, "s");
@@ -1759,7 +2241,12 @@ fn a_held_map_files_directory_is_the_given_processes() {
         .map(|entry| (entry.start, entry.end))
         .collect();
     ranges.push((range.0, range.1 + 4096));
-    let source = Arc::new(HeldMapFiles(held));
+    let source = Arc::new(HeldMapFiles {
+        dir: Some(held),
+        lease: None,
+        closed: DropFence::default(),
+        observer: None,
+    });
     let serial: Vec<_> = ranges.iter().map(|&(s, e)| source.stat(s, e)).collect();
     for threads in 1..=MAX_PROOF_STAT_THREADS {
         ProofStatPool::scoped(threads, |pool| {
@@ -1816,7 +2303,7 @@ fn a_range_unmapped_after_the_sweep_is_confirmed_never_counted_unexamined() {
     let mut probe = Probe::over(&sweep);
     probe.mapped.insert(
         20_001,
-        MappedIdentities::from([(libc_range, Err(RANGE_NOT_MAPPED.into()))]),
+        MappedIdentities::from([(libc_range, RangeProof::NotMapped)]),
     );
     probe.snapshots.insert(20_001, Vec::new());
     let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
@@ -1832,7 +2319,7 @@ fn a_range_unmapped_after_the_sweep_is_confirmed_never_counted_unexamined() {
     let mut probe = Probe::over(&sweep);
     probe.mapped.insert(
         20_001,
-        MappedIdentities::from([(libc_range, Err(RANGE_NOT_MAPPED.into()))]),
+        MappedIdentities::from([(libc_range, RangeProof::NotMapped)]),
     );
     probe.overrides.insert(20_001, Confirmation::Exited);
     let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
@@ -1866,7 +2353,7 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
         let mut probe = Probe::over(&sweep);
         probe.mapped.insert(
             10_001,
-            MappedIdentities::from([(range, Err(RANGE_NOT_MAPPED.into()))]),
+            MappedIdentities::from([(range, RangeProof::NotMapped)]),
         );
         let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
         assert_eq!(
@@ -1881,8 +2368,8 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
     probe.mapped.insert(
         10_001,
         MappedIdentities::from([
-            ((0x1000_0000, 0x1000_1000), Err(RANGE_NOT_MAPPED.into())),
-            ((0x2000_0000, 0x2000_1000), Err(RANGE_NOT_MAPPED.into())),
+            ((0x1000_0000, 0x1000_1000), RangeProof::NotMapped),
+            ((0x2000_0000, 0x2000_1000), RangeProof::NotMapped),
         ]),
     );
     let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
@@ -2262,7 +2749,12 @@ impl ConfirmIo for CountingIo<'_> {
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
         self.reads.borrow_mut().push((pid, (start, end)));
         if let Some(fault) = self.faults.get(&(start, end)) {
-            return fault.clone();
+            return match fault {
+                RangeProof::MapFiles(identity) => Ok(*identity),
+                RangeProof::NotMapped => Err(RANGE_NOT_MAPPED.into()),
+                RangeProof::Unavailable(error) => Err(error.clone()),
+                _ => panic!("the OS seam emits no kernel evidence"),
+            };
         }
         self.entries
             .iter()
@@ -2448,7 +2940,7 @@ fn a_dlopen_caller_is_attributed_by_proving_its_executable_ranges_only() {
 /// never read (the production path) or is in hand anyway.
 #[test]
 fn a_collision_on_a_data_range_does_not_cost_an_exec_proven_edge() {
-    let other_subvolume = Ok(FileIdentity {
+    let other_subvolume = RangeProof::MapFiles(FileIdentity {
         dev: 47,
         ino: PROVIDER,
     });
@@ -2479,8 +2971,8 @@ fn a_collision_on_a_data_range_does_not_cost_an_exec_proven_edge() {
     // The confirmation hands over the colliding data-range identities too:
     // the match still proves only its executable range.
     let mut mapped = collided;
-    mapped.insert(PROVIDER_TEXT, Ok(vm_file(PROVIDER)));
-    mapped.insert(LIBC_TEXT, Ok(vm_file(LIBC)));
+    mapped.insert(PROVIDER_TEXT, RangeProof::MapFiles(vm_file(PROVIDER)));
+    mapped.insert(LIBC_TEXT, RangeProof::MapFiles(vm_file(LIBC)));
     let mut scripted = Probe::over(&sweep);
     scripted.overrides.insert(
         10_001,
@@ -2528,9 +3020,10 @@ fn an_exec_range_that_fails_its_proof_is_not_attributed_with_its_reason() {
     for (fault, loss, reason) in cases {
         let sweep = vec![(10_000, caller5()), (10_001, caller5())];
         let mut probe = CountingProbe::over(&sweep);
-        probe
-            .faults
-            .insert(10_001, MappedIdentities::from([(PROVIDER_TEXT, fault)]));
+        probe.faults.insert(
+            10_001,
+            MappedIdentities::from([(PROVIDER_TEXT, RangeProof::from(fault))]),
+        );
         let (attribution, _) = run_counting(&sweep, &mut probe);
         assert!(attribution.members.is_empty(), "{loss:?}");
         assert_eq!(attribution.losses, BTreeMap::from([(loss, 1)]));
@@ -2563,7 +3056,7 @@ fn every_executable_range_of_a_key_must_prove() {
     let mut probe = CountingProbe::over(&sweep);
     probe.faults.insert(
         10_001,
-        MappedIdentities::from([(second_text, Ok(vm_file(9_999)))]),
+        MappedIdentities::from([(second_text, RangeProof::MapFiles(vm_file(9_999)))]),
     );
     let (attribution, _) = run_counting(&sweep, &mut probe);
     assert!(attribution.members.is_empty());
@@ -2690,6 +3183,8 @@ fn privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge() {
         0
     );
     // SAFETY: initialized by the successful statfs.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
     create_subvolume(parent, "s");
@@ -2762,6 +3257,4252 @@ fn privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge() {
     std::fs::remove_dir(parent.join("t")).unwrap();
 }
 
+fn d4_kernel_collision_attribution(
+    child: &SwapChild,
+    snapshot: Vec<MapEntry>,
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: PinnedObjectId,
+    key: ObjectKey,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+) -> SweepAttribution {
+    d4_kernel_attribution_for_pid(
+        child.pid as u32,
+        snapshot,
+        pins,
+        object,
+        key,
+        session,
+        generation,
+    )
+}
+
+fn d4_kernel_attribution_for_pid(
+    pid: u32,
+    snapshot: Vec<MapEntry>,
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: PinnedObjectId,
+    key: ObjectKey,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+) -> SweepAttribution {
+    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody, KernelMemberProbe};
+    use std::sync::{Arc, Mutex};
+
+    let (mut index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(
+        index.map_files_keys().contains(&key),
+        "Btrfs collision must require actual per-range proof"
+    );
+    let owner = ReservationOwner::for_examined(
+        SegmentPolicy::try_snapshot(0, 0).expect("actual FD census"),
+        0,
+    );
+    let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+    custody
+        .reconcile(SegmentPolicy::try_snapshot(1, 1).expect("actual confirmation FD census"))
+        .expect("shared physical reservation owner");
+    let pass = AnchorPass::prepare(pins, [(key, object)], custody);
+    assert!(pass.fallback.is_empty(), "{:?}", pass.fallback);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut installed = session
+        .install_anchors(pass, generation, deadline)
+        .expect("install actual held-file anchors");
+    let trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let out = {
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            OsConfirmIo::with_pool(None).observing(trace.clone()),
+            deadline,
+        );
+        probe
+            .install_expectations(&mut index)
+            .expect("actual validated anchor expectations");
+        assert!(
+            index
+                .match_slots
+                .get(&key)
+                .is_some_and(|slots| !slots.is_empty()),
+            "the held provider has no validated actual kernel slot"
+        );
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.has_collection_work(),
+            "exercise actual kernel proof, not scoped fallback"
+        );
+        attribute_unselected(
+            &[(pid, snapshot)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut probe,
+            &mut budget,
+        )
+    };
+    drop(installed);
+    let fallback = session.fallback_totals();
+    assert_eq!(fallback.passes, 0, "{fallback:?}");
+    assert_eq!(fallback.pids, 0, "{fallback:?}");
+    assert_eq!(fallback.keys, 0, "{fallback:?}");
+    assert!(fallback.first_reason.is_none(), "{fallback:?}");
+    assert!(
+        trace.lock().unwrap().reads.is_empty(),
+        "the required kernel leg performed userspace range-proof reads"
+    );
+    out
+}
+
+/// Actual identity-substrate parity on one live population: two equal-byte
+/// files in separate Btrfs subvolumes have one lexical maps key but different
+/// physical identities. No gcc, source files or external provider are needed
+/// at runtime: the real identity object is embedded in this libtest.
+/// Same-line remapping and the complete five D4 rows remain separate gates.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual kernel/userspace parity"]
+fn privileged_d4_btrfs_subvolume_collision_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let a_path = parent.join("a/libcollision.so");
+    let b_path = parent.join("b/libcollision.so");
+    std::fs::write(&a_path, vec![0xa5u8; 8192]).unwrap();
+    std::fs::copy(&a_path, &b_path).unwrap();
+    let a_file = std::fs::File::open(&a_path).unwrap();
+    let b_file = std::fs::File::open(&b_path).unwrap();
+    let a = a_file.metadata().unwrap();
+    let b = b_file.metadata().unwrap();
+    assert_eq!(
+        std::fs::read(&a_path).unwrap(),
+        std::fs::read(&b_path).unwrap()
+    );
+    assert_eq!(
+        a.ino(),
+        b.ino(),
+        "fresh subvolume files share the inode number"
+    );
+    assert_ne!(
+        (a.dev(), a.ino()),
+        (b.dev(), b.ino()),
+        "full physical IDs must differ"
+    );
+
+    let caller = SwapChild::spawn_with(&[(&a_path, true), (&b_path, false)]);
+    let wrong = SwapChild::spawn_with(&[(&b_path, true), (&a_path, false)]);
+    let reader = SwapChild::spawn_with(&[(&a_path, false)]);
+    let snapshots = [caller.maps(), wrong.maps(), reader.maps()];
+    fn line_at(snapshot: &[MapEntry], address: u64) -> &MapEntry {
+        snapshot
+            .iter()
+            .find(|entry| entry.start == address)
+            .expect("independent live mapping")
+    }
+    let a_text = line_at(&snapshots[0], caller.addresses[0]);
+    let b_data = line_at(&snapshots[0], caller.addresses[1]);
+    let b_text = line_at(&snapshots[1], wrong.addresses[0]);
+    let a_data = line_at(&snapshots[1], wrong.addresses[1]);
+    let reader_data = line_at(&snapshots[2], reader.address);
+    assert_eq!(a_text.permissions, *b"r-xp");
+    assert_eq!(b_text.permissions, *b"r-xp");
+    for data in [b_data, a_data, reader_data] {
+        assert_eq!(data.permissions, *b"r--p");
+    }
+    let key = ObjectKey::of(a_text);
+    for entry in [b_data, b_text, a_data, reader_data] {
+        assert_eq!(
+            ObjectKey::of(entry),
+            key,
+            "actual lexical collision, not scripted keys"
+        );
+    }
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(std::fs::read(&a_path).unwrap()));
+    let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held-file pin").id;
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(userspace_index.map_files_keys().contains(&key));
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in [&caller, &wrong, &reader].into_iter().enumerate() {
+        let userspace = attribute_child(child, snapshots[position].clone(), &userspace_index);
+        let kernel = d4_kernel_collision_attribution(
+            child,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        assert_eq!(
+            userspace.members, kernel.members,
+            "exact same-population backend members"
+        );
+        assert_eq!(
+            userspace.losses, kernel.losses,
+            "same actual loss classifications"
+        );
+        for (backend, out) in [("userspace", userspace), ("kernel", kernel)] {
+            let members: Vec<_> = out.members.iter().map(|member| member.pid).collect();
+            match position {
+                0 => {
+                    assert_eq!(
+                        members,
+                        [caller.pid as u32],
+                        "{backend} exact healthy caller"
+                    );
+                    assert_eq!(
+                        out.members[0]
+                            .objects
+                            .iter()
+                            .map(|matched| (matched.key, matched.object))
+                            .collect::<Vec<_>>(),
+                        [(key, object)],
+                        "{backend} exact held original-provider edge"
+                    );
+                    assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+                    assert_eq!(out.probed, 1, "{backend} nonempty executable proof demand");
+                }
+                1 => {
+                    assert!(
+                        members.is_empty(),
+                        "{backend} attributed the distinct equal-byte file"
+                    );
+                    assert_eq!(
+                        out.losses,
+                        BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+                    );
+                    assert_eq!(out.probed, 1, "{backend} real negative proof demand");
+                }
+                2 => {
+                    assert!(
+                        members.is_empty(),
+                        "{backend} attributed a data-only mapping"
+                    );
+                    assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+                    assert_eq!(
+                        out.probed, 0,
+                        "{backend} data-only input costs no executable proof"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    eprintln!(
+        "D4_BTRFS_COLLISION callers={}/{}/{} userspace=1/0/0 kernel=1/0/0 \
+         equal_bytes=true lexical_collision=true fallback=none",
+        caller.pid, wrong.pid, reader.pid
+    );
+    drop((caller, wrong, reader));
+    drop((session, pins, a_file, b_file));
+    std::fs::remove_file(&a_path).unwrap();
+    std::fs::remove_file(&b_path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("b")).unwrap();
+}
+
+/// One child remaps an equal-byte, physically different Btrfs file at the
+/// same address and path, leaving its full maps bytes unchanged. Both actual
+/// backends must discard the old provider's edge and accept a fresh pin of
+/// the current provider. Each kernel leg installs a fresh real generation
+/// and validated slots; no fallback or userspace range proof may qualify.
+/// This is scan identity parity, not native calls or whole-row D4 readiness.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual same-line remap parity"]
+fn privileged_d4_btrfs_same_line_remap_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    fn file_identity(file: &std::fs::File) -> FileIdentity {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
+    fn assert_pair(
+        phase: &str,
+        child: &SwapChild,
+        expected: Option<(ObjectKey, PinnedObjectId)>,
+        userspace: SweepAttribution,
+        kernel: SweepAttribution,
+    ) {
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert_eq!(out.probed, 1, "{phase} {backend}: actual executable demand");
+            if let Some(edge) = expected {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [child.pid as u32],
+                    "{phase} {backend}: {:?}",
+                    out.member_losses
+                );
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object))
+                        .collect::<Vec<_>>(),
+                    [edge],
+                    "{phase} {backend}: exact held-provider edge"
+                );
+                assert!(
+                    out.losses.is_empty(),
+                    "{phase} {backend}: {:?}",
+                    out.member_losses
+                );
+            } else {
+                assert!(
+                    out.members.is_empty(),
+                    "{phase} {backend}: {:?}",
+                    out.members
+                );
+                assert_eq!(
+                    out.losses,
+                    BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)]),
+                    "{phase} {backend}: {:?}",
+                    out.member_losses
+                );
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "{phase}: exact backend members"
+        );
+        assert_eq!(
+            userspace.losses, kernel.losses,
+            "{phase}: actual loss classifications"
+        );
+    }
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let path = parent.join("a/libswap.so");
+    let replacement_path = parent.join("b/libswap.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::copy(&path, &replacement_path).unwrap();
+    let a_file = std::fs::File::open(&path).unwrap();
+    let b_file = std::fs::File::open(&replacement_path).unwrap();
+    let a_identity = file_identity(&a_file);
+    let b_identity = file_identity(&b_file);
+    assert_eq!(
+        a_identity.ino, b_identity.ino,
+        "fresh subvolumes repeat inode numbers"
+    );
+    assert_ne!(
+        a_identity, b_identity,
+        "the held physical files must differ"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "equal bytes verified through each held FD"
+        );
+    }
+
+    let child = SwapChild::spawn(&path);
+    let range = (child.address, child.address + 4096);
+    let maps_path = format!("/proc/{}/maps", child.pid);
+    let before_bytes = std::fs::read(&maps_path).unwrap();
+    let before = child.maps();
+    let line = before
+        .iter()
+        .find(|entry| (entry.start, entry.end) == range)
+        .expect("the child's actual executable mapping");
+    assert_eq!(line.permissions, *b"r-xp");
+    let key = ObjectKey::of(line);
+    // Independent fixture truth, outside the required kernel leg: these
+    // identities come from file metadata, never the lexical maps device.
+    let before_identity = map_files_identity(child.pid as u32, range.0, range.1).unwrap();
+    assert_eq!(before_identity, a_identity);
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let a_pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let a_object = a_pins.pinned().next().expect("actual old-provider pin").id;
+    assert_eq!(
+        file_identity(a_pins.file_for(a_object).unwrap()),
+        a_identity
+    );
+    let (a_index, refused) = KnownKeyIndex::build(
+        [(key, Some(a_object))],
+        &BTreeMap::from([(key, a_object)]),
+        [],
+        &a_pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(a_index.map_files_keys().contains(&key));
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    assert_pair(
+        "before: held A",
+        &child,
+        Some((key, a_object)),
+        attribute_child(&child, before.clone(), &a_index),
+        d4_kernel_collision_attribution(
+            &child,
+            before.clone(),
+            &a_pins,
+            a_object,
+            key,
+            &mut session,
+            1,
+        ),
+    );
+
+    std::fs::rename(parent.join("a"), parent.join("a.old")).unwrap();
+    std::fs::rename(parent.join("b"), parent.join("a")).unwrap();
+    child.remap();
+    let after = child.maps();
+    assert_eq!(
+        std::fs::read(&maps_path).unwrap(),
+        before_bytes,
+        "full maps bytes stay identical"
+    );
+    assert_eq!(
+        after, before,
+        "same ranges, offsets, permissions, keys and paths"
+    );
+    let after_identity = map_files_identity(child.pid as u32, range.0, range.1).unwrap();
+    assert_eq!(after_identity, b_identity, "the live mapping now holds B");
+    assert_ne!(
+        after_identity, before_identity,
+        "the physical file actually changed"
+    );
+    assert_pair(
+        "after: held A must mismatch",
+        &child,
+        None,
+        attribute_child(&child, after.clone(), &a_index),
+        d4_kernel_collision_attribution(
+            &child,
+            after.clone(),
+            &a_pins,
+            a_object,
+            key,
+            &mut session,
+            2,
+        ),
+    );
+
+    let b_pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let b_object = b_pins
+        .pinned()
+        .next()
+        .expect("actual current-provider pin")
+        .id;
+    assert_eq!(
+        file_identity(b_pins.file_for(b_object).unwrap()),
+        b_identity
+    );
+    let (b_index, refused) = KnownKeyIndex::build(
+        [(key, Some(b_object))],
+        &BTreeMap::from([(key, b_object)]),
+        [],
+        &b_pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(b_index.map_files_keys().contains(&key));
+    assert_pair(
+        "after: fresh held B",
+        &child,
+        Some((key, b_object)),
+        attribute_child(&child, after.clone(), &b_index),
+        d4_kernel_collision_attribution(&child, after, &b_pins, b_object, key, &mut session, 3),
+    );
+    for (file, expected) in [(&a_file, a_identity), (&b_file, b_identity)] {
+        assert_eq!(
+            file_identity(file),
+            expected,
+            "held physical files remain unchanged"
+        );
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes);
+    }
+    eprintln!(
+        "D4_BTRFS_SAME_LINE caller={} userspace=1/0/1 kernel=1/0/1 \
+         equal_bytes=true identical_maps=true changed_file=true generations=1/2/3 fallback=none",
+        child.pid
+    );
+    drop(child);
+    drop((session, a_pins, b_pins, a_file, b_file));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(parent.join("a.old/libswap.so")).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("a.old")).unwrap();
+}
+
+/// A real executable mapping survives unlink with the held file's identity
+/// and bytes intact. Both actual backends first prove its edge, then the
+/// production deleted-path filter must name DeletedMapping without another
+/// confirmation or executable proof. Keep the validated pre-unlink anchor
+/// pass alive: unlink may change ctime, so this does not invent a current pin
+/// or bypass an unchanged-file guard. Whole D4 rows remain separate gates.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual deleted-mapping parity"]
+fn privileged_d4_btrfs_deleted_mapping_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::{
+        AnchorPass, ExaminedCustody, IdentitySession, KernelMemberProbe,
+    };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use std::sync::{Arc, Mutex};
+
+    // The production OsMemberProbe's delegation, retaining an observable
+    // actual OsConfirmIo so zero post-unlink proof reads are checkable.
+    struct UserspaceProbe<'p>(OsConfirmIo<'p>);
+
+    impl MemberProbe for UserspaceProbe<'_> {
+        fn confirm(
+            &mut self,
+            pid: u32,
+            prove: &BTreeSet<ObjectKey>,
+            budget: &mut CaptureWorkBudget,
+        ) -> Confirmation {
+            confirm_with(&mut self.0, pid, prove, budget)
+        }
+
+        fn stat_ranges(
+            &mut self,
+            pid: u32,
+            ranges: &[(u64, u64)],
+            budget: &mut CaptureWorkBudget,
+        ) -> MappedIdentities {
+            stat_unpinned(&mut self.0, pid, ranges, budget)
+        }
+    }
+
+    fn attribute(
+        child: &SwapChild,
+        snapshot: Vec<MapEntry>,
+        index: &KnownKeyIndex,
+        probe: &mut dyn MemberProbe,
+    ) -> (SweepAttribution, u64) {
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.has_collection_work(),
+            "actual kernel path, no scoped fallback"
+        );
+        let out = attribute_unselected(
+            &[(child.pid as u32, snapshot)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            index,
+            probe,
+            &mut budget,
+        );
+        (out, budget.work_units_count())
+    }
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let path = dir.path().join("libdeleted.so");
+    let bytes = vec![0x5au8; 8192];
+    std::fs::write(&path, &bytes).unwrap();
+    let held_file = std::fs::File::open(&path).unwrap();
+    let held = held_file.metadata().unwrap();
+    let physical_id = (held.dev(), held.ino());
+    let mut held_bytes = vec![0; bytes.len()];
+    held_file.read_exact_at(&mut held_bytes, 0).unwrap();
+    assert_eq!(held_bytes, bytes);
+
+    let child = SwapChild::spawn(&path);
+    let range = (child.address, child.address + 4096);
+    let before = child.maps();
+    let position = before
+        .iter()
+        .position(|entry| (entry.start, entry.end) == range)
+        .expect("the child's actual executable mapping");
+    assert_eq!(before[position].permissions, *b"r-xp");
+    let key = ObjectKey::of(&before[position]);
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let object = pins
+        .pinned()
+        .next()
+        .expect("actual pre-unlink held-file pin")
+        .id;
+    let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+    assert_eq!((pinned.dev(), pinned.ino()), physical_id);
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(userspace_index.map_files_keys().contains(&key));
+    let mut kernel_index = userspace_index.clone();
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    let owner = ReservationOwner::for_examined(
+        SegmentPolicy::try_snapshot(0, 0).expect("actual FD census"),
+        0,
+    );
+    let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+    custody
+        .reconcile(SegmentPolicy::try_snapshot(1, 1).expect("actual confirmation FD census"))
+        .expect("shared physical reservation owner");
+    let pass = AnchorPass::prepare(&pins, [(key, object)], custody);
+    assert!(pass.fallback.is_empty(), "{:?}", pass.fallback);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut installed = session
+        .install_anchors(pass, 1, deadline)
+        .expect("install actual pre-unlink held-file anchors");
+    let userspace_trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let kernel_trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let mut userspace_probe =
+        UserspaceProbe(OsConfirmIo::with_pool(None).observing(userspace_trace.clone()));
+    let mut kernel_probe = KernelMemberProbe::new(
+        &mut installed,
+        OsConfirmIo::with_pool(None).observing(kernel_trace.clone()),
+        deadline,
+    );
+    kernel_probe
+        .install_expectations(&mut kernel_index)
+        .expect("actual validated pre-unlink anchor expectations");
+    assert!(
+        kernel_index
+            .match_slots
+            .get(&key)
+            .is_some_and(|slots| !slots.is_empty()),
+        "the held provider has no validated actual kernel slot"
+    );
+    let (userspace_before, _) = attribute(
+        &child,
+        before.clone(),
+        &userspace_index,
+        &mut userspace_probe,
+    );
+    let (kernel_before, _) = attribute(&child, before.clone(), &kernel_index, &mut kernel_probe);
+    for (backend, out) in [("userspace", &userspace_before), ("kernel", &kernel_before)] {
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [child.pid as u32],
+            "{backend}: {:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            out.members[0]
+                .objects
+                .iter()
+                .map(|matched| (matched.key, matched.object))
+                .collect::<Vec<_>>(),
+            [(key, object)],
+            "{backend}: exact pre-unlink provider edge"
+        );
+        assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+        assert_eq!(
+            out.probed, 1,
+            "{backend}: nonempty pre-unlink executable demand"
+        );
+    }
+    assert_eq!(userspace_before.members, kernel_before.members);
+    {
+        let mut trace = userspace_trace.lock().unwrap();
+        assert_eq!(
+            trace.reads.len(),
+            1,
+            "positive twin observes an actual userspace proof read"
+        );
+        let (pid, start, end, _, _) = &trace.reads[0];
+        assert_eq!((*pid, *start, *end), (child.pid as u32, range.0, range.1));
+        trace.reads.clear();
+    }
+    assert!(
+        kernel_trace.lock().unwrap().reads.is_empty(),
+        "required kernel positive used userspace proof reads"
+    );
+
+    // Preserve the same live VMA and validated installation across unlink;
+    // only the production path-eligibility fact changes for this observation.
+    std::fs::remove_file(&path).unwrap();
+    assert!(!path.exists(), "the owned pathname really was unlinked");
+    let after = child.maps();
+    let mut expected = before;
+    expected[position]
+        .raw_path
+        .as_mut()
+        .expect("the mapped pathname")
+        .extend_from_slice(b" (deleted)");
+    assert_eq!(
+        after, expected,
+        "same live mapping except the actual deleted-path flag"
+    );
+    assert!(
+        is_caller_range(&after[position]),
+        "the executable caller population is nonempty"
+    );
+    let held_after = held_file.metadata().unwrap();
+    assert_eq!((held_after.dev(), held_after.ino()), physical_id);
+    assert_eq!(
+        held_after.nlink(),
+        0,
+        "the live held file has no remaining pathname"
+    );
+    assert_eq!(held_after.len(), bytes.len() as u64);
+    held_file.read_exact_at(&mut held_bytes, 0).unwrap();
+    assert_eq!(
+        held_bytes, bytes,
+        "unlink preserved the independently held file's bytes"
+    );
+
+    let (userspace_after, userspace_work) = attribute(
+        &child,
+        after.clone(),
+        &userspace_index,
+        &mut userspace_probe,
+    );
+    let (kernel_after, kernel_work) = attribute(&child, after, &kernel_index, &mut kernel_probe);
+    for (backend, out, work) in [
+        ("userspace", &userspace_after, userspace_work),
+        ("kernel", &kernel_after, kernel_work),
+    ] {
+        assert!(out.members.is_empty(), "{backend}: {:?}", out.members);
+        assert_eq!(
+            out.losses,
+            BTreeMap::from([(AttributionLoss::DeletedMapping, 1)]),
+            "{backend}: {:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            out.member_losses
+                .get(&(child.pid as u32))
+                .map(|(loss, _)| *loss),
+            Some(AttributionLoss::DeletedMapping)
+        );
+        assert_eq!(
+            out.probed, 0,
+            "{backend}: deleted mapping needs no confirmation"
+        );
+        assert_eq!(
+            work, 0,
+            "{backend}: deleted mapping needs no executable proof work"
+        );
+        assert_eq!(out.unavailable, 0);
+        assert!(
+            out.exited.is_empty(),
+            "{backend}: the mapped child is still alive"
+        );
+    }
+    assert_eq!(userspace_after.losses, kernel_after.losses);
+    assert!(
+        userspace_trace.lock().unwrap().reads.is_empty(),
+        "deleted userspace leg read a map_files proof"
+    );
+    assert!(
+        kernel_trace.lock().unwrap().reads.is_empty(),
+        "deleted kernel leg read a userspace proof"
+    );
+    drop((userspace_probe, kernel_probe));
+    drop(installed);
+    let fallback = session.fallback_totals();
+    assert_eq!(fallback.passes, 0, "{fallback:?}");
+    assert_eq!(fallback.pids, 0, "{fallback:?}");
+    assert_eq!(fallback.keys, 0, "{fallback:?}");
+    assert!(fallback.first_reason.is_none(), "{fallback:?}");
+    eprintln!(
+        "D4_BTRFS_DELETED caller={} userspace=1/0 kernel=1/0 deleted_mapping=1/1 \
+         after_probed=0/0 after_proof_reads=0/0 held_file_stable=true generation=1 fallback=none",
+        child.pid
+    );
+    drop(child);
+    drop((session, pins, held_file));
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned unlinked-file fixture directory");
+}
+
+/// A hardlink's executable mapping attributes to a pin opened through the
+/// original name, using both actual backends over the same live population.
+/// An equal-byte copy has its own unexamined key, and an alias mapped only
+/// as data has no executable proof demand. Create all names before pinning
+/// so the hardlink's ctime change is not confused with identity rejection.
+/// This qualifies alias attribution only; whole D4 rows remain separate.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual hardlink alias parity"]
+fn privileged_d4_btrfs_hardlink_alias_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let original_path = dir.path().join("liboriginal.so");
+    let alias_path = dir.path().join("libalias.so");
+    let copy_path = dir.path().join("libcopy.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&original_path, &bytes).unwrap();
+    std::fs::hard_link(&original_path, &alias_path).unwrap();
+    std::fs::copy(&original_path, &copy_path).unwrap();
+    let original_file = std::fs::File::open(&original_path).unwrap();
+    let alias_file = std::fs::File::open(&alias_path).unwrap();
+    let copy_file = std::fs::File::open(&copy_path).unwrap();
+    let original = original_file.metadata().unwrap();
+    let alias = alias_file.metadata().unwrap();
+    let copy = copy_file.metadata().unwrap();
+    let original_id = (original.dev(), original.ino());
+    let alias_id = (alias.dev(), alias.ino());
+    let copy_id = (copy.dev(), copy.ino());
+    assert_eq!(alias_id, original_id, "actual hardlink physical identity");
+    assert_eq!(original.nlink(), 2);
+    assert_eq!(alias.nlink(), 2);
+    assert_ne!(
+        copy_id, original_id,
+        "the equal-byte copy is a different held file"
+    );
+    for file in [&original_file, &alias_file, &copy_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes, "contents checked through each held FD");
+    }
+
+    let caller = SwapChild::spawn(&alias_path);
+    let copied = SwapChild::spawn(&copy_path);
+    let reader = SwapChild::spawn_with(&[(&alias_path, false)]);
+    let snapshots = [caller.maps(), copied.maps(), reader.maps()];
+    let line_at = |position: usize, child: &SwapChild| {
+        snapshots[position]
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (child.address, child.address + 4096))
+            .expect("independent actual mapping")
+    };
+    let alias_text = line_at(0, &caller);
+    let copy_text = line_at(1, &copied);
+    let alias_data = line_at(2, &reader);
+    assert_eq!(alias_text.permissions, *b"r-xp");
+    assert_eq!(copy_text.permissions, *b"r-xp");
+    assert_eq!(alias_data.permissions, *b"r--p");
+    for entry in [alias_text, alias_data] {
+        assert_eq!(
+            entry.raw_path.as_deref(),
+            Some(alias_path.as_os_str().as_encoded_bytes())
+        );
+    }
+    assert_eq!(
+        copy_text.raw_path.as_deref(),
+        Some(copy_path.as_os_str().as_encoded_bytes())
+    );
+    let key = ObjectKey::of(alias_text);
+    let copy_key = ObjectKey::of(copy_text);
+    assert_eq!(ObjectKey::of(alias_data), key);
+    assert_ne!(
+        copy_key, key,
+        "the actual copy has its own lexical maps key"
+    );
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&original_path, Some(key), 0, &digest);
+    let pin = pins
+        .pinned()
+        .next()
+        .expect("actual pin opened through the original name");
+    let object = pin.id;
+    assert_eq!(pin.path, original_path.to_str().unwrap());
+    let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+    assert_eq!((pinned.dev(), pinned.ino()), original_id);
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    let proof_keys = userspace_index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    assert_eq!(userspace_index.classify(copy_key), KeyClass::Unexamined);
+    assert_eq!(
+        proof_ranges(&snapshots[0], &proof_keys),
+        [(caller.address, caller.address + 4096)]
+    );
+    for snapshot in &snapshots[1..] {
+        assert!(
+            proof_ranges(snapshot, &proof_keys).is_empty(),
+            "copy and data-only mappings have no provider proof demand"
+        );
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in [&caller, &copied, &reader].into_iter().enumerate() {
+        let userspace = attribute_child(child, snapshots[position].clone(), &userspace_index);
+        let kernel = d4_kernel_collision_attribution(
+            child,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            assert_eq!(out.unavailable, 0);
+            assert!(out.exited.is_empty(), "{backend}: an owned child exited");
+            if position == 0 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [caller.pid as u32],
+                    "{backend}: exact alias caller"
+                );
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, alias_path.to_str().unwrap())],
+                    "{backend}: the original pin is reached through the real alias path"
+                );
+                assert_eq!(
+                    out.probed, 1,
+                    "{backend}: nonempty alias executable proof demand"
+                );
+            } else {
+                assert!(out.members.is_empty(), "{backend}: {:?}", out.members);
+                assert_eq!(
+                    out.probed, 0,
+                    "{backend}: no executable proof for a copy's unknown key or a data-only alias"
+                );
+                if position == 1 {
+                    assert!(
+                        out.unexamined_objects.contains(&copy_key),
+                        "{backend}: the copy remains honestly unexamined"
+                    );
+                    assert!(
+                        out.unexamined
+                            .get(&(copied.pid as u32))
+                            .is_some_and(|count| *count > 0)
+                    );
+                } else {
+                    assert!(
+                        !out.unexamined_objects.contains(&key),
+                        "{backend}: data-only alias is not an unexamined caller"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "exact independently checked backend members"
+        );
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(userspace.unexamined_objects, kernel.unexamined_objects);
+        assert_eq!(userspace.unexamined, kernel.unexamined);
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("recheck the actual pin"),
+        "all hardlinks were created before pinning"
+    );
+    for (file, expected) in [
+        (&original_file, original_id),
+        (&alias_file, alias_id),
+        (&copy_file, copy_id),
+    ] {
+        let metadata = file.metadata().unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), expected);
+        assert_eq!(metadata.len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes, "held physical files remain unchanged");
+    }
+    eprintln!(
+        "D4_BTRFS_HARDLINK callers={}/{}/{} userspace=1/0/0 kernel=1/0/0 \
+         same_file_alias=true equal_bytes_copy=true copy=unexamined generations=1/2/3 fallback=none",
+        caller.pid, copied.pid, reader.pid
+    );
+    drop((caller, copied, reader));
+    drop((session, pins, original_file, alias_file, copy_file));
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned hardlink fixture directory and files");
+}
+
+/// The same alias pathname names A in child-private bind namespaces and an
+/// equal-byte, physically different B in the observer's namespace. Actual
+/// attribution must follow the live mapping and held A pin on both backends;
+/// opening that pathname in the observer would reach the wrong file.
+/// This is one bind substrate control, not whole-row D4 qualification.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR, private mount namespaces and eligible BTF/task_vma identity; actual bind alias parity"]
+fn privileged_d4_btrfs_bind_alias_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    let namespace_id = |pid: u32| {
+        let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt")).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let original_path = dir.path().join("liboriginal.so");
+    let alias_path = dir.path().join("libalias.so");
+    let bytes = vec![0x5au8; 8192];
+    std::fs::write(&original_path, &bytes).unwrap();
+    std::fs::copy(&original_path, &alias_path).unwrap();
+    let a_file = std::fs::File::open(&original_path).unwrap();
+    let b_file = std::fs::File::open(&alias_path).unwrap();
+    let a = a_file.metadata().unwrap();
+    let b = b_file.metadata().unwrap();
+    let a_identity = FileIdentity {
+        dev: a.dev(),
+        ino: a.ino(),
+    };
+    let b_identity = FileIdentity {
+        dev: b.dev(),
+        ino: b.ino(),
+    };
+    assert_ne!(
+        a_identity, b_identity,
+        "parent alias is an actual different physical file"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "equal bytes independently read from held FDs"
+        );
+    }
+    let parent_namespace = namespace_id(std::process::id());
+    let parent_mounts = std::fs::read("/proc/self/mountinfo").unwrap();
+    let parent_unchanged = || {
+        assert_eq!(namespace_id(std::process::id()), parent_namespace);
+        assert_eq!(
+            std::fs::read("/proc/self/mountinfo").unwrap(),
+            parent_mounts,
+            "parent mount tree and propagation remain unchanged"
+        );
+        let current = std::fs::metadata(&alias_path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (b_identity.dev, b_identity.ino),
+            "the parent alias still opens B"
+        );
+    };
+    let (caller, caller_identity) =
+        SwapChild::spawn_private_bind(&original_path, &a_file, &alias_path, true)
+            .expect("required private bind setup; namespace/mount refusal cannot qualify");
+    parent_unchanged();
+    let copied = SwapChild::spawn(&alias_path);
+    let (reader, reader_identity) =
+        SwapChild::spawn_private_bind(&original_path, &a_file, &alias_path, false)
+            .expect("required data-only private bind setup; refusal cannot qualify");
+    parent_unchanged();
+    assert_eq!(caller_identity, a_identity, "mmap used an FD of held A");
+    assert_eq!(
+        reader_identity, a_identity,
+        "data mapping used an FD of held A"
+    );
+    assert_ne!(namespace_id(caller.pid as u32), parent_namespace);
+    assert_ne!(namespace_id(reader.pid as u32), parent_namespace);
+    assert_ne!(
+        namespace_id(caller.pid as u32),
+        namespace_id(reader.pid as u32)
+    );
+    assert_eq!(namespace_id(copied.pid as u32), parent_namespace);
+    for child in [&caller, &reader] {
+        let mountinfo = std::fs::read_to_string(format!("/proc/{}/mountinfo", child.pid)).unwrap();
+        d4_private_bind_mount(&mountinfo, &alias_path)
+            .expect("actual private Btrfs alias mount in the child's namespace");
+    }
+    let snapshots = [caller.maps(), copied.maps(), reader.maps()];
+    let line_at = |position: usize, child: &SwapChild| {
+        snapshots[position]
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (child.address, child.address + 4096))
+            .expect("the actual live mapping")
+    };
+    let bound_text = line_at(0, &caller);
+    let copy_text = line_at(1, &copied);
+    let bound_data = line_at(2, &reader);
+    assert_eq!(bound_text.permissions, *b"r-xp");
+    assert_eq!(copy_text.permissions, *b"r-xp");
+    assert_eq!(bound_data.permissions, *b"r--p");
+    for entry in [bound_text, copy_text, bound_data] {
+        assert_eq!(
+            entry.raw_path.as_deref(),
+            Some(alias_path.as_os_str().as_encoded_bytes()),
+            "the same actual maps pathname denotes different files by namespace"
+        );
+    }
+    // Independent fixture truth, outside the required kernel legs. File
+    // metadata is never compared with the lexical maps device domain.
+    for (child, expected) in [
+        (&caller, a_identity),
+        (&copied, b_identity),
+        (&reader, a_identity),
+    ] {
+        assert_eq!(
+            map_files_identity(child.pid as u32, child.address, child.address + 4096).unwrap(),
+            expected
+        );
+    }
+    let key = ObjectKey::of(bound_text);
+    let copy_key = ObjectKey::of(copy_text);
+    assert_eq!(ObjectKey::of(bound_data), key);
+    assert_ne!(copy_key, key);
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&original_path, Some(key), 0, &digest);
+    let pin = pins.pinned().next().expect("actual original-file pin");
+    let object = pin.id;
+    assert_eq!(pin.path, original_path.to_str().unwrap());
+    let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+    assert_eq!(
+        (pinned.dev(), pinned.ino()),
+        (a_identity.dev, a_identity.ino)
+    );
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(userspace_index.classify(copy_key), KeyClass::Unexamined);
+    let proof_keys = userspace_index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    assert_eq!(
+        proof_ranges(&snapshots[0], &proof_keys),
+        [(caller.address, caller.address + 4096)]
+    );
+    for snapshot in &snapshots[1..] {
+        assert!(proof_ranges(snapshot, &proof_keys).is_empty());
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in [&caller, &copied, &reader].into_iter().enumerate() {
+        let userspace = attribute_child(child, snapshots[position].clone(), &userspace_index);
+        let kernel = d4_kernel_collision_attribution(
+            child,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            assert_eq!(out.unavailable, 0);
+            assert!(out.exited.is_empty());
+            if position == 0 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [caller.pid as u32]
+                );
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, alias_path.to_str().unwrap())],
+                    "{backend}: bind alias attributes held A despite parent pathname B"
+                );
+                assert_eq!(
+                    out.probed, 1,
+                    "{backend}: actual executable positive demand"
+                );
+            } else {
+                assert!(out.members.is_empty(), "{backend}: {:?}", out.members);
+                assert_eq!(
+                    out.probed, 0,
+                    "{backend}: unknown copy/data-only alias needs no provider proof"
+                );
+                if position == 1 {
+                    assert!(
+                        out.unexamined_objects.contains(&copy_key),
+                        "{backend}: the same-path parent copy remains unexamined"
+                    );
+                    assert!(
+                        out.unexamined
+                            .get(&(copied.pid as u32))
+                            .is_some_and(|count| *count > 0)
+                    );
+                } else {
+                    assert!(!out.unexamined_objects.contains(&key));
+                }
+            }
+        }
+        assert_eq!(userspace.members, kernel.members);
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(userspace.unexamined_objects, kernel.unexamined_objects);
+        assert_eq!(userspace.unexamined, kernel.unexamined);
+        parent_unchanged();
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("actual pin remains unchanged")
+    );
+    for (file, expected) in [(&a_file, a_identity), (&b_file, b_identity)] {
+        let metadata = file.metadata().unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (expected.dev, expected.ino)
+        );
+        assert_eq!(metadata.len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes);
+    }
+    eprintln!(
+        "D4_BTRFS_BIND callers={}/{}/{} userspace=1/0/0 kernel=1/0/0 parent_alias=B child_alias=A private_namespaces=true parent_mounts_unchanged=true generations=1/2/3 fallback=none",
+        caller.pid, copied.pid, reader.pid
+    );
+    // No retained namespace/root/map_files handles remain. Reaping the
+    // children releases their private namespaces and bind mounts; the
+    // parent never performs setns or an unmount.
+    drop((session, pins));
+    drop((caller, copied, reader));
+    parent_unchanged();
+    drop((a_file, b_file));
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned bind fixture files and directory");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct D4ThreadReady {
+    token: String,
+    tgid: u32,
+    tid: u32,
+    fd: i32,
+    start: u64,
+    end: u64,
+    dev: u64,
+    ino: u64,
+}
+
+fn d4_validate_thread_ready(
+    ready: &D4ThreadReady,
+    pid: u32,
+    token: &str,
+) -> Result<(), &'static str> {
+    if ready.token != token || ready.tgid != pid || pid == 0 {
+        return Err("wrong helper process or token");
+    }
+    if ready.tid == 0 || ready.tid == pid {
+        return Err("mapping did not come from a nonleader");
+    }
+    if ready.fd < 3
+        || ready.start == 0
+        || ready.start.checked_add(4096) != Some(ready.end)
+        || ready.ino == 0
+    {
+        return Err("invalid opened-file mapping reply");
+    }
+    Ok(())
+}
+
+fn d4_write_thread_ready(
+    stream: &mut std::os::unix::net::UnixStream,
+    ready: &D4ThreadReady,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let bytes = serde_json::to_vec(ready).map_err(std::io::Error::other)?;
+    if bytes.is_empty() || bytes.len() > 1024 {
+        return Err(std::io::Error::other("thread READY exceeds its bound"));
+    }
+    stream.write_all(&(bytes.len() as u32).to_ne_bytes())?;
+    stream.write_all(&bytes)
+}
+
+fn d4_read_thread_ready(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> std::io::Result<D4ThreadReady> {
+    use std::io::Read as _;
+    let mut size = [0; 4];
+    stream.read_exact(&mut size)?;
+    let size = u32::from_ne_bytes(size) as usize;
+    if size == 0 || size > 1024 {
+        return Err(std::io::Error::other("invalid thread READY length"));
+    }
+    let mut bytes = vec![0; size];
+    stream.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+}
+
+fn d4_thread_fd_identity(path: &std::path::Path) -> std::io::Result<Option<FileIdentity>> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn d4_check_thread_file_table(
+    private: bool,
+    worker: FileIdentity,
+    leader: Option<FileIdentity>,
+) -> Result<(), &'static str> {
+    if private == (leader == Some(worker)) {
+        return Err("actual leader/worker FD evidence disagrees with the requested table state");
+    }
+    Ok(())
+}
+
+struct D4ThreadChild {
+    child: std::process::Child,
+    channel: std::os::unix::net::UnixStream,
+    reaped: bool,
+}
+
+impl D4ThreadChild {
+    fn spawn(path: &std::path::Path, private: bool, token: &str) -> (Self, D4ThreadReady) {
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let (channel, helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        helper
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        helper
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::sweep_attribution::tests::d4_thread_mapping_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("P11SCOPE_D4_THREAD_PATH", path)
+            .env(
+                "P11SCOPE_D4_THREAD_MODE",
+                if private { "private" } else { "shared" },
+            )
+            .env("P11SCOPE_D4_THREAD_TOKEN", token)
+            .stdin(Stdio::from(OwnedFd::from(helper)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .die_with_parent()
+            .spawn()
+            .expect("fresh exec of the matching libtest helper");
+        // Own the process before any fallible READY I/O or validation.
+        let mut owned = Self {
+            child,
+            channel,
+            reaped: false,
+        };
+        let ready = d4_read_thread_ready(&mut owned.channel)
+            .expect("required actual thread READY; helper refusal cannot qualify");
+        d4_validate_thread_ready(&ready, owned.child.id(), token)
+            .expect("owned helper and actual nonleader mapping");
+        (owned, ready)
+    }
+
+    fn maps(&self) -> Vec<MapEntry> {
+        crate::discovery::scan::read_maps_or_refuse(
+            std::fs::File::open(format!("/proc/{}/maps", self.child.id())).unwrap(),
+            &mut CaptureWorkBudget::default(),
+            crate::attach::monotonic_ns,
+        )
+        .unwrap()
+    }
+
+    fn verify_worker(&self, ready: &D4ThreadReady, expected: FileIdentity, private: bool) -> u64 {
+        let pid = self.child.id();
+        assert_eq!(ready.tgid, pid);
+        let start_time = crate::process::process_start_time(pid).expect("owned helper is alive");
+        assert!(
+            !crate::process::process_is_zombie(pid),
+            "the leader must remain live"
+        );
+        for tid in [pid, ready.tid] {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status"))
+                .expect("actual live leader and worker status");
+            let field = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .expect("actual task status identity field")
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap()
+            };
+            assert_eq!(field("Tgid:"), pid);
+            assert_eq!(field("Pid:"), tid);
+        }
+        let worker = d4_thread_fd_identity(std::path::Path::new(&format!(
+            "/proc/{pid}/task/{}/fd/{}",
+            ready.tid, ready.fd
+        )))
+        .expect("inspect actual worker FD")
+        .expect("worker must hold its opened file");
+        assert_eq!(
+            worker,
+            FileIdentity {
+                dev: ready.dev,
+                ino: ready.ino
+            }
+        );
+        assert_eq!(
+            worker, expected,
+            "worker FD must name the independently held file"
+        );
+        let leader = d4_thread_fd_identity(std::path::Path::new(&format!(
+            "/proc/{pid}/fd/{}",
+            ready.fd
+        )))
+        .expect("inspect leader same-number FD; only absence is acceptable refusal");
+        d4_check_thread_file_table(private, worker, leader)
+            .expect("independent leader/worker FD-table evidence");
+        start_time
+    }
+
+    fn finish(mut self) {
+        use std::io::Write as _;
+        self.channel
+            .write_all(b"Q")
+            .expect("release the exact held worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    assert!(status.success(), "thread helper failed: {status}");
+                    return;
+                }
+                Ok(None) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "thread helper did not exit after release"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("cannot reap the owned thread helper: {error}"),
+            }
+        }
+    }
+}
+
+impl Drop for D4ThreadChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        loop {
+            match self.child.wait() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Private entrypoint, never a standalone qualification. Rust worker creation
+/// happens only after exec; CLONE_FILES is unshared only in that owned worker.
+#[test]
+#[ignore = "private D4 thread fixture entrypoint; invoked only by its owning parity test with an owned socket/configuration"]
+fn d4_thread_mapping_helper() {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::MetadataExt as _;
+    let path = std::env::var_os("P11SCOPE_D4_THREAD_PATH").expect("owned helper source path");
+    let token = std::env::var("P11SCOPE_D4_THREAD_TOKEN").expect("owning fixture token");
+    assert!(!token.is_empty());
+    let private = match std::env::var("P11SCOPE_D4_THREAD_MODE").as_deref() {
+        Ok("private") => true,
+        Ok("shared") => false,
+        _ => panic!("owning fixture must select the actual FD-table mode"),
+    };
+    // SAFETY: duplicate only the stdin socket supplied by the owning fixture.
+    let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(raw >= 0, "duplicate the owned helper channel");
+    // SAFETY: fcntl returned a new fd, adopted once as this socket's owner.
+    let socket = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    socket
+        .peer_addr()
+        .expect("owning fixture must supply a connected Unix socket as stdin");
+    std::thread::spawn(move || {
+        let mut socket = socket;
+        let tgid = std::process::id();
+        // SAFETY: gettid has no arguments and identifies this actual worker.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+        assert_ne!(tgid, tid, "the mapping worker must be a nonleader");
+        if private {
+            // SAFETY: only this fresh-exec worker's FD table is detached.
+            let status = unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FILES) };
+            assert_eq!(
+                status,
+                0,
+                "required private FD table refused: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Open AFTER unshare: the leader's corresponding descriptor must not
+        // acquire this file in private mode. Keep the worker FD through proof.
+        let file = std::fs::File::open(path).expect("open the worker's actual source");
+        let metadata = file.metadata().unwrap();
+        // SAFETY: one read/execute private page from the actual live file fd.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED, "worker mmap failed");
+        struct Mapping(*mut libc::c_void);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: this worker exclusively owns the one-page mapping.
+                unsafe {
+                    libc::munmap(self.0, 4096);
+                }
+            }
+        }
+        let mapping = Mapping(address);
+        let ready = D4ThreadReady {
+            token,
+            tgid,
+            tid,
+            fd: file.as_raw_fd(),
+            start: address as u64,
+            end: address as u64 + 4096,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        d4_write_thread_ready(&mut socket, &ready).expect("report actual worker FD/VMA identity");
+        let mut command = [0];
+        socket
+            .read_exact(&mut command)
+            .expect("owning fixture must release its held worker");
+        assert_eq!(command, *b"Q");
+        drop(mapping);
+        drop(file);
+    })
+    .join()
+    .expect("owned mapping worker must finish successfully");
+}
+
+#[test]
+fn d4_thread_ready_protocol_rejects_wrong_process_thread_and_ranges() {
+    use std::io::Write as _;
+    let healthy = D4ThreadReady {
+        token: "owned".into(),
+        tgid: 101,
+        tid: 102,
+        fd: 4,
+        start: 0x1000,
+        end: 0x2000,
+        dev: 37,
+        ino: 123,
+    };
+    assert_eq!(d4_validate_thread_ready(&healthy, 101, "owned"), Ok(()));
+    let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    d4_write_thread_ready(&mut writer, &healthy).unwrap();
+    let read = d4_read_thread_ready(&mut reader).unwrap();
+    assert_eq!(
+        read, healthy,
+        "actual READY frame retains every reported field"
+    );
+    assert_eq!(d4_validate_thread_ready(&read, 101, "owned"), Ok(()));
+    let mut invalid = Vec::new();
+    let mut bad = healthy.clone();
+    bad.token = "foreign".into();
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.tgid = 103;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.tid = 101;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.tid = 0;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.fd = 0;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.end += 1;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.start = u64::MAX;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.ino = 0;
+    invalid.push(bad);
+    for bad in invalid {
+        assert!(d4_validate_thread_ready(&bad, 101, "owned").is_err());
+        assert_eq!(d4_validate_thread_ready(&healthy, 101, "owned"), Ok(()));
+    }
+    writer.write_all(&1025u32.to_ne_bytes()).unwrap();
+    assert!(
+        d4_read_thread_ready(&mut reader).is_err(),
+        "oversize frame refused before any payload read"
+    );
+}
+
+#[test]
+fn d4_thread_file_table_oracle_requires_actual_shared_or_private_evidence() {
+    let a = FileIdentity { dev: 37, ino: 123 };
+    let b = FileIdentity { dev: 38, ino: 123 };
+    assert_eq!(d4_check_thread_file_table(false, a, Some(a)), Ok(()));
+    for other in [None, Some(b)] {
+        assert!(d4_check_thread_file_table(false, a, other).is_err());
+        assert_eq!(d4_check_thread_file_table(true, a, other), Ok(()));
+        assert_eq!(d4_check_thread_file_table(false, a, Some(a)), Ok(()));
+    }
+    assert!(d4_check_thread_file_table(true, a, Some(a)).is_err());
+    assert_eq!(d4_check_thread_file_table(true, a, Some(b)), Ok(()));
+}
+
+/// A live nonleader maps A with either the shared or its own private FD
+/// table; the live leader's TGID must attribute A on both actual backends.
+/// A third private-table worker maps an equal-byte Btrfs-key collision B,
+/// which must be a real identity mismatch. This observes private files
+/// after unshare; literal clone birth, zombie leaders, active capture and
+/// native provider calls remain separate obligations.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR, worker CLONE_FILES unshare and eligible BTF/task_vma identity; actual live-thread parity"]
+fn privileged_d4_btrfs_live_thread_private_files_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let a_path = parent.join("a/libthread.so");
+    let b_path = parent.join("b/libthread.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&a_path, &bytes).unwrap();
+    std::fs::copy(&a_path, &b_path).unwrap();
+    let a_file = std::fs::File::open(&a_path).unwrap();
+    let b_file = std::fs::File::open(&b_path).unwrap();
+    let identity = |file: &std::fs::File| {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let a = identity(&a_file);
+    let b = identity(&b_file);
+    assert_eq!(
+        a.ino, b.ino,
+        "fresh subvolume files must share an inode number"
+    );
+    assert_ne!(
+        a, b,
+        "the collision files must have different physical identities"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes, "actual held equal-byte input");
+    }
+
+    let (shared, shared_ready) = D4ThreadChild::spawn(&a_path, false, "owned-shared-a");
+    let (private, private_ready) = D4ThreadChild::spawn(&a_path, true, "owned-private-a");
+    let (wrong, wrong_ready) = D4ThreadChild::spawn(&b_path, true, "owned-private-b");
+    let children = [&shared, &private, &wrong];
+    let ready = [&shared_ready, &private_ready, &wrong_ready];
+    let expected_files = [a, a, b];
+    let paths = [&a_path, &a_path, &b_path];
+    let start_times: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(position, child)| {
+            child.verify_worker(ready[position], expected_files[position], position != 0)
+        })
+        .collect();
+    for report in ready {
+        eprintln!(
+            "D4_THREAD_WORKER caller={} tid={} fd={} range={:x}-{:x} file={}:{}",
+            report.tgid, report.tid, report.fd, report.start, report.end, report.dev, report.ino
+        );
+    }
+    let snapshots = [shared.maps(), private.maps(), wrong.maps()];
+    let mut fixture_lines = Vec::new();
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        let report = ready[position];
+        let line = snapshot
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (report.start, report.end))
+            .expect("the actual worker's exact live VMA");
+        assert_eq!(line.permissions, *b"r-xp");
+        assert_eq!(line.file_offset, 0);
+        assert_eq!(
+            line.raw_path.as_deref(),
+            Some(paths[position].as_os_str().as_encoded_bytes())
+        );
+        assert!(
+            is_caller_range(line),
+            "each real worker has executable proof demand"
+        );
+        assert_eq!(
+            map_files_identity(report.tgid, line.start, line.end)
+                .expect("independent live vm_file identity"),
+            expected_files[position]
+        );
+        fixture_lines.push(line.clone());
+    }
+    let key = ObjectKey::of(&fixture_lines[0]);
+    for line in &fixture_lines {
+        assert_eq!(ObjectKey::of(line), key, "actual Btrfs maps-key collision");
+    }
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held A pin").id;
+    assert_eq!(identity(pins.file_for(object).unwrap()), a);
+    let (index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    let proof_keys = index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        assert_eq!(
+            proof_ranges(snapshot, &proof_keys),
+            [(ready[position].start, ready[position].end)],
+            "one exact real worker VMA must require identity proof"
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "no additional fixture-key mapping may hide the population"
+        );
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in children.iter().enumerate() {
+        let pid = child.child.id();
+        let userspace = attribute_pid(pid, snapshots[position].clone(), &index);
+        let kernel = d4_kernel_attribution_for_pid(
+            pid,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert_eq!(
+                out.probed, 1,
+                "{backend}: nonvacuous actual executable proof demand"
+            );
+            assert_eq!(out.unavailable, 0);
+            assert!(
+                out.exited.is_empty(),
+                "{backend}: the owned leader/worker must remain live"
+            );
+            if position < 2 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [pid],
+                    "{backend}: the live leader TGID owns the worker's executable mapping"
+                );
+                assert_eq!(out.members[0].start_time, start_times[position]);
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, a_path.to_str().unwrap())],
+                    "{backend}: exact held-A edge"
+                );
+                assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            } else {
+                assert!(
+                    out.members.is_empty(),
+                    "{backend}: the equal-byte private B is not A"
+                );
+                assert_eq!(
+                    out.losses,
+                    BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)]),
+                    "{backend}: actual physical-file mismatch"
+                );
+                assert_eq!(
+                    out.member_losses.get(&pid).map(|(loss, _)| *loss),
+                    Some(AttributionLoss::IdentityMismatch)
+                );
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "independently checked backend edges"
+        );
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(
+            child.verify_worker(ready[position], expected_files[position], position != 0),
+            start_times[position]
+        );
+        let after = child.maps();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "the actual held worker VMA remains stable"
+        );
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("recheck actual held A anchor")
+    );
+    for (file, expected) in [(&a_file, a), (&b_file, b)] {
+        assert_eq!(identity(file), expected);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "both held physical files remain unchanged"
+        );
+    }
+    let pids = [shared.child.id(), private.child.id(), wrong.child.id()];
+    eprintln!(
+        "D4_BTRFS_THREAD callers={}/{}/{} workers={}/{}/{} userspace=1/1/0 kernel=1/1/0 fd_tables=shared/private/private generations=1/2/3 fallback=none",
+        pids[0], pids[1], pids[2], shared_ready.tid, private_ready.tid, wrong_ready.tid
+    );
+    drop((session, pins));
+    shared.finish();
+    private.finish();
+    wrong.finish();
+    for pid in pids {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "owned helper must be reaped"
+        );
+    }
+    drop((a_file, b_file));
+    std::fs::remove_file(&a_path).unwrap();
+    std::fs::remove_file(&b_path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("b")).unwrap();
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned Btrfs thread fixture directory");
+}
+
+const D4_CLONE_WITHOUT_FILES_FLAGS: libc::c_int = libc::CLONE_VM
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD
+    | libc::CLONE_PARENT_SETTID
+    | libc::CLONE_CHILD_CLEARTID;
+const D4_CLONE_WORKER_MAGIC: u64 = 0xd4c1_0001;
+const D4_CLONE_WORKER_REPLY_LEN: usize = 8 * 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct D4CloneBirth {
+    returned_tid: u32,
+    parent_tid: u32,
+    flags: u32,
+}
+
+fn d4_clone_without_files_flags(flags: u32) -> Result<(), &'static str> {
+    if flags & libc::CLONE_FILES as u32 != 0 {
+        return Err("the thread must be born without CLONE_FILES");
+    }
+    if flags != D4_CLONE_WITHOUT_FILES_FLAGS as u32 {
+        return Err("require VM/SIGHAND/THREAD and the two actual kernel TID operations only");
+    }
+    Ok(())
+}
+
+fn d4_decode_clone_worker_reply(
+    bytes: &[u8],
+    tgid: u32,
+    tid: u32,
+    token: &str,
+) -> Result<D4ThreadReady, &'static str> {
+    if bytes.len() != D4_CLONE_WORKER_REPLY_LEN {
+        return Err("wrong raw worker reply size");
+    }
+    let words: [u64; 8] = std::array::from_fn(|index| {
+        u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+    });
+    if words[0] != D4_CLONE_WORKER_MAGIC
+        || words[1] != u64::from(tgid)
+        || words[2] != u64::from(tid)
+    {
+        return Err("raw worker is not the actual cloned task");
+    }
+    let ready = D4ThreadReady {
+        token: token.into(),
+        tgid,
+        tid,
+        fd: i32::try_from(words[3]).map_err(|_| "raw worker fd overflow")?,
+        start: words[4],
+        end: words[5],
+        dev: words[6],
+        ino: words[7],
+    };
+    d4_validate_thread_ready(&ready, tgid, token)?;
+    Ok(ready)
+}
+
+fn d4_decode_clone_birth(
+    bytes: &[u8],
+    ready: &D4ThreadReady,
+) -> Result<D4CloneBirth, &'static str> {
+    if bytes.len() != 12 {
+        return Err("wrong clone birth reply size");
+    }
+    let birth = D4CloneBirth {
+        returned_tid: u32::from_ne_bytes(bytes[..4].try_into().unwrap()),
+        parent_tid: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+        flags: u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
+    };
+    d4_clone_without_files_flags(birth.flags)?;
+    if birth.returned_tid == 0
+        || birth.returned_tid != ready.tid
+        || birth.parent_tid != birth.returned_tid
+    {
+        return Err("clone return, parent-written TID and live worker reply must agree");
+    }
+    Ok(birth)
+}
+
+fn d4_write_clone_birth(
+    stream: &mut std::os::unix::net::UnixStream,
+    birth: D4CloneBirth,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    for word in [birth.returned_tid, birth.parent_tid, birth.flags] {
+        stream.write_all(&word.to_ne_bytes())?;
+    }
+    Ok(())
+}
+
+impl D4ThreadChild {
+    fn spawn_clone_without_files(
+        path: &std::path::Path,
+        token: &str,
+    ) -> (Self, D4ThreadReady, D4CloneBirth) {
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let (channel, helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        helper
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        helper
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("P11SCOPE_D4_CLONE_PATH", path)
+            .env("P11SCOPE_D4_CLONE_TOKEN", token)
+            .stdin(Stdio::from(OwnedFd::from(helper)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .die_with_parent()
+            .spawn()
+            .expect("fresh exec of the matching literal-clone libtest helper");
+        let mut owned = Self {
+            child,
+            channel,
+            reaped: false,
+        };
+        let ready = d4_read_thread_ready(&mut owned.channel)
+            .expect("required actual clone worker READY; refusal cannot qualify");
+        d4_validate_thread_ready(&ready, owned.child.id(), token)
+            .expect("actual owned nonleader mapping");
+        let mut bytes = [0; 12];
+        owned
+            .channel
+            .read_exact(&mut bytes)
+            .expect("actual clone return and parent-written TID");
+        let birth =
+            d4_decode_clone_birth(&bytes, &ready).expect("literal private-files thread birth");
+        (owned, ready, birth)
+    }
+}
+
+#[test]
+fn d4_clone_without_files_flags_reject_shared_files_or_nonthreads() {
+    let healthy = (libc::CLONE_VM
+        | libc::CLONE_SIGHAND
+        | libc::CLONE_THREAD
+        | libc::CLONE_PARENT_SETTID
+        | libc::CLONE_CHILD_CLEARTID) as u32;
+    assert_eq!(d4_clone_without_files_flags(healthy), Ok(()));
+    for bad in [
+        healthy | libc::CLONE_FILES as u32,
+        healthy & !(libc::CLONE_VM as u32),
+        healthy & !(libc::CLONE_SIGHAND as u32),
+        healthy & !(libc::CLONE_THREAD as u32),
+        healthy & !(libc::CLONE_PARENT_SETTID as u32),
+        healthy & !(libc::CLONE_CHILD_CLEARTID as u32),
+        healthy | libc::CLONE_SETTLS as u32,
+    ] {
+        assert!(d4_clone_without_files_flags(bad).is_err());
+        assert_eq!(d4_clone_without_files_flags(healthy), Ok(()));
+    }
+}
+
+#[test]
+fn d4_clone_without_files_reply_rejects_wrong_tid_and_malformed_frames() {
+    let words = [D4_CLONE_WORKER_MAGIC, 101, 102, 4, 0x1000, 0x2000, 37, 123];
+    let encode = |words: &[u64]| {
+        words
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect::<Vec<_>>()
+    };
+    let bytes = encode(&words);
+    let healthy = d4_decode_clone_worker_reply(&bytes, 101, 102, "owned").unwrap();
+    assert_eq!(
+        (
+            healthy.tgid,
+            healthy.tid,
+            healthy.fd,
+            healthy.start,
+            healthy.end,
+            healthy.dev,
+            healthy.ino
+        ),
+        (101, 102, 4, 0x1000, 0x2000, 37, 123)
+    );
+    for bad in [
+        &bytes[..bytes.len() - 1],
+        &[0; D4_CLONE_WORKER_REPLY_LEN + 1][..],
+    ] {
+        assert!(d4_decode_clone_worker_reply(bad, 101, 102, "owned").is_err());
+    }
+    for (position, value) in [
+        (0, 0),
+        (1, 103),
+        (2, 103),
+        (3, u64::MAX),
+        (5, 0x2001),
+        (7, 0),
+    ] {
+        let mut bad = words;
+        bad[position] = value;
+        assert!(d4_decode_clone_worker_reply(&encode(&bad), 101, 102, "owned").is_err());
+        assert_eq!(
+            d4_decode_clone_worker_reply(&bytes, 101, 102, "owned"),
+            Ok(healthy.clone())
+        );
+    }
+    let birth = D4CloneBirth {
+        returned_tid: 102,
+        parent_tid: 102,
+        flags: D4_CLONE_WITHOUT_FILES_FLAGS as u32,
+    };
+    let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    d4_write_thread_ready(&mut writer, &healthy).unwrap();
+    d4_write_clone_birth(&mut writer, birth).unwrap();
+    let ready = d4_read_thread_ready(&mut reader).unwrap();
+    use std::io::Read as _;
+    let mut birth_bytes = [0; 12];
+    reader.read_exact(&mut birth_bytes).unwrap();
+    assert_eq!(d4_decode_clone_birth(&birth_bytes, &ready), Ok(birth));
+    for bad in [
+        D4CloneBirth {
+            returned_tid: 0,
+            ..birth
+        },
+        D4CloneBirth {
+            returned_tid: 103,
+            ..birth
+        },
+        D4CloneBirth {
+            parent_tid: 103,
+            ..birth
+        },
+        D4CloneBirth {
+            flags: birth.flags | libc::CLONE_FILES as u32,
+            ..birth
+        },
+    ] {
+        let bytes: Vec<_> = [bad.returned_tid, bad.parent_tid, bad.flags]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        assert!(d4_decode_clone_birth(&bytes, &healthy).is_err());
+        assert_eq!(d4_decode_clone_birth(&birth_bytes, &healthy), Ok(birth));
+    }
+    assert!(d4_decode_clone_birth(&birth_bytes[..11], &healthy).is_err());
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+struct D4RawCloneArgs {
+    path: *const libc::c_char,
+    channel: libc::c_int,
+    unused_channel: libc::c_int,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const D4_CLONE_WORKER_WIRE_OFFSET: usize = (std::mem::size_of::<libc::stat>() + 15) & !15;
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const D4_CLONE_WORKER_FRAME_SIZE: usize =
+    (D4_CLONE_WORKER_WIRE_OFFSET + D4_CLONE_WORKER_REPLY_LEN + 1 + 15) & !15;
+
+/// The complete newborn path is assembly: no libc syscall errno writes,
+/// inherited TLS, Rust prologue, allocation, panic or unwinding. The glibc
+/// clone trampoline supplies RDI and an independent stack. We never return,
+/// so callee-saved registers need not be restored to that trampoline.
+/// Both success and failure use SYS_exit for THIS THREAD, never exit_group.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_clone_without_files_worker(_context: *mut libc::c_void) -> libc::c_int {
+    core::arch::naked_asm!(
+        "sub rsp, {frame}",
+        "mov rbx, rdi",
+        "mov r12d, dword ptr [rbx + {args_channel}]",
+        // This endpoint belongs to the normal parent. Its newborn copy
+        // must close, or EOF would depend on a peer held by the worker.
+        "mov edi, dword ptr [rbx + {args_unused}]",
+        "mov eax, {sys_close}",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {magic}",
+        "mov qword ptr [rsp + {wire}], rax",
+        "mov eax, {sys_getpid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 8], rax",
+        "mov eax, {sys_gettid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 16], rax",
+        // Open only AFTER the literal private-files birth, with no unshare.
+        "mov eax, {sys_openat}",
+        "mov rdi, {at_fdcwd}",
+        "mov rsi, qword ptr [rbx + {args_path}]",
+        "mov edx, {open_flags}",
+        "xor r10d, r10d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r13, rax",
+        "mov qword ptr [rsp + {wire} + 24], rax",
+        "mov eax, {sys_fstat}",
+        "mov edi, r13d",
+        "mov rsi, rsp",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov rax, qword ptr [rsp + {stat_dev}]",
+        "mov qword ptr [rsp + {wire} + 48], rax",
+        "mov rax, qword ptr [rsp + {stat_ino}]",
+        "mov qword ptr [rsp + {wire} + 56], rax",
+        "mov eax, {sys_mmap}",
+        "xor edi, edi",
+        "mov esi, 4096",
+        "mov edx, {prot}",
+        "mov r10d, {map_private}",
+        "mov r8, r13",
+        "xor r9d, r9d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r14, rax",
+        "mov qword ptr [rsp + {wire} + 32], rax",
+        "add rax, 4096",
+        "mov qword ptr [rsp + {wire} + 40], rax",
+        // The bounded native-endian reply comes only from actual syscalls.
+        "lea rbp, [rsp + {wire}]",
+        "mov r15d, {reply_len}",
+        "2:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "mov rsi, rbp",
+        "mov rdx, r15",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 2b",
+        "test rax, rax",
+        "jle 9f",
+        "cmp rax, r15",
+        "ja 9f",
+        "add rbp, rax",
+        "sub r15, rax",
+        "jnz 2b",
+        "3:",
+        "mov eax, {sys_read}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 3b",
+        "cmp rax, 1",
+        "jne 9f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 81",
+        "jne 9f",
+        "mov eax, {sys_munmap}",
+        "mov rdi, r14",
+        "mov esi, 4096",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {sys_close}",
+        "mov edi, r13d",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        // ACK follows successful VMA removal and source-FD close. The
+        // normal parent still must join kernel clear-TID before freeing.
+        "mov byte ptr [rsp + {wire} + {reply_len}], 68",
+        "4:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 4b",
+        "cmp rax, 1",
+        "jne 9f",
+        "xor edi, edi",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        "9:",
+        "mov edi, 91",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        frame = const D4_CLONE_WORKER_FRAME_SIZE,
+        wire = const D4_CLONE_WORKER_WIRE_OFFSET,
+        reply_len = const D4_CLONE_WORKER_REPLY_LEN,
+        args_path = const std::mem::offset_of!(D4RawCloneArgs, path),
+        args_channel = const std::mem::offset_of!(D4RawCloneArgs, channel),
+        args_unused = const std::mem::offset_of!(D4RawCloneArgs, unused_channel),
+        stat_dev = const std::mem::offset_of!(libc::stat, st_dev),
+        stat_ino = const std::mem::offset_of!(libc::stat, st_ino),
+        magic = const D4_CLONE_WORKER_MAGIC,
+        eintr = const libc::EINTR,
+        at_fdcwd = const libc::AT_FDCWD,
+        open_flags = const libc::O_RDONLY | libc::O_CLOEXEC,
+        prot = const libc::PROT_READ | libc::PROT_EXEC,
+        map_private = const libc::MAP_PRIVATE,
+        sys_close = const libc::SYS_close,
+        sys_getpid = const libc::SYS_getpid,
+        sys_gettid = const libc::SYS_gettid,
+        sys_openat = const libc::SYS_openat,
+        sys_fstat = const libc::SYS_fstat,
+        sys_mmap = const libc::SYS_mmap,
+        sys_write = const libc::SYS_write,
+        sys_read = const libc::SYS_read,
+        sys_munmap = const libc::SYS_munmap,
+        sys_exit = const libc::SYS_exit,
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+struct D4RawCloneGuard {
+    stack: *mut libc::c_void,
+    stack_len: usize,
+    // Published allocations stay raw while the newborn can access them;
+    // moving this guard never reclaims or retags a Box over its live args.
+    args: *mut D4RawCloneArgs,
+    path: *mut libc::c_char,
+    channel: std::os::unix::net::UnixStream,
+    child_tid: *mut std::sync::atomic::AtomicI32,
+    worker_tid: libc::c_int,
+    joined: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl D4RawCloneGuard {
+    fn spawn(path: std::ffi::CString) -> (Self, D4CloneBirth) {
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let (channel, worker) = std::os::unix::net::UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        worker
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        worker
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        // SAFETY: this is the normal post-exec parent, with ordinary TLS.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page = page as usize;
+        let stack_size = 1024 * 1024;
+        let stack_len = stack_size + 2 * page;
+        // SAFETY: an owned anonymous allocation, initially all guard pages.
+        let stack = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                stack_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(stack, libc::MAP_FAILED, "owned raw-worker stack");
+        let path = path.into_raw();
+        let args = Box::into_raw(Box::new(D4RawCloneArgs {
+            path,
+            channel: worker.as_raw_fd(),
+            unused_channel: channel.as_raw_fd(),
+        }));
+        let mut owned = Self {
+            stack,
+            stack_len,
+            args,
+            path,
+            channel,
+            child_tid: Box::into_raw(Box::new(AtomicI32::new(-1))),
+            worker_tid: 0,
+            joined: false,
+        };
+        // SAFETY: only the middle of this owned allocation becomes writable;
+        // the leading/trailing pages remain guards through kernel join.
+        let stack_start = unsafe { stack.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    stack_start.cast(),
+                    stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0
+        );
+        d4_clone_without_files_flags(D4_CLONE_WITHOUT_FILES_FLAGS as u32).unwrap();
+        let tid_address = owned.tid_word().as_ptr();
+        // SAFETY: normal-parent glibc trampoline; the callback is a complete
+        // syscall-only leaf on its separate stack. All pointed-to storage and
+        // both IPC endpoints remain owned until kernel clear-TID is acquired.
+        let tid = unsafe {
+            libc::clone(
+                d4_clone_without_files_worker,
+                stack_start.add(stack_size).cast(),
+                D4_CLONE_WITHOUT_FILES_FLAGS,
+                owned.args.cast(),
+                tid_address,
+                std::ptr::null_mut::<libc::c_void>(),
+                tid_address,
+            )
+        };
+        // Establish the fatal-on-unwind guard before any assertion or I/O.
+        owned.worker_tid = tid;
+        assert!(
+            tid > 0,
+            "required literal clone failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let parent_tid = owned.tid_word().load(Ordering::Acquire);
+        assert_eq!(parent_tid, tid, "actual CLONE_PARENT_SETTID write");
+        // Parent and worker have separate FD tables. Closing this parent's
+        // copy cannot close the raw worker's peer; it makes worker EOF honest.
+        drop(worker);
+        (
+            owned,
+            D4CloneBirth {
+                returned_tid: tid as u32,
+                parent_tid: parent_tid as u32,
+                flags: D4_CLONE_WITHOUT_FILES_FLAGS as u32,
+            },
+        )
+    }
+
+    fn tid_word(&self) -> &std::sync::atomic::AtomicI32 {
+        // SAFETY: this guard owns the naturally aligned allocation until
+        // Drop after join. Only the kernel writes it after its initial -1.
+        unsafe { &*self.child_tid }
+    }
+
+    fn ready(&mut self, token: &str) -> D4ThreadReady {
+        use std::io::Read as _;
+        let mut bytes = [0; D4_CLONE_WORKER_REPLY_LEN];
+        self.channel
+            .read_exact(&mut bytes)
+            .expect("actual syscall-only worker reply");
+        d4_decode_clone_worker_reply(&bytes, std::process::id(), self.worker_tid as u32, token)
+            .expect("actual worker matches clone return and opened-file VMA")
+    }
+
+    fn finish(mut self) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+        self.channel
+            .write_all(b"Q")
+            .expect("release the actual raw worker");
+        let mut ack = [0];
+        self.channel
+            .read_exact(&mut ack)
+            .expect("raw worker cleanup ACK");
+        assert_eq!(ack, *b"D", "raw worker removed its VMA and closed its file");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut waits = 0;
+        loop {
+            let observed = self.tid_word().load(Ordering::Acquire);
+            if observed == 0 {
+                self.joined = true;
+                break;
+            }
+            assert_eq!(
+                observed, self.worker_tid,
+                "only the kernel may clear child-TID"
+            );
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("raw worker kernel join exceeded its deadline");
+            // `tv_sec` is 64-bit signed on x86-64 under both glibc and musl;
+            // `libc::time_t` names the same type but is deprecated on musl.
+            // The remaining join budget is at most ten seconds, so this cast
+            // is exact.
+            let timeout = libc::timespec {
+                tv_sec: remaining.as_secs() as i64,
+                tv_nsec: remaining.subsec_nanos() as libc::c_long,
+            };
+            // SAFETY: the naturally aligned boxed TID word and timeout stay
+            // live. clear_child_tid wakes FUTEX_WAIT, NOT FUTEX_WAIT_PRIVATE.
+            // This libc call is on the normal parent, never the raw child.
+            let status = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.tid_word().as_ptr(),
+                    libc::FUTEX_WAIT,
+                    observed,
+                    &timeout,
+                    std::ptr::null::<u32>(),
+                    0,
+                )
+            };
+            waits += 1;
+            if status < 0 {
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINTR | libc::EAGAIN | libc::ETIMEDOUT)
+                    ),
+                    "kernel clear-TID join failed: {error}"
+                );
+            }
+        }
+        assert_eq!(self.tid_word().load(Ordering::Acquire), 0);
+        // SAFETY: kernel clear-TID was acquired; no newborn user code can
+        // access this stack, args, path or IPC after this point.
+        assert_eq!(
+            unsafe { libc::munmap(self.stack, self.stack_len) },
+            0,
+            "release joined raw-worker stack"
+        );
+        self.stack = std::ptr::null_mut();
+        eprintln!(
+            "D4_CLONE_JOIN caller={} worker={} clear_tid=0 shared_futex_waits={waits}",
+            std::process::id(),
+            self.worker_tid
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl Drop for D4RawCloneGuard {
+    fn drop(&mut self) {
+        if self.worker_tid > 0 && !self.joined {
+            // A normal-parent failure must not unwind/free memory a raw
+            // worker could still use. Terminate this OWNED helper process;
+            // the outer D4ThreadChild guard reaps it. The child never uses
+            // this path, and its normal exit above is strictly thread-only.
+            unsafe { libc::_exit(104) };
+        }
+        if !self.stack.is_null() {
+            // SAFETY: no worker was created, or kernel join already completed.
+            unsafe {
+                libc::munmap(self.stack, self.stack_len);
+            }
+        }
+        // SAFETY: the fatal branch prevents reclamation with a live raw
+        // child. Each allocation was published once and is reclaimed once;
+        // the newborn never changes the owned CString's bytes or length.
+        unsafe {
+            drop(Box::from_raw(self.args));
+            drop(std::ffi::CString::from_raw(self.path));
+            drop(Box::from_raw(self.child_tid));
+        }
+    }
+}
+
+/// Private re-exec entrypoint. Missing owned configuration fails, never skips.
+#[test]
+#[ignore = "private D4 literal-clone fixture entrypoint; requires its owning parity test socket/configuration"]
+fn d4_clone_without_files_mapping_helper() {
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    panic!("the actual literal-clone fixture requires the x86-64 LP64 syscall ABI");
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        use std::io::Read as _;
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        let path = std::env::var_os("P11SCOPE_D4_CLONE_PATH").expect("owned literal-clone source");
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let token = std::env::var("P11SCOPE_D4_CLONE_TOKEN").expect("owning literal-clone token");
+        assert!(!token.is_empty());
+        // SAFETY: only this fresh-exec normal parent's supplied stdin socket.
+        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(raw >= 0);
+        // SAFETY: the fresh duplicate is adopted exactly once.
+        let mut socket = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        socket
+            .peer_addr()
+            .expect("owning fixture must supply its connected Unix socket");
+        let (mut worker, birth) = D4RawCloneGuard::spawn(path);
+        let ready = worker.ready(&token);
+        d4_write_thread_ready(&mut socket, &ready)
+            .expect("relay actual raw-worker FD/VMA identity");
+        d4_write_clone_birth(&mut socket, birth)
+            .expect("report actual clone return and parent-written TID");
+        let mut command = [0];
+        socket
+            .read_exact(&mut command)
+            .expect("owning fixture must release its raw worker");
+        assert_eq!(command, *b"Q");
+        worker.finish();
+    }
+}
+
+/// A literal CLONE_THREAD birth omits CLONE_FILES, rather than detaching
+/// files after std-thread birth. The actual live TGID must attribute A,
+/// and refuse physically different B despite its identical Btrfs maps key.
+/// Zombie leaders, active capture and native calls remain separate gates;
+/// the current zombie refusal does not satisfy that selected D4 population.
+#[test]
+#[ignore = "root x86-64 LP64 Btrfs disk TMPDIR, literal private-files clone and eligible BTF/task_vma identity; actual backend parity"]
+fn privileged_d4_btrfs_clone_without_files_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    const {
+        assert!(
+            cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
+            "the required actual raw worker uses the x86-64 LP64 syscall ABI"
+        );
+    }
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let a_path = parent.join("a/libclone.so");
+    let b_path = parent.join("b/libclone.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&a_path, &bytes).unwrap();
+    std::fs::copy(&a_path, &b_path).unwrap();
+    let a_file = std::fs::File::open(&a_path).unwrap();
+    let b_file = std::fs::File::open(&b_path).unwrap();
+    let identity = |file: &std::fs::File| {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let a = identity(&a_file);
+    let b = identity(&b_file);
+    assert_eq!(
+        a.ino, b.ino,
+        "fresh subvolume files must share an inode number"
+    );
+    assert_ne!(
+        a, b,
+        "the equal-byte collision must name different physical files"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "each actual held input has the same bytes"
+        );
+    }
+
+    let (caller, caller_ready, caller_birth) =
+        D4ThreadChild::spawn_clone_without_files(&a_path, "owned-clone-a");
+    let (wrong, wrong_ready, wrong_birth) =
+        D4ThreadChild::spawn_clone_without_files(&b_path, "owned-clone-b");
+    let children = [&caller, &wrong];
+    let ready = [&caller_ready, &wrong_ready];
+    let birth = [caller_birth, wrong_birth];
+    let expected_files = [a, b];
+    let paths = [&a_path, &b_path];
+    let mut start_times = Vec::new();
+    for (position, child) in children.iter().enumerate() {
+        let report = ready[position];
+        assert_eq!(birth[position].flags, D4_CLONE_WITHOUT_FILES_FLAGS as u32);
+        assert_eq!(birth[position].returned_tid, report.tid);
+        assert_eq!(birth[position].parent_tid, report.tid);
+        start_times.push(child.verify_worker(report, expected_files[position], true));
+        eprintln!(
+            "D4_CLONE_WORKER caller={} tid={} clone_return={} parent_tid={} flags={:#x} fd={} range={:x}-{:x} file={}:{}",
+            report.tgid,
+            report.tid,
+            birth[position].returned_tid,
+            birth[position].parent_tid,
+            birth[position].flags,
+            report.fd,
+            report.start,
+            report.end,
+            report.dev,
+            report.ino
+        );
+    }
+    let snapshots = [caller.maps(), wrong.maps()];
+    let mut fixture_lines = Vec::new();
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        let report = ready[position];
+        let line = snapshot
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (report.start, report.end))
+            .expect("the actual literal-clone worker's exact VMA");
+        assert_eq!(line.permissions, *b"r-xp");
+        assert_eq!(line.file_offset, 0);
+        assert_eq!(
+            line.raw_path.as_deref(),
+            Some(paths[position].as_os_str().as_encoded_bytes())
+        );
+        assert!(
+            is_caller_range(line),
+            "both actual workers require executable proof"
+        );
+        assert_eq!(
+            map_files_identity(report.tgid, line.start, line.end)
+                .expect("independent actual vm_file identity"),
+            expected_files[position]
+        );
+        fixture_lines.push(line.clone());
+    }
+    let key = ObjectKey::of(&fixture_lines[0]);
+    assert_eq!(
+        ObjectKey::of(&fixture_lines[1]),
+        key,
+        "actual Btrfs maps-key collision"
+    );
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held A pin").id;
+    assert_eq!(identity(pins.file_for(object).unwrap()), a);
+    let (index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    let proof_keys = index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        assert_eq!(
+            proof_ranges(snapshot, &proof_keys),
+            [(ready[position].start, ready[position].end)],
+            "one exact real worker VMA must require identity proof"
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "the entire fixture-key population is known"
+        );
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in children.iter().enumerate() {
+        let pid = child.child.id();
+        let userspace = attribute_pid(pid, snapshots[position].clone(), &index);
+        let kernel = d4_kernel_attribution_for_pid(
+            pid,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert_eq!(out.probed, 1, "{backend}: actual executable proof demand");
+            assert_eq!(out.unavailable, 0);
+            assert!(
+                out.exited.is_empty(),
+                "{backend}: the owned TGID and worker remain live"
+            );
+            if position == 0 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [pid],
+                    "{backend}: exact live TGID owns the raw worker's mapping"
+                );
+                assert_eq!(out.members[0].start_time, start_times[position]);
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, a_path.to_str().unwrap())],
+                    "{backend}: exact held-A edge"
+                );
+                assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            } else {
+                assert!(
+                    out.members.is_empty(),
+                    "{backend}: equal bytes and maps key cannot make B into A"
+                );
+                assert_eq!(
+                    out.losses,
+                    BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)]),
+                    "{backend}: actual different-file negative"
+                );
+                assert_eq!(
+                    out.member_losses.get(&pid).map(|(loss, _)| *loss),
+                    Some(AttributionLoss::IdentityMismatch)
+                );
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "independently checked backend edges"
+        );
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(
+            child.verify_worker(ready[position], expected_files[position], true),
+            start_times[position]
+        );
+        assert_eq!(
+            child
+                .maps()
+                .into_iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "actual raw-worker VMA remains held through both proofs"
+        );
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("recheck the real held A anchor")
+    );
+    for (file, expected) in [(&a_file, a), (&b_file, b)] {
+        assert_eq!(identity(file), expected);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "both held physical files remain unchanged"
+        );
+    }
+    let pids = [caller.child.id(), wrong.child.id()];
+    let tids = [caller_ready.tid, wrong_ready.tid];
+    drop((session, pins));
+    caller.finish();
+    wrong.finish();
+    for (pid, tid) in pids.into_iter().zip(tids) {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "owned helper is reaped"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{tid}")).exists(),
+            "owned raw thread is gone"
+        );
+    }
+    eprintln!(
+        "D4_BTRFS_CLONE callers={}/{} workers={}/{} userspace=1/0 kernel=1/0 files_private_at_birth=true generations=1/2 fallback=none joined_and_reaped=true",
+        pids[0], pids[1], tids[0], tids[1]
+    );
+    drop((a_file, b_file));
+    std::fs::remove_file(&a_path).unwrap();
+    std::fs::remove_file(&b_path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("b")).unwrap();
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned Btrfs literal-clone fixture directory");
+}
+
+const D4_ZOMBIE_MAGIC: u64 = 0xd401_0001;
+const D4_ZOMBIE_REPLY_LEN: usize = 11 * 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct D4ZombieReady {
+    mapping: D4ThreadReady,
+    creator: u32,
+    returned_tid: u32,
+    parent_tid: u32,
+}
+
+fn d4_zombie_reply(bytes: &[u8], pid: u32) -> Result<D4ZombieReady, &'static str> {
+    if bytes.len() != D4_ZOMBIE_REPLY_LEN {
+        return Err("fixture: wrong zombie READY length");
+    }
+    let words: [u64; 11] = std::array::from_fn(|index| {
+        u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+    });
+    if words[0] != D4_ZOMBIE_MAGIC || words[1] != u64::from(pid) {
+        return Err("fixture: foreign zombie helper");
+    }
+    let tid = u32::try_from(words[2]).map_err(|_| "fixture: worker TID overflow")?;
+    let mapping = D4ThreadReady {
+        token: "owned-zombie".into(),
+        tgid: pid,
+        tid,
+        fd: i32::try_from(words[3]).map_err(|_| "fixture: FD overflow")?,
+        start: words[4],
+        end: words[5],
+        dev: words[6],
+        ino: words[7],
+    };
+    d4_validate_thread_ready(&mapping, pid, "owned-zombie")?;
+    let ready = D4ZombieReady {
+        mapping,
+        creator: u32::try_from(words[8]).map_err(|_| "fixture: creator overflow")?,
+        returned_tid: u32::try_from(words[9]).map_err(|_| "fixture: clone return overflow")?,
+        parent_tid: u32::try_from(words[10]).map_err(|_| "fixture: parent TID overflow")?,
+    };
+    if ready.creator == 0
+        || ready.creator == pid
+        || ready.creator == tid
+        || ready.returned_tid != tid
+        || ready.parent_tid != tid
+    {
+        return Err("fixture: actual creator/clone/parent/worker TIDs disagree");
+    }
+    Ok(ready)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct D4ZombieTask {
+    tid: u32,
+    state: u8,
+    birth: u64,
+}
+
+fn d4_zombie_stat(text: &str) -> Result<D4ZombieTask, &'static str> {
+    let end = text.rfind(')').ok_or("fixture: malformed task comm")?;
+    let tid = text
+        .split_whitespace()
+        .next()
+        .ok_or("fixture: missing TID")?
+        .parse::<u32>()
+        .map_err(|_| "fixture: invalid TID")?;
+    let fields: Vec<_> = text[end + 1..].split_whitespace().collect();
+    let state = fields
+        .first()
+        .filter(|value| value.len() == 1)
+        .ok_or("fixture: missing task state")?
+        .as_bytes()[0];
+    let birth = fields
+        .get(19)
+        .ok_or("fixture: missing task birth")?
+        .parse::<u64>()
+        .map_err(|_| "fixture: invalid task birth")?;
+    if tid == 0 || birth == 0 {
+        return Err("fixture: zero task identity");
+    }
+    Ok(D4ZombieTask { tid, state, birth })
+}
+
+fn d4_zombie_task_set(
+    tasks: &[D4ZombieTask],
+    ready: &D4ZombieReady,
+    zombie: bool,
+) -> Result<(), &'static str> {
+    let live = |state| matches!(state, b'R' | b'S' | b'D');
+    let mut expected = BTreeSet::from([ready.mapping.tgid, ready.mapping.tid]);
+    if !zombie {
+        expected.insert(ready.creator);
+    }
+    let actual: BTreeSet<_> = tasks.iter().map(|task| task.tid).collect();
+    if actual != expected || actual.len() != tasks.len() {
+        return Err("fixture: extra, missing or duplicate helper task");
+    }
+    for task in tasks {
+        if zombie && task.tid == ready.mapping.tgid {
+            if task.state != b'Z' {
+                return Err("fixture: leader is not a zombie");
+            }
+        } else if !live(task.state) {
+            return Err("fixture: expected live worker/controller");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn d4_zombie_single_survivor_protocol_rejects_extra_members() {
+    let words = [
+        D4_ZOMBIE_MAGIC,
+        101,
+        103,
+        4,
+        0x1000,
+        0x2000,
+        37,
+        123,
+        102,
+        103,
+        103,
+    ];
+    let encode = |words: &[u64]| {
+        words
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect::<Vec<_>>()
+    };
+    let bytes = encode(&words);
+    let ready = d4_zombie_reply(&bytes, 101).unwrap();
+    let before = [
+        D4ZombieTask {
+            tid: 101,
+            state: b'S',
+            birth: 1,
+        },
+        D4ZombieTask {
+            tid: 102,
+            state: b'S',
+            birth: 2,
+        },
+        D4ZombieTask {
+            tid: 103,
+            state: b'S',
+            birth: 3,
+        },
+    ];
+    let after = [
+        D4ZombieTask {
+            state: b'Z',
+            ..before[0]
+        },
+        before[2],
+    ];
+    assert_eq!(d4_zombie_task_set(&before, &ready, false), Ok(()));
+    assert_eq!(d4_zombie_task_set(&after, &ready, true), Ok(()));
+    for bad in [
+        vec![after[0]],
+        vec![after[0], after[1], before[1]],
+        vec![after[0], after[1], after[1]],
+        vec![before[0], after[1]],
+        vec![
+            after[0],
+            D4ZombieTask {
+                state: b'Z',
+                ..after[1]
+            },
+        ],
+    ] {
+        assert!(d4_zombie_task_set(&bad, &ready, true).is_err());
+        assert_eq!(d4_zombie_task_set(&after, &ready, true), Ok(()));
+    }
+    assert!(d4_zombie_reply(&bytes[..bytes.len() - 1], 101).is_err());
+    for (index, value) in [
+        (0, 0),
+        (1, 104),
+        (8, 101),
+        (8, 103),
+        (9, 104),
+        (10, 104),
+        (5, 0x2001),
+    ] {
+        let mut bad = words;
+        bad[index] = value;
+        assert!(d4_zombie_reply(&encode(&bad), 101).is_err());
+        assert_eq!(d4_zombie_reply(&bytes, 101), Ok(ready.clone()));
+    }
+    let stat = "103 (owned worker) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3";
+    assert_eq!(d4_zombie_stat(stat), Ok(before[2]));
+    assert!(d4_zombie_stat("103 (bad) S").is_err());
+}
+
+struct D4ZombieChild {
+    owned: D4ThreadChild,
+}
+
+impl D4ZombieChild {
+    fn spawn(path: &std::path::Path) -> (Self, D4ZombieReady) {
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let (channel, helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        for socket in [&channel, &helper] {
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+        }
+        helper
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("P11SCOPE_D4_ZOMBIE_PATH", path)
+            .stdin(Stdio::from(OwnedFd::from(helper)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .die_with_parent()
+            .spawn()
+            .expect("fixture: matching zombie helper re-exec");
+        let mut owned = Self {
+            owned: D4ThreadChild {
+                child,
+                channel,
+                reaped: false,
+            },
+        };
+        let mut bytes = [0; D4_ZOMBIE_REPLY_LEN];
+        owned
+            .owned
+            .channel
+            .read_exact(&mut bytes)
+            .expect("fixture: actual raw zombie READY");
+        let ready = d4_zombie_reply(&bytes, owned.owned.child.id())
+            .expect("fixture: owned raw worker identity");
+        (owned, ready)
+    }
+
+    fn zombify(&mut self) {
+        use std::io::{Read as _, Write as _};
+        self.owned
+            .channel
+            .write_all(b"Z")
+            .expect("fixture: retire leader/controller");
+        let mut ack = [0];
+        self.owned
+            .channel
+            .read_exact(&mut ack)
+            .expect("fixture: raw retirement ACK");
+        assert_eq!(ack, *b"Z", "fixture: retirement protocol");
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        use std::io::{Read as _, Write as _};
+        self.owned
+            .channel
+            .write_all(b"Q")
+            .map_err(|e| format!("fixture: release failed: {e}"))?;
+        let mut ack = [0];
+        self.owned
+            .channel
+            .read_exact(&mut ack)
+            .map_err(|e| format!("fixture: cleanup ACK: {e}"))?;
+        if ack != *b"D" {
+            return Err("fixture: wrong cleanup ACK".into());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.owned.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.owned.reaped = true;
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("fixture: helper exit {status}"))
+                    };
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2))
+                }
+                Ok(None) => return Err("fixture: normal whole-group reap timed out".into()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(format!("fixture: reap failed: {e}")),
+            }
+        }
+    }
+}
+
+fn d4_zombie_open_at(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // SAFETY: held fixture directory and internally selected relative name.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: new descriptor, adopted once.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+/// Test observation only: no production member authority or selector is minted.
+/// All post-exit reads are relative to directories opened while the leader lives.
+struct D4ZombieObservation {
+    original: std::sync::Arc<crate::process::PidPin>,
+    leader: std::os::fd::OwnedFd,
+    tasks: std::os::fd::OwnedFd,
+    member: std::os::fd::OwnedFd,
+    member_birth: u64,
+    full_member: Option<std::os::fd::OwnedFd>,
+}
+
+impl D4ZombieObservation {
+    fn acquire(ready: &D4ZombieReady) -> Self {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let original =
+            std::sync::Arc::new(crate::process::PidPin::open(ready.mapping.tgid).unwrap());
+        original
+            .pidfd()
+            .expect("fixture: original group pidfd required");
+        original
+            .start_time()
+            .expect("fixture: original birth required");
+        assert_eq!(original.original_exited(), Ok(false));
+        let leader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/proc/{}", ready.mapping.tgid))
+            .unwrap()
+            .into();
+        let tasks = d4_zombie_open_at(&leader, c"task").unwrap();
+        let name = std::ffi::CString::new(ready.mapping.tid.to_string()).unwrap();
+        let member = d4_zombie_open_at(&tasks, &name).unwrap();
+        let mut result = Self {
+            original,
+            leader,
+            tasks,
+            member,
+            member_birth: 0,
+            full_member: None,
+        };
+        result.member_birth = result.stat(&result.member).unwrap().birth;
+        // The nested task directory proves original-group membership but
+        // uses tid_base_stuff, which lacks map_files. A direct /proc/TID
+        // directory uses tgid_base_stuff even for a nonleader. Its numeric
+        // path is only a candidate lookup, never independent authority.
+        // Acquire it while the owned raw worker cannot exec/exit before Q,
+        // bracketed by validation of the original group and held member.
+        result.validate(ready);
+        assert!(
+            matches!(
+                result.stat(&result.leader).unwrap().state,
+                b'R' | b'S' | b'D'
+            ),
+            "fixture: full member view must be acquired before leader retirement"
+        );
+        let candidate = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/proc/{}", ready.mapping.tid))
+            .expect("fixture: pre-exit candidate full member directory");
+        result.validate(ready);
+        assert!(
+            matches!(
+                result.stat(&result.leader).unwrap().state,
+                b'R' | b'S' | b'D'
+            ),
+            "fixture: leader retired during full-view acquisition"
+        );
+        result.full_member = Some(candidate.into());
+        result.validate(ready);
+        // Relative task/<TGID> traverses proc_task_lookup's actual
+        // same_thread_group gate from the candidate's retained task.
+        // Bind that round trip to the still-held original leader/birth.
+        let candidate_tasks = d4_zombie_open_at(result.full_member(), c"task")
+            .expect("fixture: full member view task directory");
+        let leader_name = std::ffi::CString::new(ready.mapping.tgid.to_string()).unwrap();
+        let same_group_leader = d4_zombie_open_at(&candidate_tasks, &leader_name)
+            .expect("fixture: full-view task/original-TGID same-group round trip");
+        let round_trip = result.stat(&same_group_leader).unwrap();
+        let original_leader = result.stat(&result.leader).unwrap();
+        assert_eq!(
+            (round_trip.tid, round_trip.birth),
+            (original_leader.tid, original_leader.birth),
+            "fixture: full-view original leader binding"
+        );
+        assert_eq!(
+            (round_trip.tid, Some(round_trip.birth)),
+            (ready.mapping.tgid, result.original.start_time())
+        );
+        result.validate(ready);
+        result
+    }
+
+    fn full_member(&self) -> &std::os::fd::OwnedFd {
+        self.full_member
+            .as_ref()
+            .expect("fixture: validated pre-exit full member view required")
+    }
+
+    fn stat(&self, dir: &std::os::fd::OwnedFd) -> std::io::Result<D4ZombieTask> {
+        use std::io::Read as _;
+        let file = std::fs::File::from(d4_zombie_open_at(dir, c"stat")?);
+        let mut text = String::new();
+        file.take(65536).read_to_string(&mut text)?;
+        if text.len() >= 65536 {
+            return Err(std::io::Error::other("fixture: oversized stat"));
+        }
+        d4_zombie_stat(&text).map_err(std::io::Error::other)
+    }
+
+    fn tasks(&self) -> std::io::Result<Vec<D4ZombieTask>> {
+        use std::os::fd::AsRawFd as _;
+        // This fd alias is the retained directory, never a fresh /proc/TGID walk.
+        let mut tasks = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", self.tasks.as_raw_fd()))? {
+            let name = entry?.file_name();
+            let name =
+                std::ffi::CString::new(name.as_encoded_bytes()).map_err(std::io::Error::other)?;
+            tasks.push(self.stat(&d4_zombie_open_at(&self.tasks, &name)?)?);
+        }
+        tasks.sort_by_key(|task| task.tid);
+        Ok(tasks)
+    }
+
+    fn status(&self, directory: &std::os::fd::OwnedFd) -> String {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::fs::File::from(
+            d4_zombie_open_at(directory, c"status").expect("fixture: retained task status"),
+        )
+        .take(65536)
+        .read_to_string(&mut text)
+        .unwrap();
+        assert!(text.len() < 65536, "fixture: oversized task status");
+        text
+    }
+
+    fn retirement_ready(&self, ready: &D4ZombieReady) {
+        let name = std::ffi::CString::new(ready.creator.to_string()).unwrap();
+        let creator =
+            d4_zombie_open_at(&self.tasks, &name).expect("fixture: actual creator directory");
+        for directory in [&self.leader, &creator] {
+            let status = self.status(directory);
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigBlk:"))
+                .expect("fixture: actual retirement signal mask")
+                .trim();
+            let mask = u64::from_str_radix(mask, 16).unwrap();
+            assert_eq!(
+                mask & (1 << (libc::SIGUSR1 - 1)),
+                0,
+                "fixture: targeted retirement signal must be unblocked"
+            );
+        }
+    }
+
+    fn validate(&self, ready: &D4ZombieReady) {
+        assert_eq!(
+            self.original.original_exited(),
+            Ok(false),
+            "fixture: whole group must live"
+        );
+        assert!(self.original.still_the_same());
+        let leader = self
+            .stat(&self.leader)
+            .expect("fixture: retained original leader stat");
+        assert_eq!(
+            (leader.tid, Some(leader.birth)),
+            (ready.mapping.tgid, self.original.start_time())
+        );
+        // Both descriptors pin the original task's struct pid. Neither is
+        // reopened after retirement, so member death/exec PID exchange
+        // cannot substitute a fresh task by its equal numeric TID.
+        for directory in std::iter::once(&self.member).chain(self.full_member.iter()) {
+            let member = self
+                .stat(directory)
+                .expect("fixture: retained live member stat");
+            assert_eq!(
+                (member.tid, member.birth),
+                (ready.mapping.tid, self.member_birth)
+            );
+            assert!(
+                matches!(member.state, b'R' | b'S' | b'D'),
+                "fixture: retained member must stay live"
+            );
+            let status = self.status(directory);
+            for (field, expected) in [("Tgid:", ready.mapping.tgid), ("Pid:", ready.mapping.tid)] {
+                let actual = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(field))
+                    .expect("fixture: actual member status identity")
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap();
+                assert_eq!(actual, expected, "fixture: actual member {field}");
+            }
+        }
+    }
+
+    fn maps(&self, ready: &D4ZombieReady) -> Vec<MapEntry> {
+        self.validate(ready);
+        let snapshot = crate::discovery::scan::read_maps_or_refuse(
+            std::fs::File::from(
+                d4_zombie_open_at(self.full_member(), c"maps")
+                    .expect("fixture: retained full member maps"),
+            ),
+            &mut CaptureWorkBudget::default(),
+            crate::attach::monotonic_ns,
+        )
+        .expect("fixture: fresh full member maps");
+        self.validate(ready);
+        snapshot
+    }
+
+    fn identity(&self, ready: &D4ZombieReady, name: &str) -> FileIdentity {
+        use std::os::fd::AsRawFd as _;
+        self.validate(ready);
+        let name = std::ffi::CString::new(name).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live retained directory, internal fd/range name; follow its
+        // proc link to obtain actual vm_file/open-file metadata, not a pathname.
+        assert_eq!(
+            unsafe {
+                libc::fstatat(
+                    self.full_member().as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    0,
+                )
+            },
+            0,
+            "fixture: retained full member identity {:?}: {}",
+            name,
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: successful fstatat initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        self.validate(ready);
+        FileIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+struct D4ZombieRawArgs {
+    path: *const libc::c_char,
+    channel: libc::c_int,
+    creator: libc::c_int,
+    parent_tid: *mut std::sync::atomic::AtomicI32,
+    returned_tid: std::sync::atomic::AtomicI32,
+    start: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const D4_ZOMBIE_FRAME_SIZE: usize =
+    (D4_CLONE_WORKER_WIRE_OFFSET + D4_ZOMBIE_REPLY_LEN + 1 + 15) & !15;
+
+/// Only the owned helper installs this handler. A targeted signal retires
+/// one thread without running Rust destructors or terminating the group.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_zombie_thread_exit(_signal: libc::c_int) {
+    core::arch::naked_asm!(
+        "xor edi, edi",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        sys_exit = const libc::SYS_exit,
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_zombie_creator_park() -> ! {
+    core::arch::naked_asm!(
+        "2:",
+        "mov eax, {sys_pause}",
+        "syscall",
+        "jmp 2b",
+        sys_pause = const libc::SYS_pause,
+    );
+}
+
+/// Separate from the qualified clone worker: this leaf owns the external
+/// protocol after retiring BOTH the TGID leader and libtest controller.
+/// No Rust/libc/TLS, allocator, unwinding, or exit_group runs in this path.
+/// Published storage is never reclaimed while any group member lives.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_zombie_single_survivor_worker(_context: *mut libc::c_void) -> libc::c_int {
+    core::arch::naked_asm!(
+        "sub rsp, {frame}",
+        "mov rbx, rdi",
+        "mov r12d, dword ptr [rbx + {args_channel}]",
+        // Release/acquire publication on x86-64: no child reads the return
+        // or parent-written TID before the normal creator opens this gate.
+        "2:",
+        "cmp dword ptr [rbx + {args_start}], 1",
+        "je 3f",
+        "pause",
+        "jmp 2b",
+        "3:",
+        "mov eax, {magic}",
+        "mov qword ptr [rsp + {wire}], rax",
+        "mov eax, {sys_getpid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 8], rax",
+        "mov eax, {sys_gettid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 16], rax",
+        "mov eax, dword ptr [rbx + {args_creator}]",
+        "mov qword ptr [rsp + {wire} + 64], rax",
+        "mov eax, dword ptr [rbx + {args_returned}]",
+        "mov qword ptr [rsp + {wire} + 72], rax",
+        "mov rax, qword ptr [rbx + {args_parent}]",
+        "mov eax, dword ptr [rax]",
+        "mov qword ptr [rsp + {wire} + 80], rax",
+        "mov eax, {sys_openat}",
+        "mov rdi, {at_fdcwd}",
+        "mov rsi, qword ptr [rbx + {args_path}]",
+        "mov edx, {open_flags}",
+        "xor r10d, r10d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r13, rax",
+        "mov qword ptr [rsp + {wire} + 24], rax",
+        "mov eax, {sys_fstat}",
+        "mov edi, r13d",
+        "mov rsi, rsp",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov rax, qword ptr [rsp + {stat_dev}]",
+        "mov qword ptr [rsp + {wire} + 48], rax",
+        "mov rax, qword ptr [rsp + {stat_ino}]",
+        "mov qword ptr [rsp + {wire} + 56], rax",
+        "mov eax, {sys_mmap}",
+        "xor edi, edi",
+        "mov esi, 4096",
+        "mov edx, {prot}",
+        "mov r10d, {map_private}",
+        "mov r8, r13",
+        "xor r9d, r9d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r14, rax",
+        "mov qword ptr [rsp + {wire} + 32], rax",
+        "add rax, 4096",
+        "mov qword ptr [rsp + {wire} + 40], rax",
+        "lea rbp, [rsp + {wire}]",
+        "mov r15d, {reply_len}",
+        "4:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "mov rsi, rbp",
+        "mov rdx, r15",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 4b",
+        "test rax, rax",
+        "jle 9f",
+        "cmp rax, r15",
+        "ja 9f",
+        "add rbp, rax",
+        "sub r15, rax",
+        "jnz 4b",
+        // R15 is now zero: no normal helper threads have retired yet.
+        "5:",
+        "mov eax, {sys_read}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 5b",
+        "cmp rax, 1",
+        "jne 9f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 90",
+        "je 6f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 81",
+        "jne 9f",
+        "6:",
+        "test r15d, r15d",
+        "jnz 7f",
+        // These are actual kernel TGID/creator TIDs from this owned group.
+        "mov eax, {sys_tgkill}",
+        "mov edi, dword ptr [rsp + {wire} + 8]",
+        "mov esi, edi",
+        "mov edx, {retire_signal}",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {sys_tgkill}",
+        "mov edi, dword ptr [rsp + {wire} + 8]",
+        "mov esi, dword ptr [rbx + {args_creator}]",
+        "mov edx, {retire_signal}",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov r15d, 1",
+        "7:",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 90",
+        "je 8f",
+        "mov eax, {sys_munmap}",
+        "mov rdi, r14",
+        "mov esi, 4096",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {sys_close}",
+        "mov edi, r13d",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov byte ptr [rsp + {wire} + {reply_len}], 68",
+        "8:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 8b",
+        "cmp rax, 1",
+        "jne 9f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 90",
+        "je 5b",
+        "xor edi, edi",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        "9:",
+        "mov edi, 91",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        frame = const D4_ZOMBIE_FRAME_SIZE,
+        wire = const D4_CLONE_WORKER_WIRE_OFFSET,
+        reply_len = const D4_ZOMBIE_REPLY_LEN,
+        args_path = const std::mem::offset_of!(D4ZombieRawArgs, path),
+        args_channel = const std::mem::offset_of!(D4ZombieRawArgs, channel),
+        args_creator = const std::mem::offset_of!(D4ZombieRawArgs, creator),
+        args_parent = const std::mem::offset_of!(D4ZombieRawArgs, parent_tid),
+        args_returned = const std::mem::offset_of!(D4ZombieRawArgs, returned_tid),
+        args_start = const std::mem::offset_of!(D4ZombieRawArgs, start),
+        stat_dev = const std::mem::offset_of!(libc::stat, st_dev),
+        stat_ino = const std::mem::offset_of!(libc::stat, st_ino),
+        magic = const D4_ZOMBIE_MAGIC,
+        eintr = const libc::EINTR,
+        at_fdcwd = const libc::AT_FDCWD,
+        open_flags = const libc::O_RDONLY | libc::O_CLOEXEC,
+        prot = const libc::PROT_READ | libc::PROT_EXEC,
+        map_private = const libc::MAP_PRIVATE,
+        retire_signal = const libc::SIGUSR1,
+        sys_getpid = const libc::SYS_getpid,
+        sys_gettid = const libc::SYS_gettid,
+        sys_openat = const libc::SYS_openat,
+        sys_fstat = const libc::SYS_fstat,
+        sys_mmap = const libc::SYS_mmap,
+        sys_write = const libc::SYS_write,
+        sys_read = const libc::SYS_read,
+        sys_tgkill = const libc::SYS_tgkill,
+        sys_munmap = const libc::SYS_munmap,
+        sys_close = const libc::SYS_close,
+        sys_exit = const libc::SYS_exit,
+    );
+}
+
+/// Once published, these allocations are never reclaimed in this helper.
+/// The creator and leader exit without unwinding. The shared mm keeps the
+/// storage live through the last worker's exit; the outer owned process
+/// guard then reaps the whole group before claiming cleanup.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+struct D4ZombieRawStorage {
+    stack: *mut libc::c_void,
+    stack_len: usize,
+    path: *mut libc::c_char,
+    args: *mut D4ZombieRawArgs,
+    tid: *mut std::sync::atomic::AtomicI32,
+    worker: libc::c_int,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl D4ZombieRawStorage {
+    fn publish(path: std::ffi::CString, channel: libc::c_int) -> ! {
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+        // SAFETY: all libc/TLS use is confined to the normal creator.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page = page as usize;
+        let stack_size = 1024 * 1024;
+        let stack_len = stack_size + 2 * page;
+        let stack = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                stack_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            stack,
+            libc::MAP_FAILED,
+            "fixture: owned zombie-worker stack"
+        );
+        let path = path.into_raw();
+        let tid = Box::into_raw(Box::new(AtomicI32::new(-1)));
+        let args = Box::into_raw(Box::new(D4ZombieRawArgs {
+            path,
+            channel,
+            creator: unsafe { libc::syscall(libc::SYS_gettid) } as libc::c_int,
+            parent_tid: tid,
+            returned_tid: AtomicI32::new(-1),
+            start: AtomicU32::new(0),
+        }));
+        let mut owned = Self {
+            stack,
+            stack_len,
+            path,
+            args,
+            tid,
+            worker: 0,
+        };
+        // SAFETY: only the middle of this owned mapping becomes writable.
+        let stack_start = unsafe { stack.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    stack_start.cast(),
+                    stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0
+        );
+        // SAFETY: ordinary-parent trampoline; the callback is entirely raw
+        // assembly. The newborn cannot pass its start gate until publication.
+        owned.worker = unsafe {
+            libc::clone(
+                d4_zombie_single_survivor_worker,
+                stack_start.add(stack_size).cast(),
+                D4_CLONE_WITHOUT_FILES_FLAGS,
+                args.cast(),
+                (*tid).as_ptr(),
+                std::ptr::null_mut::<libc::c_void>(),
+                (*tid).as_ptr(),
+            )
+        };
+        assert!(
+            owned.worker > 0,
+            "fixture: literal zombie-worker clone: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { (*tid).load(Ordering::Acquire) },
+            owned.worker,
+            "fixture: kernel parent-TID write"
+        );
+        // SAFETY: these raw allocations were published once, stay live to
+        // whole-group exit, and are only accessed atomically after clone.
+        unsafe {
+            (*args).returned_tid.store(owned.worker, Ordering::Relaxed);
+            (*args).start.store(1, Ordering::Release);
+        }
+        std::mem::forget(owned);
+        d4_zombie_creator_park()
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl Drop for D4ZombieRawStorage {
+    fn drop(&mut self) {
+        if self.worker > 0 {
+            // A failure must terminate this owned helper before any live
+            // newborn's stack/context/path can unwind or be reclaimed.
+            unsafe { libc::_exit(105) };
+        }
+        // SAFETY: clone did not create a worker. Successful publication
+        // forgets this guard and relies on outer whole-group reap instead.
+        unsafe {
+            libc::munmap(self.stack, self.stack_len);
+            drop(std::ffi::CString::from_raw(self.path));
+            drop(Box::from_raw(self.args));
+            drop(Box::from_raw(self.tid));
+        }
+    }
+}
+
+/// Private helper never completes as a standalone libtest qualification.
+/// It needs its owning socket/path; normal completion comes from the last
+/// raw worker's SYS_exit after the original leader/controller have retired.
+#[test]
+#[ignore = "private D4 zombie fixture entrypoint; requires owning socket and source configuration"]
+fn d4_zombie_single_survivor_mapping_helper() {
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    panic!("the actual zombie fixture requires the x86-64 LP64 syscall ABI");
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        let path =
+            std::env::var_os("P11SCOPE_D4_ZOMBIE_PATH").expect("fixture: owned zombie source");
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fresh-exec helper only; stdin must be its owning Unix socket.
+        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(raw >= 0);
+        let socket = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        socket
+            .peer_addr()
+            .expect("fixture: connected owning socket required");
+        // SAFETY: only the owned fresh helper changes its process-wide
+        // disposition. The naked handler does a thread-only syscall exit.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = d4_zombie_thread_exit as *const () as usize;
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) },
+            0
+        );
+        // No return or Rust cleanup after publication; the socket and all
+        // raw allocations remain live until the outer process guard reaps.
+        D4ZombieRawStorage::publish(path, socket.as_raw_fd());
+    }
+}
+
+/// Existing-API required-positive regression, NOT a qualified zombie port.
+/// The post-exit semantic assertions deliberately remain required positives:
+/// today's zombie/leader-only refusals do not satisfy the selected population.
+/// Both real backends are attempted and the owned helper is normally reaped
+/// BEFORE those assertions, even when either backend panics internally.
+#[test]
+#[ignore = "root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required zombie-leader positive baseline"]
+fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const {
+        assert!(
+            cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
+            "fixture: actual zombie survivor requires x86-64 LP64"
+        );
+    }
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("fixture: required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("fixture: readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let raw_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: valid owned directory name and output buffer.
+    assert_eq!(
+        unsafe { libc::statfs(raw_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: successful statfs initialized the output.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(
+        magic, 0x9123_683e,
+        "fixture: actual disk TMPDIR must be Btrfs"
+    );
+    create_subvolume(parent, "a");
+    let path = parent.join("a/libzombie.so");
+    let bytes = vec![0x5cu8; 8192];
+    std::fs::write(&path, &bytes).unwrap();
+    let held = std::fs::File::open(&path).unwrap();
+    let identity = |file: &std::fs::File| {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let physical = identity(&held);
+    let (mut child, ready) = D4ZombieChild::spawn(&path);
+    let observation = D4ZombieObservation::acquire(&ready);
+    let original_birth = observation
+        .original
+        .start_time()
+        .expect("fixture: retained original birth");
+    let pid = ready.mapping.tgid;
+    let worker = ready.mapping.tid;
+    let creator = ready.creator;
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let before_maps = observation.maps(&ready);
+    let before_line = before_maps
+        .iter()
+        .find(|entry| (entry.start, entry.end) == (ready.mapping.start, ready.mapping.end))
+        .expect("fixture: actual worker executable VMA")
+        .clone();
+    let key = ObjectKey::of(&before_line);
+    let pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("fixture: actual held-A pin").id;
+    let (index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "fixture: {refused:?}");
+    assert!(
+        index.map_files_keys().contains(&key),
+        "fixture: actual Btrfs range proof required"
+    );
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("fixture: actual strict kernel session; no fallback positive");
+
+    // Fixture checks are separate from the required attribution positives.
+    // Catch them too so a failed observation can still release the owned
+    // group normally. Q retires the controller even if Z was never sent.
+    let outcomes = catch_unwind(AssertUnwindSafe(|| {
+        d4_zombie_task_set(
+            &observation.tasks().expect("fixture: before task set"),
+            &ready,
+            false,
+        )
+        .expect("fixture: exactly leader/controller/raw worker before exit");
+        observation.retirement_ready(&ready);
+        let verify_mapping = |snapshot: &[MapEntry]| {
+            observation.validate(&ready);
+            assert_eq!(
+                (ready.mapping.dev, ready.mapping.ino),
+                (physical.dev, physical.ino),
+                "fixture: actual worker fstat matches held file"
+            );
+            assert_eq!(
+                observation.identity(&ready, &format!("fd/{}", ready.mapping.fd)),
+                physical,
+                "fixture: actual live-member FD names held A"
+            );
+            assert_eq!(
+                observation.identity(
+                    &ready,
+                    &format!(
+                        "map_files/{:x}-{:x}",
+                        ready.mapping.start, ready.mapping.end
+                    )
+                ),
+                physical,
+                "fixture: actual live-member vm_file names held A"
+            );
+            let lines: Vec<_> = snapshot
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .collect();
+            assert_eq!(
+                lines,
+                [&before_line],
+                "fixture: exact held VMA remains unchanged"
+            );
+            assert_eq!(before_line.permissions, *b"r-xp");
+            assert_eq!(before_line.file_offset, 0);
+            assert_eq!(
+                before_line.raw_path.as_deref(),
+                Some(path.as_os_str().as_encoded_bytes())
+            );
+            assert!(is_caller_range(&before_line));
+            assert_eq!(
+                proof_ranges(snapshot, &index.map_files_keys()),
+                [(ready.mapping.start, ready.mapping.end)],
+                "fixture: one exact actual proof range"
+            );
+            assert_eq!(identity(&held), physical);
+            assert_eq!(identity(pins.file_for(object).unwrap()), physical);
+            assert!(
+                pins.object_unchanged(object)
+                    .expect("fixture: actual held anchor unchanged")
+            );
+            let mut actual_bytes = vec![0; bytes.len()];
+            held.read_exact_at(&mut actual_bytes, 0).unwrap();
+            assert_eq!(actual_bytes, bytes, "fixture: held A bytes remain stable");
+        };
+        verify_mapping(&before_maps);
+        let before_userspace = catch_unwind(AssertUnwindSafe(|| {
+            attribute_pid(pid, before_maps.clone(), &index)
+        }));
+        let before_kernel = catch_unwind(AssertUnwindSafe(|| {
+            d4_kernel_attribution_for_pid(
+                pid,
+                before_maps.clone(),
+                &pins,
+                object,
+                key,
+                &mut session,
+                1,
+            )
+        }));
+        child.zombify();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let after_tasks = loop {
+            match observation.tasks() {
+                Ok(tasks) if d4_zombie_task_set(&tasks, &ready, true).is_ok() => break tasks,
+                Ok(tasks) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture: retirement never reached exactly one live survivor: {tasks:?}"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture: retiring controller enumeration did not settle: {error}"
+                    );
+                }
+                Err(error) => panic!("fixture: retained task enumeration failed: {error}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        // The retained MEMBER's maps are opened anew AFTER the zombie
+        // barrier. No leader maps path or saved snapshot substitutes for it.
+        let after_maps = observation.maps(&ready);
+        verify_mapping(&after_maps);
+        eprintln!(
+            "D4_ZOMBIE_TRUTH caller={pid} worker={worker} retired_controller={creator} tasks={after_tasks:?} original_birth={original_birth:?} group_pidfd_ready=false fd={} range={:x}-{:x} file={}:{} clone_return={} parent_tid={}",
+            ready.mapping.fd,
+            ready.mapping.start,
+            ready.mapping.end,
+            physical.dev,
+            physical.ino,
+            ready.returned_tid,
+            ready.parent_tid
+        );
+        let after_userspace = catch_unwind(AssertUnwindSafe(|| {
+            attribute_pid(pid, after_maps.clone(), &index)
+        }));
+        let after_kernel = catch_unwind(AssertUnwindSafe(|| {
+            d4_kernel_attribution_for_pid(pid, after_maps, &pins, object, key, &mut session, 2)
+        }));
+        // Both backend calls above have happened before any positive check.
+        verify_mapping(&observation.maps(&ready));
+        d4_zombie_task_set(
+            &observation
+                .tasks()
+                .expect("fixture: final retained task set"),
+            &ready,
+            true,
+        )
+        .expect("fixture: sole survivor stays live through both proofs");
+        (
+            before_userspace,
+            before_kernel,
+            after_userspace,
+            after_kernel,
+        )
+    }));
+    let cleanup = child.finish();
+    // On a fixture failure the owned guard also kills/reaps, but that is
+    // distinct from this normal release/reap required by semantic baseline.
+    cleanup.expect("fixture: normal whole-group release/reap required before semantic assertions");
+    assert_eq!(
+        observation.original.original_exited(),
+        Ok(true),
+        "fixture: original group exited"
+    );
+    assert!(!observation.original.still_the_same());
+    for id in [pid, worker, creator] {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{id}")).exists(),
+            "fixture: owned task {id} gone"
+        );
+    }
+    drop((observation, session, pins, held));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    probe_dir
+        .close()
+        .expect("fixture: remove owned kernel probe directory");
+    dir.close()
+        .expect("fixture: remove owned Btrfs zombie directory");
+    eprintln!(
+        "D4_ZOMBIE_CLEANUP caller={pid} worker={worker} controller={creator} normal_release=true whole_group_reaped=true owned_files_removed=true"
+    );
+    let (before_userspace, before_kernel, after_userspace, after_kernel) =
+        outcomes.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    for (label, result) in [
+        ("before/userspace", &before_userspace),
+        ("before/kernel", &before_kernel),
+        ("zombie/userspace", &after_userspace),
+        ("zombie/kernel", &after_kernel),
+    ] {
+        match result {
+            Ok(out) => eprintln!(
+                "D4_ZOMBIE_RESULT {label} members={} probed={} unavailable={} exited={:?} losses={:?}",
+                out.members.len(),
+                out.probed,
+                out.unavailable,
+                out.exited,
+                out.losses
+            ),
+            Err(_) => eprintln!("D4_ZOMBIE_RESULT {label} backend_panicked=true"),
+        }
+    }
+    let before_userspace = before_userspace.expect("fixture/backend: before userspace panic");
+    let before_kernel = before_kernel.expect("fixture/backend: before kernel panic");
+    let after_userspace = after_userspace.expect("fixture/backend: zombie userspace panic");
+    let after_kernel = after_kernel.expect("fixture/backend: zombie kernel panic");
+    for (phase, userspace, kernel) in [
+        ("leader live", &before_userspace, &before_kernel),
+        (
+            "leader zombie / sole live worker",
+            &after_userspace,
+            &after_kernel,
+        ),
+    ] {
+        for (backend, out) in [("userspace", userspace), ("kernel", kernel)] {
+            assert_eq!(
+                out.members
+                    .iter()
+                    .map(|member| member.pid)
+                    .collect::<Vec<_>>(),
+                [pid],
+                "required positive: {phase}/{backend} must attribute original TGID's held A; current refusal is a regression, not qualification"
+            );
+            assert_eq!(out.members[0].start_time, original_birth);
+            assert_eq!(
+                out.members[0]
+                    .objects
+                    .iter()
+                    .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                    .collect::<Vec<_>>(),
+                [(key, object, path.to_str().unwrap())]
+            );
+            assert_eq!(out.probed, 1);
+            assert_eq!(out.unavailable, 0);
+            assert!(
+                out.exited.is_empty(),
+                "required live group: {phase}/{backend}"
+            );
+            assert!(out.losses.is_empty(), "{phase}/{backend}: {:?}", out.losses);
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "independently required {phase} edges"
+        );
+    }
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now
@@ -2829,3 +7570,840 @@ fn a_caller_range_is_any_executable_shared_object_mapping() {
         "an executable non-shared-object mapping is not a provider caller range"
     );
 }
+
+// The production confirmation functions run against normally returning proof
+// reads. This fixture cancels after the first read, with another range/member
+// queued; it does not claim to interrupt an in-flight kernel operation.
+struct CgroupProofProbe {
+    inner: CountingProbe,
+    control: crate::scope::inventory_cgroup::CollectionControl,
+    cancel_first: bool,
+    opens: RefCell<Vec<u32>>,
+}
+struct CgroupProofIo<'a> {
+    inner: CountingIo<'a>,
+    control: &'a crate::scope::inventory_cgroup::CollectionControl,
+    cancel_first: bool,
+    opens: &'a RefCell<Vec<u32>>,
+}
+impl CgroupProofProbe {
+    fn new(sweep: &[(u32, Vec<MapEntry>)], cancel_first: bool) -> Self {
+        Self {
+            inner: CountingProbe::over(sweep),
+            control: crate::scope::inventory_cgroup::CollectionControl::new(None),
+            cancel_first,
+            opens: RefCell::new(Vec::new()),
+        }
+    }
+    fn io(&self, pid: u32) -> CgroupProofIo<'_> {
+        CgroupProofIo {
+            inner: self.inner.io(pid),
+            control: &self.control,
+            cancel_first: self.cancel_first,
+            opens: &self.opens,
+        }
+    }
+    fn budget(&self) -> CaptureWorkBudget {
+        let control = self.control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(crate::discovery::scan::CollectionWork::new(move |_| {
+            control.check().is_ok()
+        }));
+        budget
+    }
+}
+impl ConfirmIo for CgroupProofIo<'_> {
+    type Pin = u64;
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        let answer = self.inner.mapped_file(pid, start, end);
+        if self.cancel_first && self.inner.reads.borrow().len() == 1 {
+            self.control.cancel();
+        }
+        answer
+    }
+    fn open(&mut self, pid: u32) -> Result<u64, String> {
+        self.opens.borrow_mut().push(pid);
+        self.inner.open(pid)
+    }
+    fn start_time(&self, pin: &u64) -> Option<u64> {
+        self.inner.start_time(pin)
+    }
+    fn still_the_same(&self, pin: &u64) -> bool {
+        self.inner.still_the_same(pin)
+    }
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.inner.exe(pid)
+    }
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.inner.maps(pid, budget)
+    }
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+}
+impl MemberProbe for CgroupProofProbe {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        confirm_with(&mut self.io(pid), pid, prove, budget)
+    }
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned(&mut self.io(pid), pid, ranges, budget)
+    }
+}
+
+#[test]
+fn cgroup_review_confirmation_stop_prevents_next_range_and_member() {
+    let sweep = vec![(10_001, caller5()), (10_002, caller5())];
+    let index = caller5_index();
+    assert_eq!(
+        proof_ranges(&caller5(), &index.map_files_keys()).len(),
+        2,
+        "the fixture has two independent proof ranges"
+    );
+    let mut probe = CgroupProofProbe::new(&sweep, true);
+    let mut budget = probe.budget();
+    let attribution = attribute_unselected(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index,
+        &mut probe,
+        &mut budget,
+    );
+    assert_eq!(
+        probe.inner.reads.borrow().len(),
+        1,
+        "a returning first proof read cancels before the next range"
+    );
+    assert_eq!(
+        *probe.opens.borrow(),
+        vec![10_001],
+        "the next member cannot open a generation after cancellation"
+    );
+    assert!(attribution.members.is_empty());
+    assert!(budget.stopped_reason().is_some());
+}
+
+#[test]
+fn cgroup_review_unpinned_stop_prevents_next_range() {
+    let sweep = vec![(10_001, caller5())];
+    let probe = CgroupProofProbe::new(&sweep, true);
+    let mut budget = probe.budget();
+    let answers = stat_unpinned(
+        &mut probe.io(10_001),
+        10_001,
+        &[PROVIDER_TEXT, LIBC_TEXT],
+        &mut budget,
+    );
+    assert_eq!(
+        probe.inner.reads.borrow().len(),
+        1,
+        "precharged ranges cannot drain after cancellation"
+    );
+    assert_eq!(answers.len(), 1, "the unread suffix remains unproven");
+    assert!(budget.stopped_reason().is_some());
+}
+
+#[test]
+fn cgroup_review_confirmation_without_stop_preserves_both_members() {
+    let sweep = vec![(10_001, caller5()), (10_002, caller5())];
+    let mut probe = CgroupProofProbe::new(&sweep, false);
+    let mut budget = probe.budget();
+    let attribution = attribute_unselected(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &caller5_index(),
+        &mut probe,
+        &mut budget,
+    );
+    assert_eq!(probe.inner.reads.borrow().len(), 4);
+    assert_eq!(*probe.opens.borrow(), vec![10_001, 10_002]);
+    assert_eq!(attribution.members.len(), 2);
+    assert!(budget.stopped_reason().is_none());
+}
+
+/// Reconciliation must keep each normally returning operation behind the
+/// scoped collector's cancellation fence, including the live finish checks.
+struct CgroupOrderedIo {
+    inner: OrderedIo,
+    control: crate::scope::inventory_cgroup::CollectionControl,
+    stop_after: &'static str,
+}
+
+impl CgroupOrderedIo {
+    fn returned(&self, operation: &str) {
+        if operation == self.stop_after {
+            self.control.cancel();
+        }
+    }
+}
+
+impl ConfirmIo for CgroupOrderedIo {
+    type Pin = u64;
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.mapped_files(pid, &[(start, end)]).remove(0)
+    }
+
+    fn mapped_files(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+    ) -> Vec<Result<FileIdentity, String>> {
+        let answer = self.inner.mapped_files(pid, ranges);
+        self.returned("proof");
+        answer
+    }
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        let answer = self.inner.open(pid);
+        self.returned("open");
+        answer
+    }
+
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        self.inner.record("start_time");
+        self.inner.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        let answer = self.inner.still_the_same(pin);
+        self.returned("same");
+        answer
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        let finishing = self.inner.read();
+        let answer = self.inner.exe(pid);
+        self.returned(if finishing { "after" } else { "before" });
+        answer
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        let answer = self.inner.maps(pid, budget);
+        self.returned("maps");
+        answer
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+}
+
+#[test]
+fn d3a_cgroup_stop_checks_each_confirmation_boundary() {
+    let order = [
+        "open",
+        "exe",
+        "maps",
+        "mapped_files",
+        "exe",
+        "still_the_same",
+    ];
+    for (stop_after, completed) in [
+        ("already_stopped", 0),
+        ("open", 1),
+        ("before", 2),
+        ("maps", 3),
+        ("proof", 4),
+        ("after", 5),
+        ("same", 6),
+    ] {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let checked = control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(crate::discovery::scan::CollectionWork::new(move |_| {
+            checked.check().is_ok()
+        }));
+        if completed == 0 {
+            control.cancel();
+        }
+        let mut io = CgroupOrderedIo {
+            inner: OrderedIo::new(false),
+            control,
+            stop_after,
+        };
+        let policy = SegmentPolicy::from_headroom(3, 4, 1);
+        let owner = ReservationOwner::new(policy);
+        let resources = owner.immediate();
+        let confirmation = confirm_with_resources(
+            &mut io,
+            10_001,
+            &BTreeSet::from([key(PROVIDER)]),
+            &mut budget,
+            Some(&resources),
+        );
+        assert!(
+            matches!(confirmation, Confirmation::Lost(AttributionLoss::Budget, _)),
+            "stop after {stop_after} published a completed confirmation: {confirmation:?}"
+        );
+        assert_eq!(
+            &*io.inner.calls.borrow(),
+            &order[..completed],
+            "{stop_after}"
+        );
+        assert!(budget.stopped_reason().is_some(), "{stop_after}");
+        assert_eq!(owner.state_for_test().0, [0; 4], "{stop_after}");
+    }
+}
+
+/// A zero-request proof must not create a directory FD or depend on access to
+/// a process that the operation never needs to inspect.
+#[test]
+fn d3a_empty_proof_does_not_open_a_directory() {
+    let mut io = OsConfirmIo::default();
+    assert!(io.mapped_files(std::process::id(), &[]).is_empty());
+    assert!(
+        io.map_files.is_none(),
+        "an empty proof retained an unnecessary directory"
+    );
+}
+
+/// Catches treating unsupported/missing kernel evidence as a positive, using
+/// a numeric file identity as a slot, or accepting only one text range.
+#[test]
+fn d3a_kernel_proofs_require_complete_slot_expectations() {
+    let checks = Checks::default();
+    let mut index = provider_index(&checks);
+    let mut entries = provider_caller();
+    entries.push(mapping(
+        0x1000_3000,
+        b"r-xp",
+        PROVIDER,
+        "/usr/lib/softhsm/libsofthsm2.so",
+    ));
+    let sweep = vec![(10_001, entries.clone())];
+    let first = (0x1000_1000, 0x1000_2000);
+    let second = (0x1000_3000, 0x1000_4000);
+    let libc = (0x2000_1000, 0x2000_2000);
+    index
+        .set_kernel_slots(key(PROVIDER), BTreeSet::from([Slot(1), Slot(2)]))
+        .unwrap();
+    index
+        .set_kernel_slots(key(LIBC), BTreeSet::from([Slot(3), Slot(4)]))
+        .unwrap();
+    for (proof, loss) in [
+        (
+            RangeProof::Kernel(Slot(99)),
+            Some(AttributionLoss::IdentityMismatch),
+        ),
+        (
+            RangeProof::KernelNone,
+            Some(AttributionLoss::IdentityMismatch),
+        ),
+        (RangeProof::NotMapped, Some(AttributionLoss::MappingChanged)),
+        (
+            RangeProof::Unavailable("unvisited requested range".into()),
+            Some(AttributionLoss::MapFilesUnavailable),
+        ),
+        (RangeProof::Kernel(Slot(2)), None),
+    ] {
+        let mut probe = Probe::over(&sweep);
+        probe.mapped.insert(
+            10_001,
+            MappedIdentities::from([
+                (first, RangeProof::Kernel(Slot(1))),
+                (second, proof),
+                (libc, RangeProof::Kernel(Slot(4))),
+            ]),
+        );
+        let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+        assert!(
+            out.unexamined.is_empty(),
+            "validated examined alias must remain examined"
+        );
+        match loss {
+            Some(loss) => {
+                assert!(out.members.is_empty());
+                assert_eq!(out.member_losses[&10_001].0, loss);
+                if loss == AttributionLoss::IdentityMismatch {
+                    assert!(!out.member_losses[&10_001].1.contains("st_dev"));
+                    assert!(!out.member_losses[&10_001].1.contains("st_ino"));
+                }
+            }
+            None => {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [10_001]
+                );
+                assert!(out.losses.is_empty());
+            }
+        }
+    }
+    index
+        .set_kernel_slots(key(PROVIDER), BTreeSet::new())
+        .unwrap();
+    let mut probe = Probe::over(&sweep);
+    probe.mapped.insert(
+        10_001,
+        MappedIdentities::from([
+            (first, RangeProof::Kernel(Slot(1))),
+            (second, RangeProof::Kernel(Slot(1))),
+            (libc, RangeProof::Kernel(Slot(4))),
+        ]),
+    );
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert!(out.members.is_empty());
+    assert_eq!(
+        out.member_losses[&10_001].0,
+        AttributionLoss::IdentityMismatch
+    );
+}
+
+#[test]
+fn d3a_global_reservations_enforce_each_envelope() {
+    for (headroom, workers, retained) in [
+        (0, 0, 0),
+        (3, 0, 0),
+        (4, 0, 0),
+        (5, 0, 0),
+        (6, 1, 1),
+        (9, 2, 2),
+        (12, 3, 3),
+        (64, 4, 53),
+    ] {
+        let policy = SegmentPolicy::from_headroom(headroom, 4, 100);
+        assert_eq!((policy.workers, policy.retained), (workers, retained));
+        let owner = ReservationOwner::new(policy);
+        let batch = owner.batch();
+        let pins: Vec<_> = (0..retained).map(|_| batch.pin().unwrap()).collect();
+        assert!(batch.pin().is_err());
+        let workers: Vec<_> = (0..workers).map(|_| batch.transient().unwrap()).collect();
+        assert!(batch.transient().is_err());
+        let immediate = owner.immediate();
+        let immediate_pin = immediate.pin();
+        let immediate_io = immediate.transient();
+        if headroom >= 3 {
+            assert!(immediate_pin.is_ok());
+            assert!(immediate_io.is_ok());
+        } else {
+            assert!(immediate_pin.is_err());
+            assert!(immediate_io.is_err());
+        }
+        assert!(immediate.pin().is_err());
+        assert!(immediate.transient().is_err());
+        assert!(owner.state_for_test().2 <= headroom);
+        assert!(owner.state_for_test().3 <= headroom);
+        drop((pins, workers, immediate_pin, immediate_io));
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+    let policy = SegmentPolicy::from_headroom(usize::MAX, usize::MAX, 2);
+    assert_eq!((policy.workers, policy.retained), (2, 2));
+    assert_eq!(ReservationOwner::new(policy).state_for_test().3, 9);
+}
+
+#[test]
+fn d3b_examined_holds_use_one_global_allowance() {
+    let policy = SegmentPolicy::from_headroom(10, 0, 0);
+    let owner = ReservationOwner::for_examined(policy, 2);
+    assert_eq!(owner.examined_capacity(), 2);
+    let first = owner.examined().unwrap();
+    let first_file = std::fs::File::open("/dev/null").unwrap();
+    let sibling = owner.clone();
+    let second = sibling.examined().unwrap();
+    let second_file = std::fs::File::open("/dev/null").unwrap();
+    assert!(owner.examined().is_err(), "cap multiplied by owner clones");
+    let immediate = owner.immediate();
+    let pin = immediate.pin().unwrap();
+    let io = immediate.transient().unwrap();
+    assert_eq!(owner.examined_for_test(), (2, 2));
+    assert!(owner.state_for_test().2 <= policy.headroom);
+    drop((first_file, second_file));
+    drop((first, second, pin, io));
+    assert_eq!(owner.examined_for_test().0, 0);
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+}
+
+#[test]
+fn d3b_strict_census_never_accepts_a_partial_count() {
+    let entries = || [Ok::<_, ()>(()), Ok(()), Ok(())].into_iter();
+    // Three FDs include the census itself; held/admitted/current scan FDs
+    // would be among the other two, never subtracted a second time.
+    assert_eq!(census_allowance(100, entries(), 4, || true).unwrap(), 34);
+    assert_eq!(census_allowance(64, entries(), 4, || true).unwrap(), 0);
+    assert_eq!(
+        census_allowance(100, entries(), 3, || true).unwrap_err(),
+        FD_CENSUS_REASON
+    );
+    assert_eq!(
+        census_allowance(100, [Ok(()), Err(())].into_iter(), 4, || true).unwrap_err(),
+        FD_CENSUS_REASON
+    );
+    let polls = std::cell::Cell::new(0);
+    assert!(
+        census_allowance(100, entries(), 4, || {
+            polls.set(polls.get() + 1);
+            polls.get() < 4
+        })
+        .is_err(),
+        "late census accepted its partial count"
+    );
+    assert!(
+        census_allowance(100, entries(), 4, || false).is_err(),
+        "clock refusal was ignored"
+    );
+    assert!(census_allowance(100, std::iter::empty::<Result<(), ()>>(), 4, || true).is_err());
+    // Exercise the real unprivileged directory/syscall path too. Headroom
+    // is environment dependent, so its numeric value is not an oracle.
+    match SegmentPolicy::try_snapshot(0, 0) {
+        Ok(live) => assert_eq!((live.workers, live.retained), (0, 0)),
+        Err(reason) => assert_eq!(reason, FD_CENSUS_REASON),
+    }
+}
+
+#[test]
+fn d3b_census_reconciliation_requires_quiescence_and_counts_holds_once() {
+    let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(10, 0, 0), 2);
+    let hold = owner.examined().unwrap();
+    let held_file = std::fs::File::open("/dev/null").unwrap();
+    let immediate = owner.immediate();
+    let pin = immediate.pin().unwrap();
+    let fresh = SegmentPolicy::from_headroom(6, 1, 1);
+    assert!(
+        owner.reconcile(fresh).is_err(),
+        "live confirmation pin rebased"
+    );
+    drop(pin);
+    let worker = immediate.transient().unwrap();
+    assert!(
+        owner.reconcile(fresh).is_err(),
+        "live transient worker rebased"
+    );
+    drop(worker);
+    owner.reconcile(fresh).unwrap();
+    assert!(
+        owner.examined().is_err(),
+        "new custody after the census boundary"
+    );
+    let batch = owner.batch();
+    let pin = batch.pin().unwrap();
+    let transient = batch.transient().unwrap();
+    let immediate_pin = immediate.pin().unwrap();
+    let immediate_io = immediate.transient().unwrap();
+    assert_eq!(owner.state_for_test().0, [1, 2, 1, 2]);
+    assert_eq!(owner.examined_for_test().0, 1);
+    drop((pin, transient, immediate_pin, immediate_io));
+    drop(held_file);
+    drop(hold);
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert_eq!(owner.examined_for_test().0, 0);
+}
+
+/// A delivered reply does not release the worker's source Arc. The observer
+/// owns no source, and the next immediate operation awaits real destruction.
+#[test]
+fn d3a_directory_final_drop_fences_immediate_reuse() {
+    let policy = SegmentPolicy::from_headroom(3, 4, 2);
+    let owner = ReservationOwner::new(policy);
+    let resources = owner.immediate();
+    let lease = resources.transient().unwrap();
+    let held = Arc::new(HeldMapFiles {
+        dir: Some(MapFilesDir::open(std::process::id()).unwrap()),
+        lease: Some(lease),
+        closed: DropFence::default(),
+        observer: None,
+    });
+    let weak = Arc::downgrade(&held);
+    let observer = held.closed.clone(); // no source Arc in the observer
+    let delivered = std::sync::Barrier::new(2);
+    let release = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let worker_source = held.clone();
+        scope.spawn(|| {
+            delivered.wait(); // analogous to proof result delivery
+            release.wait();
+            drop(worker_source);
+        });
+        drop(held);
+        delivered.wait();
+        assert!(
+            weak.upgrade()
+                .unwrap()
+                .dir
+                .as_ref()
+                .unwrap()
+                .directory_metadata()
+                .is_ok()
+        );
+        assert_eq!(owner.state_for_test().0, [0, 0, 0, 2]);
+        assert!(resources.transient().is_err());
+        assert!(!*observer.0.0.lock().unwrap());
+        release.wait();
+        observer.wait();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+        let next = resources.transient().unwrap();
+        drop(next);
+    });
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+}
+
+/// Characterization (pins today's sweep rule): a userspace `map_files`
+/// identity equal to the held object's joins, and an unequal one refuses
+/// with the mismatch loss. The K1 witness avoids the joining shape for
+/// overlay keys by never producing `MapFiles` proofs.
+#[test]
+fn k1_sweep_userspace_identity_equality_joins() {
+    let expected = FileIdentity { dev: 42, ino: 7 };
+    let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
+    let mapped =
+        MappedIdentities::from([((entry.start, entry.end), RangeProof::MapFiles(expected))]);
+    prove_match(expected, None, &[&entry], &mapped, false).expect("equal userspace identity joins");
+    let other = FileIdentity { dev: 42, ino: 9 };
+    let mapped = MappedIdentities::from([((entry.start, entry.end), RangeProof::MapFiles(other))]);
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, false)
+        .expect_err("unequal identity refuses");
+    assert_eq!(loss, AttributionLoss::IdentityMismatch);
+}
+
+/// K2 RED (R1a): an overlay key whose kernel run is unavailable (here: the
+/// pure-userspace sweep, which never runs the kernel) yields the named
+/// loss, never a userspace-identity edge — even when the identities agree.
+#[test]
+fn k2_sweep_overlay_userspace_equality_refuses() {
+    let checks = Checks {
+        fs_magic: BTreeMap::from([(
+            OBJECT,
+            Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        )]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = [(1001u32, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(out.probed, 1, "the confirm still runs; the prove refuses");
+    assert!(
+        out.members.is_empty(),
+        "overlay userspace equality joined: {:?}",
+        out.members
+    );
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        out.member_losses
+    );
+}
+
+/// K2: the prove step refuses agreeing userspace identity and ladder
+/// refusal markers for overlay keys with the named loss, keeps the
+/// read-failure loss for genuinely unreadable proofs, and still joins on
+/// the kernel proof.
+#[test]
+fn k2_prove_match_overlay_refuses_userspace_joins_kernel() {
+    let expected = FileIdentity { dev: 42, ino: 7 };
+    let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
+    let range = (entry.start, entry.end);
+    let mapped = MappedIdentities::from([(range, RangeProof::MapFiles(expected))]);
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, true)
+        .expect_err("overlay userspace equality refuses");
+    assert_eq!(loss, AttributionLoss::OverlayKernelUnavailable);
+    let mapped = MappedIdentities::from([(range, RangeProof::OverlayRefused)]);
+    let (loss, detail) = prove_match(expected, None, &[&entry], &mapped, true)
+        .expect_err("overlay refusal marker refuses");
+    assert_eq!(loss, AttributionLoss::OverlayKernelUnavailable);
+    assert_eq!(
+        detail,
+        "the range 7f000000-7f001000 needs the kernel proof (overlayfs or an \
+         unproven filesystem) and no kernel proof covered it"
+    );
+    let slots = BTreeSet::from([Slot(0)]);
+    let mapped = MappedIdentities::from([(range, RangeProof::Kernel(Slot(0)))]);
+    prove_match(expected, Some(&slots), &[&entry], &mapped, true)
+        .expect("overlay kernel proof joins");
+    let mapped = MappedIdentities::from([(range, RangeProof::Unavailable("denied".into()))]);
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, true)
+        .expect_err("overlay read failure refuses");
+    assert_eq!(loss, AttributionLoss::MapFilesUnavailable);
+}
+
+/// K1-R2: the private witness session proves a watched overlay caller in
+/// the kernel (no attach-set exclusions); its verdict joins like a
+/// sweep kernel proof, never like userspace identity.
+#[test]
+fn k1_r2_prove_match_witnessed_joins_overlay() {
+    let expected = FileIdentity { dev: 42, ino: 7 };
+    let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
+    let range = (entry.start, entry.end);
+    let mapped = MappedIdentities::from([(range, RangeProof::Witnessed)]);
+    prove_match(expected, None, &[&entry], &mapped, true).expect("witnessed overlay joins");
+}
+
+/// K2 RED (R1b): an unproven filesystem (`statfs` unreadable) refuses
+/// like overlayfs — fail closed, matching the deep-scan witness rule.
+#[test]
+fn k2_sweep_unproven_fs_magic_refuses() {
+    let checks = Checks {
+        fs_magic: BTreeMap::from([(OBJECT, None)]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = [(1001u32, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(out.probed, 1, "the confirm still runs; the prove refuses");
+    assert!(
+        out.members.is_empty(),
+        "unproven userspace equality joined: {:?}",
+        out.members
+    );
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        out.member_losses
+    );
+}
+
+/// K2 control: a non-overlay key keeps today's userspace fallback edge.
+#[test]
+fn k2_sweep_non_overlay_userspace_equality_still_joins() {
+    let checks = Checks {
+        fs_magic: BTreeMap::from([(OBJECT, Some(EXT4_MAGIC))]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = [(1001u32, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    let pids: Vec<u32> = out.members.iter().map(|member| member.pid).collect();
+    assert_eq!(pids, [1001]);
+    assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+}
+
+/// K2 RED (R1a): refusal is per key, not per process — one caller mapping
+/// an overlay provider and a plain provider keeps the plain edge while the
+/// overlay key yields the named loss.
+#[test]
+fn k2_sweep_mixed_overlay_and_plain_keys_split() {
+    const PLAIN_OBJECT: PinnedObjectId = PinnedObjectId(9);
+    const OVERLAY_INO: u64 = 7_101;
+    const PLAIN_INO: u64 = 7_102;
+    let mut entries = object(0x1000_0000, OVERLAY_INO, "/opt/overlay.so");
+    entries.extend(object(0x2000_0000, PLAIN_INO, "/opt/plain.so"));
+    let checks = Checks {
+        identities: BTreeMap::from([
+            (OBJECT, Ok(vm_file(OVERLAY_INO))),
+            (PLAIN_OBJECT, Ok(vm_file(PLAIN_INO))),
+        ]),
+        fs_magic: BTreeMap::from([
+            (
+                OBJECT,
+                Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+            ),
+            (PLAIN_OBJECT, Some(EXT4_MAGIC)),
+        ]),
+        ..Checks::default()
+    };
+    let index = KnownKeyIndex::build(
+        [
+            (key(OVERLAY_INO), Some(OBJECT)),
+            (key(PLAIN_INO), Some(PLAIN_OBJECT)),
+        ],
+        &BTreeMap::from([(key(OVERLAY_INO), OBJECT), (key(PLAIN_INO), PLAIN_OBJECT)]),
+        [],
+        &checks,
+    )
+    .0;
+    let sweep = [(1001u32, entries)];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+    let keys: Vec<ObjectKey> = out.members[0].objects.iter().map(|o| o.key).collect();
+    assert_eq!(keys, [key(PLAIN_INO)], "{:?}", out.member_losses);
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        out.member_losses
+    );
+}
+
+/// K2 (witness): every userspace proof entry point refuses with the
+/// fixed marker, so a lost kernel run can never degrade to an edge.
+#[test]
+fn k1_witness_adapter_refuses_userspace_proof() {
+    let mut adapter = WitnessNoFallback::new(Io::healthy());
+    assert_eq!(
+        adapter.mapped_file(10_001, 0, 0x1000),
+        Err(WITNESS_NO_USERSPACE_PROOF.to_string())
+    );
+    let results = adapter.mapped_files(10_001, &[(0, 0x1000), (0x1000, 0x2000)]);
+    assert_eq!(results.len(), 2);
+    for result in &results {
+        assert_eq!(
+            result.as_ref().expect_err("batched proof refuses"),
+            WITNESS_NO_USERSPACE_PROOF
+        );
+    }
+    let reserved = adapter.mapped_files_reserved(10_001, &[(0, 0x1000)], None);
+    assert_eq!(reserved, vec![Err(WITNESS_NO_USERSPACE_PROOF.to_string())]);
+}
+
+/// The adapter refuses even when the inner IO would serve the read, and
+/// delegates every non-proof method untouched.
+#[test]
+fn k1_witness_adapter_delegates_everything_else() {
+    let mut inner = Io::healthy();
+    inner.mapped.insert(0, Ok(FileIdentity { dev: 1, ino: 2 }));
+    let mut adapter = WitnessNoFallback::new(inner);
+    assert!(
+        adapter.mapped_file(10_001, 0, 0x1000).is_err(),
+        "a servable inner read still refuses"
+    );
+    assert_eq!(adapter.open(10_001), Ok(1));
+    assert_eq!(adapter.start_time(&1), Some(4_242));
+    assert!(adapter.still_the_same(&1));
+    assert_eq!(adapter.exe(10_001), Some(exe()));
+    assert_eq!(
+        adapter.maps(10_001, &mut CaptureWorkBudget::default()),
+        Ok(provider_caller())
+    );
+    assert!(!adapter.gone(10_001));
+    assert!(
+        adapter
+            .mint_member(10_001, &1, &mut CaptureWorkBudget::default())
+            .is_ok()
+    );
+    assert!(adapter.take_member().is_none());
+    adapter.return_member(10_001, None);
+}
+
+/// The kernel run keeps its retained pidfd through the adapter;
+/// without it the run itself would fall back.
+#[test]
+fn k1_witness_adapter_keeps_the_kernel_run_pidfd() {
+    let mut inner = OsConfirmIo::with_pool(None);
+    let pin = inner.open(std::process::id()).expect("own pid opens");
+    let adapter = WitnessNoFallback::new(inner);
+    assert!(
+        adapter.borrowed_pidfd(&pin).is_some(),
+        "the adapter delegates the retained pidfd"
+    );
+}
+
+#[path = "d4_ext4_cells.rs"]
+mod d4_ext4_cells;
+#[path = "d4_overlay_cells.rs"]
+mod d4_overlay_cells;
+#[path = "d4_population_cells.rs"]
+mod d4_population_cells;
+#[path = "d4_zombie_cells.rs"]
+mod d4_zombie_cells;

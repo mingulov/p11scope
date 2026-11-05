@@ -17,12 +17,43 @@ assert_lane_evidence() {
     python3 -I scripts/lane-attach-e2e-oracle.py "$@"
 }
 
-if [ "${1-}" = "--self-test" ]; then
-    [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
-    assert_lane_evidence --self-test
-    echo "verify-attach-e2e self-test: OK"
-    exit 0
-fi
+diagnose_skips=0
+capture_mode=full
+capture_selected=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --self-test)
+            [ "$#" -eq 1 ] && [ "$diagnose_skips" -eq 0 ] && [ "$capture_selected" -eq 0 ] || {
+                echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2
+                exit 2
+            }
+            assert_lane_evidence --self-test
+            echo "verify-attach-e2e self-test: OK"
+            exit 0
+            ;;
+        --diagnose-skips)
+            [ "$diagnose_skips" -eq 0 ] || {
+                echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2
+                exit 2
+            }
+            diagnose_skips=1
+            shift
+            ;;
+        --capture-mode)
+            [ "$#" -ge 2 ] && [ "$capture_selected" -eq 0 ] || {
+                echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2
+                exit 2
+            }
+            case $2 in
+                full|p0) capture_mode=$2 ;;
+                *) echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2; exit 2 ;;
+            esac
+            capture_selected=1
+            shift 2
+            ;;
+        *) echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2; exit 2 ;;
+    esac
+done
 
 P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
 . scripts/product-build.sh
@@ -62,8 +93,27 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 echo "=== build ==="
 rm -rf "$WORK/build"
-p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --target-dir "$WORK/build"
+# FULL (default features) is the e2e capture mode; P0 (attribute gate
+# shut) stays an explicit --capture-mode p0 selection for the lane where
+# the FULL object still exceeds the 1M-instruction verifier budget.
+case $capture_mode in
+    full)
+        if [ "$diagnose_skips" -eq 1 ]; then
+            set -- --release --workspace --features skip-attribution --target-dir "$WORK/build"
+        else
+            set -- --release --workspace --target-dir "$WORK/build"
+        fi
+        ;;
+    p0)
+        if [ "$diagnose_skips" -eq 1 ]; then
+            e2e_features="skip-attribution,stub-object-attributes"
+        else
+            e2e_features="stub-object-attributes"
+        fi
+        set -- --release --workspace --features "$e2e_features" --target-dir "$WORK/build"
+        ;;
+esac
+p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" "$@"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token ==="
@@ -89,12 +139,14 @@ softhsm2-util --init-token --free --label e2e --so-pin 1234 --pin 1234 >/dev/nul
 # p11scope arguments this lane adds. The workload dlopens the provider, then
 # blocks on the go-file: the scan needs the provider mapped before it runs,
 # and the oracle needs every PKCS#11 call to happen after the probes are on.
+# After its last call it stays mapped until the observer finishes cleanup.
 run_lane() {
     lane=$1
     mode=$2
     shift 2
-    rm -f "$WORK/$lane-go"
-    "$WORK/harness" "$MODULE" "$WORK/$lane-go" > "$WORK/$lane-workload.log" 2>&1 &
+    rm -f "$WORK/$lane-go" "$WORK/$lane-finish"
+    "$WORK/harness" "$MODULE" "$WORK/$lane-go" "$WORK/$lane-finish" \
+        > "$WORK/$lane-workload.log" 2>&1 &
     WPID=$!
     wait_for_mapped_provider "$WPID" libsofthsm2.so
     sudo --preserve-env=SOFTHSM2_CONF "$WORK/build/release/p11scope" profile \
@@ -104,12 +156,71 @@ run_lane() {
     SPID=$!
     wait_for_capture_ready "$WORK/$lane.log" aggregate-only metrics
     touch "$WORK/$lane-go"
+    completion_attempt=0
+    until grep -Fxq 'harness OK' "$WORK/$lane-workload.log"; do
+        if ! kill -0 "$WPID" 2>/dev/null; then
+            if wait "$WPID"; then status=1; else status=$?; fi
+            WPID=
+            echo "workload failed before completion: $status"
+            cat "$WORK/$lane-workload.log"
+            exit "$status"
+        fi
+        completion_attempt=$((completion_attempt + 1))
+        if [ "$completion_attempt" -ge 400 ]; then
+            echo "workload never acknowledged completion"
+            cat "$WORK/$lane-workload.log"
+            exit 1
+        fi
+        sleep 0.05
+    done
+    if wait "$SPID"; then
+        profiler_status=0
+    else
+        profiler_status=$?
+    fi
+    SPID=
+    touch "$WORK/$lane-finish"
     if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; cat "$WORK/$lane-workload.log"; exit "$status"; fi
-    if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/$lane.log" || true; exit "$status"; fi
-    tail -n 3 "$WORK/$lane.log"
+    if [ "$profiler_status" -ne 0 ]; then
+        echo "profiler failed: $profiler_status"
+        if [ "$diagnose_skips" -eq 1 ]; then
+            tail -n 20 "$WORK/$lane.log" | sed '/^p11scope: skip-attribution: /d' || :
+        else
+            tail -n 20 "$WORK/$lane.log" || true
+        fi
+        exit "$profiler_status"
+    fi
+    if [ "$diagnose_skips" -eq 1 ]; then
+        # Attribution belongs only in the bounded checker-failure dump below.
+        tail -n 3 "$WORK/$lane.log" | sed '/^p11scope: skip-attribution: /d'
+    else
+        tail -n 3 "$WORK/$lane.log"
+    fi
     reclaim_root_output "$WORK/$lane.json"
-    python3 -I scripts/check-capture-evidence.py "$mode" \
-        "$WORK/$lane.json" spike/expected.txt
+    if python3 -I scripts/check-capture-evidence.py "$mode" \
+        "$WORK/$lane.json" spike/expected.txt; then
+        :
+    else
+        checker_status=$?
+        if [ "$diagnose_skips" -eq 1 ]; then
+            # Existing internal stderr only, bounded independently of the log.
+            # Diagnostic I/O must never replace the checker failure.
+            LC_ALL=C awk '
+                index($0, "p11scope: skip-attribution: ") == 1 {
+                    if (++records > 64) {
+                        print "p11scope: skip-attribution: [additional lines clipped]"
+                        exit
+                    }
+                    marker = " [line clipped]"
+                    if (length($0) > 2048)
+                        print substr($0, 1, 2048 - length(marker)) marker
+                    else
+                        print
+                }
+            ' "$WORK/$lane.log" >&2 2>/dev/null || :
+        fi
+        exit "$checker_status"
+    fi
 }
 
 echo "=== observe (manifest-free: memory scan only) ==="

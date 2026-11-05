@@ -28,10 +28,128 @@ import argparse
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 RECORD_SCHEMA = "p11scope/system-scope-measurement/v1"
+DETAILED_SCHEMA = "p11scope-detailed-resources-v1"
+DETAILED_ACCOUNTING = "component payload model; not RSS, exact kernel memory or an FD budget"
+DETAILED_OMISSIONS = ["map allocation overhead", "identity and task storage",
+                     "other maps and rings", "programs and dynamic attachments",
+                     "userspace state and transient allocation"]
+DETAILED_PROFILES = {"default": (512, 4096), "wide-detailed-2112": (2112, 8192)}
+U64_MAX = (1 << 64) - 1
+
+
+def possible_cpu_count(path=Path("/sys/devices/system/cpu/possible")):
+    """Count Linux possible CPUs; affinity and online CPUs are unrelated inputs."""
+    text = path.read_text(encoding="ascii").strip()
+    previous, count = -1, 0
+    for item in text.split(","):
+        if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?", item):
+            raise ValueError("invalid possible CPU list")
+        bounds = item.split("-")
+        first, last = int(bounds[0]), int(bounds[-1])
+        if first <= previous or last < first or last >= (1 << 32):
+            raise ValueError("invalid possible CPU range")
+        count += last - first + 1
+        previous = last
+    if not 0 < count < (1 << 32):
+        raise ValueError("invalid possible CPU count")
+    return count
+
+
+def validate_detailed_resources(facts, profile, possible_cpus):
+    """Validate compiled component facts without presenting them as observed memory."""
+    def refuse(detail):
+        raise ValueError(f"detailed resources: {detail}")
+
+    def integer(mapping, key, *, positive=False, bound=U64_MAX):
+        if not isinstance(mapping, dict):
+            refuse(f"missing object for {key}")
+        value = mapping.get(key)
+        if type(value) is not int or not (int(positive) <= value <= bound):
+            refuse(f"invalid {key}")
+        return value
+
+    def checked(value):
+        if value > U64_MAX:
+            refuse("component arithmetic overflow")
+        return value
+
+    def aligned(value):
+        return checked(value + 7) // 8 * 8
+
+    if not isinstance(profile, str) or profile not in DETAILED_PROFILES:
+        refuse("unknown requested profile")
+    if not isinstance(facts, dict) or facts.get("schema") != DETAILED_SCHEMA:
+        refuse("missing or malformed calculator result")
+    if facts.get("profile") != profile:
+        refuse("calculator profile differs from requested profile")
+    inputs = facts.get("inputs")
+    values = {key: integer(inputs, key, positive=True, bound=(1 << 32) - 1)
+              for key in ("slots", "rv_capacity", "possible_cpus", "start_capacity",
+                          "descriptor_capacity")}
+    if (values["slots"], values["rv_capacity"]) != DETAILED_PROFILES[profile]:
+        refuse("compiled capacities differ from requested profile")
+    if values["start_capacity"] != 16384 or values["descriptor_capacity"] != 105:
+        refuse("compiled fixed capacities differ from supported profile")
+    if type(possible_cpus) is not int or values["possible_cpus"] != possible_cpus:
+        refuse("possible_cpus differs from host metadata")
+    abi = facts.get("abi_sizes")
+    sizes = {key: integer(abi, key, positive=True, bound=(1 << 32) - 1)
+             for key in ("stats_value_bytes", "rv_key_bytes", "rv_value_bytes",
+                         "start_key_bytes", "start_value_bytes", "descriptor_value_bytes",
+                         "slot_file_value_bytes")}
+    n, rv, cpus = values["slots"], values["rv_capacity"], values["possible_cpus"]
+    start, descriptors = values["start_capacity"], values["descriptor_capacity"]
+    expected = {
+        "stats_values_bytes": checked(n * aligned(sizes["stats_value_bytes"]) * cpus),
+        "rv_keys_bytes": checked(rv * sizes["rv_key_bytes"]),
+        "rv_values_bytes": checked(rv * aligned(sizes["rv_value_bytes"]) * cpus),
+        "start_keys_bytes": checked(start * sizes["start_key_bytes"]),
+        "start_values_bytes": checked(start * sizes["start_value_bytes"]),
+        "descriptor_declared_values_bytes": checked(descriptors * sizes["descriptor_value_bytes"]),
+        "descriptor_aligned_values_bytes": checked(descriptors * aligned(sizes["descriptor_value_bytes"])),
+        "slot_file_declared_values_bytes": checked(n * sizes["slot_file_value_bytes"]),
+        "slot_file_aligned_values_bytes": checked(n * aligned(sizes["slot_file_value_bytes"])),
+        "static_singles_links": checked(n * 2),
+    }
+    expected["component_payload_bytes"] = checked(sum(expected[key] for key in (
+        "stats_values_bytes", "rv_keys_bytes", "rv_values_bytes", "start_keys_bytes",
+        "start_values_bytes", "descriptor_aligned_values_bytes", "slot_file_aligned_values_bytes")))
+    for key, value in expected.items():
+        if integer(facts.get("resources"), key) != value:
+            refuse(f"inconsistent {key}")
+    if facts.get("accounting") != DETAILED_ACCOUNTING or facts.get("omitted_costs") != DETAILED_OMISSIONS:
+        refuse("missing component accounting limitations")
+    for mapping, keys in ((facts, {"schema", "profile", "inputs", "abi_sizes", "resources",
+                                   "accounting", "omitted_costs"}),
+                          (inputs, set(values)), (abi, set(sizes)),
+                          (facts["resources"], set(expected))):
+        if set(mapping) != keys:
+            refuse("unexpected calculator fields")
+    return facts
+
+
+def prepare_detailed_resources(profile, calculator, out):
+    """Run the explicitly selected compiled example as an ordinary subprocess."""
+    cpus = possible_cpu_count()
+    calculator_path = Path(calculator).resolve(strict=True)
+    result = subprocess.run(
+        [str(calculator_path), "--possible-cpus", str(cpus), "--profile", profile],
+        capture_output=True, text=True, check=True, timeout=10)
+    try:
+        facts = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("detailed resources: malformed calculator JSON") from error
+    validate_detailed_resources(facts, profile, cpus)
+    output = Path(out)
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.write_text(json.dumps({"detailed_resources": facts, "possible_cpus": cpus,
+                                  "calculator": str(calculator_path)}, sort_keys=True) + "\n",
+                      encoding="utf-8")
 
 # Fallback only: used when check-capture-evidence.py cannot be imported,
 # and flagged in the record as counters_source=embedded-fallback.
@@ -218,8 +336,17 @@ def resolve_ring_bytes(value):
         raise ValueError(f"unparseable ring_bytes: {value!r}")
 
 
-CALL_LINE_RE = re.compile(
-    r"^\d{2}:\d{2}:\d{2}\.\d{6} pid \d+ tid \d+ (?:sess#\d+ )?(\S+)(.*) \u2192 (\S+) (.+)$")
+TRACE_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+CALL_PREFIX_RE = re.compile(
+    r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
+    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)|"
+    rf"{TRACE_JSON_STRING} \(PID [0-9]+, TID [0-9]+\) exe={TRACE_JSON_STRING}) (?P<body>.*)$")
+CALL_LINE_RE = re.compile(r"^(\S+)(.*) \u2192 (\S+) (.+)$")
+TRACE_CONTEXT_LINES = frozenset((
+    "Trace — completed call events in arrival order",
+    "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+    "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+))
 LOST_LINE_RE = re.compile(r"^LOST (\d+) events$")
 TRUNCATED_LINE_RE = re.compile(r"^TRUNCATED at \d+ events")
 
@@ -228,6 +355,7 @@ def parse_trace_stream(lines):
     """Parse a `p11scope trace` line stream into exact tallies.
 
     Line taxonomy (src/trace.rs + src/run.rs): one CAPTURE header first,
+    optional exact fixed context lines for unknown executable identity,
     timestamped completed-call lines, cumulative `LOST n events` reports
     (the kernel counter value, not a delta), at most one TRUNCATED line,
     then COUNT_EVIDENCE and EVIDENCE JSON records last. Anything else
@@ -249,6 +377,8 @@ def parse_trace_stream(lines):
     if not content[-1].startswith("EVIDENCE "):
         raise ValueError("trace stream must close with the EVIDENCE record")
     for line in content:
+        if line in TRACE_CONTEXT_LINES:
+            continue
         if line.startswith("CAPTURE "):
             capture_seen += 1
             continue
@@ -275,7 +405,17 @@ def parse_trace_stream(lines):
         if TRUNCATED_LINE_RE.match(line) is not None:
             truncated = True
             continue
-        call = CALL_LINE_RE.match(line)
+        prefix = CALL_PREFIX_RE.match(line)
+        body = prefix.group("body") if prefix else ""
+        # Consume the reserved session position once, before function parsing.
+        # An optional regex must not backtrack and reinterpret sess#N as a name.
+        if body.startswith("sess#"):
+            session, separator, body = body.partition(" ")
+            if not separator or not re.fullmatch(r"sess#[0-9]+", session):
+                raise ValueError(f"malformed trace session: {line!r}")
+        if body.startswith(("pid ", "Unknown executable ", "sess#", '"')) or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", body):
+            raise ValueError(f"duplicate trace identity/session: {line!r}")
+        call = CALL_LINE_RE.match(body) if prefix else None
         if call is not None:
             function, middle = call.group(1), call.group(2)
             per_function[function] = per_function.get(function, 0) + 1
@@ -1614,6 +1754,14 @@ def build_summary(record):
             f"truncated={stream['truncated']}",
             f"  crosscheck: {stream['crosscheck_detail']}",
         ]
+    facts = record.get("detailed_resources")
+    if facts is not None:
+        lines += ["", f"Detailed component model: profile={facts['profile']} "
+                  f"possible_cpus={facts['inputs']['possible_cpus']}",
+                  f"  {facts['accounting']}",
+                  f"  component payload={facts['resources']['component_payload_bytes']}B "
+                  f"static Singles links={facts['resources']['static_singles_links']}",
+                  "  omitted: " + "; ".join(facts["omitted_costs"])]
     lines += [
         "",
         "observer:",
@@ -1631,6 +1779,18 @@ def build_summary(record):
 
 
 def main(argv):
+    if argv == ["--possible-cpu-count"]:
+        print(possible_cpu_count())
+        return
+    if "--prepare-detailed-resources" in argv:
+        prepare = argparse.ArgumentParser(description="Prepare compiled Detailed resource facts")
+        prepare.add_argument("--prepare-detailed-resources", action="store_true")
+        prepare.add_argument("--detailed-profile", choices=DETAILED_PROFILES, required=True)
+        prepare.add_argument("--detailed-resources-calculator", required=True)
+        prepare.add_argument("--out", required=True)
+        args = prepare.parse_args(argv)
+        prepare_detailed_resources(args.detailed_profile, args.detailed_resources_calculator, args.out)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--meta", required=True)
     parser.add_argument("--report", required=True)
@@ -1643,6 +1803,16 @@ def main(argv):
 
     counter_names, counters_source = load_counters()
     meta = json.loads(Path(args.meta).read_text(encoding="utf-8"))
+    detailed_resources = None
+    if meta["condition"].get("detailed_profile") is not None:
+        detailed_resources = validate_detailed_resources(
+            meta.get("detailed_resources"), meta["condition"]["detailed_profile"],
+            meta["host"].get("possible_cpus"))
+        calculator = meta["condition"].get("detailed_resource_calculator")
+        if not isinstance(calculator, str) or not calculator:
+            raise ValueError("detailed resources: missing calculator metadata")
+    elif "detailed_resources" in meta:
+        raise ValueError("detailed resources: calculator result has no requested profile")
     scope = meta["condition"]["scope"]
     mode = meta["condition"]["mode"]
     is_trace = mode == "trace"
@@ -1744,7 +1914,14 @@ def main(argv):
                               f"(unknown); {owned['note']}; total coverage "
                               "unprovable")
             else:
-                counts_match = owned["owned_calls"] >= truth_total
+                # Exact equality: the harness runs the workload against a
+                # private provider inode that only the workload maps, so
+                # owned-attributed calls are exactly the workload's
+                # post-go ledger. Overcounting (doubled or phantom calls)
+                # fails, as undercounting does. A future mode over a
+                # shared system library would need `>=` with a named
+                # reason; no such mode exists here.
+                counts_match = owned["owned_calls"] == truth_total
                 match_note = (
                     "system scan-only: names unavailable (unknown); "
                     "owned-attributed coverage "
@@ -1758,12 +1935,20 @@ def main(argv):
                           f"workload module; {owned['note']}")
             window_coverage_detail = match_note
         else:
+            # Exact per-name equality on the private provider copy (see
+            # above): each truth name must match exactly, and any
+            # owned-attributed name outside the truth is a phantom.
             owned_observed = owned["owned_observed"] or {}
-            counts_match = all(owned_observed.get(k, 0) >= v
+            counts_match = all(owned_observed.get(k, 0) == v
                                for k, v in truth.items())
+            extras = {k: v for k, v in owned_observed.items()
+                      if k not in truth and v}
+            if extras:
+                counts_match = False
             match_note = ("system scope: receipt-attributed per-name rows must "
-                          f"cover workload truth ({owned_observed} vs {truth}); "
-                          f"{owned['note']}")
+                          f"equal workload truth exactly ({owned_observed} vs {truth}); "
+                          f"{owned['note']}" + ("" if not extras else
+                             f"; unexpected owned calls: {extras}"))
             if not counts_match:
                 window_coverage_detail = match_note
 
@@ -2054,6 +2239,8 @@ def main(argv):
             "observed consumer count.",
         ],
     }
+    if detailed_resources is not None:
+        record["detailed_resources"] = detailed_resources
     Path(args.out).write_text(json.dumps(record, indent=2) + "\n",
                               encoding="utf-8")
     Path(args.summary).write_text(build_summary(record), encoding="utf-8")

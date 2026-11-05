@@ -47,12 +47,93 @@ pub struct MechStat {
     /// mechanism simply has no decodable shape (or none observed), which
     /// is not a failure.
     pub init_no_shape: u64,
+    /// The Detailed return path published this id with
+    /// `capture::MECHANISM_UNREGISTERED`: outside `MECH_SHAPE`, so no
+    /// registry membership and no parameter shape, but the id and its
+    /// call/error counts are published. Sticky once set: membership is
+    /// fixed for the capture, so a later observation without the bit
+    /// would indicate a producer bug, surfaced as unregistered.
+    pub unregistered: bool,
 }
 
 #[cfg(test)]
 mod corrective_tests {
     use super::*;
     use crate::plan::{AttachPlan, Slot};
+
+    /// Unassigned NSS vendor gap, the codebase's unknown-vendor
+    /// sentinel (see `vendor_mechanisms::unassigned_vendor_ids_stay_out_of_the_approval_union`).
+    const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
+
+    #[test]
+    fn unregistered_mechanism_id_is_listed_with_its_call_count() {
+        // The per-mechanism stats path aggregates by verbatim id; an
+        // id the BPF return path publishes with the unregistered bit
+        // lands on a row with its call count, like any other value.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        let mut first = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
+        first.capture |= capture::MECHANISM_UNREGISTERED;
+        let mut second = first;
+        second.duration_ns = 200;
+        state.observe(&first);
+        state.observe(&second);
+
+        assert_eq!(state.mechanisms().len(), 1);
+        let stat = &state.mechanisms()[&UNREGISTERED_SENTINEL];
+        assert_eq!(stat.calls, 2);
+        assert_eq!(stat.errors, 0);
+    }
+
+    #[test]
+    fn unregistered_flag_is_sticky_once_observed() {
+        // Membership is fixed per capture; if one id were ever observed
+        // both ways, the row stays unregistered — surfacing the producer
+        // inconsistency toward the evidence total, never hiding it.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        let mut flagged = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
+        flagged.capture |= capture::MECHANISM_UNREGISTERED;
+        state.observe(&flagged);
+        state.observe(&mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0));
+        assert!(state.mechanisms()[&UNREGISTERED_SENTINEL].unregistered);
+    }
+
+    #[test]
+    fn wider_than_32bit_id_withheld_by_the_bound_leaves_no_row() {
+        // The BPF return path publishes only ids <= 0xFFFFFFFF: a
+        // wider word arrives without MECHANISM_VALUE (mechanism word
+        // untouched, still MECH_NONE), and the seam must not fabricate
+        // a row for it — the occurrence survives only in the evidence
+        // total the BPF side bumped. Characterization guard for the
+        // userspace half of withholding: it passes with and without
+        // the bound, and fails if a row is ever fabricated from a
+        // mechanism-less event.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        let mut withheld = mechanism(&p, "C_SignInit", 7, MECH_NONE, 0);
+        withheld.capture = (withheld.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_NONE;
+        state.observe(&withheld);
+
+        assert!(state.mechanisms().is_empty());
+        assert!(state.cgroups()[&withheld.cgroup_id].mechanisms.is_empty());
+    }
+
+    #[test]
+    fn unregistered_mechanism_refused_by_state_budget_counts_a_disclosed_drop() {
+        // The mechanisms map shares the capture's monotonic key budget:
+        // a refused unregistered id never appears, and the refusal is
+        // counted in `semantic_state_drops` (rendered as semantic state
+        // gaps, forcing PARTIAL), never silently dropped.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::with_limit(&p, 0);
+        let mut init = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
+        init.capture |= capture::MECHANISM_UNREGISTERED;
+        state.observe(&init);
+
+        assert!(state.mechanisms().is_empty());
+        assert!(state.semantic_evidence().semantic_state_drops > 0);
+    }
 
     #[test]
     fn history_loss_saturates_and_capacity_open_remains_observed() {
@@ -534,6 +615,7 @@ mod corrective_tests {
             Binding {
                 mechanism: 9,
                 fork_safe: true,
+                unregistered: false,
             },
         );
         state.active_ops.insert(
@@ -541,6 +623,7 @@ mod corrective_tests {
             Binding {
                 mechanism: 9,
                 fork_safe: false,
+                unregistered: false,
             },
         );
         state.active_ops.insert(
@@ -548,6 +631,7 @@ mod corrective_tests {
             Binding {
                 mechanism: 9,
                 fork_safe: true,
+                unregistered: false,
             },
         );
         state.find_active.insert((parent, sess(7)));
@@ -617,6 +701,7 @@ mod corrective_tests {
                     Binding {
                         mechanism: 1,
                         fork_safe: true,
+                        unregistered: false,
                     },
                 );
             }
@@ -1136,6 +1221,7 @@ mod corrective_tests {
                     Binding {
                         mechanism: 1,
                         fork_safe: true,
+                        unregistered: false,
                     },
                 );
             }
@@ -1724,6 +1810,11 @@ pub struct SessionStats {
 pub struct MechCallStat {
     pub calls: u64,
     pub errors: u64,
+    /// The Detailed return path published this id with
+    /// `capture::MECHANISM_UNREGISTERED` — the same sticky flag as
+    /// the capture-wide row, so the cgroup breakdown names registry
+    /// membership too.
+    pub unregistered: bool,
 }
 
 /// Aggregate stats for one `cgroup_id` — a directory inode number
@@ -1890,6 +1981,10 @@ struct SessionInfo {
 struct Binding {
     mechanism: u64,
     fork_safe: bool,
+    /// The binding Init carried `capture::MECHANISM_UNREGISTERED`.
+    /// Operational calls attributed through this binding recreate the
+    /// mechanism row (after a row purge) with the flag intact.
+    unregistered: bool,
 }
 
 #[derive(Clone)]
@@ -2514,6 +2609,7 @@ impl State {
             return;
         }
         let stat = self.mechanisms.entry(mechanism).or_default();
+        stat.unregistered |= ev.capture & capture::MECHANISM_UNREGISTERED != 0;
         record_call(stat, ev);
         // E19: skip the `String` allocation when the operation name is
         // already recorded. `BTreeSet<String>::contains` borrows `&str`,
@@ -2546,7 +2642,12 @@ impl State {
                 }
             }
         }
-        self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
+        self.record_cgroup_mechanism(
+            ev.cgroup_id,
+            mechanism,
+            ev.rv,
+            ev.capture & capture::MECHANISM_UNREGISTERED != 0,
+        );
     }
 
     fn apply_init(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
@@ -2563,6 +2664,7 @@ impl State {
                             Binding {
                                 mechanism,
                                 fork_safe: meta.fork_safe,
+                                unregistered: ev.capture & capture::MECHANISM_UNREGISTERED != 0,
                             },
                         );
                     }
@@ -2582,30 +2684,36 @@ impl State {
     }
 
     fn apply_operations(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
-        let mut mechanisms = BTreeSet::new();
+        // One entry per attributed mechanism id; the flag OR-merges
+        // across bindings (bindings for one id always agree in
+        // production — membership is fixed per capture — so a set bit
+        // anywhere wins, exactly like the sticky row flag).
+        let mut mechanisms = BTreeMap::new();
         for (operation, _) in operation_bits(meta.semantics.operations) {
             match self
                 .active_ops
                 .get(&(process, meta.session(ev.session), operation))
             {
                 Some(binding) => {
-                    mechanisms.insert(binding.mechanism);
+                    *mechanisms.entry(binding.mechanism).or_insert(false) |= binding.unregistered;
                 }
                 None => self.orphan_ops += 1,
             }
         }
-        for mechanism in mechanisms {
+        for (mechanism, unregistered) in mechanisms {
             // E19: same fused admission-before-insertion as
             // `record_requested_mechanism`: one probe plus one entry. A
             // refused mechanism cell still records cgroup attribution,
             // exactly as before.
             let is_new = !self.mechanisms.contains_key(&mechanism);
             if is_new && !self.admit(1) {
-                self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
+                self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
                 continue;
             }
-            record_call(self.mechanisms.entry(mechanism).or_default(), ev);
-            self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
+            let stat = self.mechanisms.entry(mechanism).or_default();
+            stat.unregistered |= unregistered;
+            record_call(stat, ev);
+            self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
         }
 
         let retain = match meta.semantics.transition {
@@ -3138,7 +3246,13 @@ impl State {
         stat.truncated |= total > count;
     }
 
-    fn record_cgroup_mechanism(&mut self, cgroup_id: u64, mechanism: u64, rv: u64) {
+    fn record_cgroup_mechanism(
+        &mut self,
+        cgroup_id: u64,
+        mechanism: u64,
+        rv: u64,
+        unregistered: bool,
+    ) {
         let Some(cgroup) = self.cgroups.get(&cgroup_id) else {
             return;
         };
@@ -3153,6 +3267,7 @@ impl State {
             .mechanisms
             .entry(mechanism)
             .or_default();
+        stat.unregistered |= unregistered;
         stat.calls += 1;
         if rv != CkRv::OK.0 && rv != CkRv::PENDING.0 {
             stat.errors += 1;

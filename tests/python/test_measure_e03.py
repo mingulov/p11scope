@@ -115,7 +115,7 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
                 burst_end_ns=1_100_000_000, receipt=None, observer_exit=0,
                 observer_timed_out=False, observer_signal=None, gate="frame",
                 target_receipt=None, observer_pid=None, mapped_pid=None,
-                mapped_starttime=None, mapped_endpoint="0x1800"):
+                mapped_starttime=None, mapped_endpoint="0x1800", meta_updates=None):
     """Run the real measurement main() on synthetic inputs.
 
     Returns (record, summary). `receipt` becomes the workload mapping/pin
@@ -149,6 +149,8 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
                  "loadavg": "0 0 0"},
         "artifacts": {},
     }
+    for key, value in (meta_updates or {}).items():
+        meta.setdefault(key, {}).update(value)
     paths = {}
     for name, text in (
         ("meta", json.dumps(meta)),
@@ -1222,6 +1224,119 @@ class DeliveredNoteTests(unittest.TestCase):
         self.assertEqual(path["delivered_derived"], 780)
         self.assertIn("not an independently observed consumer count",
                       path["delivered_note"])
+
+
+def detailed_resource_facts():
+    """Hand-checked default layout fixture, with 12 possible CPUs."""
+    return {
+        "schema": "p11scope-detailed-resources-v1", "profile": "default",
+        "inputs": {"slots": 512, "rv_capacity": 4096, "possible_cpus": 12,
+                   "start_capacity": 16384, "descriptor_capacity": 105},
+        "abi_sizes": {"stats_value_bytes": 296, "rv_key_bytes": 16,
+                      "rv_value_bytes": 8, "start_key_bytes": 16,
+                      "start_value_bytes": 288, "descriptor_value_bytes": 18,
+                      "slot_file_value_bytes": 4},
+        "resources": {"stats_values_bytes": 1818624,
+                      "rv_keys_bytes": 65536, "rv_values_bytes": 393216,
+                      "start_keys_bytes": 262144, "start_values_bytes": 4718592,
+                      "descriptor_declared_values_bytes": 1890,
+                      "descriptor_aligned_values_bytes": 2520,
+                      "slot_file_declared_values_bytes": 2048,
+                      "slot_file_aligned_values_bytes": 4096,
+                      "static_singles_links": 1024,
+                      "component_payload_bytes": 7264728},
+        "accounting": "component payload model; not RSS, exact kernel memory or an FD budget",
+        "omitted_costs": ["map allocation overhead", "identity and task storage",
+                          "other maps and rings", "programs and dynamic attachments",
+                          "userspace state and transient allocation"],
+    }
+
+
+class DetailedResourceConsumerTests(unittest.TestCase):
+    def measure(self, facts, *, profile="default", possible_cpus=12):
+        updates = {
+            "condition": {"detailed_profile": profile},
+            "host": {"ncpu": 2, "possible_cpus": possible_cpus},
+        }
+        if facts is not None:
+            updates["condition"]["detailed_resource_calculator"] = "/compiled/example"
+            updates["detailed_resources"] = facts
+        with tempfile.TemporaryDirectory() as raw:
+            return run_measure(
+                Path(raw), workload_argv=["/owned.so"], truth={},
+                report_text=profile_report(functions=[], discovery=[]),
+                meta_updates=updates)
+
+    def test_compiled_facts_survive_with_possible_cpus_instead_of_affinity(self):
+        facts = detailed_resource_facts()
+        record, summary = self.measure(facts)
+        self.assertEqual(record.get("detailed_resources"), facts)
+        self.assertEqual(record["host"]["ncpu"], 2)
+        self.assertEqual(record["host"]["possible_cpus"], 12)
+        self.assertIn("component payload", summary)
+        self.assertIn("possible_cpus=12", summary)
+
+    def test_required_missing_output_refuses(self):
+        with self.assertRaisesRegex(ValueError, "detailed resources"):
+            self.measure(None)
+
+    def test_wide_compiled_profile_preserves_separate_components(self):
+        facts = detailed_resource_facts()
+        facts["profile"] = "wide-detailed-2112"
+        facts["inputs"].update(slots=2112, rv_capacity=8192)
+        facts["resources"].update(stats_values_bytes=7501824, rv_keys_bytes=131072,
+                                  rv_values_bytes=786432, slot_file_declared_values_bytes=8448,
+                                  slot_file_aligned_values_bytes=16896, static_singles_links=4224,
+                                  component_payload_bytes=13419480)
+        record, _ = self.measure(facts, profile="wide-detailed-2112")
+        self.assertEqual(record["detailed_resources"], facts)
+
+    def test_overflowing_arithmetic_refuses_even_when_inputs_fit_u32(self):
+        facts = detailed_resource_facts()
+        facts["inputs"]["possible_cpus"] = (1 << 32) - 1
+        facts["abi_sizes"]["stats_value_bytes"] = (1 << 32) - 1
+        with self.assertRaisesRegex(ValueError, "arithmetic overflow"):
+            self.measure(facts, possible_cpus=(1 << 32) - 1)
+
+    def test_zero_cpu_and_wrong_capacity_refuse(self):
+        for key, invalid in (("possible_cpus", 0), ("slots", 2112),
+                             ("rv_capacity", 8192), ("start_capacity", 1)):
+            with self.subTest(key=key):
+                facts = detailed_resource_facts()
+                facts["inputs"][key] = invalid
+                with self.assertRaisesRegex(ValueError, "detailed resources"):
+                    self.measure(facts)
+
+    def test_profile_mismatch_refuses(self):
+        with self.assertRaisesRegex(ValueError, "profile"):
+            self.measure(detailed_resource_facts(), profile="wide-detailed-2112")
+
+    def test_possible_cpu_metadata_mismatch_refuses(self):
+        with self.assertRaisesRegex(ValueError, "possible_cpus"):
+            self.measure(detailed_resource_facts(), possible_cpus=2)
+
+    def test_malformed_or_overflow_component_refuses(self):
+        for invalid in (True, "1818624", -1, 1 << 64):
+            with self.subTest(invalid=invalid):
+                facts = detailed_resource_facts()
+                facts["resources"]["stats_values_bytes"] = invalid
+                with self.assertRaisesRegex(ValueError, "stats_values_bytes"):
+                    self.measure(facts)
+
+    def test_inconsistent_payload_and_missing_layout_refuse(self):
+        for mutation in ("arithmetic", "layout", "omissions", "extra"):
+            with self.subTest(mutation=mutation):
+                facts = detailed_resource_facts()
+                if mutation == "arithmetic":
+                    facts["resources"]["stats_values_bytes"] = 303104
+                elif mutation == "layout":
+                    del facts["abi_sizes"]["start_value_bytes"]
+                elif mutation == "extra":
+                    facts["resources"]["rss_bytes"] = 7264728
+                else:
+                    facts["omitted_costs"] = []
+                with self.assertRaisesRegex(ValueError, "detailed resources"):
+                    self.measure(facts)
 
 
 if __name__ == "__main__":

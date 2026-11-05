@@ -27,7 +27,11 @@
 //! errors and the projection carry capture-local public IDs and finite facts.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub(crate) mod journal;
 mod state;
+
+#[cfg(test)]
+pub(crate) use state::trace_settlement_for_test;
 
 use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::object_policy::{
@@ -86,6 +90,19 @@ impl SessionHandle {
     }
 }
 
+/// A PKCS#11 3.2 async id word: the `C_AsyncJoin` argument scalar or
+/// the `C_AsyncGetID` output scalar. Internal correlation key only;
+/// never rendered, never serialized.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AsyncValue(u64);
+redacted_debug!(AsyncValue);
+
+impl From<u64> for AsyncValue {
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Exact outer semantic domain: caller incarnation, process image, native
 /// source (image-domain tag), proven load instance and initialization era.
 ///
@@ -127,6 +144,31 @@ impl ObjectDomain {
         }
     }
 
+    /// Sealed production mint: only the journal child calls this, with a
+    /// domain proof it built from actual H3 admission evidence. No raw
+    /// words, ordinals or booleans mint a domain.
+    pub(in crate::semantics_objects) fn sealed(proof: &journal::JournalDomainProof) -> Self {
+        proof.domain()
+    }
+
+    /// Part-wise construction for the sealed proof above. Module-family
+    /// only; every production caller goes through the proof type.
+    pub(in crate::semantics_objects) fn from_sealed_parts(
+        caller: u64,
+        image: u64,
+        native_source: u64,
+        instance: u64,
+        init_era: u64,
+    ) -> Self {
+        Self {
+            caller,
+            image,
+            native_source,
+            instance,
+            init_era,
+        }
+    }
+
     /// The per-instance budget key (all fields but the initialization era).
     fn instance_key(&self) -> (u64, u64, u64, u64) {
         (self.caller, self.image, self.native_source, self.instance)
@@ -144,6 +186,13 @@ impl RefCut {
     pub(crate) fn reference(cut: u64) -> Self {
         Self(cut)
     }
+
+    /// Sealed production mint: only the journal child calls this, with a
+    /// consumption ordinal from the retained drain. No raw ordinal mints
+    /// a cut.
+    pub(in crate::semantics_objects) fn sealed(ordinal: journal::ConsumptionOrdinal) -> Self {
+        Self(ordinal.cut())
+    }
 }
 
 /// A stable logical-call key within one domain's reference history.
@@ -155,6 +204,21 @@ impl CallKey {
     #[cfg(test)]
     pub(crate) fn reference(key: u64) -> Self {
         Self(key)
+    }
+
+    /// Sealed production mint: only the journal child calls this, with a
+    /// checked nonrecycled ticket from its reservation owner. No raw
+    /// word mints a key.
+    pub(in crate::semantics_objects) fn sealed(ticket: journal::JournalTicket) -> Self {
+        Self(ticket.key())
+    }
+
+    /// The admission ordinal this key binds (C2): sealed keys mint
+    /// from the converted admission's H0 ordinal; reference keys
+    /// carry their scripted ordinal. H9 identity compares this to the
+    /// staged head's H0 position.
+    pub(crate) fn admission(self) -> u64 {
+        self.0
     }
 }
 
@@ -215,6 +279,63 @@ impl fmt::Debug for CallToken {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ObjectId(u64);
 
+impl ObjectId {
+    /// The capture-local public id for output rows. Read-only: H9
+    /// never mints ids from integers (staged with the producer).
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// H9 metadata-at-use: per-field presence bitmaps, structurally
+/// value-free. Bit `i` is field `i` in [`SafeAttributeKind`] order;
+/// only discriminants are ever read — values never cross to H9.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeyMetadataFlags {
+    /// Requested via template or query (whether or not a value
+    /// arrived).
+    pub requested: u8,
+    /// A retained value exists (current, conflict or invalidation
+    /// history — never the value itself).
+    pub established: u8,
+    /// Two claims disagreed on this field (requested or
+    /// established side): labels needing it are unusable.
+    pub conflicted: u8,
+}
+
+impl KeyMetadataFlags {
+    pub(crate) fn requested_count(self) -> u32 {
+        self.requested.count_ones()
+    }
+
+    pub(crate) fn established_count(self) -> u32 {
+        self.established.count_ones()
+    }
+
+    pub(crate) fn is_requested(self, field: usize) -> bool {
+        field < METADATA_FIELDS && self.requested & (1 << field) != 0
+    }
+
+    pub(crate) fn is_established(self, field: usize) -> bool {
+        field < METADATA_FIELDS && self.established & (1 << field) != 0
+    }
+
+    pub(crate) fn is_conflicted(self, field: usize) -> bool {
+        field < METADATA_FIELDS && self.conflicted & (1 << field) != 0
+    }
+}
+
+/// H9 receipt snapshot: resolved label (own established sizes/curve
+/// or a pair-inherited RSA size, never key material), attribution
+/// validity, and the one proven accessing session — everything a
+/// positional receipt may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiptSnapshot {
+    pub label: Option<KeyLabel>,
+    pub attribution_valid: bool,
+    pub session: SessionIncarnation,
+}
+
 impl fmt::Debug for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "object#{}", self.0)
@@ -224,6 +345,14 @@ impl fmt::Debug for ObjectId {
 /// A capture-local session incarnation (`sess#N`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SessionIncarnation(u64);
+
+impl SessionIncarnation {
+    /// The capture-local public id for output rows. Read-only: H9
+    /// never mints ids from integers (staged with the producer).
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 
 impl fmt::Debug for SessionIncarnation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -438,6 +567,26 @@ impl AttrObservation {
         }
     }
 
+    /// A wire-classified cell from a validated journal attribute list: the
+    /// kind/status/value already passed the finite wire validator, so this
+    /// maps them onto model query truth without re-reading the target. A
+    /// `None` kind (absent selector) retains nothing, however the status
+    /// reads: an uninterpretable cell is excluded, never invented.
+    pub(crate) fn classified(
+        kind: Option<SafeAttributeKind>,
+        status: QueryStatus,
+        value: Option<FieldValue>,
+    ) -> Self {
+        match kind {
+            Some(kind) => Self {
+                kind: Some(kind),
+                status,
+                value,
+            },
+            None => Self::excluded(),
+        }
+    }
+
     pub(crate) fn status(&self) -> QueryStatus {
         self.status
     }
@@ -502,6 +651,21 @@ pub(crate) struct OriginFact {
     pub(crate) entry_mechanism: MechanismEvidence,
     /// Slot/token scope evidence (OpenSession, CloseAllSessions).
     pub(crate) scope: SlotScope,
+    /// Entry-time S1 output-pointer decision (encapsulation query
+    /// guard): only a positively non-null decision authorizes an
+    /// encapsulation output. Finite class only, never an address.
+    pub(crate) entry_output: OutputEvidence,
+}
+
+/// Captured S1 output-pointer decision (`capture::OUTPUT_*`
+/// vocabulary): null/unreadable/not-captured decisions authorize no
+/// KEM output. Carries no address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputEvidence {
+    NotCaptured,
+    Null,
+    Unreadable,
+    NonNull,
 }
 
 /// One call's matched reference completion evidence.
@@ -557,6 +721,31 @@ impl CompleteInputPrefix {
             bootstrap,
         }
     }
+
+    /// Sealed production mint: only the journal child calls this, with a
+    /// sealed prefix whose audit already passed. No raw ordinal list mints
+    /// a prefix.
+    pub(in crate::semantics_objects) fn sealed(prefix: &journal::SealedObjectPrefix) -> Self {
+        prefix.prefix()
+    }
+
+    /// Part-wise construction for the sealed prefix above. Module-family
+    /// only; every production caller goes through the sealed prefix.
+    /// A continuation seal carries no bootstrap: the model keeps its
+    /// floor and no new authority is claimed or refused.
+    pub(in crate::semantics_objects) fn from_sealed_parts(
+        domain: ObjectDomain,
+        frontier: u64,
+        open: &[CallKey],
+        bootstrap: Option<u64>,
+    ) -> Self {
+        Self {
+            domain,
+            frontier: RefCut(frontier),
+            open: open.to_vec(),
+            bootstrap: bootstrap.map(RefCut),
+        }
+    }
 }
 
 /// The scope an explicit reference boundary affects.
@@ -582,6 +771,8 @@ pub(crate) enum CreationFamily {
     GeneratePair,
     Derive,
     Unwrap,
+    Encapsulate,
+    Decapsulate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +811,19 @@ pub(crate) enum ObjectEffect {
         call: CallToken,
         object: ObjectId,
         key_use: bool,
+        /// The joined call-input ordinal (H9): minted at the qualified
+        /// positional join, never reconstructed from emission order.
+        /// `None` for found-handle references, which join no input.
+        input: Option<u8>,
+        /// Metadata presence frozen at the join (H9): routing delay
+        /// between the join and receipt assembly cannot backfill an
+        /// earlier use.
+        metadata: KeyMetadataFlags,
+        /// The resolved combined label at the join (own established
+        /// or pair-inherited size).
+        label: Option<KeyLabel>,
+        /// Whether attribution was valid at the join.
+        attribution_valid: bool,
     },
     Destroyed {
         call: CallToken,
@@ -654,6 +858,14 @@ pub(crate) enum ObjectEffect {
     Unresolved {
         call: CallToken,
         reason: ObjectGap,
+    },
+    /// A PENDING origin END minted deferred origin custody (6.07b): the
+    /// frozen receipt vector (possibly empty — unknown stays unknown)
+    /// is retained under the origin ticket until the completion quantum
+    /// redeems it or a death path disposes it. Emitted even with zero
+    /// frozen inputs; absent when mint was impossible.
+    DeferredMinted {
+        call: CallToken,
     },
     Gap {
         reason: ObjectGap,
@@ -745,7 +957,7 @@ impl MetadataView {
     }
 }
 
-fn field_index(kind: SafeAttributeKind) -> usize {
+pub(crate) fn field_index(kind: SafeAttributeKind) -> usize {
     match kind {
         SafeAttributeKind::Class => 0,
         SafeAttributeKind::KeyType => 1,
@@ -756,7 +968,10 @@ fn field_index(kind: SafeAttributeKind) -> usize {
     }
 }
 
-/// A combined label from established facts of the same view only.
+/// A combined label from established facts of the same view only,
+/// except an RSA private key's pair-inherited size (resolved by the
+/// model state): the mate's established public-key size from the
+/// same successful `C_GenerateKeyPair` return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyLabel {
     Aes { value_len: u16 },
@@ -794,6 +1009,9 @@ pub(crate) struct StateUsage {
     pub(crate) live_bindings: usize,
     pub(crate) tombstones: usize,
     pub(crate) pending_calls: usize,
+    /// Live deferred async origins (6.07b): pending plus detached
+    /// records awaiting their completion quantum or a death path.
+    pub(crate) deferred_origins: usize,
     /// Lifetime counts (IDs minted) versus occupancy above: records are
     /// pruned and refunded only once no fence can still need them.
     pub(crate) lifetime_objects: u64,
@@ -812,6 +1030,9 @@ pub(crate) struct StateEstimate {
     pub(crate) session_records: usize,
     pub(crate) live_bindings: usize,
     pub(crate) pending_calls: usize,
+    /// Live deferred async origins (6.07b): pending plus detached
+    /// map entries, in bytes like the other components.
+    pub(crate) deferred_origins: usize,
 }
 
 /// The sanitized, pointer-free projection.
@@ -888,6 +1109,11 @@ pub(crate) enum LostOutcome {
     Ticket(CallToken, RefCut),
     /// Begins refused for capacity in this domain are all over by the cut.
     Refused(ObjectDomain, RefCut),
+    /// Domain history through the cut is void (fault, malformed record or
+    /// H3 loss): proof for the interval ends, the fence floor rises, and
+    /// later proof resumes at or above the cut. Only the journal child
+    /// reports this, with a sealed domain and cut.
+    Voided(ObjectDomain, RefCut),
 }
 
 impl ObjectSemantics {
@@ -914,8 +1140,28 @@ impl ObjectSemantics {
 
     /// Reference fact: a call's terminal outcome was lost; the cut is an
     /// upper bound on where it could have taken effect.
-    pub(crate) fn outcome_lost(&mut self, lost: LostOutcome) -> ObjectEffects {
-        self.state.outcome_lost(lost)
+    pub(crate) fn outcome_lost(
+        &mut self,
+        lost: LostOutcome,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.outcome_lost(lost, ledger)
+    }
+
+    /// Sealed production input: the journal adapter consumed a begin it
+    /// could not represent (reservation exhausted). Records the refusal
+    /// exactly like a model capacity refusal — bootstrap voided, fence
+    /// floor raised, no bootstrap until a lost-outcome bound — without
+    /// admitting a call the adapter cannot track. Returns the void's
+    /// invalidation effects for publication with the seal. Only the
+    /// journal child calls this, with sealed domain and cut.
+    pub(crate) fn note_refused_begin(
+        &mut self,
+        domain: ObjectDomain,
+        cut: RefCut,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.note_refused(domain, cut.0, ledger)
     }
 
     /// Register a domain identity before any fact names it. Idempotent
@@ -935,30 +1181,182 @@ impl ObjectSemantics {
     /// (`DuplicateCall`); a new key at or below the covered frontier
     /// (`ClosedFrontier`) or at an occupied cut (`MalformedFact`) is
     /// unrepresentable history and contradicts the domain's proof.
-    pub(crate) fn begin(&mut self, origin: OriginFact) -> Result<CallToken, ObjectGap> {
-        self.state.begin(origin)
+    pub(crate) fn begin(
+        &mut self,
+        origin: OriginFact,
+        ledger: &mut journal::StagingLedger,
+    ) -> Result<CallToken, ObjectGap> {
+        self.state.begin(origin, ledger)
+    }
+
+    fn begin_with_resource(
+        &mut self,
+        origin: OriginFact,
+        ledger: &mut journal::StagingLedger,
+        resource: &journal::ExistingReservation,
+    ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
+        self.state
+            .begin_with_resource(origin, ledger, Some(resource))
+    }
+
+    /// Whether `domain` ended through a qualified successful
+    /// `C_Finalize` with nothing of it left unfinished.
+    pub(crate) fn domain_completed(&self, domain: ObjectDomain) -> bool {
+        self.state.domain_completed(domain)
     }
 
     /// Stage one matched completion privately; publishes no object claim.
-    pub(crate) fn complete(&mut self, token: CallToken, result: CompletedFact) -> ObjectEffects {
-        self.state.complete(token, result)
+    pub(crate) fn complete(
+        &mut self,
+        token: CallToken,
+        result: CompletedFact,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.complete(token, result, ledger)
     }
 
     /// Apply the history covered by a complete reference prefix.
-    pub(crate) fn settle(&mut self, prefix: CompleteInputPrefix) -> ObjectEffects {
-        self.state.settle(prefix)
+    pub(crate) fn settle(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.settle(prefix, ledger)
+    }
+
+    /// Settlement appending to `effects` in place; spans
+    /// passed to `record` are relative to its length at entry.
+    pub(in crate::semantics_objects) fn settle_recorded_into(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut journal::StagingLedger,
+        effects: &mut ObjectEffects,
+        record: &mut impl FnMut(state::SettlementTransition, std::ops::Range<usize>),
+    ) {
+        self.state
+            .settle_recorded_into(prefix, ledger, effects, record);
     }
 
     /// Apply an explicit reference boundary to the affected scope.
-    pub(crate) fn invalidate(&mut self, scope: AffectedScope, reason: ObjectGap) -> ObjectEffects {
-        self.state.invalidate(scope, reason)
+    pub(crate) fn invalidate(
+        &mut self,
+        scope: AffectedScope,
+        reason: ObjectGap,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.invalidate(scope, reason, ledger)
+    }
+
+    /// Sealed production input: unbounded abandonment disposes one
+    /// domain. Fencing and proof invalidation match a loss, and the
+    /// abandoned incarnation's call storage is released with its
+    /// custody; the incarnation stays refused. Only the journal's
+    /// permanent-refusal paths call this, with a sealed domain.
+    pub(crate) fn abandon_domain(
+        &mut self,
+        domain: ObjectDomain,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.abandon_domain(domain, ledger)
     }
 
     pub(crate) fn project(&self) -> ObjectProjection {
         self.state.project()
     }
 
+    /// H9 metadata-at-use snapshot: presence bitmaps only. Values
+    /// never cross to H9 (only discriminants are matched).
+    pub(crate) fn key_metadata_flags(&self, key: ObjectId) -> Option<KeyMetadataFlags> {
+        self.state.key_metadata_flags(key)
+    }
+
+    /// H9 receipt snapshot: the resolved label (own established or
+    /// pair-inherited size), attribution validity and accessing
+    /// session for one object. No access
+    /// counts (those need the relations scan; receipts never carry
+    /// them).
+    pub(crate) fn receipt_snapshot(&self, key: ObjectId) -> Option<ReceiptSnapshot> {
+        self.state.receipt_snapshot(key)
+    }
+
+    /// 6.07b deferred custody: move one origin pending→detached
+    /// (GetID mint). Seal-path (Q2) primitive; only tests drive it
+    /// until the journal P1 packet lands.
+    // First Q2 seal-path caller lands with journal P1; unit tests drive the state fn directly.
+    #[allow(dead_code)]
+    pub(crate) fn detach_deferred(
+        &mut self,
+        session: SessionIncarnation,
+        target: u32,
+        value: u64,
+    ) -> Result<(), state::DeferredRefusal> {
+        self.state.detach_deferred(session, target, value)
+    }
+
+    /// 6.07b deferred custody: move whole detached custody to the
+    /// joiner (Join transfer). Seal-path (Q2) primitive; only tests
+    /// drive it until the journal P1 packet lands.
+    // First Q2 seal-path caller lands with journal P1; unit tests drive the state fn directly.
+    #[allow(dead_code)]
+    pub(crate) fn join_deferred_holder(
+        &mut self,
+        domain: ObjectDomain,
+        target: u32,
+        value: u64,
+        joiner: SessionIncarnation,
+    ) -> bool {
+        self.state
+            .join_deferred_holder(domain, target, value, joiner)
+    }
+
+    /// 6.07b deferred custody: consume one live origin exactly once
+    /// (Complete). Seal-path (Q2) primitive; only tests drive it
+    /// until the journal P1 packet lands.
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(crate) fn redeem_deferred(&mut self, ticket: CallToken) -> Option<ObjectEffects> {
+        self.state.redeem_deferred(ticket)
+    }
+
     pub(crate) fn state_estimate(&self) -> StateEstimate {
         self.state.estimate()
+    }
+
+    /// O(1) cardinalities for prepaying one retained audit-loss result.
+    pub(crate) fn audit_loss_record_counts(&self) -> (usize, usize) {
+        self.state.audit_loss_record_counts()
+    }
+
+    /// O(1) global upper bound, sampled before journal conversion mutates it.
+    pub(in crate::semantics_objects) fn replay_pending_count(&self) -> usize {
+        self.state.replay_pending_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncValue;
+
+    // Async ids are private correlation keys: Debug names the type
+    // but never renders the raw value, in any base.
+    #[test]
+    fn async_value_debug_redacts_raw_value() {
+        let raw = 0x1234_5678_9abc_def0u64;
+        let rendered = format!("{:?}", AsyncValue::from(raw));
+        assert!(
+            !rendered.contains(&raw.to_string()),
+            "decimal raw value must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{raw:x}")),
+            "lower-hex raw value must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{raw:X}")),
+            "upper-hex raw value must never render: {rendered}"
+        );
+        assert!(
+            rendered.contains("AsyncValue"),
+            "Debug still names the type: {rendered}"
+        );
     }
 }

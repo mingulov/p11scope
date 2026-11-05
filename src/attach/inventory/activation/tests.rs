@@ -3,6 +3,9 @@
 //! Only kernel link/map operations are replaced; target pinning uses real files.
 
 use super::*;
+
+#[path = "exit_retention_tests.rs"]
+mod exit_retention;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
 use crate::plan::{AdmissionPolicy, AttachPlan, Slot};
@@ -16,6 +19,9 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "retirement_concurrency_tests.rs"]
+mod bounded_concurrency;
 
 fn budget(n: u32) -> InventoryBudget {
     InventoryBudget::new(u64::from(n), u64::from(n) * 8).unwrap()
@@ -45,8 +51,10 @@ impl Fixture {
         assert!(end > offset + 576);
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -374,12 +382,14 @@ fn finish_failed_transaction(
             target: link.target,
             handle: Some(link.handle),
             quarantine: None,
+            _leases: Arc::default(),
         })
         .collect();
     let mut io = io.clone();
-    let mut job = RetirementJob::start(RetirementWork::new(links, vec![]), move |link| {
-        io.detach(link)
-    })
+    let mut job = RetirementJob::start(
+        RetirementWork::new(links, vec![]),
+        serial_fixture_close(move |link| io.detach(link)),
+    )
     .unwrap_or_else(|error| panic!("failed rollback worker: {}", error.error));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -532,7 +542,16 @@ fn inventory_failed_rollback_retains_uncertain_handle_and_attempts_remaining_cle
         Err(failure) => finish_failed_transaction(&io, failure),
     };
     assert!(format!("{:#}", failure.error).contains("original attach failure 4"));
-    assert_eq!(io.state.lock().unwrap().detach_attempts, [3, 2, 1, 0]);
+    let attempts = io.state.lock().unwrap().detach_attempts.clone();
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(
+        attempts[..2].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([2, 3])
+    );
+    assert_eq!(
+        attempts[2..].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
     assert_eq!(io.state.lock().unwrap().live, BTreeSet::from([2]));
     assert_eq!(failure.cleanup.closed, 3);
     assert_eq!(failure.cleanup.failures.len(), 1);
@@ -772,11 +791,12 @@ fn drive_candidate_retirement(
                 target: link.target,
                 handle: Some(link.handle),
                 quarantine: None,
+                _leases: Arc::default(),
             })
             .collect(),
         vec![],
     );
-    let mut job = RetirementJob::start(work, move |link| io.detach(link))
+    let mut job = RetirementJob::start(work, serial_fixture_close(move |link| io.detach(link)))
         .unwrap_or_else(|failure| panic!("worker start: {}", failure.error));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -869,7 +889,12 @@ fn inventory_retirement_services_discovery_while_close_is_blocked() {
         "retirement blocked the sole discovery consumer: {receipt:?}"
     );
     assert_eq!(receipt.closed, 3);
-    assert_eq!(attempts, [575, 1, 0]);
+    assert_eq!(attempts.first(), Some(&575));
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[1..].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
     assert!(!receipt.callback_quiescence_proven);
 }
 
@@ -892,6 +917,15 @@ fn inventory_synchronous_retirement_negative_control_starves_discovery() {
     assert!(!receipt.callback_quiescence_proven);
 }
 
+// Existing mutable mock I/O keeps its old serialized leaf behavior.
+// New scheduling/custody controls call the concurrent production path directly.
+fn serial_fixture_close<L>(
+    closer: impl FnMut(&mut L) -> Result<()> + Send,
+) -> impl Fn(&mut L) -> Result<()> + Send + Sync {
+    let closer = Mutex::new(closer);
+    move |link| closer.lock().unwrap_or_else(|error| error.into_inner())(link)
+}
+
 fn retirement_links<L>(
     handles: impl IntoIterator<Item = (InventoryLinkIdentity, L)>,
 ) -> Vec<RetirementLink<L>> {
@@ -901,6 +935,7 @@ fn retirement_links<L>(
             target,
             handle: Some(handle),
             quarantine: None,
+            _leases: Arc::default(),
         })
         .collect()
 }
@@ -958,14 +993,17 @@ fn inventory_retirement_expired_poll_keeps_job_pin_reader_and_positive_history()
         ]),
         vec![lease],
     );
-    let mut job = RetirementJob::start(work, move |id| {
-        observed.lock().unwrap().push(*id);
-        if *id == 575 {
-            entered.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5))?;
-        }
-        Ok(())
-    })
+    let mut job = RetirementJob::start(
+        work,
+        serial_fixture_close(move |id| {
+            observed.lock().unwrap().push(*id);
+            if *id == 575 {
+                entered.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5))?;
+            }
+            Ok(())
+        }),
+    )
     .unwrap_or_else(|failure| panic!("{}", failure.error));
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     drop(targets);
@@ -1004,7 +1042,13 @@ fn inventory_retirement_expired_poll_keeps_job_pin_reader_and_positive_history()
     .unwrap();
     assert_eq!(service.dispatched, 1);
     let work = collect_job(&mut job);
-    assert_eq!(*attempts.lock().unwrap(), [575, 1, 0]);
+    let attempts = attempts.lock().unwrap().clone();
+    assert_eq!(attempts.first(), Some(&575));
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[1..].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
     assert_eq!(work.receipt.closed, 3);
     assert!(work.receipt.failures.is_empty());
     assert!(weak.upgrade().is_some());
@@ -1031,35 +1075,48 @@ fn inventory_retirement_close_panic_and_failure_keep_handles_and_attempt_roots_l
             retirement_links(links.into_iter().map(|link| (link.target, link.handle))),
             vec![],
         ),
-        move |link: &mut TestLink| {
+        serial_fixture_close(move |link: &mut TestLink| {
             observed.lock().unwrap().detach_attempts.push(link.ordinal);
             match link.ordinal {
                 3 => panic!("owned injected close panic"),
                 2 => bail!("owned injected close failure"),
                 _ => Ok(()),
             }
-        },
+        }),
     )
     .unwrap_or_else(|failure| panic!("{}", failure.error));
     let work = collect_job(&mut job);
     assert!(format!("{:#}", failure.error).contains("original attach failure 4"));
-    assert_eq!(io.state.lock().unwrap().detach_attempts, [3, 2, 1, 0]);
+    let attempts = io.state.lock().unwrap().detach_attempts.clone();
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(
+        attempts[..2].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([2, 3])
+    );
+    assert_eq!(
+        attempts[2..].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
     assert_eq!(work.receipt.attempted, 4);
     assert_eq!(work.receipt.closed, 2);
     assert_eq!(work.receipt.failures.len(), 2);
-    assert_eq!(
-        work.receipt.failures[0].target,
-        InventoryLinkIdentity::Entry(1)
-    );
+    let panic_failure = work
+        .receipt
+        .failures
+        .iter()
+        .find(|failure| failure.target == InventoryLinkIdentity::Entry(1))
+        .unwrap();
     assert!(
-        work.receipt.failures[0]
+        panic_failure
             .error
             .to_string()
             .contains("owned injected close panic")
     );
-    assert_eq!(
-        work.receipt.failures[1].target,
-        InventoryLinkIdentity::Entry(0)
+    assert!(
+        work.receipt
+            .failures
+            .iter()
+            .any(|failure| failure.target == InventoryLinkIdentity::Entry(0))
     );
     assert_eq!(io.state.lock().unwrap().live, BTreeSet::from([2, 3]));
     assert_eq!(
@@ -1087,7 +1144,7 @@ fn inventory_retirement_spawn_and_transfer_failure_recover_owned_unattempted_wor
                 retirement_links(links.into_iter().map(|link| (link.target, link.handle))),
                 vec![],
             ),
-            move |link| close_io.detach(link),
+            serial_fixture_close(move |link| close_io.detach(link)),
             |task| {
                 // Closing the receiver before transfer deterministically makes
                 // send return its original owned payload to the controller.
@@ -1129,10 +1186,10 @@ fn inventory_retirement_unexpected_worker_panic_cannot_manufacture_success() {
     );
     let job = RetirementJob::start_with(
         work,
-        move |link: &mut TestLink| {
+        serial_fixture_close(move |link: &mut TestLink| {
             observed.lock().unwrap().detach_attempts.push(link.ordinal);
             bail!("retained before outer unwind");
-        },
+        }),
         |task| {
             std::thread::Builder::new().spawn(move || {
                 let _owned = task();
@@ -1153,7 +1210,13 @@ fn inventory_retirement_unexpected_worker_panic_cannot_manufacture_success() {
             .to_string()
             .contains("panicked outside close handling")
     );
-    assert_eq!(io.state.lock().unwrap().detach_attempts, [2, 1, 0]);
+    let attempts = io.state.lock().unwrap().detach_attempts.clone();
+    assert_eq!(attempts.first(), Some(&2));
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[1..].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
     assert_eq!(io.state.lock().unwrap().dropped, [2, 1, 0]);
     assert!(io.state.lock().unwrap().live.is_empty());
     assert!(evidence.snapshot().abandoned);
@@ -1216,11 +1279,11 @@ fn inventory_abandoned_retirement_pumps_real_decoder_and_retains_discard_evidenc
             retirement_links([(InventoryLinkIdentity::Entry(575), 575)]),
             vec![],
         ),
-        move |_| {
+        serial_fixture_close(move |_| {
             entered.send(())?;
             release_rx.recv_timeout(Duration::from_secs(5))?;
             Ok(())
-        },
+        }),
     )
     .unwrap_or_else(|failure| panic!("{}", failure.error));
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();

@@ -10,13 +10,15 @@ of three ways:
   importable package, so `-m unittest` cannot address them).
 - DRIVEN: a suite that needs a built artifact (an eBPF object, a fixture
   binary, a prepared toolchain) and is run by the named driver, which must
-  name it. The driver is a cargo integration test or a self-test the hosted
+  drive it through an invocation-shaped reference: the suite path as an
+  argument of a python/pytest/unittest call or of the runner's own suite
+  list. The driver is a cargo integration test or a self-test the hosted
   pipeline already runs.
 - EXCLUDED: a suite that cannot run anywhere today, with the reason.
 
 The registry is checked against the directory both ways before anything
 runs: a new suite nobody registered, a registered suite that is gone, or a
-driver that no longer names its suite fails the run. That is what keeps a
+driver that no longer drives its suite fails the run. That is what keeps a
 suite from silently running nowhere again.
 
 Usage:
@@ -35,42 +37,149 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SUITE_DIR = "tests/python"
 
+# Tokens of an invocation or an argument list. A quoted suite path counts
+# as driven only in argument position (after `(`, `,` or `[`) with one of
+# these within two lines: a python/pytest/unittest call, the Rust suite
+# runners, or a python argument flag. A bare mention in a comment or a
+# message has neither and fails.
+INVOCATION_MARKERS = (
+    "python", "pytest", "unittest", "run_ok", "run_native_python_suite",
+    "Command::new", ".args", ".arg(", ".join(", "vec!", "-I", "-p",
+)
+
 # (file, extra args). A file may appear more than once with different args.
 RUN = [
+    ("test_abi_execution_qualification.py", []),
+    ("test_automatic_exec_oracle.py", []),
+    ("test_automatic_exec_system_disclosures.py", []),
+    ("test_automatic_initial_readiness.py", []),
+    ("test_bank_object_proof_off_on.py", []),
+    ("test_bench_count_overhead.py", []),
+    ("test_bench_marker_cost.py", []),
+    ("test_benign_loader_evidence.py", []),
+    ("test_bpf_kernels_contract.py", []),
+    ("test_check_bpf_load_journal.py", []),
+    ("test_privileged_tests_workflow.py", []),
+    ("test_bpf_load_report.py", []),
+    ("test_bpf_noninterference.py", []),
+    ("test_multi_host_refusal.py", []),
+    ("test_browser_cells.py", []),
     ("test_cargo_wrapper.py", []),
+    ("test_cell_results.py", []),
     ("test_e16_oracle.py", []),
+    ("test_first_use_oracle.py", []),
+    ("test_first_use_sweep.py", []),
+    ("test_gate0_identity.py", []),
+    ("test_h4a_prepost_userspace.py", ["--self-test"]),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
+    ("test_canary_object.py", []),
     ("test_ci_dependency_selection.py", []),
+    ("test_ci_stop_races.py", []),
+    ("test_ci_test_partition.py", []),
+    ("test_counter_object.py", []),
+    ("test_counter_timing_object.py", []),
+    ("test_counter_softhsm_parity.py", []),
+    ("test_cgroup_replacement.py", []),
+    ("test_cgroup_stop_acceptance.py", []),
+    ("test_cgroup_trace_harness.py", []),
+    ("test_cgroup_trace_oracle.py", []),
+    ("test_container_cells.py", []),
+    ("test_container_cells_oracle.py", []),
+    ("test_dashboard_pty_cleanup.py", []),
+    ("test_detailed_leader_held_entry.py", []),
+    ("test_docker_runtime_workflow.py", []),
+    ("test_h6_cgroup_operator_path.py", []),
+    ("test_h6_initial_exec_controller.py", []),
+    ("test_h6_initial_exec_process.py", []),
+    ("test_h6_provider_receipt.py", []),
+    ("test_h6_system_dispatch.py", []),
     ("test_help_usage_drift.py", []),
+    ("test_hosted_delivery_dispatch.py", []),
+    ("test_ia32_automatic_exec.py", []),
+    ("test_ignored_tests.py", []),
+    ("test_image_bank_object.py", []),
+    ("test_inventory_capacity_oracle.py", []),
+    ("test_inventory_count_only_hooks.py", []),
+    ("test_inventory_output_readiness.py", []),
+    ("test_inventory_provider_identity.py", []),
+    ("test_inventory_readiness_cadence.py", []),
+    ("test_inventory_system_recovery_disclosures.py", []),
+    ("test_inventory_system_sibling.py", []),
+    ("test_joint_abi_oracle.py", []),
+    ("test_joint_async_oracle.py", []),
+    ("test_joint_h9_oracle.py", []),
+    ("test_joint_ledger_oracle.py", []),
+    ("test_joint_owner_proof_oracle.py", []),
+    ("test_joint_promotion_oracle.py", []),
+    ("test_joint_stall_live.py", []),
+    ("test_joint_throughput_cells.py", []),
+    ("test_joint_two_provider_oracle.py", []),
+    ("test_key_operation_ledger.py", []),
+    ("test_key_operations_fixture.py", []),
+    ("test_key_operations_linked_control.py", []),
+    ("test_key_operations_system.py", []),
+    ("test_kubernetes_runtime.py", []),
+    ("test_kubernetes_runtime_workflow.py", []),
+    ("test_legacy32_shape.py", []),
+    ("test_lib_cells_vng.py", []),
+    ("test_lifecycle_cli_oracle.py", []),
     ("test_loader.py", []),
+    ("test_loader_lifetimes.py", []),
+    ("test_matched_cost_run.py", []),
     ("test_measure_e03.py", []),
     ("test_merge_checksum_ledgers.py", []),
+    ("test_narrow_scope_oracle.py", []),
+    ("test_object_journal_qualification.py", []),
+    ("test_object_observations.py", []),
+    ("test_observed_key_operations.py", []),
+    ("test_operator_output_qualification.py", []),
     ("test_package_release.py", []),
+    ("test_package_preview.py", []),
     ("test_prepare_dependencies.py", []),
     ("test_prepared_dependency_evidence.py", []),
     ("test_prepared_dependency_metadata.py", []),
     ("test_prepared_dependency_tools.py", []),
+    ("test_public_cli_breadth.py", []),
+    ("test_public_cli_oracle.py", []),
+    ("test_public_cli_qualifier.py", []),
+    ("test_p11kit_transparency_oracle.py", []),
+    ("test_real_provider_oracle.py", []),
     ("test_python_suite_registry.py", []),
+    ("test_qualify_inventory_judge.py", []),
+    ("test_release_matrix_contract.py", []),
+    ("test_release_build_jobs.py", []),
     ("test_release_notices.py", []),
+    ("test_release_recipient.py", []),
     ("test_residual_gates.py", []),
+    ("test_return_probe_admission.py", []),
+    ("test_runtime_observer_download.py", []),
+    ("test_s1_throughput_compare.py", []),
     ("test_schema_json.py", []),
     ("test_skip_reason_vocabulary.py", []),
+    ("test_stop_race_oracle.py", []),
     ("test_system_first_use_fixture.py", []),
     ("test_system_first_use_receipt.py", []),
+    ("test_system_manifest_soak_oracle.py", []),
+    ("test_system_scope_equality.py", []),
     ("test_system_scope_measure_launch.py", []),
     ("test_system_scope_receipt.py", []),
     ("test_system_scope_sample.py", []),
+    ("test_system_scope_soak.py", []),
     ("test_system_test_manifest.py", []),
     ("test_t7_campaign.py", []),
+    ("test_uprobe_close_throughput_probe.py", []),
+    ("test_vng_wrapper_exits.py", []),
+    ("test_witness_cli_vng.py", []),
 ]
 
 _ARTIFACT_CONTRACTS = "tests/artifact_contracts.rs"
 _RECEIPTS = "tests/receipt_build_subjects.rs"
 
-# file -> driver path. The driver must contain the quoted repo-relative path
+# file -> driver path. The driver must pass the quoted repo-relative path
 # (`"tests/python/<file>"`) or, for a discover-by-pattern driver, the quoted
-# file name.
+# file name as an invocation argument (see INVOCATION_MARKERS); a bare
+# mention in a comment or a message does not count.
 DRIVEN = {
     "test_audit_oracle.py": _ARTIFACT_CONTRACTS,
     "test_bpf_map_defs.py": "tests/bpf_map_contracts.rs",
@@ -81,6 +190,7 @@ DRIVEN = {
     "test_diagnostic_linkage.py": _ARTIFACT_CONTRACTS,
     "test_discovery_flow_object.py": _ARTIFACT_CONTRACTS,
     "test_dual_build_callers.py": _ARTIFACT_CONTRACTS,
+    "test_entry_object.py": "tests/entry_object_paired.rs",
     "test_export_source.py": _ARTIFACT_CONTRACTS,
     "test_ia32_lifecycle.py": _ARTIFACT_CONTRACTS,
     "test_image_identity_core.py": _ARTIFACT_CONTRACTS,
@@ -98,6 +208,7 @@ DRIVEN = {
     "test_prepared_container_driver.py": _ARTIFACT_CONTRACTS,
     "test_prepared_four_callers.py": _ARTIFACT_CONTRACTS,
     "test_prepared_release_drivers.py": _ARTIFACT_CONTRACTS,
+    "test_process_session_dying_members.py": _ARTIFACT_CONTRACTS,
     "test_process_session_snapshot.py": _ARTIFACT_CONTRACTS,
     "test_product_build.py": _ARTIFACT_CONTRACTS,
     "test_receipt_borrowed_descriptor_admission.py": _RECEIPTS,
@@ -121,15 +232,94 @@ DRIVEN = {
     "test_task_storage_canary.py": _ARTIFACT_CONTRACTS,
 }
 
-EXCLUDED = {
-    "test_entry_object.py": (
-        "needs the default and the unsafe-unvalidated-metadata eBPF objects "
-        "at once (--default-object/--unsafe-object), which no single build "
-        "has; run against current objects (2026-10-03) it fails 8 of 40 on "
-        "pinned stack offsets and registers, so its instruction pins predate "
-        "the current object and need a refresh before it can be wired in"
-    ),
-}
+EXCLUDED = {}
+
+
+def _strip_driver_comments(text, driver):
+    """Driver text with line comments blanked (strings are kept).
+
+    Rust drivers lose `//` comments, Python and shell drivers `#` ones;
+    a marker inside a string literal never starts a comment.
+    """
+    marker = "//" if driver.endswith(".rs") else "#"
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        char = text[i]
+        if char in "\"'":
+            quote = char
+            out.append(char)
+            i += 1
+            while i < n:
+                out.append(text[i])
+                if text[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(text[i])
+                        i += 1
+                    continue
+                i += 1
+                if out[-1] == quote:
+                    break
+        elif marker == "//" and text.startswith("r", i) and text[i + 1:i + 2] in "#\"":
+            hashes = 0
+            j = i + 1
+            while text[j:j + 1] == "#":
+                hashes += 1
+                j += 1
+            if text[j:j + 1] != '"':
+                out.append(char)
+                i += 1
+            else:
+                close = '"' + "#" * hashes
+                end = text.find(close, j + 1)
+                end = n if end < 0 else end + len(close)
+                out.append(text[i:end])
+                i = end
+        elif text.startswith(marker, i):
+            while i < n and text[i] != "\n":
+                i += 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def _invocation_shaped(stripped, needle):
+    """True when some occurrence is passed as an invocation argument.
+
+    An occurrence counts when it sits in argument position (after `(`, `,`
+    or `[`, closed by `,`, `)` or `]` or whitespace) with an invocation
+    marker within two lines; a bare mention has neither and fails.
+    """
+    lines = stripped.splitlines()
+    start = 0
+    while True:
+        at = stripped.find(needle, start)
+        if at < 0:
+            return False
+        start = at + len(needle)
+        before = stripped[:at].rstrip()
+        if before and before[-1] in "(,[":
+            after = stripped[at + len(needle):]
+            if after == "" or after[0] in ",)]" or after[0].isspace():
+                row = stripped.count("\n", 0, at)
+                window = lines[max(0, row - 2):row + 3]
+                if any(marker in line
+                       for marker in INVOCATION_MARKERS for line in window):
+                    return True
+    return False
+
+
+def driven_state(text, name, driver):
+    """How a driver references a suite: "driven", "named" or "missing"."""
+    stripped = _strip_driver_comments(text, driver)
+    needles = (f'"{SUITE_DIR}/{name}"', f'"{name}"')
+    if not any(needle in stripped for needle in needles):
+        return "missing"
+    if any(_invocation_shaped(stripped, needle) for needle in needles):
+        return "driven"
+    return "named"
 
 
 def registry_problems(present, run, driven, excluded, read):
@@ -162,8 +352,14 @@ def registry_problems(present, run, driven, excluded, read):
         text = read(driver)
         if text is None:
             problems.append(f"{name}: driver {driver} does not exist")
-        elif f'"{SUITE_DIR}/{name}"' not in text and f'"{name}"' not in text:
-            problems.append(f"{name}: driver {driver} no longer names it")
+        else:
+            state = driven_state(text, name, driver)
+            if state == "named":
+                problems.append(
+                    f"{name}: driver {driver} names it without driving it "
+                    "(no invocation-shaped reference)")
+            elif state == "missing":
+                problems.append(f"{name}: driver {driver} no longer names it")
     for name, reason in sorted(excluded.items()):
         if not reason.strip():
             problems.append(f"{name} is excluded without a reason")

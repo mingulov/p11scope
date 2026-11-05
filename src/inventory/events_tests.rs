@@ -1,0 +1,1137 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! U0/D event-stream tests: versioned schema, rotation that never
+//! loses silently, retention accounting, stream gaps identical in
+//! meaning to snapshot gaps, and privacy bounds equal to snapshots.
+
+use super::*;
+use crate::discovery::caller_registry::{ImageAuthority, RegistryLimits};
+use crate::discovery::inventory_workload::{Harness, ScaleSpec};
+use std::collections::BTreeSet;
+
+/// A tempdir the event-writer trust check accepts under any umask:
+/// `tempfile` honors the process umask (0775 under the default 0002),
+/// and the writer refuses group-writable ancestors.
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    dir
+}
+
+fn limited(callers: usize) -> Harness {
+    Harness::new(RegistryLimits::new(callers, 64, 256, 64, 1 << 20, 64).unwrap()).unwrap()
+}
+
+/// A workload with refused captures: 4 retained callers, the 5th
+/// refused on the caller budget with a named gap.
+fn refused_harness() -> Harness {
+    let mut harness = limited(4);
+    let spec = ScaleSpec {
+        name: "events-refused",
+        callers: 4,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 60_004 - 4,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let now = harness.now_ns();
+    harness.source().spawn(60_004, 1111);
+    let observed: BTreeSet<u32> = [60_004].into_iter().collect();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.commit();
+    harness
+}
+
+fn presentation_for(harness: &Harness) -> (Presentation, serde_json::Value) {
+    let document = harness.render();
+    let started = document["observation"]["started_ns"].as_u64().unwrap();
+    let ended = document["observation"]["ended_ns"].as_u64().unwrap();
+    let passes = document["observation"]["passes"].as_u64().unwrap();
+    let presentation =
+        Presentation::capture(harness.coordinator(), "workload", started, ended, passes);
+    (presentation, document)
+}
+
+/// Read every stream file (live + rotations) into parsed lines.
+fn read_stream(dir: &std::path::Path, live: &str) -> Vec<(String, serde_json::Value)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name == live || name.starts_with(&format!("{live}.")))
+        .collect();
+    files.sort();
+    let mut lines = Vec::new();
+    for name in files {
+        let body = std::fs::read_to_string(dir.join(&name)).unwrap();
+        for line in body.lines() {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|_| panic!("{name}: unparsable line: {line:?}"));
+            lines.push((name.clone(), value));
+        }
+    }
+    lines
+}
+
+#[test]
+fn stream_gaps_are_identical_in_meaning_to_snapshot_gaps() {
+    let harness = refused_harness();
+    let (presentation, document) = presentation_for(&harness);
+    assert_eq!(document["budgets"]["callers"]["refused"], 1);
+    assert_eq!(document["gaps"].as_array().unwrap().len(), 1);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
+    writer
+        .finish(ended_payload(&presentation, 1000, &writer), 1000)
+        .unwrap();
+    let lines = read_stream(dir.path(), "events.jsonl");
+    // Every line is the versioned envelope, seqs contiguous from 0.
+    for (index, (_, line)) in lines.iter().enumerate() {
+        assert_eq!(line["schema"], EVENT_SCHEMA, "{line}");
+        assert_eq!(line["seq"], index as u64, "{line}");
+        assert!(line["at_ns"].is_number(), "{line}");
+        assert!(line["kind"].is_string(), "{line}");
+    }
+    // Gap events equal the snapshot gaps value-for-value (subject,
+    // reason, caller/module/pid, budget triple) — a refused capture
+    // produces stream gaps identical in meaning to snapshot gaps.
+    let stream_gaps: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_recorded")
+        .map(|(_, line)| &line["event"])
+        .collect();
+    let snapshot_gaps = document["gaps"].as_array().unwrap();
+    assert_eq!(stream_gaps.len(), snapshot_gaps.len());
+    for (position, (stream, snapshot)) in stream_gaps.iter().zip(snapshot_gaps.iter()).enumerate() {
+        // gap_recorded is the snapshot entry minus `repeats`.
+        let mut identity = (*snapshot).clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = serde_json::json!(position);
+        assert_eq!(**stream, identity, "gap event == snapshot gap identity");
+    }
+    let refusal = &stream_gaps[0];
+    assert_eq!(refusal["budget"]["resource"], "callers");
+    assert_eq!(refusal["budget"]["limit"], 4);
+    assert_eq!(refusal["budget"]["requested"], 5);
+    // Callers/modules/edges round-trip with the same identities.
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|(_, line)| line["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|(_, line)| line["kind"] == "caller_observed")
+            .count(),
+        4
+    );
+    assert!(kinds.contains(&"snapshot"));
+    assert!(kinds.contains(&"ended"));
+    let ended = lines
+        .iter()
+        .find(|(_, line)| line["kind"] == "ended")
+        .unwrap();
+    assert_eq!(ended.1["event"]["budgets"]["callers"]["refused"], 1);
+    assert_eq!(ended.1["event"]["stream"]["rotations"], 0);
+}
+
+#[test]
+fn rotation_never_loses_an_event_silently() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    // A tiny threshold forces several rotations; wide retention keeps
+    // every file, so every event must be present exactly once.
+    let mut writer = EventWriter::create(&path, 1024, 100).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
+    writer
+        .finish(ended_payload(&presentation, 1000, &writer), 1000)
+        .unwrap();
+    assert!(writer.rotations() >= 2, "rotations happened");
+    assert_eq!(writer.evicted_events(), 0, "nothing evicted");
+    let lines = read_stream(dir.path(), "events.jsonl");
+    // Seqs contiguous across ALL files: no event lost, none duplicated.
+    let mut seqs: Vec<u64> = lines
+        .iter()
+        .map(|(_, line)| line["seq"].as_u64().unwrap())
+        .collect();
+    seqs.sort_unstable();
+    for (index, seq) in seqs.iter().enumerate() {
+        assert_eq!(*seq, index as u64, "seq contiguous at {index}");
+    }
+    // Every rotation marker names a retained prior file whose line
+    // count matches the marker's accounting.
+    for (_, line) in lines.iter().filter(|(_, line)| line["kind"] == "rotated") {
+        let prior = line["event"]["prior_file"].as_str().unwrap();
+        let events = line["event"]["prior_events"].as_u64().unwrap();
+        let body = std::fs::read_to_string(dir.path().join(prior))
+            .unwrap_or_else(|_| panic!("{prior} retained"));
+        assert_eq!(body.lines().count() as u64, events, "{prior} line count");
+    }
+    // Payload events survived rotation intact.
+    let gap_events = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_recorded")
+        .count();
+    assert_eq!(gap_events, 1);
+    // The live file's line count is exactly the writer's live tally.
+    let live_lines = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(live_lines.lines().count() as u64, writer.live_events());
+}
+
+#[test]
+fn retention_eviction_is_accounted_not_silent() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    // Two files retained against many rotations: evictions must occur,
+    // each accounted in a retained event.
+    let mut writer = EventWriter::create(&path, 1024, 2).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
+    writer
+        .finish(ended_payload(&presentation, 1000, &writer), 1000)
+        .unwrap();
+    assert!(writer.rotations() >= 2);
+    assert!(writer.evicted_events() > 0, "evictions happened");
+    let lines = read_stream(dir.path(), "events.jsonl");
+    // Retained files respect the bound (live + one rotation).
+    let files: BTreeSet<&str> = lines.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(files.len() <= 2, "retention bound holds: {files:?}");
+    // Exact conservation: retained lines + accounted (direct +
+    // transitive) == emitted. Every emission is retained exactly once
+    // or covered exactly once by a retained record.
+    let emitted: u64 = lines
+        .iter()
+        .map(|(_, line)| line["seq"].as_u64().unwrap())
+        .max()
+        .unwrap()
+        + 1;
+    let evicted: u64 = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "retention_evicted")
+        .map(|(_, line)| {
+            line["event"]["evicted_events"].as_u64().unwrap()
+                + line["event"]["covered_events"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(
+        lines.len() as u64 + evicted,
+        emitted,
+        "every emission is retained or accounted"
+    );
+    // Evicted files are gone AND named with their counts.
+    for (_, line) in lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "retention_evicted")
+    {
+        let victim = line["event"]["evicted_file"].as_str().unwrap();
+        assert!(
+            !dir.path().join(victim).exists(),
+            "{victim} deleted after accounting"
+        );
+        assert!(line["event"]["evicted_events"].as_u64().unwrap() > 0);
+        assert!(
+            line["event"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("retention")
+        );
+    }
+}
+
+/// Sol F5: the cumulative eviction totals count each deleted line once.
+/// Evicting a file whose records covered earlier evictions adds only the
+/// deleted file's OWN lines/bytes to the footer totals — the covered
+/// counts were already added when those earlier files were deleted —
+/// while the replacement coverage record still re-covers transitively
+/// (retained + covered == emitted keeps holding).
+#[test]
+fn cumulative_eviction_totals_count_each_deleted_line_once() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    // `--event-max-files 1` evicts on every rotation; 2 keeps one
+    // rotation beside the live file. Both pin the same footer identity.
+    for max_files in [1usize, 2] {
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 8192, max_files).unwrap();
+        for i in 0..600u64 {
+            writer
+                .append("tick", serde_json::json!({"i": i}), 1000 + i)
+                .unwrap();
+        }
+        assert!(writer.rotations() >= 3, "rotations happened");
+        assert!(writer.evicted_events() > 0, "evictions happened");
+        // Top up to just past a rotation, so the live file holds only the
+        // marker and its eviction record: the `ended` line then fits
+        // without rotating, and the footer sees the final totals.
+        let rotations = writer.rotations();
+        for i in 600..6000u64 {
+            writer
+                .append("tick", serde_json::json!({"i": i}), 1000 + i)
+                .unwrap();
+            if writer.rotations() > rotations {
+                break;
+            }
+        }
+        assert!(writer.rotations() > rotations, "topped up past a rotation");
+        let payload = ended_payload(&presentation, 2_000_000, &writer);
+        let ended_len = writer.line_len("ended", &payload, 2_000_000);
+        assert!(
+            writer.live_bytes() + ended_len <= 8192,
+            "the ended line fits without rotating"
+        );
+        let rotations = writer.rotations();
+        writer.finish(payload, 2_000_000).unwrap();
+        assert_eq!(writer.rotations(), rotations, "finish appends in place");
+        let lines = read_stream(dir.path(), "events.jsonl");
+        let emitted: u64 = lines
+            .iter()
+            .map(|(_, line)| line["seq"].as_u64().unwrap())
+            .max()
+            .unwrap()
+            + 1;
+        let retained = lines.len() as u64;
+        // Transitive coverage is intact: every emission is retained once
+        // or covered once by a retained record.
+        let mut covered_events = 0u64;
+        let mut covered_bytes = 0u64;
+        for (_, line) in lines
+            .iter()
+            .filter(|(_, line)| line["kind"] == "retention_evicted")
+        {
+            covered_events += line["event"]["evicted_events"].as_u64().unwrap()
+                + line["event"]["covered_events"].as_u64().unwrap();
+            covered_bytes += line["event"]["evicted_bytes"].as_u64().unwrap()
+                + line["event"]["covered_bytes"].as_u64().unwrap();
+        }
+        assert_eq!(
+            retained + covered_events,
+            emitted,
+            "max_files={max_files}: every emission is retained or accounted"
+        );
+        // THE pin: the footer totals equal the TRUE deleted lines/bytes —
+        // emitted minus retained on disk — with no double count of the
+        // transitively covered earlier evictions.
+        assert_eq!(
+            writer.evicted_events(),
+            emitted - retained,
+            "max_files={max_files}: footer counts each deleted line once"
+        );
+        assert_eq!(
+            writer.evicted_bytes(),
+            covered_bytes,
+            "max_files={max_files}: footer counts each deleted byte once"
+        );
+        let ended = lines
+            .iter()
+            .find(|(_, line)| line["kind"] == "ended")
+            .unwrap_or_else(|| panic!("max_files={max_files}: the ended line is retained"));
+        assert_eq!(
+            ended.1["event"]["stream"]["evicted_events"]
+                .as_u64()
+                .unwrap(),
+            emitted - retained,
+            "max_files={max_files}: ended.stream pins the true deleted lines"
+        );
+        assert_eq!(
+            ended.1["event"]["stream"]["evicted_bytes"]
+                .as_u64()
+                .unwrap(),
+            covered_bytes,
+            "max_files={max_files}: ended.stream pins the true deleted bytes"
+        );
+    }
+}
+
+fn assert_final_stream_accounting(writer: &EventWriter, dir: &Path) -> serde_json::Value {
+    let records = read_stream(dir, "events.jsonl");
+    let emitted = records
+        .iter()
+        .map(|(_, row)| row["seq"].as_u64().unwrap())
+        .max()
+        .unwrap()
+        + 1;
+    let (covered_events, covered_bytes) = records
+        .iter()
+        .filter(|(_, row)| row["kind"] == "retention_evicted")
+        .fold((0, 0), |(events, bytes), (_, row)| {
+            let event = &row["event"];
+            (
+                events
+                    + event["evicted_events"].as_u64().unwrap()
+                    + event["covered_events"].as_u64().unwrap(),
+                bytes
+                    + event["evicted_bytes"].as_u64().unwrap()
+                    + event["covered_bytes"].as_u64().unwrap(),
+            )
+        });
+    assert_eq!(records.len() as u64 + covered_events, emitted);
+    assert_eq!(writer.evicted_events(), covered_events);
+    assert_eq!(writer.evicted_bytes(), covered_bytes);
+    let ended: Vec<_> = records
+        .iter()
+        .filter(|(_, row)| row["kind"] == "ended")
+        .collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].1["event"]["stream"],
+        serde_json::json!({
+            "rotations": writer.rotations(),
+            "evicted_events": covered_events,
+            "evicted_bytes": covered_bytes,
+        }),
+        "ended.stream must include the rotation and deletion caused by ended itself"
+    );
+    let live = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(live.lines().last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "ended");
+    ended[0].1["event"].clone()
+}
+
+#[test]
+fn ended_stream_accounts_for_its_own_rotation_and_retention() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    for max_files in [1, 2, 3] {
+        for (max_bytes, final_rotation) in [(1024, true), (8192, false), (8192, true)] {
+            let dir = private_tempdir();
+            let path = dir.path().join("events.jsonl");
+            let mut writer = EventWriter::create(&path, max_bytes, max_files).unwrap();
+            for i in 0..512 {
+                if writer.rotations() == 9 {
+                    break;
+                }
+                writer
+                    .append(
+                        "tick",
+                        serde_json::json!({"i": i, "pad": "p".repeat(500)}),
+                        1,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                writer.rotations(),
+                9,
+                "the final rotation crosses a digit boundary"
+            );
+            let payload = ended_payload(&presentation, 2, &writer);
+            if final_rotation {
+                for i in 0..256 {
+                    if writer.live_bytes() + writer.line_len("ended", &payload, 2) > max_bytes {
+                        break;
+                    }
+                    writer
+                        .append("padding", serde_json::json!({"i": i}), 1)
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                writer.live_bytes() + writer.line_len("ended", &payload, 2) > max_bytes,
+                final_rotation
+            );
+            assert_eq!(
+                writer.rotations(),
+                9,
+                "padding did not cause a separate rotation"
+            );
+            writer.finish(payload, 2).unwrap();
+            assert_eq!(
+                writer.rotations(),
+                9 + u64::from(final_rotation),
+                "an oversized footer still causes at most one append rotation"
+            );
+            assert_final_stream_accounting(&writer, dir.path());
+            assert!(std::fs::read_dir(dir.path()).unwrap().count() <= max_files);
+        }
+    }
+}
+
+#[test]
+fn ended_stream_on_an_empty_file_does_not_rotate_even_when_oversized() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let mut writer = EventWriter::create(&dir.path().join("events.jsonl"), 1, 1).unwrap();
+    writer
+        .finish(ended_payload(&presentation, 2, &writer), 2)
+        .unwrap();
+    assert_eq!(writer.rotations(), 0);
+    assert_final_stream_accounting(&writer, dir.path());
+}
+
+#[test]
+fn ended_normalizes_stream_totals_before_deciding_whether_to_rotate() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let max_bytes = 8192;
+    let mut writer = EventWriter::create(&path, max_bytes, 1).unwrap();
+    writer.append("tick", serde_json::json!({}), 1).unwrap();
+    let mut payload = ended_payload(&presentation, 2, &writer);
+    payload["padding"] = "".into();
+    let padding = max_bytes - writer.live_bytes() - writer.line_len("ended", &payload, 2);
+    payload["padding"] = "p".repeat(padding as usize).into();
+    assert_eq!(
+        writer.live_bytes() + writer.line_len("ended", &payload, 2),
+        max_bytes
+    );
+    payload["stream"] = serde_json::json!({
+        "rotations": u64::MAX,
+        "evicted_events": u64::MAX,
+        "evicted_bytes": u64::MAX,
+    });
+    assert!(writer.live_bytes() + writer.line_len("ended", &payload, 2) > max_bytes);
+    writer.finish(payload, 2).unwrap();
+    assert_eq!(
+        writer.rotations(),
+        0,
+        "stale footer totals must not force a rotation"
+    );
+    assert_final_stream_accounting(&writer, dir.path());
+}
+
+#[test]
+fn ended_settlements_include_stream_digit_growth_in_the_written_payload() {
+    let mut harness = limited(4);
+    harness.commit();
+    let (presentation, _) = presentation_for(&harness);
+    assert!(presentation.edges.is_empty());
+    for combined in [false, true] {
+        for next_seq in [9, 99] {
+            let dir = private_tempdir();
+            let path = dir.path().join("events.jsonl");
+            let max_bytes = 32 * 1024;
+            let mut writer = EventWriter::create(&path, max_bytes, 1).unwrap();
+            for i in 0..next_seq {
+                writer
+                    .append("tick", serde_json::json!({"i": i}), 1)
+                    .unwrap();
+            }
+            assert_eq!(writer.next_seq, next_seq);
+            assert_eq!(writer.rotations(), 0);
+            let mut base = ended_payload(&presentation, 2, &writer);
+            for key in [
+                "edges_unretained",
+                "instances_unretained",
+                "semantic_edges_unretained",
+                "key_operations_unretained",
+            ] {
+                base[key] = 0.into();
+            }
+            base["padding"] = "".into();
+            let unpadded = writer.line_len("ended", &base, 2);
+            let padding = max_bytes - writer.live_bytes() - unpadded + 1;
+            base["padding"] = "e".repeat(padding as usize).into();
+            assert_eq!(
+                writer.live_bytes() + writer.line_len("ended", &base, 2),
+                max_bytes + 1
+            );
+            let build = |counts: (usize, usize, usize, usize)| {
+                let mut payload = base.clone();
+                payload["edges_unretained"] = counts.0.into();
+                payload["instances_unretained"] = counts.1.into();
+                payload["semantic_edges_unretained"] = counts.2.into();
+                payload["key_operations_unretained"] = counts.3.into();
+                payload
+            };
+            let edges = EdgeEmitter::new();
+            let payload = if combined {
+                let (counts, payload) = settle_ended_combined(
+                    &edges,
+                    &InstanceEmitter::new(),
+                    &KeyOperationEmitter::new(),
+                    &writer,
+                    &presentation,
+                    &presentation.object_observations,
+                    (usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+                    2,
+                    build,
+                );
+                assert_eq!(counts, (0, 0, 0, 0));
+                payload
+            } else {
+                let (count, payload) = edges
+                    .settle_ended(&writer, &[], usize::MAX, 2, |count| build((count, 0, 0, 0)));
+                assert_eq!(count, 0);
+                payload
+            };
+            let settled_len = writer.line_len("ended", &payload, 2);
+            writer.finish(payload.clone(), 2).unwrap();
+            assert_eq!(writer.rotations(), 1);
+            assert_eq!(writer.evicted_events(), next_seq);
+            let actual = assert_final_stream_accounting(&writer, dir.path());
+            assert_eq!(
+                payload, actual,
+                "finish must write the exact settled payload"
+            );
+            let live = std::fs::read_to_string(path).unwrap();
+            let last = live.lines().last().unwrap();
+            assert_eq!(last.len() as u64 + 1, settled_len);
+            let ended: serde_json::Value = serde_json::from_str(last).unwrap();
+            assert_eq!(
+                ended["seq"], next_seq,
+                "existing triggering-line sequence is preserved"
+            );
+        }
+    }
+}
+
+#[test]
+fn synthetic_ended_payload_without_stream_keeps_its_shape() {
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1024, 1).unwrap();
+    writer.append("tick", serde_json::json!({}), 1).unwrap();
+    let payload = serde_json::json!({"edges_unretained": 1, "pad": "x".repeat(2048)});
+    writer.finish(payload.clone(), 2).unwrap();
+    assert_eq!(writer.rotations(), 1);
+    let live = std::fs::read_to_string(path).unwrap();
+    let ended: serde_json::Value = serde_json::from_str(live.lines().last().unwrap()).unwrap();
+    assert_eq!(ended["event"], payload);
+}
+
+#[test]
+fn stream_privacy_bounds_match_snapshots_exactly() {
+    let harness = refused_harness();
+    let (presentation, document) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    // Envelope keys are fixed and documented.
+    for (_, line) in &lines {
+        let keys: BTreeSet<&str> = line
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["at_ns", "event", "kind", "schema", "seq"]
+                .into_iter()
+                .collect()
+        );
+    }
+    // Caller/module payloads carry exactly the snapshot caller/module
+    // keys — no new capture, however derived.
+    let caller_keys: BTreeSet<&str> = document["callers"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for (_, line) in lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "caller_observed")
+    {
+        let keys: BTreeSet<&str> = line["event"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, caller_keys, "caller payload == snapshot keys");
+    }
+    let module_keys: BTreeSet<&str> = document["modules"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for (_, line) in lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "module_observed")
+    {
+        let keys: BTreeSet<&str> = line["event"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, module_keys, "module payload == snapshot keys");
+    }
+    // Edge facts preserve snapshot keys; the additive context is independently allowlisted.
+    let mut edge_keys: BTreeSet<&str> = document["edges"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    edge_keys.extend(["presence", "capture", "activity", "identity_context"]);
+    for (_, line) in lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "edge_observed")
+    {
+        let keys: BTreeSet<&str> = line["event"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys, edge_keys,
+            "edge payload == snapshot keys + states + compact context"
+        );
+    }
+}
+
+#[test]
+fn incremental_pass_events_match_the_final_snapshot() {
+    // The production incremental path (per-pass caller/gap/pass
+    // markers), replayed through the harness exactly as the run loops
+    // emit it.
+    let mut harness = refused_harness();
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    // One more pass with an exit, emitted incrementally (the
+    // refused harness admitted pids 60000-60003).
+    harness.source().kill(60_000);
+    let observed: BTreeSet<u32> = [60_001, 60_002, 60_003].into_iter().collect();
+    let now = harness.now_ns();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.commit();
+    let document = harness.render();
+    let started = document["observation"]["started_ns"].as_u64().unwrap();
+    let ended = document["observation"]["ended_ns"].as_u64().unwrap();
+    let passes = document["observation"]["passes"].as_u64().unwrap();
+    let presentation =
+        Presentation::capture(harness.coordinator(), "workload", started, ended, passes);
+    // Emit the pass the way production does (caller turnover, new
+    // gaps, pass marker).
+    let identities = IdentityIndex::new(&presentation);
+    for event in &events {
+        writer
+            .append(
+                "caller_event",
+                caller_event_payload(event, &identities),
+                now,
+            )
+            .unwrap();
+    }
+    let emitted_gaps = GapEmitter::new()
+        .emit(&mut writer, &presentation.gaps, false, now)
+        .unwrap();
+    assert!(emitted_gaps > 0);
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    // The exit is an event; the gaps equal the snapshot gaps.
+    assert!(
+        lines
+            .iter()
+            .any(|(_, line)| line["kind"] == "caller_event" && line["event"]["event"] == "exited"),
+        "exit emitted"
+    );
+    let stream_gaps: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_recorded")
+        .map(|(_, line)| &line["event"])
+        .collect();
+    let snapshot_gaps = document["gaps"].as_array().unwrap();
+    assert_eq!(stream_gaps.len(), snapshot_gaps.len());
+    for (position, (stream, snapshot)) in stream_gaps.iter().zip(snapshot_gaps.iter()).enumerate() {
+        let mut identity = (*snapshot).clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = serde_json::json!(position);
+        assert_eq!(**stream, identity);
+    }
+}
+
+#[test]
+fn rotation_sequences_never_collide_across_runs() {
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut first = EventWriter::create(&path, 256, 10).unwrap();
+    for index in 0..20 {
+        first
+            .append("probe", serde_json::json!({"i": index}), 1000 + index)
+            .unwrap();
+    }
+    let first_rotations = first.rotations();
+    assert!(first_rotations > 0);
+    drop(first);
+    // A second run in the same directory continues the sequence past
+    // the first run's rotations (no overwrite, no collision).
+    let mut second = EventWriter::create(&path, 256, 10).unwrap();
+    for index in 0..20 {
+        second
+            .append("probe", serde_json::json!({"i": index}), 2000 + index)
+            .unwrap();
+    }
+    drop(second);
+    let mut seqs: Vec<u64> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter_map(|name| {
+            name.strip_prefix("events.jsonl.")
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+        })
+        .collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(
+        seqs.len(),
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("events.jsonl.")
+            })
+            .count(),
+        "no rotated name reused across runs"
+    );
+    // All retained lines still parse (both runs' markers intact).
+    for (_, line) in read_stream(dir.path(), "events.jsonl") {
+        assert_eq!(line["schema"], EVENT_SCHEMA);
+    }
+}
+
+/// DR-K8S-4: a gap repeated on every pass is one gap with a repeat
+/// count, and the snapshot, the event stream and the presentation the
+/// dashboard renders all agree on both.
+#[test]
+fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
+    use crate::discovery::caller_registry::RegistryGap;
+    let mut harness = limited(8);
+    for pass in 0..20 {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "overlay collapse".into(),
+                reason: "two overlay instances map one inode".into(),
+                budget: None,
+            });
+        if pass == 9 {
+            harness
+                .coordinator_mut()
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(5),
+                    subject: "distinct".into(),
+                    reason: "seen once".into(),
+                    budget: None,
+                });
+        }
+        harness.commit();
+    }
+    let (presentation, document) = presentation_for(&harness);
+    let json_gaps = document["gaps"].as_array().unwrap();
+    assert_eq!(json_gaps.len(), 2, "{json_gaps:?}");
+    assert_eq!(json_gaps[0]["subject"], "overlay collapse");
+    assert_eq!(json_gaps[0]["repeats"], 20);
+    assert_eq!(json_gaps[1]["repeats"], 1);
+    assert_eq!(document["gaps_suppressed"], 0);
+    // Dashboard/snapshot consumers read the same view.
+    let view: Vec<u64> = presentation.gaps.iter().map(|gap| gap.repeats).collect();
+    assert_eq!(view, vec![20, 1]);
+    // The event stream: one gap_recorded per distinct gap, carrying the
+    // same payload as the snapshot entry.
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 4).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    let stream: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_recorded")
+        .map(|(_, line)| &line["event"])
+        .collect();
+    assert_eq!(stream.len(), 2);
+    let repeated: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_repeated")
+        .map(|(_, line)| &line["event"])
+        .collect();
+    assert_eq!(
+        repeated,
+        vec![&serde_json::json!({"index": 0, "repeats": 20})]
+    );
+    for (position, (stream, snapshot)) in stream.iter().zip(json_gaps).enumerate() {
+        let mut identity = (*snapshot).clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = serde_json::json!(position);
+        assert_eq!(**stream, identity);
+    }
+}
+
+/// B1: the live event file opens with the `-o` hardening. A symlink
+/// at the name is refused and its target is left byte-for-byte untouched
+/// (a plain `OpenOptions` open would truncate through it).
+#[test]
+fn event_log_refuses_a_symlink_and_leaves_its_target_untouched() {
+    let dir = private_tempdir();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not truncate").unwrap();
+    let link = dir.path().join("events.jsonl");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let Err(error) = EventWriter::create(&link, 1 << 20, 5) else {
+        panic!("a symlink at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a symbolic link"),
+        "clear symlink refusal: {error}"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted link is left as it was"
+    );
+}
+
+/// B1: a new event file is private from creation.
+#[test]
+fn event_log_creates_private_0600_and_truncates_an_existing_file_to_0600() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    drop(EventWriter::create(&path, 1 << 20, 5).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a new file is 0600, not the default umask mode"
+    );
+    // A pre-existing world-readable file is truncated and made private,
+    // like `-o`: same policy, documented difference is only that the
+    // truncate happens at creation rather than at a later begin.
+    std::fs::write(&path, b"previous run\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(EventWriter::create(&path, 1 << 20, 5).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+/// B1: a FIFO at the name is refused without blocking. No reader exists:
+/// a plain blocking open would hang here.
+#[test]
+fn event_log_refuses_a_fifo_without_blocking() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = private_tempdir();
+    let fifo = dir.path().join("events.jsonl");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in temp path");
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let Err(error) = EventWriter::create(&fifo, 1 << 20, 5) else {
+        panic!("a FIFO at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a FIFO"),
+        "clear non-regular refusal: {error}"
+    );
+}
+
+/// B1: a directory at the name is refused (non-regular final component).
+#[test]
+fn event_log_refuses_a_directory() {
+    let dir = private_tempdir();
+    let subdir = dir.path().join("events.jsonl");
+    std::fs::create_dir(&subdir).unwrap();
+    let Err(error) = EventWriter::create(&subdir, 1 << 20, 5) else {
+        panic!("a directory at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a directory"),
+        "clear non-regular refusal: {error}"
+    );
+}
+
+/// B1: a device at the name is refused without opening it for the
+/// stream. `/dev/null` opens fine with plain flags, so only the
+/// regular-file check refuses it — the same check that now refuses
+/// `/dev/full` up front (see `a_full_event_log_disk_is_an_error`).
+#[test]
+fn event_log_refuses_a_device() {
+    let Err(error) = EventWriter::create(std::path::Path::new("/dev/null"), 1 << 20, 5) else {
+        panic!("a device at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a character device"),
+        "clear non-regular refusal: {error}"
+    );
+}
+
+/// B1: the live file inherits `-o`'s trusted-parent check. A directory
+/// writable by others without the sticky bit is refused by name, like
+/// `-o`, before anything is created in it.
+#[test]
+fn event_log_refuses_an_untrusted_parent_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = private_tempdir();
+    let loose = dir.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = loose.join("events.jsonl");
+    let Err(error) = EventWriter::create(&path, 1 << 20, 5) else {
+        panic!("an untrusted parent directory must be refused");
+    };
+    assert!(error.contains("untrusted"), "names the parent: {error}");
+    assert!(
+        std::fs::symlink_metadata(&path).is_err(),
+        "nothing was created in the refused directory"
+    );
+}
+
+/// B1: the rotation rename never follows or clobbers a planted
+/// `<path>.1` symlink: it fails closed and leaves both the link and its
+/// target untouched.
+#[test]
+fn event_log_rotation_refuses_a_planted_symlink_target() {
+    let dir = private_tempdir();
+    let live = dir.path().join("events.jsonl");
+    std::fs::write(&live, b"live").unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    let rotated = dir.path().join("events.jsonl.1");
+    std::os::unix::fs::symlink(&victim, &rotated).unwrap();
+    let error = rename_live_to_rotated(&live, &rotated).unwrap_err();
+    assert!(error.contains("refusing to replace"), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        std::fs::symlink_metadata(&rotated)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted rotation link is left as it was"
+    );
+    assert_eq!(std::fs::read(&live).unwrap(), b"live");
+}
+
+/// B1: a full rotation through `append` fails closed on a planted
+/// rotation symlink instead of writing through it.
+#[test]
+fn event_log_append_rotation_does_not_follow_a_planted_symlink() {
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 512, 5).unwrap();
+    writer.append("first", serde_json::json!({}), 1).unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    // The next rotation sequence is 1: no prior files existed at creation.
+    let planted = dir.path().join("events.jsonl.1");
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+    // A payload large enough to force the rotation.
+    let big = serde_json::json!({"pad": "x".repeat(1024)});
+    let error = writer.append("second", big, 2).unwrap_err();
+    assert!(error.contains("refusing to replace"), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted rotation link is left as it was"
+    );
+}
+
+/// B1: retention eviction never follows a symlink victim: it refuses and
+/// leaves both the link and its target untouched.
+#[test]
+fn event_log_eviction_refuses_a_symlink_victim() {
+    let dir = private_tempdir();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    let link = dir.path().join("events.jsonl.1");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let error = remove_retained_file(&link).unwrap_err();
+    assert!(error.contains("refusing to remove"), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted victim link is left as it was"
+    );
+    // A missing victim is already evicted.
+    remove_retained_file(&dir.path().join("events.jsonl.9")).unwrap();
+}
+
+/// Review R-1 (margins): the dump fit bound holds exactly at its
+/// boundary. With the records an emitter carries, the smallest rotate
+/// size whose contiguous capacity covers carried bytes + per-edge slack +
+/// the tail reserve fits; one byte less does not. Loosening any margin
+/// (the tail reserve, the largest line, the rotation overhead, the slack)
+/// moves the boundary and fails here.
+#[test]
+fn the_dump_fit_bound_is_exact_at_its_boundary() {
+    let mut harness = limited(8);
+    harness.stage_scale(&ScaleSpec {
+        name: "fit-boundary",
+        callers: 3,
+        modules: 2,
+        edges_per_caller: 2,
+        endpoints_per_module: 4,
+        first_pid: 70_000,
+    });
+    harness.commit();
+    let (presentation, _) = presentation_for(&harness);
+    assert_eq!(presentation.edges.len(), 6);
+    let dir = private_tempdir();
+    let mut writer = EventWriter::create(&dir.path().join("big.jsonl"), 1 << 20, 2).unwrap();
+    let mut emitter = EdgeEmitter::new();
+    emitter
+        .emit(
+            &mut writer,
+            &presentation.edges,
+            &IdentityIndex::new(&presentation),
+            64,
+            1,
+        )
+        .unwrap();
+    let edges = presentation.edges.len() as u64;
+    let need = emitter.carried_bytes + DUMP_LINE_SLACK * edges + DUMP_TAIL_RESERVE;
+    let per_line = emitter.largest_line + DUMP_LINE_SLACK + ROTATION_OVERHEAD;
+    for files in [2u64, 3, 5] {
+        let per_file = need.div_ceil(files - 1);
+        let boundary = per_file + per_line;
+        let probe = dir.path().join(format!("probe-{files}.jsonl"));
+        let fits = |max_bytes: u64| {
+            emitter.fits(&EventWriter::create(&probe, max_bytes, files as usize).unwrap())
+        };
+        assert!(fits(boundary), "{files} files at {boundary}");
+        assert!(!fits(boundary - 1), "{files} files at {}", boundary - 1);
+    }
+}

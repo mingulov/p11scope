@@ -57,26 +57,88 @@
 //! [`ExecTransition`]: the coordinator retires `X` and mints its successor.
 //! The proving row itself stays unbound: the successor is admitted after it.
 //!
-//! What this does not claim: the `ImageGuard` `Exact` contract (the current
-//! exec sequence is never read from userspace), so the mapping lane stays
-//! scan-pinned.
+//! What this does not claim: the `ImageGuard` `Exact` contract. The
+//! specifically approved inventory-owner guard may check an independently
+//! supplied expected binding through a fresh observation; cached binder
+//! state is never currency evidence, so the mapping lane stays
+//! scan-pinned until packet 2 wires preparation.
 
 use crate::attach::capture::{
-    CookieQuery, DiscoveryBatch, DomainCookie, ExecCoverage, InventoryCapture, NativeDomainId,
-    RetiredCapture, RetiringCapture, WitnessBatch, WitnessRow,
+    BindingObservation, CallerImageObservation, CookieQuery, DiscoveryBatch, DomainCookie,
+    ExecCoverage, InventoryCapture, NativeDomainId, RetiredCapture, RetiringCapture, WitnessBatch,
+    WitnessRow,
 };
 use crate::discovery::caller_registry::{CallerAdapter, CallerId, ProcessSource};
 use crate::process::PidPin;
-use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, ImageIdentity};
+use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
-/// Where native identity comes from: the owner lane's exact image (the
+mod metadata;
+pub(crate) use metadata::{BinderMetadataImage, BinderMetadataKey};
+
+/// Expected native image identity for one owner: the domain-tagged ticket
+/// plus the full exec sequence the binder settled for one caller. This is
+/// the image to check, never evidence the process still runs it: only a
+/// fresh observation through the retained pin can prove currency. Equality
+/// only; there is no numeric accessor, tuple conversion, `Deref`, `Display`,
+/// serde form, `Default`, ordering, or production conversion from wire
+/// identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+pub(crate) struct BoundImage {
+    ticket: DomainCookie,
+    full_exec_id: u64,
+}
+
+impl std::fmt::Debug for BoundImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BoundImage(<expected>)")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+impl BoundImage {
+    /// The settled binder association only: the production factory below.
+    fn from_settled(ticket: DomainCookie, full_exec_id: u64) -> Self {
+        Self {
+            ticket,
+            full_exec_id,
+        }
+    }
+
+    /// A scripted expected image for owner/guard tests (never a host read).
+    /// Zero is unavailable, never an expected image; exec zero is valid.
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId, ticket: u64, full_exec_id: u64) -> Option<Self> {
+        (ticket != 0).then(|| Self::from_settled(DomainCookie::new(domain, ticket), full_exec_id))
+    }
+
+    /// Whether this expected image belongs to `domain`: an equality
+    /// coordinate, never a number.
+    pub(crate) fn belongs_to(&self, domain: NativeDomainId) -> bool {
+        self.ticket.domain() == domain
+    }
+
+    /// Compare a fresh observation of `original` against this expected
+    /// image, passing the private fields through without returning them.
+    pub(crate) fn compare_observation(
+        &self,
+        original: &Arc<PidPin>,
+        observation: &CallerImageObservation,
+    ) -> BindingObservation {
+        observation.compare_binding(original, self.ticket, self.full_exec_id)
+    }
+}
+
+/// Where native identity comes from: the owner lane's expected image (the
 /// `ImageGuard` contract; `None` everywhere in production) and the cookie
 /// queries the binder makes through a caller's retained pin.
 pub(crate) trait NativeIdentity<Pin> {
-    /// Exact image identity for the native owner lane, or `None` (the
-    /// scan lane).
-    fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity>;
+    /// Expected image identity for the native owner lane, or `None` (the
+    /// scan lane). A cookie-only capture query never supplies this: the
+    /// full expected image comes only from a settled binder association.
+    fn owner_image(&mut self, pid: u32) -> Option<BoundImage>;
     /// The `domain` object's ticket for the process `pin` holds. A source
     /// without that domain answers `Unavailable`.
     fn query_cookie(&mut self, domain: NativeDomainId, pin: &Pin) -> CookieQuery;
@@ -86,7 +148,7 @@ pub(crate) trait NativeIdentity<Pin> {
 pub(crate) struct ScanOnlyIdentity;
 
 impl<Pin> NativeIdentity<Pin> for ScanOnlyIdentity {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -96,12 +158,14 @@ impl<Pin> NativeIdentity<Pin> for ScanOnlyIdentity {
 }
 
 /// Test seam: the owner lane's scripted exact images, no cookie queries.
+/// Scenes share one stable domain per `expected` helper; minting a fresh
+/// domain inside every call would break equality for the wrong reason.
 #[cfg(test)]
-pub(crate) struct OwnerImages(pub fn(u32) -> Option<ImageIdentity>);
+pub(crate) struct OwnerImages(pub fn(u32) -> Option<BoundImage>);
 
 #[cfg(test)]
 impl<Pin> NativeIdentity<Pin> for OwnerImages {
-    fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, pid: u32) -> Option<BoundImage> {
         (self.0)(pid)
     }
 
@@ -117,7 +181,7 @@ fn foreign_domain() -> CookieQuery {
 }
 
 impl NativeIdentity<PidPin> for InventoryCapture {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -131,7 +195,7 @@ impl NativeIdentity<PidPin> for InventoryCapture {
 }
 
 impl NativeIdentity<PidPin> for RetiringCapture {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -145,7 +209,7 @@ impl NativeIdentity<PidPin> for RetiringCapture {
 }
 
 impl NativeIdentity<PidPin> for RetiredCapture {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -179,6 +243,35 @@ impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> 
             pin,
         })
     }
+}
+
+/// A current-image query for an already historically bound image.
+#[derive(Clone, Copy)]
+pub(crate) struct CurrentBindingRequest {
+    pub caller: CallerId,
+    pub pid: u32,
+    pub image: DomainCookie,
+    pub exec_id: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CurrentBindingSighting {
+    request: CurrentBindingRequest,
+    first_seen_ns: u64,
+    sighted_ns: u64,
+}
+
+impl CurrentBindingSighting {
+    pub(crate) fn sighted_ns(&self) -> u64 {
+        self.sighted_ns
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CurrentBindingCheck {
+    Pending,
+    Proven,
+    Rejected(UnboundReason),
 }
 
 /// Why one witness row stays unbound. The order is the census order.
@@ -280,8 +373,8 @@ pub(crate) struct Decision {
 pub(crate) struct ExecTransition {
     caller: CallerId,
     pid: u32,
-    old: (DomainCookie, u64),
-    new: (DomainCookie, u64),
+    old: Option<(DomainCookie, u64)>,
+    new: Option<(DomainCookie, u64)>,
 }
 
 impl ExecTransition {
@@ -294,16 +387,50 @@ impl ExecTransition {
         self.pid
     }
 
-    /// The ended image (ticket, exec sequence).
+    /// The ended image (ticket, exec sequence), when the binder held it.
+    /// `None` when the predecessor was never held: the exec hook proved
+    /// the end, but no bound row ever proved which image ended.
     #[cfg_attr(not(test), allow(dead_code))] // ExecProof carries it.
-    pub(crate) fn old(&self) -> (DomainCookie, u64) {
+    pub(crate) fn old(&self) -> Option<(DomainCookie, u64)> {
         self.old
     }
 
-    /// The image that replaced it.
+    /// The image that replaced it, when a decided row proved it. `None`
+    /// for a hook-minted handoff: the live guard proved a current image
+    /// exists, but no row proved its ticket or exec sequence.
     #[cfg_attr(not(test), allow(dead_code))] // ExecProof carries it.
-    pub(crate) fn new_image(&self) -> (DomainCookie, u64) {
+    pub(crate) fn new_image(&self) -> Option<(DomainCookie, u64)> {
         self.new
+    }
+
+    /// A transition the binder proves by a decided row against a held
+    /// image: both images are known exactly.
+    fn row_proven(
+        caller: CallerId,
+        pid: u32,
+        old: (DomainCookie, u64),
+        new: (DomainCookie, u64),
+    ) -> Self {
+        Self {
+            caller,
+            pid,
+            old: Some(old),
+            new: Some(new),
+        }
+    }
+
+    /// A transition the coordinator mints from an exec hook for a caller
+    /// whose image the binder never held (the lost race): the hook proved
+    /// the end and the live guard proved a current image, but neither
+    /// image is exactly known. Only the binder constructs transitions;
+    /// the coordinator calls this constructor for the hook path.
+    pub(crate) fn unheld_predecessor(caller: CallerId, pid: u32) -> Self {
+        Self {
+            caller,
+            pid,
+            old: None,
+            new: None,
+        }
     }
 }
 
@@ -377,10 +504,14 @@ fn stamp(ns: u64) -> Option<u64> {
 /// One native domain's binding state.
 struct DomainState {
     domain: NativeDomainId,
+    finished: bool,
     /// Start of the latest complete lifecycle drain.
     lifecycle_ns: Option<u64>,
     /// Start of the latest readable health read.
     health_ns: Option<u64>,
+    /// Latest ordered health qualification for display-only image bindings.
+    metadata_health_ns: Option<u64>,
+    metadata_health_proven: bool,
     /// Where exec coverage began (`None`: not reported, nothing predating
     /// a revalidation is eligible).
     coverage_ns: Option<u64>,
@@ -413,8 +544,11 @@ impl DomainState {
     fn new(domain: NativeDomainId) -> Self {
         Self {
             domain,
+            finished: false,
             lifecycle_ns: None,
             health_ns: None,
+            metadata_health_ns: None,
+            metadata_health_proven: false,
             coverage_ns: None,
             revalidated: None,
             ring_loss: 0,
@@ -463,9 +597,14 @@ impl DomainState {
 pub(crate) struct NativeBinder {
     limits: BinderLimits,
     domains: Vec<DomainState>,
+    domain_indices: HashMap<NativeDomainId, usize>,
     decided: Vec<Decision>,
     transitions: Vec<ExecTransition>,
     census: BindingCensus,
+    /// Qualified only on the explicit metadata opt-in, never an image grant.
+    metadata_clock_qualified: bool,
+    #[cfg(test)]
+    current_binding_clock: Option<fn() -> Option<u64>>,
 }
 
 impl NativeBinder {
@@ -473,9 +612,13 @@ impl NativeBinder {
         Self {
             limits,
             domains: Vec::new(),
+            domain_indices: HashMap::new(),
             decided: Vec::new(),
             transitions: Vec::new(),
             census: BindingCensus::default(),
+            metadata_clock_qualified: false,
+            #[cfg(test)]
+            current_binding_clock: None,
         }
     }
 
@@ -516,12 +659,24 @@ impl NativeBinder {
         std::mem::take(&mut self.transitions)
     }
 
+    /// Whether the caller holds a bound image in this domain. The
+    /// coordinator's exec-hook path mints only for callers that hold
+    /// none: a held image means the row-proven transition path owns this
+    /// caller, so the hook path stays out. Read-only: it changes no rule.
+    pub(crate) fn holds_image(&self, domain: NativeDomainId, caller: CallerId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| self.domains[*index].callers.contains_key(&caller))
+    }
+
     fn domain_index(&mut self, domain: NativeDomainId) -> usize {
-        match self.domains.iter().position(|state| state.domain == domain) {
+        match self.domain_indices.get(&domain).copied() {
             Some(index) => index,
             None => {
+                let index = self.domains.len();
                 self.domains.push(DomainState::new(domain));
-                self.domains.len() - 1
+                self.domain_indices.insert(domain, index);
+                index
             }
         }
     }
@@ -623,6 +778,27 @@ impl NativeBinder {
         let index = self.domain_index(batch.domain);
         let limits = self.limits;
         let state = &mut self.domains[index];
+        let metadata_health = batch.phase == crate::attach::capture::CapturePhase::Active
+            && batch.health.failures.is_empty()
+            && batch.health.discovery_counters.is_some()
+            && batch.health_unproven.is_none()
+            && batch.health_regression.is_none()
+            && !batch.unsettled;
+        match stamp(batch.health_read_ns) {
+            Some(read)
+                if state
+                    .metadata_health_ns
+                    .is_none_or(|previous| read > previous) =>
+            {
+                state.metadata_health_ns = Some(read);
+                state.metadata_health_proven = metadata_health;
+            }
+            Some(read) if state.metadata_health_ns == Some(read) && !metadata_health => {
+                state.metadata_health_proven = false;
+            }
+            None => state.metadata_health_proven = false,
+            _ => {}
+        }
         if let Some(counters) = batch.health.discovery_counters {
             if crate::attach::capture::ring_loss_rose(state.ring_loss, Some(counters)).is_some()
                 || batch.health.malformed_discovery > state.malformed
@@ -678,13 +854,196 @@ impl NativeBinder {
         self.decide_ready(index);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_current_binding_clock(&mut self, clock: fn() -> Option<u64>) {
+        self.current_binding_clock = Some(clock);
+    }
+
+    pub(crate) fn domain_active(&self, domain: NativeDomainId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| !self.domains[*index].finished)
+    }
+
+    /// The expected image for one settled caller binding: which
+    /// `(domain, ticket, exec)` to check, never proof it is current. Reads
+    /// the explicitly selected domain only (never the first), requires the
+    /// live PID lookup to still name `caller`, and refuses finished,
+    /// ended, absent, conflicting, or known-invalidated bindings. A
+    /// surviving value stays just an expected image after its source
+    /// domain ends; the active-domain check is a separate veto at use
+    /// time. This is not a proof factory for `Exact`: cached bindings
+    /// deliberately keep attributing historical rows after retirement.
+    #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+    pub(crate) fn expected_owner_image<Pin>(
+        &self,
+        domain: NativeDomainId,
+        caller: CallerId,
+        pid: u32,
+        lookup: &dyn CallerLookup<Pin>,
+    ) -> Option<BoundImage> {
+        let state = self
+            .domain_indices
+            .get(&domain)
+            .map(|index| &self.domains[*index])?;
+        if state.finished || state.ended.contains(&caller) {
+            return None;
+        }
+        let &(ticket, exec) = state.callers.get(&caller)?;
+        // The live PID lookup must still name the requested caller.
+        let live = lookup.live_caller(pid).filter(|live| live.id == caller)?;
+        // A known-invalidated binding: an exec or lost lifecycle evidence
+        // at or after the caller's admission.
+        if state
+            .exec_ns
+            .get(&pid)
+            .is_some_and(|at| *at >= live.first_seen_ns)
+            || state.loss_ns.is_some_and(|at| at >= live.first_seen_ns)
+        {
+            return None;
+        }
+        // Conflicting: a newer exec of the ticket is known, so the
+        // settled association is no longer the current image.
+        if state
+            .cookies
+            .get(&ticket)
+            .is_some_and(|epochs| epochs.keys().next_back().is_some_and(|&later| later > exec))
+        {
+            return None;
+        }
+        Some(BoundImage::from_settled(ticket, exec))
+    }
+
+    pub(crate) fn sight_current_binding<Pin>(
+        &self,
+        request: CurrentBindingRequest,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+    ) -> Result<CurrentBindingSighting, UnboundReason> {
+        #[cfg(test)]
+        let clock = self
+            .current_binding_clock
+            .unwrap_or(crate::attach::monotonic_ns);
+        #[cfg(not(test))]
+        let clock = crate::attach::monotonic_ns;
+        self.sight_current_binding_at(request, lookup, identity, || clock().and_then(stamp))
+    }
+
+    fn sight_current_binding_at<Pin>(
+        &self,
+        request: CurrentBindingRequest,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+        clock: impl FnOnce() -> Option<u64>,
+    ) -> Result<CurrentBindingSighting, UnboundReason> {
+        let state = self
+            .domain_indices
+            .get(&request.image.domain())
+            .map(|index| &self.domains[*index])
+            .ok_or(UnboundReason::EvidenceIncomplete)?;
+        if state.finished {
+            return Err(UnboundReason::EvidenceIncomplete);
+        }
+        if state.ended.contains(&request.caller) {
+            return Err(UnboundReason::ExecTransition);
+        }
+        if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
+            return Err(UnboundReason::ExecAmbiguous);
+        }
+        let caller = lookup
+            .live_caller(request.pid)
+            .filter(|caller| caller.id == request.caller)
+            .ok_or(UnboundReason::NoLiveCaller)?;
+        let query = identity.query_cookie(request.image.domain(), caller.pin);
+        // Query completion, never the caller's pass-start or an old witness stamp.
+        let sighted_ns = clock()
+            .filter(|ns| *ns > 0)
+            .ok_or(UnboundReason::EvidenceIncomplete)?;
+        match query {
+            CookieQuery::Cookie(answered) if answered == request.image => {}
+            CookieQuery::Cookie(_) | CookieQuery::NoCookie => {
+                return Err(UnboundReason::CookieMismatch);
+            }
+            CookieQuery::Exited => return Err(UnboundReason::CallerExited),
+            CookieQuery::Unavailable(_) => return Err(UnboundReason::CookieUnavailable),
+        }
+        if sighted_ns < caller.first_seen_ns {
+            return Err(UnboundReason::BeforeAdmission);
+        }
+        let sighting = CurrentBindingSighting {
+            request,
+            first_seen_ns: caller.first_seen_ns,
+            sighted_ns,
+        };
+        if let CurrentBindingCheck::Rejected(reason) = self.check_current_binding(&sighting) {
+            return Err(reason);
+        }
+        Ok(sighting)
+    }
+
+    pub(crate) fn check_current_binding(
+        &self,
+        sighting: &CurrentBindingSighting,
+    ) -> CurrentBindingCheck {
+        let request = sighting.request;
+        let Some(state) = self
+            .domain_indices
+            .get(&request.image.domain())
+            .map(|index| &self.domains[*index])
+        else {
+            return CurrentBindingCheck::Rejected(UnboundReason::EvidenceIncomplete);
+        };
+        let rejected = if state.finished {
+            Some(UnboundReason::EvidenceIncomplete)
+        } else if state.ended.contains(&request.caller) {
+            Some(UnboundReason::ExecTransition)
+        } else if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
+            Some(UnboundReason::ExecAmbiguous)
+        } else if state
+            .exec_ns
+            .get(&request.pid)
+            .is_some_and(|ns| *ns >= sighting.first_seen_ns)
+        {
+            Some(UnboundReason::ExecAfterAdmission)
+        } else if state.loss_ns.is_some_and(|ns| ns >= sighting.first_seen_ns) {
+            Some(UnboundReason::LifecycleLoss)
+        } else if state.predates_coverage(sighting.first_seen_ns)
+            && state
+                .revalidated
+                .as_ref()
+                .is_none_or(|ids| !ids.contains(&request.caller))
+        {
+            Some(UnboundReason::ExecCoverageGap)
+        } else if state.cookies.get(&request.image).is_none_or(|execs| {
+            execs
+                .keys()
+                .next_back()
+                .is_none_or(|exec| *exec != request.exec_id)
+        }) {
+            Some(UnboundReason::ExecAmbiguous)
+        } else {
+            None
+        };
+        if let Some(reason) = rejected {
+            return CurrentBindingCheck::Rejected(reason);
+        }
+        if state
+            .lifecycle_ns
+            .is_some_and(|ns| ns > sighting.sighted_ns)
+            && state.health_ns.is_some_and(|ns| ns > sighting.sighted_ns)
+        {
+            CurrentBindingCheck::Proven
+        } else {
+            CurrentBindingCheck::Pending
+        }
+    }
+
     /// No later evidence will arrive for `domain` (its capture retired):
     /// every row of that domain still waiting is unbound. Other domains
     /// are untouched.
     pub(crate) fn finish(&mut self, domain: NativeDomainId) {
-        let Some(index) = self.domains.iter().position(|state| state.domain == domain) else {
-            return;
-        };
+        let index = self.domain_index(domain);
+        self.domains[index].finished = true;
         while let Some(pending) = self.domains[index].pending.pop_front() {
             self.census.pending -= 1;
             let reason = if self.domains[index].awaits_revalidation(&pending) {
@@ -760,12 +1119,12 @@ fn decide(
     if let Some(&(held, held_exec)) = state.callers.get(&caller) {
         let ended = held != cookie || exec > held_exec;
         if ended && state.ended.insert(caller) {
-            transitions.push(ExecTransition {
+            transitions.push(ExecTransition::row_proven(
                 caller,
-                pid: row.host_tgid,
-                old: (held, held_exec),
-                new: (cookie, exec),
-            });
+                row.host_tgid,
+                (held, held_exec),
+                (cookie, exec),
+            ));
         }
         return Binding::Unbound(if ended {
             UnboundReason::ExecTransition

@@ -7,6 +7,21 @@ publish = false
 
 [features]
 wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
+stub-object-attributes = ["p11scope-ebpf-common/stub-object-attributes"]
+# Private fixed-capacity artifacts, never selected by the observer yet.
+# These features do not forward a larger endpoint/RV capacity to common.
+counter-broad = []
+counter-counts = ["counter-broad"]
+counter-timestamps = ["counter-broad"]
+counter-latency = ["counter-broad"]
+counts-bank-proof = ["counter-counts"]
+# Timing bank objects share the counts Rust shape (CountStats STATS and the
+# ordinary counter maps); the mode selects the native bank unit, the timed
+# roots and the bank geometry.
+timestamps-bank-proof = ["counter-counts"]
+latency-bank-proof = ["counter-counts"]
+# Private image-bank feasibility roots; default capture never selects them.
+image-bank-proof = []
 inventory-only = []
 inventory-callers = ["inventory-only"]
 small-ring = ["p11scope-ebpf-common/small-ring"]
@@ -26,5 +41,6 @@ path = "src/main.rs"
 panic = "abort"
 lto = true
 codegen-units = 1
+opt-level = "s"
 
 [workspace]

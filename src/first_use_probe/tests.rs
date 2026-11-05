@@ -218,8 +218,10 @@ fn scan_identity_truncation_is_bounded_and_invalidates_the_journal() {
     let pid = std::process::id();
     let view = ProcessView::open(ProcessViewId(73), pid).unwrap();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key: ObjectKey {

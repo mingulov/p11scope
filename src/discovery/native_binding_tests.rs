@@ -5,7 +5,7 @@
 use super::*;
 use crate::attach::capture::{CaptureHealth, CapturePhase, ScopeCustody};
 use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
-use p11scope_ebpf_common::DiscoveryRecord;
+use p11scope_ebpf_common::{DiscoveryRecord, ImageIdentity};
 use std::collections::HashMap;
 
 /// A scripted pin: (pid, generation). Two generations of one pid are two
@@ -101,6 +101,7 @@ fn read_at(
         health_unproven: None,
         health_baseline_ns: 0,
         health_read_ns: at_ns,
+        rows_anchor_ns: at_ns + 1,
         rows_read_ns: at_ns + 1,
         counts_read_ns: at_ns + 1,
         changed_objects: Vec::new(),
@@ -240,7 +241,7 @@ struct AnswerTable<'a> {
 }
 
 impl NativeIdentity<Pin> for AnswerTable<'_> {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -254,6 +255,224 @@ impl NativeIdentity<Pin> for AnswerTable<'_> {
 }
 
 const T: u32 = 4242;
+
+fn metadata_record(
+    id: CallerId,
+    pid: u32,
+    admitted: u64,
+) -> super::super::caller_registry::CallerRecord {
+    use super::super::caller_registry::{CallerLifecycle, CallerRecord, ImageAuthority};
+    CallerRecord {
+        id,
+        pid,
+        start_time: Some(1),
+        incarnation: 0,
+        exe: None,
+        exec_observed: false,
+        authority: ImageAuthority::ScanPinned,
+        lifecycle: CallerLifecycle::Mapped,
+        lifecycle_reason: None,
+        first_seen_ns: admitted,
+        admitted_ns: admitted,
+        last_seen_ns: admitted,
+        retired: false,
+    }
+}
+
+#[test]
+fn metadata_binding_requires_genuine_settled_postcoverage_image_not_record_authority() {
+    use super::super::caller_registry::ImageAuthority;
+    for exec in [0, 0x8000_0000_0000_0001] {
+        let mut run = Run::covered_from(200);
+        run.binder.metadata_clock_qualified = true; // Scripted common clock.
+        let domain = run.domain;
+        let caller = run.world.admit(T, 1, 0, 200);
+        let record = metadata_record(caller, T, 200);
+        run.world.answer(T, 1, domain, cookie(domain, 7));
+        assert!(run.binder.metadata_key(&record).is_none());
+        run.read(vec![row(domain, 7, exec, T, 210)]);
+        assert!(run.binder.metadata_key(&record).is_none());
+        run.settle();
+        assert_eq!(run.verdicts(), vec![bound(caller)]);
+        let key = run.binder.metadata_key(&record).unwrap();
+        assert_eq!(run.binder.metadata_key(&record), Some(key));
+        assert_eq!(format!("{key:?}"), "BinderMetadataKey(<retained>)");
+        assert_eq!(record.authority, ImageAuthority::ScanPinned);
+        run.binder.invalidate_metadata_clock();
+        assert!(run.binder.metadata_key(&record).is_none());
+    }
+}
+
+#[test]
+fn metadata_binding_refuses_precoverage_even_when_c1_native_binding_accepts_it() {
+    let mut run = Run::covered_from(200);
+    run.binder.metadata_clock_qualified = true;
+    let domain = run.domain;
+    let caller = run.world.admit(T, 1, 0, 100);
+    let record = metadata_record(caller, T, 100);
+    run.world.answer(T, 1, domain, cookie(domain, 7));
+    run.read(vec![row(domain, 7, 2, T, 210)]);
+    run.settle();
+    run.revalidate(250, &[caller]);
+    assert_eq!(run.verdicts(), vec![bound(caller)]);
+    assert!(run.binder.metadata_key(&record).is_none());
+}
+
+#[test]
+fn metadata_binding_refuses_retired_ended_exec_loss_and_finished_domains() {
+    for refusal in ["retired", "ended", "exec", "loss", "finished"] {
+        let mut run = Run::new();
+        run.binder.metadata_clock_qualified = true;
+        let domain = run.domain;
+        let caller = run.world.admit(T, 1, 0, 1_000);
+        let mut record = metadata_record(caller, T, 1_000);
+        run.world.answer(T, 1, domain, cookie(domain, 7));
+        run.read(vec![row(domain, 7, 1, T, 1_500)]);
+        run.settle();
+        assert!(run.binder.metadata_key(&record).is_some());
+        match refusal {
+            "retired" => record.retired = true,
+            "ended" => {
+                run.read(vec![row(domain, 7, 2, T, 1_600)]);
+                run.settle();
+                assert_eq!(run.binder.take_transitions().len(), 1);
+            }
+            "exec" => run.drain(&[(T, 1_600)]),
+            "loss" => run.read_with_loss(Vec::new(), 1),
+            "finished" => run.binder.finish(domain),
+            _ => unreachable!(),
+        }
+        assert!(run.binder.metadata_key(&record).is_none(), "{refusal}");
+    }
+}
+
+#[test]
+fn metadata_binding_refuses_unreadable_health_and_ignores_older_healthy_read() {
+    let mut run = Run::new();
+    run.binder.metadata_clock_qualified = true;
+    let domain = run.domain;
+    let caller = run.world.admit(T, 1, 0, 1_000);
+    let record = metadata_record(caller, T, 1_000);
+    run.world.answer(T, 1, domain, cookie(domain, 7));
+    run.read(vec![row(domain, 7, 1, T, 1_500)]);
+    run.settle();
+    assert!(run.binder.metadata_key(&record).is_some());
+    run.read_domain(domain, Vec::new(), None);
+    assert!(run.binder.metadata_key(&record).is_none());
+    let older = read_at(domain, Vec::new(), run.clock - 1, Some(0));
+    run.binder.absorb_witnesses(
+        &older,
+        &Lookup(&run.world.live),
+        &mut AnswerTable {
+            answers: &run.world.answers,
+            queries: &mut run.world.queries,
+        },
+    );
+    assert!(run.binder.metadata_key(&record).is_none());
+    run.read(Vec::new());
+    assert!(run.binder.metadata_key(&record).is_some());
+}
+
+#[test]
+fn metadata_binding_refuses_two_active_domains_with_coincident_cookies() {
+    let mut run = Run::new();
+    run.binder.metadata_clock_qualified = true;
+    let first = run.domain;
+    let second = NativeDomainId::mint();
+    let caller = run.world.admit(T, 1, 0, 1_000);
+    let record = metadata_record(caller, T, 1_000);
+    run.world.answer(T, 1, first, cookie(first, 7));
+    run.read(vec![row(first, 7, 1, T, 1_500)]);
+    run.settle();
+    let first_key = run.binder.metadata_key(&record).unwrap();
+    run.binder
+        .note_exec_coverage(ExecCoverage::scripted(second, 0));
+    run.world.answer(T, 1, second, cookie(second, 7));
+    run.read_domain(second, vec![row(second, 7, 1, T, 1_500)], Some(0));
+    run.binder
+        .absorb_lifecycle(&drained(second, &[], run.clock + 2));
+    run.read_domain(second, Vec::new(), Some(0));
+    assert!(run.binder.metadata_key(&record).is_none());
+    run.binder.finish(first);
+    let second_key = run.binder.metadata_key(&record).unwrap();
+    assert_ne!(first_key, second_key);
+}
+
+#[test]
+fn metadata_proof_binds_actual_adapter_original_and_keeps_paired_custody_charge() {
+    use super::super::caller_registry::{ImageAuthority, OsProcessSource};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use std::sync::Arc;
+
+    struct Identity(NativeDomainId);
+    impl NativeIdentity<PidPin> for Identity {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
+            None
+        }
+        fn query_cookie(&mut self, domain: NativeDomainId, _: &PidPin) -> CookieQuery {
+            assert_eq!(domain, self.0);
+            CookieQuery::Cookie(DomainCookie::new(domain, 7))
+        }
+    }
+
+    let pool = SemanticResourcePool::default();
+    let initial = pool.snapshot().charged_bytes;
+    let mut adapter = CallerAdapter::new(OsProcessSource, pool.reserver());
+    let caller = adapter
+        .admit(std::process::id(), ImageAuthority::ScanPinned, 1_000)
+        .unwrap();
+    let original = adapter.shared_semantic_custody(caller).unwrap();
+    let replacement = Arc::new(PidPin::open(original.pid()).unwrap());
+    let domain = NativeDomainId::mint();
+    let mut binder = NativeBinder::new(BinderLimits::default());
+    binder.metadata_clock_qualified = true; // Scripted native clock envelope.
+    binder.note_exec_coverage(ExecCoverage::scripted(domain, 0));
+    let mut identity = Identity(domain);
+    binder.absorb_witnesses(
+        &read_at(
+            domain,
+            vec![row(domain, 7, 0, original.pid(), 1_500)],
+            2_000,
+            Some(0),
+        ),
+        &adapter,
+        &mut identity,
+    );
+    binder.absorb_lifecycle(&drained(domain, &[], 3_000));
+    binder.absorb_witnesses(
+        &read_at(domain, Vec::new(), 4_000, Some(0)),
+        &adapter,
+        &mut identity,
+    );
+    assert_eq!(binder.census().bound, 1);
+    assert!(
+        binder
+            .metadata_image(&adapter, caller, &replacement)
+            .is_none()
+    );
+    let before = pool.snapshot().charged_bytes;
+    let proof = binder.metadata_image(&adapter, caller, &original).unwrap();
+    assert_eq!(
+        proof.key(),
+        binder
+            .metadata_key(adapter.record(caller).unwrap())
+            .unwrap()
+    );
+    assert_eq!(format!("{proof:?}"), "BinderMetadataImage(<retained>)");
+    assert_eq!(
+        adapter.record(caller).unwrap().authority,
+        ImageAuthority::ScanPinned
+    );
+    assert_eq!(pool.snapshot().charged_bytes, before);
+    let weak = Arc::downgrade(&original);
+    drop(adapter);
+    drop(original);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(pool.snapshot().charged_bytes, before);
+    drop(proof);
+    drop(weak);
+    assert_eq!(pool.snapshot().charged_bytes, initial);
+}
 
 fn bound(caller: CallerId) -> Binding {
     Binding::Bound(caller)
@@ -340,8 +559,14 @@ fn same_binary_re_exec_splits_by_exec_id() {
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].caller(), x);
     assert_eq!(transitions[0].pid(), T);
-    assert_eq!(transitions[0].old().1, 1);
-    assert_eq!(transitions[0].new_image().1, 2);
+    assert_eq!(
+        transitions[0].old(),
+        Some((DomainCookie::scripted(d, 7), 1))
+    );
+    assert_eq!(
+        transitions[0].new_image(),
+        Some((DomainCookie::scripted(d, 7), 2))
+    );
 
     // The old image's rows still bind to X, at once (cached exact image).
     run.read(vec![row_on(d, 7, 1, T, 2_200, 2)]);
@@ -961,4 +1186,225 @@ fn a_drain_that_ended_at_a_busy_head_never_covers_a_read() {
     assert!(run.verdicts().is_empty());
     run.settle();
     assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+// A cached historical binding must still take a fresh current-image query.
+#[test]
+fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
+    let mut run = Run::new();
+    let caller = run.world.admit(7, 500, 1, 50);
+    run.world.answer(7, 500, run.domain, cookie(run.domain, 41));
+    run.read(vec![row(run.domain, 41, 1, 7, 100)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![Binding::Bound(caller)]);
+    let request = CurrentBindingRequest {
+        caller,
+        pid: 7,
+        image: DomainCookie::scripted(run.domain, 41),
+        exec_id: 1,
+    };
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    let lookup = Lookup(live);
+    let mut identity = AnswerTable { answers, queries };
+    let sighting = run
+        .binder
+        .sight_current_binding_at(request, &lookup, &mut identity, || Some(2_000))
+        .expect("fresh exact sighting");
+    assert_eq!(*queries, 2, "history cannot bypass the fresh query");
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Pending
+    ));
+    run.binder
+        .absorb_lifecycle(&drained(run.domain, &[], 2_001));
+    run.read_domain(run.domain, Vec::new(), Some(0));
+    assert!(
+        matches!(
+            run.binder.check_current_binding(&sighting),
+            CurrentBindingCheck::Pending
+        ),
+        "older readable health cannot settle it"
+    );
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    run.binder.absorb_witnesses(
+        &read_at(run.domain, Vec::new(), 2_002, Some(0)),
+        &Lookup(live),
+        &mut AnswerTable { answers, queries },
+    );
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Proven
+    ));
+    assert_eq!(
+        run.binder.census().rows,
+        1,
+        "current proof is not another witness"
+    );
+    run.binder.finish(run.domain);
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Rejected(_)
+    ));
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    assert!(
+        run.binder
+            .sight_current_binding_at(
+                request,
+                &Lookup(live),
+                &mut AnswerTable { answers, queries },
+                || Some(3_000)
+            )
+            .is_err()
+    );
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    run.binder.absorb_witnesses(
+        &read_at(
+            run.domain,
+            vec![row(run.domain, 41, 1, 7, 110)],
+            3_001,
+            Some(0),
+        ),
+        &Lookup(live),
+        &mut AnswerTable { answers, queries },
+    );
+    assert_eq!(
+        run.verdicts(),
+        vec![Binding::Bound(caller)],
+        "Finish cancels current proof but preserves exact cached historical binding"
+    );
+}
+
+#[test]
+fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertainty() {
+    for control in 0..7 {
+        let mut run = Run::new();
+        let caller = run.world.admit(7, 500, 1, 50);
+        run.world.answer(7, 500, run.domain, cookie(run.domain, 41));
+        run.read(vec![row(run.domain, 41, 1, 7, 100)]);
+        run.settle();
+        assert_eq!(run.verdicts(), vec![Binding::Bound(caller)]);
+        let request = CurrentBindingRequest {
+            caller,
+            pid: 7,
+            image: DomainCookie::scripted(run.domain, 41),
+            exec_id: 1,
+        };
+        match control {
+            0 => run.world.answer(7, 500, run.domain, CookieQuery::Exited),
+            1 => run.world.answer(7, 500, run.domain, CookieQuery::NoCookie),
+            2 => run.world.answer(
+                7,
+                500,
+                run.domain,
+                CookieQuery::Unavailable("unavailable".into()),
+            ),
+            3 => run
+                .world
+                .answer(7, 500, run.domain, cookie(NativeDomainId::mint(), 41)),
+            _ => {}
+        }
+        let World {
+            live,
+            answers,
+            queries,
+        } = &mut run.world;
+        let result = run.binder.sight_current_binding_at(
+            request,
+            &Lookup(live),
+            &mut AnswerTable { answers, queries },
+            || if control == 4 { None } else { Some(2_000) },
+        );
+        if control <= 4 {
+            assert!(
+                result.is_err(),
+                "unavailable/mismatched identity or clock cannot yield a sighting"
+            );
+        } else {
+            let sighting = result.expect("exact fresh sighting before lifecycle uncertainty");
+            run.binder.absorb_lifecycle(&drained(
+                run.domain,
+                if control == 5 { &[(7, 1_500)] } else { &[] },
+                2_001,
+            ));
+            let World {
+                live,
+                answers,
+                queries,
+            } = &mut run.world;
+            run.binder.absorb_witnesses(
+                &read_at(
+                    run.domain,
+                    Vec::new(),
+                    2_002,
+                    Some(if control == 6 { 1 } else { 0 }),
+                ),
+                &Lookup(live),
+                &mut AnswerTable { answers, queries },
+            );
+            assert!(
+                matches!(
+                    run.binder.check_current_binding(&sighting),
+                    CurrentBindingCheck::Rejected(_)
+                ),
+                "same-binary exec and loss reject saved proof"
+            );
+        }
+    }
+}
+
+#[test]
+fn bound_image_equality_keeps_domain_and_full_exec() {
+    let domain = NativeDomainId::mint();
+    let other = NativeDomainId::mint();
+    let image = BoundImage::scripted(domain, 41, 7).unwrap();
+    assert_eq!(image, BoundImage::scripted(domain, 41, 7).unwrap());
+    // Identical numbers in another domain are another image.
+    assert_ne!(image, BoundImage::scripted(other, 41, 7).unwrap());
+    // Exec zero is a valid image; all 64 exec bits matter.
+    let zero = BoundImage::scripted(domain, 41, 0).unwrap();
+    assert_ne!(image, zero);
+    assert_eq!(zero, BoundImage::scripted(domain, 41, 0).unwrap());
+    assert_ne!(
+        image,
+        BoundImage::scripted(domain, 41, 7 ^ (1 << 63)).unwrap()
+    );
+    assert_ne!(image, BoundImage::scripted(domain, 42, 7).unwrap());
+    // Zero is unavailable, never an expected image.
+    assert!(BoundImage::scripted(domain, 0, 7).is_none());
+    assert!(BoundImage::scripted(domain, 0, 0).is_none());
+    // Domain membership is an equality coordinate, not a number.
+    assert!(image.belongs_to(domain));
+    assert!(!image.belongs_to(other));
+}
+
+#[test]
+fn bound_image_debug_redacts_private_numbers() {
+    use super::super::caller_registry::ImageAuthority;
+    let domain = NativeDomainId::mint();
+    let image = BoundImage::scripted(domain, 41, 7).unwrap();
+    assert_eq!(format!("{image:?}"), "BoundImage(<expected>)");
+    // Authority snapshots redact through the same form: the label stays,
+    // the numbers never appear.
+    let authority = ImageAuthority::NativeExact { image };
+    assert_eq!(authority.label(), "native_exact");
+    let rendered = format!("{authority:?}");
+    assert!(rendered.contains("NativeExact"));
+    assert!(rendered.contains("<expected>"));
+    assert!(!rendered.contains("41"));
 }

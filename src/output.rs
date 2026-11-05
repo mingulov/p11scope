@@ -138,6 +138,22 @@ impl AtomicFile {
         &mut self.temp_file
     }
 
+    /// Identity of the existing final name in the retained directory. This
+    /// remains the actual publication target if its parent pathname moves.
+    pub(crate) fn destination_identity(&self) -> Result<Option<(u64, u64)>, String> {
+        if !check_final_name(&self.directory, &self.final_name, &self.final_path)? {
+            return Ok(None);
+        }
+        match metadata_at(&self.directory, &self.final_name) {
+            Ok(metadata) => Ok(Some((metadata.identity.device, metadata.identity.inode))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "checking output {} identity failed: {error}",
+                self.final_path.display()
+            )),
+        }
+    }
+
     /// Re-verifies the temp identity (regular file, same dev/ino, owner ==
     /// euid, mode & 0o077 == 0), `sync_all`, re-checks the final name, then
     /// renames over it. On any error the temp file is unlinked by `Drop`.
@@ -449,7 +465,7 @@ fn check_stream_file(file: &std::fs::File, final_path: &Path) -> Result<FileIden
     Ok(FileIdentity::from_metadata(&metadata))
 }
 
-fn normalize_output_path(path: PathBuf) -> Result<PathBuf, String> {
+pub(crate) fn normalize_output_path(path: PathBuf) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path
     } else {
@@ -952,9 +968,45 @@ fn unlinkat(directory: &std::fs::File, name: &CString) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{atomic_file_test_fixture, atomic_file_test_fixture_read_only};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    /// Retains an owned private test directory directly, so transport tests can
+    /// exercise real AtomicFile publication even on a sandbox whose `/` has an
+    /// untrusted mapped owner. Production callers always use `AtomicFile::create`.
+    pub(crate) fn atomic_file_test_fixture(path: &Path) -> AtomicFile {
+        let directory_path = path.parent().unwrap();
+        let directory = std::fs::File::open(directory_path).unwrap();
+        validate_trusted_directory(&directory, directory_path).unwrap();
+        let final_name = c_name(path.file_name().unwrap(), "test output name").unwrap();
+        check_final_name(&directory, &final_name, path).unwrap();
+        let temp_name =
+            CString::new(format!(".p11scope.{}.fixture.tmp", std::process::id())).unwrap();
+        let temp_file = openat_profile(&directory, &temp_name).unwrap();
+        let identity = FileIdentity::from_metadata(&temp_file.metadata().unwrap());
+        AtomicFile {
+            directory,
+            temp_file,
+            temp_name,
+            final_name,
+            final_path: path.to_path_buf(),
+            identity,
+            cleanup: true,
+        }
+    }
+
+    pub(crate) fn atomic_file_test_fixture_read_only(output: &mut AtomicFile) {
+        let temporary = output
+            .final_path
+            .parent()
+            .unwrap()
+            .join(output.temp_name.to_str().unwrap());
+        output.temp_file = std::fs::File::open(temporary).unwrap();
+    }
 
     fn private_tempdir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1649,8 +1701,8 @@ mod tests {
             }
         }
         assert_eq!(
-            calls, 4,
-            "expected verify + Drop temp stats, the final check and the unbegun-stream Drop"
+            calls, 5,
+            "expected verify + Drop temp stats, the final check, retained destination identity and the unbegun-stream Drop"
         );
     }
 }

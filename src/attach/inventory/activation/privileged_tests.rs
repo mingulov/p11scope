@@ -1,11 +1,20 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned, ignored live gates. The parent runs these serially with its BPF lane.
 use super::*;
-use crate::capacity::CallerBudget;
-use crate::discovery::identity::{bind_scanned_modules, pin_scanned_view_objects};
-use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, scan_process_view,
+use crate::attach::inventory::capture::{
+    CapturePhase, CaptureScope, ExtendWindow, InventoryCapture, MULTI_LINK_MAX_SITES,
+    MULTI_LINK_MIN_SITES, ReadWindow, RetiredCapture, ScopeCustody, WitnessBatch, WitnessRow,
 };
+use crate::capacity::CallerBudget;
+use crate::discovery::engine::tests::copy_executable_via_waited_child;
+use crate::discovery::identity::{bind_scanned_modules, pin_scanned_view_objects};
+use crate::discovery::inventory_attach_set::tests as inventory_fx;
+use crate::discovery::inventory_attach_set::{AbsorbOutcome, AttachVerdict, InventoryAttachSet};
+use crate::discovery::scan::{
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedInterface, ScannedModule, scan_process_view,
+};
+use crate::fixture_guard::DieWithParent as _;
+use crate::plan::AdmissionScope;
 use crate::plan::Slot;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
 use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray, PerCpuHashMap};
@@ -50,7 +59,8 @@ pub(in crate::attach::inventory) struct OwnedFixture {
 }
 
 /// Largest owned-fixture endpoint count: the biggest controller-owned live
-/// selector N (L-T7-5 boundary at 8192; covers L-T7-3 4097 and L-T7-4 6530).
+/// selector N (L-T7-5 boundary at 8192; includes L-T7-3 4097, the historical
+/// L-T7-4 6530 control, and the actual private positive at 6531).
 /// The Inventory path is parametric in N (budget to u32 capacity to
 /// `map_max_entries`), so this fixture bound — not a map or plan limit — is
 /// what admits those cells. Anything larger is unowned and stays refused.
@@ -74,8 +84,10 @@ impl OwnedFixture {
         let view =
             ProcessView::open(ProcessViewId(0), std::process::id()).map_err(anyhow::Error::msg)?;
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -507,7 +519,10 @@ impl Task4IdentityFixture {
             .file_offset;
         ensure!(original_offset == alias_offset && snapshot.is_executable_offset(original_offset));
         let copy_path = directory.path().join("owned-provider-copy");
-        std::fs::copy(&path, &copy_path)?;
+        // Through the shared waited-child writer: an in-process copy would
+        // hold the destination open for writing across concurrent forks, and
+        // the copy is exec'd below.
+        copy_executable_via_waited_child(&path, &copy_path);
         let copy_elf = open_object(&copy_path).map_err(anyhow::Error::msg)?;
         let copy_snapshot = ElfSnapshot::read(&copy_elf).map_err(anyhow::Error::msg)?;
         let copy_offset = copy_snapshot
@@ -834,6 +849,7 @@ impl OwnedCaller {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()?;
         let input = child.stdin.take().context("owned input")?;
         let output = child.stdout.take().context("owned output")?;
@@ -1266,23 +1282,44 @@ impl OwnedIds {
     }
 
     fn prepared(prepared: &PreparedInventory) -> Result<Self> {
+        // The caller object also carries the identity-only image baseline
+        // iterator and its two maps (886ce765b): preparation checks that
+        // the iterator is present but never loads it (the baseline query
+        // loads it on demand), so it has no program ID here. Every other
+        // program must be loaded.
+        const BASELINE: &str = "p11_inventory_image_baseline";
+        let callers = matches!(prepared.flavor, InventoryFlavor::Callers(_));
         let mut ids = Self::default();
         for (name, map) in prepared.ebpf.maps() {
             let id = super::super::inventory_map_data(name, map)?.1.info()?.id();
             ensure!(id_exists(bpf_cmd::BPF_MAP_GET_NEXT_ID, id)?);
             ids.maps.insert(id);
         }
-        for (_, program) in prepared.ebpf.programs() {
+        let mut baseline_unloaded = false;
+        for (name, program) in prepared.ebpf.programs() {
+            if callers && name == BASELINE {
+                ensure!(
+                    matches!(program.info(), Err(ProgramError::NotLoaded)),
+                    "caller preparation loaded the on-demand baseline iterator"
+                );
+                baseline_unloaded = true;
+                continue;
+            }
             let id = program.info()?.id();
             ensure!(id_exists(bpf_cmd::BPF_PROG_GET_NEXT_ID, id)?);
             ids.programs.insert(id);
         }
-        let expected_maps = if matches!(prepared.flavor, InventoryFlavor::Callers(_)) {
-            19
-        } else {
-            14
-        };
-        ensure!(ids.maps.len() == expected_maps && ids.programs.len() == 12);
+        ensure!(
+            baseline_unloaded == callers,
+            "caller baseline iterator presence differs from the flavor"
+        );
+        let expected_maps = if callers { 21 } else { 14 };
+        ensure!(
+            ids.maps.len() == expected_maps && ids.programs.len() == 12,
+            "prepared Inventory census (maps, programs) = ({}, {}), expected ({expected_maps}, 12)",
+            ids.maps.len(),
+            ids.programs.len()
+        );
         Ok(ids)
     }
 
@@ -4246,15 +4283,18 @@ fn task4_record_registration(
     // optionally (`InstanceTracking::start`); the census classifies their
     // links as an `instance` role and cross-checks the kernel-observed
     // count against the userspace-retained hook count, so a leaked or
-    // missing hook trips the census in either direction.
-    let instance: BTreeMap<_, _> = crate::attach::INSTANCE_PROGRAMS
+    // missing hook trips the census in either direction. The session's
+    // active set selects the exec-release variant for this kernel.
+    let instance: BTreeMap<_, _> = session
+        .instance
+        .active_program_names()
         .into_iter()
-        .map(|(name, _)| -> Result<_> {
+        .map(|name| -> Result<_> {
             Ok((session.ebpf.program(name).context(name)?.info()?.id(), name))
         })
         .collect::<Result<_>>()?;
     ensure!(
-        instance.len() == 3
+        instance.len() == 4
             && !instance.contains_key(&return_program)
             && !instance.contains_key(&entry_program)
             && instance.keys().all(|id| !lifecycle.contains_key(id))
@@ -4388,10 +4428,11 @@ fn task4_record_registration(
     }
     // Hook attach is all-or-nothing (`InstanceTracking::start` detaches
     // every hook when any attach fails), so an attached session shows all
-    // three instance programs exactly once; a refused session shows none.
-    let expected_instance: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
-        .iter()
-        .map(|(name, _)| *name)
+    // four instance programs exactly once; a refused session shows none.
+    let expected_instance: BTreeSet<_> = session
+        .instance
+        .active_program_names()
+        .into_iter()
         .collect();
     ensure!(
         role_counts == [n, n, instance_expected]
@@ -4408,7 +4449,7 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
     let n = offsets.len();
     ensure!(n > 0);
     let identity = phase == "second_attached";
-    // Stage A continuity hooks add zero or three `instance` kernel rows per
+    // Stage A continuity hooks add zero or four `instance` kernel rows per
     // group (all-or-nothing attach), so group sizes are data-dependent:
     // identity groups split on the recorded session generation, and every
     // group below proves its exact static + kernel + instance shape.
@@ -4508,10 +4549,30 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
         let mut role_counts = [0usize; 3];
         let mut lifecycle = BTreeMap::new();
         let mut instance = BTreeMap::new();
-        let instance_names: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
+        // The replay carries no kernel release, so it accepts exactly one of
+        // the four complete hook sets (one program per variant slot).
+        let hook_set = |copy, exec| {
+            crate::attach::active_instance_programs(crate::attach::HookTargets { copy, exec })
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+        };
+        let legacy_names: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
             .iter()
             .map(|(name, _)| *name)
             .collect();
+        let mmap_names = hook_set(
+            crate::attach::CopyVmaTarget::Legacy,
+            crate::attach::ExecReleaseTarget::ExecMmap,
+        );
+        let ret_names = hook_set(
+            crate::attach::CopyVmaTarget::FuncRet,
+            crate::attach::ExecReleaseTarget::ExecMmRelease,
+        );
+        let ret_mmap_names = hook_set(
+            crate::attach::CopyVmaTarget::FuncRet,
+            crate::attach::ExecReleaseTarget::ExecMmap,
+        );
         for (position, row) in kernel_rows.iter().enumerate() {
             let id = row["link_id"].as_u64().context("kernel link ID")?;
             let program_id = row["program_id"].as_u64().context("kernel program ID")?;
@@ -4523,7 +4584,11 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
                 ("entry", "p11_entry")
             } else {
                 let name = row["program"].as_str().context("non-static program")?;
-                if instance_names.contains(name) {
+                if legacy_names.contains(name)
+                    || mmap_names.contains(name)
+                    || ret_names.contains(name)
+                    || ret_mmap_names.contains(name)
+                {
                     ensure!(instance.insert(name, program_id).is_none());
                     role_counts[2] += 1;
                     ("instance", name)
@@ -4557,19 +4622,23 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
                 "Detailed borrowed-FD kernel link census changed"
             );
         }
-        // Hook attach is all-or-nothing, so a group carries zero or three
-        // instance rows naming the full hook set exactly once; the kernel
+        // Hook attach is all-or-nothing, so a group carries zero or four
+        // instance rows naming one full hook set exactly once; the kernel
         // tail length is exact, never a lower bound.
         let instance_count = role_counts[2];
+        let observed_instance: BTreeSet<_> = instance.keys().copied().collect();
         ensure!(
             role_counts[0] == n
                 && role_counts[1] == n
                 && kernel_rows.len() == 2 * n + 3 + instance_count
                 && lifecycle.keys().copied().collect::<BTreeSet<_>>()
                     == BTreeSet::from(["sched_process_exec", "sched_process_exit", "task_newtask"])
-                && (instance_count == 0 || instance_count == 3)
+                && (instance_count == 0 || instance_count == 4)
                 && (instance_count == 0
-                    || instance.keys().copied().collect::<BTreeSet<_>>() == instance_names)
+                    || observed_instance == legacy_names
+                    || observed_instance == mmap_names
+                    || observed_instance == ret_names
+                    || observed_instance == ret_mmap_names)
         );
         let group_programs: BTreeSet<_> = program_ids
             .values()
@@ -4674,7 +4743,7 @@ fn task4_detailed_registration_rejects_missing_tail_entry_and_kernel_link() -> R
 }
 
 /// Synthetic n=2 `attached`-shaped registration rows: 4 static + 4
-/// return/entry + 3 lifecycle kernel rows, plus the 3 Stage A `instance`
+/// return/entry + 3 lifecycle kernel rows, plus the 4 continuity `instance`
 /// kernel rows when `instance` is set. Row shapes mirror
 /// `task4_record_registration`; `id_shift` keeps program/link IDs disjoint
 /// across identity groups.
@@ -4769,6 +4838,12 @@ fn task4_synthetic_attached_rows(
                 "p11_inst_vma_copy",
                 bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
             ),
+            (
+                33,
+                "instance",
+                "p11_image_exec_release",
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+            ),
         ]);
     }
     for (position, (program_id, role, program, kind)) in kernel.into_iter().enumerate() {
@@ -4802,13 +4877,13 @@ fn task4_detailed_registration_accepts_instance_tail_and_rejects_mistakes() -> R
     // Hook-free shape (k=0) still accepted.
     let plain = task4_synthetic_attached_rows("attached", 1, 21, 77, 0, false);
     task4_replay_registration(&encode(&plain)?, &offsets, "attached")?;
-    // Instance tail (k=3) accepted. Instance rows sit at global 11..14
+    // Instance tail (k=4) accepted. Instance rows sit at global 11..15
     // (4 static + 7 return/entry/lifecycle kernel rows first).
     let hooked = task4_synthetic_attached_rows("attached", 1, 21, 77, 0, true);
     task4_replay_registration(&encode(&hooked)?, &offsets, "attached")?;
-    // Partial tail (k=2): rejected.
+    // Partial tail (k=3): rejected.
     let mut partial = hooked.clone();
-    partial.remove(12);
+    partial.remove(hooked.len() - 1);
     assert!(task4_replay_registration(&encode(&partial)?, &offsets, "attached").is_err());
     // Wrong link type on an instance row: rejected.
     let mut changed = hooked.clone();
@@ -4822,7 +4897,7 @@ fn task4_detailed_registration_accepts_instance_tail_and_rejects_mistakes() -> R
     let mut changed = hooked.clone();
     changed[12]["program"] = changed[11]["program"].clone();
     assert!(task4_replay_registration(&encode(&changed)?, &offsets, "attached").is_err());
-    // Identity split with instance tails in both groups (28 rows): accepted.
+    // Identity split with instance tails in both groups (30 rows): accepted.
     let mut identity = task4_synthetic_attached_rows("first_attached", 1, 21, 77, 0, true);
     identity.extend(task4_synthetic_attached_rows(
         "second_attached",
@@ -4835,8 +4910,47 @@ fn task4_detailed_registration_accepts_instance_tail_and_rejects_mistakes() -> R
     task4_replay_registration(&encode(&identity)?, &offsets, "second_attached")?;
     // Tampered generation boundary: rejected.
     let mut changed = identity.clone();
-    changed[14]["session_generation"] = serde_json::json!(1);
+    changed[hooked.len()]["session_generation"] = serde_json::json!(1);
     assert!(task4_replay_registration(&encode(&changed)?, &offsets, "second_attached").is_err());
+    // The 7.3+ hook set swaps only the exec-release program: accepted.
+    let mut mmap = hooked.clone();
+    mmap[14]["program"] = serde_json::json!("p11_image_mmap_release");
+    task4_replay_registration(&encode(&mmap)?, &offsets, "attached")?;
+    // Both variants at once (five rows): rejected.
+    let mut both = mmap.clone();
+    let mut extra = mmap[14].clone();
+    extra["program"] = serde_json::json!("p11_image_exec_release");
+    extra["position"] = serde_json::json!(both.len());
+    extra["link_id"] = serde_json::json!(both.len() as u64 + 100);
+    extra["program_id"] = serde_json::json!(both.len() as u64 + 21);
+    both.push(extra);
+    assert!(task4_replay_registration(&encode(&both)?, &offsets, "attached").is_err());
+    // Four rows mixing both variants for a stable hook: rejected.
+    let mut mixed = hooked.clone();
+    mixed[11]["program"] = serde_json::json!("p11_image_mmap_release");
+    assert!(task4_replay_registration(&encode(&mixed)?, &offsets, "attached").is_err());
+    // The ret copy set swaps only the copy program: accepted, alone and
+    // with the 7.3+ exec-release program.
+    for exec in ["p11_image_exec_release", "p11_image_mmap_release"] {
+        let mut ret = hooked.clone();
+        ret[13]["program"] = serde_json::json!("p11_inst_vma_retcopy");
+        ret[14]["program"] = serde_json::json!(exec);
+        task4_replay_registration(&encode(&ret)?, &offsets, "attached")?;
+    }
+    // Both copy variants at once (five rows): rejected.
+    let mut both_copy = hooked.clone();
+    both_copy[13]["program"] = serde_json::json!("p11_inst_vma_retcopy");
+    let mut extra_copy = hooked[13].clone();
+    extra_copy["program"] = serde_json::json!("p11_inst_vma_copy");
+    extra_copy["position"] = serde_json::json!(both_copy.len());
+    extra_copy["link_id"] = serde_json::json!(both_copy.len() as u64 + 100);
+    extra_copy["program_id"] = serde_json::json!(both_copy.len() as u64 + 21);
+    both_copy.push(extra_copy);
+    assert!(task4_replay_registration(&encode(&both_copy)?, &offsets, "attached").is_err());
+    // Four rows with an exec variant in the copy slot: rejected.
+    let mut mixed_copy = hooked.clone();
+    mixed_copy[13]["program"] = serde_json::json!("p11_image_mmap_release");
+    assert!(task4_replay_registration(&encode(&mixed_copy)?, &offsets, "attached").is_err());
     Ok(())
 }
 
@@ -5889,6 +6003,8 @@ inventory_sweep_test!(
 // N is profile-independent, so these run on the default profile only. Each
 // cell calls every admitted ID and requires the exact all-ID positive set;
 // the controller checks the FD/link preflight (ordinary T7 math test) first.
+// Keep 6530 as the historical motivating control and 6531 as the actual
+// private Inventory capacity-positive selector.
 #[cfg(not(feature = "wide-detailed-2112"))]
 inventory_sweep_test!(privileged_t7_inventory_n576_lp64, 576, "inventory-t7-n576");
 #[cfg(not(feature = "wide-detailed-2112"))]
@@ -5908,6 +6024,12 @@ inventory_sweep_test!(
     privileged_t7_inventory_n6530_lp64,
     6530,
     "inventory-t7-n6530"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_t7_inventory_n6531_lp64,
+    6531,
+    "inventory-t7-n6531"
 );
 /// T7 L-T7-5 boundary cell: the sweep plus an explicit out-of-envelope
 /// refusal branch. The preflight gate samples live FD occupancy against
@@ -5950,6 +6072,571 @@ fn t7_boundary_cell_gate(n: u32, cell: &'static str) -> Result<()> {
 #[ignore = "root-owned BPF lane; bounded physical Inventory sweep with envelope refusal branch"]
 fn privileged_t7_inventory_n8192_boundary_lp64() -> Result<()> {
     t7_boundary_cell_gate(8192, "inventory-t7-n8192-boundary")
+}
+
+/// N+1 inventory refusal on Multi (V5-20 scale cell): a real 8,193-endpoint
+/// system population — one 8,192-endpoint provider plus one 1-endpoint
+/// provider, both owned binaries with real symbols at distinct executable
+/// offsets — lowers through the production Shared-scope Inventory merge at
+/// the 8,192 policy budget. The merge admits the first provider whole and
+/// refuses the second whole with the named over-budget reason; the capture
+/// facade then attaches exactly the admitted 8,192 across uprobe-multi
+/// groups that partition the prefix, every one fires, the refused endpoint
+/// leaves no witness, and the stop releases every link and map.
+/// Profile-independent (Inventory N), so unlike the T7 sweep cells this
+/// runs on both profiles.
+#[test]
+#[ignore = "root-owned BPF lane; 8193-endpoint Multi population refuses the 8193rd whole and keeps the 8192 prefix"]
+fn privileged_inventory_multi_n8193_refuses_lp64() -> Result<()> {
+    inventory_multi_prefix_case(true)
+}
+
+/// Healthy twin of the N+1 cell: the same 8,192 endpoints on Multi with no
+/// over-budget module — nothing refused, every endpoint admitted and
+/// attached, all 8,192 entries witnessed, clean stop. The T7 n8192 sweep
+/// cell runs Singles through the global flavor and carries an
+/// envelope-refusal branch, so it asserts none of these Multi
+/// capture-facade facts.
+#[test]
+#[ignore = "root-owned BPF lane; 8192-endpoint Multi population admits every endpoint with no refusal"]
+fn privileged_inventory_multi_n8192_prefix_lp64() -> Result<()> {
+    inventory_multi_prefix_case(false)
+}
+
+/// The 8,192 Inventory policy budget both prefix cells run under: the real,
+/// tested system-scale limit (`MAX_INVENTORY_ENDPOINT_LIMIT`), never a
+/// lowered stand-in.
+const MULTI_PREFIX_BUDGET: u64 = 8192;
+
+/// Caller-pair budget for the prefix cells. Witness rows are per
+/// (caller image, object) pair — one caller on one provider object is one
+/// row — so the expected population is 1-2 rows. The budget stays loose at
+/// 8,192 on purpose: a tight budget would refuse a wrongly attached
+/// provider B's row with PairInsertFailure, and the B-absence proof below
+/// would pass by incapacity instead of by non-arrival.
+const MULTI_PREFIX_PAIRS: u64 = 8192;
+
+/// Backstop for the whole cell: every phase already carries its own
+/// deadline (extend/read windows, bounded read loop, bounded stop, 5 s
+/// caller line reads), so this only catches a hung phase, never a slow one.
+const MULTI_PREFIX_TOTAL_BUDGET: Duration = Duration::from_secs(1800);
+
+/// A prefix-cell population: the owned fixtures (kept alive: their
+/// tempdirs own the binaries the pins and links point at), the lowering
+/// pins, the merged plan, and the absorbed attach set with its outcome.
+struct MultiPrefixPopulation {
+    a: OwnedFixture,
+    b: Option<OwnedFixture>,
+    pins: PinnedObjects,
+    plan: AttachPlan,
+    set: InventoryAttachSet,
+    outcome: AbsorbOutcome,
+}
+
+fn multi_prefix_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
+}
+
+/// Reads until one full CALLER_USE sweep completes: clean health, no
+/// integrity row, no read failure, no unrecorded row, no sweep gap.
+fn multi_prefix_read_sweep(
+    capture: &mut InventoryCapture,
+) -> Result<(Vec<WitnessRow>, WitnessBatch)> {
+    let mut rows = Vec::new();
+    for _ in 0..64 {
+        let batch = capture.read_witnesses(
+            ReadWindow::new(16_384, Instant::now() + Duration::from_secs(120)).unwrap(),
+        );
+        ensure!(
+            batch.integrity.is_empty(),
+            "integrity rows: {:?}",
+            batch.integrity
+        );
+        ensure!(batch.read_failures.is_empty(), "{:?}", batch.read_failures);
+        ensure!(
+            batch.phase == CapturePhase::Prepared || batch.health.failures.is_empty(),
+            "{:?}",
+            batch.health
+        );
+        ensure!(
+            batch.health_regression.is_none(),
+            "{:?}",
+            batch.health_regression
+        );
+        ensure!(
+            batch.unrecorded_rows == 0 && !batch.sweep_gaps,
+            "sweep dropped rows: {batch:?}"
+        );
+        rows.extend(batch.rows.iter().cloned());
+        if batch.sweep_completed {
+            return Ok((rows, batch));
+        }
+    }
+    bail!("no CALLER_USE sweep completed in 64 quanta")
+}
+
+/// Bounded stop: service lifecycle records while retirement runs, then
+/// take the retired capture. Past 60 s this fails, never hangs.
+fn multi_prefix_stop(capture: InventoryCapture) -> Result<RetiredCapture> {
+    let mut retiring = capture.begin_stop();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let window = ReadWindow::new(16_384, Instant::now() + Duration::from_secs(120)).unwrap();
+        let service = retiring.service_discovery(window);
+        ensure!(service.failure.is_none(), "{service:?}");
+        if retiring.poll_completion(deadline)? {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "capture retirement deadline");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    retiring
+        .try_finish()
+        .map_err(|_| anyhow::anyhow!("completed retirement did not transfer"))
+}
+
+/// Builds the real population (8,192 owned endpoints, plus one more owned
+/// endpoint when `with_over_budget`), lowers it through the production
+/// Shared-scope Inventory merge at the 8,192 budget, and absorbs it into a
+/// fresh attach set. Asserts the admission contract: with the extra module
+/// the plan holds exactly 8,192 slots and refuses the 1-endpoint module
+/// whole with the exact named reason; without it nothing is refused.
+fn multi_prefix_population(with_over_budget: bool) -> Result<MultiPrefixPopulation> {
+    let fixture_start = Instant::now();
+    let a = OwnedFixture::build_n(false, 8192)?;
+    ensure!(
+        a.plan.slots.len() == 8192,
+        "fixture A carries {} endpoints, not 8192",
+        a.plan.slots.len()
+    );
+    let b = with_over_budget
+        .then(|| OwnedFixture::build_n(false, 1))
+        .transpose()?;
+    if let Some(b) = &b {
+        ensure!(
+            b.plan.slots.len() == 1,
+            "fixture B carries {} endpoints, not 1",
+            b.plan.slots.len()
+        );
+    }
+    eprintln!(
+        "MULTI_PREFIX_FIXTURE endpoints={} ms={}",
+        8192 + usize::from(with_over_budget),
+        fixture_start.elapsed().as_millis()
+    );
+    let mut files = vec![(a.path.as_path(), a.expected_sha256.as_str())];
+    if let Some(b) = &b {
+        files.push((b.path.as_path(), b.expected_sha256.as_str()));
+    }
+    let pins = inventory_fx::pass_pins(&files);
+    // The production lowering shape: Shared scope, scan evidence only. A is
+    // corroborated the way a real --system provider is — its scan decoded
+    // an exact-standard interface triple naming its table — so the GT-5
+    // value order admits it before the heuristic 1-endpoint module,
+    // deterministically (AdmissionClass order, not inode order).
+    let mut modules = Vec::new();
+    let a_offsets: Vec<u64> = a.plan.slots.iter().map(|slot| slot.file_offset).collect();
+    let mut a_module = inventory_fx::module(&pins, &a.path, &a_offsets);
+    a_module.scanned.interfaces.push(ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    });
+    modules.push(a_module);
+    if let Some(b) = &b {
+        let b_offsets: Vec<u64> = b.plan.slots.iter().map(|slot| slot.file_offset).collect();
+        modules.push(inventory_fx::module(&pins, &b.path, &b_offsets));
+    }
+    let budget = InventoryBudget::new(MULTI_PREFIX_BUDGET, 8 * MULTI_PREFIX_BUDGET)
+        .map_err(anyhow::Error::msg)?;
+    let plan_start = Instant::now();
+    let plan = crate::plan::build_from_sources_for_policy_scoped(
+        &modules,
+        &[],
+        &pins,
+        AdmissionPolicy::Inventory(budget),
+        AdmissionScope::Shared,
+    );
+    ensure!(
+        plan.slots.len() == 8192,
+        "the merge admitted {} slots, not the 8192 prefix",
+        plan.slots.len()
+    );
+    ensure!(
+        plan.modules.len() == 1 && plan.modules[0].path == a.path.to_str().unwrap(),
+        "the merge admitted {:?}, not provider A whole",
+        plan.modules
+            .iter()
+            .map(|module| &module.path)
+            .collect::<Vec<_>>()
+    );
+    ensure!(
+        plan.slots
+            .iter()
+            .all(|slot| slot.semantics == SlotSemantics::COUNT_ONLY),
+        "Inventory admits count-only"
+    );
+    let mut set = InventoryAttachSet::new(budget);
+    let outcome = set.absorb(&plan, &pins);
+    ensure!(
+        outcome.delta.endpoints.len() == 8192 && set.len() == 8192,
+        "the attach set holds {} endpoints, not the 8192 prefix",
+        set.len()
+    );
+    ensure!(
+        outcome.gaps.is_empty(),
+        "refusals live in module verdicts, not gaps: {:?}",
+        outcome.gaps
+    );
+    let verdict_of = |sha256: &str| {
+        outcome
+            .verdicts
+            .iter()
+            .find(|(key, _)| key.sha256 == sha256)
+            .map(|(_, verdict)| verdict)
+    };
+    match verdict_of(&a.expected_sha256) {
+        Some(AttachVerdict::Admitted { endpoints, reasons }) => {
+            ensure!(
+                *endpoints == 8192 && reasons.is_empty(),
+                "provider A verdict is not a clean 8192 admission: {endpoints} endpoints, {reasons:?}"
+            );
+        }
+        other => bail!("provider A has no clean admission verdict: {other:?}"),
+    }
+    if let Some(b) = &b {
+        ensure!(
+            plan.modules_skipped.len() == 1,
+            "the merge skipped {:?}, not exactly the 1-endpoint module",
+            plan.modules_skipped
+        );
+        let skipped = &plan.modules_skipped[0];
+        ensure!(
+            skipped.subject == b.path.to_str().unwrap(),
+            "the refused module is {}, not provider B",
+            skipped.subject
+        );
+        // The named over-budget reason the user sees: the Shared-scope
+        // whole-module refusal (plan::CapacityRefusal), verbatim. It flows
+        // into inventory JSON `modules[].admission.reasons[]` and profile
+        // JSON `evidence.modules_skipped[].reason`, with the text surfaces
+        // reading the refusal state and counts beside it.
+        let expected_reason = format!(
+            "module needs 1 more; only 8192 attach slots are available; 8192 are in use \
+             (8192 active, 0 retired; held by {} 8192); 2048 are reserved for providers \
+             with a corroborated function table \u{2014} refusing to attach a prefix; to \
+             capture one provider, name it with --module <path>; to free slots, exclude \
+             an unneeded module with --exclude-module <name>",
+            a.path.to_str().unwrap(),
+        );
+        ensure!(
+            skipped.reason == expected_reason,
+            "wrong over-budget reason:\n got: {}\nwant: {}",
+            skipped.reason,
+            expected_reason
+        );
+        ensure!(
+            !crate::plan::is_growth_omission(&skipped.reason),
+            "a refused-whole module is not a growth omission"
+        );
+        ensure!(
+            crate::plan::whole_refusal_needed_count(&skipped.reason) == Some(1),
+            "the whole-refusal count does not parse as 1"
+        );
+        // The reason survives both user surfaces: no control byte can break
+        // a text line, and it JSON-round-trips byte-exact.
+        ensure!(
+            skipped
+                .reason
+                .bytes()
+                .all(|byte| byte >= 0x20 || byte == b'\n' || byte == b'\t'),
+            "the reason carries a control byte that breaks text rendering"
+        );
+        let json = serde_json::to_value(&skipped.reason).unwrap();
+        ensure!(
+            json.as_str() == Some(skipped.reason.as_str()),
+            "the reason does not JSON-round-trip"
+        );
+        match verdict_of(&b.expected_sha256) {
+            Some(AttachVerdict::Refused { reason }) => {
+                ensure!(
+                    *reason == expected_reason,
+                    "the attach-set verdict does not carry the named reason: {reason}"
+                );
+            }
+            other => bail!("provider B has no refusal verdict: {other:?}"),
+        }
+    } else {
+        ensure!(
+            plan.modules_skipped.is_empty(),
+            "the healthy twin refused {:?}",
+            plan.modules_skipped
+        );
+        ensure!(
+            outcome.verdicts.len() == 1,
+            "the healthy twin judged {:?}",
+            outcome.verdicts.keys().collect::<Vec<_>>()
+        );
+    }
+    eprintln!(
+        "MULTI_PREFIX_PLAN slots=8192 skipped={} ms={}",
+        plan.modules_skipped.len(),
+        plan_start.elapsed().as_millis()
+    );
+    Ok(MultiPrefixPopulation {
+        a,
+        b,
+        pins,
+        plan,
+        set,
+        outcome,
+    })
+}
+
+/// One prefix case: the population above, attached on Multi through the
+/// capture facade, every admitted endpoint called and witnessed, the
+/// refused endpoint (when present) proven absent from kernel state, and a
+/// bounded stop that releases every link and map.
+fn inventory_multi_prefix_case(with_over_budget: bool) -> Result<()> {
+    let total_start = Instant::now();
+    let cell = if with_over_budget { "n8193" } else { "n8192" };
+    let mut population = multi_prefix_population(with_over_budget)?;
+    let budget = population.set.budget();
+    let fds_before = multi_prefix_fd_count();
+    let prepare_start = Instant::now();
+    let mut capture = InventoryCapture::prepare(
+        CaptureScope::System,
+        budget,
+        crate::attach::inventory::capture::caller_budget(budget, MULTI_PREFIX_PAIRS)?,
+        AttachBackend::Multi,
+    )?;
+    ensure!(
+        capture.backend() == AttachBackend::Multi,
+        "the capture did not stay Multi"
+    );
+    let receipt = capture.extend(
+        std::mem::take(&mut population.outcome.delta),
+        &population.set,
+        ExtendWindow::new(8192, Instant::now() + Duration::from_secs(300)).unwrap(),
+    );
+    ensure!(
+        receipt.activated_roots,
+        "the first extend did not activate: {receipt:?}"
+    );
+    ensure!(
+        receipt.refused.is_none(),
+        "the 8192 prefix extend refused: {:?}",
+        receipt.refused
+    );
+    ensure!(
+        receipt.failed.is_empty(),
+        "prefix attach failures: {} (first: {:?})",
+        receipt.failed.len(),
+        receipt.failed.iter().take(3).collect::<Vec<_>>()
+    );
+    ensure!(
+        receipt.attached.len() == 8192,
+        "attached {} endpoints, not the 8192 prefix",
+        receipt.attached.len()
+    );
+    // Multi links are adaptive, 8..=96 sites each, so one provider object
+    // attaches as several immutable groups at 8,192 endpoints. The groups
+    // must partition the attached prefix: every attached endpoint in
+    // exactly one group, one link per group (no bisect: every site is a
+    // real executable offset), every group on provider A's object.
+    ensure!(
+        !receipt.groups.is_empty(),
+        "Multi attached no group for the 8192 prefix"
+    );
+    let group_object = receipt.groups[0].object;
+    let mut grouped: Vec<u32> = Vec::new();
+    let mut group_links = 0usize;
+    let mut smallest = usize::MAX;
+    let mut largest = 0usize;
+    for group in &receipt.groups {
+        ensure!(
+            group.links == 1,
+            "group {} split into {} links around refused sites",
+            group.serial,
+            group.links
+        );
+        ensure!(
+            group.object == group_object,
+            "the groups span more than one provider object"
+        );
+        ensure!(
+            (MULTI_LINK_MIN_SITES..=MULTI_LINK_MAX_SITES).contains(&group.members.len()),
+            "group {} carries {} sites, outside 8..=96",
+            group.serial,
+            group.members.len()
+        );
+        group_links += group.links;
+        smallest = smallest.min(group.members.len());
+        largest = largest.max(group.members.len());
+        grouped.extend(group.members.iter().map(|id| id.0));
+    }
+    grouped.sort_unstable();
+    let mut attached_ids: Vec<u32> = receipt
+        .attached
+        .iter()
+        .map(|endpoint| endpoint.id.0)
+        .collect();
+    attached_ids.sort_unstable();
+    ensure!(
+        grouped == attached_ids && attached_ids.len() == 8192,
+        "the {} Multi groups do not partition the attached 8192 ({} members)",
+        receipt.groups.len(),
+        grouped.len()
+    );
+    ensure!(
+        receipt.custody == Some(ScopeCustody::System),
+        "wrong scope custody: {:?}",
+        receipt.custody
+    );
+    ensure!(
+        capture.live_links() == 2 + group_links,
+        "two roots plus {} group links, not {} live links",
+        group_links,
+        capture.live_links()
+    );
+    eprintln!(
+        "MULTI_PREFIX_ATTACH cell={cell} attached=8192 groups={} group_sites={smallest}..={largest} links={} fds={}->{} prepare_ms={} attach_ns_total={} attach_ns_max={}",
+        receipt.groups.len(),
+        2 + group_links,
+        fds_before,
+        multi_prefix_fd_count(),
+        prepare_start.elapsed().as_millis(),
+        receipt.attach_ns_total,
+        receipt.attach_ns_max,
+    );
+    // The admitted prefix intact through real BPF: call every owned
+    // endpoint once. Witness rows are per (caller image, object) pair, so
+    // one caller on provider A is exactly one row — and its saturating
+    // entry count is the exact prefix total: 8,192 probe firings, no
+    // fewer (a silent drop), no more. Zeroed BPF evidence beside it proves
+    // no firing was dropped on the floor (bad cookie, failed insert).
+    let call_start = Instant::now();
+    let mut caller_a = population.a.spawn()?;
+    for id in 0..8192u32 {
+        caller_a.calls(id, 1)?;
+    }
+    let call_ms = call_start.elapsed().as_millis();
+    let read_start = Instant::now();
+    let (rows, batch) = multi_prefix_read_sweep(&mut capture)?;
+    let read_ms = read_start.elapsed().as_millis();
+    ensure!(
+        rows.len() == 1 && batch.seen_rows == 1,
+        "witnessed {} rows (seen {}), not the one (caller, provider A) row",
+        rows.len(),
+        batch.seen_rows
+    );
+    let row = &rows[0];
+    ensure!(
+        row.host_tgid == caller_a.child.id(),
+        "the witness row names another process"
+    );
+    ensure!(
+        row.domain == capture.domain(),
+        "the witness row carries another domain"
+    );
+    ensure!(
+        row.entry_count == 8192,
+        "the witness row counted {} entries, not the exact 8192 prefix",
+        row.entry_count
+    );
+    ensure!(
+        batch.counts.is_empty(),
+        "no count refresh is owed on first sight: {:?}",
+        batch.counts
+    );
+    ensure!(
+        batch
+            .health
+            .caller_evidence
+            .is_none_or(|cells| cells == [0, 0, 0, 0]),
+        "caller evidence is dirty: {:?}",
+        batch.health.caller_evidence
+    );
+    ensure!(
+        batch
+            .health
+            .usage_evidence
+            .is_none_or(|cells| cells == [0, 0, 0]),
+        "usage evidence is dirty: {:?}",
+        batch.health.usage_evidence
+    );
+    eprintln!(
+        "MULTI_PREFIX_WITNESS cell={cell} rows=1 entry_count=8192 call_ms={call_ms} read_ms={read_ms}"
+    );
+    // The 8,193rd endpoint is not attached anywhere: calling it opens no
+    // second row, advances no count, and dirties no evidence. The pair
+    // budget above is loose on purpose, so a wrongly attached provider B
+    // could land its row — this absence is non-arrival, not incapacity.
+    if let Some(b) = &population.b {
+        let mut caller_b = b.spawn()?;
+        caller_b.calls(0, 1)?;
+        let (extra_rows, extra_batch) = multi_prefix_read_sweep(&mut capture)?;
+        ensure!(
+            extra_rows.is_empty() && extra_batch.seen_rows == 1,
+            "the refused endpoint leaked {} witness rows",
+            extra_rows.len()
+        );
+        ensure!(
+            extra_batch.counts.is_empty(),
+            "the refused call advanced entry counts: {:?}",
+            extra_batch.counts
+        );
+        ensure!(
+            extra_batch
+                .health
+                .caller_evidence
+                .is_none_or(|cells| cells == [0, 0, 0, 0]),
+            "caller evidence is dirty after the refused call: {:?}",
+            extra_batch.health.caller_evidence
+        );
+        caller_b.finish()?;
+        eprintln!("MULTI_PREFIX_ABSENT cell={cell} refused_witness_rows=0");
+    }
+    caller_a.finish()?;
+    // The caller handles (child pipes, pidfd) are harness fds, not product
+    // kernel state: drop them before the stop so the release check below
+    // measures only what the capture held. (caller_b already dropped at
+    // its block end.)
+    drop(caller_a);
+    let live_before_stop = capture.live_links();
+    let stop_start = Instant::now();
+    let retired = multi_prefix_stop(capture)?;
+    let stop_ms = stop_start.elapsed().as_millis();
+    let cleanup = retired.cleanup();
+    ensure!(
+        cleanup.failures.is_empty() && cleanup.retained_links == 0,
+        "dirty stop: {cleanup:?}"
+    );
+    ensure!(
+        cleanup.closed == live_before_stop,
+        "the stop closed {} links, not the {} live ones",
+        cleanup.closed,
+        live_before_stop
+    );
+    let closed = cleanup.closed;
+    drop(retired);
+    let fds_after = multi_prefix_fd_count();
+    ensure!(
+        fds_after == fds_before,
+        "the stop leaked descriptors: {fds_before} -> {fds_after}"
+    );
+    let total_ms = total_start.elapsed().as_millis();
+    eprintln!(
+        "MULTI_PREFIX_STOP cell={cell} closed={closed} fds={fds_before}->{fds_after} stop_ms={stop_ms} total_ms={total_ms}"
+    );
+    ensure!(
+        total_start.elapsed() < MULTI_PREFIX_TOTAL_BUDGET,
+        "the cell overran its finite-time backstop"
+    );
+    Ok(())
 }
 
 #[cfg(not(feature = "wide-detailed-2112"))]
@@ -7303,6 +7990,16 @@ fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &
 /// halts every probe at its scope gate, userspace reads OWNER_CTL, and the
 /// published evidence names the halt and is a concrete-gap PARTIAL, instead
 /// of a quiet zero-call capture.
+///
+/// PID scope reads the owner through its continuity baseline before the
+/// first static link, and terminal poison refuses static attachment there
+/// (12a6c3568: explicit stop, terminal or detach state never permits
+/// attachment), so a PID-scoped start with the seeded poison must refuse
+/// before it returns a session. A healthy twin without the seed starts
+/// first, pinning the refusal to the poison latch rather than the shared
+/// message alone. The disclosure body runs under an owned
+/// cgroup scope: its probes are process-wide and gated in BPF only, so the
+/// session starts and the halt reaches the read path.
 #[test]
 #[ignore = "root-owned BPF lane; a poisoned native owner halts capture and is disclosed"]
 fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
@@ -7311,21 +8008,60 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
     let plan =
         AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
             .map_err(anyhow::Error::msg)?;
+    // Created before the caller, so an early failure drops (kills) the
+    // caller first and the cgroup can still be removed.
+    let group = OwnedCgroup::create()?;
     let mut caller = fixture.spawn_gated()?;
-    crate::attach::TEST_OWNER_POISON
-        .with(|seed| seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED));
-    let started = crate::attach::Session::start(
-        &plan,
-        &Scope::Pid(caller.child.id()),
-        &fixture.pins,
-        crate::attach::CapturePolicy::AggregateOnly,
-        None,
-        None,
-        None,
-        crate::attach::BackendSelection::Singles,
-    );
+    let poisoned_start = |scope: &Scope| {
+        crate::attach::TEST_OWNER_POISON
+            .with(|seed| seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED));
+        let started = crate::attach::Session::start(
+            &plan,
+            scope,
+            &fixture.pins,
+            crate::attach::CapturePolicy::AggregateOnly,
+            None,
+            None,
+            None,
+            crate::attach::BackendSelection::Singles,
+        );
+        crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
+        started
+    };
+    // Healthy twin: without the seeded poison the same PID-scoped start
+    // attaches, proving the refusal below tracks the poison latch and not
+    // the scope or the fixture (the refusal message is shared by the stop,
+    // poison and detach causes of a terminal baseline).
     crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
-    let mut session = started?;
+    {
+        let mut healthy = crate::attach::Session::start(
+            &plan,
+            &Scope::Pid(caller.child.id()),
+            &fixture.pins,
+            crate::attach::CapturePolicy::AggregateOnly,
+            None,
+            None,
+            None,
+            crate::attach::BackendSelection::Singles,
+        )?;
+        let detached = healthy.detach_producers();
+        let clean = healthy.detach_failures().is_empty();
+        drop(healthy);
+        detached?;
+        ensure!(clean, "healthy PID-scoped twin detach retained failures");
+    }
+    eprintln!("OWNER_POISON_PID_TWIN started without poison");
+    let refused = match poisoned_start(&Scope::Pid(caller.child.id())) {
+        Ok(_) => bail!("a PID-scoped start attached static probes under terminal owner poison"),
+        Err(error) => format!("{error:#}"),
+    };
+    ensure!(
+        refused.contains("static attachment refused while Session is stopping or detached"),
+        "the poisoned PID-scoped start failed for another reason: {refused}"
+    );
+    eprintln!("OWNER_POISON_PID_START refused={refused:?}");
+    group.move_in(&caller)?;
+    let mut session = poisoned_start(&crate::scope::cgroup(&group.path)?)?;
     let ids = OwnedIds::detailed(&session)?;
     caller.go()?;
     caller.calls(0, CALLS)?;
@@ -7358,6 +8094,7 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
     caller.finish()?;
     detached?;
     ensure!(clean_detach, "poisoned Detailed detach retained failures");
+    std::fs::remove_dir(&group.path).context("owner poison cgroup cleanup")?;
     Ok(())
 }
 
@@ -7583,46 +8320,24 @@ fn privileged_t7_detailed_hot_slot_third_rv_lp64() -> Result<()> {
     Ok(())
 }
 
-fn task4_writer_evidence(endpoints: u32) -> Result<(tempfile::TempDir, Task4Evidence)> {
+fn task4_writer_evidence(endpoints: usize) -> Result<(tempfile::TempDir, [Task4Rows; 3])> {
     let directory = tempfile::tempdir()?;
-    let fixture = OwnedFixture::build_n(false, endpoints)?;
-    let offsets: Vec<_> = fixture
-        .plan
-        .slots
-        .iter()
-        .map(|slot| slot.file_offset)
-        .collect();
-    std::fs::write(
-        directory.path().join("offsets-00.json"),
-        serde_json::to_vec(&offsets)?,
-    )?;
-    let evidence = Task4Evidence::new_control_at(
-        "inventory",
-        if cfg!(feature = "wide-detailed-2112") {
-            "wide-detailed-2112"
-        } else {
-            "default"
-        },
-        &fixture,
-        crate::EBPF_INVENTORY_OBJECT,
-        None,
-        directory.path().to_owned(),
-        0,
-    )?;
-    Ok((directory, evidence))
+    let rows = |name| Task4Rows::create(directory.path(), 0, name, "jsonl", "inventory", endpoints);
+    let writers = [rows("raw")?, rows("ledger")?, rows("links")?];
+    Ok((directory, writers))
 }
 
 fn task4_assert_complete_writer_sweep(
-    endpoints: u32,
+    endpoints: usize,
     raw_rows: usize,
     ledger_rows: usize,
     link_rows: usize,
 ) -> Result<()> {
-    let (_directory, mut evidence) = task4_writer_evidence(endpoints)?;
+    let (_directory, [mut raw, mut ledger, mut links]) = task4_writer_evidence(endpoints)?;
     for (writer, rows) in [
-        (&mut evidence.raw, raw_rows),
-        (&mut evidence.ledger, ledger_rows),
-        (evidence.links.as_mut().context("links writer")?, link_rows),
+        (&mut raw, raw_rows),
+        (&mut ledger, ledger_rows),
+        (&mut links, link_rows),
     ] {
         for position in 0..rows {
             writer.json(serde_json::json!({
@@ -7666,11 +8381,11 @@ fn task4_evidence_preserves_n8192_sweep() -> Result<()> {
 
 #[test]
 fn task4_evidence_refuses_runaway_rows_without_writing() -> Result<()> {
-    let (_directory, mut evidence) = task4_writer_evidence(8_192)?;
+    let (_directory, [mut raw, mut ledger, mut links]) = task4_writer_evidence(8_192)?;
     for (writer, runaway_rows) in [
-        (&mut evidence.raw, 409_650),
-        (&mut evidence.ledger, 82_020),
-        (evidence.links.as_mut().context("links writer")?, 81_940),
+        (&mut raw, 409_650),
+        (&mut ledger, 82_020),
+        (&mut links, 81_940),
     ] {
         let mut refused = false;
         for written in 0..runaway_rows {
@@ -7697,18 +8412,12 @@ fn task4_evidence_refuses_runaway_rows_without_writing() -> Result<()> {
 
 #[test]
 fn task4_evidence_byte_limit_preserves_existing_bytes() -> Result<()> {
-    let (_directory, mut evidence) = task4_writer_evidence(1)?;
+    let (_directory, [mut raw, _, _]) = task4_writer_evidence(1)?;
     let at_limit = vec![b'x'; 16 * 1024 * 1024];
-    evidence.raw.write(&at_limit)?;
-    let error = evidence
-        .raw
-        .write(b"x")
-        .expect_err("oversize file admitted");
+    raw.write(&at_limit)?;
+    let error = raw.write(b"x").expect_err("oversize file admitted");
     ensure!(format!("{error:#}").contains("16 MiB"));
-    ensure!(
-        evidence.raw.contents()? == at_limit,
-        "failed write changed evidence"
-    );
+    ensure!(raw.contents()? == at_limit, "failed write changed evidence");
     Ok(())
 }
 
@@ -7789,17 +8498,27 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     )?;
     ensure!(first.attach_failures().is_empty() && first.attached_probes() == 4);
     let first_ids = OwnedIds::detailed(&first)?;
-    // Canonical Detailed Allowlisted Singles inventory, measured
-    // 2026-10-08: 24 base maps + 8 Stage A continuity maps (G_EPOCH,
-    // INSTANCE_CALIB/COUNTERS/GEN/START, PROC_EPOCH, SLOT_FILE,
-    // WATCHED_FILES); 13 base programs + 3 instance hooks; 7 base links +
-    // 3 hook links.
+    // Exact healthy Allowlisted Singles inventory: 42 maps (the 32 maps
+    // before 13d8b62d3, its four image maps, the three object-custody maps
+    // OBJECT_START/OBJECT_ZERO/OBJECT_DESCRIPTORS from 9d9a9a443 and the
+    // three selected-detail maps linked by 4b5c780bb, named
+    // SELECTED_DETAIL/SELECTED_BCTL/SELECTED_DSTATE since feb152a9c),
+    // plus the two birth-marker maps when this build carries the birth
+    // marker (shipped by default since the WU-2b journal+marker
+    // activation): JOURNAL_MARKER_CTL and the PID-scope birth witness
+    // PID_START_TICK; 13 base programs, four continuity hooks and one
+    // loaded task iterator (the selected programs stay unloaded outside a
+    // selected session); seven base links plus four hook links. Query
+    // links are temporary and absent from this retained census.
+    let detailed_census = (42 + 2 * usize::from(cfg!(p11scope_birth_marker)), 18, 11);
+    let first_census = (
+        first_ids.maps.len(),
+        first_ids.programs.len(),
+        first_ids.links.len(),
+    );
     ensure!(
-        (
-            first_ids.maps.len(),
-            first_ids.programs.len(),
-            first_ids.links.len()
-        ) == (32, 16, 10)
+        first_census == detailed_census,
+        "first Detailed census (maps, programs, links) = {first_census:?}, expected {detailed_census:?}"
     );
     let first_witness = task4_session_witness(&first, &first_ids, 1, original.child.id())?;
     task4_record_registration(
@@ -7828,12 +8547,14 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     ensure!(second.attach_failures().is_empty() && second.attached_probes() == 4);
     let second_ids = OwnedIds::detailed(&second)?;
     // Same canonical inventory as the first session (see above).
+    let second_census = (
+        second_ids.maps.len(),
+        second_ids.programs.len(),
+        second_ids.links.len(),
+    );
     ensure!(
-        (
-            second_ids.maps.len(),
-            second_ids.programs.len(),
-            second_ids.links.len()
-        ) == (32, 16, 10)
+        second_census == detailed_census,
+        "second Detailed census (maps, programs, links) = {second_census:?}, expected {detailed_census:?}"
     );
     let second_witness = task4_session_witness(&second, &second_ids, 2, copy.child.id())?;
     ensure!(
@@ -7853,8 +8574,15 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     )?;
     let ids = first_ids.union(&second_ids);
     // Twice the canonical per-session inventory: the two sessions are
-    // proven disjoint above, so the union is the exact sum 2*(32,16,10).
-    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (64, 32, 20));
+    // proven disjoint above, so the union is the exact sum 2*detailed_census.
+    ensure!(
+        (ids.maps.len(), ids.programs.len(), ids.links.len())
+            == (
+                2 * detailed_census.0,
+                2 * detailed_census.1,
+                2 * detailed_census.2
+            )
+    );
     task4_ids_phase("second_attached", &ids);
     task4_session_ids("second_attached", second_witness, &second_ids);
     task4_ids_receipt(&ids);
@@ -8492,7 +9220,11 @@ fn wide_highslot_gate(exec: bool) -> Result<()> {
             old_pair.len() == 2,
             "old high-slot pair lacks two unique IDs"
         );
-        let attachment = session.attach_targets(&[plan.slots[2_048].clone()], &fixture.pins);
+        let attachment = session.attach_targets(
+            &[plan.slots[2_048].clone()],
+            &fixture.pins,
+            &std::collections::BTreeSet::new(),
+        );
         let rebound = OwnedIds::detailed(&session)?;
         task4_ids_phase("post_rebind_attempt", &rebound);
         ids.links.extend(rebound.links.iter().copied());
@@ -10304,6 +11036,8 @@ fn owned_retirement_barrier_checks_nonce_and_bounds_unreleased_wait() -> Result<
 #[test]
 #[ignore = "root-owned BPF lane and external lifecycle ledger; explicit controlled worker/synchronous comparison"]
 fn privileged_inventory_retirement_controlled_churn() -> Result<()> {
+    use aya::programs::links::Link as _;
+
     let mode = std::env::var("P11SCOPE_I3A_RETIREMENT_MODE")?;
     ensure!(
         mode == "worker" || mode == "synchronous",
@@ -10339,14 +11073,24 @@ fn privileged_inventory_retirement_controlled_churn() -> Result<()> {
         "I3A_CONTROLLED_BEFORE mode={mode} counters={:?}",
         before.health.discovery_counters
     );
-    // The immutable static order establishes that the first real successful
-    // close is entry575; both roots remain in the work while the barrier waits.
+    // Gate the actual entry575 fd after its close returns. Other entry closes
+    // may overlap, while both roots remain behind the ordinary-link barrier.
     ensure!(active.state.links.last().unwrap().target == InventoryLinkIdentity::Entry(575));
-    let mut first = true;
+    let KernelInventoryLink::Fds(controlled_fds) = &active.state.links.last().unwrap().handle
+    else {
+        anyhow::bail!("controlled entry575 does not own fd links");
+    };
+    ensure!(controlled_fds.len() == 1);
+    let controlled_fd = controlled_fds[0]
+        .as_aya()
+        .context("controlled Singles entry575 does not own an Aya fd link")?
+        .id();
     let mut close = move |fds: &mut Vec<InventoryFd>| {
+        let controlled = fds
+            .iter()
+            .any(|fd| fd.as_aya().is_some_and(|link| link.id().eq(&controlled_fd)));
         close_inventory_fds(fds)?;
-        if first {
-            first = false;
+        if controlled {
             barrier.wait(Duration::from_secs(30))?;
         }
         Ok(())

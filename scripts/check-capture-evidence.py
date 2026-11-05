@@ -4,6 +4,7 @@
 
 import copy
 import json
+import os
 import re
 import sys
 import tempfile
@@ -20,6 +21,7 @@ COUNTERS = (
     "abi_refusals",
     "semantic_capture_failures",
     "unregistered_mechanisms",
+    "unpublished_mechanisms",
     "template_tail_failures",
     "process_tracking_fallbacks",
     "process_tracking_failures",
@@ -60,12 +62,18 @@ COUNTERS = (
 )
 
 # v2-metrics is retained only for historical fixtures and compatibility reads;
-# it predates the task-uprobe link-loss, ABI-refusal, and semantic-history-drop
-# evidence added to v3.
+# it predates the task-uprobe link-loss, ABI-refusal, semantic-history-drop,
+# and unpublished-mechanism evidence added to v3.
 HISTORICAL_METRICS_SCHEMA = "p11scope/observed-profile/v2-metrics"
 HISTORICAL_COUNTERS = tuple(
     counter for counter in COUNTERS
-    if counter not in {"abi_refusals", "task_uprobe_link_losses", "semantic_history_drops"}
+    if counter
+    not in {
+        "abi_refusals",
+        "task_uprobe_link_losses",
+        "semantic_history_drops",
+        "unpublished_mechanisms",
+    }
 )
 
 # `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
@@ -85,6 +93,11 @@ LOADER_DISCOVERY_GROUPS = {
     "initial_set_capture": ("eligible", "none", "pause_protected"),
 }
 LOADER_DISCOVERY_COUNTERS = ("hits", "state_read_failures")
+# Optional counters: accepted when present, defaulted when absent so old
+# reports verify under the old rule. `benign_hits` counts loader hits whose
+# records resolved benignly (accepted, scan complete, no new provider, no
+# suspicious close) or under pause proof; it never exceeds `hits`.
+LOADER_DISCOVERY_OPTIONAL_COUNTERS = ("benign_hits",)
 # Consumer-scheduling evidence (Task 3.1 repair): one nested object, closed
 # keys, exact loss-split identities. The terminal drain bound is a source
 # constant (events.rs TERMINAL_DRAIN_BOUND); pinning its value here forces
@@ -138,7 +151,12 @@ SCHEDULING_PHASE_TS_KEYS = ("attach_mono_ns", "loop_start_mono_ns",
 SCHEDULING_LOOP_END_REASONS = {"expiry", "operator_stop", "target_exit",
                                "limit_reached", "error", "unstarted"}
 PAUSE_VALUES = ("none", "sigstop", "partial")
-PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
+PAUSE_COUNTERS = (
+    "pause_attempts",
+    "pause_confirmed",
+    "pause_partial",
+    "pause_unavailable",
+)
 DISCOVERY_LOSS_COUNTERS = (
     "discovery_ring_loss",
     "discovery_state_failures",
@@ -147,7 +165,43 @@ DISCOVERY_LOSS_COUNTERS = (
 )
 MAX_MANIFEST_OBJECT_FALLBACKS = 512
 MANIFEST_STALE_REASONS = {"open_stale", "identity_mismatch"}
-ALLOWED_SOURCE_ARRAYS = (["scan"], ["manifest"], ["scan", "manifest"])
+ALLOWED_SOURCE_ARRAYS = (
+    ["scan"],
+    ["manifest"],
+    ["prearm"],
+    ["scan", "manifest"],
+    ["scan", "prearm"],
+    ["manifest", "prearm"],
+    ["scan", "manifest", "prearm"],
+)
+ALLOWED_WATCH_STATES = {
+    "pinned_unarmed",
+    "armed",
+    "armed_idle",
+    "unavailable",
+    "ended",
+}
+ALLOWED_WATCH_ENDS = {
+    "attached",
+    "scope_end",
+    "stop",
+    "object_changed",
+    "health_loss",
+    "scope_uncertain",
+}
+ALLOWED_UNOBSERVED_REASONS = {
+    "pre_attach",
+    "late_discovery",
+    "mapped_unattached",
+    "health_loss",
+    "scope_uncertain",
+}
+# Residual 6.13 review: the watch/window shapes are closed. `since_ns` is
+# always present (null until armed); `until_ns`/`ended_by` appear only when
+# the end actually happened; `changed` is the object_changed bracket.
+WATCH_KEYS = {"since_ns", "state", "until_ns", "ended_by", "changed"}
+WATCH_CHANGED_KEYS = {"last_ok_ns", "detected_ns", "previous_ino"}
+UNOBSERVED_WINDOW_KEYS = {"start_ns", "end_ns", "reason"}
 ALLOWED_TABLE_SOURCES = {"scan", "manifest"}
 ALLOWED_CORROBORATION = {
     "single_source",
@@ -209,10 +263,12 @@ STANDARD_EXPORT_STATUS = {
 }
 ATTACH_MECHANISMS = {"per-offset", "uprobe-multi"}
 PROFILE_V3_FIELDS = {
-    "interface_selection", "attach_mechanisms", "attach_backend",
+    "interface_selection", "attach_mechanisms",
     "pid_descendant_gaps", "multi_rebuild_gaps",
 }
 ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
+OBJECT_CAPTURE_KEYS = {"available", "reason"}
+OBJECT_CAPTURE_REASONS = {None, "not_enabled"}
 ATTACH_SELECTIONS = {"auto", "multi", "singles"}
 SCOPE_FILTERS = {None, "kernel-pid+bpf", "perf-task+bpf"}
 RESIDUAL_EVIDENCE_KEYS = {
@@ -254,8 +310,124 @@ ROOT_FAILURE_REASONS = {
 }
 # C_GetInterface result flags publish only this finite class, never the word.
 SELECTION_RESULT_FLAG_CLASSES = {"zero", "fork_safe", "other"}
+COUNTER_COLLECTION_KEYS = {
+    "mode", "generation", "read_window", "status", "health", "discontinuity", "failure",
+}
+COUNTER_COLLECTION_FAILURES = {
+    "read_shape", "read_budget", "read_stats", "read_rvs", "read_health",
+    "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
+    "mode", "generation_rollback", "limits", "saturated", "contended",
+    "kernel_evidence", "fold_overflow", "regressed", "projection",
+}
+# 6.15 endpoint selection: the additive `selected_detail` envelope the
+# metrics composer adds beside --select-endpoint captures
+# (src/metrics/selected_detail_driver.rs is the producer authority).
+# Closed nested shape, finite vocabularies. The envelope never carries
+# raw PID/TID (allowlist-v1): `original_pid` is not a permitted key
+# anywhere below, and no nested field publishes process identity.
+SELECTED_DETAIL_KEYS = {"selection", "events", "lineage", "aggregate", "detail"}
+SELECTED_DETAIL_REQUIRED = {"events"}
+SELECTED_DETAIL_SELECTION_KEYS = {"endpoint", "slot", "file_offset", "names", "refusal"}
+SELECTED_DETAIL_SELECTION_REQUIRED = {"endpoint"}
+# SelectedDriverRefusal::name: the promotion_* snake words, the adapter
+# words (gate words plus endpoint/child/topology/window), and the two
+# driver words. Every selection refusal is one of these, never a label.
+SELECTED_DETAIL_GATE_WORDS = {
+    "broad_not_counter", "broad_stopping", "child_shape", "not_published",
+    "foreign", "changed", "quarantined", "budget",
+}
+SELECTED_DETAIL_ADAPTER_WORDS = SELECTED_DETAIL_GATE_WORDS | {
+    "endpoint_unresolved", "child_foreign_slot", "broad_plan_topology",
+    "window_active",
+}
+SELECTED_DETAIL_SELECTION_REFUSALS = {
+    "promotion_disabled", "promotion_busy", "promotion_duplicate",
+    "promotion_already_detailed", "promotion_exhausted",
+    "promotion_foreign_capture", "promotion_stale_view",
+    "promotion_unknown_caller", "promotion_caller_retired",
+    "promotion_caller_changed", "promotion_provider_changed",
+    "promotion_provider_unloaded", "promotion_manifest_unavailable",
+    "promotion_endpoint_ambiguous", "promotion_endpoint_dependency",
+    "promotion_scope_ended", "promotion_scope_unsupported",
+    "promotion_preparation_failed", "promotion_activation_failed",
+    "promotion_capacity",
+    *SELECTED_DETAIL_ADAPTER_WORDS,
+    "endpoint_unknown", "bundle_unavailable",
+}
+# DetailWindowEvent::name: the seq-shaped window rows. `close_refused`
+# has its own row shape (view/endpoint_offset/refusal, no seq) from
+# render_close_refused_row; the other six share the window-event shape.
+SELECTED_DETAIL_WINDOW_EVENTS = {
+    "reserved", "bound", "cas_won", "cas_refused", "closed",
+    "cancelled_unactivated",
+}
+SELECTED_DETAIL_WINDOW_ROW_KEYS = {"event", "request", "caller", "provider", "seq"}
+SELECTED_DETAIL_CLOSE_REFUSED_KEYS = {
+    "event", "request", "caller", "provider", "view", "endpoint_offset",
+    "refusal",
+}
+SELECTED_DETAIL_RESERVE_REFUSED_KEYS = {
+    "event", "request", "caller", "provider", "refusal", "seq",
+}
+SELECTED_DETAIL_START_REFUSED_KEYS = {
+    "event", "request", "caller", "provider", "reason",
+}
+# PromotionRefusal::label / PromotionEnd::label: the human reason words
+# the outcome and start-refused rows carry (distinct from the snake
+# refusal words the selection record carries).
+SELECTED_DETAIL_REFUSAL_LABELS = {
+    "control disabled", "another promotion is outstanding",
+    "same pair already requested", "pair already detailed",
+    "request serials exhausted", "foreign capture", "view expired",
+    "unknown caller", "caller retired", "caller identity changed",
+    "provider changed", "provider unloaded", "no manifest permission",
+    "ambiguous endpoints", "dependency endpoints outside closure",
+    "parent scope ended", "parent scope unsupported", "preparation failed",
+    "activation failed", "install capacity unavailable",
+}
+SELECTED_DETAIL_END_LABELS = {
+    "cancelled by operator", "run stopped", "lane closed",
+}
+SELECTED_DETAIL_OUTCOMES = {"refused", "ended", "active"}
+SELECTED_DETAIL_LINEAGE_KEYS = {
+    "request", "caller", "provider", "view", "endpoint_offset",
+    "broad_original_index", "broad_generation", "detail_generation",
+    "broad_read_seq_before", "broad_read_seq_after",
+    "broad_mark_before", "broad_mark_after", "drift", "after_read",
+}
+SELECTED_DETAIL_MARK_KEYS = {
+    "seq", "generation", "indices", "bank_ids", "transaction",
+}
+SELECTED_DETAIL_DRIFT_KINDS = {"generation", "indices", "bank_ids", "transaction"}
+# CloseBracketVerdict rendering: matched, unavailable, or the first
+# mismatch (after_bracket_mismatch plus the collector "rejected").
+SELECTED_DETAIL_AFTER_READS = {
+    "matched", "unavailable", "mismatched:generation", "mismatched:mode",
+    "mismatched:read_failed", "mismatched:health", "mismatched:kernel",
+    "mismatched:rows", "mismatched:rejected",
+}
+SELECTED_DETAIL_AGGREGATE_KEYS = {
+    "scope", "unit", "mode", "seq_before", "seq_after", "mode_mixed",
+    "rows",
+}
+SELECTED_DETAIL_DETAIL_KEYS = {
+    "scope", "unit", "mode", "detail_generation", "mode_mixed", "rows",
+}
+SELECTED_DETAIL_MODES = {"counts", "timestamps", "latency"}
+SELECTED_DETAIL_ROW_BASE_KEYS = {
+    "slot", "object", "file_offset", "entered", "returned", "errors",
+    "rv_counts",
+}
+SELECTED_DETAIL_LATENCY_BUCKETS = 32
+# --exclude-module reporting (additive, present only when the flag is
+# passed; omitted when empty): excluded_modules lists one row per
+# distinct excluded file, unmatched_excludes lists inputs that matched
+# nothing. Producer: src/render.rs DiscoveryEvidence (flattened into
+# evidence); schema: docs/schema/observed-profile-v3.schema.json. Never
+# feeds verdicts or completeness (a declared choice, not a loss).
+EXCLUDED_MODULE_KEYS = {"path", "dev", "ino", "processes"}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
-    "kernel_control",
+    "kernel_control", "attach_backend", "object_capture",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
     "scan_unavailable", "scan_ms", "table_entries", "slots", "active_slots",
     "attached_probes",
@@ -281,42 +453,48 @@ TRACE_TERMINAL_KEYS = {
 # attaches (every induced-gap lane, and every lane whose target is released by a
 # go-file). This slice scans once, at attach time, so the scan finds nothing in
 # scope: the manifest is the only source, and it is `uncorroborated` because
-# nothing was there to confirm it. Thirteen surfaces, 988 entries — the helper's
-# own numbers, unchanged from v1.
+# nothing was there to confirm it. Thirteen surfaces, 1056 entries: the
+# acquired 4.0-labelled interface retains its known common 68-entry prefix.
 VERSION_SURFACES = Counter(
     {
         ("full", 68): 2,
         ("full", 92): 2,
         ("full", 104): 2,
-        ("known_prefix", 68): 1,
+        ("known_prefix", 68): 2,
         ("known_prefix", 92): 2,
         ("known_prefix", 104): 2,
-        ("refused", 0): 1,
         ("not_walked", 0): 1,
     }
 )
 # SCANNED — the canary workload maps the provider *before* attach, so both
-# sources describe it. LP64 scans three file-backed tables and reports one
-# conflict; ILP32 also scans the 3.1 and 3.2 tables and agrees with the manifest.
+# sources describe it. LP64 scans three complete tables and reports one
+# conflict; ILP32 also scans the 3.1, 3.2 and future-minor 3.9 tables and agrees
+# with the manifest. These exact subsets describe the selected compiled
+# fixtures' file-backed page tails, not a version restriction in the scanner.
 # Tables built at run time in .bss are not object-level scan failures. Every
 # scanned table remains an exact per-source record.
 #
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
 # sources named it. `surfaces` keeps the per-source records, so the scan adds
-# three LP64 surfaces (13 -> 16) or five ILP32 surfaces (13 -> 18).
+# three baseline LP64 surfaces (13 -> 16) or six ILP32 surfaces (13 -> 19).
+# A terminal LP64 3.1 table can additionally contribute a complete or
+# page-bounded partial observation; validate its own extent below.
+# Independent exported callbacks can retain a larger same-base prefix beside
+# the common68 view. ILP32 can also expose tbad's68 and tunknown's68/92 views;
+# these are bounded recovery observations, not additional manifest demand.
 # `table_entries` counts exact target occurrences across sources, so neither
-# scan subset changes the 988-entry union.
+# scan subset changes the 1056-entry union.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
     {("full", 68): 2, ("full", 92): 1}
 )
 VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
-    {("full", 92): 1, ("full", 104): 1}
+    {("full", 92): 1, ("full", 104): 1, ("known_prefix", 104): 1}
 )
-VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
-VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
+VERSION_SHAPE_MANIFEST_ONLY = (1056, 104, 208, VERSION_SURFACES, 1, "ok")
+VERSION_SHAPE_SCANNED = (1056, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
 VERSION_SHAPE_SCANNED_IA32 = (
-    988,
+    1056,
     104,
     208,
     VERSION_SURFACES_SCANNED_IA32,
@@ -331,14 +509,14 @@ VERSION_TABLES_MANIFEST_ONLY = Counter(
         ("manifest", (3, 1), 92): 2,
         ("manifest", (3, 2), 104): 3,
         ("manifest", (3, 9), 104): 1,
-        ("manifest", (4, 0), 0): 1,
+        ("manifest", (4, 0), 68): 1,
     }
 )
 VERSION_TABLES_SCANNED = VERSION_TABLES_MANIFEST_ONLY + Counter(
     {("scan", (2, 40), 68): 2, ("scan", (3, 0), 92): 1}
 )
 VERSION_TABLES_SCANNED_IA32 = VERSION_TABLES_SCANNED + Counter(
-    {("scan", (3, 1), 92): 1, ("scan", (3, 2), 104): 1}
+    {("scan", (3, 1), 92): 1, ("scan", (3, 2), 104): 1, ("scan", (3, 9), 104): 1}
 )
 DISCOVERY_SUBJECT = "discovery subject"
 DISCOVERY_UNAVAILABLE = "discovery unavailable"
@@ -363,12 +541,39 @@ PHYSICAL_IDENTITY_AMBIGUITY = (
 UNSUPPORTED_TABLE_VERSION = (
     "unsupported function-table version; the scanner does not walk this layout"
 )
+# OD34: fixed product-limit skips name their limit instead of redacting to
+# `discovery unavailable` (render.rs `capture_skipped_out` allowlist). Each
+# is fixed product wording with no target-derived data; the view form
+# normalizes the configured limit value out so the public vocabulary stays
+# finite. The validator must accept what the producer emits.
+PROCESS_VIEW_CAPACITY_EXHAUSTED = (
+    "capture process-view capacity was exhausted; remaining generations were not scanned"
+)
+LOADER_CONTEXT_CAPACITY_EXHAUSTED = "loader context capacity 256 is exhausted"
+LOADER_SCAN_LEDGER_EXCEEDED = (
+    "a deferred loader memory scan exceeded the bounded loader-context ledger"
+)
+LOADER_ARM_LEDGER_FULL = "the bounded loader-arm catch-up ledger was full"
+# Never-stop (2026-11-05): per-object manifest/pre-arm skips and live
+# discovery transport failures project to these finite reasons.
+MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
+PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
+DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
     SHARED_OVERLAY_UNCERTAINTY,
     PHYSICAL_IDENTITY_AMBIGUITY,
     UNSUPPORTED_TABLE_VERSION,
+    "static probe coverage gap incomplete",
+    "static probes detached and exact pairs reattached",
+    PROCESS_VIEW_CAPACITY_EXHAUSTED,
+    LOADER_CONTEXT_CAPACITY_EXHAUSTED,
+    LOADER_SCAN_LEDGER_EXCEEDED,
+    LOADER_ARM_LEDGER_FULL,
+    MANIFEST_OBJECT_UNAVAILABLE,
+    PREARM_OBJECT_UNAVAILABLE,
+    DISCOVERY_TRANSPORT_UNAVAILABLE,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a
@@ -383,31 +588,42 @@ LEGACY_SURFACES = Counter({("full", 68): 1})
 # `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the frozen
 # attach ceiling a whole-module capacity refusal is taken against.
 MAX_SLOTS = 512
-# What the installed libp11-kit really maps (verified byte-level on the lane
-# host, Task 1.4): 64 static CK_FUNCTION_LIST_3_2 closure templates, 104
-# entries each, ordinals 65/66 shared by all 64 (64*102+2 = 6530 distinct
-# targets). The K=4 per-object heuristic cap admits 4 tables (any 4 share
-# exactly the 2 family targets: 4*102+2 = 410 distinct, 0 nulls); the other
-# 60 spill as `discovery_uncorroborated_candidates` — evidence, never slots.
+# What the installed libp11-kit really maps (Task 1.4, refreshed for the
+# first-plan prefix): 67 static CK_FUNCTION_LIST_3_2 closure templates on
+# the lane hosts, 104 entries each, ordinals 65/66 shared by all
+# (67*102+2 = 6836 distinct targets). The reserve-capped heuristic prefix
+# admits the leading 3 tables (any 3 share exactly the 2 family targets:
+# 3*102+2 = 308 distinct, 0 nulls); the other 64 spill as
+# `discovery_uncorroborated_candidates` — evidence, never slots.
 #
 # Admitted p11-kit template families (audit F8): the 3.x (version, entries)
 # combinations the version matrix declares — 92-entry 3.0/3.1, 104-entry
-# 3.2 — each with the distinct targets K=4 admits from 4 tables sharing the
-# 2 family targets (4*(entries-2)+2). The lane qualifies whichever build is
-# installed instead of pinning one provider version; every table in one
-# capture must still share exactly one shape.
+# 3.2. The lane qualifies whichever build is installed instead of pinning
+# one provider version; every table in one capture must still share
+# exactly one shape. A prefix of N tables of one shape attaches
+# N*(entries-2)+2 distinct targets (the 2 family targets shared).
 ADMITTED_PROXY_TABLE_SHAPES = {
-    (3, 0): {"entries": 92, "admitted_slots": 362},
-    (3, 1): {"entries": 92, "admitted_slots": 362},
-    (3, 2): {"entries": 104, "admitted_slots": 410},
+    (3, 0): {"entries": 92},
+    (3, 1): {"entries": 92},
+    (3, 2): {"entries": 104},
 }
-PROXY_TABLES = 64
+# Admitted SoftHSM2 table versions: the installed SoftHSM2 build publishes
+# its one table as 2.40 (Debian lane host) or 3.2 (Fedora lane host).
+ADMITTED_SOFTHSM_VERSIONS = {(2, 40), (3, 2)}
 # The installed build's shape, which the self-test fixture pins exactly.
+# Live captures parse (N, M) from their own prefix record instead.
+PROXY_TABLES = 67
 PROXY_TABLE_ENTRIES = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["entries"]
-PROXY_ADMITTED_TABLES = 4
-PROXY_ADMITTED_SLOTS = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["admitted_slots"]
-PROXY_SPILL = PROXY_TABLES - PROXY_ADMITTED_TABLES
-PROXY_DECODED_ENTRIES = PROXY_TABLES * PROXY_TABLE_ENTRIES
+PROXY_PREFIX_TABLES = 3
+PROXY_PREFIX_SLOTS = PROXY_PREFIX_TABLES * (PROXY_TABLE_ENTRIES - 2) + 2
+PROXY_SPILL = PROXY_TABLES - PROXY_PREFIX_TABLES
+PROXY_DECODED_ENTRIES = PROXY_SPILL * PROXY_TABLE_ENTRIES + PROXY_PREFIX_TABLES * 68
+# `LEGACY_PREFIX_SLOTS` (src/discovery/scan.rs): a short accept decodes the
+# known 68-entry prefix, never the declared layout.
+SHORT_PREFIX_SLOTS = 68
+# The prefix never takes the reserve (`shared_scope_reserve(512)`): with
+# the 68-slot backend admitted first, the prefix fills at most this many.
+PROXY_PREFIX_CEILING = MAX_SLOTS - 128
 
 SAFE_ALLOWANCES = {
     "semantic_capture_failures": 3,
@@ -573,7 +789,7 @@ def exact_attach_backend(backend, mechanisms, document, *, terminal=False):
     )
     require(fallback is None or backend["selection"] == "auto",
             f"only auto falls back: {backend!r}")
-    require(fallback is None or "uprobe-multi" not in mechanisms,
+    require(fallback is None or mechanisms is None or "uprobe-multi" not in mechanisms,
             f"a fallback session attached uprobe-multi: {backend!r} {mechanisms!r}")
     scope_filter = backend["scope_filter"]
     require(scope_filter in SCOPE_FILTERS, f"invalid scope filter: {backend!r}")
@@ -583,6 +799,19 @@ def exact_attach_backend(backend, mechanisms, document, *, terminal=False):
         pid_scope = document["capture"]["scope"] == "pid"
         require((scope_filter is not None) == pid_scope,
                 f"scope filter disagrees with the capture scope: {backend!r}")
+
+
+def exact_object_capture(status):
+    """P0-only ship vehicle: the closed build-scope disclosure. A stubbed
+    (v0.4.0) build disclaims attribute coverage with the finite
+    `not_enabled` reason; FULL builds report available with no reason."""
+    exact_keys(status, OBJECT_CAPTURE_KEYS, "object_capture")
+    require(isinstance(status["available"], bool),
+            f"invalid object capture availability: {status!r}")
+    require(status["reason"] in OBJECT_CAPTURE_REASONS,
+            f"invalid object capture reason: {status!r}")
+    require(status["available"] == (status["reason"] is None),
+            f"object capture availability disagrees with its reason: {status!r}")
 
 
 def exact_profile_v3_selection(document, *, terminal=False, run=False):
@@ -597,6 +826,8 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     else:
         evidence = document
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
+    if not terminal:
+        exact_counter_function_timing(document)
     exact_scheduling_evidence(evidence)
     exact_kernel_control(evidence)
     exact_task_uprobe_link_losses(evidence)
@@ -689,12 +920,10 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
                 tuple_,
             )
         elif tuple_["authority"] == "selection_count_only":
-            require(
-                tuple_["request"]["name"] == result["name"] == "exact_standard"
-                and result["version"] in {"v3_0", "v3_1", "v3_2"}
-                and result["flags"] in {"zero", "fork_safe"},
-                tuple_,
-            )
+            # Target pins and observed ordinals authorize counts independently
+            # of names, version labels and returned flag bits. A null table
+            # cannot supply such an observation; an unreadable header can.
+            require(result["version"] != "null", tuple_)
         else:
             require(tuple_["authority"] == "none", tuple_)
         for match in matches:
@@ -718,12 +947,13 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
         f"attach mechanisms disagree with attached probes: {mechanisms!r}",
     )
     exact_attach_backend(evidence["attach_backend"], mechanisms, document, terminal=terminal)
+    exact_object_capture(evidence["object_capture"])
     for field in ("pid_descendant_gaps", "multi_rebuild_gaps"):
         uint(evidence[field], U64_MAX, field)
     loss = (
         selection["selection_truncated"]
         or any(item["coverage"] not in {"observed", "absent_covered"} for item in providers)
-        or any(item["status"] not in {"present", "legacy_absent"} for item in exports)
+        or any(item["status"] not in {"present", "legacy_absent", "required_absent"} for item in exports)
         or any(item["authority"] == "selection_count_only" for item in tuples)
         or any(item["rv"] == 0 and item["authority"] == "none" for item in tuples)
         or evidence["pid_descendant_gaps"] != 0
@@ -771,9 +1001,23 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted -= RESIDUAL_EVIDENCE_KEYS
         wanted -= VERDICT_CLASS_KEYS
         wanted.discard("kernel_control")
+        wanted.discard("attach_backend")
+        wanted.discard("object_capture")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
+    if not historical and not terminal and "counter_collection" in evidence:
+        wanted.add("counter_collection")
+        exact_counter_collection(evidence["counter_collection"])
+    if not historical and not terminal and "selected_detail" in evidence:
+        wanted.add("selected_detail")
+        exact_selected_detail(evidence["selected_detail"])
+    if not historical and not terminal and "excluded_modules" in evidence:
+        wanted.add("excluded_modules")
+        exact_excluded_modules(evidence["excluded_modules"])
+    if not historical and not terminal and "unmatched_excludes" in evidence:
+        wanted.add("unmatched_excludes")
+        exact_unmatched_excludes(evidence["unmatched_excludes"])
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
@@ -785,6 +1029,337 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
+
+
+def exact_excluded_modules(value):
+    """The additive --exclude-module hit list: one closed row per distinct
+    excluded file (fstat identity plus the in-scope process count)."""
+    require(isinstance(value, list), f"excluded_modules must be an array: {value!r}")
+    for row in value:
+        exact_keys(row, EXCLUDED_MODULE_KEYS, "excluded_modules row")
+        require(isinstance(row["path"], str) and row["path"],
+                f"invalid excluded_modules.path: {row!r}")
+        require(u64(row["dev"]), f"invalid excluded_modules.dev: {row!r}")
+        require(u64(row["ino"]), f"invalid excluded_modules.ino: {row!r}")
+        require(u64(row["processes"], positive=True),
+                f"invalid excluded_modules.processes: {row!r}")
+
+
+def exact_unmatched_excludes(value):
+    """The additive --exclude-module miss list: operator inputs that matched
+    no mapped file, in operator order."""
+    require(isinstance(value, list) and all(isinstance(item, str) for item in value),
+            f"unmatched_excludes must be a string array: {value!r}")
+
+
+def exact_counter_collection(collection):
+    """Derived availability of the accepted cumulative snapshot, not intent."""
+    exact_keys(collection, COUNTER_COLLECTION_KEYS, "counter_collection")
+    require(collection["mode"] in ("counts", "timestamps", "latency"),
+            f"invalid counter mode: {collection!r}")
+    require(u64(collection["generation"]) and collection["generation"] > 0,
+            f"invalid counter generation: {collection!r}")
+    window = collection["read_window"]
+    if window is not None:
+        exact_keys(window, {"started_ns", "finished_ns"}, "counter read_window")
+        require(u64(window["started_ns"]) and u64(window["finished_ns"])
+                and window["started_ns"] <= window["finished_ns"],
+                f"invalid counter read_window: {window!r}")
+    require(type(collection["discontinuity"]) is bool,
+            f"invalid counter discontinuity: {collection!r}")
+    require(collection["status"] in ("fresh", "stale"),
+            f"invalid counter status: {collection!r}")
+    failure = collection["failure"]
+    require(failure is None or isinstance(failure, str) and failure in COUNTER_COLLECTION_FAILURES,
+            f"invalid counter failure: {collection!r}")
+    health = collection["health"]
+    if health is not None:
+        exact_keys(health, {"saturated", "contended"}, "counter health")
+        require(all(type(value) is bool for value in health.values()),
+                f"invalid counter health: {health!r}")
+    if collection["status"] == "fresh":
+        require(failure is None and health == {"saturated": False, "contended": False},
+                f"fresh counter collection must have accepted healthy rows: {collection!r}")
+    else:
+        require(failure is not None and health is None,
+                f"stale counter collection must retain a failure and unknown attempt health: {collection!r}")
+
+
+def exact_selected_detail(section):
+    """The additive 6.15 selection envelope: closed keys, finite refusal
+    and event vocabularies, no process identity. The selection record
+    names the requested endpoint plus its resolved slot (or the named
+    refusal); the window ledger rows, lineage and brackets follow."""
+    require(isinstance(section, dict), "selected_detail must be an object")
+    require(set(section) <= SELECTED_DETAIL_KEYS,
+            f"unexpected selected_detail keys: {sorted(set(section) - SELECTED_DETAIL_KEYS)}")
+    require(SELECTED_DETAIL_REQUIRED <= set(section),
+            f"missing selected_detail keys: {sorted(SELECTED_DETAIL_REQUIRED - set(section))}")
+    if "selection" in section:
+        exact_selected_detail_selection(section["selection"])
+    events = section["events"]
+    require(isinstance(events, list), "selected_detail events must be an array")
+    for row in events:
+        exact_selected_detail_event(row)
+    if "lineage" in section:
+        exact_selected_detail_lineage(section["lineage"])
+    if "aggregate" in section:
+        exact_selected_detail_bracket(section["aggregate"], detail=False)
+    if "detail" in section:
+        exact_selected_detail_bracket(section["detail"], detail=True)
+
+
+def exact_selected_detail_selection(selection):
+    require(isinstance(selection, dict), "selected_detail selection must be an object")
+    require(set(selection) <= SELECTED_DETAIL_SELECTION_KEYS,
+            f"unexpected selected_detail selection keys: "
+            f"{sorted(set(selection) - SELECTED_DETAIL_SELECTION_KEYS)}")
+    require(SELECTED_DETAIL_SELECTION_REQUIRED <= set(selection),
+            "selected_detail selection must name its endpoint")
+    require(isinstance(selection["endpoint"], str) and selection["endpoint"],
+            f"invalid selected endpoint: {selection!r}")
+    require(("slot" in selection) == ("file_offset" in selection),
+            f"selected slot and file_offset arrive together: {selection!r}")
+    if "slot" in selection:
+        uint(selection["slot"], U32_MAX, "selected_detail selection.slot")
+    if "file_offset" in selection:
+        require(u64(selection["file_offset"]),
+                f"invalid selected_detail selection.file_offset: {selection!r}")
+    if "names" in selection:
+        names = selection["names"]
+        require(isinstance(names, list) and names
+                and all(isinstance(name, str) and name for name in names),
+                f"invalid selected_detail selection.names: {selection!r}")
+    if "refusal" in selection:
+        require(selection["refusal"] in SELECTED_DETAIL_SELECTION_REFUSALS,
+                f"invalid selected_detail selection.refusal: {selection!r}")
+
+
+def exact_selected_detail_ids(row, label):
+    """The stable numeric ids every ledger row carries: the u64 request
+    serial plus the u32 caller/provider registry ids (never PIDs)."""
+    require(u64(row["request"]), f"invalid {label}.request: {row!r}")
+    uint(row["caller"], U32_MAX, f"{label}.caller")
+    uint(row["provider"], U32_MAX, f"{label}.provider")
+
+
+def exact_selected_detail_event(row):
+    require(isinstance(row, dict) and isinstance(row.get("event"), str),
+            f"selected_detail event must name itself: {row!r}")
+    event = row["event"]
+    if event in SELECTED_DETAIL_WINDOW_EVENTS:
+        allowed = set(SELECTED_DETAIL_WINDOW_ROW_KEYS) | {"note"}
+        require(set(row) <= allowed,
+                f"unexpected selected_detail {event} keys: {sorted(set(row) - allowed)}")
+        require(set(SELECTED_DETAIL_WINDOW_ROW_KEYS) <= set(row),
+                f"missing selected_detail {event} keys: {row!r}")
+        exact_selected_detail_ids(row, f"selected_detail {event}")
+        require(u64(row["seq"]), f"invalid selected_detail {event}.seq: {row!r}")
+        if "note" in row:
+            require(isinstance(row["note"], str),
+                    f"invalid selected_detail {event}.note: {row!r}")
+    elif event == "close_refused":
+        exact_keys(row, SELECTED_DETAIL_CLOSE_REFUSED_KEYS, "selected_detail close_refused")
+        exact_selected_detail_ids(row, "selected_detail close_refused")
+        require(u64(row["view"]), f"invalid selected_detail close_refused.view: {row!r}")
+        require(u64(row["endpoint_offset"]),
+                f"invalid selected_detail close_refused.endpoint_offset: {row!r}")
+        require(row["refusal"] in SELECTED_DETAIL_GATE_WORDS,
+                f"invalid selected_detail close_refused.refusal: {row!r}")
+    elif event == "reserve_refused":
+        exact_keys(row, SELECTED_DETAIL_RESERVE_REFUSED_KEYS, "selected_detail reserve_refused")
+        exact_selected_detail_ids(row, "selected_detail reserve_refused")
+        require(row["refusal"] in SELECTED_DETAIL_ADAPTER_WORDS,
+                f"invalid selected_detail reserve_refused.refusal: {row!r}")
+        require(row["seq"] is None or u64(row["seq"]),
+                f"invalid selected_detail reserve_refused.seq: {row!r}")
+    elif event == "start_refused":
+        exact_keys(row, SELECTED_DETAIL_START_REFUSED_KEYS, "selected_detail start_refused")
+        exact_selected_detail_ids(row, "selected_detail start_refused")
+        require(row["reason"] in SELECTED_DETAIL_REFUSAL_LABELS,
+                f"invalid selected_detail start_refused.reason: {row!r}")
+    elif event == "promotion_outcome":
+        require(row.get("outcome") in SELECTED_DETAIL_OUTCOMES,
+                f"invalid selected_detail promotion_outcome.outcome: {row!r}")
+        outcome = row["outcome"]
+        if outcome == "active":
+            exact_keys(row, {"event", "request", "outcome", "caller", "provider"},
+                       "selected_detail promotion_outcome")
+            require(u64(row["request"]),
+                    f"invalid selected_detail promotion_outcome.request: {row!r}")
+            uint(row["caller"], U32_MAX, "selected_detail promotion_outcome.caller")
+            uint(row["provider"], U32_MAX, "selected_detail promotion_outcome.provider")
+        else:
+            exact_keys(row, {"event", "request", "outcome", "reason"},
+                       "selected_detail promotion_outcome")
+            require(u64(row["request"]),
+                    f"invalid selected_detail promotion_outcome.request: {row!r}")
+            vocabulary = (SELECTED_DETAIL_REFUSAL_LABELS if outcome == "refused"
+                          else SELECTED_DETAIL_END_LABELS)
+            require(row["reason"] in vocabulary,
+                    f"invalid selected_detail promotion_outcome.reason: {row!r}")
+    else:
+        raise AssertionError(f"unknown selected_detail event: {event!r}")
+
+
+def exact_selected_detail_mark(mark, label):
+    exact_keys(mark, SELECTED_DETAIL_MARK_KEYS, label)
+    require(u64(mark["seq"]), f"invalid {label}.seq: {mark!r}")
+    require(u64(mark["generation"], positive=True),
+            f"invalid {label}.generation: {mark!r}")
+    require(isinstance(mark["indices"], list)
+            and all(isinstance(index, int) and not isinstance(index, bool)
+                    and 0 <= index <= U32_MAX for index in mark["indices"]),
+            f"invalid {label}.indices: {mark!r}")
+    require(isinstance(mark["bank_ids"], list)
+            and all(isinstance(pair, list) and len(pair) == 2
+                    and all(isinstance(bank, int) and not isinstance(bank, bool)
+                            and 0 <= bank <= U32_MAX for bank in pair)
+                    for pair in mark["bank_ids"]),
+            f"invalid {label}.bank_ids: {mark!r}")
+    require(mark["transaction"] is None or u64(mark["transaction"], positive=True),
+            f"invalid {label}.transaction: {mark!r}")
+
+
+def exact_selected_detail_drift(drift):
+    require(isinstance(drift, dict) and drift.get("kind") in SELECTED_DETAIL_DRIFT_KINDS,
+            f"invalid selected_detail lineage.drift: {drift!r}")
+    kind = drift["kind"]
+    if kind == "generation":
+        exact_keys(drift, {"kind", "before", "after"}, "selected_detail drift")
+        require(u64(drift["before"], positive=True) and u64(drift["after"], positive=True),
+                f"invalid selected_detail drift: {drift!r}")
+    elif kind == "indices":
+        exact_keys(drift, {"kind", "before", "after"}, "selected_detail drift")
+        for side in ("before", "after"):
+            require(isinstance(drift[side], list)
+                    and all(isinstance(index, int) and not isinstance(index, bool)
+                            and 0 <= index <= U32_MAX for index in drift[side]),
+                    f"invalid selected_detail drift.{side}: {drift!r}")
+    elif kind == "bank_ids":
+        exact_keys(drift, {"kind", "bank", "before", "after"}, "selected_detail drift")
+        uint(drift["bank"], U32_MAX, "selected_detail drift.bank")
+        for side in ("before", "after"):
+            require(drift[side] is None
+                    or (isinstance(drift[side], int) and not isinstance(drift[side], bool)
+                        and 0 <= drift[side] <= U32_MAX),
+                    f"invalid selected_detail drift.{side}: {drift!r}")
+    else:
+        exact_keys(drift, {"kind", "before", "after"}, "selected_detail drift")
+        for side in ("before", "after"):
+            require(drift[side] is None or u64(drift[side], positive=True),
+                    f"invalid selected_detail drift.{side}: {drift!r}")
+
+
+def exact_selected_detail_lineage(lineage):
+    exact_keys(lineage, SELECTED_DETAIL_LINEAGE_KEYS, "selected_detail lineage")
+    require(u64(lineage["request"]), f"invalid selected_detail lineage.request: {lineage!r}")
+    uint(lineage["caller"], U32_MAX, "selected_detail lineage.caller")
+    uint(lineage["provider"], U32_MAX, "selected_detail lineage.provider")
+    require(u64(lineage["view"]), f"invalid selected_detail lineage.view: {lineage!r}")
+    require(u64(lineage["endpoint_offset"]),
+            f"invalid selected_detail lineage.endpoint_offset: {lineage!r}")
+    uint(lineage["broad_original_index"], U32_MAX, "selected_detail lineage.broad_original_index")
+    require(u64(lineage["broad_generation"], positive=True),
+            f"invalid selected_detail lineage.broad_generation: {lineage!r}")
+    require(u64(lineage["detail_generation"]),
+            f"invalid selected_detail lineage.detail_generation: {lineage!r}")
+    require(u64(lineage["broad_read_seq_before"]),
+            f"invalid selected_detail lineage.broad_read_seq_before: {lineage!r}")
+    require(u64(lineage["broad_read_seq_after"]),
+            f"invalid selected_detail lineage.broad_read_seq_after: {lineage!r}")
+    exact_selected_detail_mark(lineage["broad_mark_before"], "selected_detail lineage.mark_before")
+    exact_selected_detail_mark(lineage["broad_mark_after"], "selected_detail lineage.mark_after")
+    require(lineage["drift"] is None or isinstance(lineage["drift"], dict),
+            f"invalid selected_detail lineage.drift: {lineage!r}")
+    if lineage["drift"] is not None:
+        exact_selected_detail_drift(lineage["drift"])
+    require(lineage["after_read"] in SELECTED_DETAIL_AFTER_READS,
+            f"invalid selected_detail lineage.after_read: {lineage!r}")
+
+
+def exact_selected_detail_rv_counts(counts, label):
+    """Return-value rows keyed by the canonical decimal u64 the
+    collector renders (serde integer-map keys, no leading zeros);
+    possibly empty, never negative."""
+    require(isinstance(counts, dict), f"invalid {label}: {counts!r}")
+    for key, value in counts.items():
+        require(isinstance(key, str) and len(key) <= 20
+                and re.fullmatch(r"0|[1-9][0-9]*", key) is not None
+                and int(key) <= U64_MAX and u64(value),
+                f"invalid {label}[{key!r}]: {value!r}")
+
+
+def exact_selected_detail_row(row, mode, label):
+    wanted = set(SELECTED_DETAIL_ROW_BASE_KEYS)
+    if mode in ("timestamps", "latency"):
+        wanted |= {"total_ns", "max_ns"}
+    if mode == "latency":
+        wanted.add("buckets")
+    exact_keys(row, wanted, label)
+    uint(row["slot"], U32_MAX, f"{label}.slot")
+    uint(row["object"], U32_MAX, f"{label}.object")
+    require(u64(row["file_offset"]), f"invalid {label}.file_offset: {row!r}")
+    for field in ("entered", "returned", "errors"):
+        require(u64(row[field]), f"invalid {label}.{field}: {row!r}")
+    exact_selected_detail_rv_counts(row["rv_counts"], f"{label}.rv_counts")
+    if mode in ("timestamps", "latency"):
+        require(u64(row["total_ns"]), f"invalid {label}.total_ns: {row!r}")
+        require(u64(row["max_ns"]), f"invalid {label}.max_ns: {row!r}")
+    if mode == "latency":
+        require(isinstance(row["buckets"], list)
+                and len(row["buckets"]) == SELECTED_DETAIL_LATENCY_BUCKETS
+                and all(u64(bucket) for bucket in row["buckets"]),
+                f"invalid {label}.buckets: {row!r}")
+
+
+def exact_selected_detail_bracket(fragment, *, detail):
+    """One close bracket: scope-wide aggregate rows or the selected
+    child's own detail rows. Same cells, separate units, never summed."""
+    keys = SELECTED_DETAIL_DETAIL_KEYS if detail else SELECTED_DETAIL_AGGREGATE_KEYS
+    exact_keys(fragment, keys, "selected_detail detail" if detail else "selected_detail aggregate")
+    label = "selected_detail detail" if detail else "selected_detail aggregate"
+    require(fragment["scope"] == ("detail" if detail else "broad"),
+            f"invalid {label}.scope: {fragment!r}")
+    require(fragment["unit"] == "calls", f"invalid {label}.unit: {fragment!r}")
+    require(fragment["mode"] in SELECTED_DETAIL_MODES,
+            f"invalid {label}.mode: {fragment!r}")
+    if detail:
+        require(u64(fragment["detail_generation"]),
+                f"invalid {label}.detail_generation: {fragment!r}")
+    else:
+        require(u64(fragment["seq_before"]), f"invalid {label}.seq_before: {fragment!r}")
+        require(u64(fragment["seq_after"]), f"invalid {label}.seq_after: {fragment!r}")
+    require(type(fragment["mode_mixed"]) is bool,
+            f"invalid {label}.mode_mixed: {fragment!r}")
+    require(isinstance(fragment["rows"], list), f"invalid {label}.rows: {fragment!r}")
+    for row in fragment["rows"]:
+        exact_selected_detail_row(row, fragment["mode"], f"{label}.row")
+
+
+def exact_counter_function_timing(document):
+    """Counter mode describes the accepted rows' existing timing capability."""
+    collection = document["evidence"].get("counter_collection")
+    if collection is None:
+        return
+    mode = collection["mode"]
+    require(isinstance(document["functions"], list), "counter functions must be an array")
+    for row in document["functions"]:
+        require(isinstance(row, dict) and "latency_ns" in row,
+                "counter function must state timing availability")
+        timing = row["latency_ns"]
+        if mode == "counts":
+            require(timing is None, "counts function cannot publish measured timing")
+            continue
+        exact_keys(timing, {"approximate", "p50", "p95", "p99", "total", "max"},
+                   "counter function timing")
+        require(timing["approximate"] is (mode == "latency"),
+                "counter mode disagrees with function percentile availability")
+        require(u64(timing["total"]) and u64(timing["max"]),
+                "counter timing totals must be measured u64 values")
+        for field in ("p50", "p95", "p99"):
+            require(timing[field] is None or mode == "latency" and u64(timing[field]),
+                    "counter function percentile disagrees with measurement capability")
 
 
 def selection_tuple_key(tuple_):
@@ -850,6 +1425,11 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+    exact_counter_function_timing(document)
+    # Metrics exposes the actual Session backend/filter without publishing
+    # profile-only successful-link mechanisms or selection verdict authority.
+    exact_attach_backend(document["evidence"]["attach_backend"], None, document)
+    exact_object_capture(document["evidence"]["object_capture"])
     exact_scheduling_evidence(document["evidence"])
     exact_kernel_control(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
@@ -1123,15 +1703,18 @@ def exact_task_uprobe_link_losses(evidence):
 def loader_discovery_complete(loader):
     """render.rs `LoaderDiscovery::complete`: only neutral strategies,
     qualified pre-constructor or pause-protected timing, and eligible or
-    pause-protected initial sets; dlopen timing is a gap only once a load
-    happened (hits > 0)."""
+    pause-protected initial sets; dlopen timing is a gap only while a hit
+    is unaccounted. Fully benign hits do not gate exactness even with
+    unproven timing; a missing `benign_hits` defaults to zero so old
+    reports verify under the old rule."""
     def timing_gaps(timing):
         return timing["known_pre_relocation"] + timing["unproven"] + timing["none"]
 
+    benign_hits = loader.get("benign_hits", 0)
     return (
         loader["strategies"]["dlopen_return"] == 0
         and loader["strategies"]["unavailable"] == 0
-        and (loader["hits"] == 0 or timing_gaps(loader["dlopen_timing"]) == 0)
+        and (benign_hits == loader["hits"] or timing_gaps(loader["dlopen_timing"]) == 0)
         and timing_gaps(loader["initial_set_timing"]) == 0
         and loader["initial_set_capture"]["none"] == 0
         and loader["state_read_failures"] == 0
@@ -1143,7 +1726,7 @@ def selection_observation_complete(selection):
     return (
         not selection["selection_truncated"]
         and all(p["coverage"] in ("observed", "absent_covered") for p in selection["providers"])
-        and all(e["status"] in ("present", "legacy_absent") for e in selection["standard_exports"])
+        and all(e["status"] in ("present", "legacy_absent", "required_absent") for e in selection["standard_exports"])
         and all(
             not (
                 t["rv"] == 0
@@ -1201,6 +1784,7 @@ def expected_gap_classes(evidence):
             ("discovery_truncated", evidence["discovery_truncated"] > 0),
             ("task_uprobe_link_losses", evidence["task_uprobe_link_losses"] > 0),
             ("pause_partial", evidence["pause_partial"] > 0),
+            ("pause_unavailable", evidence["pause_unavailable"] > 0),
             ("loader_discovery", not loader_discovery_complete(evidence["loader_discovery"])),
             ("scheduling.terminal_drain_truncated", scheduling["terminal_drain_truncated"] is True),
             (
@@ -1217,6 +1801,7 @@ def expected_gap_classes(evidence):
             ("module_ambiguous", evidence["module_ambiguous"] > 0),
             ("module_unresolved_slots", evidence["module_unresolved_slots"] > 0),
             ("unregistered_mechanisms", evidence["unregistered_mechanisms"] > 0),
+            ("unpublished_mechanisms", evidence["unpublished_mechanisms"] > 0),
             ("discovery_conflicts", evidence["discovery_conflicts"] > 0),
             ("discovery_uncorroborated", evidence["discovery_uncorroborated"] > 0),
         ],
@@ -1246,6 +1831,11 @@ def expected_gap_classes(evidence):
         gates["attribution"].append((
             "interface_selection.selection_count_only",
             any(t["authority"] == "selection_count_only" for t in selection["tuples"]),
+        ))
+    collection = evidence.get("counter_collection")
+    if collection is not None:
+        gates["observation"].append((
+            "counter_collection", collection["status"] == "stale" or collection["discontinuity"],
         ))
     causes = {name: [cause for cause, hit in gate if hit] for name, gate in gates.items()}
     if causes["semantics"]:
@@ -1479,6 +2069,101 @@ def semantic_join_eligible(function, module, *, has_manifest_object_fallback):
     )
 
 
+def exact_prearm_keys(module):
+    """Packet 6.13 additive keys: `watch`, `attached_at_ns`,
+    `unobserved_windows`. Absent unless pre-arm named the module; present
+    keys must match the frozen shapes."""
+    if "watch" in module:
+        watch = module["watch"]
+        require(
+            isinstance(watch, dict)
+            and {"since_ns", "state"} <= set(watch)
+            and set(watch) <= WATCH_KEYS,
+            f"invalid watch keys: {module}",
+        )
+        require(
+            watch["state"] in ALLOWED_WATCH_STATES,
+            f"invalid watch state: {module}",
+        )
+        require(
+            watch["since_ns"] is None or u64(watch["since_ns"]),
+            f"invalid watch since_ns: {module}",
+        )
+        if "until_ns" in watch:
+            require(u64(watch["until_ns"]), f"invalid watch until_ns: {module}")
+        if "ended_by" in watch:
+            require(
+                watch["ended_by"] in ALLOWED_WATCH_ENDS,
+                f"invalid watch ended_by: {module}",
+            )
+        if "changed" in watch:
+            changed = watch["changed"]
+            require(
+                isinstance(changed, dict) and set(changed) == WATCH_CHANGED_KEYS,
+                f"invalid watch changed keys: {module}",
+            )
+            require(
+                u64(changed["last_ok_ns"])
+                and u64(changed["detected_ns"])
+                and u64(changed["previous_ino"])
+                and changed["last_ok_ns"] <= changed["detected_ns"],
+                f"invalid watch changed bracket: {module}",
+            )
+        # Interval ordering and state/end coherence. The legitimate
+        # clock-unknown end (`ended` + `attached`, no stamps) stays valid:
+        # only invented or contradictory shapes are rejected.
+        since = watch["since_ns"]
+        until = watch.get("until_ns")
+        state = watch["state"]
+        ended_by = watch.get("ended_by")
+        if since is not None and until is not None:
+            require(since <= until, f"invalid watch interval: {module}")
+        if state in ("armed", "armed_idle"):
+            require(since is not None, f"invalid watch arm: {module}")
+        if state in ("pinned_unarmed", "unavailable"):
+            require(since is None, f"invalid watch arm: {module}")
+        if state == "ended":
+            require(ended_by is not None, f"invalid watch end: {module}")
+        if ended_by is not None:
+            require(
+                state in ("ended", "armed_idle"),
+                f"invalid watch end: {module}",
+            )
+        if state == "armed_idle" and ended_by is not None:
+            require(
+                ended_by in ("scope_end", "stop"),
+                f"invalid watch end: {module}",
+            )
+        if until is not None:
+            require(ended_by is not None, f"invalid watch end: {module}")
+        if "changed" in watch:
+            require(
+                state == "ended" and ended_by == "object_changed",
+                f"invalid watch changed: {module}",
+            )
+    if "attached_at_ns" in module:
+        attached = module["attached_at_ns"]
+        require(
+            attached is None or u64(attached),
+            f"invalid attached_at_ns: {module}",
+        )
+    if "unobserved_windows" in module:
+        windows = module["unobserved_windows"]
+        require(isinstance(windows, list), f"invalid unobserved_windows: {module}")
+        for window in windows:
+            require(
+                isinstance(window, dict) and set(window) == UNOBSERVED_WINDOW_KEYS,
+                f"invalid unobserved window keys: {module}",
+            )
+            require(
+                u64(window["start_ns"])
+                and u64(window["end_ns"])
+                and window["start_ns"] <= window["end_ns"]
+                and window["reason"] in ALLOWED_UNOBSERVED_REASONS,
+                f"invalid unobserved window: {module}",
+            )
+
+
 def exact_discovery_semantics(evidence):
     conflicts = 0
     for module in evidence["discovery"]:
@@ -1503,6 +2188,14 @@ def exact_discovery_semantics(evidence):
             }
         elif sources == ["manifest"]:
             source_outcomes_ok = outcome_set == {"uncorroborated"}
+        elif sources == ["prearm"]:
+            # Packet 6.13: a pin is custody, never coverage — pre-arm-only
+            # reads uncorroborated, like manifest-only.
+            source_outcomes_ok = outcome_set == {"uncorroborated"}
+        elif sources == ["manifest", "prearm"]:
+            # No scan pairing (else "scan" would be a source), so every
+            # manifest outcome is uncorroborated and pre-arm adds none.
+            source_outcomes_ok = outcome_set == {"uncorroborated"}
         else:
             source_outcomes_ok = not outcome_set.intersection(
                 {"single_source", "uncorroborated"}
@@ -1521,6 +2214,7 @@ def exact_discovery_semantics(evidence):
             source = table["source"]
             require(source in ALLOWED_TABLE_SOURCES, f"invalid table source: {table}")
             require(source in module["sources"], f"table source absent from module: {module}")
+        exact_prearm_keys(module)
     require(
         evidence["discovery_conflicts"] == conflicts,
         f"discovery_conflicts: want {conflicts}, got {evidence['discovery_conflicts']}",
@@ -1663,6 +2357,101 @@ def table_signature(evidence):
         (table["source"], tuple(table["version"]), table["entries"])
         for table in evidence["discovery"][0]["tables"]
     )
+
+
+def version_canary_scan_shape(evidence, target_bits):
+    """Keep the fixed matrix union exact and validate recovered raw prefixes.
+
+    The controlled fixture's file/BSS boundary varies by ABI/linker layout.
+    Same-base views require their independent export witnesses; other raw
+    tables cannot overlap. Partial LP64 tails must end at the page boundary.
+    """
+    require(len(evidence["discovery"]) == 1, "version fixture needs one provider")
+    module = evidence["discovery"][0]
+    tables = module["tables"]
+    for table in tables:
+        version = table["version"]
+        require(isinstance(version, list) and len(version) == 2
+                and all(type(part) is int and 0 <= part <= 255 for part in version),
+                "invalid version fixture table metadata")
+        require(u64(table["entries"]), "invalid version fixture table extent")
+    base_tables = (VERSION_TABLES_SCANNED_IA32 if target_bits == 32
+                   else VERSION_TABLES_SCANNED)
+    base_surfaces = (VERSION_SURFACES_SCANNED_IA32 if target_bits == 32
+                     else VERSION_SURFACES_SCANNED)
+    actual = table_signature(evidence)
+    require(not base_tables - actual, "version fixture lost a required table")
+    extra = actual - base_tables
+    for (source, version, count), multiplicity in extra.items():
+        allowed = (version == (3, 1) and 0 < count <= 92 if target_bits == 64
+                   else (version, count) in {((3, 2), 68), ((4, 0), 68), ((4, 0), 92)})
+        require(source == "scan" and multiplicity == 1 and allowed,
+                "unrelated or duplicate version fixture table")
+    if target_bits == 64:
+        counts = sorted(count for (_, _, count) in extra)
+        require(len(counts) <= 1 or (len(counts) == 2 and counts[0] == 68 and counts[1] >= 70),
+                "unrelated terminal fixture prefixes")
+
+    word = target_bits // 8
+    groups = {}
+    raw = [table for table in tables if table["source"] == "scan"]
+    for table in raw:
+        offset, count = table.get("file_offset"), table["entries"]
+        require(u64(offset) and offset % word == 0, "invalid raw table offset")
+        end = offset + word * (count + 1)
+        require(u64(end), "raw table extent overflows")
+        groups.setdefault(offset, []).append(table)
+
+    def anchored(table, wanted):
+        require(table.get("linkage") == "heuristic"
+                and type(table.get("exports_agreeing")) is int
+                and table["exports_agreeing"] == wanted,
+                "recovered fixture prefix lacks its independent export witness")
+
+    for views in groups.values():
+        if len(views) == 1:
+            continue
+        ordered_views = sorted(views, key=lambda table: table["entries"])
+        version = [3, 1] if target_bits == 64 else [4, 0]
+        # The three fixture exports occupy ordinals3,68,69: a69-word
+        # observation cannot witness the third export at ordinal69.
+        require(len(ordered_views) == 2 and all(table["version"] == version for table in views)
+                and ordered_views[0]["entries"] == 68 and 70 <= ordered_views[1]["entries"] <= 92,
+                "duplicate or conflicting same-base fixture views")
+        anchored(ordered_views[0], 1)
+        anchored(ordered_views[1], 3)
+    ordered = sorted((offset, max(offset + word * (table["entries"] + 1) for table in views))
+                     for offset, views in groups.items())
+    require(all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:])),
+            "duplicate or overlapping raw fixture tables")
+    if not extra:
+        return base_surfaces, base_tables
+
+    added_surfaces = Counter()
+    for prefix in raw:
+        version, count = tuple(prefix["version"]), prefix["entries"]
+        if ("scan", version, count) not in extra:
+            continue
+        offset = prefix["file_offset"]
+        paired = len(groups[offset]) == 2
+        walk = "known_prefix" if target_bits == 32 or paired or count < 92 else "full"
+        if target_bits == 64:
+            require(offset == ordered[-1][0], "fixture prefix is not the terminal raw table")
+            if count < 92 and not (paired and count == 68):
+                page = os.sysconf("SC_PAGE_SIZE")
+                require(word * (count + 1) == page - offset % page,
+                        "partial fixture prefix does not end at its page boundary")
+        else:
+            anchored(prefix, 3 if count == 92 else 1)
+            if count == 92:
+                require(paired, "recovered extension lacks its same-base common prefix")
+        # A complete92 row may cross pages: no VMA-end witness is published.
+        require(sum(surface == {"source": module["path"] + f" table {version[0]}.{version[1]}",
+                                "acquisition": "ok", "walk": walk, "functions": count}
+                    for surface in evidence["surfaces"]) == 1,
+                "recovered fixture prefix lacks its exact source surface")
+        added_surfaces[walk, count] += 1
+    return base_surfaces + added_surfaces, base_tables + extra
 
 
 def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interface_list):
@@ -1846,7 +2635,11 @@ def exact_loader_discovery(evidence):
     aggregate = evidence["loader_discovery"]
     require(isinstance(aggregate, dict), f"loader_discovery is not an object: {aggregate!r}")
     require(
-        set(aggregate) == set(LOADER_DISCOVERY_GROUPS) | set(LOADER_DISCOVERY_COUNTERS),
+        set(aggregate) == set(LOADER_DISCOVERY_GROUPS) | set(LOADER_DISCOVERY_COUNTERS)
+        or set(aggregate)
+        == set(LOADER_DISCOVERY_GROUPS)
+        | set(LOADER_DISCOVERY_COUNTERS)
+        | set(LOADER_DISCOVERY_OPTIONAL_COUNTERS),
         f"loader_discovery key set: {sorted(aggregate)}",
     )
     for group, keys in LOADER_DISCOVERY_GROUPS.items():
@@ -1865,10 +2658,19 @@ def exact_loader_discovery(evidence):
             require(u64(value[key]), f"loader_discovery.{group}.{key}: {value[key]!r}")
     for counter in LOADER_DISCOVERY_COUNTERS:
         require(u64(aggregate[counter]), f"loader_discovery.{counter}: {aggregate[counter]!r}")
+    for counter in LOADER_DISCOVERY_OPTIONAL_COUNTERS:
+        if counter in aggregate:
+            require(u64(aggregate[counter]), f"loader_discovery.{counter}: {aggregate[counter]!r}")
+    require(
+        aggregate.get("benign_hits", 0) <= aggregate["hits"],
+        f"loader_discovery benign_hits above hits: {aggregate.get('benign_hits', 0)} > {aggregate['hits']}",
+    )
     # Every exact bound context is counted once as a strategy and once in
     # exactly one timing group, and an initial-set context additionally states
     # its capture outcome. `hits` and `state_read_failures` are BPF counters
-    # over records, not contexts, and are deliberately unconstrained here.
+    # over records, not contexts, and are deliberately unconstrained here;
+    # `benign_hits` is a userspace classification over the same records,
+    # bounded above by `hits` only.
     strategies = sum(aggregate["strategies"].values())
     dlopen = sum(aggregate["dlopen_timing"].values())
     initial_set = sum(aggregate["initial_set_timing"].values())
@@ -1908,13 +2710,21 @@ def exact_live_discovery_evidence(evidence, *, run=False):
     require(evidence["pause"] in PAUSE_VALUES, f"pause: {evidence['pause']!r}")
     for counter in PAUSE_COUNTERS:
         require(u64(evidence[counter]), f"{counter}: {evidence[counter]!r}")
-    attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
+    attempts, confirmed, partial, unavailable = (
+        evidence[name] for name in PAUSE_COUNTERS
+    )
     require(
-        confirmed + partial == attempts,
-        f"pause counters do not add up: {attempts} != {confirmed} + {partial}",
+        confirmed + partial + unavailable == attempts,
+        f"pause counters do not add up: {attempts} != {confirmed} + {partial} + {unavailable}",
     )
     # The published value is exactly the lattice, never an independent label.
-    wanted = "none" if attempts == 0 else "partial" if partial else "sigstop"
+    wanted = (
+        "none"
+        if attempts == 0
+        else "partial"
+        if (partial or unavailable)
+        else "sigstop"
+    )
     require(evidence["pause"] == wanted, f"pause: want {wanted}, got {evidence['pause']}")
     for counter in DISCOVERY_LOSS_COUNTERS:
         require(u64(evidence[counter]), f"{counter}: {evidence[counter]!r}")
@@ -2223,6 +3033,8 @@ def exact_capture_modules(document):
 ADMITTED_GROWTH_PREFIX = "admitted module needs "
 
 
+# Live caller outside this file: scripts/matrix/verify-proxy-stack.sh's nested
+# exports lane calls this with growth_path=None (no growth record allowed).
 def exact_admitted_growth_skips(evidence, growth_path=None):
     """`modules_skipped` holds only G-03 growth records for `growth_path`.
 
@@ -2249,21 +3061,61 @@ def exact_admitted_growth_skips(evidence, growth_path=None):
     return len(skips)
 
 
-def validate_proxy_capacity_fallback(document, module_path=None):
-    """The exact p11-kit-bounded/SoftHSM2-attached live shape.
+PREFIX_RECORD_RE = re.compile(r"^(\d+) of (\d+) template tables attached")
 
-    This is the p11-kit proxy lane's *expected* outcome, not a fallback. The
-    installed libp11-kit maps 64 static 3.x closure templates into the
+
+def exact_prefix_skips(evidence, prefix_path=None):
+    """`modules_skipped` holds exactly the heuristic-prefix record for `prefix_path`.
+
+    With `prefix_path` None no record is allowed. The record names how many
+    leading template tables attached out of how many decoded (N of M); a
+    record makes the document PARTIAL. Anything else — a whole-module
+    refusal, an admitted-growth record, a record for another module — fails:
+    a non-closure refusal or omission fails the lane (I2). Returns (N, M).
+    """
+    skips = evidence["modules_skipped"]
+    require(isinstance(skips, list), f"invalid modules_skipped: {skips!r}")
+    if prefix_path is None:
+        require(skips == [], f"prefix records allowed none: {skips!r}")
+        return None
+    require(len(skips) == 1, f"exactly one prefix record: {skips!r}")
+    skip = skips[0]
+    require(
+        isinstance(skip, dict)
+        and skip.get("name") == prefix_path
+        and isinstance(skip.get("reason"), str),
+        f"modules_skipped allows only the prefix record for {prefix_path!r}: {skip!r}",
+    )
+    match = PREFIX_RECORD_RE.match(skip["reason"])
+    require(match is not None, f"not a prefix record: {skip['reason']!r}")
+    tables, total = int(match.group(1)), int(match.group(2))
+    require(0 < tables < total, f"prefix record names no leading tables: {skip['reason']!r}")
+    require(
+        evidence["completeness"] == "PARTIAL",
+        f"a prefix record forces PARTIAL: {evidence['completeness']!r}",
+    )
+    return (tables, total)
+
+
+def validate_proxy_capacity_fallback(document, module_path=None):
+    """The exact p11-kit-prefix/SoftHSM2-attached live shape.
+
+    This is the p11-kit proxy lane's *expected* outcome, not a fallback.
+    The installed libp11-kit maps M static 3.x closure templates into the
     scanned image — one of ADMITTED_PROXY_TABLE_SHAPES, e.g. 3.2/104-entry
-    (6530 distinct targets) on the lane host. Since Task 1.2 the K=4
-    per-object heuristic cap admits 4 tables (410 distinct targets at
-    3.2/104) and records the other 60 as
+    (6836 distinct targets over 67 templates) on the lane hosts. The
+    late-start closure takes the reserve-capped heuristic prefix: the
+    leading N tables attach (N*(entries-2)+2 distinct targets, the 2
+    family targets shared — 308 at 3.2/104) and the other M-N spill as
     `discovery_uncorroborated_candidates` — spill is evidence, never slots
-    — so the proxy module is NOT refused whole: both providers attach (478
-    slots at 3.2/104), nothing is skipped, and every slot is scan-only
-    `unknown` (1.3 mislabel guard). `module_path`, when the caller controls
-    it, pins the directly-attached SoftHSM2 module by the exact path the
-    lane configured rather than by a substring.
+    — so the proxy module carries exactly one prefix record ("N of M
+    template tables attached"): SoftHSM2 attaches in full first (68 slots),
+    then the prefix (308 slots at 3.2/104, 376 total), every prefix slot scan-only
+    `unknown` (1.3 mislabel guard). (N, M) parse from the capture's own
+    record; the installed build's shape is pinned only by the self-test
+    fixture. `module_path`, when the caller controls it, pins the
+    directly-attached SoftHSM2 module by the exact path the lane configured
+    rather than by a substring.
     """
     exact_metrics_schema(document)
     exact_capture_modules(document)
@@ -2293,7 +3145,14 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         f"manifest-free proxy lane attested slot semantics: "
         f"{evidence['semantic_unverified_slots']} of {evidence['slots']} unverified",
     )
-    require(evidence["skipped"] == [], evidence["skipped"])
+    # Ambient discovery races (a mapping that exits mid-scan) are recorded
+    # but never fail the lane; anything else skipped is a real gap.
+    for skip in evidence["skipped"]:
+        require(
+            skip.get("name") == "discovery subject"
+            and skip.get("reason") == "discovery unavailable",
+            f"non-ambient skip: {skip!r}",
+        )
 
     modules = document["capture"]["modules"]
     require(len(modules) == 2, [module["path"] for module in modules])
@@ -2311,8 +3170,11 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     )
     soft_id = {key: soft[key] for key in ("dev", "ino", "sha256")}
     proxy_id = {key: proxy[key] for key in ("dev", "ino", "sha256")}
-    # G-03: the capped proxy may carry its admitted-growth record, nothing else.
-    exact_admitted_growth_skips(evidence, growth_path=proxy["path"])
+    # First-plan prefix: the late-start proxy carries exactly its prefix
+    # record, nothing else — any non-closure refusal or omission fails (I2).
+    # (N, M) below are the record's own counts, the shape authority for
+    # every pin that follows.
+    prefix_tables, proxy_total = exact_prefix_skips(evidence, prefix_path=proxy["path"])
 
     discovery = evidence["discovery"]
     require(len(discovery) == 2, [module["path"] for module in discovery])
@@ -2342,19 +3204,22 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     # heuristic, and their slots stay `unknown`.
     soft_tables = by_path[soft["path"]]["tables"]
     require(len(soft_tables) == 1, soft_tables)
+    soft_version = soft_tables[0]["version"]
     require(
-        {key: soft_tables[0][key] for key in ("version", "entries", "source")}
-        == {"version": [2, 40], "entries": 68, "source": "scan"},
+        {key: soft_tables[0][key] for key in ("entries", "source")}
+        == {"entries": 68, "source": "scan"}
+        and isinstance(soft_version, list)
+        and tuple(soft_version) in ADMITTED_SOFTHSM_VERSIONS,
         soft_tables,
     )
     require(soft_tables[0]["linkage"] == "exports", soft_tables)
     require(soft_tables[0]["exports_agreeing"] == 68, soft_tables)
     require(u64(soft_tables[0]["file_offset"]), soft_tables)
     proxy_tables = by_path[proxy["path"]]["tables"]
-    require(len(proxy_tables) == PROXY_TABLES, len(proxy_tables))
+    require(len(proxy_tables) == proxy_total, len(proxy_tables))
     offsets = set()
     shape = None
-    for table in proxy_tables:
+    for index, table in enumerate(proxy_tables):
         version = table["version"]
         require(
             isinstance(version, list)
@@ -2363,33 +3228,42 @@ def validate_proxy_capacity_fallback(document, module_path=None):
             f"proxy table version is not a [major, minor] pair: {table}",
         )
         key = tuple(version)
-        require(
-            key in ADMITTED_PROXY_TABLE_SHAPES
-            and table["entries"] == ADMITTED_PROXY_TABLE_SHAPES[key]["entries"]
-            and table["source"] == "scan",
-            table,
-        )
+        require(key in ADMITTED_PROXY_TABLE_SHAPES, table)
         if shape is None:
             shape = key
         require(key == shape, f"proxy tables mix provider builds: {shape} vs {key}")
+        # The leading N tables short-accept their known prefix (the
+        # attached prefix); the spilled rest decode their full layout.
+        want_entries = (
+            SHORT_PREFIX_SLOTS
+            if index < prefix_tables
+            else ADMITTED_PROXY_TABLE_SHAPES[key]["entries"]
+        )
+        require(
+            table["entries"] == want_entries and table["source"] == "scan",
+            table,
+        )
         require(table["linkage"] == "heuristic", table)
         require(u64(table["exports_agreeing"]), table)
         require(u64(table["file_offset"]), table)
         offsets.add(table["file_offset"])
-    require(len(offsets) == PROXY_TABLES, "proxy tables share a file offset")
-    admitted = ADMITTED_PROXY_TABLE_SHAPES[shape]
-    table_entries = admitted["entries"]
-    admitted_slots = admitted["admitted_slots"]
-    # K=4 spill: 64 decoded, 4 admitted, 60 recorded as candidates.
+    require(len(offsets) == proxy_total, "proxy tables share a file offset")
+    table_entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
+    prefix_slots = prefix_tables * (table_entries - 2) + 2
+    # Prefix spill: M decoded, N admitted, M-N recorded as candidates.
     require(
-        evidence["discovery_uncorroborated_candidates"] == PROXY_SPILL,
+        evidence["discovery_uncorroborated_candidates"] == proxy_total - prefix_tables,
         evidence["discovery_uncorroborated_candidates"],
     )
 
-    # Decoded occurrences are recorded *before* heuristic-cap admission, so
-    # the bounded module keeps every entry it decoded; the cap bounds
+    # Decoded occurrences are recorded *before* prefix admission, so the
+    # proxy module keeps every entry it decoded; the prefix bounds
     # attachment, not discovery (schema v2 `table_entries`). Both modules must
     # own every surface: an unattributable surface is a gap, not an allowance.
+    # The backend decodes its whole table (the walk label follows the
+    # installed build's layout: a short accept walks the known prefix);
+    # the spilled proxy templates decode their full layout while the N
+    # attached leading templates short-accept theirs.
     soft_surfaces = Counter()
     proxy_surfaces = Counter()
     for surface in evidence["surfaces"]:
@@ -2401,26 +3275,42 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         else:
             require(False, f"surface belongs to neither module: {surface}")
     require(
-        soft_surfaces == LEGACY_SURFACES,
+        soft_surfaces in (Counter({("full", 68): 1}), Counter({("known_prefix", 68): 1})),
         f"unexpected SoftHSM2 surfaces: {dict(soft_surfaces)}",
     )
     require(
-        proxy_surfaces == Counter({("full", table_entries): PROXY_TABLES}),
+        proxy_surfaces
+        == Counter(
+            {
+                ("full", table_entries): proxy_total - prefix_tables,
+                ("known_prefix", SHORT_PREFIX_SLOTS): prefix_tables,
+            }
+        ),
         f"unexpected proxy surfaces: {dict(proxy_surfaces)}",
     )
     # One slot per {object, offset} and two probes per slot. The admitted
-    # proxy slots are the distinct targets across 4 admitted tables of the
-    # observed shape (410 at 3.2/104: 4*102+2, ordinals 65/66 shared,
-    # byte-verified, 0 nulls); a target both providers publish is attached
-    # exactly once.
+    # proxy slots are the distinct targets across the N leading tables of
+    # the observed shape (308 at 3.2/104 with N=3: 3*102+2, ordinals 65/66
+    # shared, byte-verified, 0 nulls); a target both providers publish is
+    # attached exactly once. The prefix is maximal under the reserve cap:
+    # N tables fit outside the reserve with the backend admitted first,
+    # N+1 would take it.
     for name, wanted in (
-        ("table_entries", 68 + PROXY_TABLES * table_entries),
-        ("slots", 68 + admitted_slots),
-        ("attached_probes", 2 * (68 + admitted_slots)),
+        (
+            "table_entries",
+            68 + (proxy_total - prefix_tables) * table_entries + prefix_tables * 68,
+        ),
+        ("slots", 68 + prefix_slots),
+        ("attached_probes", 2 * (68 + prefix_slots)),
         ("vendor_interfaces", 0),
         ("interface_list", "absent"),
     ):
         require(evidence[name] == wanted, f"{name}: want {wanted!r}, got {evidence[name]!r}")
+    require(
+        68 + prefix_slots <= PROXY_PREFIX_CEILING
+        < 68 + (prefix_tables + 1) * (table_entries - 2) + 2,
+        f"prefix is not the reserve-capped maximum: N={prefix_tables} M={proxy_total}",
+    )
 
     functions = document["functions"]
     require(len(functions) == evidence["slots"], len(functions))
@@ -2447,7 +3337,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         else:
             called_proxy += item["calls"]
     require(
-        dict(attributed) == {"soft": 68, "proxy": admitted_slots},
+        dict(attributed) == {"soft": 68, "proxy": prefix_slots},
         f"per-module function split: {dict(attributed)}",
     )
     require(len(soft_names) == 68, f"SoftHSM2 names are not 68 distinct: {sorted(soft_names)}")
@@ -2624,16 +3514,17 @@ def validate_lane02_owned_run_metrics(document, expected, pause):
         else {"eligible": 0, "none": 1, "pause_protected": 0}
     )
     require(loader["initial_set_capture"] == capture, loader["initial_set_capture"])
-    attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
+    attempts, confirmed, partial, unavailable = (evidence[name] for name in PAUSE_COUNTERS)
     if pause == "never":
         require(
-            (evidence["pause"], attempts, confirmed, partial) == ("none", 0, 0, 0),
-            f"Lane02 never pause tuple: {(evidence['pause'], attempts, confirmed, partial)}",
+            (evidence["pause"], attempts, confirmed, partial, unavailable) == ("none", 0, 0, 0, 0),
+            f"Lane02 never pause tuple: {(evidence['pause'], attempts, confirmed, partial, unavailable)}",
         )
     else:
         require(evidence["pause"] == "sigstop", evidence["pause"])
         require(attempts == confirmed and confirmed >= 1, (attempts, confirmed))
         require(partial == 0, partial)
+        require(unavailable == 0, unavailable)
 
 
 def validate_shared_layer_metrics(document, expected, multiplier=1, uncertainties=1):
@@ -2708,10 +3599,15 @@ def validate_canary(lane, document, target_bits=64):
         "owned-default-metrics": ("aggregate", "metrics", "scanned"),
         "owned-feature-metrics": ("aggregate", "metrics", "scanned"),
         "freeze-unsafe-profile": ("unsafe", "profile", "manifest-only"),
+        "object-lp64": ("object", "profile", "scanned"),
+        "object-ia32": ("object", "profile", "scanned"),
     }
     require(lane in lanes, f"unknown canary lane: {lane}")
     require(target_bits in (32, 64), f"invalid canary target width: {target_bits!r}")
     policy, kind, discovery = lanes[lane]
+    if policy == "object":
+        require(lane == ("object-ia32" if target_bits == 32 else "object-lp64"),
+                "object lane contradicts the selected target ABI")
     owned_metrics = lane in {"owned-default-metrics", "owned-feature-metrics"}
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
@@ -2722,12 +3618,12 @@ def validate_canary(lane, document, target_bits=64):
         exact_profile_v3_selection(document, terminal=trace)
 
     scanned = discovery == "scanned"
-    scanned_shape = VERSION_SHAPE_SCANNED_IA32 if target_bits == 32 else VERSION_SHAPE_SCANNED
-    exact_shape(evidence, *(scanned_shape if scanned else VERSION_SHAPE_MANIFEST_ONLY))
-    scanned_tables = (
-        VERSION_TABLES_SCANNED_IA32 if target_bits == 32 else VERSION_TABLES_SCANNED
-    )
-    wanted_tables = scanned_tables if scanned else VERSION_TABLES_MANIFEST_ONLY
+    if scanned:
+        surfaces, wanted_tables = version_canary_scan_shape(evidence, target_bits)
+        exact_shape(evidence, 1056, 104, 208, surfaces, 1, "ok")
+    else:
+        exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
+        wanted_tables = VERSION_TABLES_MANIFEST_ONLY
     require(
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
@@ -2745,7 +3641,8 @@ def validate_canary(lane, document, target_bits=64):
         run=owned_metrics,
     )
     allowances = dict(
-        SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
+        SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else
+        {"orphan_ops": 1, "operation_state_imports": 1} if policy == "object" else {}
     )
     if scanned and target_bits == 64:
         allowances["discovery_conflicts"] = 1
@@ -2771,6 +3668,7 @@ def validate_canary(lane, document, target_bits=64):
         "safe": "allowlisted",
         "unsafe": "unsafe-unvalidated-metadata",
         "aggregate": "aggregate-only",
+        "object": "allowlisted",
     }[policy]
     if trace:
         require(evidence["privacy_mode"] == privacy, evidence["privacy_mode"])
@@ -2810,10 +3708,71 @@ def validate_canary(lane, document, target_bits=64):
             )
             require(
                 (evidence["pause"], evidence["pause_attempts"],
-                 evidence["pause_confirmed"], evidence["pause_partial"])
-                == ("none", 0, 0, 0),
+                 evidence["pause_confirmed"], evidence["pause_partial"],
+                 evidence["pause_unavailable"])
+                == ("none", 0, 0, 0, 0),
                 "owned metrics requires exact never-pause evidence",
             )
+    elif policy == "object":
+        validate_object_canary_functions(document)
+
+
+OBJECT_CANARY_ORDINALS = {
+    "C_CreateObject": 20, "C_CopyObject": 21, "C_DestroyObject": 22,
+    "C_GetObjectSize": 23, "C_GetAttributeValue": 24, "C_SetAttributeValue": 25,
+    "C_FindObjects": 27, "C_EncryptInit": 29, "C_DecryptInit": 33,
+    "C_DigestKey": 40, "C_SignInit": 42, "C_SignRecoverInit": 46,
+    "C_VerifyInit": 48, "C_VerifyRecoverInit": 52, "C_GenerateKey": 58,
+    "C_GenerateKeyPair": 59, "C_WrapKey": 60, "C_UnwrapKey": 61,
+    "C_DeriveKey": 62, "C_SetOperationState": 17, "C_MessageEncryptInit": 72,
+    "C_MessageDecryptInit": 77, "C_MessageSignInit": 82, "C_MessageVerifyInit": 87,
+    "C_VerifySignatureInit": 94,
+}
+
+
+def validate_object_canary_functions(document):
+    """Exact independent aggregate ledger beside the retained raw-map oracle."""
+    rows = document["functions"]
+    require(isinstance(rows, list) and len(rows) == 104, "object canary requires all 104 fixture rows")
+    wanted = {name: 6 if name == "C_GetAttributeValue" else 1 for name in OBJECT_CANARY_ORDINALS}
+    seen_names, seen_targets, actual = set(), set(), {}
+    for row in rows:
+        exact_keys(row, {"names", "aliased", "target", "ordinals", "module", "module_ambiguous",
+                         "module_unresolved", "calls", "errors", "pending_returns", "in_flight",
+                         "latency_ns", "rv_counts"}, "object function")
+        names = row["names"]
+        require(isinstance(names, list) and len(names) == 1 and isinstance(names[0], str),
+                "object function requires one unaliased name")
+        name = names[0]
+        require(name not in seen_names and row["aliased"] is False, "duplicate/aliased object function")
+        seen_names.add(name)
+        target = json.dumps(row["target"], sort_keys=True, separators=(",", ":"))
+        require(target not in seen_targets, "duplicate object function target")
+        seen_targets.add(target)
+        calls = row["calls"]
+        require(u64(calls), "object function call count is not u64")
+        require(calls == wanted.get(name, 0), "object function call count differs from workload ledger")
+        if calls:
+            actual[name] = calls
+            require(row["ordinals"] and {entry["ordinal"] for entry in row["ordinals"]}
+                    == {OBJECT_CANARY_ORDINALS[name]}, "object function ordinal differs from named call")
+        errors = 5 if name == "C_GetAttributeValue" else 0
+        require(u64(row["errors"]) and row["errors"] == errors, "object function error count differs")
+        for field in ("pending_returns", "in_flight"):
+            require(u64(row[field]) and row[field] == 0, f"object function {field} must be zero")
+        expected_rvs = ({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)}
+                        if name == "C_GetAttributeValue" else {"0x0000000000000000": 1} if calls else {})
+        rvs = row["rv_counts"]
+        require(isinstance(rvs, dict) and all(u64(count, positive=True) for count in rvs.values())
+                and rvs == expected_rvs, "object function full-width RV counts differ from actual ledger")
+        latency = row["latency_ns"]
+        exact_keys(latency, {"approximate", "p50", "p95", "p99", "total", "max"}, "object function latency")
+        require(latency["approximate"] is True and u64(latency["total"]) and u64(latency["max"])
+                and latency["max"] <= latency["total"], "invalid object function latency")
+        for field in ("p50", "p95", "p99"):
+            require(u64(latency[field]) if calls else latency[field] is None,
+                    "object function latency lacks its exact call population")
+    require(actual == wanted and sum(actual.values()) == 30, "object canary lacks the complete 30-call ledger")
 
 
 # Every induced-gap lane holds its workload behind a go-file, so nothing has
@@ -2958,12 +3917,16 @@ def function_items(pairs, identity=None):
 
 def discovery_fixture(sources=("scan",)):
     sources = list(sources)
-    corroborated = sources == ["scan", "manifest"]
+    corroborated = sources in (
+        ["scan", "manifest"],
+        ["scan", "prearm"],
+        ["scan", "manifest", "prearm"],
+    )
     outcome = (
         "agreed"
         if corroborated
         else "uncorroborated"
-        if sources == ["manifest"]
+        if sources and set(sources) <= {"manifest", "prearm"}
         else "single_source"
     )
     return [
@@ -2989,7 +3952,10 @@ def discovery_fixture(sources=("scan",)):
                     "linkage": "exports" if source == "scan" else "manifest",
                     "exports_agreeing": 68 if source == "scan" else None,
                 }
+                # Packet 6.13: pre-arm emits proved offsets, never decoded
+                # tables — a prearm fixture carries no prearm table.
                 for source in sources
+                if source in ("scan", "manifest")
             ],
             interfaces=0,
             skipped=[],
@@ -3085,6 +4051,16 @@ def kernel_control_fixture():
     }
 
 
+def version_tables_fixture(counter):
+    tables = [{"source": source, "version": list(version), "entries": entries}
+              for (source, version, entries), count in counter.items()
+              for _ in range(count)]
+    # Disjoint synthetic offsets, not a claim about one linker layout.
+    for index, table in enumerate(table for table in tables if table["source"] == "scan"):
+        table["file_offset"] = 4096 * (index + 1)
+    return tables
+
+
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
@@ -3123,7 +4099,9 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         **{name: 0 for name in COUNTERS},
         # A fixture is self-consistent: a module only the manifest described is
         # uncorroborated, by definition of the word.
-        "discovery_uncorroborated": 1 if list(sources) == ["manifest"] else 0,
+        "discovery_uncorroborated": (
+            1 if list(sources) and set(sources) <= {"manifest", "prearm"} else 0
+        ),
         "discovery_uncorroborated_candidates": 0,
         "templates_truncated": False,
         "provider_changed": False,
@@ -3157,25 +4135,30 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
 
 def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy="allowlisted"):
     evidence = copy.deepcopy(evidence)
+    if schema in (PROFILE_SCHEMA, METRICS_SCHEMA):
+        # The fixture's capture scope is `pid` (below), behind per-offset links.
+        evidence.setdefault("attach_backend", {
+            "selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf",
+        })
+        evidence.setdefault("object_capture", {"available": True, "reason": None})
     if schema == PROFILE_SCHEMA:
         evidence.setdefault("interface_selection", {
             "providers": [], "standard_exports": [], "inventory_surfaces": [],
             "tuples": [], "selection_truncated": False,
         })
         evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
-        # The fixture's capture scope is `pid` (below), behind per-offset links.
-        evidence.setdefault("attach_backend", {
-            "selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf",
-        })
         evidence.setdefault("pid_descendant_gaps", 0)
         evidence.setdefault("multi_rebuild_gaps", 0)
     elif schema in (METRICS_SCHEMA, HISTORICAL_METRICS_SCHEMA):
         for field in PROFILE_V3_FIELDS:
             evidence.pop(field, None)
         if schema == HISTORICAL_METRICS_SCHEMA:
+            evidence.pop("attach_backend", None)
+            evidence.pop("object_capture", None)
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
+            evidence.pop("unpublished_mechanisms", None)
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
             evidence.pop("kernel_control", None)
@@ -3400,7 +4383,8 @@ def self_test():
         )
         if pause != "never":
             owned["evidence"].update(
-                pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0
+                pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0,
+                pause_unavailable=0,
             )
         settle_fixture_verdict(owned)
         validate_lane02_owned_run_metrics(owned, {"C_Initialize": 1}, pause)
@@ -3436,6 +4420,20 @@ def self_test():
         rejected(
             lambda bad=bad, pause=pause: validate_lane02_owned_run_metrics(
                 bad, {"C_Initialize": 1}, pause
+            )
+        )
+        # pause_unavailable is part of the closed pause tuple in both
+        # branches: a lattice-consistent unavailable attempt is still not
+        # an exact Lane02 owned run.
+        unavail = copy.deepcopy(owned)
+        unavail["evidence"].update(
+            pause="partial", pause_attempts=1, pause_confirmed=0,
+            pause_partial=0, pause_unavailable=1,
+        )
+        settle_fixture_verdict(unavail)
+        rejected(
+            lambda unavail=unavail, pause=pause: validate_lane02_owned_run_metrics(
+                unavail, {"C_Initialize": 1}, pause
             )
         )
         rejected(
@@ -3749,6 +4747,33 @@ def self_test():
         unreadable["evidence"]["gap_classes"]["observation"]["causes"] == ["skipped"],
         unreadable["evidence"]["gap_classes"],
     )
+    for reason in (
+        "static probe coverage gap incomplete",
+        "static probes detached and exact pairs reattached",
+    ):
+        physical_gap = verdict_doc(skipped=[{"name": DISCOVERY_SUBJECT, "reason": reason}])
+        exact_metrics_schema(physical_gap)
+        require(discovery_skips(physical_gap["evidence"]) == physical_gap["evidence"]["skipped"],
+                "the static category is a finite discovery-level skip")
+        require(
+            physical_gap["evidence"]["completeness"] == "PARTIAL"
+            and physical_gap["evidence"]["verdict_detail"] == "concrete_gap"
+            and physical_gap["evidence"]["gap_classes"]["observation"]
+            == {"status": "lossy", "causes": ["skipped"]}
+            and physical_gap["evidence"]["unprotected_live_windows"] == 0
+            and physical_gap["evidence"]["attach_gap_ms"] is None,
+            "a fixed physical category retains loss without inventing a loader window or duration",
+        )
+        for name, invalid_reason in (
+            ("C_Initialize", reason),
+            ("unknown", reason),
+            ("physical static probe gap", reason),
+            (DISCOVERY_SUBJECT, reason + " private sentinel"),
+            (DISCOVERY_SUBJECT, reason.upper()),
+        ):
+            invalid = verdict_doc(skipped=[{"name": name, "reason": invalid_reason}])
+            rejected(lambda invalid=invalid: bounded_skip(invalid["evidence"]["skipped"][0]))
+    print("fixed static-gap categories retain observation loss and finite privacy: OK")
     open_calls = verdict_doc(in_flight_at_end=2)
     require(
         open_calls["evidence"]["gap_classes"]["observation"]["causes"] == ["in_flight_at_end"]
@@ -3847,7 +4872,11 @@ def self_test():
             tables=[
                 {
                     "version": [3, 2],
-                    "entries": PROXY_TABLE_ENTRIES,
+                    "entries": (
+                        SHORT_PREFIX_SLOTS
+                        if index < PROXY_PREFIX_TABLES
+                        else PROXY_TABLE_ENTRIES
+                    ),
                     "source": "scan",
                     "file_offset": 0x2000 + index * 840,
                     "linkage": "heuristic",
@@ -3859,9 +4888,12 @@ def self_test():
             skipped=[],
         )
     )
-    # The bounded module's decode survives the K=4 cap, so the capture keeps
-    # its surfaces and counts their entries on top of the attached 68.
+    # The proxy module's decode survives prefix admission, so the capture
+    # keeps its surfaces and counts their entries on top of the attached 68:
+    # the backend's whole table, the spilled templates' full layouts, and
+    # the attached leading templates' short-accepted prefixes.
     proxy["evidence"]["surfaces"][0]["source"] = f"{soft_path} table 2.40"
+    proxy["evidence"]["surfaces"][0]["walk"] = "known_prefix"
     proxy["evidence"]["surfaces"] += [
         {
             "walk": "full",
@@ -3869,65 +4901,118 @@ def self_test():
             "acquisition": "ok",
             "source": f"{PROXY_MODULE_FIXTURE['path']} table 3.2",
         }
-        for _ in range(PROXY_TABLES)
+        for _ in range(PROXY_SPILL)
+    ] + [
+        {
+            "walk": "known_prefix",
+            "functions": SHORT_PREFIX_SLOTS,
+            "acquisition": "ok",
+            "source": f"{PROXY_MODULE_FIXTURE['path']} table 3.2",
+        }
+        for _ in range(PROXY_PREFIX_TABLES)
     ]
     proxy["evidence"].update(
         table_entries=68 + PROXY_DECODED_ENTRIES,
-        slots=68 + PROXY_ADMITTED_SLOTS,
-        attached_probes=2 * (68 + PROXY_ADMITTED_SLOTS),
+        slots=68 + PROXY_PREFIX_SLOTS,
+        attached_probes=2 * (68 + PROXY_PREFIX_SLOTS),
         discovery_uncorroborated_candidates=PROXY_SPILL,
         skipped=[],
-        semantic_unverified_slots=68 + PROXY_ADMITTED_SLOTS,
+        semantic_unverified_slots=68 + PROXY_PREFIX_SLOTS,
     )
     soft_names = [[f"C_Fixture{index:02d}"] for index in range(68)]
     proxy["functions"] = function_items(
         [(soft_names[0], 1)] + [(names, 0) for names in soft_names[1:]]
     ) + function_items(
-        [(["unknown"], 1)] + [(["unknown"], 0)] * (PROXY_ADMITTED_SLOTS - 1),
+        [(["unknown"], 1)] + [(["unknown"], 0)] * (PROXY_PREFIX_SLOTS - 1),
         identity=proxy_id,
     )
+    # The late-start proxy always carries its prefix record (I2: a bare
+    # capture with no record is refused below).
+    proxy["evidence"]["modules_skipped"] = [
+        {
+            "name": PROXY_MODULE_FIXTURE["path"],
+            "reason": "3 of 67 template tables attached; calls through the others are not counted",
+        }
+    ]
     settle_fixture_verdict(proxy)
+    require(
+        proxy["evidence"]["verdict_detail"] == "concrete_gap",
+        proxy["evidence"]["verdict_detail"],
+    )
     validate_proxy_capacity_fallback(proxy, module_path=soft_path)
+    # Installed-build variance the lane accepts: SoftHSM2 3.2 tables, a
+    # fully-walked SoftHSM2 surface, and ambient discovery races.
+    soft32 = copy.deepcopy(proxy)
+    soft32["evidence"]["discovery"][0]["tables"][0]["version"] = [3, 2]
+    validate_proxy_capacity_fallback(soft32, module_path=soft_path)
+    softfull = copy.deepcopy(proxy)
+    softfull["evidence"]["surfaces"][0]["walk"] = "full"
+    validate_proxy_capacity_fallback(softfull, module_path=soft_path)
+    ambient = copy.deepcopy(proxy)
+    ambient["evidence"]["skipped"] = [
+        {"name": "discovery subject", "reason": "discovery unavailable"}
+    ] * 2
+    settle_fixture_verdict(ambient)
+    validate_proxy_capacity_fallback(ambient, module_path=soft_path)
     # DR-RETRO-C6-2: completeness is derived, not a literal. Behind a proven
-    # stop-gate drain the lane stays PARTIAL for its stated attribution cause
-    # (attribution_only), so COMPLETE there is refused, and so is a document
-    # that attested any slot's semantics.
+    # stop-gate drain the lane stays PARTIAL concrete_gap — the proven
+    # settlement never launders observation loss — so COMPLETE there is
+    # refused, and so is a document that attested any slot's semantics.
     proven_proxy = copy.deepcopy(proxy)
     proven_proxy["evidence"].update(
         drain_proven=True,
         stop_quiescence={"state": "proven", "post_q_events": False, "post_q_discovery": False},
     )
     settle_fixture_verdict(proven_proxy)
-    require(proven_proxy["evidence"]["verdict_detail"] == "attribution_only",
+    require(proven_proxy["evidence"]["verdict_detail"] == "concrete_gap",
             proven_proxy["evidence"]["verdict_detail"])
+    require(proven_proxy["evidence"]["gap_classes"]["settlement"] == "proven",
+            proven_proxy["evidence"]["gap_classes"])
     validate_proxy_capacity_fallback(proven_proxy, module_path=soft_path)
     for mutate in (
         lambda d: d["evidence"].update(completeness="COMPLETE"),
-        lambda d: d["evidence"].update(semantic_unverified_slots=PROXY_ADMITTED_SLOTS),
+        lambda d: d["evidence"].update(semantic_unverified_slots=PROXY_PREFIX_SLOTS),
     ):
         bad = copy.deepcopy(proven_proxy)
         mutate(bad)
         if bad["evidence"]["completeness"] != "COMPLETE":
             settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad, module_path=soft_path))
-    # DR-RETRO-PROXY-1 (G-03): the live lane records the capped proxy's
-    # admitted growth in modules_skipped. That record, for the proxy path
-    # only, is accepted and forces PARTIAL; a whole-module refusal, a record
-    # for SoftHSM2, or COMPLETE beside the record is refused.
+    # DR-RETRO-PROXY-1 (first-plan prefix): the live lane records the
+    # late-start proxy's heuristic prefix in modules_skipped. That record,
+    # for the proxy path only, is accepted and forces PARTIAL; an
+    # admitted-growth record, a whole-module refusal, a record for
+    # SoftHSM2, or COMPLETE beside the record is refused (I2).
+    prefix_reason = (
+        "3 of 67 template tables attached; calls through the others are not counted"
+    )
     growth_reason = (
-        "admitted module needs 6120 more; only 512 attach slots are available; 478 are in use "
-        "(478 active, 0 retired) — 6120 endpoints not attached; kept its 410 attached endpoints"
+        "admitted module needs 6120 more; only 512 attach slots are available; 376 are in use "
+        "(376 active, 0 retired) — 6120 endpoints not attached; kept its 308 attached endpoints"
     )
     proxy_path = PROXY_MODULE_FIXTURE["path"]
     grown = copy.deepcopy(proven_proxy)
-    grown["evidence"]["modules_skipped"] = [{"name": proxy_path, "reason": growth_reason}]
+    grown["evidence"]["modules_skipped"] = [{"name": proxy_path, "reason": prefix_reason}]
     settle_fixture_verdict(grown)
     require(grown["evidence"]["verdict_detail"] == "concrete_gap", grown["evidence"]["verdict_detail"])
     validate_proxy_capacity_fallback(grown, module_path=soft_path)
     for skip in (
+        # A growth record is never the proxy's shape under first-plan
+        # admission; a whole-module refusal, a record for SoftHSM2, a
+        # record whose (N, M) contradicts the decoded tables, and a
+        # malformed record are refused alike.
+        {"name": proxy_path, "reason": growth_reason},
         {"name": proxy_path, "reason": growth_reason.removeprefix("admitted ")},
-        {"name": soft_path, "reason": growth_reason},
+        {"name": soft_path, "reason": prefix_reason},
         {"name": proxy_path, "reason": "stale shape"},
+        {
+            "name": proxy_path,
+            "reason": "4 of 67 template tables attached; calls through the others are not counted",
+        },
+        {
+            "name": proxy_path,
+            "reason": "3 of 64 template tables attached; calls through the others are not counted",
+        },
     ):
         bad = copy.deepcopy(grown)
         bad["evidence"]["modules_skipped"] = [skip]
@@ -3937,9 +5022,9 @@ def self_test():
     rejected(lambda: validate_proxy_capacity_fallback(twice, module_path=soft_path))
     claimed = copy.deepcopy(grown)
     claimed["evidence"]["completeness"] = "COMPLETE"
-    rejected(lambda: exact_admitted_growth_skips(claimed["evidence"], proxy_path))
-    rejected(lambda: exact_admitted_growth_skips(grown["evidence"], None))
-    print("proxy lane accepts only its admitted-growth record, always PARTIAL: OK")
+    rejected(lambda: exact_prefix_skips(claimed["evidence"], proxy_path))
+    rejected(lambda: exact_prefix_skips(grown["evidence"], None))
+    print("proxy lane accepts only its prefix record, always PARTIAL: OK")
     # The lane pins its own module by exact path, so a capture that attached
     # some other SoftHSM2 build is not this lane's evidence.
     rejected(
@@ -3958,13 +5043,14 @@ def self_test():
         ),
         lambda d: d["functions"][0]["module"].update(ino=999),
         lambda d: d["evidence"].update(completeness="COMPLETE"),
-        lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS - 1),
+        lambda d: d["evidence"].update(slots=68 + PROXY_PREFIX_SLOTS - 1),
+        lambda d: d["evidence"].update(modules_skipped=[]),
         lambda d: [item.update(calls=0) for item in d["functions"]],
         # Audit F6: complete call loss on one provider is not two-provider
         # coverage, even with the other provider's call still present.
         lambda d: [item.update(calls=0) for item in d["functions"][68:]],
         lambda d: d["functions"][0].update(calls=0),
-        # The K=4 spill is exact in both directions.
+        # The prefix spill is exact in both directions.
         lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL - 1),
         lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL + 1),
         # A decoded table dropped from history, or relabeled as linked.
@@ -3994,7 +5080,7 @@ def self_test():
         lambda d: d["functions"][68].update(module=dict(soft_id)),
         # A target both providers publish is attached once: two probes per
         # slot, one reported function per slot.
-        lambda d: d["evidence"].update(attached_probes=2 * (68 + PROXY_ADMITTED_SLOTS) + 1),
+        lambda d: d["evidence"].update(attached_probes=2 * (68 + PROXY_PREFIX_SLOTS) + 1),
         lambda d: d["functions"].pop(),
     ):
         bad = copy.deepcopy(proxy)
@@ -4002,20 +5088,24 @@ def self_test():
         settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
     # Audit F8: every other admitted 3.x family is accepted when it is
-    # internally consistent — same table count, one shape, K=4 spill, and
-    # the slot/surface/call counts that shape implies.
+    # internally consistent — same table count, one shape, the maximal
+    # reserve-capped prefix, and the slot/surface/call counts that shape
+    # implies.
     for shape in ((3, 0), (3, 1)):
         entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
-        admitted = ADMITTED_PROXY_TABLE_SHAPES[shape]["admitted_slots"]
+        admitted = PROXY_PREFIX_TABLES * (entries - 2) + 2
         older = copy.deepcopy(proxy)
-        for table in older["evidence"]["discovery"][1]["tables"]:
+        for index, table in enumerate(older["evidence"]["discovery"][1]["tables"]):
             table["version"] = list(shape)
-            table["entries"] = entries
+            table["entries"] = (
+                SHORT_PREFIX_SLOTS if index < PROXY_PREFIX_TABLES else entries
+            )
         for surface in older["evidence"]["surfaces"][1:]:
-            surface["functions"] = entries
+            if surface["walk"] == "full":
+                surface["functions"] = entries
             surface["source"] = surface["source"].replace("table 3.2", f"table {shape[0]}.{shape[1]}")
         older["evidence"].update(
-            table_entries=68 + PROXY_TABLES * entries,
+            table_entries=68 + PROXY_SPILL * entries + PROXY_PREFIX_TABLES * 68,
             slots=68 + admitted,
             attached_probes=2 * (68 + admitted),
             semantic_unverified_slots=68 + admitted,
@@ -4033,7 +5123,7 @@ def self_test():
         for mutate in (
             lambda d: d["evidence"]["discovery"][1]["tables"][0].update(entries=PROXY_TABLE_ENTRIES),
             lambda d: [table.update(version=[3, 9]) for table in d["evidence"]["discovery"][1]["tables"]],
-            lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS),
+            lambda d: d["evidence"].update(slots=68 + PROXY_PREFIX_SLOTS),
             lambda d: d["evidence"]["discovery"][1]["tables"][0].update(version="3.0"),
         ):
             bad = copy.deepcopy(older)
@@ -4047,13 +5137,9 @@ def self_test():
         sources=("scan", "manifest"),
         discovery_skipped=0,
     )
-    version["discovery"][0]["tables"] = [
-        {"source": source, "version": list(table_version), "entries": entries}
-        for (source, table_version, entries), count in VERSION_TABLES_SCANNED.items()
-        for _ in range(count)
-    ]
+    version["discovery"][0]["tables"] = version_tables_fixture(VERSION_TABLES_SCANNED)
     version.update(
-        table_entries=988,
+        table_entries=1056,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -4073,33 +5159,107 @@ def self_test():
     safe32["evidence"]["surfaces"].extend(
         [
             {
-                "walk": "full",
+                "walk": walk,
                 "functions": functions,
                 "acquisition": "ok",
                 "source": f"/opt/p11.so table {major}.{minor}",
             }
-            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+            for major, minor, functions, walk in (
+                (3, 1, 92, "full"),
+                (3, 2, 104, "full"),
+                (3, 9, 104, "known_prefix"),
+            )
         ]
     )
-    safe32["evidence"]["discovery"][0]["tables"].extend(
-        [
-            {"source": "scan", "version": [3, 1], "entries": 92},
-            {"source": "scan", "version": [3, 2], "entries": 104},
-        ]
-    )
+    safe32["evidence"]["discovery"][0]["tables"] = version_tables_fixture(
+        VERSION_TABLES_SCANNED_IA32)
     safe32["evidence"]["discovery"][0].update(
         corroborated=True,
         corroboration=["agreed"],
     )
     safe32["evidence"]["discovery_conflicts"] = 0
+    require(
+        surface_signature(safe32["evidence"]) == Counter({
+            ("full", 68): 4, ("full", 92): 4, ("full", 104): 3,
+            ("known_prefix", 68): 2, ("known_prefix", 92): 2,
+            ("known_prefix", 104): 3, ("not_walked", 0): 1,
+        }),
+        "the IA32 matrix has exactly nineteen independently specified surfaces",
+    )
+    require(
+        sum(table["source"] == "manifest"
+            for table in safe32["evidence"]["discovery"][0]["tables"]) == 13,
+        "the extra future-minor scan does not change the thirteen manifest rows",
+    )
     settle_fixture_verdict(safe32)
     validate_canary("default-safe-profile", safe32, 32)
     rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
     rejected(lambda: validate_canary("default-safe-profile", safe, 32))
+    # Independently literal H7 ledger expectations. These constructed documents
+    # test the validator; they do not stand in for installed canary captures.
+    object_ordinals = {
+        "C_CreateObject": 20, "C_CopyObject": 21, "C_DestroyObject": 22,
+        "C_GetObjectSize": 23, "C_GetAttributeValue": 24, "C_SetAttributeValue": 25,
+        "C_FindObjects": 27, "C_EncryptInit": 29, "C_DecryptInit": 33,
+        "C_DigestKey": 40, "C_SignInit": 42, "C_SignRecoverInit": 46,
+        "C_VerifyInit": 48, "C_VerifyRecoverInit": 52, "C_GenerateKey": 58,
+        "C_GenerateKeyPair": 59, "C_WrapKey": 60, "C_UnwrapKey": 61,
+        "C_DeriveKey": 62, "C_SetOperationState": 17, "C_MessageEncryptInit": 72,
+        "C_MessageDecryptInit": 77, "C_MessageSignInit": 82, "C_MessageVerifyInit": 87,
+        "C_VerifySignatureInit": 94,
+    }
+    for bits, prior in ((64, safe), (32, safe32)):
+        objects = copy.deepcopy(prior)
+        objects["evidence"].update({name: 0 for name in COUNTERS})
+        objects["evidence"].update(orphan_ops=1, operation_state_imports=1,
+                                   discovery_conflicts=int(bits == 64))
+        pairs = [([name], 6 if name == "C_GetAttributeValue" else 1)
+                 for name in object_ordinals]
+        pairs += [([f"C_Uncalled_{index}"], 0) for index in range(79)]
+        objects["functions"] = function_items(pairs)
+        for row in objects["functions"]:
+            get = row["names"] == ["C_GetAttributeValue"]
+            row.update(errors=5 if get else 0, pending_returns=0, in_flight=0,
+                       latency_ns={"approximate": True, "p50": 1 if row["calls"] else None,
+                                   "p95": 1 if row["calls"] else None,
+                                   "p99": 1 if row["calls"] else None,
+                                   "total": row["calls"], "max": int(row["calls"] > 0)},
+                       rv_counts=({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)} if get
+                                  else {"0x0000000000000000": 1} if row["calls"] else {}))
+            if row["names"][0] in object_ordinals:
+                row["ordinals"] = [{"table_file_offset": None,
+                                     "ordinal": object_ordinals[row["names"][0]]}]
+        settle_fixture_verdict(objects)
+        lane = "object-ia32" if bits == 32 else "object-lp64"
+        validate_canary(lane, objects, bits)
+        rejected(lambda: validate_canary(lane, prior, bits))
+        rejected(lambda: validate_canary(lane, objects, 96 - bits))
+        rejected(lambda: validate_canary("object-synthetic", objects, bits))
+        for mutate in (
+            lambda d: d["functions"].pop(),
+            lambda d: d["functions"].clear(),
+            lambda d: d["functions"][0].update(calls=0, rv_counts={}),
+            lambda d: d["functions"][0].update(names=["C_Initialize"]),
+            lambda d: d["functions"][0].update(calls=True),
+            lambda d: d["functions"][0].update(pointer=0x1234),
+            lambda d: d["functions"][0]["ordinals"][0].update(ordinal=21),
+            lambda d: d["functions"][1]["target"].update(file_offset=0x1000),
+            lambda d: d["functions"][4]["rv_counts"].pop("0x0000000000000011"),
+            lambda d: d["functions"][4].update(errors=4),
+            lambda d: d["functions"][4].update(pending_returns=1),
+            lambda d: d["functions"][4]["rv_counts"].update({"0x11": 1}),
+            lambda d: d["evidence"].update(event_loss=1),
+            lambda d: d["evidence"].pop("interface_selection"),
+        ):
+            bad = copy.deepcopy(objects)
+            mutate(bad)
+            settle_fixture_verdict(bad)
+            rejected(lambda bad=bad: validate_canary(lane, bad, bits))
+    print("object canary requires exact 30-call function/RV ledger and target ABI: OK")
     for label, mutate in (
         ("missing ia32 scan table", lambda d: d["evidence"]["discovery"][0]["tables"].pop()),
         (
-            "extra ia32 scan table",
+            "duplicate ia32 future-minor scan table",
             lambda d: d["evidence"]["discovery"][0]["tables"].append(
                 {"source": "scan", "version": [3, 9], "entries": 104}
             ),
@@ -4107,6 +5267,27 @@ def self_test():
         (
             "relabeled ia32 scan table",
             lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+        ),
+        (
+            "wrong ia32 future-minor version",
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(version=[3, 8]),
+        ),
+        (
+            "wrong ia32 future-minor entry count",
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(entries=92),
+        ),
+        ("missing ia32 future-minor surface", lambda d: d["evidence"]["surfaces"].pop()),
+        (
+            "duplicate ia32 future-minor surface",
+            lambda d: d["evidence"]["surfaces"].append(dict(d["evidence"]["surfaces"][-1])),
+        ),
+        (
+            "wrong ia32 future-minor walk",
+            lambda d: d["evidence"]["surfaces"][-1].update(walk="full"),
+        ),
+        (
+            "wrong ia32 future-minor surface count",
+            lambda d: d["evidence"]["surfaces"][-1].update(functions=92),
         ),
     ):
         bad = copy.deepcopy(safe32)
@@ -4408,12 +5589,23 @@ def self_test():
     count_only["evidence"]["completeness"] = "PARTIAL"
     settle_fixture_verdict(count_only)
     exact_profile_v3_selection(count_only)
+    # Retained targets are proven separately from finite returned metadata.
+    # Count-only tuples never grant API naming, inventory or semantic authority.
+    for metadata_request_name in sorted(SELECTION_NAME_CLASSES):
+        for metadata_result_name in sorted(SELECTION_NAME_CLASSES):
+            for metadata_version in sorted(SELECTION_VERSION_CLASSES - {"null"}):
+                for metadata_flags in ("zero", "fork_safe", "other"):
+                    metadata_candidate = copy.deepcopy(count_only)
+                    metadata_tuple = metadata_candidate["evidence"]["interface_selection"]["tuples"][0]
+                    metadata_tuple["request"].update(name=metadata_request_name)
+                    metadata_tuple["result"].update(name=metadata_result_name, version=metadata_version, flags=metadata_flags)
+                    settle_fixture_verdict(metadata_candidate)
+                    exact_profile_v3_selection(metadata_candidate)
     for mutate in (
-        lambda t: t["request"].update(name="other"),
-        lambda t: t["result"].update(name="other"),
-        lambda t: t["result"].update(version="v2_40"),
-        lambda t: t["result"].update(flags="other"),
         lambda t: t["result"].update(flags=0),
+        lambda t: t["result"].update(version="null"),
+        lambda t: t.update(rv=1),
+        lambda t: t.update(result=None),
     ):
         invalid = copy.deepcopy(count_only)
         mutate(invalid["evidence"]["interface_selection"]["tuples"][0])
@@ -4492,11 +5684,11 @@ def self_test():
         "`null_output` and `unreadable_interface` require `result=null`.",
         "A successful query with `result=null` permits only `null_output`, `unreadable_interface`, or `provider_changed`.",
         "Only `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, and `provider_changed` may coexist with a factual non-null result.",
-        "With a factual non-null result, `unreadable_name` requires a `null` or `unreadable` result name; `unreadable_version` requires an `unreadable` result version; and `unreadable_table` requires a `null`, `v3_0`, `v3_1`, or `v3_2` result version.",
+        "With a factual non-null result, `unreadable_name` requires a `null` or `unreadable` result name; `unreadable_version` requires an `unreadable` result version; and `unreadable_table` requires a `null`, `v2_40`, `v3_0`, `v3_1`, `v3_2`, or `other` result version.",
         "`inventory_matches` is a sorted, unique array of at most 16 exact `{surface, name_agrees, version_agrees}` records.",
         "Authority is exactly `inventory`, `selection_count_only`, or `none`.",
         "That failure class is exactly `null_output`, `unreadable_interface`, `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, or `provider_changed`.",
-        "Each table id is an integer from 0 through 9, its version is 3.0, 3.1, or 3.2, its walk is exactly `full`, and it contains at most 104 function records with `semantic_authorized=false`.",
+        "Each table id is an integer from 0 through 9, its version is metadata, its walk is `full`, `known_prefix`, or `unreadable`, and it contains at most 104 canonical function records with `semantic_authorized=false`.",
         "A selector is an integer from 0 through 4 and request flags are exactly 0 or 1.",
     ):
         require(statement in normalized_allowlist,
@@ -4551,7 +5743,7 @@ def self_test():
     bad = copy.deepcopy(safe)
     bad["evidence"]["table_entries"] = 1216
     rejected(lambda: validate_canary("default-safe-profile", bad))
-    print("canary matrix 988/104/208 with 16 mixed surfaces: OK")
+    print("canary baseline matrix 1056/104/208 with 16 mixed surfaces: OK")
     # The scan's own contribution is not optional: dropping the three exact
     # source-labelled tables it decoded, or the conflict they imply, must fail.
     bad = copy.deepcopy(safe)
@@ -4571,13 +5763,10 @@ def self_test():
 
     # The freeze lane: same provider, same policy, manifest alone.
     freeze_evidence = evidence_fixture(VERSION_SURFACES, sources=("manifest",))
-    freeze_evidence["discovery"][0]["tables"] = [
-        {"source": source, "version": list(table_version), "entries": entries}
-        for (source, table_version, entries), count in VERSION_TABLES_MANIFEST_ONLY.items()
-        for _ in range(count)
-    ]
+    freeze_evidence["discovery"][0]["tables"] = version_tables_fixture(
+        VERSION_TABLES_MANIFEST_ONLY)
     freeze_evidence.update(
-        table_entries=988,
+        table_entries=1056,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -4589,7 +5778,7 @@ def self_test():
     validate_canary("freeze-unsafe-profile", freeze)
     rejected(lambda: validate_canary("feature-unsafe-profile", freeze))
     rejected(lambda: validate_canary("freeze-unsafe-profile", safe))
-    print("canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK")
+    print("canary freeze lane is manifest-only 1056/104/208 with 13 surfaces: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["unregistered_mechanisms"] = 3
     rejected(lambda: validate_canary("default-safe-profile", bad))

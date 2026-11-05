@@ -9,6 +9,10 @@
  *       Single-byte commands on stdin, one reply line each on stdout:
  *       c  call C_GetSlotInfo(0x70000000 + gen) through the current handle
  *       C  call it through the dlmopen sibling, tag 0x71000000 + gen
+ *       b  hold one C_GetSlotInfo inside the provider        -> HELD
+ *       o  hold one C_SignInit inside the provider           -> OHELD tid
+ *       u  release the held call                             -> UNHELD gen rv
+ *       K  cancel the held call's thread (no return)         -> CANCELLED gen
  *       r  reload: dlclose then dlopen (gen += 1)        -> RELOAD gen old new
  *       d  dlmopen(LM_ID_NEWLM) a sibling copy           -> SIBLING base
  *       m  mmap+munmap an unrelated file                 -> UNRELATED
@@ -59,16 +63,84 @@
  * generation it ran in independently of any routing decision. */
 #define _GNU_SOURCE
 #ifdef INSTANCE_PROVIDER
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 typedef unsigned long CK_ULONG;
 /* Some text before the endpoint so it does not sit at the segment start. */
 __attribute__((noinline)) CK_ULONG instance_continuity_pad(CK_ULONG v)
 {
     return v * 2654435761UL ^ (v >> 7);
 }
+/* Held-call gate for the birth-marker return-side cell: the driver arms it,
+ * runs one C_GetSlotInfo on a worker thread, and waits for the entry byte,
+ * which proves the call is inside the provider frame. The driver releases
+ * the call after moving the process, so the call's entry and return run on
+ * opposite sides of a scope boundary. At most one call is held at a time;
+ * the pipe reads/writes order the flag, which the driver sets before the
+ * thread starts and clears after it joins. */
+static int gate_entry[2] = { -1, -1 };
+static int gate_release[2] = { -1, -1 };
+static int gate_armed = 0;
+static void gate_close_pair(int pair[2])
+{
+    if (pair[0] >= 0)
+        close(pair[0]);
+    if (pair[1] >= 0)
+        close(pair[1]);
+    pair[0] = pair[1] = -1;
+}
+int instance_block_arm(void)
+{
+    if (gate_armed)
+        return -1;
+    if (pipe2(gate_entry, O_CLOEXEC) != 0)
+        return -1;
+    if (pipe2(gate_release, O_CLOEXEC) != 0) {
+        gate_close_pair(gate_entry);
+        return -1;
+    }
+    gate_armed = 1;
+    return gate_entry[0];
+}
+int instance_block_release_fd(void)
+{
+    return gate_armed ? gate_release[1] : -1;
+}
+void instance_block_disarm(void)
+{
+    gate_armed = 0;
+    gate_close_pair(gate_entry);
+    gate_close_pair(gate_release);
+}
+static void instance_block_wait(void)
+{
+    if (gate_armed) {
+        /* EINTR-only retries: a persistently broken gate must fail the
+         * driver's entry-proof read loudly, never spin here. */
+        char entered = 'E', released = 0;
+        ssize_t done;
+        do {
+            done = write(gate_entry[1], &entered, 1);
+        } while (done < 0 && errno == EINTR);
+        do {
+            done = read(gate_release[0], &released, 1);
+        } while (done < 0 && errno == EINTR);
+    }
+}
 CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
 {
     (void)info;
+    instance_block_wait();
     return instance_continuity_pad(slot) == 1 ? 0 : 3;
+}
+CK_ULONG C_SignInit(CK_ULONG session, void *mechanism, CK_ULONG key)
+{
+    (void)session;
+    (void)mechanism;
+    (void)key;
+    instance_block_wait();
+    return 0;
 }
 #else
 #include <dlfcn.h>
@@ -85,12 +157,14 @@ CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 typedef unsigned long CK_ULONG;
 typedef CK_ULONG (*slot_info_fn)(CK_ULONG, void *);
+typedef CK_ULONG (*sign_init_fn)(CK_ULONG, void *, CK_ULONG);
 
 static uint64_t now_ns(void)
 {
@@ -147,6 +221,35 @@ static int held_sharer_child(void *unused)
         return 2;
     munmap(p, 4096);
     return 0;
+}
+
+/* A held provider call: 'b' arms the provider gate for C_GetSlotInfo,
+ * 'o' for C_SignInit. Each runs on one worker thread and reports
+ * HELD once the provider's entry byte proves the call is inside the
+ * provider frame. 'u' releases it and joins the thread. At most one call
+ * is held at a time. */
+static pthread_t held_call_thread;
+static atomic_int held_call_tid = -1;
+static int held_call_active = 0;
+static int held_call_entry = -1;
+static int held_call_release = -1;
+static void (*held_call_disarm)(void) = NULL;
+static struct {
+    slot_info_fn call;
+    sign_init_fn sign_init;
+    CK_ULONG tag;
+    char info[256];
+    CK_ULONG rv;
+} held_call;
+
+static void *held_call_worker(void *unused)
+{
+    (void)unused;
+    held_call_tid = (pid_t)syscall(SYS_gettid);
+    held_call.rv = held_call.sign_init
+        ? held_call.sign_init(held_call.tag, NULL, 0x42UL)
+        : held_call.call(held_call.tag, held_call.info);
+    return NULL;
 }
 
 /* A zombie-leader scenario (F3 soundness): 'z' forks a child whose main
@@ -514,6 +617,117 @@ static int cmd_mode(const char *provider)
             if (!call)
                 die("sibling dlsym");
             printf("SCALL %u %lu\n", gen, call(0x71000000UL + gen, info));
+            break;
+        }
+        case 'o':
+        case 'b': {
+            /* Hold one call inside C_GetSlotInfo or C_SignInit. The ledger is printed
+             * only after the entry byte arrives, so the observer's entry
+             * probe has certainly fired before the test moves on. */
+            int (*arm)(void);
+            int (*release_fd)(void);
+            void (*disarm)(void);
+            char entered = 0;
+            ssize_t done;
+            if (held_call_active)
+                die("call already held");
+            arm = (int (*)(void))dlsym(handle, "instance_block_arm");
+            release_fd = (int (*)(void))dlsym(handle, "instance_block_release_fd");
+            disarm = (void (*)(void))dlsym(handle, "instance_block_disarm");
+            if (!arm || !release_fd || !disarm)
+                die("held-call gate");
+            held_call_entry = arm();
+            if (held_call_entry < 0)
+                die("held-call arm");
+            held_call_release = release_fd();
+            if (held_call_release < 0)
+                die("held-call release fd");
+            held_call.call = command == 'b' ? main_call(handle) : NULL;
+            held_call.sign_init = command == 'o'
+                ? (sign_init_fn)dlsym(handle, "C_SignInit") : NULL;
+            if (!held_call.call && !held_call.sign_init)
+                die("dlsym");
+            held_call.tag = 0x70000000UL + gen;
+            held_call_disarm = disarm;
+            if (pthread_create(&held_call_thread, NULL, held_call_worker, NULL) != 0)
+                die("held-call thread");
+            held_call_active = 1;
+            do {
+                done = read(held_call_entry, &entered, 1);
+            } while (done < 0 && errno == EINTR);
+            if (done != 1 || entered != 'E')
+                die("held-call entry");
+            if (command == 'o')
+                printf("OHELD %d\n", atomic_load(&held_call_tid));
+            else
+                printf("HELD\n");
+            break;
+        }
+        case 'u': {
+            /* Release the 'b' call: its return runs wherever the process
+             * is now. */
+            void *result = NULL;
+            char released = 'R';
+            ssize_t done;
+            if (!held_call_active)
+                die("no held call");
+            do {
+                done = write(held_call_release, &released, 1);
+            } while (done < 0 && errno == EINTR);
+            if (done != 1)
+                die("held-call release");
+            pthread_join(held_call_thread, &result);
+            if (result != NULL)
+                die("held-call join");
+            held_call_active = 0;
+            held_call_disarm();
+            held_call_disarm = NULL;
+            held_call_entry = held_call_release = -1;
+            printf("UNHELD %u %lu\n", gen, held_call.rv);
+            break;
+        }
+        case 'K': {
+            /* Cancel the 'b' call's thread while it is blocked inside
+             * C_GetSlotInfo: the call entered in scope and never
+             * returns, so thread exit must reclaim its START. The
+             * process keeps running. pthread_join wakes at exit_mm,
+             * before the exit tracepoint on pre-6.16 kernels, while
+             * the tid vanishes only at release_task, after the
+             * tracepoint, so wait for the task dir to disappear. */
+            void *result = NULL;
+            char task_path[64];
+            struct stat probe;
+            struct timespec nap = { 0, 1000000 };
+            uint64_t deadline;
+            if (!held_call_active)
+                die("no held call");
+            if (held_call_tid <= 0)
+                die("held-call tid");
+            snprintf(task_path, sizeof task_path, "/proc/self/task/%d", (int)held_call_tid);
+            if (stat(task_path, &probe) != 0)
+                die("held-call task before cancel");
+            if (pthread_cancel(held_call_thread) != 0)
+                die("held-call cancel");
+            pthread_join(held_call_thread, &result);
+            if (result != PTHREAD_CANCELED)
+                die("held-call cancel join");
+            deadline = now_ns() + 10ULL * 1000000000ULL;
+            for (;;) {
+                if (stat(task_path, &probe) != 0) {
+                    if (errno == ENOENT)
+                        break;
+                    die("held-call task poll");
+                }
+                if (now_ns() > deadline)
+                    die("held-call task reap timeout");
+                nanosleep(&nap, NULL);
+            }
+            held_call_tid = -1;
+            held_call_active = 0;
+            held_call_disarm();
+            held_call_disarm = NULL;
+            held_call_entry = held_call_release = -1;
+            printf("CANCELLED %u\n", gen);
             break;
         }
         case 'r': {

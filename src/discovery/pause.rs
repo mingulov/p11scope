@@ -3,7 +3,8 @@ use crate::run::OwnedChild;
 use crate::{
     attach,
     discovery::engine::{
-        DeferredDiscoveryItem, Engine, EngineSession, IncompleteTerminalDrain, TerminalBatch,
+        DISCOVERY_HELD_CAP, DeferredDiscoveryItem, DiscoveryCapacityBlocked, Engine, EngineSession,
+        IncompleteTerminalDrain, TerminalBatch,
     },
 };
 use p11scope_ebpf_common::{
@@ -11,6 +12,7 @@ use p11scope_ebpf_common::{
     PAUSE_REQUESTED,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) use crate::events::DiscoveryItem;
@@ -19,6 +21,9 @@ pub(crate) use crate::events::DiscoveryItem;
 /// its hook. Crate-visible so the run loop's gate tests measure against it.
 pub(crate) const CYCLE_NS: u64 = 500_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
+/// Upper bound on the first sample's settling re-samples: one per sample
+/// interval of a cycle. The cycle deadline normally ends it first.
+const MAX_SETTLE_SAMPLES: u64 = CYCLE_NS / SAMPLE_NS;
 /// Stops one arm may chain after its first (GT-4). A confirmed stop installs
 /// a successor while the child is still stopped, so the owned child's next
 /// pause-eligible event — a loader hit, a `C_GetFunctionList` /
@@ -46,6 +51,7 @@ const MSG_PAUSE_RESUME_DEADLINE: &str = "pause resume observation deadline cross
 const MSG_PAUSE_CAUSAL_DEADLINE: &str = "pause causal deadline crossed";
 const MSG_COALESCED_RECORD_DEADLINE: &str = "coalesced record crossed winner deadline";
 const MSG_UNSERVICED_AT_CLEANUP: &str = "the capture ended before a pause cycle serviced its stop";
+const MSG_TASK_SET_CHANGED: &str = "task set changed or was not entirely stopped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PauseDiagnostic {
@@ -172,6 +178,10 @@ pub(crate) struct PauseCounters {
     pub(crate) attempts: u64,
     pub(crate) confirmed: u64,
     pub(crate) partial: u64,
+    /// `--pause always` degrades that collected unpaused instead of
+    /// aborting (never-stop F-16). Each counts as partial for the
+    /// status and the `PARTIAL` verdict.
+    pub(crate) unavailable: u64,
 }
 
 impl PauseCounters {
@@ -181,6 +191,7 @@ impl PauseCounters {
             attempts,
             confirmed: attempts,
             partial: 0,
+            unavailable: 0,
         }
     }
 
@@ -190,19 +201,23 @@ impl PauseCounters {
             attempts,
             confirmed: 0,
             partial: attempts,
+            unavailable: 0,
         }
     }
 
     pub(crate) fn status(self) -> PauseStatus {
-        match (self.attempts, self.partial) {
-            (0, _) => PauseStatus::None,
-            (_, 0) => PauseStatus::Sigstop,
+        match (self.attempts, self.partial, self.unavailable) {
+            (0, _, _) => PauseStatus::None,
+            (_, 0, 0) => PauseStatus::Sigstop,
             _ => PauseStatus::Partial,
         }
     }
 
     fn valid(self) -> bool {
-        self.confirmed.saturating_add(self.partial) == self.attempts
+        self.confirmed
+            .saturating_add(self.partial)
+            .saturating_add(self.unavailable)
+            == self.attempts
     }
 }
 
@@ -253,14 +268,35 @@ impl std::fmt::Display for PauseError {
 
 impl std::error::Error for PauseError {}
 
+/// One task's `/proc` state letter and kernel start time (boot-relative
+/// clock ticks), taken from a single read of its `stat` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskSample {
+    pub(crate) state: u8,
+    pub(crate) start: Option<u64>,
+}
+
 /// The coordinator owns policy, not Aya. This fixed-purpose seam is also the
-/// complete failure-injection surface: one clock, task reader, discovery owner,
-/// authorization map, Engine batch application, marker, pidfd resume, and
-/// terminal detach action.
+/// complete failure-injection surface: one clock, task reader, task-start
+/// reader, hook-attach clock, discovery owner, authorization map, Engine batch
+/// application, marker, pidfd resume, and terminal detach action.
 pub(crate) trait PauseIo {
     fn now_ns(&mut self) -> Result<u64, String>;
     fn wait_one_ms(&mut self) -> Result<(), String>;
     fn task_states(&mut self, pid: u32) -> Result<BTreeMap<u32, u8>, String>;
+    /// Every task of `pid` with its state letter and kernel start time in
+    /// boot-relative clock ticks (`/proc/<pid>/task/<tid>/stat` fields 3 and
+    /// 22), both from one read of each `stat` file. A `None` start is undated
+    /// and never treated as covered.
+    fn task_samples(&mut self, pid: u32) -> Result<BTreeMap<u32, TaskSample>, String>;
+    /// When the last provider hook attach completed, in `CLOCK_BOOTTIME`
+    /// nanoseconds (the start-time-tick domain). `None` when no attach has
+    /// completed or one is still in flight: then no thread born after
+    /// preflight dates as covered.
+    fn last_hook_attach_boot_ns(&mut self) -> Option<u64>;
+    /// The `CLOCK_BOOTTIME` reading, in nanoseconds (the hook-attach clock's
+    /// domain); `None` when it cannot be read.
+    fn boot_now_ns(&mut self) -> Option<u64>;
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String>;
     fn arm(&mut self) -> Result<(), String>;
     fn authorization(&mut self) -> Result<Option<u64>, String>;
@@ -363,11 +399,47 @@ enum AuthorizationSource {
     Removal,
 }
 
+/// Gap-free hold of the owned child across the first pause epoch
+/// (R2-D1-6 proof source (i)): the pause-proven segment of the from-start
+/// hold the pre-arm exactness builder checks. A held child can neither map
+/// nor call. The segment alone does not prove the window: the child may
+/// run its command before the first *verified* pause stop, so the
+/// builder additionally requires every declared first-stamp to precede the
+/// barrier release — pre-release windows are barrier-covered exactly, and
+/// post-release stamps withhold the proof. The owned `run` path composes
+/// the claim start (its pre-spawn scope start, bridged by spawn order and
+/// the pre-exec barrier) and the release bound with this segment; the
+/// builder emits the proof only when the composed interval covers a
+/// pre-release window, and assembly still exact-matches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PauseGateHold {
+    /// Lower bound on the arm that opened the hold: the first arm's
+    /// `armed_at_ns`, installed before the barrier release. `None` when the
+    /// arm clock read failed: unboundable, never exact.
+    pub(crate) start_ns: Option<u64>,
+    /// Last instant the child was proven stopped before the first resume:
+    /// the latest stopped-sample clock of the first completed pause cycle,
+    /// sampled after the cycle's attach batch. `None` until the first
+    /// resume freezes a hold (an armed-but-never-stopped child ran free).
+    pub(crate) end_ns: Option<u64>,
+    /// The first epoch stayed gap-free. Anything unproven before the
+    /// first resume voids it, sticky: a failed cycle, a rejected or
+    /// refuted stop, a revalidation failure, a missing clock. The freeze at
+    /// the first completing resume is immutable: a re-arm starts a new
+    /// interval (the child ran between), and a later gap is after the
+    /// proven end, so neither moves nor voids the frozen hold.
+    pub(crate) continuous: bool,
+}
+
 pub(crate) struct PauseCoordinator {
     policy: PausePolicy,
     pid: u32,
     generation: u64,
     expected_tasks: BTreeMap<u32, u8>,
+    /// Kernel start time (boot-relative ticks) of each expected task: thread
+    /// identity is the (tid, start time) pair, so a reused tid never passes
+    /// as the thread the preflight saw.
+    expected_starts: BTreeMap<u32, u64>,
     counters: PauseCounters,
     epoch: PauseEpoch,
     armed: bool,
@@ -376,6 +448,21 @@ pub(crate) struct PauseCoordinator {
     /// first see it. `None` when no arm recorded one, which keeps every record
     /// a candidate.
     armed_at_ns: Option<u64>,
+    /// First arm's `armed_at_ns` snapshot: the hold's start bound. Never
+    /// overwritten by successor installs, which only move the live arm.
+    hold_start_ns: Option<u64>,
+    /// A first arm already ran: the start snapshot is first-arm-only, so a
+    /// re-arm after a clockless first arm cannot smuggle in a later bound.
+    hold_armed_once: bool,
+    /// Latest stopped-sample instant of the first epoch, frozen at the
+    /// first completing resume; later cycles never move it, and the
+    /// accessor publishes it only once frozen.
+    hold_end_ns: Option<u64>,
+    /// Sticky pre-freeze gap latch (fail-closed): any unproven break
+    /// before the first resume voids the from-start claim.
+    hold_void: bool,
+    /// The first pause cycle completed its resume: the hold is frozen.
+    hold_frozen: bool,
     rearming_enabled: bool,
     may_be_stopped: bool,
     attempt_open: bool,
@@ -440,9 +527,13 @@ impl PauseCoordinator {
             .pin()
             .probe_signal_authority()
             .map_err(|error| Self::policy_error(policy, error, true))?;
-        let expected_tasks = io
-            .task_states(child.pid())
+        let samples = io
+            .task_samples(child.pid())
             .map_err(|error| Self::policy_error(policy, error, true))?;
+        let expected_tasks: BTreeMap<u32, u8> = samples
+            .iter()
+            .map(|(tid, sample)| (*tid, sample.state))
+            .collect();
         if expected_tasks.is_empty() || !child.pin().still_the_same() {
             return Err(Self::policy_error(
                 policy,
@@ -450,12 +541,24 @@ impl PauseCoordinator {
                 true,
             ));
         }
-        Ok(Self::new(
+        let mut coordinator = Self::new(
             policy,
             child.pid(),
             child.generation().get(),
             expected_tasks,
-        ))
+        );
+        let tids: Vec<u32> = coordinator.expected_tasks.keys().copied().collect();
+        for tid in tids {
+            let Some(start) = samples.get(&tid).and_then(|sample| sample.start) else {
+                return Err(Self::policy_error(
+                    policy,
+                    format!("cannot read task {tid} start time during pause preflight"),
+                    true,
+                ));
+            };
+            coordinator.expected_starts.insert(tid, start);
+        }
+        Ok(coordinator)
     }
 
     fn new(
@@ -469,10 +572,16 @@ impl PauseCoordinator {
             pid,
             generation,
             expected_tasks,
+            expected_starts: BTreeMap::new(),
             counters: PauseCounters::default(),
             epoch: PauseEpoch::default(),
             armed: false,
             armed_at_ns: None,
+            hold_start_ns: None,
+            hold_armed_once: false,
+            hold_end_ns: None,
+            hold_void: false,
+            hold_frozen: false,
             rearming_enabled: policy != PausePolicy::Never,
             may_be_stopped: false,
             attempt_open: false,
@@ -499,7 +608,15 @@ impl PauseCoordinator {
         generation: u64,
         expected_tasks: BTreeMap<u32, u8>,
     ) -> Self {
-        Self::new(policy, pid, generation, expected_tasks)
+        let mut coordinator = Self::new(policy, pid, generation, expected_tasks);
+        // The scripted seam dates every unscripted task at tick zero, so the
+        // default baseline matches it; birth-dating tests overwrite this.
+        coordinator.expected_starts = coordinator
+            .expected_tasks
+            .keys()
+            .map(|tid| (*tid, 0))
+            .collect();
+        coordinator
     }
 
     #[cfg(test)]
@@ -543,6 +660,13 @@ impl PauseCoordinator {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
+                // The hold's start bound is the first arm's clock only: a
+                // re-arm or successor install never moves it, not even
+                // after a clockless first arm (which stays unboundable).
+                if !self.hold_armed_once {
+                    self.hold_armed_once = true;
+                    self.hold_start_ns = armed_at;
+                }
                 self.successors_left = MAX_SUCCESSORS_PER_ARM;
                 Ok(ArmResult::Armed)
             }
@@ -755,6 +879,7 @@ impl PauseCoordinator {
         let mut received = received;
         if let Some(batch) = received.terminal_batch.take() {
             if self.terminal_batch.is_some() {
+                self.void_hold();
                 return Err(Self::policy_error(
                     self.policy,
                     "more than one terminal discovery batch reached the coordinator",
@@ -776,6 +901,7 @@ impl PauseCoordinator {
             return self.fail_cycle(io, "malformed discovery record in pause epoch", false);
         };
         if exact_pid(&first) != self.pid {
+            self.begin_attempt();
             return self.fail_cycle(io, "unaccounted discovery record in pause epoch", false);
         }
 
@@ -805,7 +931,7 @@ impl PauseCoordinator {
             match authorization {
                 Some(PAUSE_REQUESTED) => return self.service_requested(io, deadline),
                 Some(PAUSE_ARMED) => {
-                    if let Err(error) = self.apply_unowned(io, Some(deadline)) {
+                    if let Err(error) = self.apply_unowned_opening_on_error(io, deadline) {
                         return self.fail_cycle(io, error.to_string(), error.lifecycle());
                     }
                     match io.authorization() {
@@ -865,6 +991,9 @@ impl PauseCoordinator {
             }
             self.epoch.zero_candidate = false;
             self.may_be_stopped = false;
+            // Refuted: ARMED still held, so no hook won and nothing stopped
+            // the child — it ran unstopped past this record.
+            self.void_hold();
             return self.apply_unowned(io, None);
         }
         self.may_be_stopped = true;
@@ -997,9 +1126,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, "discovery ring loss in pause epoch", false);
         }
 
-        let first_sample = match self.sample_stopped(io, deadline) {
+        let first_sample = match self.sample_until_stopped(io, deadline) {
             Ok(sample) => sample,
-            Err(error) => return self.fail_cycle(io, error, false),
+            Err((error, lifecycle)) => return self.fail_cycle(io, error, lifecycle),
         };
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
@@ -1008,6 +1137,7 @@ impl PauseCoordinator {
             Ok(sample) => sample,
             Err(error) => return self.fail_cycle(io, error, false),
         };
+        self.note_hold_sample(second_sample);
         if second_sample
             .checked_sub(first_sample)
             .is_none_or(|delta| delta < SAMPLE_NS)
@@ -1079,8 +1209,9 @@ impl PauseCoordinator {
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        if let Err(error) = self.sample_stopped(io, deadline) {
-            return self.fail_cycle(io, error, false);
+        match self.sample_stopped(io, deadline) {
+            Ok(sample) => self.note_hold_sample(sample),
+            Err(error) => return self.fail_cycle(io, error, false),
         }
         let marker_seen = match io.marker_seen() {
             Ok(seen) => seen,
@@ -1128,8 +1259,9 @@ impl PauseCoordinator {
             if let Err(error) = io.wait_one_ms() {
                 return self.fail_cycle(io, error, true);
             }
-            if let Err(error) = self.sample_stopped(io, deadline) {
-                return self.fail_cycle(io, error, false);
+            match self.sample_stopped(io, deadline) {
+                Ok(sample) => self.note_hold_sample(sample),
+                Err(error) => return self.fail_cycle(io, error, false),
             }
             match io.marker_seen() {
                 Ok(false) => {}
@@ -1151,6 +1283,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error.to_string(), lifecycle);
         }
 
+        if let Err(error) = hold_until_the_attach_tick_passes(io, deadline) {
+            return self.fail_cycle(io, error, true);
+        }
         match io.cancelled() {
             Ok(false) => {}
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
@@ -1164,6 +1299,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error, true);
         }
         self.epoch.resume_succeeded = true;
+        // The first completing resume freezes the from-start hold: the
+        // child runs past here, so later cycles start a new interval.
+        self.hold_frozen = true;
         if install_successor {
             self.epoch = PauseEpoch {
                 successor_installed: true,
@@ -1260,6 +1398,32 @@ impl PauseCoordinator {
         }
     }
 
+    /// A bounded unowned apply whose failure ends this cycle. On error it
+    /// opens the attempt, so the partial closes one, and keeps the category
+    /// the failed apply recorded, which opening the attempt would otherwise
+    /// clear as a leftover. A category left from before is set aside for the
+    /// apply and restored only when it succeeds, as without this wrapper.
+    fn apply_unowned_opening_on_error(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+    ) -> Result<(), PauseError> {
+        let leftover = if self.attempt_open {
+            None
+        } else {
+            self.pending_diagnostic.take()
+        };
+        let result = self.apply_unowned(io, Some(deadline));
+        if result.is_err() {
+            let recorded = self.pending_diagnostic.take();
+            self.begin_attempt();
+            self.pending_diagnostic = recorded;
+        } else if leftover.is_some() {
+            self.pending_diagnostic = leftover;
+        }
+        result
+    }
+
     fn remove_and_account(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
         let disposition = if self.epoch.rejected {
             RemovalDisposition::Rejected
@@ -1284,6 +1448,9 @@ impl PauseCoordinator {
     }
 
     fn reject_cycle(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<(), PauseError> {
+        // Rejected: the helper refused the stop, so the child was never
+        // held by this epoch.
+        self.void_hold();
         self.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
         if self.policy == PausePolicy::Always {
             return self.terminal_cleanup_with_cause(
@@ -1370,18 +1537,122 @@ impl PauseCoordinator {
         self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
-    fn sample_stopped(&self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
-        let states = io.task_states(self.pid)?;
+    /// A strict sample: every thread must already be stopped and the task set
+    /// must be exactly the expected one. Used once the stop was seen complete:
+    /// a stopped group cannot clone, so a running or new thread means
+    /// something ran under the stop.
+    fn sample_stopped(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
+        self.sample_tasks(io, deadline, false)?
+            .ok_or_else(|| MSG_TASK_SET_CHANGED.into())
+    }
+
+    /// The stop's first sample. The helper's SIGSTOP is queued before its
+    /// record, but on a loaded host a thread can still be running or about to
+    /// be woken into the group stop when the record is serviced. Re-sample at
+    /// the existing 1 ms cadence until every thread is stopped, inside the
+    /// stop's existing deadline and never more than one cycle of samples. A
+    /// thread still on its way at the deadline, or when the samples run out,
+    /// reports the deadline; a changed set (vanished, reused or undated thread) or a thread that can
+    /// never reach the stop refuses at once. Nothing is attached before this
+    /// returns, so a thread that ran while the stop settled only ran before
+    /// the hooks changed. The error carries whether it is a lifecycle failure
+    /// (a failed wait).
+    fn sample_until_stopped(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+    ) -> Result<u64, (String, bool)> {
+        for _ in 0..=MAX_SETTLE_SAMPLES {
+            if let Some(now) = self
+                .sample_tasks(io, deadline, true)
+                .map_err(|error| (error, false))?
+            {
+                return Ok(now);
+            }
+            io.wait_one_ms().map_err(|error| (error, true))?;
+        }
+        // Every sample found the threads on their way into the stop: running
+        // out of samples is the deadline's twin.
+        Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+    }
+
+    /// One task sample, a single `stat` read per thread. The task set and
+    /// thread states are judged before the deadline. A strict sample that is
+    /// not fully stopped, or any sample with a thread that can never reach the
+    /// stop, is today's task-set refusal. While `settling`, a sample whose
+    /// threads are all in `T`, `R`, `S` or `D` waits (`Ok(None)`) for the
+    /// ones on their way into the stop, and once past the deadline reports
+    /// the deadline message, as a fully stopped sample past the deadline does.
+    /// New threads are adopted only by a fully stopped settling sample.
+    fn sample_tasks(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+        settling: bool,
+    ) -> Result<Option<u64>, String> {
+        let samples = io.task_samples(self.pid)?;
+        // Read after the starts: a later read can only see a later attach.
+        let last_attach = io.last_hook_attach_boot_ns();
         let now = io.now_ns()?;
+        let births = self.covered_births(&samples, last_attach, settling)?;
+        if samples.values().any(|sample| sample.state != b'T') {
+            let settles = |sample: &TaskSample| matches!(sample.state, b'T' | b'R' | b'S' | b'D');
+            if !settling || !samples.values().all(settles) {
+                return Err(MSG_TASK_SET_CHANGED.into());
+            }
+            if now > deadline {
+                return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+            }
+            return Ok(None);
+        }
         if now > deadline {
             return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
         }
-        if states.keys().ne(self.expected_tasks.keys())
-            || states.values().any(|state| *state != b'T')
-        {
-            return Err("task set changed or was not entirely stopped".into());
+        for (tid, start) in births {
+            self.expected_tasks.insert(tid, b'T');
+            self.expected_starts.insert(tid, start);
         }
-        Ok(now)
+        Ok(Some(now))
+    }
+
+    /// Threads whose floored birth is strictly after the last completed
+    /// provider hook attach (see [`birth_covered`]), which a settling sample
+    /// may adopt into the expected set. Uprobes are per file: once attached
+    /// they fire for every thread, so such a thread is no more exposed than a
+    /// thread that existed at preflight. The pause arm is deliberately not the
+    /// instant: a frame or successor re-arm is no attach. Only the first
+    /// (`settling`) sample admits a new thread; at a strict sample any unknown
+    /// tid is a refusal. Every other change — a missing expected tid, a
+    /// reused tid (same tid, different start time), a floored birth at or
+    /// before the attach, an unreadable start time, no recorded attach or one
+    /// in flight — keeps today's task-set refusal. An adopted thread is then
+    /// held to every later sample like a preflight thread, so this stop's own
+    /// attach (which it was verified stopped through) does not undo it.
+    fn covered_births(
+        &self,
+        samples: &BTreeMap<u32, TaskSample>,
+        last_attach_boot_ns: Option<u64>,
+        admit_births: bool,
+    ) -> Result<Vec<(u32, u64)>, String> {
+        for tid in self.expected_tasks.keys() {
+            if !samples.contains_key(tid) {
+                return Err(MSG_TASK_SET_CHANGED.into());
+            }
+        }
+        let mut births = Vec::new();
+        for (tid, sample) in samples {
+            let known = self.expected_tasks.contains_key(tid);
+            match (known, self.expected_starts.get(tid), sample.start) {
+                (true, Some(recorded), Some(start)) if start == *recorded => {}
+                (false, None, Some(start))
+                    if admit_births && birth_covered(start, last_attach_boot_ns) =>
+                {
+                    births.push((*tid, start));
+                }
+                _ => return Err(MSG_TASK_SET_CHANGED.into()),
+            }
+        }
+        Ok(births)
     }
 
     fn observe_resumed(
@@ -1492,6 +1763,7 @@ impl PauseCoordinator {
         message: impl Into<String>,
         lifecycle: bool,
     ) -> Result<(), PauseError> {
+        self.void_hold();
         let message = message.into();
         self.set_message_diagnostic(&message);
         io.note_unconfirmed_cycle();
@@ -1883,6 +2155,54 @@ impl PauseCoordinator {
         self.counters
     }
 
+    /// Records one `--pause always` degrade that collected unpaused
+    /// instead of aborting (never-stop). The attempt was already counted
+    /// by `begin_attempt`; this moves it to `unavailable` (partial).
+    pub(crate) fn note_unavailable(&mut self) {
+        self.counters.unavailable = self.counters.unavailable.saturating_add(1);
+        debug_assert!(
+            self.counters.valid(),
+            "unavailable must stay within attempts: {:?}",
+            self.counters
+        );
+    }
+
+    /// Records a stopped-sample instant toward the first hold: the child
+    /// was proven stopped at `now`. Frozen holds never move.
+    fn note_hold_sample(&mut self, now: u64) {
+        if !self.hold_frozen {
+            let end = self.hold_end_ns.get_or_insert(now);
+            *end = (*end).max(now);
+        }
+    }
+
+    /// Voids the from-start claim after anything unproven. Sticky until
+    /// the freeze; frozen holds are immutable (a later gap lands after
+    /// the proven end, so it ends nothing).
+    fn void_hold(&mut self) {
+        if !self.hold_frozen {
+            self.hold_void = true;
+        }
+    }
+
+    /// The first-hold proof for pre-arm exactness, once the coordinator
+    /// armed: `None` while no arm proved a hold (a passive capture, a
+    /// failed or disabled arm, or a missing arm clock). The end bound
+    /// publishes only after the first resume freezes it, so a cycle that
+    /// never completes can never lend a partial end to a proof. A
+    /// returned hold carries its own gap flag; the builder trusts only a
+    /// continuous one.
+    pub(crate) fn pause_hold(&self) -> Option<PauseGateHold> {
+        let start = self.hold_start_ns?;
+        let end = self.hold_end_ns.filter(|_| self.hold_frozen);
+        let sane = end.is_none_or(|end| start <= end);
+        Some(PauseGateHold {
+            start_ns: Some(start),
+            end_ns: end,
+            continuous: !self.hold_void && sane,
+        })
+    }
+
     #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.
     pub(crate) fn status(&self) -> PauseStatus {
         self.counters.status()
@@ -2094,7 +2414,30 @@ impl PauseIo for SessionPauseIo<'_> {
         read_task_states(pid)
     }
 
+    fn task_samples(&mut self, pid: u32) -> Result<BTreeMap<u32, TaskSample>, String> {
+        read_task_samples(pid)
+    }
+
+    fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+        last_hook_attach_boot_ns()
+    }
+
+    fn boot_now_ns(&mut self) -> Option<u64> {
+        boot_ns()
+    }
+
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
+        // Shared allowance, enforced structurally: a staged pop is a
+        // credit transfer and always proceeds, but a ring read needs a
+        // free credit. At zero room the coordinator gets an explicit
+        // capacity block — never an empty observation — so its cycle
+        // fails honestly instead of over-admitting.
+        let staged = self.session.staged_discovery_len();
+        if staged == 0
+            && staged.saturating_add(self.engine.discovery_held_len()) >= DISCOVERY_HELD_CAP
+        {
+            return Err("live discovery pull stopped at the shared storage allowance with records still unread".into());
+        }
         let item = self
             .session
             .discovery_dequeue()
@@ -2136,6 +2479,23 @@ impl PauseIo for SessionPauseIo<'_> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let nested_deadline = std::cell::Cell::new(false);
+        // Every nested pull in this batch shares one budget seeded from
+        // the shared allowance beside the batch-local records; merges of
+        // those locals into pending are transfers, already counted.
+        let malformed = std::mem::take(&mut self.malformed);
+        // The reconcile above may hold the terminal batch
+        // coordinator-side: its records are still owned, so they count
+        // against fresh acquisition until the install below moves them
+        // back into the engine.
+        let coordinator_held = terminal_batch.as_ref().map_or(0, TerminalBatch::len);
+        let pull_budget = std::cell::Cell::new(
+            DISCOVERY_HELD_CAP
+                .saturating_sub(self.session.staged_discovery_len())
+                .saturating_sub(self.engine.discovery_held_len())
+                .saturating_sub(records.len())
+                .saturating_sub(malformed as usize)
+                .saturating_sub(coordinator_held),
+        );
         let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(
                 session,
@@ -2144,27 +2504,40 @@ impl PauseIo for SessionPauseIo<'_> {
                 stop_candidate_seen,
                 pause_owned,
                 &nested_deadline,
+                &pull_budget,
             )
         };
         let terminal_dispatch = terminal_batch.is_some();
-        if let Some(batch) = terminal_batch.take()
-            && let Err(error) = self
-                .engine
-                .install_terminal_batch(batch.clone(), records.clone())
-        {
-            *terminal_batch = Some(batch);
-            return Err(PauseBatchError::new(
-                format!("terminal discovery batch restore failed: {error:#}"),
-                None,
-            ));
-        }
-        let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
+        // Move-only: the batch and its records move into the engine. The
+        // install is prechecked before the move, so a refusal restores the
+        // batch without needing a second owned copy.
+        let records = match terminal_batch.take() {
+            Some(batch) => {
+                if let Err(error) = self.engine.terminal_batch_installable(&batch) {
+                    *terminal_batch = Some(batch);
+                    self.malformed = self.malformed.saturating_add(malformed);
+                    return Err(PauseBatchError::new(
+                        format!("terminal discovery batch restore failed: {error:#}"),
+                        None,
+                    ));
+                }
+                if let Err(error) = self.engine.install_terminal_batch(batch, records) {
+                    self.malformed = self.malformed.saturating_add(malformed);
+                    return Err(PauseBatchError::new(
+                        format!("terminal discovery batch restore failed: {error:#}"),
+                        None,
+                    ));
+                }
+                Vec::new()
+            }
+            None => records,
+        };
         let before_ns = attach::monotonic_ns();
         self.engine.set_pause_owned_batch(pause_owned);
         let applied = self.engine.apply_discovery_batch_with(
             self.session,
             records,
-            std::mem::take(&mut self.malformed),
+            malformed,
             additions_allowed,
             terminal_dispatch,
             &mut collect,
@@ -2267,6 +2640,13 @@ impl PauseIo for SessionPauseIo<'_> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let nested_deadline = std::cell::Cell::new(false);
+        // Nested pulls in this revalidation share one budget seeded from
+        // the shared allowance beside what the Engine already holds.
+        let pull_budget = std::cell::Cell::new(
+            DISCOVERY_HELD_CAP
+                .saturating_sub(self.session.staged_discovery_len())
+                .saturating_sub(self.engine.discovery_held_len()),
+        );
         let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(
                 session,
@@ -2275,6 +2655,7 @@ impl PauseIo for SessionPauseIo<'_> {
                 stop_candidate_seen,
                 pause_owned,
                 &nested_deadline,
+                &pull_budget,
             )
         };
         let outcome =
@@ -2382,6 +2763,7 @@ fn collect_timed_retirement(
     stop_candidate_seen: &mut bool,
     pause_owned: bool,
     nested_deadline: &std::cell::Cell<bool>,
+    budget: &std::cell::Cell<usize>,
 ) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
     collect_timed_retirement_with(
         child.pid(),
@@ -2390,7 +2772,22 @@ fn collect_timed_retirement(
         pause_owned,
         Some(nested_deadline),
         || attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed")),
-        || session.discovery_dequeue(),
+        // Shared allowance: staged pops are credit transfers and always
+        // proceed, but a ring read consumes one shared credit. At zero
+        // room with nothing staged the collect stops with a typed
+        // capacity block — never an empty observation — and the retained
+        // prefix travels with it.
+        || {
+            let staged_before = session.staged_discovery_len();
+            if budget.get() == 0 && staged_before == 0 {
+                return Err(DiscoveryCapacityBlocked.into());
+            }
+            let item = session.discovery_dequeue()?;
+            if item.is_some() && session.staged_discovery_len() == staged_before {
+                budget.set(budget.get().saturating_sub(1));
+            }
+            Ok(item)
+        },
         || owned_generation_retained(child).map_err(anyhow::Error::msg),
     )
 }
@@ -2438,6 +2835,17 @@ fn collect_timed_retirement_with(
         let item = match dequeue() {
             Ok(item) => item,
             Err(error) => {
+                // A capacity stop keeps its exact prefix and reports the
+                // allowance, never a transport failure: the operation
+                // retries after owned items settle.
+                if error.is::<DiscoveryCapacityBlocked>() {
+                    return Err(IncompleteTerminalDrain::capacity_blocked(
+                        records,
+                        malformed,
+                        unvalidated_records,
+                    )
+                    .into());
+                }
                 return Err(IncompleteTerminalDrain::new(
                     records,
                     malformed,
@@ -2621,6 +3029,238 @@ fn parse_task_state(stat: &[u8]) -> Option<u8> {
         .flatten()
 }
 
+/// Every task of `pid` with its state letter and kernel start time, from one
+/// read of each `/proc/<pid>/task/<tid>/stat` (fields 3 and 22), so a
+/// thread's state and identity come from the same read. As in
+/// [`read_task_states`], an unreadable `stat` file or state is an error (the
+/// sample then refuses); a start time that cannot be parsed is undated
+/// (`None`), which the coordinator treats as a changed set, never as covered.
+pub(crate) fn read_task_samples(pid: u32) -> Result<BTreeMap<u32, TaskSample>, String> {
+    let directory = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map_err(|error| format!("cannot enumerate task set for pid {pid}: {error}"))?;
+    let mut samples = BTreeMap::new();
+    for entry in directory {
+        let entry =
+            entry.map_err(|error| format!("cannot enumerate task for pid {pid}: {error}"))?;
+        let name = entry.file_name();
+        let tid: u32 = name
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| format!("invalid task directory for pid {pid}"))?;
+        let stat = std::fs::read(entry.path().join("stat"))
+            .map_err(|error| format!("cannot read task {tid} state: {error}"))?;
+        let state =
+            parse_task_state(&stat).ok_or_else(|| format!("cannot parse task {tid} state"))?;
+        let start = parse_task_start(&stat);
+        samples.insert(tid, TaskSample { state, start });
+    }
+    if samples.is_empty() {
+        Err(format!("pid {pid} has an empty task set"))
+    } else {
+        Ok(samples)
+    }
+}
+
+/// Whether a thread's birth provably follows the last completed provider hook
+/// attach: `start_ticks * tick_ns > attach_ns` (ruling PT-3).
+///
+/// Why the floor alone is sound: `fs/proc/array.c` `do_task_stat` reports
+/// `nsec_to_clock_t(timens_add_boottime_ns(task->start_boottime))`.
+/// `copy_process` (`kernel/fork.c`) sets `start_boottime =
+/// ktime_get_boottime_ns()` before the task is made visible or woken, so it
+/// precedes anything the thread runs. `timens_add_boottime_ns` adds the
+/// *reader's* time-namespace boottime offset, the same offset
+/// `posix_get_boottime_timespec` (`kernel/time/posix-timers.c`) adds to this
+/// observer's own `CLOCK_BOOTTIME`, so both values share one domain. With
+/// `NSEC_PER_SEC % USER_HZ == 0` (USER_HZ 100 on x86-64), `nsec_to_clock_t`
+/// is an exact floor division, so `start_ticks * tick_ns <= birth_ns`; a
+/// truncated `tick_ns` only lowers the bound. Hence a floor strictly after
+/// the attach proves the birth is after it. Checked against the 6.6.157,
+/// 6.12.111 and 7.0.14 sources. Without a margin, this also relies on the
+/// kernel's boot clock being ordered across CPUs: an attach completion read on
+/// one CPU before a `clone` on another never reads later than that child's
+/// `start_boottime` (both come from the one system-wide timekeeper). Equality
+/// is not covered, and neither is a missing instant (none recorded or one in
+/// flight) or a saturated one.
+fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
+    let Some(attach) = last_attach_boot_ns else {
+        return false;
+    };
+    start_ticks.saturating_mul(clock_tick_ns()) > attach
+}
+
+/// Holds a confirmed stop's resume until the boot clock has crossed into the
+/// clock tick after the last completed provider hook attach. A thread the
+/// child starts once resumed is dated by its floored tick ([`birth_covered`]),
+/// and a birth inside the attach's own tick floors at or before the attach, so
+/// it would keep the stop partial although it came after the hooks. Every
+/// such thread is born after the resume, so once the resume is past the next
+/// tick boundary its floor is at or past that boundary, strictly after the
+/// attach. This changes only when the child resumes, never which births are
+/// covered. The hold makes at most one tick's worth of the existing 1 ms
+/// waits (each may oversleep). A resume observed after the stop `deadline`
+/// fails the run, so the hold only starts a wait while the wait, plus one
+/// clock tick of headroom for oversleep, the resume and the observer's first
+/// read, still fits before the deadline; otherwise, or when the stop clock
+/// cannot be read or the margin overflows, it resumes at once. This makes a
+/// late observation unlikely, not impossible: a wait that oversleeps by more
+/// than the headroom can still end past the deadline. A birth inside the
+/// attach's tick then stays partial at the next stop, the safe direction. With no recorded attach, an unreadable boot
+/// clock, a saturated instant or a zero tick there is nothing to wait for.
+/// Only a failed wait is an error.
+fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo, deadline: u64) -> Result<(), String> {
+    let Some(mut boot) = io.boot_now_ns() else {
+        return Ok(());
+    };
+    let Some(attach) = io.last_hook_attach_boot_ns() else {
+        return Ok(());
+    };
+    let tick = clock_tick_ns();
+    let Some(boundary) = attach
+        .checked_div(tick)
+        .and_then(|ticks| ticks.checked_add(1))
+        .and_then(|ticks| ticks.checked_mul(tick))
+    else {
+        return Ok(());
+    };
+    for _ in 0..=tick / SAMPLE_NS {
+        if boot >= boundary {
+            return Ok(());
+        }
+        let wait_end = io.now_ns().ok().and_then(|now| {
+            now.checked_add(SAMPLE_NS)
+                .and_then(|end| end.checked_add(tick))
+        });
+        match wait_end {
+            Some(end) if end <= deadline => {}
+            _ => return Ok(()),
+        }
+        io.wait_one_ms()?;
+        let Some(read) = io.boot_now_ns() else {
+            return Ok(());
+        };
+        boot = read;
+    }
+    Ok(())
+}
+
+fn parse_task_start(stat: &[u8]) -> Option<u64> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let tail = stat.get(close + 1..)?;
+    let field = tail
+        .split(|byte| *byte == b' ')
+        .filter(|token| !token.is_empty())
+        .nth(19)?;
+    std::str::from_utf8(field).ok()?.parse().ok()
+}
+
+/// The kernel clock tick in nanoseconds (`sysconf(_SC_CLK_TCK)`, USER_HZ),
+/// cached: start-time ticks floor births to this granularity. Falls back to
+/// USER_HZ 100 when the sysconf read fails.
+fn clock_tick_ns() -> u64 {
+    static TICK_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TICK_NS.get_or_init(|| {
+        // SAFETY: `sysconf` takes only the name constant and returns the
+        // configured value or -1; it writes through no pointer.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = if hz > 0 { hz as u64 } else { 100 };
+        1_000_000_000 / hz
+    })
+}
+
+/// `CLOCK_BOOTTIME` in nanoseconds: the clock domain of `/proc` starttime
+/// ticks (field 22 counts boot-relative ticks), so thread births date against
+/// hook attach completions without a suspend-sensitive conversion. Returns
+/// `None` exactly when the clock read fails.
+pub(crate) fn boot_ns() -> Option<u64> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes `timestamp` on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, timestamp.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized `timestamp`.
+    let timestamp = unsafe { timestamp.assume_init() };
+    let seconds = u64::try_from(timestamp.tv_sec).ok()?;
+    let nanos = u64::try_from(timestamp.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+/// When provider hook attaches completed, in the boot clock. Uprobes are per
+/// file, so once a provider's hooks are live they fire for every thread of
+/// every process mapping it: a thread born strictly after the last completed
+/// attach is no more exposed than a thread that existed at preflight (a
+/// provider mapped but not yet attached is unhooked for every thread alike).
+/// One process-wide maximum is kept, which is conservative: an attach for any
+/// provider anywhere in this observer moves the instant later, never earlier.
+pub(crate) struct HookAttachClock {
+    in_flight: AtomicU64,
+    /// Latest completion stamp; zero when none is recorded. An unreadable
+    /// boot clock at completion stamps `u64::MAX`, so nothing dates after it.
+    last_boot_ns: AtomicU64,
+}
+
+static HOOK_ATTACH_CLOCK: HookAttachClock = HookAttachClock::new();
+
+impl HookAttachClock {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicU64::new(0),
+            last_boot_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn open(&self) -> HookAttachWindow<'_> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        HookAttachWindow { clock: self }
+    }
+
+    fn close(&self, completed_boot_ns: Option<u64>) {
+        let stamp = completed_boot_ns.unwrap_or(u64::MAX).max(1);
+        self.last_boot_ns.fetch_max(stamp, Ordering::SeqCst);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The latest completion, or `None` when none is recorded or an attach
+    /// is open on either side of the read.
+    fn completed(&self) -> Option<u64> {
+        if self.in_flight.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let last = self.last_boot_ns.load(Ordering::SeqCst);
+        if self.in_flight.load(Ordering::SeqCst) != 0 || last == 0 {
+            return None;
+        }
+        Some(last)
+    }
+}
+
+/// One provider hook attach in flight. Its completion is stamped when it
+/// drops, on every return path (success, error or unwind): whatever the
+/// attach made live was live by then, so the stamp is an upper bound on
+/// every hook it installed. Bind it to a named variable for the whole attach:
+/// `let _ =` drops it at once and stamps an instant before the attach.
+#[must_use = "the window stamps the attach completion when it drops"]
+pub(crate) struct HookAttachWindow<'a> {
+    clock: &'a HookAttachClock,
+}
+
+impl Drop for HookAttachWindow<'_> {
+    fn drop(&mut self) {
+        self.clock.close(boot_ns());
+    }
+}
+
+/// Opens a window around one provider hook attach (see [`HookAttachClock`]).
+pub(crate) fn hook_attach_window() -> HookAttachWindow<'static> {
+    HOOK_ATTACH_CLOCK.open()
+}
+
+/// The last completed provider hook attach in this observer, in the boot
+/// clock, or `None` when none completed yet or one is in flight.
+pub(crate) fn last_hook_attach_boot_ns() -> Option<u64> {
+    HOOK_ATTACH_CLOCK.completed()
+}
+
 pub(crate) struct TimedItem {
     before_ns: u64,
     after_ns: u64,
@@ -2660,6 +3300,7 @@ mod tests {
     use crate::discovery::hooks::HookAbi;
     use crate::discovery::identity::PinnedObjectId;
     use crate::discovery::loader::LoaderContextId;
+    use crate::fixture_guard::DieWithParent as _;
     use p11scope_ebpf_common::{
         COALESCED_NO_HELPER_RC, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LOADER,
         DISCOVERY_STATUS_COALESCED_NO_HELPER, DiscoveryRecord, PAUSE_ARMED, PAUSE_REQUESTED,
@@ -2698,6 +3339,21 @@ mod tests {
         now: VecDeque<Result<u64, String>>,
         fallback_now: u64,
         states: VecDeque<Result<BTreeMap<u32, u8>, String>>,
+        /// Last staged task set, repeated once the queue drains: like the
+        /// real `/proc` read, the fake's world persists until scripted
+        /// otherwise. `None` until the first staged read.
+        stable_states: Option<BTreeMap<u32, u8>>,
+        starts: VecDeque<Result<BTreeMap<u32, u64>, String>>,
+        last_states: BTreeMap<u32, u8>,
+        /// Scripted last-attach instants, one per read; the last one
+        /// repeats. Default: none recorded.
+        attach_instants: VecDeque<Option<u64>>,
+        fallback_attach: Option<u64>,
+        /// Scripted boot-clock readings, one per read; then `fallback_boot`.
+        /// Default: unreadable.
+        boot_clock: VecDeque<Option<u64>>,
+        fallback_boot: Option<u64>,
+        state_reads: u64,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
         authorization_results: VecDeque<Result<Option<u64>, String>>,
@@ -2716,6 +3372,13 @@ mod tests {
         unvalidated_records: u64,
         required_complete: bool,
         fail_wait: bool,
+        /// Waits that succeed before every later wait fails. Default: no limit.
+        fail_wait_after: Option<usize>,
+        waits_done: usize,
+        /// Fails the first stop-clock read after the first boot-clock read
+        /// (the resume hold's), once.
+        fail_first_now_after_boot: bool,
+        boot_read: bool,
         cancelled: bool,
         same_generation: bool,
         same_generation_results: VecDeque<Result<bool, String>>,
@@ -2748,6 +3411,14 @@ mod tests {
                 now: VecDeque::new(),
                 fallback_now: 0,
                 states: VecDeque::new(),
+                stable_states: None,
+                starts: VecDeque::new(),
+                last_states: BTreeMap::new(),
+                attach_instants: VecDeque::new(),
+                fallback_attach: None,
+                boot_clock: VecDeque::new(),
+                fallback_boot: None,
+                state_reads: 0,
                 queue: VecDeque::new(),
                 authorization: None,
                 authorization_results: VecDeque::new(),
@@ -2766,6 +3437,10 @@ mod tests {
                 unvalidated_records: 0,
                 required_complete: true,
                 fail_wait: false,
+                fail_wait_after: None,
+                waits_done: 0,
+                fail_first_now_after_boot: false,
+                boot_read: false,
                 cancelled: false,
                 same_generation: true,
                 same_generation_results: VecDeque::new(),
@@ -2794,8 +3469,24 @@ mod tests {
         }
     }
 
+    impl FakeIo {
+        /// The scripted start times for one sample, read after its states.
+        fn scripted_starts(&mut self) -> Result<BTreeMap<u32, u64>, String> {
+            if let Some(starts) = self.starts.pop_front() {
+                return starts;
+            }
+            // Unscripted tasks date at tick zero, matching the default test
+            // baseline; a scripted birth dates against the scripted attach.
+            Ok(self.last_states.keys().map(|tid| (*tid, 0)).collect())
+        }
+    }
+
     impl PauseIo for FakeIo {
         fn now_ns(&mut self) -> Result<u64, String> {
+            if self.fail_first_now_after_boot && self.boot_read {
+                self.fail_first_now_after_boot = false;
+                return Err("clock".into());
+            }
             if self.resumed
                 && let Some(now) = self.post_resume_now.pop_front()
             {
@@ -2819,21 +3510,56 @@ mod tests {
 
         fn wait_one_ms(&mut self) -> Result<(), String> {
             self.events.push("wait");
-            if self.fail_wait {
+            if self.fail_wait || self.fail_wait_after.is_some_and(|n| self.waits_done >= n) {
                 return Err("wait".into());
             }
+            self.waits_done += 1;
             self.fallback_now = self.fallback_now.saturating_add(SAMPLE_NS);
             Ok(())
         }
 
         fn task_states(&mut self, _: u32) -> Result<BTreeMap<u32, u8>, String> {
-            self.states.pop_front().unwrap_or_else(|| {
-                if self.resumed && !self.post_resume_all_stopped {
-                    Ok([(41, b'R'), (42, b'T')].into_iter().collect())
-                } else {
-                    Ok(stopped())
+            self.state_reads = self.state_reads.saturating_add(1);
+            let states = match self.states.pop_front() {
+                Some(states) => {
+                    if let Ok(states) = &states {
+                        self.stable_states = Some(states.clone());
+                    }
+                    states
                 }
-            })
+                None if self.resumed && !self.post_resume_all_stopped => {
+                    Ok([(41, b'R'), (42, b'T')].into_iter().collect())
+                }
+                None => Ok(self.stable_states.clone().unwrap_or_else(stopped)),
+            };
+            if let Ok(states) = &states {
+                self.last_states = states.clone();
+            }
+            states
+        }
+
+        fn task_samples(&mut self, pid: u32) -> Result<BTreeMap<u32, TaskSample>, String> {
+            let states = self.task_states(pid)?;
+            let starts = self.scripted_starts()?;
+            Ok(states
+                .into_iter()
+                .map(|(tid, state)| {
+                    let start = starts.get(&tid).copied();
+                    (tid, TaskSample { state, start })
+                })
+                .collect())
+        }
+
+        fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+            if let Some(instant) = self.attach_instants.pop_front() {
+                self.fallback_attach = instant;
+            }
+            self.fallback_attach
+        }
+
+        fn boot_now_ns(&mut self) -> Option<u64> {
+            self.boot_read = true;
+            self.boot_clock.pop_front().unwrap_or(self.fallback_boot)
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
@@ -3048,6 +3774,7 @@ mod tests {
         assert_eq!(parse_task_state(b"missing delimiter"), None);
         let mut child = std::process::Command::new("sleep")
             .arg("1")
+            .die_with_parent()
             .spawn()
             .unwrap();
         assert!(!read_task_states(child.id()).unwrap().is_empty());
@@ -3187,6 +3914,31 @@ mod tests {
         );
     }
 
+    /// Preflight dates every thread it freezes: a thread whose start time
+    /// cannot be read refuses the pause instead of joining the expected set
+    /// undated.
+    #[test]
+    fn preflight_refuses_a_thread_without_a_start_time() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let expected = [(child.pid(), b'S')].into_iter().collect();
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(expected)]),
+            starts: VecDeque::from([Ok(BTreeMap::new())]),
+            ..FakeIo::default()
+        };
+
+        let error = PauseCoordinator::preflight(PausePolicy::Always, &child, &mut io)
+            .err()
+            .expect("an undated preflight thread must refuse");
+
+        assert!(
+            error
+                .to_string()
+                .contains("start time during pause preflight"),
+            "{error}"
+        );
+    }
+
     /// The owned child ends; its last records are already in the ring. Nothing
     /// else can be producing under that pid — the unreaped fork child still
     /// holds it — so the records are still this generation's and the ordinary
@@ -3259,6 +4011,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(
@@ -3332,6 +4085,7 @@ mod tests {
                     attempts: 1,
                     confirmed: 0,
                     partial: 0,
+                    unavailable: 0,
                 }
             );
             assert_eq!(
@@ -3357,6 +4111,242 @@ mod tests {
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
     }
 
+    /// Drives the real `arm` (not `arm_for_test`) so the hold snapshots
+    /// the arm clock, then points the scripted authorization at the won
+    /// REQUESTED the service cycle consumes. `arm_now` is consumed first.
+    fn armed_hold_coordinator(io: &mut FakeIo, arm_now: Result<u64, String>) -> PauseCoordinator {
+        io.now.push_front(arm_now);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut *io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+        coordinator
+    }
+
+    /// The first completed pause cycle freezes the from-start hold: the
+    /// arm lower bound plus the last stopped sample before the resume. A
+    /// re-arm and a second completed cycle neither move the frozen end nor
+    /// replace the first arm's start.
+    #[test]
+    fn pause_hold_freezes_first_hold_at_resume() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(None);
+        let mut coordinator = armed_hold_coordinator(&mut io, Ok(5));
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        let frozen = PauseGateHold {
+            start_ns: Some(5),
+            end_ns: Some(2_000_016),
+            continuous: true,
+        };
+        assert_eq!(coordinator.pause_hold(), Some(frozen));
+
+        // Re-arm after the freeze: the live arm moves, the snapshot stays.
+        io.now.push_front(Ok(20));
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.resume_authorization = Some(Some(PAUSE_REQUESTED));
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(record(25, 0, false)))),
+            Ok(None),
+            Ok(None),
+        ]);
+        io.now.push_back(Ok(26));
+        io.now.push_back(Ok(27));
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped())]);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(2));
+        assert_eq!(coordinator.pause_hold(), Some(frozen));
+    }
+
+    /// A cycle that fails after stopping voids the from-start claim and
+    /// publishes no end: without a completing resume nothing freezes.
+    #[test]
+    fn pause_hold_failed_cycle_voids() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fail_apply = true;
+        let mut coordinator = armed_hold_coordinator(&mut io, Ok(5));
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A passive capture never arms: no hold exists at all.
+    #[test]
+    fn pause_hold_never_policy_yields_none() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(coordinator.pause_hold(), None);
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.pause_hold(), None);
+    }
+
+    /// An arm whose clock read failed proves no start bound: even a fully
+    /// confirmed cycle afterward yields no hold, and a later re-arm cannot
+    /// smuggle in its own clock as the first bound.
+    #[test]
+    fn pause_hold_missing_arm_clock_yields_none() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(None);
+        let mut coordinator = armed_hold_coordinator(&mut io, Err("clock".into()));
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(coordinator.pause_hold(), None);
+
+        io.now.push_front(Ok(20));
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        assert_eq!(coordinator.pause_hold(), None);
+    }
+
+    /// A rejected stop never held the child: the hold voids with no end.
+    #[test]
+    fn pause_hold_rejected_stop_voids() {
+        let mut io = successful_io(vec![record(10, -libc::EPERM as i64, false)]);
+        let mut coordinator = armed_hold_coordinator(&mut io, Ok(5));
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A refuted stop candidate (ARMED still held: no hook won) means the
+    /// child ran unstopped: the hold voids even though service succeeds.
+    #[test]
+    fn pause_hold_refuted_candidate_voids() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now.push_front(Ok(5));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        // The arm exchange left ARMED behind: no hook won it.
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A refuted first epoch voids sticky: even a fully confirmed later
+    /// cycle freezes a gapped hold, never a clean one.
+    #[test]
+    fn pause_hold_refute_then_complete_freezes_gapped() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now.push_front(Ok(5));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(record(25, 0, false)))),
+            Ok(None),
+            Ok(None),
+        ]);
+        io.now.push_back(Ok(26));
+        io.now.push_back(Ok(27));
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped())]);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: Some(2_000_032),
+                continuous: false,
+            })
+        );
+    }
+
+    /// A second terminal batch colliding with the coordinator's is a
+    /// lifecycle failure before any stop: the hold voids.
+    #[test]
+    fn pause_hold_terminal_batch_collision_voids() {
+        let owner = crate::discovery::loader::LoaderContextId::from_case_id(1);
+        let mut held = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+        held.extend([record(10, -libc::EPERM as i64, false)]);
+        let mut carried = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+        carried.extend([record(10, -libc::EPERM as i64, false)]);
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.hold_start_ns = Some(5);
+        coordinator.terminal_batch = Some(held);
+
+        let error = coordinator
+            .service_deferred(
+                &mut io,
+                TimedItem {
+                    before_ns: 1,
+                    after_ns: 2,
+                    item: DiscoveryItem::Record(record(10, -libc::EPERM as i64, false)),
+                    terminal_batch: Some(carried),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one terminal"),
+            "{error}"
+        );
+        // The void latches even though the collision precedes any stop.
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
     #[test]
     fn generation_mismatch_after_resume_is_lifecycle_fatal() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -3375,6 +4365,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
     }
@@ -3615,6 +4606,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert!(!coordinator.rearming_enabled());
@@ -3634,6 +4626,1149 @@ mod tests {
         coordinator.service(&mut io).unwrap();
 
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    /// The kernel clock tick in nanoseconds, read independently of the
+    /// coordinator: birth-dating tests script arm and birth instants against
+    /// this oracle, not against the code under test.
+    fn test_tick_ns() -> u64 {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = if hz > 0 { hz as u64 } else { 100 };
+        1_000_000_000 / hz
+    }
+
+    /// A birth-dating stop: every stopped sample shows `states` dated by
+    /// `starts`, and the last provider hook attach completed at `attach`
+    /// (`None`: none recorded, or one in flight). The confirm path takes four
+    /// stopped samples (two pre-apply, one post-apply, one post-successor-arm).
+    fn birth_dating_io(
+        states: BTreeMap<u32, u8>,
+        starts: BTreeMap<u32, u64>,
+        attach: Option<u64>,
+    ) -> FakeIo {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = attach;
+        io.states = VecDeque::from([
+            Ok(states.clone()),
+            Ok(states.clone()),
+            Ok(states.clone()),
+            Ok(states),
+        ]);
+        io.starts = VecDeque::from([
+            Ok(starts.clone()),
+            Ok(starts.clone()),
+            Ok(starts.clone()),
+            Ok(starts),
+        ]);
+        io
+    }
+
+    /// An armed stop with the preflight threads 41 and 42 born at tick 50.
+    /// The coordinator keeps no arm instant in the boot clock, so no arm (a
+    /// fresh frame or a successor re-arm) is an input to birth dating; only
+    /// `birth_first_seen_after_a_successor_rearm_keeps_partial` runs a real
+    /// successor re-arm.
+    fn birth_dating_coordinator() -> PauseCoordinator {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.expected_starts = [(41, 50), (42, 50)].into_iter().collect();
+        coordinator
+    }
+
+    /// Thread 43 joins the preflight threads, born at `birth_tick`.
+    fn grown_by_one(birth_tick: u64) -> (BTreeMap<u32, u8>, BTreeMap<u32, u64>) {
+        (
+            [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect(),
+            [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect(),
+        )
+    }
+
+    /// Runs one stop that sees thread 43 born at `birth_tick` against a last
+    /// completed attach at `attach_tick`.
+    fn birth_dating_stop(birth_tick: u64, attach_tick: Option<u64>) -> PauseCoordinator {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(
+            grown,
+            starts,
+            attach_tick.map(|attach| attach.saturating_mul(tick)),
+        );
+        let mut coordinator = birth_dating_coordinator();
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    fn assert_covered(coordinator: &PauseCoordinator) {
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.expected_tasks.keys().collect::<Vec<_>>(),
+            [&41, &42, &43]
+        );
+        assert!(coordinator.expected_starts.contains_key(&43));
+    }
+
+    fn assert_partial(coordinator: &PauseCoordinator) {
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// A thread whose floored birth is after the last hook attach is no more
+    /// exposed than a preflight thread: the stop adopts it into the expected
+    /// set and confirms instead of reporting partial.
+    #[test]
+    fn thread_born_after_last_attach_is_adopted_and_the_stop_confirms() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
+        let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50), (43, 102)].into_iter().collect();
+        let mut io = birth_dating_io(grown, starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.expected_tasks.keys().collect::<Vec<_>>(),
+            [&41, &42, &43]
+        );
+    }
+
+    /// The OpenSC shape: worker threads born ten ticks or more after the
+    /// provider's hooks attached are covered and the stop confirms. Births
+    /// date against the attach alone; no arm is an input.
+    #[test]
+    fn birth_well_after_the_last_attach_is_covered() {
+        for birth_tick in [100, 101] {
+            let coordinator = birth_dating_stop(birth_tick, Some(90));
+            assert_covered(&coordinator);
+        }
+    }
+
+    /// A thread born before the last hook attach completed might have run
+    /// provider code before that provider's hooks were live: the stop keeps
+    /// today's partial.
+    #[test]
+    fn thread_born_before_last_attach_keeps_partial() {
+        assert_partial(&birth_dating_stop(99, Some(100)));
+    }
+
+    /// A thread born after one provider attached (tick 90) but before a later
+    /// module's attach completed (tick 110) dates against the later attach and
+    /// keeps today's partial.
+    #[test]
+    fn later_module_attach_after_the_birth_keeps_partial() {
+        assert_partial(&birth_dating_stop(102, Some(110)));
+    }
+
+    /// Runs one stop that sees thread 43 born at `birth_tick` against a last
+    /// completed attach at `attach_ns`.
+    fn birth_dating_stop_at(birth_tick: u64, attach_ns: u64) -> PauseCoordinator {
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(grown, starts, Some(attach_ns));
+        let mut coordinator = birth_dating_coordinator();
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    /// The kernel floors the birth to whole ticks, and the floor is a lower
+    /// bound on the birth (ruling PT-3): a floor at or before the attach
+    /// instant (equality included) keeps today's partial, and any floor
+    /// strictly after it is covered, even inside the attach's own tick.
+    #[test]
+    fn birth_floor_at_or_before_the_attach_keeps_partial_and_a_later_floor_is_covered() {
+        let tick = test_tick_ns();
+        for (birth_tick, attach_ns) in [
+            (99, 100 * tick),
+            (100, 100 * tick),
+            (100, 100 * tick + 1),
+            (101, 101 * tick),
+        ] {
+            let coordinator = birth_dating_stop_at(birth_tick, attach_ns);
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "floor {birth_tick} vs attach {attach_ns} must stay partial"
+            );
+            assert!(!coordinator.rearming_enabled());
+        }
+        for (birth_tick, attach_ns) in [
+            (101, 100 * tick),
+            (101, 101 * tick - 1),
+            (101, 100 * tick + tick / 4),
+        ] {
+            assert_covered(&birth_dating_stop_at(birth_tick, attach_ns));
+        }
+    }
+
+    /// An attach still in flight reports no completed instant: nothing born
+    /// after preflight dates as covered.
+    #[test]
+    fn attach_in_flight_keeps_partial() {
+        let clock = HookAttachClock::new();
+        let tick = test_tick_ns();
+        let earlier = clock.open();
+        drop(earlier);
+        let completed = clock.completed().expect("a closed attach is recorded");
+        let open = clock.open();
+        let in_flight = clock.completed();
+        assert_eq!(in_flight, None, "an open attach reports no instant");
+
+        let (grown, starts) = grown_by_one(completed / tick + 1_000);
+        let mut io = birth_dating_io(grown, starts, in_flight);
+        let mut coordinator = birth_dating_coordinator();
+        coordinator.service(&mut io).unwrap();
+        drop(open);
+
+        assert_partial(&coordinator);
+    }
+
+    /// With no attach completion recorded, nothing born after preflight dates
+    /// as covered.
+    #[test]
+    fn no_attach_instant_recorded_keeps_partial() {
+        assert_eq!(HookAttachClock::new().completed(), None);
+        assert_partial(&birth_dating_stop(102, None));
+    }
+
+    /// A thread adopted before this stop's own attach was verified stopped
+    /// through that attach (the post-apply and post-arm samples require it
+    /// stopped), so the attach completing after its birth does not undo the
+    /// adoption.
+    #[test]
+    fn adopted_thread_survives_the_stops_own_attach() {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(102);
+        let mut io = birth_dating_io(grown, starts, Some(90u64.saturating_mul(tick)));
+        io.attach_instants = VecDeque::from([
+            Some(90u64.saturating_mul(tick)),
+            Some(90u64.saturating_mul(tick)),
+            Some(110u64.saturating_mul(tick)),
+            Some(110u64.saturating_mul(tick)),
+        ]);
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_covered(&coordinator);
+    }
+
+    /// Births are adopted only in the stop's first (settling) sample. A stopped
+    /// group cannot clone, so a thread first seen after the successor re-arm
+    /// means something ran under the stop: today's partial, even when its
+    /// floored birth is after the last attach (ruling PT-5).
+    #[test]
+    fn birth_first_seen_after_a_successor_rearm_keeps_partial() {
+        let tick = test_tick_ns();
+        for attach_tick in [100, 101, 102] {
+            let coordinator = birth_first_seen_at(3, 102, attach_tick * tick);
+            assert_partial(&coordinator);
+        }
+    }
+
+    /// Runs one stop whose thread 43 (born at `birth_tick`) is first seen at
+    /// sample `first_seen`: 0 settling, 1 the second sample, 2 post-apply,
+    /// 3 post-successor-arm. Earlier samples see only the preflight threads.
+    fn birth_first_seen_at(first_seen: usize, birth_tick: u64, attach_ns: u64) -> PauseCoordinator {
+        let preflight: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(attach_ns));
+        io.states = (0..4)
+            .map(|sample| {
+                Ok(if sample < first_seen {
+                    stopped()
+                } else {
+                    grown.clone()
+                })
+            })
+            .collect();
+        io.starts = (0..4)
+            .map(|sample| {
+                Ok(if sample < first_seen {
+                    preflight.clone()
+                } else {
+                    starts.clone()
+                })
+            })
+            .collect();
+        let mut coordinator = birth_dating_coordinator();
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    /// The strict samples admit no new thread (ruling PT-5): a covered birth
+    /// first seen at the second or the post-attach sample keeps today's
+    /// partial; the same birth first seen while the stop settles confirms.
+    #[test]
+    fn birth_first_seen_at_a_strict_sample_keeps_partial() {
+        let tick = test_tick_ns();
+        assert_covered(&birth_first_seen_at(0, 102, 90 * tick));
+        for first_seen in [1, 2] {
+            let coordinator = birth_first_seen_at(first_seen, 102, 90 * tick);
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "first seen at sample {first_seen}"
+            );
+            assert!(!coordinator.expected_tasks.contains_key(&43));
+        }
+    }
+
+    /// An adopted thread is held to the later samples like a preflight one:
+    /// a changed start time (a reused tid) or a running state at a strict
+    /// sample keeps today's partial.
+    #[test]
+    fn adopted_thread_is_held_to_the_strict_samples() {
+        let tick = test_tick_ns();
+        for change in ["reused", "running"] {
+            let (grown, starts) = grown_by_one(102);
+            let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(90 * tick));
+            if change == "reused" {
+                let mut reused = starts;
+                reused.insert(43, 103);
+                io.starts[1] = Ok(reused);
+            } else {
+                let mut running = grown;
+                running.insert(43, b'R');
+                io.states[1] = Ok(running);
+            }
+            let mut coordinator = birth_dating_coordinator();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "adopted thread {change} at the second sample"
+            );
+        }
+    }
+
+    /// A preflight thread whose start time becomes unreadable at a later
+    /// sample can no longer be identified: today's partial.
+    #[test]
+    fn known_thread_whose_start_becomes_unreadable_keeps_partial() {
+        let preflight: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(stopped(), preflight, Some(90 * test_tick_ns()));
+        io.starts[1] = Ok([(41, 50)].into_iter().collect());
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_partial(&coordinator);
+    }
+
+    /// The covered check itself (ruling PT-3): covered exactly when the
+    /// floored birth `start_tick * tick_ns` is strictly after the attach;
+    /// equality is not covered, nothing is covered without an instant, and
+    /// nothing after a saturated (unreadable-clock) instant.
+    #[test]
+    fn birth_covered_needs_an_instant_and_a_strictly_later_floor() {
+        let tick = test_tick_ns();
+        assert!(!birth_covered(102, None));
+        assert!(!birth_covered(99, Some(100 * tick)));
+        assert!(!birth_covered(100, Some(100 * tick)));
+        assert!(!birth_covered(100, Some(100 * tick + 1)));
+        assert!(birth_covered(100, Some(100 * tick - 1)));
+        assert!(birth_covered(101, Some(100 * tick)));
+        assert!(birth_covered(101, Some(100 * tick + tick / 2)));
+        assert!(!birth_covered(u64::MAX, Some(u64::MAX)));
+        assert!(!birth_covered(u64::MAX / tick, Some(u64::MAX - 1)));
+    }
+
+    /// The attach clock keeps the latest completion, stamps it in the boot
+    /// clock when the window closes, never moves backward, and fails closed
+    /// (nothing dates after it) when the boot clock was unreadable at close.
+    #[test]
+    fn hook_attach_clock_keeps_the_latest_completion_and_fails_closed() {
+        let clock = HookAttachClock::new();
+        assert_eq!(clock.completed(), None);
+
+        let before = boot_ns().expect("the boot clock reads");
+        drop(clock.open());
+        let after = boot_ns().expect("the boot clock reads");
+        let stamped = clock.completed().expect("a closed attach is recorded");
+        assert!(
+            (before..=after).contains(&stamped),
+            "{before} <= {stamped} <= {after}"
+        );
+
+        let outer = clock.open();
+        let inner = clock.open();
+        drop(inner);
+        assert_eq!(clock.completed(), None, "one attach is still in flight");
+        drop(outer);
+        assert!(clock.completed().unwrap() >= stamped);
+
+        let latest = clock.completed().unwrap();
+        let stale = clock.open();
+        std::mem::forget(stale);
+        clock.close(Some(1));
+        assert_eq!(clock.completed(), Some(latest), "an older stamp never wins");
+
+        let unreadable = clock.open();
+        std::mem::forget(unreadable);
+        clock.close(None);
+        assert_eq!(clock.completed(), Some(u64::MAX));
+    }
+
+    /// Start time has tick granularity: a floor equal to the instant (the
+    /// birth could be at it) or before it keeps today's partial.
+    #[test]
+    fn birth_at_or_before_the_attach_tick_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        for birth_tick in [99, 100] {
+            let grown: BTreeMap<u32, u8> =
+                [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
+            let starts: BTreeMap<u32, u64> =
+                [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect();
+            let mut io = birth_dating_io(grown, starts, Some(instant));
+            let mut coordinator = birth_dating_coordinator();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "birth at tick {birth_tick} must stay partial"
+            );
+            assert!(!coordinator.rearming_enabled());
+        }
+    }
+
+    fn running_42() -> BTreeMap<u32, u8> {
+        [(41, b'T'), (42, b'R')].into_iter().collect()
+    }
+
+    fn waits(io: &FakeIo) -> usize {
+        io.events.iter().filter(|event| **event == "wait").count()
+    }
+
+    /// A stop's first sample can catch a thread the group stop has not reached
+    /// yet (a loaded host). The coordinator re-samples at the 1 ms cadence,
+    /// inside the stop's deadline, until every thread is stopped, then
+    /// confirms (ruling PT-3).
+    #[test]
+    fn first_sample_waits_for_a_running_thread_to_stop() {
+        let sleeping: BTreeMap<u32, u8> = [(41, b'S'), (42, b'T')].into_iter().collect();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = VecDeque::from([
+            Ok(running_42()),
+            Ok(sleeping),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert!(coordinator.rearming_enabled());
+    }
+
+    /// The OpenSC shape under load: a newborn worker (born after the last
+    /// attach) is still running at the first sample, then stops; it is
+    /// covered and the stop confirms.
+    #[test]
+    fn covered_newborn_running_at_the_first_sample_settles_and_confirms() {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(101);
+        let mut first = grown.clone();
+        first.insert(43, b'R');
+        let mut io = birth_dating_io(grown, starts.clone(), Some(100 * tick));
+        io.states.push_front(Ok(first));
+        io.starts.push_front(Ok(starts));
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_covered(&coordinator);
+    }
+
+    /// The settling is bounded by the stop's existing deadline: a thread still
+    /// running when it passes ends the stop partial on the deadline message
+    /// (ruling PT-7), after at most one wait per millisecond of the cycle.
+    #[test]
+    fn thread_still_running_at_the_stop_deadline_keeps_partial() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = std::iter::repeat_with(|| Ok(running_42()))
+            .take(2_000)
+            .collect();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_partial(&coordinator);
+        assert!(
+            waits(&io) <= (CYCLE_NS / SAMPLE_NS) as usize + 2,
+            "{} waits",
+            waits(&io)
+        );
+        assert!(
+            !io.states.is_empty(),
+            "the deadline, not the script, ended it"
+        );
+    }
+
+    /// The settling sample itself: a thread still running when the deadline
+    /// passes reports the deadline message (ruling PT-7), a first sample
+    /// already past the deadline keeps the deadline message, and a failed wait
+    /// is a lifecycle failure.
+    #[test]
+    fn settling_sample_reports_the_deadline_when_it_runs_out_of_time() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(running_42()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, 5 * SAMPLE_NS),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+        assert!((4..=6).contains(&waits(&io)), "{} waits", waits(&io));
+
+        let mut late = FakeIo {
+            fallback_now: 10,
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut late, 5),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+
+        let mut failing = FakeIo {
+            states: VecDeque::from([Ok(running_42())]),
+            fail_wait: true,
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut failing, CYCLE_NS),
+            Err(("wait".into(), true))
+        );
+    }
+
+    /// The `wait` events immediately before the resume.
+    fn waits_before_resume(io: &FakeIo) -> usize {
+        let resume = io
+            .events
+            .iter()
+            .position(|event| *event == "resume")
+            .expect("the stop resumed");
+        io.events[..resume]
+            .iter()
+            .rev()
+            .take_while(|event| **event == "wait")
+            .count()
+    }
+
+    /// A thread the child starts once resumed dates by its floored tick,
+    /// which cannot prove a birth inside the last attach's own tick. The
+    /// resume therefore waits, at the 1 ms cadence, until the boot clock has
+    /// crossed into the tick after the last completed attach; then every such
+    /// birth floors strictly after the attach.
+    #[test]
+    fn resume_waits_for_the_tick_after_the_last_attach() {
+        let tick = test_tick_ns();
+        let attach = 100 * tick + tick / 2;
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(attach);
+        io.boot_clock = VecDeque::from([Some(attach + 1), Some(101 * tick - 1), Some(101 * tick)]);
+        io.fallback_boot = Some(101 * tick + 1);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 2);
+        assert!(
+            io.boot_clock.is_empty(),
+            "the boundary reading ended the wait"
+        );
+    }
+
+    /// The hold never delays a stop without a reason or past its bound: no
+    /// wait once the boot clock is already past the attach's tick, none with
+    /// no recorded attach or an unreadable boot clock, and at most one tick of
+    /// 1 ms waits when the boot clock never gets there.
+    #[test]
+    fn resume_hold_is_skipped_or_bounded() {
+        let tick = test_tick_ns();
+        for (attach, boot, max_waits) in [
+            (Some(100 * tick), Some(101 * tick), 0),
+            (None, Some(100 * tick), 0),
+            (Some(100 * tick), None, 0),
+            (
+                Some(100 * tick),
+                Some(100 * tick),
+                (tick / SAMPLE_NS) as usize + 1,
+            ),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.fallback_attach = attach;
+            io.fallback_boot = boot;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::confirmed(1),
+                "attach {attach:?} boot {boot:?}"
+            );
+            assert_eq!(
+                waits_before_resume(&io),
+                max_waits,
+                "attach {attach:?} boot {boot:?}"
+            );
+        }
+    }
+
+    /// The hold never costs the stop its deadline: a confirmed stop whose
+    /// next 1 ms wait could cross the deadline resumes at once, because a
+    /// resume observed late fails the whole run. A birth inside the attach's
+    /// tick then stays partial at the next stop, the safe direction.
+    #[test]
+    fn resume_hold_never_waits_past_the_stop_deadline() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now = [10, 11, 496_999_997].into_iter().map(Ok).collect();
+        io.fallback_attach = Some(100 * tick + 1);
+        io.fallback_boot = Some(100 * tick + 2);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// A 1 ms wait started with exactly 1 ms left ends past the deadline once
+    /// the resume and the observer's first read follow it, so the hold also
+    /// keeps a clock tick of headroom: with 1 ms plus less than a tick left it
+    /// resumes at once.
+    #[test]
+    fn resume_hold_keeps_a_tick_of_headroom_before_the_deadline() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now = [10, 11, 495_999_999].into_iter().map(Ok).collect();
+        io.fallback_attach = Some(100 * tick + 1);
+        io.fallback_boot = Some(100 * tick + 2);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// The hold resumes at once when it cannot read the stop's clock: it has
+    /// no way to know the next wait is inside the deadline.
+    #[test]
+    fn resume_hold_resumes_at_once_without_the_stop_clock() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(100 * tick);
+        io.fallback_boot = Some(100 * tick);
+        io.fail_first_now_after_boot = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// A saturated attach instant has no next tick: nothing to wait for.
+    #[test]
+    fn resume_hold_skips_a_saturated_attach_instant() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(u64::MAX);
+        io.fallback_boot = Some(0);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0);
+    }
+
+    /// A wait that fails inside the hold is a lifecycle failure like every
+    /// other wait in the cycle, and the stopped child is still resumed.
+    #[test]
+    fn a_failed_wait_inside_the_resume_hold_is_lifecycle_and_still_resumes() {
+        let tick = test_tick_ns();
+        let held = |fail_wait_after| {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.fallback_attach = Some(100 * tick);
+            io.fallback_boot = Some(100 * tick);
+            io.fail_wait_after = fail_wait_after;
+            io
+        };
+        let mut reference = held(None);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.service(&mut reference).unwrap();
+        let hold_waits = waits_before_resume(&reference);
+        assert!(hold_waits > 2);
+        let resume = reference
+            .events
+            .iter()
+            .position(|e| *e == "resume")
+            .unwrap();
+        let waits_before_hold = waits(&FakeIo {
+            events: reference.events[..resume - hold_waits].to_vec(),
+            ..FakeIo::default()
+        });
+
+        let mut io = held(Some(waits_before_hold + 2));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(
+            error.lifecycle(),
+            "a failed hold wait is lifecycle: {error}"
+        );
+        assert_eq!(io.waits_done, waits_before_hold + 2);
+        let last_wait = io.events.iter().rposition(|e| *e == "wait").unwrap();
+        assert!(
+            io.events[last_wait..].contains(&"resume"),
+            "the child is resumed after the failed wait: {:?}",
+            io.events
+        );
+    }
+
+    /// While the stop settles, a thread still on its way into the stop when
+    /// the deadline passes is a late boundary: the deadline message and its
+    /// `later_pause_boundary` category, as for a late fully stopped sample.
+    #[test]
+    fn settling_sample_out_of_time_with_a_thread_on_its_way_reports_the_deadline() {
+        for state in *b"RSD" {
+            let on_its_way: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            let mut io = FakeIo {
+                states: VecDeque::from([Ok(on_its_way.clone()), Ok(on_its_way)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(
+                coordinator.sample_until_stopped(&mut io, SAMPLE_NS / 2),
+                Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false)),
+                "state {}",
+                state as char
+            );
+            assert_eq!(waits(&io), 1);
+        }
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = std::iter::repeat_with(|| Ok(running_42()))
+            .take(600)
+            .collect();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            "{error}"
+        );
+    }
+
+    /// The settle loop's sample cap is the deadline's twin: a stop whose
+    /// threads are all still on their way into it when the samples run out
+    /// reports the deadline message, as when the deadline passes first, while
+    /// a thread that can never reach the stop still refuses at once on the
+    /// task set.
+    #[test]
+    fn settle_samples_running_out_report_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(running_42()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, u64::MAX / 2),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+        assert_eq!(waits(&io), MAX_SETTLE_SAMPLES as usize + 1);
+
+        let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, b'Z')].into_iter().collect();
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(unreachable.clone()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, u64::MAX / 2),
+            Err((MSG_TASK_SET_CHANGED.into(), false))
+        );
+        assert_eq!(waits(&io), 0);
+    }
+
+    /// The other direction: a strict sample with a running thread, and a
+    /// settling sample with a thread that can never reach the stop, keep the
+    /// task-set refusal even past the deadline (ruling PT-6).
+    #[test]
+    fn late_strict_or_unreachable_samples_keep_the_task_set_refusal() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(running_42())]),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_stopped(&mut io, 0),
+            Err(MSG_TASK_SET_CHANGED.into())
+        );
+        for state in *b"ZXxt" {
+            let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            let mut io = FakeIo {
+                states: VecDeque::from([Ok(unreachable)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(
+                coordinator.sample_until_stopped(&mut io, 0),
+                Err((MSG_TASK_SET_CHANGED.into(), false)),
+                "state {}",
+                state as char
+            );
+            assert_eq!(waits(&io), 0);
+        }
+    }
+
+    /// While the stop settles, only a thread on its way into the stop (`R`,
+    /// `S` or `D`) is waited for. A zombie, a dead or a traced thread can never
+    /// reach the group stop: today's partial at once, without re-sampling
+    /// (ruling PT-5).
+    #[test]
+    fn settling_fails_fast_on_a_state_that_cannot_reach_the_stop() {
+        for state in *b"ZXxt" {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            io.states = std::iter::repeat_with(|| Ok(unreachable.clone()))
+                .take(2_000)
+                .collect();
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_partial(&coordinator);
+            assert_eq!(io.state_reads, 1, "state {}", state as char);
+        }
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = VecDeque::from([
+            Ok([(41, b'D'), (42, b'T')].into_iter().collect()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    /// A settling sample that finds every thread stopped but lands after the
+    /// deadline (an overslept wait on a loaded host) is a late boundary, not a
+    /// task-set change: it keeps the deadline message and its
+    /// `later_pause_boundary` category.
+    #[test]
+    fn settled_but_late_first_sample_reports_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(running_42()), Ok(stopped())]),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, SAMPLE_NS / 2),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+        assert_eq!(waits(&io), 1);
+        assert_eq!(
+            diagnostic_for_message(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            Some(PauseDiagnostic::LaterPauseBoundary)
+        );
+    }
+
+    /// A thread that vanishes while the stop settles changes the task set:
+    /// today's partial, without waiting out the deadline.
+    #[test]
+    fn thread_vanishing_while_the_stop_settles_keeps_partial() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = VecDeque::from([
+            Ok(running_42()),
+            Ok([(41, b'T')].into_iter().collect()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_partial(&coordinator);
+        assert!(waits(&io) < 10, "{} waits", waits(&io));
+    }
+
+    /// Only the first sample settles. Once every thread was seen stopped, a
+    /// thread seen running at the second (pre-apply), the post-apply or the
+    /// post-successor-arm sample was continued under the stop: today's
+    /// partial, no re-sampling.
+    #[test]
+    fn thread_running_after_the_stop_was_seen_stopped_keeps_partial() {
+        for running_at in [1usize, 2, 3] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let mut states: VecDeque<_> = (0..6).map(|_| Ok(stopped())).collect();
+            states[running_at] = Ok(running_42());
+            io.states = states;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "running at sample {running_at}"
+            );
+        }
+    }
+
+    /// A new thread whose start time cannot be read cannot be dated: the stop
+    /// keeps today's partial.
+    #[test]
+    fn thread_with_unreadable_start_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
+        let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(grown, starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// Thread identity is the (tid, start time) pair: an expected tid with a
+    /// different start time is a new thread, and an older start keeps today's
+    /// partial even though the tid set is unchanged.
+    #[test]
+    fn reused_tid_with_older_start_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let starts: BTreeMap<u32, u64> = [(41, 49), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(stopped(), starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// A reused tid keeps today's partial whatever its start time: even a
+    /// start well after the last attach does not adopt a tid the preflight
+    /// already knew.
+    #[test]
+    fn reused_tid_with_newer_start_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let starts: BTreeMap<u32, u64> = [(41, 150), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(stopped(), starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// The start-time reader reports `/proc` field 22 and orders a real birth:
+    /// a freshly spawned process dates between two boot-clock checkpoints.
+    /// The crafted lines pin the field index (past a comm containing `)`)
+    /// and the truncation failure the sampler maps to an error.
+    #[test]
+    fn task_start_reader_reports_field_22_and_orders_a_real_birth() {
+        let line = b"123 (a)b) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20";
+        assert_eq!(parse_task_start(line), Some(19));
+        assert_eq!(parse_task_start(b"123 (a) R 1 2"), None);
+        assert_eq!(parse_task_start(b"missing delimiter"), None);
+
+        let tick = test_tick_ns();
+        let boot_before = boot_ns().expect("the boot clock reads");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let samples = read_task_samples(child.id()).expect("task samples read");
+        let boot_after = boot_ns().expect("the boot clock reads");
+        let leader = samples.get(&child.id()).and_then(|sample| sample.start);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let leader = leader.expect("the leader dates its own birth");
+        assert!(
+            leader.saturating_mul(tick) <= boot_after.saturating_add(tick),
+            "birth tick {leader} starts after the read"
+        );
+        assert!(
+            leader.saturating_add(1).saturating_mul(tick) > boot_before,
+            "birth tick {leader} ends before the spawn"
+        );
+    }
+
+    /// The helper's SIGSTOP is asynchronous: under host load the target is
+    /// still running when the first sample reads it, and the stop lands
+    /// milliseconds later. The same task set reporting `R` and then `T` is
+    /// delivery latency, not a changed child, so the proof waits for the
+    /// stop within its causal deadline instead of failing the cycle.
+    #[test]
+    fn a_stop_still_landing_confirms_once_every_task_reports_stopped() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let landing: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(landing.clone()), Ok(landing), Ok(stopped())]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert!(
+            io.events.iter().filter(|event| **event == "wait").count() >= 2,
+            "the proof waits for delivery: {:?}",
+            io.events
+        );
+    }
+
+    /// Delivery tolerance never covers a changed child: paranoia about new or
+    /// vanished tasks fails the sample immediately, without spending the
+    /// causal deadline waiting for a task set that is already wrong.
+    #[test]
+    fn a_changed_task_set_fails_without_waiting_for_delivery() {
+        for tasks in [
+            [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect(),
+            [(41, b'T')].into_iter().collect(),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.states = VecDeque::from([Ok(tasks)]);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "wait").count(),
+                0,
+                "a changed task set fails fast"
+            );
+        }
+    }
+
+    /// Delivery tolerance covers only a task still on its way to the stop
+    /// (R/S/D): a zombie, a dead task or a tracing stop at the first
+    /// sample will never become `T`, so the sample fails at once, without
+    /// spending the causal deadline waiting for delivery.
+    #[test]
+    fn a_task_outside_r_s_d_t_fails_without_waiting_for_delivery() {
+        for state in *b"ZXt" {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let tasks: BTreeMap<u32, u8> = [(41, state), (42, b'T')].into_iter().collect();
+            io.states = VecDeque::from([Ok(tasks)]);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "state {}",
+                state as char
+            );
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "wait").count(),
+                0,
+                "state {} fails fast",
+                state as char
+            );
+        }
+    }
+
+    /// Delivery tolerance ends at the first sample: a task running again
+    /// after stopped samples means SIGCONT, not a late SIGSTOP, so the
+    /// later samples never wait out a re-stop (SIGTTIN, Ctrl-Z). Staged
+    /// `[stopped, stopped, running, stopped...]` ends partial, not
+    /// confirmed.
+    #[test]
+    fn a_task_running_after_stopped_samples_is_sigcont_not_delivery() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(running), Ok(stopped())]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    /// The delivery wait's own failure is a lifecycle failure like every
+    /// other wait in the cycle, not an unconfirmed pause.
+    #[test]
+    fn a_failed_delivery_wait_is_a_lifecycle_failure() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fail_wait = true;
+        let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(running)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle(), "a failed wait is lifecycle: {error}");
+    }
+
+    /// A child that never stops (every sample reports it running) cannot
+    /// confirm: the delivery wait ends at the confirmation deadline, which
+    /// `always` refuses as a required pause failure.
+    #[test]
+    fn a_stop_that_never_lands_fails_on_the_confirmation_deadline() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from(vec![Ok(running); 600]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            "a running child fails on the deadline, not the task set: {error}"
+        );
     }
 
     #[test]
@@ -3834,10 +5969,20 @@ mod tests {
 
     #[test]
     fn ordinary_auto_failures_are_sticky_and_disable_rearming_after_safe_resume() {
-        for failure in ["tasks", "attach"] {
+        for failure in ["tasks", "changed", "attach"] {
             let mut io = successful_io(vec![record(10, 0, false)]);
-            if failure == "tasks" {
-                io.states = VecDeque::from([Ok([(41, b'R'), (42, b'T')].into_iter().collect())]);
+            if failure == "changed" {
+                // A changed task set fails at once, inside the deadline.
+                io.states = VecDeque::from([Ok([(41, b'T'), (43, b'T')].into_iter().collect())]);
+            } else if failure == "tasks" {
+                // A thread that never reaches the stop: the first sample now
+                // re-samples until the stop deadline (ruling PT-3) and then
+                // ends on the deadline message (ruling PT-7), an ordinary
+                // failure all the same.
+                let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+                io.states = std::iter::repeat_with(|| Ok(running.clone()))
+                    .take(2_000)
+                    .collect();
             } else {
                 io.fail_apply = true;
             }
@@ -4370,6 +6515,152 @@ mod tests {
     }
 
     #[test]
+    fn stale_record_apply_failure_with_armed_readback_counts_its_attempt() {
+        // The field order (`service_received` -> `fail_cycle` ->
+        // `finish_nonconfirmed` with no open attempt): an armed epoch
+        // dequeues a stale record while the authorization still reads
+        // ARMED, and the bounded unowned apply fails. The partial must
+        // close an attempt, not outrun the attempt count.
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(9, 0, false))))]),
+            fail_apply: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(10);
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn stale_record_apply_failure_keeps_its_apply_diagnostic() {
+        // Opening the attempt for a failed stale-record apply must not clear
+        // the category that apply recorded.
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(9, 0, false))))]),
+            fail_apply: true,
+            apply_error_diagnostic: Some(PauseDiagnostic::DeadlineDuringEngineApply),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(10);
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=deadline_during_engine_apply]"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unaccounted_record_counts_its_attempt() {
+        // Same defect class: a record for another pid fails the cycle
+        // before any attempt opens, so the partial must open one first.
+        let mut foreign = record(9, 0, false);
+        foreign.pid_tgid = 42u64 << 32;
+        let mut io = FakeIo {
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(foreign)))]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn stopped_sample_retries_a_lagging_stop_then_confirms() {
+        // Under host load SIGSTOP delivery lags the record: the first
+        // sample sees a running task for a stop that is still landing.
+        // The cycle must poll within its unchanged deadline, not fail it.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let lagging: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([
+            Ok(lagging),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    #[test]
+    fn stopped_sample_stops_polling_at_the_cycle_deadline() {
+        // A stop that never lands must not spin past its deadline: two
+        // running polls, then the clock crosses the cycle deadline.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5), Ok(10), Ok(11), Ok(12), Ok(13), Ok(u64::MAX)]);
+        let lagging: BTreeMap<u32, u8> = [(41, b'R'), (42, b'R')].into_iter().collect();
+        io.states = VecDeque::from([Ok(lagging.clone()), Ok(lagging.clone()), Ok(lagging)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.state_reads, 3);
+    }
+
+    #[test]
+    fn stopped_sample_fails_fast_on_exited_tasks() {
+        // A zombie never becomes stopped: no polling, one read, partial.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let zombie: BTreeMap<u32, u8> = [(41, b'Z'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(zombie)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.state_reads, 1);
+    }
+
+    #[test]
+    fn stopped_sample_fails_fast_on_changed_task_set() {
+        // A forked task is a real change, not lag: no polling either.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let forked: BTreeMap<u32, u8> = [(41, b'T'), (43, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(forked)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.state_reads, 1);
+    }
+
+    #[test]
     fn post_insert_map_read_failure_removes_without_resume_without_request() {
         let mut io = FakeIo {
             authorization_results: VecDeque::from([
@@ -4847,6 +7138,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -4882,6 +7174,7 @@ mod tests {
                 attempts: 2,
                 confirmed: 1,
                 partial: 1,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -4919,6 +7212,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -4957,6 +7251,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -6573,6 +8868,7 @@ mod tests {
                             attempts: 2,
                             confirmed: 1,
                             partial: 1,
+                            unavailable: 0,
                         }
                     );
                     assert_eq!(coordinator.status(), PauseStatus::Partial);
@@ -6586,6 +8882,7 @@ mod tests {
                             attempts: 2,
                             confirmed: 1,
                             partial: 0,
+                            unavailable: 0,
                         }
                     );
                 }
@@ -6604,14 +8901,24 @@ mod tests {
                 attempts: 2,
                 confirmed: 1,
                 partial: 1,
+                unavailable: 0,
+            },
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+                unavailable: 1,
             },
         ] {
-            assert_eq!(counters.confirmed + counters.partial, counters.attempts);
+            assert_eq!(
+                counters.confirmed + counters.partial + counters.unavailable,
+                counters.attempts
+            );
             assert_eq!(
                 counters.status(),
-                match (counters.attempts, counters.partial) {
-                    (0, _) => PauseStatus::None,
-                    (_, 0) => PauseStatus::Sigstop,
+                match (counters.attempts, counters.partial, counters.unavailable) {
+                    (0, _, _) => PauseStatus::None,
+                    (_, 0, 0) => PauseStatus::Sigstop,
                     _ => PauseStatus::Partial,
                 }
             );
@@ -6757,5 +9064,1134 @@ mod tests {
         coordinator.attempt_open = false;
         coordinator.begin_attempt();
         assert_eq!(coordinator.pending_diagnostic, None);
+    }
+
+    fn exec_record_for(pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_EXEC;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.hook_ts_ns = u64::MAX;
+        record
+    }
+
+    /// One retiring harness: a live child, its retiring engine and owner,
+    /// and a session authorizing loader records with the terminal export.
+    fn pause_credit_harness() -> (OwnedChild, Engine, LoaderContextId, ScriptedSession) {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        (child, engine, owner, session)
+    }
+
+    /// H5 storage: pause and terminal-return batches use the same shared
+    /// credits. The real adapter dequeues owned records (malformed counted
+    /// beside them), applies a nonempty paused batch to completion with
+    /// and without a deadline, returns an error prefix with its original
+    /// owner/exports/timestamps, restores it move-only and dispatches
+    /// every record exactly once. One predispatch retry survives with the
+    /// same batch; owned pending moves with it. At full occupancy the
+    /// dequeue guard and the nested budget refuse with typed
+    /// capacity-blocked — never empty — while staged transfers still move.
+    /// Child cleanup keeps the retained batch owned until its honest
+    /// disposal. Work charges are observed exactly through the ceiling.
+    #[test]
+    fn pressure_credits_survive_pause_and_terminal_handoff() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+
+        // Successful nonempty paused apply, no deadline: three loader
+        // records plus one malformed dequeued through the real adapter,
+        // applied, retired and dispatched exactly once.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for (hook, malformed) in [(11u64, false), (0, true), (22, false), (33, false)] {
+            if malformed {
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Malformed)));
+            } else {
+                let mut record = loader_record_for(owner, child.pid());
+                record.hook_ts_ns = hook;
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Record(record))));
+            }
+        }
+        let (records, malformed) = with_session_io(&mut engine, &mut session, &child, |io| {
+            let mut records = Vec::new();
+            while let Some(item) = io.dequeue().expect("room to dequeue") {
+                if let DiscoveryItem::Record(record) = item {
+                    records.push(record);
+                }
+            }
+            (records, io.malformed)
+        });
+        assert_eq!(records.len(), 3);
+        assert_eq!(malformed, 1, "dequeue counts malformed beside records");
+        let mut terminal_batch = None;
+        let outcome = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(records, None, true, true, &mut terminal_batch)
+                .expect("a clean paused apply succeeds")
+        });
+        // The malformed item honestly withholds required-complete: the
+        // batch applied and retired, but one unit was never validated.
+        assert!(!outcome.required_complete);
+        assert_eq!(engine.dispatched_loader_records(), 3);
+        assert!(terminal_batch.is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.discovery_held_len(), 0);
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+
+        // The same apply with a deadline installs it into the budget.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        let mut terminal_batch = None;
+        let outcome = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![loader_record_for(owner, child.pid())],
+                Some(u64::MAX),
+                true,
+                true,
+                &mut terminal_batch,
+            )
+            .expect("a deadline apply succeeds")
+        });
+        // A single loader hit needs revalidation: incomplete is routine
+        // pause cycling, not failure — the record still dispatched.
+        assert!(!outcome.required_complete);
+        assert_eq!(engine.dispatched_loader_records(), 1);
+        assert_eq!(engine.installed_budget_deadline_for_test(), Some(u64::MAX));
+
+        // Pure renewals complete: nothing pending, nothing to revalidate.
+        let (child, mut engine, _owner, mut session) = pause_credit_harness();
+        let mut terminal_batch = None;
+        let outcome = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![exec_record_for(5_000_001), exec_record_for(5_000_002)],
+                None,
+                true,
+                true,
+                &mut terminal_batch,
+            )
+            .expect("a renewal apply succeeds")
+        });
+        assert!(outcome.required_complete);
+        assert_eq!(engine.discovery_held_len(), 0);
+
+        // Error prefix round trip: two records plus a ring failure retain
+        // with original authority; the restored batch completes and every
+        // record dispatches exactly once — no clone, no replay.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for hook in [11u64, 22] {
+            let mut record = loader_record_for(owner, child.pid());
+            record.hook_ts_ns = hook;
+            session
+                .dequeues
+                .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        }
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("a failed terminal drain is loss, never a batch error")
+        });
+        let batch = terminal_batch.as_ref().expect("prefix retained");
+        assert_eq!((batch.record_count(), batch.complete()), (2, false));
+        assert_eq!(batch.authority.owner, owner);
+        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert_eq!(batch.tagged_owners(), [Some(owner), Some(owner)]);
+        assert_eq!(
+            batch.record_hook_stamps_for_test(),
+            [11, 22],
+            "original timing brackets survive"
+        );
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, false, false))
+        );
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "the engine released the prefix to its single coordinator owner"
+        );
+        let mut record = loader_record_for(owner, child.pid());
+        record.hook_ts_ns = 33;
+        session
+            .dequeues
+            .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the restored batch completes")
+        });
+        assert!(terminal_batch.is_none(), "the batch moved exactly once");
+        assert_eq!(
+            engine.dispatched_loader_records(),
+            3,
+            "two retained plus one fresh dispatch exactly once"
+        );
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.discovery_held_len(), 0);
+
+        // Predispatch retry: the first failure keeps the same batch and
+        // owes exactly one retry; owned pending moves with the recovery.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for hook in [11u64, 22] {
+            let mut record = loader_record_for(owner, child.pid());
+            record.hook_ts_ns = hook;
+            session
+                .dequeues
+                .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        }
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        assert!(terminal_batch.is_some());
+        session.fail_counter_reads([true]);
+        let regain = vec![exec_record_for(5_000_001), exec_record_for(5_000_002)];
+        let error = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(regain, None, true, false, &mut terminal_batch)
+                .expect_err("the failed predispatch errors")
+        });
+        assert!(
+            error.message.contains("batch application failed"),
+            "unexpected error: {}",
+            error.message
+        );
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, false, true)),
+            "exactly one retry is owed"
+        );
+        let batch = terminal_batch.as_ref().expect("same batch returned");
+        // The refused ordinary records joined the install: they ride the
+        // retry inside the batch, untagged, behind the retained prefix.
+        assert_eq!((batch.record_count(), batch.complete()), (4, false));
+        assert_eq!(batch.authority.owner, owner);
+        assert_eq!(
+            batch.tagged_owners(),
+            [Some(owner), Some(owner), None, None]
+        );
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "install moved every record into the single returned batch"
+        );
+        let mut record = loader_record_for(owner, child.pid());
+        record.hook_ts_ns = 33;
+        session
+            .dequeues
+            .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the retry completes")
+        });
+        assert!(terminal_batch.is_none());
+        assert_eq!(engine.dispatched_loader_records(), 3);
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "pending and batch both settled"
+        );
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+
+        // Owned pending moves: an ordinary apply refused by predispatch
+        // parks its records in pending, and the recovery dispatches them.
+        let (child, mut engine, _owner, mut session) = pause_credit_harness();
+        session.fail_counter_reads([true]);
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![exec_record_for(5_000_001), exec_record_for(5_000_002)],
+                None,
+                true,
+                false,
+                &mut terminal_batch,
+            )
+            .expect_err("the failed predispatch errors")
+        });
+        assert_eq!(
+            engine.discovery_held_len(),
+            2,
+            "refused records park owned in pending"
+        );
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the recovery dispatches pending")
+        });
+        assert_eq!(engine.discovery_held_len(), 0);
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+
+        // Dequeue guard: staged pops are transfers and always proceed, but
+        // a ring read at full occupancy is an explicit capacity block.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..3_996).map(|_| {
+            Ok(Some(DiscoveryItem::Record(loader_record_for(
+                owner,
+                child.pid(),
+            ))))
+        }));
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        let batch = terminal_batch.as_ref().expect("prefix retained");
+        assert_eq!(batch.record_count(), 3_996);
+        // Install the batch into the engine so it counts as held while
+        // staging fills the last 100 credits; staged pops then transfer
+        // in order.
+        engine
+            .install_terminal_batch(terminal_batch.take().expect("prefix retained"), Vec::new())
+            .expect("the pending journal accepts its batch");
+        assert_eq!(engine.discovery_held_len(), 3_996);
+        session.dequeues.extend((0..100u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                5_000_000 + index,
+            ))))
+        }));
+        session.dequeues.extend((0..4u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let staged = session
+            .stage_discovery(100, engine.discovery_held_len())
+            .unwrap();
+        assert_eq!((staged.staged, staged.capacity_blocked), (100, false));
+        let pids = with_session_io(&mut engine, &mut session, &child, |io| {
+            let mut pids = Vec::new();
+            for _ in 0..100 {
+                match io.dequeue().expect("staged transfers proceed") {
+                    Some(DiscoveryItem::Record(record)) => {
+                        pids.push((record.pid_tgid >> 32) as u32)
+                    }
+                    _other => panic!("expected a staged record"),
+                }
+            }
+            pids
+        });
+        assert_eq!(pids, (5_000_000..5_000_100).collect::<Vec<_>>());
+        assert_eq!(session.staged_discovery_len(), 0);
+        // The transfers freed room: the next dequeue reads fresh.
+        let fresh = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.dequeue().expect("freed room reads fresh")
+        });
+        assert!(matches!(
+            fresh,
+            Some(DiscoveryItem::Record(record)) if (record.pid_tgid >> 32) as u32 == 6_000_000
+        ));
+
+        // Full occupancy blocks the ring read with a typed refusal.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..DISCOVERY_HELD_CAP).map(|_| {
+            Ok(Some(DiscoveryItem::Record(loader_record_for(
+                owner,
+                child.pid(),
+            ))))
+        }));
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        session.dequeues.extend((0..8u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        engine
+            .install_terminal_batch(terminal_batch.take().expect("prefix retained"), Vec::new())
+            .expect("the pending journal accepts its batch");
+        assert_eq!(engine.discovery_held_len(), DISCOVERY_HELD_CAP);
+        assert_eq!(session.staged_discovery_len(), 0);
+        let spare_before = session.dequeues.len();
+        // The budget stopped the retain at 4,096 before the scripted
+        // error: the error plus eight spare records stay queued.
+        assert_eq!(spare_before, 9);
+        let blocked = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.dequeue().err().expect("full occupancy blocks")
+        });
+        assert!(
+            blocked.contains("shared storage allowance"),
+            "unexpected refusal: {blocked}"
+        );
+        assert_eq!(
+            session.dequeues.len(),
+            spare_before,
+            "a blocked dequeue never reads"
+        );
+
+        // Nested budget mechanics: staged pops transfer free, ring reads
+        // consume, and the stop carries its exact prefix.
+        let (child, _engine, _owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..5u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                5_000_000 + index,
+            ))))
+        }));
+        session.stage_discovery(5, 0).expect("room to stage");
+        session.dequeues.extend((0..4u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let mut stop_seen = false;
+        let stopped = collect_timed_retirement(
+            &mut session,
+            &child,
+            None,
+            &mut stop_seen,
+            false,
+            &std::cell::Cell::new(false),
+            &std::cell::Cell::new(0),
+        )
+        .err()
+        .expect("zero budget stops");
+        let stopped = stopped
+            .downcast::<IncompleteTerminalDrain>()
+            .expect("typed capacity stop");
+        assert!(stopped.capacity_blocked && !stopped.backlog);
+        assert_eq!(stopped.records.len(), 5, "staged transfers move free");
+        assert_eq!(session.staged_discovery_len(), 0);
+        assert_eq!(session.dequeues.len(), 4, "no ring read past the stop");
+        let spare = collect_timed_retirement(
+            &mut session,
+            &child,
+            None,
+            &mut stop_seen,
+            false,
+            &std::cell::Cell::new(false),
+            &std::cell::Cell::new(3),
+        )
+        .err()
+        .expect("three units of room stop at the fourth");
+        // The spare EXEC pids never name the child, so no stop is seen.
+        assert!(!stop_seen);
+        let spare = spare
+            .downcast::<IncompleteTerminalDrain>()
+            .expect("typed capacity stop");
+        assert!(spare.capacity_blocked && !spare.backlog);
+        assert_eq!((spare.records.len(), spare.malformed), (3, 0));
+        assert_eq!(session.dequeues.len(), 1);
+
+        // Exact pause charges: records plus malformed once, never replayed.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        assert!(engine.budget_charge_for_test(WORK_CEILING - 4));
+        for (hook, malformed) in [(11u64, false), (0, true), (22, false), (33, false)] {
+            if malformed {
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Malformed)));
+            } else {
+                let mut record = loader_record_for(owner, child.pid());
+                record.hook_ts_ns = hook;
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Record(record))));
+            }
+        }
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            let mut records = Vec::new();
+            while let Some(item) = io.dequeue().expect("room to dequeue") {
+                if let DiscoveryItem::Record(record) = item {
+                    records.push(record);
+                }
+            }
+            io.apply_batch(records, None, true, true, &mut terminal_batch)
+                .expect("the charged apply succeeds")
+        });
+        assert!(
+            !engine.budget_charge_for_test(1),
+            "three records plus one malformed consumed exactly four units"
+        );
+
+        // Child cleanup keeps the retained batch owned until honest
+        // disposal: exact records out, nothing left behind.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for hook in [11u64, 22] {
+            let mut record = loader_record_for(owner, child.pid());
+            record.hook_ts_ns = hook;
+            session
+                .dequeues
+                .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        }
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        let batch = terminal_batch.as_ref().expect("prefix retained");
+        assert_eq!((batch.record_count(), batch.complete()), (2, false));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.detach_pause_links().expect("child link cleanup runs");
+            io.cleanup_terminal_batch_without_replay(&mut terminal_batch)
+                .expect("honest disposal succeeds")
+        });
+        assert!(terminal_batch.is_none(), "the batch moved out exactly once");
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.discovery_held_len(), 0);
+        assert_eq!(
+            engine.dispatched_loader_records(),
+            0,
+            "disposed, never replayed"
+        );
+    }
+
+    /// H5 transfer seam: a coordinator-held terminal batch still owns its
+    /// records while the retry reconciles, so the nested pull budget seeds
+    /// against it. At full occupancy the retry reads nothing fresh: the
+    /// batch stays retained and the ring stays queued for a later turn.
+    #[test]
+    fn coordinator_held_terminal_batch_counts_against_nested_pull_budget() {
+        // Retain a full-capacity prefix into the coordinator-held batch,
+        // then install it so the engine holds full occupancy.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..DISCOVERY_HELD_CAP).map(|_| {
+            Ok(Some(DiscoveryItem::Record(loader_record_for(
+                owner,
+                child.pid(),
+            ))))
+        }));
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        session.dequeues.extend((0..8u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        assert_eq!(
+            terminal_batch
+                .as_ref()
+                .expect("prefix retained")
+                .record_count(),
+            DISCOVERY_HELD_CAP
+        );
+        engine
+            .install_terminal_batch(terminal_batch.take().expect("prefix retained"), Vec::new())
+            .expect("the pending journal accepts its batch");
+        assert_eq!(engine.discovery_held_len(), DISCOVERY_HELD_CAP);
+        // The retry's ring reads would succeed: drop the scripted error so
+        // only the shared allowance stands between the drain and the spares.
+        assert!(
+            session
+                .dequeues
+                .pop_front()
+                .expect("scripted error queued")
+                .is_err()
+        );
+        assert_eq!(session.dequeues.len(), 8);
+        // The retry reconciles the batch coordinator-side before seeding
+        // its nested budget: at full occupancy it reads nothing fresh.
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect_err("full occupancy refuses fresh acquisition");
+        });
+        assert_eq!(
+            session.dequeues.len(),
+            8,
+            "a refused retry never reads the ring"
+        );
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "the refused batch returns coordinator-side"
+        );
+        assert_eq!(
+            terminal_batch
+                .as_ref()
+                .expect("batch retained")
+                .record_count(),
+            DISCOVERY_HELD_CAP,
+            "nothing acquired past the shared allowance"
+        );
+    }
+
+    /// The `fn` item enclosing `offset`: the nearest preceding item start,
+    /// plus whether a test attribute sits directly above it.
+    fn enclosing_item(source: &str, offset: usize) -> (String, bool) {
+        let lines: Vec<&str> = source[..offset].split('\n').collect();
+        let mut index = lines.len();
+        loop {
+            assert!(index > 0, "no enclosing item for offset {offset}");
+            index -= 1;
+            if let Some(name) = item_name(lines[index]) {
+                let test = (index.saturating_sub(6)..index)
+                    .any(|above| matches!(lines[above].trim(), "#[test]" | "#[cfg(test)]"));
+                return (name, test);
+            }
+        }
+    }
+
+    fn item_name(line: &str) -> Option<String> {
+        let mut stripped = line.strip_prefix("    ").unwrap_or(line);
+        stripped = stripped.strip_prefix("pub(crate) ").unwrap_or(stripped);
+        stripped = stripped.strip_prefix("pub ").unwrap_or(stripped);
+        for qualifier in ["const ", "async ", "unsafe "] {
+            stripped = stripped.strip_prefix(qualifier).unwrap_or(stripped);
+        }
+        let rest = stripped.strip_prefix("fn ")?;
+        let name = rest.split(['(', '<']).next()?.trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(found) = haystack[from..].find(needle) {
+            out.push(from + found);
+            from += found + needle.len();
+        }
+        out
+    }
+
+    /// `run` frees its owned PID only after the pause authorization is gone.
+    /// The `PAUSE_PIDS` entry is keyed by (tgid, generation token), both
+    /// taken from the PID number, so a process reusing the number while an
+    /// entry is armed would be stopped by the discovery hook. Reaping (which
+    /// frees the number) therefore always follows the coordinator's terminal
+    /// cleanup, which removes the authorization. This pins the funnel:
+    /// `Owned::finish` requests the stop gate and cleans up before it
+    /// settles, settlement has that one call site, and every other
+    /// production reap precedes the first arm (setup and preflight
+    /// failures return before the coordinator exists).
+    /// The capture loops route every end (exit, error, signal, timeout,
+    /// kill-on-timeout, second SIGINT) through that same finish; that
+    /// routing is an audited property of `run.rs`, documented here:
+    /// - `capture_profile`/`capture_trace` return only through
+    ///   `finish_capture_error`, `finish_quiesce_error` or
+    ///   `finish_capture_with`, each of which runs `Owned::finish` (cleanup
+    ///   then settlement) before any reap or detach;
+    /// - pre-arm failures (`combine_setup_failure`, the preflight closure)
+    ///   reap before `Owned` exists, when no entry was ever armed;
+    /// - `OwnedChild::drop` reaps only what that funnel left behind.
+    #[test]
+    fn owned_reap_follows_pause_cleanup_before_settlement() {
+        let run = include_str!("../run.rs");
+        let production = run
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("tests mod anchor")
+            .0;
+        // The core ordering: cleanup before settlement in the one finish.
+        let finish = production
+            .split_once("    fn finish(\n")
+            .expect("Owned::finish")
+            .1
+            .split_once("\n    }\n}")
+            .expect("finish end")
+            .0;
+        let cleanup = finish
+            .find("self.coordinator.cleanup(")
+            .expect("finish cleans up");
+        let settle = finish.find("settle_owned_child(").expect("finish settles");
+        assert!(
+            cleanup < settle,
+            "Owned::finish must remove the pause authorization before settling the child"
+        );
+        // The stop gate is requested in the same finish before
+        // settlement, so the links' background move never outruns it.
+        let stop = finish
+            .find("stop_gate().request_stop()")
+            .expect("finish requests the stop gate");
+        assert!(
+            stop < settle,
+            "Owned::finish must request the stop gate before settling the child"
+        );
+        // The single funnel: settlement is defined once and called from
+        // finish only (test calls live past the tests-mod anchor).
+        assert_eq!(
+            offsets_of(production, "settle_owned_child(").len(),
+            2,
+            "settle_owned_child must keep its definition plus the one finish call"
+        );
+        // No new direct reaps: every production terminate_and_reap call
+        // stays in its audited function.
+        let mut reapers = std::collections::BTreeSet::new();
+        let mut preflight_reap = None;
+        for offset in offsets_of(production, "terminate_and_reap(") {
+            let line_start = production[..offset].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = production[offset..]
+                .find('\n')
+                .map_or(production.len(), |at| offset + at);
+            if production[line_start..line_end].contains("fn terminate_and_reap") {
+                continue;
+            }
+            let (item, test) = enclosing_item(production, offset);
+            if test {
+                continue;
+            }
+            if item == "run_owned_inner_with_host" {
+                preflight_reap = Some(offset);
+            }
+            reapers.insert(item);
+        }
+        assert_eq!(
+            reapers,
+            std::collections::BTreeSet::from([
+                "abort_pending_handoff".to_string(),
+                "combine_setup_failure".to_string(),
+                "run_owned_inner_with_host".to_string(),
+                "settle_owned_child".to_string(),
+                "wait_for".to_string(),
+            ]),
+            "a reap moved outside its audited function: {reapers:?}"
+        );
+        // The wait_for kill arm stays dead: every call passes false, and
+        // production calls come only from the post-cleanup settle paths.
+        for line in run.split('\n') {
+            if line.contains("wait_for(") && !line.contains("fn wait_for(") {
+                assert!(
+                    line.contains(", false)"),
+                    "wait_for must never take the kill arm: {line:?}"
+                );
+            }
+        }
+        let mut waiters = std::collections::BTreeSet::new();
+        for offset in offsets_of(production, "wait_for(") {
+            let line_start = production[..offset].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = production[offset..]
+                .find('\n')
+                .map_or(production.len(), |at| offset + at);
+            if production[line_start..line_end].contains("fn wait_for(") {
+                continue;
+            }
+            let (item, test) = enclosing_item(production, offset);
+            assert!(!test, "production wait_for call sits in a test item");
+            waiters.insert(item);
+        }
+        assert_eq!(
+            waiters,
+            std::collections::BTreeSet::from([
+                "settle_after_signal_with_grace_and".to_string(),
+                "stage_handoff".to_string(),
+            ]),
+            "wait_for must stay inside the settle paths: {waiters:?}"
+        );
+        // Pre-arm reaps: setup failures and the preflight closure run
+        // before Owned (and its coordinator) exists, so no entry is armed.
+        let owned = production
+            .find("let mut owned = Owned {")
+            .expect("Owned construction");
+        for offset in offsets_of(production, "combine_setup_failure(") {
+            assert!(
+                offset < owned,
+                "setup failure must precede the owned coordinator"
+            );
+        }
+        assert!(
+            preflight_reap.is_some_and(|offset| offset < owned),
+            "the preflight reap must precede the owned coordinator"
+        );
+    }
+
+    /// SoftHSM2 provider layouts across hosts (Debian multiarch, the
+    /// `/usr/lib` layout of the vng guests, Fedora `/usr/lib64`). The first
+    /// present one wins; the run fails loudly when none is installed.
+    fn wrapper_softhsm_lib() -> &'static str {
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+        ];
+        CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("a SoftHSM2 provider must be installed for the wrapper cells")
+    }
+
+    /// A fresh SoftHSM token for one cell. Each cell owns its token directory,
+    /// so cells never share token state even when run back to back.
+    fn wrapper_token(dir: &std::path::Path) -> std::path::PathBuf {
+        let tokens = dir.join("tokens");
+        std::fs::create_dir_all(&tokens).expect("token dir");
+        let conf = dir.join("softhsm2.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "directories.tokendir = {}\nobjectstore.backend = file\nlog.level = ERROR\n",
+                tokens.display()
+            ),
+        )
+        .expect("token conf");
+        let output = std::process::Command::new("/usr/bin/softhsm2-util")
+            .env("SOFTHSM2_CONF", &conf)
+            .args([
+                "--init-token",
+                "--free",
+                "--label",
+                "pausewrap",
+                "--so-pin",
+                "5678",
+                "--pin",
+                "1234",
+            ])
+            .output()
+            .expect("spawn softhsm2-util");
+        assert!(
+            output.status.success(),
+            "token init: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        wrapper_chown_invoker(dir);
+        conf
+    }
+
+    /// Root-created token state is unusable to the owned child, which runs as
+    /// the sudo invoker. Hand the cell dir to that account. Without sudo (or
+    /// unprivileged) there is nothing to hand over, and the run itself refuses
+    /// loudly below.
+    fn wrapper_chown_invoker(dir: &std::path::Path) {
+        let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
+            return;
+        };
+        // SAFETY: reading the effective uid has no preconditions.
+        if uid == "0" || unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let status = std::process::Command::new("chown")
+            .arg("-R")
+            .arg(format!("{uid}:{gid}"))
+            .arg(dir)
+            .status()
+            .expect("spawn chown");
+        assert!(status.success(), "handing the cell dir to the invoker");
+        // The campaign runner points TMPDIR at a root-only dir, which the
+        // invoker-owned child cannot traverse to reach the cell dir handed
+        // over above (its C_Initialize then fails on the unreadable token).
+        // Grant search-only on TMPDIR itself; names stay hidden (no read
+        // bit) and every higher ancestor is already traversable (the runner
+        // creates OUTDIR default, a lane TMPDIR is invoker-owned).
+        let tmp = std::env::temp_dir();
+        let metadata = std::fs::metadata(&tmp).expect("stat campaign TMPDIR");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o001);
+        std::fs::set_permissions(&tmp, permissions).expect("search bit on campaign TMPDIR");
+    }
+
+    /// `run` passes `SOFTHSM2_CONF` through its clean child environment, so
+    /// the direct oracle needs it in the observer's environment. Restored on
+    /// drop; privileged cells run `--exact --test-threads=1`.
+    struct WrapperEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl WrapperEnvGuard {
+        fn set(conf: &std::path::Path) -> Self {
+            let previous = std::env::var_os("SOFTHSM2_CONF");
+            // SAFETY: the cell runs alone; nothing else in this process
+            // touches the environment while the guard is alive.
+            unsafe { std::env::set_var("SOFTHSM2_CONF", conf) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for WrapperEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => std::env::set_var("SOFTHSM2_CONF", previous),
+                    None => std::env::remove_var("SOFTHSM2_CONF"),
+                }
+            }
+        }
+    }
+
+    fn wrapper_work_dir(cell: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pause-wrap-{cell}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("cell dir");
+        dir
+    }
+
+    fn wrapper_pkcs11_tool(module: &str) -> Vec<std::ffi::OsString> {
+        vec![
+            "/usr/bin/pkcs11-tool".into(),
+            "--module".into(),
+            module.into(),
+            "-O".into(),
+            "--login".into(),
+            "--pin".into(),
+            "1234".into(),
+        ]
+    }
+
+    fn wrapper_profile(
+        pause: PausePolicy,
+        command: Vec<std::ffi::OsString>,
+        out: &std::path::Path,
+    ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
+        let args = crate::cli::RunArgs {
+            track_short_lived: false,
+            kind: crate::cli::Kind::Profile,
+            modules: Vec::new(),
+            exclude_modules: vec![],
+            manifests: Vec::new(),
+            prearm_modules: Vec::new(),
+            hooks: crate::discovery::hooks::HookRegistry::builtin(),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            duration: None,
+            out: Some(out.to_path_buf()),
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            pause,
+            attach_backend: crate::attach::BackendSelection::default(),
+            kill_on_timeout: false,
+            command,
+        };
+        let outcome = crate::run::run_owned(&args).expect("owned run completes");
+        let text = std::fs::read_to_string(out).expect("report exists");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        (outcome, document)
+    }
+
+    fn wrapper_total_calls(document: &serde_json::Value) -> u64 {
+        document["functions"]
+            .as_array()
+            .expect("functions array")
+            .iter()
+            .map(|function| function["calls"].as_u64().expect("call count"))
+            .sum()
+    }
+
+    fn assert_sigstop_lattice(evidence: &crate::render::Evidence) {
+        assert_eq!(
+            evidence.pause_confirmed + evidence.pause_partial,
+            evidence.pause_attempts,
+            "pause counters do not add up"
+        );
+        assert!(evidence.pause_attempts > 0, "auto attempted nothing");
+        assert_eq!(evidence.pause_partial, 0, "every stop must confirm");
+        assert_eq!(evidence.pause, "sigstop");
+        assert_eq!(evidence.pause_confirmed, evidence.pause_attempts);
+    }
+
+    /// `run --pause auto -- env VAR=… pkcs11-tool …`: the same task execs a
+    /// second image before loading the provider. The pause follows that exec
+    /// chain, so the wrapper observes exactly the direct run's calls with
+    /// every stop confirmed.
+    #[test]
+    #[ignore = "privileged: run --pause auto through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_env_wrapper_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("env");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let mut wrapped = vec![
+            std::ffi::OsString::from("/usr/bin/env"),
+            std::ffi::OsString::from(format!("SOFTHSM2_CONF={}", conf.display())),
+        ];
+        wrapped.extend(wrapper_pkcs11_tool(module));
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(
+            wrapper_total_calls(&document),
+            oracle,
+            "the env wrapper must observe exactly the direct count"
+        );
+        assert_sigstop_lattice(&outcome.evidence);
+    }
+
+    /// `run --pause auto -- sh -c 'exec …'`: the shell replaces itself with
+    /// the workload in the same task. Same oracle and lattice as the env cell.
+    #[test]
+    #[ignore = "privileged: run --pause auto through sh -c exec with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("shexec");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let script = format!("exec /usr/bin/pkcs11-tool --module {module} -O --login --pin 1234");
+        let wrapped = vec![
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+        ];
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(
+            wrapper_total_calls(&document),
+            oracle,
+            "the sh -c exec wrapper must observe exactly the direct count"
+        );
+        assert_sigstop_lattice(&outcome.evidence);
+    }
+
+    /// `run --pause auto -- sh -c '…'` without `exec`: the provider loads in
+    /// a grandchild outside PID scope, which the pause cannot cover. The run
+    /// stays honest: the workload succeeds invisibly, zero calls are
+    /// observed, and the report is PARTIAL with no silent success. The
+    /// background `& wait` form forces the fork on every shell: some shells
+    /// replace themselves with a lone `sh -c` command instead of forking.
+    #[test]
+    #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64() {
+        let dir = wrapper_work_dir("shfork");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        assert!(
+            wrapper_total_calls(&direct_doc) > 0,
+            "the oracle proves the token can produce calls"
+        );
+        let script = format!("/usr/bin/pkcs11-tool --module {module} -O --login --pin 1234 & wait");
+        let wrapped = vec![
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+        ];
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(
+            outcome.child_exit_code,
+            Some(0),
+            "the grandchild workload must succeed invisibly"
+        );
+        assert_eq!(
+            wrapper_total_calls(&document),
+            0,
+            "no call in the owned task may be observed"
+        );
+        assert!(
+            document["functions"]
+                .as_array()
+                .expect("functions array")
+                .is_empty(),
+            "no attach slot may be planned for the owned task"
+        );
+        assert_eq!(outcome.evidence.completeness, "PARTIAL");
+        assert_eq!(
+            outcome.evidence.pause_confirmed + outcome.evidence.pause_partial,
+            outcome.evidence.pause_attempts,
+            "pause counters do not add up"
+        );
+    }
+
+    /// `--pause never` twin: the wrapper shape without any pause completes and
+    /// publishes the neutral lattice. Call counts stay out of this cell: an
+    /// unpaused child can outrun discovery under load, so exact counts are
+    /// verified live, not pinned here.
+    #[test]
+    #[ignore = "privileged: run --pause never through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64() {
+        let dir = wrapper_work_dir("never");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, _) = wrapper_profile(
+            PausePolicy::Never,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        assert_eq!(direct.evidence.pause, "none");
+        assert_eq!(direct.evidence.pause_attempts, 0);
+        let mut wrapped = vec![
+            std::ffi::OsString::from("/usr/bin/env"),
+            std::ffi::OsString::from(format!("SOFTHSM2_CONF={}", conf.display())),
+        ];
+        wrapped.extend(wrapper_pkcs11_tool(module));
+        let (outcome, _) = wrapper_profile(PausePolicy::Never, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(outcome.evidence.pause, "none");
+        assert_eq!(outcome.evidence.pause_attempts, 0);
+    }
+
+    /// A second exec after the provider already loads: the owned task maps
+    /// SoftHSM under its first image (via `LD_PRELOAD`) and then execs the
+    /// workload. The exec refresh keeps the observation exact and confirmed.
+    #[test]
+    #[ignore = "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_preloaded_exec_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("preload");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let script = format!("exec /usr/bin/pkcs11-tool --module {module} -O --login --pin 1234");
+        let wrapped = vec![
+            std::ffi::OsString::from("/usr/bin/env"),
+            std::ffi::OsString::from(format!("SOFTHSM2_CONF={}", conf.display())),
+            std::ffi::OsString::from(format!("LD_PRELOAD={module}")),
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+        ];
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(
+            wrapper_total_calls(&document),
+            oracle,
+            "the preloaded exec must observe exactly the direct count"
+        );
+        assert_sigstop_lattice(&outcome.evidence);
     }
 }

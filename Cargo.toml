@@ -1,8 +1,8 @@
 [package]
 name = "p11scope"
-version = "0.3.0"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/mingulov/p11scope"
 description = "Non-interposing PKCS#11 observer on eBPF uprobes"
@@ -15,28 +15,36 @@ path = "src/lib.rs"
 [features]
 unsafe-unvalidated-metadata = []
 wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
+# P0 explicit option: build the Detailed object with the H7-E4
+# attribute gate shut (entry acquires nothing, Get emission reads
+# nothing). Official release bytes are FULL (default features) unless
+# --capture-mode p0 selects this.
+stub-object-attributes = []
 # Internal-only diagnostic: attribute every published discovery skip to the
 # site that raised it. Stderr only; the capture document is byte-identical
 # either way (src/discovery/attribution.rs).
 skip-attribution = []
+# Internal, bounded stderr metadata for one PID/Singles exec diagnostic.
+h6-reexec-diagnostic = []
 
 [dependencies]
 anyhow = "1"
 aya = "=0.14.0"
+aya-obj = "=0.3.0"
 cryptoki-sys = "0.5"
 libc = "0.2"
 p11scope-bpf-multi = { version = "0.0.0", path = "crates/bpf-multi" }
 p11scope-ebpf-common = { version = "0.0.0", path = "crates/ebpf-common", features = ["user"] }
 p11scope-manifest = { version = "0.0.0", path = "crates/manifest", features = ["identify"] }
-pkcs11-module = { version = "0.2.0", git = "https://github.com/mingulov/pkcs11-components", rev = "d0a47c71d34294466bc41100ae6b5a5a329029d2" }
-pkcs11-types = { version = "0.2.0", git = "https://github.com/mingulov/pkcs11-components", rev = "d0a47c71d34294466bc41100ae6b5a5a329029d2" }
+pkcs11-module = "0.2.3"
+pkcs11-types = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = { version = "0.4.4", default-features = false }
+unicode-width = { version = "=0.2.2", default-features = false }
 
 [dev-dependencies]
-aya-obj = "=0.3.0"
-p11scope-discover = { version = "0.3.0", path = "crates/discover" }
+p11scope-discover = { version = "0.6.0", path = "crates/discover" }
 sha2 = "=0.11.0"
 tempfile = "3"
 
@@ -52,8 +60,9 @@ aya = { path = "third-party/src/aya-0.14.0-p2" }
 aya-obj = { path = "third-party/src/aya-obj-0.3.0-p2" }
 
 [profile.test]
-# 0b: line tables only. Full debuginfo pushes the lib unit-test
-# binary past the product's 256 MiB MAX_OBJECT_BYTES cap, and many
-# tests pin/identify their own test binary as a fixture object.
-# Backtraces keep file:line; variable inspection in tests is reduced.
+# Tests pin/identify their own executable as a fixture object. Even line
+# tables exceed the product's 256 MiB cap as the suite grows, so strip debug
+# info only. ELF symbols and LLVM coverage maps remain; backtraces lose
+# file:line detail. Product build profiles and object limits are unchanged.
 debug = "line-tables-only"
+strip = "debuginfo"

@@ -64,7 +64,8 @@ typedef unsigned long long u64;
 #define INST_GEN_FAULT 0U
 #define INST_GEN_ATTACH 1U
 #define INST_GEN_STICKY 2U
-#define INST_GEN_CELLS 3U
+#define INST_GEN_IMAGE_COVERAGE 3U
+#define INST_GEN_CELLS 4U
 /* INSTANCE_GEN[STICKY] bits: conditions that disable routing for the rest
  * of the capture (a later epoch cannot repair them). */
 #define INST_STICKY_FORK_UNMARKED 1ULL
@@ -100,6 +101,11 @@ struct instance_record {
     u64 epoch[INST_RECORD_SLOTS];
     u64 flags;
     u64 exec_attach_gen;
+    /* H8-D atomic birth marker (journal_marker.h encoding): 0
+     * unpublished, 1 DIRTY, else READY naming an exec generation.
+     * Fresh storage is kernel-zeroed; the init path below writes 0
+     * explicitly. 64-bit cell: CAS-lowered (F1). */
+    u64 journal_bootstrap;
 };
 struct instance_file_key {
     u64 dev;
@@ -125,6 +131,15 @@ struct instance_counters {
     u64 faults;
     u64 calib_hits;
 };
+/* Exit summary: the eight slot+1 cells plus the record flag word, copied
+ * out of the leader record for the kind-7 exit record. The helper ORs the
+ * record flags into `flags` and never clears caller pre-seed bits (capture
+ * state such as refused hooks). Tracks the kind-7 DiscoveryRecord arm in
+ * p11scope_ebpf_common; change both together. */
+struct instance_exit_summary {
+    u64 slot_plus1[INST_RECORD_SLOTS];
+    u64 flags;
+};
 _Static_assert(sizeof(struct instance_stamp) == 16, "stamp ABI");
 _Static_assert(__builtin_offsetof(struct instance_stamp, file_slot_plus1) == 12, "stamp slot");
 _Static_assert(__builtin_offsetof(struct instance_stamp, flags) == 14, "stamp flags");
@@ -132,12 +147,15 @@ _Static_assert(sizeof(struct instance_start_key) == 16, "start key ABI");
 _Static_assert(sizeof(struct instance_entry) == 24, "entry ABI");
 _Static_assert(sizeof(struct instance_continuity) == 40, "continuity ABI");
 _Static_assert(__builtin_offsetof(struct instance_continuity, return_stamp) == 24, "continuity ret");
-_Static_assert(sizeof(struct instance_record) == 144, "record ABI");
+_Static_assert(sizeof(struct instance_record) == 152, "record ABI");
 _Static_assert(__builtin_offsetof(struct instance_record, epoch) == 64, "record epoch");
 _Static_assert(__builtin_offsetof(struct instance_record, flags) == 128, "record flags");
 _Static_assert(__builtin_offsetof(struct instance_record, exec_attach_gen) == 136, "record gen");
+_Static_assert(__builtin_offsetof(struct instance_record, journal_bootstrap) == 144, "record marker");
 _Static_assert(sizeof(struct instance_file_key) == 16, "key ABI");
 _Static_assert(sizeof(struct instance_calib) == 40, "calib ABI");
 _Static_assert(sizeof(struct instance_counters) == 80, "counters ABI");
+_Static_assert(sizeof(struct instance_exit_summary) == 72, "exit summary ABI");
+_Static_assert(__builtin_offsetof(struct instance_exit_summary, flags) == 64, "exit summary flags");
 
 #endif

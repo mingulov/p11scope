@@ -9,8 +9,23 @@ use p11scope::discovery::hooks::HookRegistry;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
+#[path = "support/multi_host.rs"]
+mod multi_host;
+
+fn assert_failure_stage(text: &str, expected_after_admission: &str, host_refusal: Option<&str>) {
+    if let Some(reason) = host_refusal {
+        assert_eq!(
+            text, reason,
+            "host admission must precede sink/discovery work"
+        );
+    } else {
+        assert!(text.contains(expected_after_admission), "{text}");
+    }
+}
+
 #[test]
 fn untrusted_output_is_refused_before_the_discovery_scan() {
+    let host_refusal = multi_host::refusal();
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     // Group-writable without the sticky bit: untrusted (cf. F-Scale-6's 0775 dir).
@@ -19,15 +34,20 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
     std::fs::set_permissions(&untrusted, std::fs::Permissions::from_mode(0o775)).unwrap();
 
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
+        exclude_modules: vec![],
         // Poison the discovery scan too: this missing manifest is read inside
         // `Engine::discover`, after the sweep — so if the scan ran first, the
         // manifest would be the error. Sink-first means the untrusted dir wins.
         manifests: vec![PathBuf::from("/definitely/not/a/manifest.json")],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(std::process::id()),
         metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: Some(untrusted.join("observed.json")),
         max_events: None,
@@ -40,20 +60,26 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
     };
     let error = capture(&args).expect_err("untrusted output must fail the capture");
     let text = format!("{error:#}");
-    assert!(text.contains("untrusted"), "{text}");
+    assert_failure_stage(&text, "untrusted", host_refusal.as_deref());
     assert!(!text.contains("manifest"), "{text}");
+    assert!(std::fs::read_dir(&untrusted).unwrap().next().is_none());
 }
 
 fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
+        exclude_modules: vec![],
         // Read inside `Engine::discover`: if discovery ran first, the missing
         // manifest would be the error instead of the output refusal.
         manifests: vec![PathBuf::from("/definitely/not/a/manifest.json")],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(std::process::id()),
         metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: Some(out),
         max_events: None,
@@ -71,6 +97,7 @@ fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
 /// the whole capture. They are refused before the discovery scan now.
 #[test]
 fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
+    let host_refusal = multi_host::refusal();
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let captures = dir.path().join("captures");
@@ -89,7 +116,7 @@ fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
         let error = capture(&poisoned_profile_args(out.clone()))
             .expect_err("a non-file output must fail the capture");
         let text = format!("{error:#}");
-        assert!(text.contains(expected), "{}: {text}", out.display());
+        assert_failure_stage(&text, expected, host_refusal.as_deref());
         assert!(!text.contains("manifest"), "{}: {text}", out.display());
     }
     use std::os::unix::fs::FileTypeExt as _;
@@ -110,9 +137,11 @@ fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
 
 /// M-2: a trace whose capture never starts (here: discovery fails on a
 /// missing manifest, after the sink preflight) must not destroy the
-/// previous `-o` file. Privilege-independent: discovery fails either way.
+/// previous `-o` file. OD36 may refuse host admission even earlier; either
+/// failure must preserve the previous file and leave a fresh path absent.
 #[test]
 fn a_failed_trace_keeps_the_previous_output_file() {
+    let host_refusal = multi_host::refusal();
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let previous = dir.path().join("prior-trace.log");
@@ -123,9 +152,10 @@ fn a_failed_trace_keeps_the_previous_output_file() {
         let mut args = poisoned_profile_args(out);
         args.kind = Kind::Trace;
         args.duration = Some(std::time::Duration::from_secs(1));
-        let error = capture(&args).expect_err("the poisoned manifest fails discovery");
+        let error =
+            capture(&args).expect_err("host admission or the poisoned manifest refuses capture");
         let text = format!("{error:#}");
-        assert!(text.contains("manifest"), "{text}");
+        assert_failure_stage(&text, "manifest", host_refusal.as_deref());
     }
     assert_eq!(
         std::fs::read(&previous).unwrap(),

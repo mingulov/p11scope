@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # `p11scope/inventory/v1`: module/caller inventory
 
-Answers "which module is used by whom" for one scope (`--pid` or
+Answers "which module is used by whom" for one scope (`--pid`, `--cgroup`, or
 `--system`) over one snapshot pass or a `--duration` observation window.
 Emitted by `p11scope inventory [--json | -o <out.json>]`.
 
@@ -20,7 +20,10 @@ carries: `{"observer": "initial" | "nested" | "unknown", "kernel_pids":
 document (`callers[].pid`, `gaps[].pid`) is read through `/proc`, so it is
 in the numbering `proc_pids` names; it equals the kernel's initial-namespace
 PID only when `observer` is `initial` and `proc_pids` is `observer`.
-`inventory --pid` is refused (`pid-namespace-mismatch`) otherwise, and
+`inventory --pid` and `inventory --cgroup` are refused (`pid-namespace-mismatch`)
+otherwise. Cgroup refusal applies to scan, auto and native; userspace discovery
+and native image identity both require initial task numbering. The refusal
+precedes report, event and diagnostic output creation. In contrast,
 `inventory --system` then also carries one scope-level gap (`caller`,
 `module` and `pid` null, `subject` `pid namespace`) from its first pass on,
 so a consumer reading only `gaps[]` still sees the incompleteness: the scan
@@ -65,7 +68,8 @@ A native document adds to `observation`:
     the in-BPF PID guard: `"kernel-pid+bpf"` (the uprobe-multi links name
     the target; the kernel pid filter was proven to cover every thread)
     or `"perf-task+bpf"` (each per-offset link is bound to the target's
-    task); `null` under `--system`.
+    task); `"bpf-cgroup"` under `--cgroup` (all-process links restricted by the
+    frozen retained-root BPF filter); `null` under `--system`.
 - `lifecycle`: the lifecycle feed's own account. The native lane drains
   the kernel's 2 MiB lifecycle (exec and exit) ring every 10 ms,
   including while a pass collects `/proc` on a worker thread; it stages
@@ -89,6 +93,36 @@ not the kernel's (`pid_namespace`), native `--system` still binds witnesses
 (through pidfd cookies, never PID numbers) but never claims a watch: every
 admitted edge's coverage is `unknown` (`loss`) with a gap saying why.
 
+## Cgroup scope
+
+The top-level scope label is exactly `"cgroup"`; neither the operator path nor
+descendant names appear as scope metadata. The retained root and current
+descendants select bounded discovery candidates. Fresh begin/end membership of
+the original held process generation is required at actual caller publication;
+candidate enumeration alone grants no admission. Directory/member/byte/work
+limits and cooperative cancellation produce finite incomplete gaps, never
+complete absence or invented exit/unmap facts. `--max-scan-pids` limits deep
+scans separately from traversal work.
+
+Quiet cgroup edges use `unknown` with reason `scope_membership_unproven` when
+otherwise covered: endpoint samples do not prove continuous residency and cannot
+authorize `watched_no_use`. Existing valid counted history remains usable.
+Same-image reentry retains its caller ID; a deferred successor need not have an
+ID merely to retire an old image. Scoped native owners activate and refresh
+inside the final cgroup membership bracket while an image-acquisition handle
+is active, and suspend back to scan-pinned facts with a named gap when their
+caller leaves a complete transaction, retires, or is proven to have exec'd at
+a refresh check; without an active handle, activation stays unavailable with
+a standing named gap and scan-pinned caller facts remain available.
+The main thread services lifecycle evidence before scoped admission, then
+publishes newly admitted targets before extending them and publishes native
+receipts before output. Cancellation is cooperative at returning-operation
+checkpoints; it cannot interrupt a blocked kernel operation.
+
+Two recorded `"cgroup"` labels do not establish the same physical scope or
+continuous counts. Offline comparison preserves independent windows and
+`scope_completeness_unknown`.
+
 ## Privacy
 
 Owner ruling FB-PRIV (2026-10-03): the document publishes each caller
@@ -97,7 +131,9 @@ and `path`), read from `/proc/<pid>/stat` and `/proc/<pid>/exe` of processes
 whose mappings hold a provider object — reads the scan lane already makes.
 The native lane adds none: its witness rows bind through a pidfd cookie
 query, and no witness gap carries the kernel tgid. No command line,
-environment, `comm` or argument is read or published. See the inventory
+environment or argument is read or published, and no `comm` is retained
+or published (start-time sampling reads the whole stat line and parses
+around the comm field, discarding it). See the inventory
 caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
 `callers[].image.task_cookie` and `.exec_id` are always null in v0.2.0
 (`owner_image` returns `None` everywhere in production); only a future
@@ -171,13 +207,20 @@ non-null values needs a new allowlist row.
   `{from, to, at_ns}` in order (`[]` while the first verdict stands, at
   most two entries), and each rise is also a `module admission changed`
   gap. The verdict is judged against the Inventory
-  endpoint budget (4096 endpoints), not the 512-slot detailed ceiling
+  endpoint budget (`--max-endpoints`, default 4096, range 1..=8192), not the 512-slot detailed ceiling
   `inspect --system` reports, so the two can disagree either way: an
   object `inspect` refuses can read `admitted` here, and one it admits
-  can read `refused` here. Each pass lowers under that budget with the
-  same shared-scope reserve `inspect` applies (uncorroborated providers
-  — unlinked heuristic tables, proxy closure arrays — take at most 3072
-  of the 4096), and endpoints admitted earlier in the run stay counted
+  can read `refused` here. Each pass lowers under that budget. An
+  unaimed pass — system or cgroup scope without `--module` — keeps the
+  same shared-scope reserve `inspect` applies to unaimed captures
+  (uncorroborated providers — unlinked heuristic tables, proxy closure
+  arrays — leave the larger of one quarter of the selected limit,
+  rounded down, and 104 entries reserved, capped by the selected limit;
+  below 104 the whole budget is reserved). A pass the operator aimed —
+  `--pid`, or `--module` naming the providers to capture — admits
+  first-come in discovery order with no reserve, as
+  `inspect --system --module` does, and
+  endpoints admitted earlier in the run stay counted
   for the whole run: an endpoint ID is never reused, so a module can be
   refused once earlier modules hold the budget. Refusals by the run's
   attach set — the run-lifetime endpoint or module-record budget, an
@@ -218,8 +261,8 @@ non-null values needs a new allowlist row.
   double-load detected` gap names it; without that evidence the
   merge carries no marking. For `dlopen` in one namespace the merge
   is correct (same file → same loaded object → one session
-  namespace); per-instance separation for `dlmopen` is S2 scope
-  (instance authority — see `docs/notes/s2-instance-authority.md`).
+  namespace). The additive instance projection below separates proven
+  semantic instances; physical module and entry meanings stay the same.
 - `edges[]`: one record per (caller incarnation, module instance)
   pair. `mapping` is scan evidence (state `mapped`, `ended`, or
   `uncertain`, with first/last seen and an interruption count of
@@ -418,6 +461,31 @@ non-null values needs a new allowlist row.
   for a module not `admitted`; its usage stays unknown). `observation.usage_feed` is
   a derived summary: true iff at least one edge holds non-`unknown`
   coverage.
+- `observation.semantic_capture` (additive): the Detailed lane's
+  sanitized summary, counts only —
+  `{status, admitted_endpoints, refused_endpoints, continuity_cuts,
+  unrouted_returns, events_lost, stop_quiescence, final_drain}`.
+  `status` is `disabled` (no manifests, no lane), `active`,
+  `partial` (live with refused endpoints, declared loss, or
+  `events_lost` above zero), `unavailable` (startup failed) or
+  `stopped` (after the terminal sequence).
+  `admitted_endpoints`/`refused_endpoints` count required
+  endpoints; `continuity_cuts` counts actual successful physical-cut
+  advances; `unrouted_returns` counts records the terminal drain
+  consumed that H0 never routed; `events_lost` counts EVENTS
+  records the kernel refused while the ring was full (the `lost`
+  term on the stop line; disjoint from `unrouted_returns`, never
+  double counted with it). While the `native capture events loss
+  unknown` gap is present, `events_lost` may undercount; the kernel
+  counter is cumulative, so the next good read restores the exact
+  total. `stop_quiescence` is `not_requested`,
+  `quiesced` or `unproven`; `final_drain` is null before stop,
+  then whether the terminal drain ran clean: both owned cursors
+  drained exactly to the proven Q with no post-Q writer and no
+  declared terminal loss (it scopes to the terminal drain only and
+  does not cover `events_lost`, which is reported separately). The
+  summary grants no semantic permission; per-provider and per-edge
+  gaps stay authoritative.
 - `observation.native_witnesses` (Task 6 C4): the native caller binder's
   census, every witness row once: `{rows, bound, unbound, pending,
   integrity, unbound_reasons, placement}`. All zero in the scan lane.
@@ -481,11 +549,14 @@ non-null values needs a new allowlist row.
   `unknown (count-only slot)` (count-only or unrecognized producing
   slots), `unknown (no operation evidence)` (an authorized feed
   observed only lifecycle traffic, failed `Init`s, or orphan calls
-  that establish no claim), or `unknown (same-file double-load)`
+  that establish no claim), `unknown (same-file double-load)`
   (scan evidence shows the object loaded twice in the caller's
   process — duplicate executable file-offset coverage — so no
   observed call can attribute to one instance and every call voids;
-  the `same-file double-load detected` gap names the edge).
+  the `same-file double-load detected` gap names the edge), or
+  `unknown (per-edge summary withheld; see semantic children)`
+  (claimed semantic children hold this edge's rows, so no per-edge
+  summary is attempted — read the children instead).
   Unsupported or ambiguous semantics render `unknown`, never
   invented.
 - `edges[].mechanisms` (S1, `null` when no mechanism was
@@ -562,7 +633,10 @@ non-null values needs a new allowlist row.
   key is another file —, `map_files_unavailable` — the proof could not
   be read for lack of privilege —, `mapping_changed` — a range read
   inside the confirmation's pin was no longer one mapping when its
-  `map_files` entry was read, an unmap or remap during the read) and name a matched caller that also
+  `map_files` entry was read, an unmap or remap during the read —,
+  `overlay_kernel_unavailable` — the key needs the kernel proof
+  (overlayfs or an unproven filesystem) and no kernel proof covered
+  it, so no userspace fallback) and name a matched caller that also
   maps shared objects no deep scan examined. A shared object counts as
   examined only where a complete deep scan's own maps read opened it
   and found no provider, and the other process's executable ranges are
@@ -570,7 +644,11 @@ non-null values needs a new allowlist row.
   the same way, to be that file. An object whose sweep matching was
   refused (non-unique inodes; only where a process past the cap maps
   it) or dropped (it changed after the confirmation reads) is a gap
-  under its path. Admission
+  under its path, as is a mapping on overlayfs (or an unproven
+  filesystem) the kernel witness could not prove is the held file:
+  reason `original_file_unproven` with one of four fixed causes (the
+  witness proved another file, the witness query budget was exhausted,
+  the witness was unavailable, the anchor binding failed). Admission
   failures record one `caller admission failed` gap per pass and kind:
   a single failure keeps its pid and exact reason; several aggregate
   with a count (`N admissions refused this pass: caller budget
@@ -610,7 +688,9 @@ non-null values needs a new allowlist row.
   endpoint counts), `inventory_endpoints` (additive within v1:
   `{limit, occupied}` — the run's Inventory attach set, whose
   capture-lifetime endpoint budget the admission verdicts are judged
-  against, and the endpoints it holds; IDs are never reused, so
+  against (`--max-endpoints`, default 4096), and the endpoints it holds;
+  the limit is separate from the summed per-module endpoint census.
+  IDs are never reused, so
   occupancy only grows, and its refusals are the
   `inventory_endpoints`/`inventory_attach_modules` budget gaps;
   `refused` counts per-pass module refusals on that budget, so one
@@ -641,6 +721,347 @@ non-null values needs a new allowlist row.
   watched caller's scope). Refusal never erases
   retained evidence: over-budget members are dropped with a named
   gap while catalog entries and previously observed use stay.
+- `object_observations` (additive within v1): the frozen H9
+  key-operation section (`version` 1), rendered from the
+  `inventory-v1-object-observations` schema only. `status` is
+  `populated`, `partial`, `stale`, or `unavailable`; `reason` is the
+  finite machine reason (`none` only when populated). In v0.5.0 no
+  journal producer is linked, so the section reads `unavailable`
+  with `journal_unavailable` (no key-operation feed exists; S1
+  mechanisms and API results are unaffected), and the lane records
+  one `joint_journal_unavailable` gap. `bootstrap_unavailable` keeps
+  its 0.6.0 meaning (journal linked, no birth yet).
+- `excluded_modules`, `unmatched_excludes` (additive within v1):
+  present only when `--exclude-module` is passed. `excluded_modules`
+  lists one row per distinct excluded file (`path`, `dev`, `ino`,
+  `processes`); `unmatched_excludes` lists the inputs that matched no
+  mapped file. A declared operator choice, never a gap or a loss.
+
+## Semantic instances (additive within v1)
+
+`instances[]` contains `{id, caller, module, state, reason, first_seen_ns,
+last_seen_ns}`. Capture-local IDs are `iN`, referencing this document's `cN`
+and `mN`. `state` is `observed`, `uncertain` or `retired`; `reason` is null or
+a finite code below. Rows are sorted by instance ID, retained after retirement,
+and IDs are never reused. These references disclose no router ID, native
+domain, task cookie, exec ID, address, session, slot or async handle.
+
+`semantic_edges[]` has one row per registered instance, including instances
+with no calls, sorted by instance ID:
+
+- `caller`, `module`, `instance`: references resolving in this snapshot.
+- `entries`: exactly `{unit:"api_entries", count:null,
+  observation:"unavailable"}`. Only physical `edges[].entries` counts
+  Inventory entries; no count is copied, divided or rolled up into a child.
+- `api_returns`: `{unit:"api_returns", count:null|u64, saturated:bool,
+  historical_only_returns:u64}`. The count is null before the first admitted
+  return, then an observed lower bound, including proven late returns.
+  It does not count successful operations. Saturation is explicit.
+- `semantics`, `mechanisms`, `operations`: the existing S1 shapes above.
+  No-call rows have an unknown label and null mechanism/operation details,
+  rather than observed zeroes. `operations.calls` counts reducer-admitted
+  API observations; outcomes count operations. Historical-only returns do not
+  update the current operation machine. A retry, Update or pending return does
+  not imply completion.
+- `coverage`: `{lossy:bool, reasons:[finite_code,...]}`, with sorted,
+  duplicate-free reasons. Historical positive aggregates survive loss with
+  this sticky disclosure. The new semantic loss path does not alter physical
+  entry totals or their coverage.
+
+Finite reasons are `no_calls`, `instance_unproven`,
+`provider_instance_unproven`, `caller_unbound`, `unauthorized`,
+`ambiguous_descriptor`, `count_only`, `semantic_loss`,
+`before_semantic_boundary`, `out_of_order_return`, `instance_retired`,
+`image_retired`, `task_retired`, `capture_stopped`, `instance_capacity`,
+`semantic_state_capacity`, `negative_state_capacity`, `authority_exhausted`.
+
+Additive budgets are:
+
+- `instances`: `{limit, occupied, refused}` for lifetime retained records,
+  including retired records (default limit 4096).
+- `instance_semantic_state`: `{limit, occupied, unknown_edges, refused,
+  shared_limit, shared_occupied}`. No-call registration allocates no reducer.
+  `limit` is the lesser of the instance and existing semantic-state limits;
+  `shared_*` accounts for legacy plus instance reducers under the existing
+  `max_semantic_states`. Existing `semantic_state` keeps its physical-edge
+  meaning. `unknown_edges` here counts only new semantic edges.
+- `instance_negative_state`: `{limit, occupied, refused, exhausted}` for one
+  bounded ledger shared by domain/task/image/module/exact loss and retirement
+  scopes (default limit 4096). Existing scopes coalesce without eviction.
+  `refused` counts unretained inputs, not distinct keys. The first distinct
+  scope past capacity permanently sets `exhausted`, invalidates current
+  instance operations and refuses new registrations/reductions, preserving
+  physical counts, history and admitted late API-return evidence.
+- `instance_semantic_resources`: `{limit_bytes, charged_bytes,
+  peak_charged_bytes, refused, occupancy}` for the single allocation-charge
+  pool shared by legacy physical-edge and instance S1 reducers. The default
+  limit is 64 MiB, including a permanently charged 1 MiB transition-scratch
+  reservation even when no reducer exists. Charges reserve conservative
+  allocation envelopes before growth; retained reducer bases and historical
+  provenance remain charged after live state is invalidated. `charged_bytes`
+  is current ownership, `peak_charged_bytes` includes temporary reservations,
+  and `refused` counts rejected reservations. These are not RSS measurements
+  or an allocator-independent process-memory guarantee.
+  `occupancy` contains current aggregate counts: `open_bindings`,
+  `active_machines`, `pending_calls`, `detached_calls`, `mechanisms`,
+  `operation_categories`, `provenance_functions`, `provenance_function_bytes`,
+  `provenance_function_capacity_bytes`, `provenance_returns`,
+  `async_function_bytes`, `async_function_capacity_bytes`, `origin_vectors`,
+  `origin_elements`, and `origin_capacity_elements`. Length and reserved
+  capacity are separate; no handles, function strings or return values are
+  exposed by this census. Counts are collected once into the immutable
+  presentation and reused by JSON, JSONL and terminal views. P6 physical
+  comparison does not compare these additive semantic resource fields.
+
+The H2 implementation supplies sealed consumers and this projection. Production
+activation remains H3: its sole proof-consuming adapter must establish the
+original input order and fresh continuity, fence unpublished calls after real
+physical uncertainty, and qualify the final unpublished-batch and emitter
+costs alongside the enforced reducer allocation pool. A remapped
+physical edge or a newer ordinal alone does not prove semantic recovery.
+Empty arrays in current production captures do not prove absence of instances
+or complete semantic coverage. No object authority is added.
+
+## Reload disclosure (additive within v1)
+
+When the Detailed lane observes a provider file's continuity break and
+rejoin without an observed unload — a reload it cannot exclude — the
+capture discloses it under the top-level `instance_reload_not_excluded`
+object. The key is absent when the capture produced no disclosure
+(never null):
+
+- `continued_across_global`, `joined_across_global`: capture-monotonic
+  saturating router totals, snapshotted at the terminal projection.
+  Exact even when `identities` is partial or empty.
+- `identities`: one entry per affected registry module, sorted by
+  numeric module order, each with the disclosed instance references in
+  numeric instance order:
+  `{"module": "mN", "instances": ["iN", ...]}`. Entries that share a
+  module merge into one entry with the sorted union of instances.
+
+An empty `identities` list with nonzero counts means the router
+observed continuations that project to no nameable identity: mint
+exhaustion, an identity whose every router ID is unregistered, or
+identities shed past the ledger cap. The counts stay exact in each
+case. Router IDs that never registered (refused or unconverted
+coverages) are omitted from their identity, and identities with
+nothing nameable are dropped. Registration refusals are disclosed
+under the existing `instance semantics refused` gap, conversion
+refusals under `semantic input refused`, and ledger-cap shed under
+`reload disclosure identities shed`. Like `instances[]`, these
+references disclose no router ID, native domain, task cookie, exec
+ID, address, session, slot or async handle.
+
+## Object observations (additive within v1)
+
+The additive `object_observations` section carries capture-local object
+activity and limited metadata observed from application calls: session
+rows, object views with requested/established metadata, proved-key
+operation aggregates and unknown-key summaries. The frozen consumer
+contracts are
+[inventory-v1-object-observations.schema.json](inventory-v1-object-observations.schema.json)
+(section version 1) and
+[inventory-v1-object-observations-v2.schema.json](inventory-v1-object-observations-v2.schema.json)
+(section version 2); consumers must reject unknown section versions,
+never guess. JSON, JSONL and the dashboard render from this one
+immutable projection. While H9 delivery stays gated, production
+captures carry `status: "unavailable"` with a finite `reason` and
+empty rows; unavailable/partial/stale name object authority only and
+never imply S1 loss.
+
+- `version` is 1 or 2, following the content: 2 iff a KEM creation
+  (`encapsulate`, `decapsulate`) or role (`encapsulation_key`,
+  `decapsulation_key`) label is present, otherwise byte-stable 1.
+  Version 1 is frozen and never carries KEM labels. `revision` is the
+  publication revision. `status` is
+  `populated`, `partial`, `stale` or `unavailable`; `reason` is `none`
+  only when populated. A stale publication's rows are historical, not
+  current authority.
+- `sessions[]` (`{session, origin, status}`, sorted by session id) is
+  snapshot-only: the event stream carries session lifecycle through
+  `object_observed` rows, not a session kind.
+- `objects[]` (sorted by object id) holds one view per observed object
+  incarnation: `{object, session, origin, creation, birth, lifetime,
+  lifetime_reason, attribution, attribution_reason, requested,
+  established, queries, label, successful_references,
+  successful_key_references, accessing_sessions}`. IDs are
+  capture-local monotonic model IDs, never raw handles. `creation` is
+  the observed creation family or null; `birth` is the observed call
+  interval or null, never physical age. Counters count successful
+  references, never distinct keys, completed operations or physical
+  token inventory.
+- `requested`/`established` each hold the six fixed metadata slots
+  (`class`, `key_type`, `token`, `value_len`, `modulus_bits`,
+  `ec_params`), every slot `{status, value}` with `status` one of
+  `unknown`, `value`, `conflict` or `invalidated`. A `value` carries
+  the accepted numeric code or null: class 0-4, key type 0, 1, 2, 3,
+  4, 16, 31, 64 or 65 (OASIS numbers), token 0 or 1, value length 16,
+  24 or 32 bytes, modulus bits 1024, 2048, 3072, 4096 or 8192, and
+  the EC curve name (`secp256r1`, `secp384r1`, `secp521r1`) or null.
+  Labels are presentation names; JSON carries numeric codes. Requested
+  metadata never establishes result properties; conflicting duplicates
+  stay conflicts, never last-writer-wins.
+- `queries` holds the per-field latest query outcome (`not_queried`,
+  `established`, `unavailable`, `size_only`, `unsupported`,
+  `malformed`, `excluded`), distinct from current validity.
+- `label` is the combined key label from established facts of the same
+  view only (`rsa_1024`, `rsa_2048`, `rsa_3072`, `rsa_4096`,
+  `rsa_other`, `aes_128`, `aes_192`, `aes_256`, `aes_other`,
+  `ec_p256`, `ec_p384`, `ec_p521`) or null. It is withheld when class
+  conflicts or an established class is incompatible with the key type
+  (AES needs `secret_key`; RSA/EC need `public_key`/`private_key`).
+  One provenance exception: an RSA private key created by
+  `C_GenerateKeyPair` carries its pair-mate public key's established
+  size when both handles came from the same successful return
+  (CKA_MODULUS_BITS is defined on RSA public keys only, so the
+  private size is never read directly). Such a label is recognizable:
+  the view's own `established.modulus_bits` stays `unknown` while the
+  label names the inherited size. Unpaired keys and failed generations
+  stay unlabeled (`metadata_unknown` at use).
+- `key_operations[]` (sorted by instance, object, category, role and
+  metadata label) holds proved-key aggregate rows
+  `{instance, object, category, role, metadata_at_use, unit,
+  started, completed, failed, cancelled, unknown, active,
+  key_join_lost}`. `instance` joins `instances[]`; `unit` is
+  `operations`, or `message_contexts` for `message_*` categories.
+  Row equation: `started = completed + failed + cancelled + unknown
+  + active + key_join_lost` (before counter saturation). Role rows
+  count associations and cannot be summed across roles into a global
+  operation denominator.
+- `unknown_key_operations[]` (sorted by category and reason) holds
+  capture-wide unknown-key summaries without `started` (starts are
+  never fabricated into the unknown bucket).
+- `gaps` (`{rows[{subject, reason, repeats}], suppressed}`) and
+  `budgets` (`key_rows`/`object_rows`/`unknown_rows` occupancy,
+  measured `encoded_bytes`, pool `allocation_refused`/`refusal_reason`)
+  mirror the snapshot's loss accounting. Row limits refuse with
+  `partial` coverage; history is never evicted.
+- Initialization-era boundaries: one qualified successful
+  `C_Initialize` on a never-initialized domain mints the first era;
+  `ALREADY_INITIALIZED` and errors mint nothing; a genuine second
+  success on the live era contradicts (`unseen_finalize`). A birth
+  bootstrap alone is not a live era. Honesty limit: a
+  finalize+reinitialize pair the capture never saw stays undetectable
+  from this rule alone (except when later betrayed by
+  `CRYPTOKI_NOT_INITIALIZED` or duplicate-OK contradiction) — modeled
+  Initialize handling never claims to detect unseen reinitialization.
+  Successful reinitialize through the owning journal/seal (fresh sealed
+  `init_era` above the termination fence) is NOT delivered here: the
+  ended domain stays ended and later quanta refuse at conversion,
+  pending 6.04 sealed era issuance.
+- Privacy: no raw handles, pointers, native keys, epochs, PIDs/TIDs,
+  address-derived hashes or arbitrary attribute bytes appear anywhere
+  in this section. Key values, moduli, EC points, labels, IDs and PINs
+  are never read or carried. Initialize arguments (including `pInitArgs`)
+  are never read.
+
+## Caller metadata (additive within v1)
+
+The opt-in source contract uses the one immutable `Presentation`.
+Installed two-container/two-pod and migration acceptance remains open.
+Metadata contributes no admission, scope, provider identity or counter authority.
+
+The top-level option declaration is
+`caller_metadata.mode`: `"none"` (default, explicit off) or `"cgroup"`.
+Off omits `callers[].metadata` entirely; omission in an older document
+means not recorded. On carries one optional object per caller even
+while pending/unknown, with exactly the keys `status`, `reason`,
+`revision`, `sample_started_ns`, `sample_ended_ns`, `validity`,
+`cgroup`, `container`, `pod`. Top `status` is `pending`, `sampled`,
+`unknown`, `stale` or `historical`; `validity` is `endpoint_sample_only`
+when a stable endpoint sample backs the row, else null. `revision`,
+`sample_started_ns`, `sample_ended_ns` and `cgroup.directory_inode` are
+exact decimal strings (values above 2^53 round-trip); unknown values
+are null.
+
+`cgroup` carries `status` (`sampled`/`unknown`), `source`
+(`retained_proc_cgroup2_directory`), `directory_inode`, `mount_context`
+(capture-local `cg<N>`, not portable identity) and finite `reason`.
+`container` carries `status` (`hint`/`unknown`), `source`
+(`cgroup_path_pattern`), `runtime` (`unknown`/`docker`/`containerd`/
+`cri_o`), canonical 64-hex `id` and finite `reason`. `pod` carries
+`status`, `source`, canonical 36-character `uid` and finite `reason`.
+Finite reasons are `permission_denied`, `identity_unavailable`,
+`generation_changed`, `process_exited`, `read_failed`, `malformed`,
+`byte_limit`, `row_limit`, `lookup_limit`, `deadline`,
+`changed_during_sample`, `hierarchy_unsupported`,
+`membership_ambiguous`, `namespace_unresolved`, `unrecognized`,
+`ambiguous_pattern`, `refresh_overdue` and `stopped`. Hints are display
+context only and never join callers across captures or revise counters.
+
+## Pre-arm interval rows (additive within v1)
+
+`prearm[]` carries one row per `--prearm-module` input, in flag order
+(`[]` without the flag). Inventory `modules[]` rows cover mapped
+instances only and cannot carry never-mapped watches, so pre-arm rows
+live in their own section — stable whether the input ever maps. Each
+row is `{path, identity, mapped, watch, attached_at_ns,
+unobserved_windows?}`:
+
+- `path` is the operator's spelling (messages and the module path
+  only, never identity); `identity` is `{device: {major, minor},
+  inode, sha256}` of the retained pin (`sha256` null when unproven).
+- `mapped` tells at a glance whether the object was observed mapped
+  by a scope member during the capture (any published registry module
+  record names it; records are never removed, so unload evidence is
+  retained and this stays true after an unload).
+- `watch` is `{since_ns, state, until_ns?, ended_by?, changed?}`:
+  `state` is exactly `pinned_unarmed`, `armed`, `armed_idle`,
+  `unavailable`, or `ended`; `since_ns` is always present (null
+  until armed, never pin time); `until_ns`/`ended_by` appear only
+  when the end actually happened (`ended_by` is exactly `attached`,
+  `scope_end`, `stop`, `object_changed`, `health_loss`, or
+  `scope_uncertain`); `changed` is the `{last_ok_ns, detected_ns,
+  previous_ino}` uncertainty bracket of a retained-object change.
+  `watch` is null only when the input resolved to no retained object
+  (defensive: retained pins always resolve).
+- `attached_at_ns` is always present: null when assembled with
+  nothing attached, otherwise the max over the declared set's real
+  attach stamps (only when every member carries one — a subset
+  maximum is not declared-set readiness).
+- `unobserved_windows` is a list of `{start_ns, end_ns, reason}`
+  with `reason` exactly `pre_attach`, `late_discovery`,
+  `mapped_unattached`, `health_loss`, or `scope_uncertain`; absent
+  means undisclosed (never-mapped pre-arm, unattached modules), and
+  an explicitly empty list reads as exact only with an R2-D1-6 proof
+  behind it. Key presence never proves exactness. Inventory emits
+  only `pre_attach` and `mapped_unattached` window reasons;
+  `late_discovery` is Detailed-only, and `health_loss`/`scope_uncertain`
+  appear as `ended_by`, never as window reasons, on this lane.
+
+Never-mapped rule: a pre-armed input no scope member maps carries no
+window — its watch speaks. When the declared set never attached, it
+ends at the run's end (`scope_end` or `stop`) with no arm instant and
+no attach instant; on the
+native lane the declared set attaches and arms without any mapping
+(`mapped` false, `armed`, `since`/`attached_at` set). Attached modules
+without an R2-D1-6 proof always disclose their
+`[scope_start_ns, attached_at_ns]` window with reason `pre_attach`;
+inventory has no exactness producer, so a quiet pre-armed interval is
+a stated watch interval, not proven-exact coverage. Refusals and
+replacement ride the existing gap subjects (`inventory attach set
+refused module`, `inventory attach target changed identity`). An input
+that cannot be pinned at all (unresolvable locator, unreadable file)
+carries no `prearm[]` row — it resolved to no retained object — and
+instead publishes one scope-level gap (`subject` `inventory prearm
+input unavailable`, `reason` `{operator path}: {pin cause}`) while
+sibling inputs pin and report normally.
+
+Declared-set scope: inventory freezes each watch's declared endpoint
+set from proved offsets only (no manifest claims), while the Detailed
+lane also includes manifest-claimed offsets. The inventory set is
+conservative: manifest-only offsets that later attach surface as
+`mapped_unattached` windows, never as silent coverage.
+
+Truncation causes: a health-dirty terminal truncates armed watches at
+the last proven-clean bound (a counter rise or unreadable health
+anywhere in the run truncates even when a later sweep reads clean).
+`health_loss` also covers pair-precondition and pair-uncounted
+evidence conservatively: those void no-use proof rather than link or
+observation health, but they still truncate the watch. `scope_uncertain`
+covers any custody loss, including a proven PID-target exit: the exit
+itself is proven, but coverage past it is not, so the watch truncates
+conservatively instead of riding to the run end.
 
 ## Example (abridged)
 
@@ -737,3 +1158,18 @@ label plus the mechanism rows and operation aggregates:
   }
 }
 ```
+
+`caller_metadata` also carries its separate `pending`, `sampled`, `unknown`,
+`stale`, `historical` census and exact decimal strings `started`, `discarded`,
+`refresh_failures`, `budget_refusals`, `retained_bytes`, `peak_retained_bytes`.
+These describe enrichment, not native capture loss or a lossless guarantee.
+Off allocates no metadata table and opens no metadata files. Without a genuine native caller-use image binding after coverage starts,
+metadata yields `identity_unavailable` (including scan-only captures). The
+selected original and full64 image must match the binding and both native
+observations before a sample may be committed. This display proof never
+upgrades the CallerRecord's admission or image-authority field. Numeric directory identity is currently
+withheld as `namespace_unresolved`; lexical hints can still be sampled.
+A stale row keeps its sampled components and times, while a failed refresh
+clears current claims. Retired rows freeze historical evidence. Samples target
+1s refresh within the finite scheduling budget;4096 callers are not promised
+one refresh each second. A sample older than10s is stale at frame time.

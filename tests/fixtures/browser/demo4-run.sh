@@ -105,11 +105,17 @@ with tls_server.FlowServer(cert=cert, key=key) as flow, \
      tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
                            client_ca=cred.cert_pem) as ccflow:
     with sync_playwright() as pw:
+        # Chromium's auto-select switch takes a JSON policy, not a
+        # bare URL; cover every loopback port so the phase-2 fresh
+        # server (a new port) is auto-selected too.
+        auto_policy = json.dumps(
+            [{"pattern": "https://127.0.0.1:*/*", "filter": {}}])
         context, match, home = cells.launch_browser_context(
             pw, browser, work / "cell",
             extra_browser_args=STABLE_ARGS if browser == "chromium" else (),
             extra_prefs=FF_STABLE if browser == "firefox" else None,
-            flow_url=ccflow.url, auto_select_cert=True,
+            flow_url=auto_policy if browser == "chromium" else ccflow.url,
+            auto_select_cert=True,
             nss_credential=cred)
         try:
             pid = cells.main_browser_pid(match, browser)

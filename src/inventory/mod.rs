@@ -5871,11 +5871,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(warning) = warning {
             self.warn(&warning);
         }
-        // DEMO-4 deferred scan seal: the first engine-changing pass
-        // retains the scan-discovered tables the startup mint could
-        // not see. A refused or empty mint keeps the pending flag
-        // for the next engine-changing pass, bounded and honest.
-        if self.semantic.is_none() && self.scan_seal_pending && report.engine_changed {
+        // DEMO-4 deferred scan seal: the first pass retains the
+        // scan-discovered tables the startup mint could not see.
+        // A refused or empty mint keeps the pending flag for the
+        // next pass, bounded and honest. The attempt is NOT gated
+        // on the pass report's engine-changed flag: that flag only
+        // tracks native owner commits, so a system scan-lane pass
+        // (zero native callers) would never set it and the seal
+        // would never be attempted (fedora diag1, 2026-11-05).
+        if self.semantic.is_none() && self.scan_seal_pending {
             let engine_scope = Scope::from(scope);
             if let Some(lane) = start_semantic_lane(
                 self.coordinator,
@@ -24932,6 +24936,29 @@ mod seal_readiness_tests {
     /// The exact seal line, pinned as a literal: the wording is the
     /// contract with users and scripts, independent of the builder.
     const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
+
+    /// DEMO-4 regression (fedora diag1, 2026-11-05): the deferred
+    /// scan-seal attempt in `ClassicDriver::apply` must not be
+    /// gated on `report.engine_changed` — that flag only tracks
+    /// native owner commits, so a `--system` scan-lane pass (zero
+    /// native callers) never sets it and the no-manifest seal was
+    /// never attempted (76 passes, no seal, no refusals).
+    #[test]
+    fn scan_seal_attempt_is_not_engine_changed_gated() {
+        let source = include_str!("mod.rs");
+        let attempt = source
+            .find("DEMO-4 deferred scan seal")
+            .expect("the deferred scan seal block exists");
+        let window = &source[attempt..attempt + 1200];
+        assert!(
+            window.contains("self.scan_seal_pending {"),
+            "the attempt keys on the pending flag alone"
+        );
+        assert!(
+            !window.contains("report.engine_changed"),
+            "the attempt must not gate on engine_changed"
+        );
+    }
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(

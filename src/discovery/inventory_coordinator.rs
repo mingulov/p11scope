@@ -326,6 +326,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     engine_collected_finish_calls: u64,
+    /// Calls into `note_joint_watchdog_trip` (test count): the exit
+    /// hold's two trip arms are pinned through it.
+    #[cfg(test)]
+    joint_watchdog_notes: u64,
     /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
     /// Whether a no-manifest scan seal will be attempted for this
@@ -810,6 +814,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             promotion_records_discarded: 0,
             #[cfg(test)]
             engine_collected_finish_calls: 0,
+            #[cfg(test)]
+            joint_watchdog_notes: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             scan_mint_requested: false,
             scan_mint_sources: None,
@@ -2078,7 +2084,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// feed, so staged calls left unsealed count once as
     /// `watchdog_no_progress` in the next publication.
     pub(crate) fn note_joint_watchdog_trip(&mut self) {
+        #[cfg(test)]
+        {
+            self.joint_watchdog_notes = self.joint_watchdog_notes.saturating_add(1);
+        }
         self.registry.note_joint_watchdog_trip();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joint_watchdog_notes_for_test(&self) -> u64 {
+        self.joint_watchdog_notes
     }
 
     /// Observe the actual engine tail attempts without adding counters or

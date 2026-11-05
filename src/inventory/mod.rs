@@ -3035,6 +3035,49 @@ impl ClassicDriver<'_> {
     /// promoted lane at install. Success makes the lane Joint; refusal
     /// keeps the legacy one-sided path with one disclosure gap.
     /// In v0.5.0 (R-50) the bound machine installs no key-operation feed: the lane stays S1-only with one `joint_journal_unavailable` disclosure.
+    /// DEMO-4 deferred scan seal: the first pass retains the
+    /// scan-discovered tables the startup mint could not see.
+    /// A refused or empty mint keeps the pending flag for the
+    /// next pass, bounded and honest. The attempt is NOT gated
+    /// on the pass report's engine-changed flag: that flag only
+    /// tracks native owner commits, so a system scan-lane pass
+    /// (zero native callers) would never set it and the seal
+    /// would never be attempted (fedora diag1, 2026-11-05).
+    fn attempt_deferred_scan_seal(&mut self, scope: InspectScope) {
+        if self.semantic.is_none() && self.scan_seal_pending {
+            let engine_scope = Scope::from(scope);
+            if let Some(lane) = start_semantic_lane(
+                self.coordinator,
+                &engine_scope,
+                self.attach_backend,
+                true,
+                true,
+            ) {
+                // A refused live start returns the fallback shell:
+                // drop it and keep the seal pending so the next
+                // pass retries (a transient multi-provider moment
+                // must not disable the seal for the whole run,
+                // fedora cr-late-3). Only a lane that did not fail
+                // startup seats and clears the pending flag.
+                if !lane.startup_failed() {
+                    let live = lane.is_live();
+                    self.semantic = Some(lane);
+                    self.scan_seal_pending = false;
+                    if live {
+                        self.coordinator.note_scope_gap(
+                            "semantic subset scan-derived".into(),
+                            "key operations use scan-discovered tables without a manifest; \
+                             table provenance is scan publication evidence (name-authorized \
+                             tables only), not operator attestation"
+                                .into(),
+                        );
+                        self.initialize_joint_lane();
+                    }
+                }
+            }
+        }
+    }
+
     fn initialize_joint_lane(&mut self) {
         let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
         let Some(lane) = semantic.as_mut() else {
@@ -5884,46 +5927,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(warning) = warning {
             self.warn(&warning);
         }
-        // DEMO-4 deferred scan seal: the first pass retains the
-        // scan-discovered tables the startup mint could not see.
-        // A refused or empty mint keeps the pending flag for the
-        // next pass, bounded and honest. The attempt is NOT gated
-        // on the pass report's engine-changed flag: that flag only
-        // tracks native owner commits, so a system scan-lane pass
-        // (zero native callers) would never set it and the seal
-        // would never be attempted (fedora diag1, 2026-11-05).
-        if self.semantic.is_none() && self.scan_seal_pending {
-            let engine_scope = Scope::from(scope);
-            if let Some(lane) = start_semantic_lane(
-                self.coordinator,
-                &engine_scope,
-                self.attach_backend,
-                true,
-                true,
-            ) {
-                // A refused live start returns the fallback shell:
-                // drop it and keep the seal pending so the next
-                // pass retries (a transient multi-provider moment
-                // must not disable the seal for the whole run,
-                // fedora cr-late-3). Only a lane that did not fail
-                // startup seats and clears the pending flag.
-                if !lane.startup_failed() {
-                    let live = lane.is_live();
-                    self.semantic = Some(lane);
-                    self.scan_seal_pending = false;
-                    if live {
-                        self.coordinator.note_scope_gap(
-                            "semantic subset scan-derived".into(),
-                            "key operations use scan-discovered tables without a manifest; \
-                             table provenance is scan publication evidence (name-authorized \
-                             tables only), not operator attestation"
-                                .into(),
-                        );
-                        self.initialize_joint_lane();
-                    }
-                }
-            }
-        }
+        self.attempt_deferred_scan_seal(scope);
         if let Some(lane) = self.semantic.as_mut() {
             bind_semantic_callers(self.coordinator, lane);
         }
@@ -23174,6 +23178,55 @@ mod promotion_driver_tests {
         );
     }
 
+    /// The exit hold notes the watchdog trip on the coordinator (so
+    /// staged calls left unsealed count once as
+    /// `watchdog_no_progress`) on each trip arm: the finish wedge,
+    /// the running-audit trip, both, and never without a trip.
+    /// Deleting either hold call site fails its arm here.
+    #[test]
+    fn hold_joint_lane_for_exit_notes_the_watchdog_on_each_trip_arm() {
+        use crate::inventory_semantics::AttestedSemanticLane;
+        struct ClearPosedTrips;
+        impl Drop for ClearPosedTrips {
+            fn drop(&mut self) {
+                AttestedSemanticLane::pose_no_progress_trip_for_test(None);
+                AttestedSemanticLane::pose_audit_no_progress_trip_for_test(None);
+            }
+        }
+        let _clear = ClearPosedTrips;
+        let trip = Some((9, std::time::Duration::from_secs(4)));
+        for (finish, audit, want) in [
+            (false, false, 0),
+            (true, false, 1),
+            (false, true, 1),
+            (true, true, 2),
+        ] {
+            AttestedSemanticLane::pose_no_progress_trip_for_test(finish.then_some(trip).flatten());
+            AttestedSemanticLane::pose_audit_no_progress_trip_for_test(
+                audit.then_some(trip).flatten(),
+            );
+            let mut coordinator = coordinator();
+            let mut display = None;
+            let mut warn = WarnSink {
+                display: &mut display,
+            };
+            let _ = ClassicDriver::hold_joint_lane_for_exit(
+                joint_lane(WindDownIo::completing(), false),
+                &mut coordinator,
+                "watchdog arm",
+                "joint finish abandoned for exit",
+                &mut warn,
+                None,
+            );
+            assert_eq!(
+                coordinator.joint_watchdog_notes_for_test(),
+                want,
+                "finish trip {finish}, audit trip {audit}: watchdog notes"
+            );
+            let _ = take_warned_for_test();
+        }
+    }
+
     #[test]
     fn held_wedged_live_publication_names_stall_and_abandon_on_stderr() {
         // Isolate from lines other tests on this thread warned: the
@@ -24958,51 +25011,103 @@ mod seal_readiness_tests {
     /// contract with users and scripts, independent of the builder.
     const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
 
-    /// DEMO-4 regression (fedora diag1, 2026-11-05): the deferred
-    /// scan-seal attempt in `ClassicDriver::apply` must not be
-    /// gated on `report.engine_changed` — that flag only tracks
-    /// native owner commits, so a `--system` scan-lane pass (zero
-    /// native callers) never sets it and the no-manifest seal was
-    /// never attempted (76 passes, no seal, no refusals).
+    /// Scripts for one deferred scan-seal attempt whose live starts
+    /// all refuse: the journal start and the ordinary retry each mint
+    /// the subset pair and refuse, then the fallback shell mints once.
+    fn refused_attempt_preparations() -> Vec<SubsetPreparation> {
+        (0..5).map(|_| some_preparation()).collect()
+    }
+
+    /// DEMO-4 regression (fedora cr-late-3/cr-first-1, 2026-11-05),
+    /// driven through the real `ClassicDriver` attempt: the scan
+    /// subset minted but the live start refused (a transient
+    /// multi-provider moment on a busy host). The startup-failed
+    /// shell must not seat and must keep the pending flag, so the
+    /// next pass retries; that retry seals, seats the lane, clears
+    /// the flag and discloses the scan-derived provenance once.
     #[test]
-    fn scan_seal_attempt_is_not_engine_changed_gated() {
-        let source = include_str!("mod.rs");
-        assert!(
-            source.contains("if self.semantic.is_none() && self.scan_seal_pending {"),
-            "the attempt keys on the pending flag alone"
+    fn deferred_scan_seal_refused_start_keeps_pending_then_seats_on_retry() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        seal_startup_test::with_start_queue(
+            refused_attempt_preparations(),
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+            ],
+            || driver.attempt_deferred_scan_seal(scope),
         );
-        let gated = ["self.scan_seal_pending && report.engine", "_changed"].concat();
         assert!(
-            !source.contains(&gated),
-            "the attempt must not gate on engine_changed"
+            driver.semantic.is_none(),
+            "a startup-failed shell never seats"
+        );
+        assert!(
+            driver.scan_seal_pending,
+            "a refused start keeps the seal pending for the next pass"
+        );
+        assert!(take_sealed_for_test().is_empty(), "no seal line yet");
+
+        seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || driver.attempt_deferred_scan_seal(scope),
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the retry seats the sealed live lane"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE.to_string()],
+            "the retry notes the seal line once"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "semantic subset scan-derived").len(),
+            1,
+            "the seated scan-derived lane discloses its provenance once"
         );
     }
 
-    /// DEMO-4 regression (fedora cr-late-3/cr-first-1, 2026-11-05):
-    /// the scan subset minted but the live start refused
-    /// (`semantic_attachment_refused`, a transient multi-provider
-    /// moment on a busy host). The fallback shell seated and
-    /// cleared `scan_seal_pending`, so one refused start disabled
-    /// the no-manifest seal for the whole run. A startup-failed
-    /// shell must keep the pending flag so the next pass retries;
-    /// only a lane that did not fail startup seats.
+    /// The attempt keys on the pending flag alone (no pass-report
+    /// input, so the engine-changed flag cannot gate it: a
+    /// `--system` scan-lane pass with zero native callers must still
+    /// attempt, fedora diag1): without the flag nothing is minted
+    /// or started, and with it the very first attempt runs.
     #[test]
-    fn scan_seal_refused_start_keeps_pending_for_retry() {
-        let source = include_str!("mod.rs");
-        let start = source
-            .find("if self.semantic.is_none() && self.scan_seal_pending {")
-            .expect("the deferred scan-seal attempt block");
-        let attempt: String = source[start..].chars().take(2400).collect();
-        let failed_guard = attempt
-            .find("lane.startup_failed()")
-            .expect("the attempt keys seating on the startup-failed flag");
-        let clears = attempt
-            .find("self.scan_seal_pending = false")
-            .expect("the attempt clears pending when it seats");
-        assert!(
-            failed_guard < clears,
-            "pending clears only behind the startup-failed guard:\n{attempt}"
+    fn deferred_scan_seal_attempts_only_while_pending() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let scope = InspectScope::Pid(std::process::id());
+        let untouched = seal_startup_test::with(
+            vec![some_preparation()],
+            Some(Err(SemanticRefusal::Unavailable)),
+            || {
+                driver.attempt_deferred_scan_seal(scope);
+                seal_startup_test::take_prepared().is_some()
+                    && seal_startup_test::take_start_verdict().is_some()
+            },
         );
+        assert!(untouched, "no pending flag: no mint and no start");
+        assert!(driver.semantic.is_none());
+
+        driver.scan_seal_pending = true;
+        seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || driver.attempt_deferred_scan_seal(scope),
+        );
+        assert!(driver.semantic.is_some(), "the pending attempt seals");
+        assert!(!driver.scan_seal_pending);
+        assert_eq!(take_sealed_for_test(), vec![SEAL_LINE.to_string()]);
     }
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {

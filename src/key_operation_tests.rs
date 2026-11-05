@@ -21564,6 +21564,69 @@ fn key_operation_conservation_attributed_plus_unattributed_equals_observed() {
     assert_eq!(proved_signs, 2, "the two clean signs attribute once each");
 }
 
+/// Registry level of the exit-hold watchdog note: calls a Joint
+/// feed staged but never saw sealed count once as
+/// `watchdog_no_progress` after the trip (noted twice: once), and
+/// nothing counts before the trip.
+#[test]
+fn key_operation_registry_watchdog_trip_counts_staged_joint_calls() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Two more calls stage; no seal ever arrives for them.
+    for shape in [&init, &sign] {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    }
+    let before = guarded.registry.joint_observations(80);
+    assert!(
+        before
+            .unattributed
+            .iter()
+            .all(|row| row.reason != "watchdog_no_progress"),
+        "no watchdog count before the trip: {:?}",
+        before.unattributed
+    );
+    guarded.registry.note_joint_watchdog_trip();
+    guarded.registry.note_joint_watchdog_trip();
+    let after = guarded.registry.joint_observations(81);
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "watchdog_no_progress",
+            count: 2,
+        }],
+        "the two unsealed staged calls count once each: {:?}",
+        after.unattributed
+    );
+    let proved_signs: u64 = after
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved_signs, 1, "the sealed sign keeps its row");
+}
+
 /// Late attach: an instance registered without a witnessed birth
 /// keeps its S1 counts and counts its calls as
 /// `started_before_attach`, while a Joint sibling that started

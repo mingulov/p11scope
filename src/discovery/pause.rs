@@ -7117,6 +7117,45 @@ mod tests {
         );
     }
 
+    /// An engine-incomplete cycle is a counted named gap, never the end of
+    /// the pause chain: the child was resumed, so a later loader hit must
+    /// be able to arm and confirm like any other cycle.
+    #[test]
+    fn an_engine_incomplete_cycle_rearms_for_the_next_loader_hit() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.required_complete = false;
+        io.apply_outcome_diagnostic = Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(
+            coordinator.rearming_enabled(),
+            "an incomplete cycle must not retire the pause chain"
+        );
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+
+        io.required_complete = true;
+        io.apply_outcome_diagnostic = None;
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.queue
+            .push_back(Ok(Some(DiscoveryItem::Record(record(20, 0, false)))));
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 2,
+                confirmed: 1,
+                partial: 1,
+                unavailable: 0,
+            }
+        );
+        assert_eq!(coordinator.status(), PauseStatus::Partial);
+    }
+
     #[test]
     fn post_release_revalidation_remains_owned_by_the_pause_ledger() {
         let mut io = FakeIo {

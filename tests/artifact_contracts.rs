@@ -12036,11 +12036,11 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
         "self.fresh_with(",
         "terminal acquires a fresh observation",
     )?;
-    require_contract_marker(
-        terminal,
-        "never acquired a snapshot fails",
-        "terminal publishes stale, failing only without a snapshot",
-    )?;
+    if terminal.contains('?') {
+        return Err(
+            "terminal must return the fresh observation directly instead of propagating it".into(),
+        );
+    }
     if terminal.contains("require_terminal") {
         return Err("terminal must publish stale, not reject it via require_terminal".into());
     }
@@ -12091,11 +12091,6 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "            Ok(None) => {",
             "            Ok(_) => {",
             "Ok(None)",
-        ),
-        (
-            "never acquired a snapshot fails",
-            "always fails",
-            "terminal publishes stale, failing only without a snapshot",
         ),
         (
             "            plan, pins, profile, binding, acquire, legacy, generation, kernel,\n        )",

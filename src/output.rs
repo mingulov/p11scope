@@ -62,6 +62,10 @@ pub struct AtomicFile {
     final_name: CString,
     final_path: PathBuf,
     identity: FileIdentity,
+    /// The temp file's owner: the sudo invoker when the sink was
+    /// handed over at creation, otherwise the creator. Identity
+    /// checks compare against this, never against a fresh `geteuid`.
+    owner: u32,
     cleanup: bool,
 }
 
@@ -89,12 +93,17 @@ impl AtomicFile {
             .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
         let final_name = c_name(final_name, "output file name")?;
         check_final_name(&directory, &final_name, &final_path)?;
+        let handover = sudo_handover_target(&directory, &final_path)?;
         for sequence in 0..128u32 {
             let temp_name =
                 CString::new(format!(".p11scope.{}.{}.tmp", std::process::id(), sequence))
                     .expect("generated temporary output name has no NUL");
             match openat_profile(&directory, &temp_name) {
                 Ok(temp_file) => {
+                    if let Err(error) = handover_new_file(&temp_file, handover, &final_path) {
+                        let _ = unlinkat(&directory, &temp_name);
+                        return Err(error);
+                    }
                     let metadata = temp_file.metadata().map_err(|error| {
                         format!(
                             "checking temporary output beside {} failed: {error}",
@@ -109,6 +118,9 @@ impl AtomicFile {
                         ));
                     }
                     let identity = FileIdentity::from_metadata(&metadata);
+                    let owner = handover
+                        .map(|(uid, _)| uid)
+                        .unwrap_or_else(|| unsafe { libc::geteuid() });
                     return Ok(Self {
                         directory,
                         temp_file,
@@ -116,6 +128,7 @@ impl AtomicFile {
                         final_name,
                         final_path,
                         identity,
+                        owner,
                         cleanup: true,
                     });
                 }
@@ -219,10 +232,11 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        let current = unsafe { libc::geteuid() };
+        // The owner recorded at creation: the sudo invoker after a
+        // handover, otherwise the creator.
         if !metadata.is_file()
             || metadata.identity != self.identity
-            || metadata.owner != current
+            || metadata.owner != self.owner
             || metadata.mode & 0o077 != 0
         {
             return Err(format!(
@@ -238,7 +252,7 @@ impl AtomicFile {
         })?;
         if !held.is_file()
             || FileIdentity::from_metadata(&held) != self.identity
-            || held.uid() != current
+            || held.uid() != self.owner
             || held.mode() & 0o077 != 0
         {
             return Err(format!(
@@ -264,7 +278,7 @@ impl Drop for AtomicFile {
             && metadata_at(&self.directory, &self.temp_name).is_ok_and(|metadata| {
                 metadata.is_file()
                     && metadata.identity == self.identity
-                    && metadata.owner == unsafe { libc::geteuid() }
+                    && metadata.owner == self.owner
                     && metadata.mode & 0o077 == 0
             })
         {
@@ -296,6 +310,11 @@ pub struct PrivateStream {
     final_path: PathBuf,
     identity: FileIdentity,
     origin: StreamOrigin,
+    /// The sudo handover decided at preflight from the retained
+    /// directory: files this stream created are handed to it, and a
+    /// pre-existing file the invoker owns is accepted like the
+    /// caller's own. Never handed to a file the stream did not create.
+    sudo_target: Option<(u32, u32)>,
 }
 
 /// How a trace sink's file reaches its name.
@@ -361,7 +380,19 @@ impl PrivateStream {
                             self.final_path.display()
                         )
                     })?;
-                let identity = check_stream_file(&file, &self.final_path)?;
+                handover_stream_file(
+                    &self.directory,
+                    &self.final_name,
+                    &file,
+                    origin,
+                    self.sudo_target,
+                    &self.final_path,
+                )?;
+                let identity = check_stream_file(
+                    &file,
+                    &self.final_path,
+                    self.sudo_target.map(|(uid, _)| uid),
+                )?;
                 self.file = Some(file);
                 self.identity = identity;
                 self.origin = origin;
@@ -388,12 +419,16 @@ impl std::fmt::Debug for PrivateStream {
 
 impl Drop for PrivateStream {
     fn drop(&mut self) {
+        let expected = self
+            .sudo_target
+            .map(|(uid, _)| uid)
+            .unwrap_or_else(|| unsafe { libc::geteuid() });
         if self.file.is_some()
             && self.origin == StreamOrigin::Created
             && metadata_at(&self.directory, &self.final_name).is_ok_and(|metadata| {
                 metadata.is_file()
                     && metadata.identity == self.identity
-                    && metadata.owner == unsafe { libc::geteuid() }
+                    && metadata.owner == expected
             })
         {
             let _ = unlinkat(&self.directory, &self.final_name);
@@ -406,8 +441,9 @@ impl Drop for PrivateStream {
 /// published atomically like `AtomicFile`. The parent is retained without
 /// following any path symlink, and O_NOFOLLOW protects the final component
 /// too. O_NONBLOCK makes a planted FIFO fail instead of blocking, mode 0600.
-/// An existing target must be a regular file owned by the caller; it is only
-/// truncated and made private by [`PrivateStream::begin`].
+/// An existing target must be a regular file owned by the caller (or, after
+/// a sudo handover, by the invoker); it is only truncated and made private
+/// by [`PrivateStream::begin`].
 pub fn create_private_stream(path: &Path) -> Result<PrivateStream, String> {
     create_private_stream_with(path, true)
 }
@@ -428,9 +464,18 @@ fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStrea
         .file_name()
         .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
     let final_name = c_name(final_name, "output file name")?;
+    let handover = sudo_handover_target(&directory, &final_path)?;
     let (file, origin) = openat_stream(&directory, &final_name, unnamed)
         .map_err(|error| format!("opening output {} failed: {error}", final_path.display()))?;
-    let identity = check_stream_file(&file, &final_path)?;
+    handover_stream_file(
+        &directory,
+        &final_name,
+        &file,
+        origin,
+        handover,
+        &final_path,
+    )?;
+    let identity = check_stream_file(&file, &final_path, handover.map(|(uid, _)| uid))?;
     if origin == StreamOrigin::Unnamed {
         check_link_source(&unnamed_link_source(&file), identity, &final_path)?;
     }
@@ -441,11 +486,43 @@ fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStrea
         final_name,
         final_path,
         origin,
+        sudo_target: handover,
     })
 }
 
-/// A trace sink must be a regular file the caller owns.
-fn check_stream_file(file: &std::fs::File, final_path: &Path) -> Result<FileIdentity, String> {
+/// Hands a stream file the sink itself created to the sudo invoker.
+/// A pre-existing file is never handed over. On failure a file
+/// created at the name is unlinked again while it is still ours; an
+/// unnamed file has no name to clean up.
+fn handover_stream_file(
+    directory: &std::fs::File,
+    name: &CString,
+    file: &std::fs::File,
+    origin: StreamOrigin,
+    target: Option<(u32, u32)>,
+    final_path: &Path,
+) -> Result<(), String> {
+    if origin == StreamOrigin::Existing {
+        return Ok(());
+    }
+    if let Err(error) = handover_new_file(file, target, final_path) {
+        if origin == StreamOrigin::Created {
+            let _ = unlinkat(directory, name);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// A trace sink must be a regular file the caller owns — or, after a
+/// sudo handover was decided for this directory, a regular file the
+/// invoker owns, so a later run can append to a report an earlier
+/// run handed over. Anything else is refused and left as it was.
+fn check_stream_file(
+    file: &std::fs::File,
+    final_path: &Path,
+    sudo_owner: Option<u32>,
+) -> Result<FileIdentity, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("checking output {} failed: {error}", final_path.display()))?;
@@ -455,11 +532,12 @@ fn check_stream_file(file: &std::fs::File, final_path: &Path) -> Result<FileIden
             final_path.display()
         ));
     }
-    if metadata.uid() != unsafe { libc::geteuid() } {
+    let owner = metadata.uid();
+    if owner != unsafe { libc::geteuid() } && Some(owner) != sudo_owner {
         return Err(format!(
             "output {} exists and is owned by uid {}; refusing to overwrite it",
             final_path.display(),
-            metadata.uid()
+            owner
         ));
     }
     Ok(FileIdentity::from_metadata(&metadata))
@@ -658,19 +736,19 @@ fn sudo_uid() -> Option<u32> {
     if unsafe { libc::geteuid() } != 0 {
         return None;
     }
-    let value = std::env::var_os("SUDO_UID")?;
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let uid = value.to_str()?.parse::<u32>().ok()?;
-    if uid == 0 || uid == u32::MAX || !uid_has_account(uid) {
+    let uid = parse_sudo_id(&std::env::var_os("SUDO_UID")?)?;
+    if !uid_has_account(uid) {
         return None;
     }
     Some(uid)
 }
 
 fn uid_has_account(uid: u32) -> bool {
+    account_primary_gid(uid).is_some()
+}
+
+/// The primary gid of an existing account, `None` for an unknown uid.
+fn account_primary_gid(uid: u32) -> Option<u32> {
     let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0; 16 * 1024];
@@ -683,15 +761,38 @@ fn uid_has_account(uid: u32) -> bool {
             &mut result,
         )
     };
-    status == 0 && !result.is_null()
+    if status == 0 && !result.is_null() {
+        Some(account.pw_gid)
+    } else {
+        None
+    }
 }
 
 /// Parses one `SUDO_*` identity value: all digits, non-empty, and a
 /// non-root id below `u32::MAX`. Anything else (unset, blank,
 /// non-numeric, root, `u32::MAX`) is not an invoker.
-fn parse_sudo_id(_value: &OsStr) -> Option<u32> {
-    // RED stub: implemented with the sudo-output handover.
-    None
+fn parse_sudo_id(value: &OsStr) -> Option<u32> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let id = value.to_str()?.parse::<u32>().ok()?;
+    if id == 0 || id == u32::MAX {
+        return None;
+    }
+    Some(id)
+}
+
+/// The validated sudo invoker: root only, and `SUDO_UID`/`SUDO_GID`
+/// name one existing non-root account (the `run` pair rule for
+/// trusting `SUDO_*`). Anything else hands nothing over.
+pub(crate) fn sudo_invoker() -> Option<(u32, u32)> {
+    let uid = sudo_uid()?;
+    let gid = parse_sudo_id(&std::env::var_os("SUDO_GID")?)?;
+    if account_primary_gid(uid)? != gid {
+        return None;
+    }
+    Some((uid, gid))
 }
 
 /// Whether a newly created output file is handed to the sudo invoker
@@ -701,12 +802,69 @@ fn parse_sudo_id(_value: &OsStr) -> Option<u32> {
 /// Any missing condition hands nothing over. Never called for a
 /// pre-existing file, and never acts when not root.
 fn sudo_output_target(
-    _euid: u32,
-    _invoker: Option<(u32, u32)>,
-    _parent_owner: u32,
+    euid: u32,
+    invoker: Option<(u32, u32)>,
+    parent_owner: u32,
 ) -> Option<(u32, u32)> {
-    // RED stub: implemented with the sudo-output handover.
-    None
+    if euid != 0 {
+        return None;
+    }
+    let target = invoker?;
+    if parent_owner != target.0 {
+        return None;
+    }
+    Some(target)
+}
+
+/// The handover target for a sink in `directory`: root plus a
+/// validated sudo pair plus a parent the invoker owns. The parent
+/// owner comes from the retained directory descriptor, never from a
+/// path lookup.
+fn sudo_handover_target(
+    directory: &std::fs::File,
+    final_path: &Path,
+) -> Result<Option<(u32, u32)>, String> {
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        return Ok(None);
+    }
+    let invoker = sudo_invoker();
+    if invoker.is_none() {
+        return Ok(None);
+    }
+    let parent_owner = directory
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "checking output directory for {} failed: {error}",
+                final_path.display()
+            )
+        })?
+        .uid();
+    Ok(sudo_output_target(euid, invoker, parent_owner))
+}
+
+/// Hands a newly created sink file to the sudo invoker: `fchown` on
+/// the open descriptor, never by path, so no symlink can redirect
+/// it. The creation mode (`0600`) is unchanged by `fchown`. `None`
+/// keeps the caller's ownership. Callers unlink a file they just
+/// created when this fails.
+fn handover_new_file(
+    file: &std::fs::File,
+    target: Option<(u32, u32)>,
+    final_path: &Path,
+) -> Result<(), String> {
+    let Some((uid, gid)) = target else {
+        return Ok(());
+    };
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } == -1 {
+        return Err(format!(
+            "handing output {} to the invoking user (uid {uid}, gid {gid}) failed: {}",
+            final_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Opens the trace target without truncating it, and says how its file
@@ -1018,6 +1176,7 @@ mod tests {
             final_name,
             final_path: path.to_path_buf(),
             identity,
+            owner: unsafe { libc::geteuid() },
             cleanup: true,
         }
     }

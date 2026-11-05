@@ -17,7 +17,9 @@
 //! for it (its old endpoints retire; capture history still names it), except
 //! that a shared-scope Detailed ordinary provider refused whole retries as
 //! its leading-tables prefix with a named partial gap (JK-22a) — whole
-//! refusal stays only when not even the strongest table fits. A
+//! refusal stays only when not even the strongest table fits within its
+//! reserve-aware budget, or when its corroborated (published) tables
+//! together do not fit. A
 //! module whose sources still list such endpoints is never refused whole
 //! (G-03): when what it needs next does not fit, it keeps those endpoints, no
 //! prefix of the rest is attached, and the omission is reported, so it is
@@ -328,9 +330,12 @@ pub(crate) fn is_closure_array_prefix(reason: &str) -> bool {
 
 /// Whether a `modules_skipped` reason records a JK-22a prefix-admitted
 /// ordinary provider: some leading endpoints attached, the rest not
-/// counted. Partially covered, never a whole refusal.
+/// counted. Partially covered, never a whole refusal. The counted phrase
+/// is required beside the tag: whole refusals interpolate holder paths
+/// verbatim, and a path may name the tag.
 pub(crate) fn is_provider_prefix(reason: &str) -> bool {
-    reason.contains("(provider_prefix)")
+    reason.contains("endpoints attached; calls through the others are not counted")
+        && reason.contains("(provider_prefix)")
 }
 
 /// The omitted count a growth omission states — the `N` of
@@ -709,8 +714,9 @@ pub enum AdmissionScope {
     /// published tables, and any other Detailed provider refused whole
     /// retries as its leading-tables prefix with a named partial gap
     /// (JK-22a) — whole refusal stays only when not even the strongest
-    /// table fits. Uncorroborated modules leave [`shared_scope_reserve`]
-    /// slots free.
+    /// table fits within its reserve-aware budget, or when its
+    /// corroborated (published) tables together do not fit.
+    /// Uncorroborated modules leave [`shared_scope_reserve`] slots free.
     Shared,
 }
 
@@ -3390,8 +3396,10 @@ fn merge(
             // retries whole, then its leading-tables prefix; a prefix that
             // attaches nothing falls through to the whole refusal below, so
             // whole refusal stays exactly for a provider whose strongest
-            // table does not fit. Prefix and whole never spill, so the
-            // baseline reset is exact.
+            // table does not fit within its reserve-aware budget, or whose
+            // corroborated (published) tables together do not fit (the
+            // published-union check above runs in both passes). Prefix and
+            // whole never spill, so the baseline reset is exact.
             if provider_prefix_allowed && kept.is_empty() && !use_provider_prefix_fallback {
                 use_provider_prefix_fallback = true;
                 uncorroborated_candidates = spill_baseline;
@@ -12975,7 +12983,8 @@ mod tests {
     /// whose leading tables do is admitted on that prefix — never refused
     /// whole — with a named `provider_prefix` partial gap stating needed
     /// versus attached endpoints. Whole refusal stays only for a provider
-    /// whose strongest table does not fit.
+    /// whose strongest table does not fit within its reserve-aware budget,
+    /// or whose corroborated (published) tables together do not fit.
     #[test]
     fn shared_scope_admits_a_provider_prefix_when_whole_does_not_fit() {
         let filled = MAX_SLOTS as usize - 112;
@@ -13014,6 +13023,68 @@ mod tests {
             "neither a growth omission nor a whole refusal: {}",
             partial.reason
         );
+    }
+
+    /// The published-union exception to the strongest-table rule: a fresh
+    /// shared-scope provider whose corroborated (published) tables together
+    /// exceed the remaining budget is refused whole even when its strongest
+    /// single published table fits. Published tables stay atomic.
+    #[test]
+    fn shared_scope_refuses_a_provider_whose_published_union_exceeds_the_budget_whole() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        // Two corroborated tables of 60 endpoints each: the 120-endpoint
+        // union exceeds the 112 free slots, but either table alone fits.
+        let published = provider_with_tables(52, "/opt/published.so", 2, 60, true);
+        let shared = scoped_plan(&[filler, published], AdmissionScope::Shared);
+
+        assert_eq!(slots_of(&shared, 51), filled, "filler admitted whole");
+        assert_eq!(
+            slots_of(&shared, 52),
+            0,
+            "the published union is refused whole"
+        );
+        let refusal = refusal_of(&shared, "/opt/published.so").expect("whole refusal reported");
+        assert_eq!(
+            whole_refusal_needed_count(&refusal.reason),
+            Some(120),
+            "the complete fresh demand: {}",
+            refusal.reason
+        );
+        assert!(
+            !is_provider_prefix(&refusal.reason),
+            "the remainder is not a named prefix gap: {}",
+            refusal.reason
+        );
+    }
+
+    /// The provider-prefix classifier must not false-positive on a whole
+    /// refusal whose holder path names the tag: holder paths are
+    /// target-controlled labels interpolated verbatim into the refusal.
+    #[test]
+    fn provider_prefix_classifier_ignores_holder_paths_naming_the_tag() {
+        let whole = "module needs 150 more; only 512 attach slots are available; 400 are in use \
+             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+             a prefix; to capture one provider, name it with --module <path>; to free slots, exclude \
+             an unneeded module with --exclude-module <name>";
+        assert!(
+            whole_refusal_needed_count(whole).is_some(),
+            "the pin is a whole refusal: {whole}"
+        );
+        assert!(
+            !is_provider_prefix(whole),
+            "a holder path naming the tag is not a prefix: {whole}"
+        );
+        for prefix in [
+            "100 of 150 endpoints attached; calls through the others are not counted (provider_prefix)",
+            "300 of 600 endpoints attached; calls through the others are not counted; 128 are reserved \
+             for providers with a corroborated function table (provider_prefix)",
+        ] {
+            assert!(
+                is_provider_prefix(prefix),
+                "a planner prefix stays recognized: {prefix}"
+            );
+        }
     }
 
     /// Healthy twin: a shared-scope provider that fits whole is still

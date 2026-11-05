@@ -64,7 +64,10 @@ An ordinary provider that does not fit whole in a shared-scope Detailed
 capture is likewise admitted on the leading-tables prefix that fits,
 with a named `provider_prefix` partial gap stating attached versus
 needed endpoints; it is refused whole only when not even its strongest
-table fits. Inventory, counter and broad admission keep their
+table fits within its reserve-aware budget, or when its corroborated
+(published) tables together do not fit — published tables stay atomic,
+since spilling one as uncorroborated would mislabel corroborated
+evidence. Inventory, counter and broad admission keep their
 complete-union whole rule.
 
 Endpoint selection (`--select-endpoint` with `--mode metrics` and

@@ -15,9 +15,10 @@ mod inventory_claims;
 #[path = "tabled_readiness_tests.rs"]
 mod tabled_readiness;
 use crate::discovery::identity::test_fixture::{
-    SHA as OVERLAY_SHA, backing_file as overlay_backing_file, module as overlay_module,
-    overlay as overlay_key, pins as overlay_pins, real_scan_pin as overlay_real_scan_pin,
-    reback as overlay_reback, record_scan_ownership, view_pin as overlay_view_pin,
+    PATH as OVERLAY_PATH, SHA as OVERLAY_SHA, backing_file as overlay_backing_file,
+    module as overlay_module, overlay as overlay_key, pins as overlay_pins,
+    real_scan_pin as overlay_real_scan_pin, reback as overlay_reback, record_scan_ownership,
+    view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
     ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object,
@@ -3503,6 +3504,135 @@ fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
     // And not the reverse: a known prefix is never replaced by a whole refusal.
     let reverse = plan::is_closure_array_refusal(prefix) && plan::is_closure_array_prefix(whole);
     assert!(!reverse, "a whole refusal never replaces a prefix");
+}
+
+/// JK-22a: a later provider-prefix record replaces an earlier whole-refusal
+/// record for the same provider module in the engine history the report
+/// renders — and a later whole refusal never replaces a published prefix.
+/// Real planner outputs both times: a crowded shared-scope publish refuses
+/// the heuristic provider whole, and the corroborated rescan admits its
+/// leading tables as a prefix under the same crowd.
+#[test]
+fn a_later_provider_prefix_replaces_the_earlier_whole_refusal() {
+    use plan::AdmissionScope;
+    let free = 112usize;
+    let filled = p11scope_ebpf_common::MAX_SLOTS as usize - free;
+    // The filler crowds the budget identically in every publish.
+    let mut filler = overlay_module(overlay_key(58));
+    filler.tables[0].entries = overlay_entries(&filler, first_offsets(filled as u32));
+    filler.tables[0].live_return = true;
+    // The provider's three tables (150 endpoints): heuristic at first, so
+    // the crowded publish refuses it whole; the rescan corroborates its
+    // leading table, so the same crowd admits a 100-endpoint prefix.
+    let provider_key = overlay_key(59);
+    // Both modules keep the fixture path pinning reconciles by; the filler
+    // is admitted, so the provider owns the only skip record either way.
+    let provider_scan = |published: bool| {
+        let mut provider = overlay_module(provider_key);
+        let base = provider.tables[0].clone();
+        provider.tables = (0..3)
+            .map(|table| {
+                let mut candidate = base.clone();
+                candidate.address = 0x7000 + table * 0x1000;
+                candidate.file_offset = Some(table * 0x1000);
+                candidate.live_return = published && table == 0;
+                candidate.entries = (0..50)
+                    .map(|entry| ScannedEntry {
+                        name: "C_Sign",
+                        object: provider_key,
+                        object_path: provider.path.clone(),
+                        file_offset: (table * 50 + entry) * 8,
+                    })
+                    .collect();
+                candidate
+            })
+            .collect();
+        provider
+    };
+    let publish = |engine: &mut Engine, scans: &[ScannedModule]| {
+        let entries: Vec<(p11scope_manifest::maps::ObjectKey, &str, i64)> = scans
+            .iter()
+            .map(|scan| (scan.key, OVERLAY_SHA, 1))
+            .collect();
+        let mut pins = overlay_pins(&entries);
+        let (modules, skipped) = bind_scanned_modules(scans, &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let plan = plan::build_from_sources_scoped(
+            &modules,
+            &[],
+            &pins,
+            false,
+            AdmissionScope::Shared,
+            false,
+        );
+        engine.plan = plan;
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+    };
+    let mut engine = Engine::empty();
+    // Crowded: the heuristic provider is refused whole.
+    publish(&mut engine, &[filler.clone(), provider_scan(false)]);
+    assert_eq!(engine.plan.slots.len(), filled, "only the filler attached");
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    let whole = &engine.discovery.modules_skipped[0];
+    assert_eq!(whole.name, OVERLAY_PATH);
+    assert_eq!(
+        plan::whole_refusal_needed_count(&whole.reason),
+        Some(150),
+        "refused whole with its complete demand: {}",
+        whole.reason
+    );
+    assert!(
+        !plan::is_provider_prefix(&whole.reason),
+        "never a prefix: {}",
+        whole.reason
+    );
+    // Corroborated: the same crowd admits the leading-tables prefix, and
+    // the prefix replaces the stale whole refusal in capture history.
+    publish(&mut engine, &[filler.clone(), provider_scan(true)]);
+    assert_eq!(
+        engine.plan.slots.len(),
+        filled + 100,
+        "the prefix attached beside the filler"
+    );
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    let prefix = &engine.discovery.modules_skipped[0];
+    assert_eq!(prefix.name, OVERLAY_PATH);
+    assert!(
+        prefix.reason.contains("100 of 150 endpoints attached")
+            && plan::is_provider_prefix(&prefix.reason),
+        "the prefix replaces the whole refusal: {}",
+        prefix.reason
+    );
+    // And not the reverse: republishing the crowded whole refusal keeps
+    // the prefix as the capture's record.
+    publish(&mut engine, &[filler.clone(), provider_scan(false)]);
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    assert!(
+        plan::is_provider_prefix(&engine.discovery.modules_skipped[0].reason),
+        "a whole refusal never replaces a prefix: {}",
+        engine.discovery.modules_skipped[0].reason
+    );
 }
 
 /// An awaiting-publication gap ranks below a counted capacity refusal in the

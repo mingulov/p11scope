@@ -14,8 +14,25 @@ the profile identifier, the `lane` discriminator, the six original additions
 below, the six residual additions (`drain_proven`, `verdict_detail`,
 `uretprobe_override`, `handoff_child_pid`, `p11scope_env`, `pid_namespace`), the stop-gate
 outcome (`stop_quiescence`), the verdict
-classes (`gap_classes` and its three published inputs), and row identity
-(`functions[].target`, `functions[].ordinals`, table linkage `exports`).
+classes (`gap_classes` and its three published inputs), row identity
+(`functions[].target`, `functions[].ordinals`, table linkage `exports`),
+and the `modules_skipped[]` named-prefix delta below.
+
+`modules_skipped[]` extends the inherited v2 row: a module new to a
+shared-scope Detailed capture may attach in part, as a named
+leading-tables prefix, instead of being refused whole. Such a module
+appears in both `discovery[]` and `modules_skipped[]`; its `reason`
+opens with the attached-vs-total counts — `A of N endpoints attached;
+calls through the others are not counted (provider_prefix)` for an
+ordinary provider, or `M of N template tables attached; calls through
+the others are not counted (closure_prefix)` for a late-start proxy
+closure array — rather than with `module needs`. The whole-refusal
+(`module needs …`) and growth-omission (`admitted module needs …`)
+openings are unchanged, and every kind — whole refusal, growth
+omission, and either named prefix — forces `PARTIAL`. The
+`inspect --system` catalog files a prefix-admitted object under
+`refused` with the same named-gap reason; its attached-vs-needed
+counts are in the reason text.
 
 The inherited `functions[].latency_ns` timing-availability shapes also apply
 to v3: counts has null timing, timestamps has measured total/max and null

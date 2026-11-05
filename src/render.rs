@@ -6245,6 +6245,48 @@ pub(crate) mod tests {
         assert!(!text.contains("--module"), "{text}");
     }
 
+    /// JK-22a: a prefix-admitted ordinary provider names its attached
+    /// endpoints as partially covered, counted under "modules partially
+    /// covered" rather than "modules refused".
+    #[test]
+    fn scope_summary_names_a_prefix_admitted_provider() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/mixed.so".into(),
+            reason: "100 of 150 endpoints attached; calls through the others are not counted (provider_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules partially covered"), "{text}");
+        assert!(
+            text.contains("/opt/mixed.so: partially covered — "),
+            "{text}"
+        );
+        assert!(text.contains("100 of 150 endpoints attached"), "{text}");
+    }
+
+    /// A whole refusal whose holder path names `(provider_prefix)` still
+    /// renders as refused, never as partially covered.
+    #[test]
+    fn scope_summary_treats_holder_path_naming_provider_prefix_as_whole_refusal() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/crowded.so".into(),
+            reason: "module needs 150 more; only 512 attach slots are available; 400 are in use \
+                 (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+                 a prefix; to capture one provider, name it with --module <path>; to free slots, exclude \
+                 an unneeded module with --exclude-module <name>"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules refused"), "{text}");
+        assert!(!text.contains("modules partially covered"), "{text}");
+        assert!(text.contains("/opt/crowded.so: not attached — "), "{text}");
+        assert!(!text.contains("partially covered"), "{text}");
+    }
+
     /// `--exclude-module` files are listed as "excluded by you" with path,
     /// identity, and process count, plus unmatched inputs; a capture whose
     /// only skips are excluded stays exact.

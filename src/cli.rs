@@ -847,7 +847,7 @@ fn grouped_count(mut value: u64) -> String {
 /// otherwise as raw bytes so help never rounds.
 fn mib_or_bytes(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
-    if bytes % MIB == 0 {
+    if bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")

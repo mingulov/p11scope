@@ -273,6 +273,12 @@ TRACE_CONTEXT_LINES = frozenset((
     "Trace — completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+    "Calls on unverified functions are not decoded (names only).",
+))
+TRACE_TOTALS = re.compile(
+    r"\d+ completed calls; \d+ returned errors; \d+ entries without an observed return\.")
+TRACE_TAIL_LINES = frozenset((
+    "run with -v for details",
 ))
 
 
@@ -320,6 +326,12 @@ def trace_scannable(label, text):
         if not line or line.startswith((
             "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
         )):
+            kept.append(line)
+            continue
+        if line in TRACE_TAIL_LINES or line.startswith("coverage: "):
+            kept.append(line)
+            continue
+        if TRACE_TOTALS.fullmatch(line):
             kept.append(line)
             continue
         event = TRACE_EVENT.match(line)

@@ -4035,11 +4035,7 @@ fn task4_replay_identity_files(
                     && (position % 2 != 0 || ts.checked_sub(duration) == witness["ts_ns"].as_u64())
             );
             let line = std::str::from_utf8(rendered[position])?;
-            ensure!(
-                line.contains("C_Finalize")
-                    && line.contains("C_Initialize")
-                    && line.contains("[semantics unverified]")
-            );
+            ensure!(line.contains("C_Finalize") && line.contains("C_Initialize"));
         }
         let terminal = &raw[16];
         ensure!(

@@ -1485,6 +1485,7 @@ fn run_with_terminal_budget(
                 &engine_scope,
                 attach_backend,
                 key_operations,
+                false,
             )
         })
     };
@@ -1572,6 +1573,7 @@ fn run_with_terminal_budget(
         attach_backend,
         display: None,
         semantic,
+        scan_seal_pending: manifests.is_empty() && key_operations && native_available,
         semantic_staged: false,
         seated_summary: None,
         second_signal: Some(request.second_signal),
@@ -2229,6 +2231,12 @@ struct ClassicDriver<'a> {
     /// attested a subset. Ticks drive H0; commits finalize beside the
     /// physical evidence; the stop path owns its terminal sequence.
     semantic: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    /// DEMO-4 deferred scan seal: with `--key-operations` and no
+    /// manifest, no subset exists before the first discovery pass,
+    /// so the lane start retries after engine-changing passes until
+    /// a scan-derived subset mints (then this clears). Never set
+    /// when a manifest was given.
+    scan_seal_pending: bool,
     /// A lane batch is already staged ahead of the next commit: at most
     /// one ordinary collection quantum is owned at a time, so later
     /// ticks in the same pass stay quiet instead of backpressuring.
@@ -2374,6 +2382,7 @@ pub(crate) fn classic_semantic_ticks_for_test(
         identity: None,
         display: None,
         semantic: Some(lane),
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2444,6 +2453,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         identity: None,
         display: None,
         semantic: Some(lane),
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2627,6 +2637,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         identity: None,
         display: None,
         semantic: Some(lane),
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2723,6 +2734,7 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         identity: None,
         display: Some(display),
         semantic: None,
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -5120,6 +5132,7 @@ fn start_semantic_lane(
     scope: &Scope,
     backend: crate::attach::BackendSelection,
     key_operations: bool,
+    scan_subset: bool,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
     // The bytes rule before any semantic-lane BPF work: a stale or
     // mismatched embedded object degrades here with the plain mismatch
@@ -5133,14 +5146,14 @@ fn start_semantic_lane(
         inventory_diagnostic(&format!(
             "p11scope: {message}; broad inventory continues without instance semantics"
         ));
-        return fallback_shell(coordinator, scope, backend);
+        return fallback_shell(coordinator, scope, backend, scan_subset);
     }
     if key_operations {
         let spec = crate::attach::journal::JournalSpec;
         // Guard refusals at the mints disclose and end the startup
         // here, exactly as without the flag: only a refused journal
         // *start* retries ordinary, never a refused subset.
-        let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator)?;
+        let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator, scan_subset)?;
         match seal_start_live(attach_subset, convert_subset, scope, backend, Some(&spec)) {
             Ok(lane) => {
                 note_semantic_lane_sealed();
@@ -5154,10 +5167,14 @@ fn start_semantic_lane(
                         "{reason}; broad inventory continues with S1 mechanisms and API results"
                     ),
                 );
+                inventory_diagnostic(&format!(
+                    "p11scope: key operations unavailable: {reason}; broad inventory \
+                     continues with S1 mechanisms and API results"
+                ));
             }
         }
     }
-    let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator)?;
+    let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator, scan_subset)?;
     match seal_start_live(attach_subset, convert_subset, scope, backend, None) {
         Ok(lane) => {
             note_semantic_lane_sealed();
@@ -5168,7 +5185,7 @@ fn start_semantic_lane(
                 "semantic lane unavailable".into(),
                 format!("{refusal}; broad inventory continues without instance semantics"),
             );
-            fallback_shell(coordinator, scope, backend)
+            fallback_shell(coordinator, scope, backend, scan_subset)
         }
     }
 }
@@ -5180,11 +5197,12 @@ fn start_semantic_lane(
 /// journal start consumed its subsets.
 fn seal_mint_start_subsets(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scan_subset: bool,
 ) -> Option<(
     crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
     crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
 )> {
-    let preparation = seal_prepare_subset(coordinator);
+    let preparation = seal_prepare_subset(coordinator, scan_subset);
     for refusal in &preparation.refusals {
         coordinator.note_scope_gap(
             "semantic subset refused".into(),
@@ -5195,7 +5213,7 @@ fn seal_mint_start_subsets(
     // The second mint over the same retained sources stays the lane's
     // conversion envelope; it fails only when the retained inputs
     // moved under the startup.
-    let second = seal_prepare_subset(coordinator);
+    let second = seal_prepare_subset(coordinator, scan_subset);
     let convert_subset = match second.subset {
         Some(subset) => subset,
         None => {
@@ -5254,9 +5272,10 @@ fn fallback_shell(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
+    scan_subset: bool,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
     use crate::inventory_semantics::AttestedSemanticLane;
-    seal_prepare_subset(coordinator)
+    seal_prepare_subset(coordinator, scan_subset)
         .subset
         .and_then(|subset| AttestedSemanticLane::start(subset, scope, backend).ok())
         .map(|mut shell| {
@@ -5270,12 +5289,17 @@ fn fallback_shell(
 /// through `seal_startup_test::with` instead of attesting manifests.
 fn seal_prepare_subset(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scan_subset: bool,
 ) -> crate::discovery::engine::inventory_coordinator::semantics::SubsetPreparation {
     #[cfg(test)]
     if let Some(prepared) = seal_startup_test::take_prepared() {
         return prepared;
     }
-    coordinator.prepare_semantic_subset()
+    if scan_subset {
+        coordinator.prepare_scan_semantic_subset()
+    } else {
+        coordinator.prepare_semantic_subset()
+    }
 }
 
 /// The seal boundary of the lane startup (BPF): the live lane start
@@ -5846,6 +5870,34 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         )?;
         if let Some(warning) = warning {
             self.warn(&warning);
+        }
+        // DEMO-4 deferred scan seal: the first engine-changing pass
+        // retains the scan-discovered tables the startup mint could
+        // not see. A refused or empty mint keeps the pending flag
+        // for the next engine-changing pass, bounded and honest.
+        if self.semantic.is_none() && self.scan_seal_pending && report.engine_changed {
+            let engine_scope = Scope::from(scope);
+            if let Some(lane) = start_semantic_lane(
+                self.coordinator,
+                &engine_scope,
+                self.attach_backend,
+                true,
+                true,
+            ) {
+                let live = lane.is_live();
+                self.semantic = Some(lane);
+                self.scan_seal_pending = false;
+                if live {
+                    self.coordinator.note_scope_gap(
+                        "semantic subset scan-derived".into(),
+                        "key operations use scan-discovered tables without a manifest; \
+                         table provenance is scan publication evidence (name-authorized \
+                         tables only), not operator attestation"
+                            .into(),
+                    );
+                    self.initialize_joint_lane();
+                }
+            }
         }
         if let Some(lane) = self.semantic.as_mut() {
             bind_semantic_callers(self.coordinator, lane);
@@ -7495,6 +7547,7 @@ fn run_dashboard(
         attach_backend,
         display: Some(display),
         semantic,
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: Some(second_signal),
@@ -9721,6 +9774,7 @@ mod tests {
             &mut coordinator,
             &Scope::Pid(std::process::id()),
             crate::attach::BackendSelection::Auto,
+            false,
             false,
         );
         assert!(
@@ -13158,6 +13212,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13255,6 +13310,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13330,6 +13386,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13460,6 +13517,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13598,6 +13656,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: true,
                 seated_summary: None,
                 second_signal: None,
@@ -13692,6 +13751,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -18114,6 +18174,7 @@ mod promotion_driver_tests {
             identity: None,
             display: Some(display),
             semantic: None,
+            scan_seal_pending: false,
             semantic_staged: false,
             seated_summary: None,
             second_signal: None,
@@ -24805,6 +24866,7 @@ mod promotion_driver_tests {
             identity: None,
             display: None,
             semantic: None,
+            scan_seal_pending: false,
             semantic_staged: false,
             seated_summary: None,
             second_signal: None,
@@ -24950,6 +25012,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     false,
+                    false,
                 )
             },
         );
@@ -24976,6 +25039,7 @@ mod seal_readiness_tests {
             &mut coordinator,
             &scope,
             crate::attach::BackendSelection::Auto,
+            false,
             false,
         );
         assert!(lane.is_none(), "no subset seats no lane");
@@ -25005,6 +25069,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                     false,
                 )
             },
@@ -25045,6 +25110,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     false,
+                    false,
                 )
             },
         );
@@ -25078,6 +25144,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                     false,
                 )
             },
@@ -25218,6 +25285,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
+                    false,
                 )
             },
         );
@@ -25271,6 +25339,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
+                    false,
                 )
             },
         );
@@ -25327,6 +25396,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
+                    false,
                 )
             });
             assert!(lane.is_none(), "refused subsets seat no lane");
@@ -25357,6 +25427,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                     false,
                 )
             },

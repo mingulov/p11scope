@@ -986,12 +986,17 @@ Limits that matter in pods:
   physical counting; this
   preparation gate alone does not activate positive Inventory instance delivery.
   `--key-operations` (default off) opts in to per-key tracking through a linked
-  journal session; it requires `--capture auto` or `native` and a build with
-  the journal object. No manifest is needed for per-key rows. A refused
-  journal start keeps the S1 capture with a finite reason. Attaching to an
-  already-running process works: rows cover operations that start after the
-  attach, earlier operations are counted in named gaps, and no restart is
-  needed.
+  journal session; it requires `--capture auto` or `native`. No manifest is
+  required: without one, the semantic lane seals from scan-discovered,
+  name-authorized tables after the first discovery pass (the report carries
+  a `semantic subset scan-derived` gap naming that provenance; a manifest
+  still adds operator attestation when supplied). A build without the
+  journal object, or a refused journal start, keeps the S1 capture with a
+  finite reason instead of refusing the inventory. Attaching to an
+  already-running application needs no restart: operations that start
+  after attach attribute per key (a key first seen before attach rows
+  with type `unknown` until an observed attribute call establishes it),
+  and anything that cannot be attributed is counted beside the rows.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.
   Retired images say `Application executed a new image`, and exited

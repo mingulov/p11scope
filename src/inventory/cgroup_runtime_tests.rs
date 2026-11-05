@@ -47,6 +47,7 @@ impl<'a> ObservedDriver<'a> {
                 attach_backend: crate::attach::BackendSelection::Auto,
                 display: None,
                 semantic: None,
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,

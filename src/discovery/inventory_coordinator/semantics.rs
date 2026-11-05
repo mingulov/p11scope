@@ -263,6 +263,20 @@ impl SemanticInputs {
         prepare_retained_subset(engine, retained)
     }
 
+    /// The no-manifest scan mint (DEMO-4): seed the accepted set
+    /// from the engine's scan-discovered providers and build the
+    /// subset with scan authorization. Only meaningful when no
+    /// manifest was requested; the driver owns that gate.
+    pub(crate) fn prepare_scan(&mut self, engine: &Engine) -> SubsetPreparation {
+        let retained = self.retained_or_load(engine);
+        build_subset_from_accepted(
+            engine,
+            accept_retained_inputs(engine, retained, true),
+            None,
+            true,
+        )
+    }
+
     /// The memoized retained inputs, loaded once from the operator
     /// paths. Shared by the full mint and the selected restriction so
     /// both read the same retained files.
@@ -322,7 +336,19 @@ pub(crate) fn prepare_attested_subset(engine: &Engine, paths: &[PathBuf]) -> Sub
 }
 
 fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPreparation {
-    build_subset_from_accepted(engine, accept_retained_inputs(engine, inputs), None)
+    build_subset_from_accepted(
+        engine,
+        accept_retained_inputs(engine, inputs, false),
+        None,
+        false,
+    )
+}
+
+/// Test seam for the no-manifest scan mint, mirroring
+/// [`prepare_attested_subset`] with no operator inputs.
+#[cfg(test)]
+pub(crate) fn prepare_scan_attested_subset(engine: &Engine) -> SubsetPreparation {
+    SemanticInputs::new(Vec::new()).prepare_scan(engine)
 }
 
 /// Manifests accepted against the retained scan, before claims: the
@@ -336,7 +362,11 @@ struct AcceptedRetainedInputs {
     requested: bool,
 }
 
-fn accept_retained_inputs(engine: &Engine, inputs: &RetainedInputs) -> AcceptedRetainedInputs {
+fn accept_retained_inputs(
+    engine: &Engine,
+    inputs: &RetainedInputs,
+    seed_scan: bool,
+) -> AcceptedRetainedInputs {
     // This Inventory owner does not admit live Detailed selection claims.
     // Enabling that Engine path also requires incorporating its retained
     // claims/table latches here before preparing fresh semantic authority.
@@ -404,6 +434,16 @@ fn accept_retained_inputs(engine: &Engine, inputs: &RetainedInputs) -> AcceptedR
             Err(_) => refusals.push(SemanticRefusal::ManifestInput),
         }
     }
+    // DEMO-4 scan seed: with no manifest requested, every pinned
+    // scan-discovered provider is a candidate; completeness in
+    // `build_subset_from_accepted` still decides which ones mint.
+    if seed_scan && !inputs.requested {
+        for module in &engine.modules {
+            if pins.file_for(module.object).is_some() {
+                accepted.insert(module.object);
+            }
+        }
+    }
     AcceptedRetainedInputs {
         pins,
         manifests,
@@ -424,6 +464,7 @@ fn build_subset_from_accepted(
     engine: &Engine,
     accepted: AcceptedRetainedInputs,
     restrict: Option<&BTreeSet<PinnedObjectId>>,
+    scan_authorized: bool,
 ) -> SubsetPreparation {
     let AcceptedRetainedInputs {
         pins,
@@ -433,7 +474,9 @@ fn build_subset_from_accepted(
         requested,
     } = accepted;
     if accepted.is_empty() {
-        if !requested {
+        // The scan mint retries per discovery pass: no provider
+        // discovered yet is quiet, never a per-pass refusal.
+        if !requested && !scan_authorized {
             refusals.push(SemanticRefusal::Unattested);
         }
         return SubsetPreparation {
@@ -441,14 +484,23 @@ fn build_subset_from_accepted(
             refusals,
         };
     }
-    let claims = plan::semantic_source_claims(&engine.modules, &manifests, &pins);
-    let plan = plan::build_from_sources_for_policy_scoped(
-        &engine.modules,
-        &manifests,
-        &pins,
-        plan::AdmissionPolicy::detailed(),
-        plan::AdmissionScope::Named,
-    );
+    let (claims, plan) = if scan_authorized {
+        (
+            plan::semantic_source_claims_scan_authorized(&engine.modules, &manifests, &pins),
+            plan::build_from_sources_scan_authorized(&engine.modules, &manifests, &pins),
+        )
+    } else {
+        (
+            plan::semantic_source_claims(&engine.modules, &manifests, &pins),
+            plan::build_from_sources_for_policy_scoped(
+                &engine.modules,
+                &manifests,
+                &pins,
+                plan::AdmissionPolicy::detailed(),
+                plan::AdmissionScope::Named,
+            ),
+        )
+    };
     let mut selected = BTreeSet::new();
     for provider in accepted {
         let complete = claims
@@ -1894,11 +1946,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let accepted = accept_retained_inputs(
             &self.engine,
             self.semantic_inputs.retained_or_load(&self.engine),
+            false,
         );
         let object = provider_object_for_key(&accepted.pins, &key)
             .ok_or(PromotionRefusal::ManifestUnavailable)?;
         let restrict = BTreeSet::from([object]);
-        build_subset_from_accepted(&self.engine, accepted, Some(&restrict))
+        build_subset_from_accepted(&self.engine, accepted, Some(&restrict), false)
             .subset
             .ok_or(PromotionRefusal::ManifestUnavailable)
     }

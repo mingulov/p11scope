@@ -4149,6 +4149,48 @@ pub fn build_from_sources_for_policy_scoped_with_prearm(
     )
 }
 
+/// Builds the initial Detailed/Named plan for the no-manifest
+/// semantic subset (DEMO-4): scanned pieces lower with scan
+/// authorization (name-authorized tables only), manifest pieces
+/// keep their own authority. Used only by the scan subset mint;
+/// every broad/capture plan keeps scan targets count-only.
+pub(crate) fn build_from_sources_scan_authorized(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+) -> AttachPlan {
+    let (mut pinned_id, mut compatible) = pinned_manifest_lookups(pinned);
+    let mut discovered: Vec<Discovered<'_>> = scanned
+        .iter()
+        .map(|module| lower_scanned_with(module, true))
+        .collect();
+    let mut orphaned = Vec::new();
+    for manifest in manifests {
+        let (module, skipped) = lower_manifest(manifest, &mut pinned_id, &mut compatible);
+        discovered.extend(module);
+        orphaned.extend(skipped);
+    }
+    let mut plan = merge(
+        discovered,
+        manifests.iter().map(|m| m.vendor_interfaces.len()).sum(),
+        manifests.first().map_or_else(
+            || "absent".to_string(),
+            |m| acquisition_label(&m.interface_list),
+        ),
+        ExistingAllocation {
+            slots: 0,
+            active: &BTreeMap::new(),
+            owned: &BTreeMap::new(),
+        },
+        false,
+        AdmissionPolicy::detailed(),
+        AdmissionScope::Named,
+    );
+    plan.skipped.extend(orphaned);
+    plan.note_object_identities(pinned);
+    plan
+}
+
 /// Complete target requirements before table/slot admission. These are negative
 /// completeness and ambiguity facts, never permission to read arguments.
 pub(crate) struct SemanticSourceClaims {
@@ -4161,6 +4203,27 @@ pub(crate) fn semantic_source_claims(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     pinned: &PinnedObjects,
+) -> SemanticSourceClaims {
+    semantic_source_claims_with(scanned, manifests, pinned, false)
+}
+
+/// [`semantic_source_claims`] for the no-manifest scan subset:
+/// scanned pieces lower with scan authorization, so a key is
+/// degraded only for the same rival/ambiguity reasons as a
+/// manifest key — never merely for being scan-discovered.
+pub(crate) fn semantic_source_claims_scan_authorized(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+) -> SemanticSourceClaims {
+    semantic_source_claims_with(scanned, manifests, pinned, true)
+}
+
+fn semantic_source_claims_with(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+    scan_authorized: bool,
 ) -> SemanticSourceClaims {
     let affecting = |name: &str| {
         crate::kinds::descriptor(name)
@@ -4195,7 +4258,10 @@ pub(crate) fn semantic_source_claims(
         })
         .map(|module| module.object)
         .collect();
-    let mut pieces: Vec<_> = scanned.iter().map(lower_scanned).collect();
+    let mut pieces: Vec<_> = scanned
+        .iter()
+        .map(|module| lower_scanned_with(module, scan_authorized))
+        .collect();
     let mut selection_claims = Vec::new();
     for manifest in manifests {
         let (piece, _) = lower_manifest(
@@ -4493,6 +4559,15 @@ fn scanned_table_rows(
 }
 
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
+    lower_scanned_with(module, false)
+}
+
+/// Scan lowering for the no-manifest semantic subset (DEMO-4): when
+/// `scan_authorized`, targets of name-authorized tables (publication
+/// evidence per [`table_name_authorized`]) carry semantic authority
+/// inside this lowering only. Every other lowering keeps scan
+/// targets count-only, exactly as before.
+fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
     // every table this module published.
@@ -4575,7 +4650,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 object_path: &entry.object_path,
                 file_offset: entry.file_offset,
                 fork_safe,
-                semantic_authorized: false,
+                semantic_authorized: scan_authorized && authorized,
                 name_authorized: authorized,
                 table: Some(index),
                 ordinal: standard_ordinal(entry.name).map(|ordinal| SlotOrdinal {

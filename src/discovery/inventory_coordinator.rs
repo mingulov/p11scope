@@ -1515,6 +1515,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_inputs.prepare(&self.engine)
     }
 
+    /// The no-manifest scan mint (DEMO-4), over the same retained
+    /// engine facts as [`Self::prepare_semantic_subset`].
+    pub(crate) fn prepare_scan_semantic_subset(&mut self) -> semantics::SubsetPreparation {
+        self.semantic_inputs.prepare_scan(&self.engine)
+    }
+
     pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {
         self.diagnostics = Some(Recorder::try_new(config)?);
         Ok(())

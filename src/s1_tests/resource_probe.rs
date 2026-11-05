@@ -837,6 +837,8 @@ fn native_semantic_resource_final_types_pinned() {
     // 40 -> 48), measured 1184.
     // +40: the optional staged reload-disclosure view (two u64 counts
     // plus the identities vector), measured 1224.
+    // +24 (joint partial): the `unattributed` counter Vec in
+    // ObjectObservations, measured 1240 below.
     pin!(crate::inventory_present::PresentationRenderIndex, 8);
     pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
     // +24 (c9e1dd977): one inline Vec of pre-arm interval rows, one row
@@ -847,7 +849,7 @@ fn native_semantic_resource_final_types_pinned() {
     // 1176 -> 1216.
     pin!(
         crate::inventory_present::Presentation,
-        1216 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1240 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 3 * size_of::<Vec<u8>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.

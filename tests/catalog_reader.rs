@@ -774,6 +774,54 @@ fn catalog_closure_admission_accepts_prefix_gap_only_when_relaxed() {
 }
 
 #[test]
+fn catalog_partial_admission_accepts_prefix_shapes_with_counts() {
+    // The producer files a prefix-admitted object as partial with its
+    // attached count; the oracle must read that shape in both
+    // renderings, for closure and provider prefixes alike.
+    let closure_reason = "33 of 65 template tables attached; calls through the others are not counted (closure_prefix)";
+    let closure_json = serde_json::json!({
+        "state": "partial", "class": "closure_array",
+        "endpoints": 3399, "reason": closure_reason,
+    });
+    let closure_text =
+        format!("  admission  partial (closure_array): {closure_reason} [scan-only admission]");
+    for wide in [false, true] {
+        for strict in [false, true] {
+            validate_closure_admission(
+                json_whole_admission(&closure_json).unwrap(),
+                CLOSURE,
+                wide,
+                strict,
+            )
+            .unwrap();
+            validate_closure_admission(
+                text_whole_admission(&closure_text).unwrap(),
+                CLOSURE,
+                wide,
+                strict,
+            )
+            .unwrap();
+        }
+    }
+    // A provider prefix reads the same way: partial state plus the
+    // attached count in JSON, partial verb in text. Both renderings
+    // must parse (the text verb is new) and keep their counts.
+    let provider_reason = "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)";
+    let provider_json = serde_json::json!({
+        "state": "partial", "class": "heuristic",
+        "endpoints": 300, "reason": provider_reason,
+    });
+    let provider = json_whole_admission(&provider_json).unwrap();
+    assert_eq!(provider.state, "partial");
+    assert_eq!(provider.endpoints, Some(300));
+    let provider_text =
+        format!("  admission  partial (heuristic): {provider_reason} [scan-only admission]");
+    let parsed = text_whole_admission(&provider_text).unwrap();
+    assert_eq!(parsed.state, "partial");
+    assert_eq!(parsed.class, "heuristic");
+}
+
+#[test]
 fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
     let _guard = serial_guard();
     let dir = tmp("catalog-reader-partial-exports");

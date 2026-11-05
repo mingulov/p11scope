@@ -9128,6 +9128,33 @@ fn module_refusal_diagnostics_escape_target_controls() {
     assert!(!message.contains('\u{1b}') && !message.contains('\r'));
 }
 
+#[test]
+fn prefix_gap_stderr_names_partial_coverage_not_refusal() {
+    // The terminal stderr verdict must agree with the report: a
+    // prefix-admitted (or growth-omitted) module is partially
+    // covered, never refused. Whole refusals keep their verb.
+    for reason in [
+        "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)",
+        "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)",
+        "admitted module needs 2 more; only 512 attach slots are available; 511 are in use — 2 endpoints not attached; kept its 511 attached endpoints",
+    ] {
+        let message = format_module_refusal("/opt/prefix.so", reason);
+        assert!(
+            message.starts_with("p11scope: module partially covered: /opt/prefix.so — "),
+            "a partial gap must not read refused: {message}"
+        );
+        assert!(message.contains(reason), "{message}");
+    }
+    let whole = format_module_refusal(
+        "/opt/crowded.so",
+        "module needs 150 more; only 512 attach slots are available — refusing to attach a prefix",
+    );
+    assert!(
+        whole.starts_with("p11scope: module refused: /opt/crowded.so — "),
+        "a whole refusal keeps its verb: {whole}"
+    );
+}
+
 /// Task 9.2-fix5 item B, first half. The same `exec` transition, one step
 /// earlier: when the whole image is replaced the moved hook address often
 /// resolves to *no* mapping at all rather than to a moved one, so the

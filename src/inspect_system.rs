@@ -6647,6 +6647,41 @@ mod tests {
             }
         }
 
+        #[test]
+        fn prefix_admitted_provider_reports_partial_state_with_counts() {
+            // A prefix-admitted object is partially covered, never
+            // refused: JSON and text must agree on the partial state
+            // and carry the attached-vs-needed counts.
+            let unaimed =
+                scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
+            let json = render_json(&unaimed);
+            let admission = json["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|object| object["path"] == PATH)
+                .unwrap()["admission"]
+                .clone();
+            assert_eq!(admission["state"], "partial");
+            assert_eq!(admission["class"], "heuristic");
+            assert_eq!(admission["endpoints"], 300);
+            let reason = admission["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("300 of 600 endpoints attached")
+                    && reason.contains("(provider_prefix)"),
+                "the partial record keeps the prefix counts: {reason}"
+            );
+            let text = render_text(&unaimed);
+            let line = text
+                .lines()
+                .find(|line| line.contains("admission") && line.contains("(provider_prefix)"))
+                .expect("the text catalog names the prefix gap");
+            assert!(
+                line.contains("partial (heuristic)"),
+                "the text verdict must read partial, got: {line}"
+            );
+        }
+
         fn capped_gaps(catalog: &Catalog) -> Vec<&PidGap> {
             catalog
                 .skipped

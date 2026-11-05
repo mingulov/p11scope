@@ -9804,6 +9804,39 @@ mod tests {
         }
     }
 
+    /// Item 6: an auto PID capture whose native preparation hits a
+    /// host-wide BPF refusal (no root) falls back to the scan lane with a
+    /// named gap instead of failing. System scope stays fatal (see the
+    /// test above).
+    #[test]
+    fn auto_pid_capture_falls_back_to_scan_on_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let mut coordinator = coordinator();
+        let refusal =
+            MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let lane = open_native_lane_with(
+            CaptureMode::Auto,
+            BackendSelection::Auto,
+            Scope::Pid(std::process::id()),
+            &mut coordinator,
+            |_, _, _| Err(refusal.into()),
+        )
+        .expect("auto PID capture falls back to scan on host refusal");
+        assert!(lane.is_none(), "fallback leaves no native lane");
+        coordinator.registry_mut().publish();
+        let gaps: Vec<(String, String)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        let (_, reason) = gaps
+            .iter()
+            .find(|(subject, _)| subject == "native usage feed unavailable")
+            .expect("fallback records a named gap");
+        assert!(reason.contains("sudo"), "{reason}");
+    }
+
     /// Extract one top-level function body from this file's source for the
     /// wiring pin below (the uretprobe loader-contract shape).
     fn pin_body<'a>(

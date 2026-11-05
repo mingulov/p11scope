@@ -2398,7 +2398,8 @@ impl CallerRegistry {
             .instance_state
             .instance_calls_refused
             .values()
-            .fold(0u64, |total, count| total.saturating_add(*count));
+            .fold(0u64, |total, count| total.saturating_add(*count))
+            .saturating_add(self.foreign_unrouted_calls);
         observations.add_unattributed("foreign_or_unproven_caller", refused);
         observations
     }

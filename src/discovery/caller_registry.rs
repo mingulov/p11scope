@@ -2984,6 +2984,10 @@ pub(crate) struct CallerRegistry {
     /// (no ledger supplied, or the shared ledger refused): S1
     /// preserved, Joint evidence absent for those calls.
     joint_direct_fallback: u64,
+    /// Calls shed unrouted after S1 proved a caller other than
+    /// every bound one: counted as foreign not-attributed beside
+    /// the bound callers' key-operation rows.
+    foreign_unrouted_calls: u64,
     /// Diagnostic settlement-latency histogram (`None` unless the
     /// diagnostic toggle enables it): per-applied-call
     /// ENTRY-to-application delay. Boxed and absent by default, so
@@ -3083,8 +3087,19 @@ impl CallerRegistry {
             joint_accounting: false,
             key_projection: None,
             joint_direct_fallback: 0,
+            foreign_unrouted_calls: 0,
             settlement_latency: None,
         }
+    }
+
+    /// Count calls shed unrouted from a provably other caller.
+    pub(crate) fn note_foreign_unrouted_calls(&mut self, count: u64) {
+        self.foreign_unrouted_calls = self.foreign_unrouted_calls.saturating_add(count);
+    }
+
+    /// Calls shed unrouted from provably other callers, lifetime.
+    pub(crate) fn foreign_unrouted_calls(&self) -> u64 {
+        self.foreign_unrouted_calls
     }
 
     /// Enable or disable the diagnostic settlement-latency

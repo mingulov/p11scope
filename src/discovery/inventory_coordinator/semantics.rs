@@ -3759,6 +3759,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .flatten()
                 .and_then(|pid| self.adapter.live_id(pid))
                 .filter(|caller| self.semantic_bindings.get(*caller).is_none());
+            self.registry.note_foreign_unrouted_calls(total);
             self.registry.record_gap(RegistryGap {
                 caller,
                 module: None,

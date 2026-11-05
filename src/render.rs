@@ -6573,6 +6573,10 @@ pub(crate) mod tests {
             ),
             "{text}"
         );
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
+            "{text}"
+        );
     }
 
     /// Part 0: a prefix-admitted closure array names its covered templates
@@ -6595,6 +6599,10 @@ pub(crate) mod tests {
         );
         assert!(text.contains("4 of 64 template tables attached"), "{text}");
         assert!(!text.contains("--module"), "{text}");
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
+            "{text}"
+        );
     }
 
     /// JK-22a: a prefix-admitted ordinary provider names its attached

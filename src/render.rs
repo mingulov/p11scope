@@ -6618,6 +6618,42 @@ pub(crate) mod tests {
         );
     }
 
+    /// A prefix-admitted layer's own stub slots count under its own module
+    /// id; the forwarding hint must not name the layer itself among the
+    /// providers below it.
+    #[test]
+    fn prefix_hint_excludes_the_layer_itself() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.ino = 71;
+        layer.path = "/opt/libp11-kit.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/p11-kit-trust.so".into();
+        let mut self_row = report("C_GetSlotList", 500, 0, false);
+        self_row.module = Some(ModuleId(7));
+        let mut backend_row = report("C_FindObjects", 744, 0, false);
+        backend_row.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[self_row, backend_row], &ev);
+        assert!(
+            text.contains("/opt/p11-kit-trust.so: 744 calls"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("/opt/libp11-kit.so: 500 calls"),
+            "the layer must not list itself as a provider below it: {text}"
+        );
+    }
+
     /// JK-22a: a prefix-admitted ordinary provider names its attached
     /// endpoints as partially covered, counted under "modules partially
     /// covered" rather than "modules refused".

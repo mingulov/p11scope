@@ -288,7 +288,7 @@ if [ $rc -ne 0 ]; then
 fi
 sudo -n chown "$(id -u):$(id -g)" "$work/inventory.json" 2>/dev/null || true
 python3 -I - "$work/inventory.json" "$work/flow.json" "$BROWSER" "$MODE" "$LABEL" <<'PY'
-import json, sys
+import json, os, sys
 doc = json.load(open(sys.argv[1]))
 flow = json.load(open(sys.argv[2]))
 browser, mode, label = sys.argv[3], sys.argv[4], sys.argv[5]
@@ -323,7 +323,10 @@ print(f"RESULT label={label} browser={browser} mode={mode} "
       f"mechanisms={mech_used} functions={functions_used} "
       f"pre_presented={pre_presented} "
       f"post_presented={post_presented} "
-      f"callers={len(doc.get('callers') or [])} gaps={','.join(gap_names)}")
+      f"callers={len(doc.get('callers') or [])} gaps={','.join(gap_names)} "
+      f"knobs=head_start:{os.environ.get('DEMO4_HEAD_START', '20')},"
+      f"observer_delay:{os.environ.get('DEMO4_OBSERVER_DELAY', '-')},"
+      f"lane_held:{os.environ.get('DEMO4_LANE_HELD', '0')}")
 ok = post_presented >= 1
 if mode == "late":
     ok = ok and pre_presented >= 1

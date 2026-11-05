@@ -1387,6 +1387,15 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 None => crate::attach::identity_iter::Run::default(),
             }
         } else {
+            // A nested run without pidfd promotion cannot attribute:
+            // emitted initial-namespace tgids are unknowable, so the
+            // numeric lookup below would compare across PID-numbering
+            // domains and could join another process's verdicts. Fail
+            // closed before the scope write; the witness refuses
+            // userspace proof by construction and reports the gap.
+            if nested && !nested_per_pid {
+                return self.userspace(batch, RunFailure::Scope);
+            }
             // Nested runs bind by pidfd (below): the bitmap goes
             // permissive, since no selective set can name the bound
             // task's unknowable initial-namespace tgid.
@@ -1484,8 +1493,9 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             // Nested pidfd-bound runs match the sole emitter (the
             // pidfd already bound the request's task); anywhere else the
             // numbered pid keys the run. A nested run without promotion
-            // (no pidfd) can never attribute: the numbered lookup misses
-            // and the request falls back per request.
+            // (no pidfd) never reaches this match: it fails closed to
+            // userspace above, since the numbered lookup would compare
+            // across PID-numbering domains.
             let demoted = if nested_per_pid {
                 !run.demoted_pids.is_empty()
             } else {

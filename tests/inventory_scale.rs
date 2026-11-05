@@ -168,6 +168,17 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
     cmd.die_with_parent();
     let mut child = cmd.spawn().unwrap();
     let pid = child.id();
+    // Drain stdout while the child runs: the final report can exceed the
+    // 64 KiB pipe (an unaimed --system run names every unselected process),
+    // and the observer's writer watchdog fails the run when nobody reads.
+    let stdout = child.stdout.take().expect("spawn_with_peak callers pipe stdout");
+    let drain = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).expect("drain observer stdout");
+        bytes
+    });
     let mut peak = 0u64;
     loop {
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
@@ -187,7 +198,8 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
             None => std::thread::sleep(Duration::from_millis(5)),
         }
     }
-    let output = child.wait_with_output().unwrap();
+    let mut output = child.wait_with_output().unwrap();
+    output.stdout = drain.join().expect("stdout drain thread");
     (output, peak)
 }
 

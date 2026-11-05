@@ -2347,7 +2347,6 @@ pub fn scope_summary_with_verbosity(
     let open = sum(|row| row.in_flight);
     let mut text = String::new();
     if verbosity != TextVerbosity::Quiet {
-        text.push_str(&format!("Scope: {} scope\n", scope_label(scope)));
         if scope != "pid" {
             text.push_str("Aggregate across the selected scope; counts are not per application.\n");
         }
@@ -2380,15 +2379,8 @@ pub fn scope_summary_with_verbosity(
     text.push_str(&format!(
         "{calls} completed calls; {errors} returned errors; {open} entries without an observed return.\n"
     ));
-    if ev.completeness == "COMPLETE" {
-        text.push_str("Coverage COMPLETE (nothing known was lost)\n");
-    } else {
-        text.push_str(&format!(
-            "Coverage {}{}\n",
-            escape_controls(ev.completeness),
-            escape_controls(&verdict_reasons(ev, verbose)),
-        ));
-    }
+    text.push_str(&coverage_line(ev, verbose));
+    text.push('\n');
     if verbosity != TextVerbosity::Quiet {
         text.push_str(&unattributed_provider_line(ev));
     }
@@ -2539,7 +2531,9 @@ pub fn live_scoped(
 /// handle. Concise keeps the header, totals, plain coverage reasons
 /// and the function/mechanism tables plus the `-v` hint; verbose is
 /// the full frame with Evidence and machine reason names; quiet keeps
-/// the header, totals and coverage only.
+/// the header, totals and coverage only. The function table renders
+/// only when some row has activity; the header carries the privacy
+/// mode under verbose only.
 #[allow(clippy::too_many_arguments)]
 pub fn live_scoped_with_verbosity(
     reports: &[SlotReport],
@@ -2553,57 +2547,67 @@ pub fn live_scoped_with_verbosity(
     verbosity: crate::cli::TextVerbosity,
 ) -> String {
     let mut s = String::new();
+    // Concise states the scope once, in the header; the privacy mode
+    // is verbose detail.
+    let privacy = if verbosity == crate::cli::TextVerbosity::Verbose {
+        format!(" — privacy={}", policy.privacy_mode())
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {} — privacy={} — {}\n",
+        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {}{} — {}\n",
         scope_label(scope),
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
         elapsed.as_secs() % 60,
         escape_controls(mode),
-        policy.privacy_mode(),
+        privacy,
         escape_controls(module),
     ));
     s.push_str(&scope_summary_with_verbosity(scope, reports, ev, verbosity));
     if verbosity == crate::cli::TextVerbosity::Quiet {
         return s;
     }
-    s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
-    s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
-    s.push_str(&format!(
-        "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-        "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
-    ));
     let mut rows: Vec<&SlotReport> = reports
         .iter()
         .filter(|r| r.calls > 0 || r.in_flight > 0)
         .collect();
     rows.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.names.cmp(&b.names)));
-    for r in rows {
-        let percentiles = if r.mode.has_histogram() {
-            [
-                percentile_ns(&r.buckets, 0.50),
-                percentile_ns(&r.buckets, 0.95),
-                percentile_ns(&r.buckets, 0.99),
-            ]
-        } else {
-            [None; 3]
-        };
-        let mut name = label(r);
-        if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
-            name.push_str(init.text_suffix());
-        }
+    // No table at all when nothing was called — neither legends nor
+    // header. One latency legend otherwise, above the table.
+    if !rows.is_empty() {
+        s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
+        s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
         s.push_str(&format!(
             "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            escape_controls(&name),
-            r.calls,
-            r.errors,
-            fmt_ns(percentiles[0]),
-            fmt_ns(percentiles[1]),
-            fmt_ns(percentiles[2]),
-            r.in_flight
+            "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
         ));
+        for r in rows {
+            let percentiles = if r.mode.has_histogram() {
+                [
+                    percentile_ns(&r.buckets, 0.50),
+                    percentile_ns(&r.buckets, 0.95),
+                    percentile_ns(&r.buckets, 0.99),
+                ]
+            } else {
+                [None; 3]
+            };
+            let mut name = label(r);
+            if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
+                name.push_str(init.text_suffix());
+            }
+            s.push_str(&format!(
+                "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+                escape_controls(&name),
+                r.calls,
+                r.errors,
+                fmt_ns(percentiles[0]),
+                fmt_ns(percentiles[1]),
+                fmt_ns(percentiles[2]),
+                r.in_flight
+            ));
+        }
     }
-    s.push_str("(~ = log2-bucket approximation, lower bound)\n");
     if !mechanisms.is_empty() {
         s.push_str(&format!(
             "{:<28} {:>8} {:>6}\n",
@@ -2630,8 +2634,8 @@ pub fn live_scoped_with_verbosity(
         // while a mapped provider actually lacks one.
         if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
             s.push_str(&format!(
-                "Mechanisms: none attributed — {} function{} counted but not named; \
-                 add --manifest for each mapped provider file (see Coverage).\n",
+                "Mechanisms: none attributed — {} function{} named from the standard table, \
+                 unconfirmed; add --manifest for each mapped provider file (see Coverage).\n",
                 ev.semantic_unverified_slots,
                 if ev.semantic_unverified_slots == 1 {
                     ""
@@ -2694,15 +2698,21 @@ pub fn live_scoped_with_verbosity(
     s
 }
 
-/// `": calls may be missing (12 call records lost); names withheld (68
-/// functions counted but not named)"` — one group per class with a cause,
-/// from `ev.gap_classes` — or the unproven-drain sentence when the
-/// terminal seal is the only reason. Empty when `COMPLETE`. Concise
-/// text is plain words only; verbose pairs each machine name beside
-/// its plain words.
+/// `" — calls may be missing (12 call records lost); names unconfirmed
+/// (…)"` — one group per class with a cause, from `ev.gap_classes` —
+/// or the unproven-drain sentence when the terminal seal is the only
+/// reason. Empty when `COMPLETE`. Concise text is plain words only;
+/// verbose pairs each machine name beside its plain words.
 fn verdict_reasons(ev: &Evidence, verbose: bool) -> String {
+    verdict_reason_body(ev, verbose).map_or_else(String::new, |body| format!(" — {body}"))
+}
+
+/// The [`verdict_reasons`] groups without the leading separator, so
+/// the coverage line can reuse or replace them. `None` when `COMPLETE`
+/// or when no reason renders at all.
+fn verdict_reason_body(ev: &Evidence, verbose: bool) -> Option<String> {
     if ev.completeness == "COMPLETE" {
-        return String::new();
+        return None;
     }
     let classes = &ev.gap_classes;
     let mut groups: Vec<String> = [
@@ -2732,9 +2742,9 @@ fn verdict_reasons(ev: &Evidence, verbose: bool) -> String {
         });
     }
     if groups.is_empty() {
-        String::new()
+        None
     } else {
-        format!(": {}", groups.join("; "))
+        Some(groups.join("; "))
     }
 }
 
@@ -2744,7 +2754,7 @@ fn verdict_reasons(ev: &Evidence, verbose: bool) -> String {
 fn verdict_group_label(label: &str, status: &str, verbose: bool) -> String {
     let plain = match (label, status) {
         ("observation", "lossy") => "calls may be missing",
-        ("attribution", "withheld") => "names withheld",
+        ("attribution", "withheld") => "names unconfirmed",
         ("semantics", "degraded") => "call details degraded",
         _ => return format!("{label} {status}"),
     };
@@ -2783,7 +2793,9 @@ fn semantic_state_counter(ev: &Evidence, cause: &str) -> Option<u64> {
 /// into "other gaps" in concise text and renders as its own field name
 /// in verbose, so a new gate always surfaces.
 fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec<String> {
-    let count = |n: u64, label: &str| format!("{n} {label}");
+    let count = |n: u64, one: &str, many: &str| {
+        format!("{n} {}", if n == 1 { one } else { many })
+    };
     let mut fragments = Vec::new();
     let mut state_gaps = 0u64;
     let mut state_causes: Vec<&str> = Vec::new();
@@ -2825,28 +2837,52 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     .filter(|module| crate::plan::is_partial_coverage(&module.reason))
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
-                for (n, label) in [
-                    (refused, "provider files not watched"),
-                    (partially_covered, "provider files partially covered"),
+                for (n, one, many) in [
+                    (refused, "provider file not watched", "provider files not watched"),
+                    (
+                        partially_covered,
+                        "provider file partially covered",
+                        "provider files partially covered",
+                    ),
                 ] {
                     if n > 0 {
-                        fragments.push(tag(count(n, label)));
+                        fragments.push(tag(count(n, one, many)));
                     }
                 }
                 continue;
             }
             "attach_failures" => count(
                 ev.attach_failures.len() as u64,
+                "function could not be watched",
                 "functions could not be watched",
             ),
             "skipped" => {
-                fragments.push(tag(count(
-                    ev.skipped
-                        .iter()
-                        .filter(|skip| skip.reason != NULL_POINTER_REASON)
-                        .count() as u64,
-                    "functions skipped",
-                )));
+                // Discovery-subject entries are unavailable discovery
+                // steps, not skipped functions; only named function
+                // entries keep the "skipped" wording.
+                let mut subjects = 0u64;
+                let mut functions = 0u64;
+                for skip in ev
+                    .skipped
+                    .iter()
+                    .filter(|skip| skip.reason != NULL_POINTER_REASON)
+                {
+                    if skip.name == DISCOVERY_SUBJECT {
+                        subjects += 1;
+                    } else {
+                        functions += 1;
+                    }
+                }
+                if subjects > 0 {
+                    fragments.push(tag(count(
+                        subjects,
+                        "discovery step unavailable",
+                        "discovery steps unavailable",
+                    )));
+                }
+                if functions > 0 {
+                    fragments.push(tag(count(functions, "function skipped", "functions skipped")));
+                }
                 // One histogram line per named limit present, in canonical
                 // order; the labels are the finite public reasons, never
                 // raw skip text, so no target data can reach this line.
@@ -2865,30 +2901,64 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         fragments.push(tag(format!("{reason}: {hits}")));
                     }
                 }
+                if verbose {
+                    let items = skipped_item_list(ev);
+                    if !items.is_empty() {
+                        fragments.push(format!("skipped: {}", items.join(", ")));
+                    }
+                }
                 continue;
             }
-            "in_flight_at_end" => count(ev.in_flight_at_end, "calls still running at capture end"),
+            "in_flight_at_end" => count(
+                ev.in_flight_at_end,
+                "call still running at capture end",
+                "calls still running at capture end",
+            ),
             "surfaces" => count(
                 ev.surfaces
                     .iter()
                     .filter(|s| s.walk != "full" || s.acquisition != "ok")
                     .count() as u64,
+                "provider table incompletely read",
                 "provider tables incompletely read",
             ),
             "vendor_interfaces" => count(
                 ev.vendor_interfaces as u64,
+                "vendor-specific interface not decoded",
                 "vendor-specific interfaces not decoded",
             ),
             "interface_list" => "could not list interfaces".to_string(),
-            "event_loss" => count(ev.event_loss, "call records lost"),
-            "start_insert_failures" => count(ev.start_insert_failures, "call starts not recorded"),
-            "unmatched_returns" => count(ev.unmatched_returns, "returns without a recorded start"),
-            "rv_update_failures" => count(ev.rv_update_failures, "return values not recorded"),
-            "cgroup_scope_failures" => {
-                count(ev.cgroup_scope_failures, "cgroup membership checks failed")
-            }
-            "abi_refusals" => count(ev.abi_refusals, "unexpected probe hits refused"),
-            "malformed_records" => count(ev.malformed_records, "unreadable kernel records"),
+            "event_loss" => count(ev.event_loss, "call record lost", "call records lost"),
+            "start_insert_failures" => count(
+                ev.start_insert_failures,
+                "call start not recorded",
+                "call starts not recorded",
+            ),
+            "unmatched_returns" => count(
+                ev.unmatched_returns,
+                "return without a recorded start",
+                "returns without a recorded start",
+            ),
+            "rv_update_failures" => count(
+                ev.rv_update_failures,
+                "return value not recorded",
+                "return values not recorded",
+            ),
+            "cgroup_scope_failures" => count(
+                ev.cgroup_scope_failures,
+                "cgroup membership check failed",
+                "cgroup membership checks failed",
+            ),
+            "abi_refusals" => count(
+                ev.abi_refusals,
+                "unexpected probe hit refused",
+                "unexpected probe hits refused",
+            ),
+            "malformed_records" => count(
+                ev.malformed_records,
+                "unreadable kernel record",
+                "unreadable kernel records",
+            ),
             "provider_changed" => "provider file changed during capture".to_string(),
             "trace_truncated" => "trace truncated at its event cap".to_string(),
             "counter_collection" => "final counter read incomplete".to_string(),
@@ -2900,65 +2970,112 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "observer PID namespace {}: kernel PIDs unresolvable",
                 ev.pid_namespace.observer
             ),
-            "unprotected_live_windows" => "unguarded live capture window".to_string(),
-            "discovery_ring_loss" => count(ev.discovery_ring_loss, "discovery records lost"),
-            "discovery_state_failures" => {
-                count(ev.discovery_state_failures, "discovery updates failed")
+            "unprotected_live_windows" => {
+                "calls made while probes were being attached may be missing".to_string()
             }
-            "discovery_read_failures" => {
-                count(ev.discovery_read_failures, "discovery reads failed")
+            "discovery_ring_loss" => count(
+                ev.discovery_ring_loss,
+                "discovery record lost",
+                "discovery records lost",
+            ),
+            "discovery_state_failures" => count(
+                ev.discovery_state_failures,
+                "discovery update failed",
+                "discovery updates failed",
+            ),
+            "discovery_read_failures" => count(
+                ev.discovery_read_failures,
+                "discovery read failed",
+                "discovery reads failed",
+            ),
+            "discovery_truncated" => count(
+                ev.discovery_truncated,
+                "discovery record truncated",
+                "discovery records truncated",
+            ),
+            "task_uprobe_link_losses" => {
+                count(ev.task_uprobe_link_losses, "probe link lost", "probe links lost")
             }
-            "discovery_truncated" => count(ev.discovery_truncated, "discovery records truncated"),
-            "task_uprobe_link_losses" => count(ev.task_uprobe_link_losses, "probe links lost"),
-            "pause_partial" => count(ev.pause_partial, "loads only partly paused"),
+            "pause_partial" => count(
+                ev.pause_partial,
+                "load only partly paused",
+                "loads only partly paused",
+            ),
             "pause_unavailable" => count(
                 ev.pause_unavailable,
+                "load could not be paused (collected unpaused)",
                 "loads could not be paused (collected unpaused)",
             ),
             "loader_discovery" => {
                 let loader = &ev.loader_discovery;
                 if loader.hits == 0 && loader.strategies.debug_state_every_hit == 1 {
-                    "loader BPF delivery failure suspected (0 hits, no EXEC acknowledgment)"
+                    "library-load tracking received nothing from the kernel \
+                     (loads may be missing)"
                         .to_string()
                 } else if loader.hits == 0 && loader.strategies.debug_state_every_hit >= 2 {
-                    "loader uprobe never fired despite EXEC processing (uprobe miss suspected)"
-                        .to_string()
+                    "library-load tracking missed loads it should have seen".to_string()
                 } else {
-                    "live loader timing unproven".to_string()
+                    "library-load tracking could not be confirmed".to_string()
                 }
             }
             "scheduling.terminal_drain_truncated" => {
                 "final drain cut short (last calls may be missing)".to_string()
             }
-            "scheduling.sink_dropped_bytes" => {
-                count(ev.scheduling.sink_dropped_bytes, "output bytes dropped")
-            }
-            "interface_selection" => "function list not fully identified".to_string(),
-            "pid_descendant_gaps" => count(ev.pid_descendant_gaps, "short-lived process gaps"),
-            "multi_rebuild_gaps" => count(ev.multi_rebuild_gaps, "probe re-attach gaps"),
-            "semantic_unverified_slots" => format!(
-                "{} function{} counted but not named",
-                ev.semantic_unverified_slots,
-                if ev.semantic_unverified_slots == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+            "scheduling.sink_dropped_bytes" => count(
+                ev.scheduling.sink_dropped_bytes,
+                "output byte dropped",
+                "output bytes dropped",
             ),
-            "aliased" => count(ev.aliased.len() as u64, "functions sharing an address"),
+            "interface_selection" => "function list not fully identified".to_string(),
+            "pid_descendant_gaps" => count(
+                ev.pid_descendant_gaps,
+                "short-lived process gap",
+                "short-lived process gaps",
+            ),
+            "multi_rebuild_gaps" => count(
+                ev.multi_rebuild_gaps,
+                "probe re-attach gap",
+                "probe re-attach gaps",
+            ),
+            "semantic_unverified_slots" => {
+                // The names render from the standard table; only a
+                // manifest confirms them. Verbose keeps the slot count
+                // with the machine cause name.
+                const PLAIN: &str = "function names follow the standard PKCS#11 table and were \
+                     not confirmed by a manifest (add --manifest to confirm)";
+                if verbose {
+                    fragments.push(format!(
+                        "{PLAIN} ({} slots; {cause})",
+                        ev.semantic_unverified_slots
+                    ));
+                } else {
+                    fragments.push(PLAIN.to_string());
+                }
+                continue;
+            }
+            "aliased" => count(
+                ev.aliased.len() as u64,
+                "function sharing an address",
+                "functions sharing an address",
+            ),
             "module_ambiguous" => count(
                 ev.discovery.module_ambiguous,
+                "function claimed by two provider files",
                 "functions claimed by two provider files",
             ),
             "module_unresolved_slots" => count(
                 ev.module_unresolved_slots as u64,
+                "function with no proven provider file",
                 "functions with no proven provider file",
             ),
-            "unregistered_mechanisms" => {
-                count(ev.unregistered_mechanisms, "unregistered mechanisms")
-            }
+            "unregistered_mechanisms" => count(
+                ev.unregistered_mechanisms,
+                "unregistered mechanism",
+                "unregistered mechanisms",
+            ),
             "unpublished_mechanisms" => count(
                 ev.unpublished_mechanisms,
+                "vendor mechanism not listed by name",
                 "vendor mechanisms not listed by name",
             ),
             "discovery_conflicts" => format!(
@@ -2968,6 +3085,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             ),
             "discovery_uncorroborated" => count(
                 ev.discovery.uncorroborated,
+                "provider file not confirmed from a second source",
                 "provider files not confirmed from a second source",
             ),
             "interface_selection.selection_count_only" => {
@@ -2975,19 +3093,25 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             }
             "semantic_capture_failures" => count(
                 ev.semantic_capture_failures,
+                "mechanism detail not recorded",
                 "mechanism details not recorded",
             ),
             "template_tail_failures" => count(
                 ev.template_tail_failures,
+                "attribute-list read not recorded",
                 "attribute-list reads not recorded",
             ),
-            "semantic_history_drops" => {
-                count(ev.semantic_history_drops, "mechanism histories dropped")
-            }
+            "semantic_history_drops" => count(
+                ev.semantic_history_drops,
+                "mechanism history dropped",
+                "mechanism histories dropped",
+            ),
             "templates_truncated" => "attribute lists cut short".to_string(),
-            "shape_decode_total_failures" => {
-                count(ev.shape_decode_total_failures, "mechanisms never decoded")
-            }
+            "shape_decode_total_failures" => count(
+                ev.shape_decode_total_failures,
+                "mechanism never decoded",
+                "mechanisms never decoded",
+            ),
             other => {
                 if verbose {
                     fragments.push(other.to_string());
@@ -3000,7 +3124,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
         fragments.push(tag(fragment));
     }
     if state_gaps > 0 {
-        let plain = count(state_gaps, "session-tracking gaps");
+        let plain = count(state_gaps, "session-tracking gap", "session-tracking gaps");
         fragments.push(if verbose && !state_causes.is_empty() {
             format!("{plain} ({})", state_causes.join(", "))
         } else {
@@ -3015,6 +3139,106 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
         ));
     }
     fragments
+}
+
+/// Verbose `-v` listing of the skipped entries behind the `skipped`
+/// cause: each distinct `{name} ({reason})` in first-seen order with
+/// a repeat count, capped like the module gaps. The coverage line
+/// already escapes the whole reasons string, so categorical names and
+/// reasons render as-is.
+fn skipped_item_list(ev: &Evidence) -> Vec<String> {
+    const SHOWN: usize = 5;
+    let mut distinct: Vec<(&str, &str, u64)> = Vec::new();
+    for skip in ev
+        .skipped
+        .iter()
+        .filter(|skip| skip.reason != NULL_POINTER_REASON)
+    {
+        if let Some(entry) = distinct
+            .iter_mut()
+            .find(|(name, reason, _)| *name == skip.name && *reason == skip.reason)
+        {
+            entry.2 += 1;
+        } else {
+            distinct.push((skip.name.as_str(), skip.reason.as_str(), 1));
+        }
+    }
+    let mut items: Vec<String> = distinct
+        .iter()
+        .take(SHOWN)
+        .map(|(name, reason, n)| {
+            if *n > 1 {
+                format!("{name} ({reason}) ×{n}")
+            } else {
+                format!("{name} ({reason})")
+            }
+        })
+        .collect();
+    if distinct.len() > SHOWN {
+        items.push(format!("and {} more", distinct.len() - SHOWN));
+    }
+    items
+}
+
+/// True for an owned run that never paused while its command ran
+/// ahead of probe attachment: nothing was watched, a live load went
+/// unpaused, and a refused loader context or repeated discovery
+/// misses corroborate the missed provider. A bare command with no
+/// missed load (one subject skip, no refused context) stays generic.
+fn missed_provider_load(ev: &Evidence) -> bool {
+    ev.child_still_running.is_some()
+        && ev.pause == "none"
+        && ev.pause_attempts == 0
+        && ev.unprotected_live_windows > 0
+        && ev.slots == 0
+        && (ev.discovery_truncated > 0
+            || ev
+                .skipped
+                .iter()
+                .filter(|skip| skip.name == DISCOVERY_SUBJECT)
+                .count()
+                > 1)
+}
+
+/// The one coverage line shared by the profile summary and the trace
+/// tail: `coverage: complete`; `coverage: counts complete; …` when
+/// names are the only gap; the owned-run missed-load remedy; or
+/// `coverage: partial — <reasons>`. Verbose keeps the full grouped
+/// reasons beside the special cases.
+pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
+    if ev.completeness == "COMPLETE" {
+        return "coverage: complete".to_string();
+    }
+    if missed_provider_load(ev) {
+        let mut line = "coverage: partial — the command loaded its provider before probes \
+             attached; rerun with --pause auto"
+            .to_string();
+        if verbose
+            && let Some(reasons) = verdict_reason_body(ev, true)
+        {
+            line.push_str("; ");
+            line.push_str(&escape_controls(&reasons));
+        }
+        return line;
+    }
+    let classes = &ev.gap_classes;
+    if classes.observation.causes.is_empty()
+        && classes.semantics.causes.is_empty()
+        && !classes.attribution.causes.is_empty()
+    {
+        let fragments = cause_fragments(ev, &classes.attribution.causes, verbose);
+        if fragments.is_empty() {
+            return "coverage: counts complete".to_string();
+        }
+        return format!(
+            "coverage: counts complete; {}",
+            escape_controls(&fragments.join("; "))
+        );
+    }
+    match verdict_reason_body(ev, verbose) {
+        Some(body) => format!("coverage: partial — {}", escape_controls(&body)),
+        None => "coverage: partial".to_string(),
+    }
 }
 
 /// The module a slot's counts belong to, as `functions[]` renders it.

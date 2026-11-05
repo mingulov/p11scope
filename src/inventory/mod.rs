@@ -9382,6 +9382,48 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// Inventory JSON positive arm: when the engine discloses
+    /// unobserved windows, the `prearm[]` row carries each window with
+    /// its exact bounds and reason. (The scan-lane twins pin the
+    /// absent side; the engine seam pins the windows themselves; the
+    /// attaching lane that joins both needs live BPF.)
+    #[test]
+    fn inventory_prearm_json_carries_unobserved_windows_verbatim() {
+        use crate::discovery::engine::inventory_coordinator::PrearmReportRow;
+        let row = PrearmReportRow {
+            path: "/tmp/libprearm.so".into(),
+            dev: (8, 1),
+            ino: 4242,
+            sha256: Some("row-sha".into()),
+            mapped: true,
+            watch: None,
+            attached_at_ns: Some(900),
+            unobserved_windows: Some(vec![
+                crate::render::UnobservedWindow {
+                    start_ns: 50,
+                    end_ns: 900,
+                    reason: crate::render::UnobservedReason::PreAttach,
+                },
+                crate::render::UnobservedWindow {
+                    start_ns: 900,
+                    end_ns: 950,
+                    reason: crate::render::UnobservedReason::MappedUnattached,
+                },
+            ]),
+        };
+        let value = prearm_json(&row);
+        let windows = value["unobserved_windows"]
+            .as_array()
+            .expect("the windows array: {value}");
+        assert_eq!(windows.len(), 2, "every window: {value}");
+        assert_eq!(windows[0]["start_ns"], 50);
+        assert_eq!(windows[0]["end_ns"], 900);
+        assert_eq!(windows[0]["reason"], "pre_attach");
+        assert_eq!(windows[1]["start_ns"], 900);
+        assert_eq!(windows[1]["end_ns"], 950);
+        assert_eq!(windows[1]["reason"], "mapped_unattached");
+    }
+
     /// Inventory JSON twin: rename-over between pin and capture end
     /// keeps the pinned inode and reports the change — the `changed`
     /// uncertainty bracket, the `object_changed` end, and the

@@ -1529,6 +1529,21 @@ mod tests {
         assert_eq!(calls, 30);
     }
 
+    /// Different counter modes never fold together: a counts row and
+    /// a latency row for the same function stay two rows, since their
+    /// cells measure different things.
+    #[test]
+    fn merge_slot_reports_keeps_different_modes_apart() {
+        let mut counts = merge_fixture("C_DigestUpdate", 0x1234, 4242, 10, 0, buckets_with(1, 0));
+        counts.mode = CounterMode::Counts;
+        let mut latency = merge_fixture("C_DigestUpdate", 0x1234, 4242, 20, 0, buckets_with(0, 1));
+        latency.mode = CounterMode::Latency;
+        let merged = merge_slot_reports(vec![counts, latency]);
+        assert_eq!(merged.len(), 2, "two modes stay two rows");
+        let calls: u64 = merged.iter().map(|row| row.calls).sum();
+        assert_eq!(calls, 30);
+    }
+
     #[test]
     fn historical_shared_slot_counts_stay_unattributed_after_one_owner_survives() {
         let target = crate::discovery::identity::PinnedObjectId(10);

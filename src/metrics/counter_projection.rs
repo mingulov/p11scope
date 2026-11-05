@@ -1208,6 +1208,54 @@ pub(super) mod tests {
         }
     }
 
+    /// Two exec generations of one function fold to one aggregate row
+    /// in counter projections too, not just the legacy reader: same
+    /// names, file and offset sum their counters instead of printing
+    /// twice.
+    #[test]
+    fn projection_folds_duplicate_function_rows_across_generations() {
+        let (_file, plan, pins) = fixture();
+        let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let reserve = pool.reserver();
+        let slot = &plan.slots[0];
+        let row = |returned: u64| {
+            CounterRow::fold(
+                slot,
+                CounterMode::Counts,
+                [CounterCell::Counts(&CountStats {
+                    entered: returned + 1,
+                    returned,
+                    errors: 1,
+                })],
+                [(
+                    RvKey {
+                        slot: slot.index,
+                        _pad: 0,
+                        rv: 0,
+                    },
+                    returned,
+                )],
+                LIMITS,
+            )
+            .unwrap()
+        };
+        let rows = vec![row(10), row(20)];
+        let reservation = ReadReservation::reserve(2, 2, &reserve).unwrap();
+        let read = CounterRead::new(
+            std::num::NonZeroU64::new(1).unwrap(),
+            CounterMode::Counts,
+            ReadWindow::new(Some(10), Some(20)),
+            Ok(rows),
+            CounterHealth::default(),
+            KernelEvidence::default(),
+            reservation,
+        )
+        .unwrap();
+        let (reports, _lease) = super::stage_projection(&plan, &pins, &read, &reserve).unwrap();
+        assert_eq!(reports.len(), 1, "two generations fold to one row");
+        assert_eq!(reports[0].calls, 30);
+    }
+
     #[test]
     fn consumer_selection_uses_prepared_presence_and_never_falls_back_on_refusal() {
         use crate::attach::counter_banks::{BankRefusal, BankShapeCause};

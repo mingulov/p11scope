@@ -846,7 +846,8 @@ Limits that matter in pods:
   newly created report, trace and event-log files are handed to that
   user (still private `0600`), so the report stays readable without
   `sudo cat`; pre-existing files keep their owner, and anywhere else
-  the files stay root-owned as before.
+  the files stay root-owned as before. A second run reuses and
+  truncates an invoker-owned stream file it previously refused.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one

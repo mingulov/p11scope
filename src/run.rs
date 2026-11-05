@@ -3162,12 +3162,29 @@ pub struct OwnedRunOutcome {
     /// signalled). `None` exactly when `--duration` expired without
     /// `--kill-on-timeout` and the child was handed back still running.
     pub child_exit_code: Option<i32>,
+    /// True when `--kill-on-timeout` was requested and the timeout kill
+    /// reaped a live child by signal: a normal end, reported as
+    /// success even though the child's own status is a signal death.
+    pub requested_timeout_kill: bool,
     /// Mirrors `evidence.child_still_running`.
     pub child_still_running: bool,
     /// The child this run owned. A handed-back child must be nameable or the
     /// operator cannot find what `run` left alive. Not a rendered field.
     pub child_pid: u32,
     pub evidence: render::Evidence,
+}
+
+impl OwnedRunOutcome {
+    /// The process exit code for this run: a requested timeout kill
+    /// and a handed-back child are observer success (0); otherwise
+    /// the child's own status, as a shell would report it.
+    pub fn exit_code(&self) -> i32 {
+        if self.requested_timeout_kill {
+            0
+        } else {
+            self.child_exit_code.unwrap_or(0)
+        }
+    }
 }
 
 /// The owned child and the coordinator that protects its live windows, plus
@@ -3181,6 +3198,7 @@ struct Owned {
     kill_on_timeout: bool,
     pid: u32,
     exit_code: Option<i32>,
+    requested_kill: bool,
     still_running: bool,
     /// The run's own pre-spawn scope start: the claim start the terminal
     /// pre-arm hold composes with the coordinator's proven segment.
@@ -3288,6 +3306,7 @@ impl Owned {
             signals,
             &mut self.pending_handoff,
             &mut self.exit_code,
+            &mut self.requested_kill,
             &mut self.still_running,
         );
         // A reaped child is an expected target exit: without the mark, a
@@ -3315,8 +3334,10 @@ fn settle_owned_child(
     signals: &SignalState,
     pending: &mut Option<OwnedChild>,
     exit_code: &mut Option<i32>,
+    requested_kill: &mut bool,
     still_running: &mut bool,
 ) -> Result<()> {
+    *requested_kill = false;
     let end = if end == CaptureEnd::DurationExpired && signals.interrupted() {
         CaptureEnd::Signal
     } else {
@@ -3938,6 +3959,7 @@ fn run_owned_inner_with_host(
         kill_on_timeout: args.kill_on_timeout,
         pid,
         exit_code: None,
+        requested_kill: false,
         still_running: false,
         prearm_scope_start_ns: scope_start_ns,
         prearm_release_ns: None,
@@ -4067,6 +4089,7 @@ fn run_owned_inner_with_host(
     }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
+        requested_timeout_kill: owned.requested_kill,
         child_still_running: owned.still_running,
         child_pid: owned.pid,
         evidence,
@@ -11435,6 +11458,7 @@ mod tests {
         let fd = child.pin().pidfd().unwrap().as_raw_fd();
         let mut pending = None;
         let mut exit_code = None;
+        let mut requested_kill = false;
         let mut running = false;
         let mut retained = Some(child);
         settle_owned_child(
@@ -11445,6 +11469,7 @@ mod tests {
             &SignalState::new(),
             &mut pending,
             &mut exit_code,
+            &mut requested_kill,
             &mut running,
         )
         .unwrap();
@@ -11580,6 +11605,7 @@ mod tests {
             }
             let mut pending = None;
             let mut exit_code = None;
+            let mut requested_kill = false;
             let mut still_running = false;
             let mut retained = Some(child);
             settle_owned_child(
@@ -11590,6 +11616,7 @@ mod tests {
                 &signals,
                 &mut pending,
                 &mut exit_code,
+                &mut requested_kill,
                 &mut still_running,
             )
             .unwrap();
@@ -11604,6 +11631,72 @@ mod tests {
                 assert_eq!(pending.pid(), pid);
             }
         }
+    }
+
+    /// A requested timeout kill of a live child is a normal end: the
+    /// settlement marks it so the run exits 0, while the child's own
+    /// signal status stays exact for the death note. A child that
+    /// already exited keeps its own status unmarked.
+    #[test]
+    fn requested_timeout_kill_marks_a_live_child_reaped_by_signal() {
+        let signals = SignalState::new();
+        // Live sleeper, timeout expiry with the kill requested: marked.
+        let mut child = spawn("/bin/sleep", &["10"]);
+        child.release().unwrap();
+        assert!(child.still_running());
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            true,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(128 + libc::SIGTERM));
+        assert!(!still_running);
+        assert!(
+            requested_kill,
+            "a requested kill of a live child must be marked"
+        );
+        // Exited child, same end: its own status, unmarked.
+        let mut child = spawn("/bin/true", &[]);
+        child.release().unwrap();
+        wait_until(
+            || !child.still_running(),
+            "target fixture never reached its exit state",
+        );
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            true,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(0));
+        assert!(!still_running);
+        assert!(
+            !requested_kill,
+            "a child that exited on its own keeps its status unmarked"
+        );
     }
 
     /// I1: a quiesce failure after `--duration` without
@@ -11622,6 +11715,7 @@ mod tests {
             let mut retained = Some(child);
             let mut pending = None;
             let mut exit_code = None;
+            let mut requested_kill = false;
             let mut still_running = false;
             let mut detached = false;
             let published = std::cell::Cell::new(false);
@@ -11643,6 +11737,7 @@ mod tests {
                         &signals,
                         &mut pending,
                         &mut exit_code,
+                        &mut requested_kill,
                         &mut still_running,
                     )
                 },
@@ -12512,6 +12607,7 @@ mod tests {
                 let mut retained = Some(child);
                 let mut pending = None;
                 let mut exit_code = None;
+                let mut requested_kill = false;
                 let mut still_running = false;
                 settle_owned_child(
                     &mut retained,
@@ -12521,6 +12617,7 @@ mod tests {
                     &signals,
                     &mut pending,
                     &mut exit_code,
+                    &mut requested_kill,
                     &mut still_running,
                 )
                 .unwrap();

@@ -85,7 +85,7 @@ fn run() -> Result<i32> {
                 ));
                 return Ok(2);
             }
-            run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0))
+            run_owned(&a).map(|outcome| outcome.exit_code())
         }
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target
         // that exited while its objects were being pinned — mean "the target could

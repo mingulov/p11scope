@@ -2394,7 +2394,10 @@ impl CallerRegistry {
                     // Same reason precedence as the producer: a
                     // counted loss or fallback names itself.
                     observations.status = crate::key_operation_projection::ObsStatus::Partial;
-                    if stagings.iter().any(|staging| staging.degraded_loss()) {
+                    if stagings
+                        .iter()
+                        .any(|staging| staging.degraded_loss() || staging.watchdog_tripped())
+                    {
                         observations.reason = "authority_lost";
                     } else if stagings.iter().any(|staging| staging.fell_back()) {
                         observations.reason = "proof_refused_fallback";
@@ -2431,7 +2434,9 @@ impl CallerRegistry {
     /// `watchdog_no_progress` at publication. Idempotent per feed.
     pub(crate) fn note_joint_watchdog_trip(&mut self) {
         for record in self.instance_state.semantics.values_mut() {
-            record.feed.note_watchdog_trip();
+            if record.feed.note_watchdog_trip() {
+                self.joint_feeds = self.joint_feeds.saturating_sub(1);
+            }
         }
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {

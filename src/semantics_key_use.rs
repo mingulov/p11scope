@@ -69,6 +69,9 @@ enum DegradedWindow {
     Fallback,
     /// Real loss ended the segment.
     Loss,
+    /// The no-progress watchdog tripped: the lane is held for exit
+    /// and no seal will settle anything again (never resumes).
+    Watchdog,
 }
 
 /// Whether the frozen endpoint table proves `function` irrelevant
@@ -422,6 +425,7 @@ impl JointStaging {
     /// segment. Returns whether the mode changed.
     pub(crate) fn resume_joint(&mut self) -> bool {
         if self.mode == FeedMode::S1Only
+            && !self.watchdog_tripped
             && self.selected_receipt.is_some()
             && self.segment_resumable
             && self.staged.is_empty()
@@ -477,15 +481,39 @@ impl JointStaging {
         self.watchdog_unsealed
     }
 
-    /// Note the no-progress watchdog trip for this feed: snapshot
-    /// the staged calls no seal will now settle, exactly once.
-    /// They stay staged (never reduced, never replayed) and count
-    /// once as `watchdog_no_progress` at publication.
-    pub(crate) fn note_watchdog_trip(&mut self) {
-        if !self.watchdog_tripped {
-            self.watchdog_tripped = true;
-            self.watchdog_unsealed = self.staged.len() as u64;
+    /// Note the no-progress watchdog trip for this feed, exactly
+    /// once: take every staged call out (history-only, like loss
+    /// disposal: never reduced, never replayed, releases pended to
+    /// the next ledger contact) and count each once as
+    /// `watchdog_no_progress`. The segment closes for good: no later
+    /// seal, loss or replay can count those calls again, nothing new
+    /// stages, and later direct key calls count under the watchdog
+    /// reason too. Returns whether this call left Joint mode.
+    pub(crate) fn note_watchdog_trip(&mut self) -> bool {
+        if self.watchdog_tripped {
+            return false;
         }
+        self.watchdog_tripped = true;
+        while let Some(head) = self.staged.pop_front() {
+            let bytes = head.charged_bytes();
+            let (position, native) = (head.position, head.resource_native);
+            drop(head);
+            self.release_or_pend(None, position, bytes, native);
+            self.frontier = self.frontier.max(position);
+            self.watchdog_unsealed = self.watchdog_unsealed.saturating_add(1);
+        }
+        let was_joint = self.mode == FeedMode::Joint;
+        if was_joint || self.selected_receipt.is_some() {
+            self.mode = FeedMode::S1Only;
+            self.segment_resumable = false;
+            self.degraded_window = Some(DegradedWindow::Watchdog);
+        }
+        was_joint
+    }
+
+    /// Whether the no-progress watchdog tripped on this feed.
+    pub(crate) fn watchdog_tripped(&self) -> bool {
+        self.watchdog_tripped
     }
 
     /// End the current Joint segment: degrade to S1Only and open
@@ -523,6 +551,9 @@ impl JointStaging {
             }
             Some(DegradedWindow::Loss) => {
                 self.degraded_loss_direct = self.degraded_loss_direct.saturating_add(1);
+            }
+            Some(DegradedWindow::Watchdog) => {
+                self.watchdog_unsealed = self.watchdog_unsealed.saturating_add(1);
             }
             None => {}
         }

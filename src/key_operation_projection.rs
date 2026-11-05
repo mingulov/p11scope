@@ -1029,7 +1029,12 @@ pub(crate) mod producer {
         let joint = stagings
             .iter()
             .any(|staging| staging.mode() == FeedMode::Joint);
-        let lost = stagings.iter().any(|staging| staging.degraded_loss());
+        // A tripped no-progress watchdog held the lane for exit: its
+        // feeds left Joint for good, so the census is partial under
+        // lost authority, the exact rows kept beside the counts.
+        let lost = stagings
+            .iter()
+            .any(|staging| staging.degraded_loss() || staging.watchdog_tripped());
         let fallback = stagings.iter().any(|staging| staging.fell_back());
         let unattributed = collect_unattributed(stagings);
         // Joint never stops as a whole: a feed that fell back or lost

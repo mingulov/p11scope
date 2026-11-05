@@ -784,8 +784,9 @@ fn parse_sudo_id(value: &OsStr) -> Option<u32> {
 }
 
 /// The validated sudo invoker: root only, and `SUDO_UID`/`SUDO_GID`
-/// name one existing non-root account (the `run` pair rule for
-/// trusting `SUDO_*`). Anything else hands nothing over.
+/// name one existing non-root account (the `run` account-pair rule,
+/// without `run`'s set-id continuity check — a setuid install is
+/// unsupported). Anything else hands nothing over.
 pub(crate) fn sudo_invoker() -> Option<(u32, u32)> {
     let uid = sudo_uid()?;
     let gid = parse_sudo_id(&std::env::var_os("SUDO_GID")?)?;

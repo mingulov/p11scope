@@ -7,8 +7,10 @@
 //! the first semantic mutation: [`FeedMode::Joint`] stages H3-admitted
 //! S1 payloads and replays them through the one [`EdgeSemantics`]
 //! reducer as sealed H8 calls settle; [`FeedMode::S1Only`] reduces
-//! directly and never stages. An S1Only incarnation never becomes
-//! Joint, and an already-reduced call is never replayed.
+//! directly and never stages. An incarnation selected S1Only at
+//! registration never becomes Joint; one that left Joint through
+//! fallback or loss resumes at its next clean point
+//! ([`is_clean_point`]). An already-reduced call is never replayed.
 //!
 //! The original seal retains call-qualified settlement steps and frozen
 //! effect spans. Effect emission and the exact admission head advance
@@ -41,15 +43,34 @@ use std::mem::size_of;
 pub(crate) const JOINT_STAGING_CAPACITY: usize =
     crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
 
-/// Permanent per-instance/era feed selection, chosen at registration
-/// before the first semantic mutation (H9).
+/// Per-instance/era feed selection, chosen at registration before
+/// the first semantic mutation (H9). A feed that leaves Joint
+/// (fallback or loss) stays S1Only until its next clean point —
+/// an operation init, login, or session open — where a feed that
+/// still holds its birth receipt re-enters Joint for the new
+/// segment. Already-reduced calls are never replayed either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedMode {
-    /// Reduce directly; never stage, never replay, never upgrade.
+    /// Reduce directly; never stage, never replay. Selected at
+    /// registration it is permanent; reached by fallback or loss
+    /// with a retained receipt it lasts until the next clean point.
     S1Only,
     /// Stage H3-admitted payloads; replay each through the one
     /// reducer as its sealed call settles.
     Joint,
+}
+
+/// Whether `function` starts a clean segment boundary at which a
+/// degraded feed may resume attribution: an operation init (the
+/// frozen descriptor's INITIALIZE transition), a login, or a
+/// session open. Reads only the function name's frozen descriptor.
+pub(crate) fn is_clean_point(function: &str) -> bool {
+    use p11scope_ebpf_common::{lifecycle, transition};
+    crate::kinds::descriptor(function).is_some_and(|descriptor| {
+        descriptor.transition == transition::INITIALIZE
+            || descriptor.lifecycle == lifecycle::LOGIN
+            || descriptor.lifecycle == lifecycle::OPEN_SESSION
+    })
 }
 
 /// Why one call was not staged.
@@ -242,8 +263,9 @@ pub(crate) struct JointStaging {
     /// `proof_refused_fallback`.
     fell_back: bool,
     /// Ledger releases pended by a ledger-less ordered fallback
-    /// (C4): flushed on the next ledger contact. At most one
-    /// fallback per feed (feeds never re-enter Joint), so bounded by
+    /// (C4): flushed on the next ledger contact. One fallback drains
+    /// staging, and re-staging after a clean-point resume flushes
+    /// first, so one segment's worth is ever pended: bounded by
     /// [`JOINT_STAGING_CAPACITY`].
     pending_releases: Vec<(Option<crate::attach::capture::NativeDomainId>, u64, u64)>,
 }
@@ -318,6 +340,25 @@ impl JointStaging {
 
     pub(crate) fn mode(&self) -> FeedMode {
         self.mode
+    }
+
+    /// Re-enter Joint at a clean point after a fallback or loss
+    /// ended the previous segment. Only a feed that was selected
+    /// Joint at registration (retained receipt), actually left it,
+    /// and holds no staged remainder may resume; the loss/fallback
+    /// flags stay set so publication keeps counting the closed
+    /// segment. Returns whether the mode changed.
+    pub(crate) fn resume_joint(&mut self) -> bool {
+        if self.mode == FeedMode::S1Only
+            && self.selected_receipt.is_some()
+            && (self.fell_back || self.degraded_loss)
+            && self.staged.is_empty()
+        {
+            self.mode = FeedMode::Joint;
+            true
+        } else {
+            false
+        }
     }
 
     /// Calls replayed through the one reducer (seal or fallback).

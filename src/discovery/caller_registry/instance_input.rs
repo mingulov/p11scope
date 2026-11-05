@@ -2857,7 +2857,7 @@ impl CallerRegistry {
         input: &AdmittedInstanceCall,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> Result<u64, crate::semantics_edge::resources::SemanticResourceRefusal> {
-        let joint = self
+        let mut joint = self
             .instance_state
             .semantics
             .get(&id)
@@ -2865,6 +2865,25 @@ impl CallerRegistry {
             .feed
             .mode()
             == FeedMode::Joint;
+        if !joint
+            && ledger.is_some()
+            && crate::semantics_key_use::is_clean_point(&input.facts.function)
+        {
+            // Clean point after a closed segment: a feed that fell
+            // back or lost authority resumes Joint for the segment
+            // this call opens; the closed segment stays counted.
+            let resumed = self
+                .instance_state
+                .semantics
+                .get_mut(&id)
+                .expect("retained edge")
+                .feed
+                .resume_joint();
+            if resumed {
+                joint = true;
+                self.joint_feeds = self.joint_feeds.saturating_add(1);
+            }
+        }
         let mut fallback_refused = 0u64;
         if joint {
             if let Some(ledger) = ledger.as_deref_mut() {

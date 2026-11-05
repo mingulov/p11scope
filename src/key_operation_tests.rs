@@ -20654,7 +20654,8 @@ fn key_operation_joint_resumes_at_next_clean_point() {
     complete.authorized = true;
     complete.unambiguous = true;
     complete.attributable = true;
-    guarded.observe(&joint_key, 1_000_000, complete);
+    let complete_pos = guarded.scene.fixture.admit_function("C_SignInit").h0_ordinal();
+    guarded.observe(&joint_key, complete_pos, complete);
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());

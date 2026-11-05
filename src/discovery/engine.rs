@@ -830,6 +830,22 @@ impl Engine {
         &self.view_log
     }
 
+    /// Seed one retained scan input holding several scanned
+    /// modules under real scan-style pins (multi-view fixtures).
+    pub(crate) fn seed_scan_input_for_test_multi(
+        &mut self,
+        modules: Vec<crate::discovery::scan::ScannedModule>,
+    ) {
+        let (pins, skipped) = crate::discovery::identity::pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("scan pinning succeeds");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        self.seed_scan_input_for_test(modules, pins);
+    }
+
     /// Seed one retained scan input (the per-view scan state passes
     /// maintain), for tests of consumers that must read current
     /// scan state rather than the creation-time module snapshot.

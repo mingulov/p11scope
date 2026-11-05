@@ -754,6 +754,27 @@ fn native_semantic_scan_subset_mints_from_current_scan_inputs() {
     assert_eq!(subset.plan().slots.len(), 2);
 }
 
+/// DEMO-4 (fedora cr-late-2): a multi-process browser maps one
+/// provider in several views; one view's partial table walk must
+/// not poison the provider when another view walked the same
+/// tables fully. The scan mint keeps the best entry per object.
+#[test]
+fn native_semantic_scan_subset_keeps_best_view_per_object() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let full = fixture.source(["C_SignInit", "C_Sign"]);
+    let mut partial = full.clone();
+    partial.scanned.tables[0].walk = "partial".into();
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![full.scanned.clone(), partial.scanned.clone()]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_some(),
+        "a full view of the provider mints despite a partial sibling view: {:?}",
+        prepared.refusals
+    );
+}
+
 #[test]
 fn native_semantic_names_never_attest() {
     let fixture = ProviderFixture::new();

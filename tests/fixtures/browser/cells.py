@@ -438,12 +438,18 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
                            extra_browser_args: tuple[str, ...] = (),
                            extra_prefs: dict | None = None,
                            flow_url: str = "",
-                           auto_select_cert: bool = True):
+                           auto_select_cert: bool = True,
+                           nss_credential=None,
+                           nss_nickname: str = "g33-nss-client"):
     """Launch a persistent Playwright context on a fresh profile.
 
     Returns ``(context, match, profile_path)``: the context, the
     command-line match resolving the main browser PID, and the fresh
     Firefox profile (or Chromium HOME) carrying the registration.
+    ``nss_credential`` (a ``softhsm.ClientCredential``) seeds the
+    browser's own empty-password NSS database with a usable client
+    key before launch (DEMO-4), so the browser signs with its own
+    softokn token and no PIN prompt can stall the handshake.
     """
     if browser == "firefox":
         ff_prefs = {"security.default_personal_cert": "Select Automatically"}
@@ -451,6 +457,10 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         profile = FirefoxProfile.create(
             workdir / "ffprofile", module_lib=register_module,
             prefs=ff_prefs)
+        if nss_credential is not None:
+            from profiles import seed_nss_client_credential
+            seed_nss_client_credential(
+                profile.path, nss_credential, nss_nickname)
         # Explicit environment: the Playwright driver keeps the environment
         # it inherited at startup, so anything set afterwards (notably the
         # fresh Chromium HOME below) must ride `env=` to reach the browser.
@@ -460,6 +470,10 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         return context, str(profile.path), profile.path
     elif browser == "chromium":
         home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
+        if nss_credential is not None:
+            from profiles import seed_nss_client_credential
+            seed_nss_client_credential(
+                home / ".pki" / "nssdb", nss_credential, nss_nickname)
         browser_env = dict(os.environ)
         browser_env["HOME"] = str(home)
         cr_args = list(extra_browser_args)

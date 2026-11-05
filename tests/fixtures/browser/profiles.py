@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +70,56 @@ def chromium_binary() -> Path:
             return legacy
         raise ProfileError(f"chromium binary missing: {binary}")
     return binary
+
+
+#: Password the exported PKCS#12 carries in transit. The seeded NSS
+#: database itself is empty-password, which is what keeps the
+#: browser's own token usable without a PIN prompt.
+_NSS_P12_PASSWORD = "g33-fixture-p12"
+
+
+def seed_nss_client_credential(dbdir: Path, credential, nickname: str) -> None:
+    """Create an empty-password NSS DB at ``dbdir`` holding ``credential``.
+
+    ``credential`` is a ``softhsm.ClientCredential`` (PEM key + cert).
+    The browser's own softokn token then has a client key it can use
+    for TLS signing without any login or PIN prompt (an
+    empty-password database needs none), so client-certificate
+    handshakes produce real ``C_Sign`` calls with no external token.
+    Raises :class:`ProfileError` naming the missing tool or the
+    failing step; never writes outside ``dbdir`` and its parent.
+    """
+    for tool in ("certutil", "pk12util", "openssl"):
+        if shutil.which(tool) is None:
+            raise ProfileError(f"{tool} missing (NSS credential seed)")
+    dbdir.mkdir(parents=True, exist_ok=True)
+    dbref = f"sql:{dbdir}"
+
+    def run(argv: list[str]) -> None:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise ProfileError(
+                f"{argv[0]} failed ({proc.returncode}): "
+                f"{(proc.stderr or proc.stdout)[-300:]}")
+
+    if not (dbdir / "cert9.db").exists():
+        run(["certutil", "-N", "-d", dbref, "--empty-password"])
+    with tempfile.TemporaryDirectory(dir=dbdir.parent) as tmp:
+        bundle = Path(tmp) / "client.p12"
+        run(["openssl", "pkcs12", "-export",
+             "-inkey", str(credential.key_pem),
+             "-in", str(credential.cert_pem),
+             "-name", nickname,
+             "-out", str(bundle),
+             "-password", f"pass:{_NSS_P12_PASSWORD}"])
+        run(["pk12util", "-i", str(bundle), "-d", dbref,
+             "-W", _NSS_P12_PASSWORD, "-K", ""])
+    keys = subprocess.run(["certutil", "-K", "-d", dbref],
+                          capture_output=True, text=True)
+    if keys.returncode != 0 or nickname not in keys.stdout:
+        raise ProfileError(
+            f"seeded NSS DB does not list key {nickname!r}: "
+            f"{(keys.stdout + keys.stderr)[-300:]}")
 
 
 @dataclass

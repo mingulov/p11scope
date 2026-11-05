@@ -7646,6 +7646,35 @@ mod publication_progress_tests {
             );
         }
 
+        // Twin: an applied pass records its scanned members' task
+        // identities for next-pass freshness; a discarded scan records
+        // nothing (its outcomes never applied).
+        #[test]
+        fn applied_pass_records_scanned_tasks_for_freshness() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            let freshness: Vec<(u32, Option<u64>)> = driver
+                .scene
+                .coordinator
+                .scan_freshness_for_test()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(
+                freshness,
+                vec![(PID, Some(START))],
+                "the applied pass scanned pid 7; the discarded scan adds nothing"
+            );
+        }
+
         // EXEC hooks for never-admitted pids that drain after the last
         // completed pass: two newcomers (one hooks twice) leave one
         // coverage gap naming two unknown processes.

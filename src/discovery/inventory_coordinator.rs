@@ -26362,3 +26362,31 @@ mod continuity_clock_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod scan_freshness_tests {
+    use super::*;
+
+    /// Cross-pass task memory keeps entries still present with an
+    /// unchanged start generation; departed pids and pid reuse (same
+    /// number, new start time) drop, while unknown generations stay
+    /// conservative (no positive reuse evidence, no drop).
+    #[test]
+    fn retain_current_tasks_drops_departed_and_reused_tasks() {
+        let mut tasks: BTreeSet<(u32, Option<u64>)> =
+            [(1, Some(100)), (2, None), (3, Some(300)), (4, Some(400))]
+                .into_iter()
+                .collect();
+        let current: BTreeMap<u32, Option<u64>> = [
+            (1, Some(100)),
+            (2, Some(200)),
+            (3, Some(999)),
+            (5, Some(500)),
+        ]
+        .into_iter()
+        .collect();
+        retain_current_tasks(&mut tasks, &current);
+        let kept: BTreeSet<(u32, Option<u64>)> = [(1, Some(100)), (2, None)].into_iter().collect();
+        assert_eq!(tasks, kept);
+    }
+}

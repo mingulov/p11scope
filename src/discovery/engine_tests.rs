@@ -36044,6 +36044,86 @@ fn selection_edges_tie_break_empty_key_under_cap() {
     assert_eq!(select_deep_scan_candidates(&under, 3), vec![9, 30, 50]);
 }
 
+/// Freshness-tiered selection with nothing scanned agrees exactly with
+/// rarity selection: every group is fresh, representatives stay lowest,
+/// unmapped trail in pid order. Single-pass sites keep today's behavior.
+#[test]
+fn fresh_first_selection_with_empty_scanned_matches_rarity_selection() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (30, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (31, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (40, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (41, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (50, vec![]),
+        (9001, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+    ];
+    let empty: BTreeSet<u32> = BTreeSet::new();
+    for cap in 1..=sweep.len() {
+        assert_eq!(
+            select_fresh_first_candidates(&sweep, cap, &empty),
+            select_deep_scan_candidates(&sweep, cap),
+            "empty freshness agrees at cap {cap}"
+        );
+    }
+}
+
+/// A newcomer group ranked below the cut by pure rarity is never
+/// selected across identical passes (today's starvation, pinned); once
+/// earlier passes scanned the incumbents, freshness tiers rescue it in
+/// the next pass instead of losing every pass.
+#[test]
+fn fresh_first_selection_rescues_a_newcomer_group_below_the_cut() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // G_rare={10} (min_global 1), G_common={20,21,22} (min_global 3),
+    // G_new={30,31,32,33} (min_global 4). Cap 2.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/rare-p11.so", 1)]),
+        (20, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (21, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (22, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (30, vec![map_entry("/opt/new-p11.so", 3)]),
+        (31, vec![map_entry("/opt/new-p11.so", 3)]),
+        (32, vec![map_entry("/opt/new-p11.so", 3)]),
+        (33, vec![map_entry("/opt/new-p11.so", 3)]),
+    ];
+    // Pass 1: nothing scanned yet; the newcomer group loses the cut.
+    let first: BTreeSet<u32> = BTreeSet::new();
+    assert_eq!(
+        select_fresh_first_candidates(&sweep, 2, &first),
+        vec![10, 20]
+    );
+    // Pure rarity repeats pass 1 forever: the newcomer never scans.
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![10, 20]);
+    // Pass 2: pass 1 scanned {10, 20}; the all-fresh newcomer group
+    // jumps ahead of the all-scanned rare group.
+    let scanned: BTreeSet<u32> = [10, 20].into_iter().collect();
+    assert_eq!(
+        select_fresh_first_candidates(&sweep, 2, &scanned),
+        vec![21, 30]
+    );
+}
+
 /// Deep-scan selection never spends slots on kernel threads: they have no
 /// user address space to scan. A fixture /proc with 260 kernel threads at
 /// the lowest pids and 40 unmapped user processes at high pids still

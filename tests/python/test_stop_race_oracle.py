@@ -131,13 +131,15 @@ def stderr_text(pending=0, oldest="n/a", cleanup=True, panic=False, storage_refu
     if storage_refusal:
         lines.append("p11scope: system: provider_storage_refused\n")
     lines.append("p11scope: timing: stages scan=6ms pin=1ms bind=0ms plan=0ms merge=0ms "
-                 "projection=0ms attach=7ms drain=1ms cleanup=0ms (unknown-clock spans: 0); "
-                 "longest op: attach/attach_dynamic_loader@7ms; "
-                 "inter-drain gap p50/p99/max: 2ms/2ms/2ms (6693 samples); "
-                 "newcomer queue: admitted 0 (max/mean age n/a/n/a), pending %d (oldest %s), "
-                 "dropped 0 (max age n/a); tails: 0 published, 14 skipped; "
-                 "rss start/readiness/end/max: 32524/65684/74068/74068 kB\n"
+                 "projection=0ms\n")
+    lines.append("p11scope: timing: stages attach=7ms drain=1ms cleanup=0ms "
+                 "(unknown-clock spans: 0); longest op: attach/attach_dynamic_loader@7ms\n")
+    lines.append("p11scope: timing: inter-drain gap p50/p99/max: 2ms/2ms/2ms (6693 samples)\n")
+    lines.append("p11scope: timing: newcomer queue: admitted 0 (max/mean age n/a/n/a), "
+                 "pending %d (oldest %s), dropped 0 (max age n/a)\n"
                  % (pending, oldest))
+    lines.append("p11scope: timing: tails: 0 published, 14 skipped; "
+                 "rss start/readiness/end/max: 32524/65684/74068/74068 kB\n")
     if cleanup:
         lines.append("p11scope: cleanup completed, 2/2 links released, 0 s\n")
     return "".join(lines)

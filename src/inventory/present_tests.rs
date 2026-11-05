@@ -1964,6 +1964,39 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
     assert_eq!(snapshot.matches("entries 55 (").count(), 1);
 }
 
+/// `--quiet` keeps the summary head (header, coverage, key operations,
+/// every application edge) and drops everything from `Details:` on.
+#[test]
+fn quiet_summary_keeps_the_head_and_drops_details() {
+    let harness = varied_harness();
+    let presentation = capture_for(&harness, &harness.render());
+    let full = render_snapshot(&presentation);
+    assert!(full.contains("Details: retained paths"), "{full}");
+    assert!(full.contains("application "), "{full}");
+    let summary = render_snapshot_summary(&presentation);
+    let head: String = full
+        .lines()
+        .take_while(|line| !line.starts_with("Details:"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(summary, head);
+    assert!(summary.contains("application "), "{summary}");
+}
+
+/// Empty edges under `--quiet`: the absence line stands alone.
+#[test]
+fn quiet_summary_on_empty_edges_keeps_the_absence_line() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.edges.clear();
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("No application/module associations observed"),
+        "{summary}"
+    );
+    assert!(!summary.contains("Details:"), "{summary}");
+}
+
 #[test]
 fn f7_snapshot_high_cardinality_allocation_baseline() {
     // Exercise the real renderer with all 4096 edges/children, rather than

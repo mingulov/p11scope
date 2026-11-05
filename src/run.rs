@@ -6609,9 +6609,11 @@ fn capture_profile(
             profile,
         );
         render::apply_counter_snapshot(&mut ev, &snapshot);
-        let summary = timing_summary_line(&ev.scheduling);
+        let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
-        let _ = crate::sink::try_stderr_line(&summary);
+        for summary in &summaries {
+            let _ = crate::sink::try_stderr_line(summary);
+        }
 
         poll_terminal_cancellation();
         if let Some(mut out_file) = context.5.take() {
@@ -7504,9 +7506,11 @@ fn capture_trace(
                             ],
                         );
                     });
-                    let summary = timing_summary_line(&evidence.scheduling);
+                    let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
-                    let _ = crate::sink::try_stderr_line(&summary);
+                    for summary in &summaries {
+                        let _ = crate::sink::try_stderr_line(summary);
+                    }
                     Ok(evidence)
                 },
             )
@@ -8329,10 +8333,15 @@ fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::R
 /// The concise operator-visible timing summary (Phase 2): stage totals,
 /// the longest indivisible operation, the inter-drain gap distribution,
 /// newcomer queue ages, and capture-process resources. Missing samples
-/// render as `n/a`, never as zero.
-pub(crate) fn timing_summary_line(scheduling: &render::SchedulingEvidence) -> String {
+/// render as `n/a`, never as zero. One short `p11scope: timing:` stderr
+/// line per group, so a terminal never wraps a 400-column line; the
+/// newcomer-queue ages stay on one line for the stop-race oracle.
+pub(crate) fn timing_summary_lines(scheduling: &render::SchedulingEvidence) -> Vec<String> {
     fn ms(value: Option<u64>) -> String {
         value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"))
+    }
+    fn kb(value: Option<u64>) -> String {
+        value.map_or_else(|| "n/a".to_string(), |kb| kb.to_string())
     }
     let stages = &scheduling.stage_ms;
     let longest = &scheduling.longest_op;
@@ -8343,51 +8352,46 @@ pub(crate) fn timing_summary_line(scheduling: &render::SchedulingEvidence) -> St
     let gap = &scheduling.inter_drain_gap;
     let queue = &scheduling.newcomer_queue;
     let resource = &scheduling.resource;
-    format!(
-        "p11scope: timing: stages scan={}ms pin={}ms bind={}ms plan={}ms merge={}ms projection={}ms attach={}ms drain={}ms cleanup={}ms (unknown-clock spans: {}); longest op: {}; inter-drain gap p50/p99/max: {}/{}/{} ({} samples); newcomer queue: admitted {} (max/mean age {}/{}), pending {} (oldest {}), dropped {} (max age {}); tails: {} published, {} skipped; rss start/readiness/end/max: {}/{}/{}/{} kB",
-        stages.scan,
-        stages.pin,
-        stages.bind,
-        stages.plan,
-        stages.merge,
-        stages.projection,
-        stages.attach,
-        stages.drain,
-        stages.cleanup,
-        scheduling.stage_unknown_clock,
-        longest_text,
-        ms(gap.p50_ms),
-        ms(gap.p99_ms),
-        ms(gap.max_ms),
-        gap.samples,
-        queue.admitted,
-        ms(queue.max_admitted_age_ms),
-        ms(queue.mean_admitted_age_ms),
-        queue.pending,
-        ms(queue.oldest_pending_age_ms),
-        queue.dropped,
-        ms(queue.max_dropped_age_ms),
-        scheduling.tail_publishes,
-        scheduling.tail_skips,
-        scheduling
-            .resource
-            .start
-            .rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-        scheduling
-            .resource
-            .readiness
-            .rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-        scheduling
-            .resource
-            .end
-            .rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-        resource
-            .max_rss_kb
-            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
-    )
+    vec![
+        format!(
+            "p11scope: timing: stages scan={}ms pin={}ms bind={}ms plan={}ms merge={}ms projection={}ms",
+            stages.scan, stages.pin, stages.bind, stages.plan, stages.merge, stages.projection,
+        ),
+        format!(
+            "p11scope: timing: stages attach={}ms drain={}ms cleanup={}ms (unknown-clock spans: {}); longest op: {}",
+            stages.attach,
+            stages.drain,
+            stages.cleanup,
+            scheduling.stage_unknown_clock,
+            longest_text,
+        ),
+        format!(
+            "p11scope: timing: inter-drain gap p50/p99/max: {}/{}/{} ({} samples)",
+            ms(gap.p50_ms),
+            ms(gap.p99_ms),
+            ms(gap.max_ms),
+            gap.samples,
+        ),
+        format!(
+            "p11scope: timing: newcomer queue: admitted {} (max/mean age {}/{}), pending {} (oldest {}), dropped {} (max age {})",
+            queue.admitted,
+            ms(queue.max_admitted_age_ms),
+            ms(queue.mean_admitted_age_ms),
+            queue.pending,
+            ms(queue.oldest_pending_age_ms),
+            queue.dropped,
+            ms(queue.max_dropped_age_ms),
+        ),
+        format!(
+            "p11scope: timing: tails: {} published, {} skipped; rss start/readiness/end/max: {}/{}/{}/{} kB",
+            scheduling.tail_publishes,
+            scheduling.tail_skips,
+            kb(resource.start.rss_kb),
+            kb(resource.readiness.rss_kb),
+            kb(resource.end.rss_kb),
+            kb(resource.max_rss_kb),
+        ),
+    ]
 }
 
 fn reduce_profile_event(
@@ -9198,6 +9202,93 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    /// The timing summary wraps to short prefixed stderr lines: every line
+    /// stays greppable under `p11scope: timing:`, every token of the old
+    /// single line survives, and the oracle's `pending N (oldest X)`
+    /// substring stays on one physical line.
+    #[test]
+    fn timing_summary_wraps_to_short_prefixed_lines() {
+        let rss = |kb: u64| render::ResourceSampleEvidence {
+            rss_kb: Some(kb),
+            ..Default::default()
+        };
+        let scheduling = render::SchedulingEvidence {
+            stage_ms: render::StageMs {
+                scan: 6,
+                pin: 1,
+                bind: 0,
+                plan: 0,
+                merge: 0,
+                projection: 0,
+                attach: 7,
+                drain: 1,
+                cleanup: 0,
+            },
+            stage_unknown_clock: 0,
+            longest_op: render::LongestOpEvidence {
+                stage: Some("attach"),
+                op: Some("attach_dynamic_loader"),
+                duration_ms: Some(7),
+            },
+            inter_drain_gap: render::InterDrainGapEvidence {
+                samples: 6693,
+                p50_ms: Some(2),
+                p99_ms: Some(2),
+                max_ms: Some(2),
+            },
+            newcomer_queue: render::NewcomerQueueEvidence {
+                admitted: 0,
+                max_admitted_age_ms: None,
+                mean_admitted_age_ms: None,
+                pending: 3,
+                oldest_pending_age_ms: Some(12),
+                dropped: 0,
+                max_dropped_age_ms: None,
+                ..Default::default()
+            },
+            tail_publishes: 0,
+            tail_skips: 14,
+            resource: render::ResourceEvidence {
+                start: rss(32524),
+                readiness: rss(65684),
+                end: rss(74068),
+                max_rss_kb: Some(74068),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = timing_summary_lines(&scheduling);
+        assert!(lines.len() >= 3, "one long line became several: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.starts_with("p11scope: timing: "),
+                "every line stays prefixed: {line:?}"
+            );
+            assert!(
+                line.len() <= 160,
+                "every line stays short enough to read: {line:?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("pending 3 (oldest 12ms)")),
+            "the oracle substring stays on one physical line: {lines:?}"
+        );
+        let joined = lines.join("\n");
+        for token in [
+            "scan=6ms",
+            "cleanup=0ms",
+            "unknown-clock spans: 0",
+            "longest op: attach/attach_dynamic_loader@7ms",
+            "2ms/2ms/2ms (6693 samples)",
+            "tails: 0 published, 14 skipped",
+            "rss start/readiness/end/max: 32524/65684/74068/74068 kB",
+        ] {
+            assert!(joined.contains(token), "token survives the wrap: {token}");
+        }
+    }
 
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {
         OwnedChild::spawn(

@@ -2968,7 +2968,7 @@ fn render_text(catalog: &Catalog) -> String {
         out.push('\n');
     }
     render_process_summary(&mut out, catalog);
-    render_gaps(&mut out, "skipped", &catalog.skipped);
+    render_skipped(&mut out, &catalog.skipped);
     render_gaps(&mut out, "notes", &catalog.notes);
     render_excluded(&mut out, catalog);
     if let Some(explanation) = &catalog.explanation {
@@ -3021,11 +3021,30 @@ fn render_object(
             );
         }
         AdmissionRecord::Refused { class, reason } => {
-            let _ = writeln!(
-                out,
-                "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
-                crate::render::escape_controls(reason),
-            );
+            if crate::plan::is_closure_awaiting_publication(reason) {
+                // By-design refusal: the proxy alone admits nothing until
+                // its providers publish. One plain line; JSON keeps the
+                // full planner reason.
+                let proxy = if std::path::Path::new(&object.path)
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("p11-kit"))
+                {
+                    "p11-kit proxy"
+                } else {
+                    "proxy closure array"
+                };
+                let _ = writeln!(
+                    out,
+                    "  admission  refused ({class}): {proxy} not attached by design; the providers \
+                     it forwards to attach when they load (--json shows the full reason)"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
+                );
+            }
         }
         AdmissionRecord::Unresolved { reasons } => {
             for reason in reasons {
@@ -3214,6 +3233,48 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
                 );
             }
         }
+    }
+}
+
+/// Skipped records in text: member gaps group by reason — a lone gap keeps
+/// its pid and subject, a repeated reason folds to one counted line — then
+/// scope-level gaps print verbatim (the split already deduped them). JSON
+/// keeps every record; see `render_json`.
+fn render_skipped(out: &mut String, gaps: &[PidGap]) {
+    let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();
+    for gap in gaps.iter().filter(|gap| gap.pid.is_some()) {
+        by_reason.entry(gap.reason.as_str()).or_default().push(gap);
+    }
+    for (reason, group) in &by_reason {
+        if group.len() == 1 {
+            let gap = group[0];
+            let _ = writeln!(
+                out,
+                "skipped: pid {} {} — {}",
+                gap.pid.expect("member gap carries its pid"),
+                crate::render::escape_controls(&gap.subject),
+                crate::render::escape_controls(&gap.reason),
+            );
+            continue;
+        }
+        let processes: BTreeSet<u32> = group.iter().filter_map(|gap| gap.pid).collect();
+        let _ = writeln!(
+            out,
+            "skipped ({} gap{} in {} process{}): {} (--json lists each)",
+            group.len(),
+            if group.len() == 1 { "" } else { "s" },
+            processes.len(),
+            if processes.len() == 1 { "" } else { "es" },
+            crate::render::escape_controls(reason),
+        );
+    }
+    for gap in gaps.iter().filter(|gap| gap.pid.is_none()) {
+        let _ = writeln!(
+            out,
+            "skipped: {} — {}",
+            crate::render::escape_controls(&gap.subject),
+            crate::render::escape_controls(&gap.reason)
+        );
     }
 }
 
@@ -7805,6 +7866,164 @@ mod tests {
         assert!(text.contains("processes: 2 scanned"), "{text}");
         assert!(
             text.contains("0 admitted, 1 refused, 0 unresolved"),
+            "{text}"
+        );
+    }
+
+    /// An unpublished proxy closure array (the p11-kit proxy alone) refuses
+    /// by design: the text says so in one plain line, while JSON keeps the
+    /// full planner reason.
+    #[test]
+    fn text_folds_unpublished_closure_refusal_to_one_plain_line() {
+        let reason = "a proxy closure array alone in the capture's first plan, or mapped during \
+             the capture, attaches only its published tables, and none of its 67 lookalike \
+             function tables is published yet, so calls through it are not counted \
+             (a proxy closure array is admitted whole, as a prefix when mapped before the \
+             capture's first plan beside a provider or named by the operator, or as published \
+             tables); the providers it forwards to attach when they load";
+        let catalog = catalog_with(vec![object(
+            "/usr/lib64/libp11-kit.so.0.4.11",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: reason.into(),
+            },
+        )]);
+        let text = render_text(&catalog);
+        assert!(
+            text.contains(
+                "refused (closure_array): p11-kit proxy not attached by design; the providers \
+                 it forwards to attach when they load (--json shows the full reason)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("lookalike"), "{text}");
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["objects"][0]["admission"]["reason"].as_str(),
+            Some(reason),
+            "{document}"
+        );
+    }
+
+    /// Same by-design fold for a closure array outside p11-kit: the generic
+    /// proxy name replaces the p11-kit one.
+    #[test]
+    fn text_folds_unpublished_closure_refusal_without_proxy_name() {
+        let catalog = catalog_with(vec![object(
+            "/opt/proxy.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "a proxy closure array alone in the capture's first plan, or mapped \
+                     during the capture, attaches only its published tables, and none of \
+                     its 3 lookalike function tables is published yet, so calls through it \
+                     are not counted (a proxy closure array is admitted whole, as a prefix \
+                     when mapped before the capture's first plan beside a provider or named \
+                     by the operator, or as published tables); the providers it forwards to \
+                     attach when they load"
+                    .into(),
+            },
+        )]);
+        let text = render_text(&catalog);
+        assert!(
+            text.contains(
+                "refused (closure_array): proxy closure array not attached by design; the \
+                 providers it forwards to attach when they load (--json shows the full reason)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A capacity closure refusal keeps its full text: the demand it states
+    /// is actionable, not a by-design constant.
+    #[test]
+    fn text_keeps_capacity_closure_refusal_verbatim() {
+        let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
+             use — refusing to attach a prefix of its 67 lookalike function tables \
+             (a proxy closure array is admitted whole, as a prefix when mapped before the \
+             capture's first plan beside a provider or named by the operator, or as published \
+             tables)";
+        let catalog = catalog_with(vec![object(
+            "/usr/lib64/libp11-kit.so.0.4.11",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: reason.into(),
+            },
+        )]);
+        let text = render_text(&catalog);
+        assert!(
+            text.contains(&format!(
+                "refused (closure_array): {reason} [{SCAN_ONLY_NOTE}]"
+            )),
+            "{text}"
+        );
+    }
+
+    /// Twenty identical pin-loss skips across two processes fold to one
+    /// counted line in text; JSON still lists every record.
+    #[test]
+    fn text_folds_repeated_skipped_gaps_to_one_counted_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for pid in [639, 640] {
+            for index in 0..10 {
+                catalog.skipped.push(PidGap::member(
+                    pid,
+                    Skipped {
+                        subject: format!("/proc/{pid}/root/usr/lib/object{index}.so"),
+                        reason: "opening object within retained target root: No such file or \
+                             directory (os error 2)"
+                            .into(),
+                    },
+                ));
+            }
+        }
+        let text = render_text(&catalog);
+        assert!(
+            text.contains(
+                "skipped (20 gaps in 2 processes): opening object within retained target \
+                 root: No such file or directory (os error 2) (--json lists each)"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("skipped"))
+                .count(),
+            1,
+            "{text}"
+        );
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["skipped"].as_array().map(Vec::len),
+            Some(20),
+            "{document}"
+        );
+    }
+
+    /// A lone skip keeps its pid and subject: there is nothing to fold.
+    #[test]
+    fn text_keeps_a_single_skipped_gap_verbatim() {
+        let mut catalog = catalog_with(Vec::new());
+        catalog.skipped.push(PidGap::member(
+            7,
+            Skipped {
+                subject: "/opt/a.so".into(),
+                reason: "identity_mismatch: mapping (8:1, 5) != opened (8:1, 6)".into(),
+            },
+        ));
+        let text = render_text(&catalog);
+        assert!(
+            text.contains(
+                "skipped: pid 7 /opt/a.so — identity_mismatch: mapping (8:1, 5) != opened (8:1, 6)"
+            ),
             "{text}"
         );
     }

@@ -2216,6 +2216,57 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
     )
 }
 
+/// True when at least one mapped provider has no manifest source at all.
+fn has_unattested_provider(ev: &Evidence) -> bool {
+    !ev.discovery.modules.is_empty()
+        && ev
+            .discovery
+            .modules
+            .iter()
+            .any(|module| !module.sources.contains(&"manifest"))
+}
+
+/// Plain-words companion to the `semantic_unverified_slots` verdict
+/// fragment: how many mapped providers have no manifest at all, by name.
+/// Prints only when unverified slots remain and at least one mapped
+/// provider lacks any manifest source; partial manifest coverage keeps
+/// the machine fragment alone. Human text only; the JSON is unchanged.
+fn unattributed_provider_line(ev: &Evidence) -> String {
+    if ev.semantic_unverified_slots == 0 || !has_unattested_provider(ev) {
+        return String::new();
+    }
+    let modules = &ev.discovery.modules;
+    let mut unattested: Vec<String> = modules
+        .iter()
+        .filter(|module| !module.sources.contains(&"manifest"))
+        .map(|module| {
+            std::path::Path::new(&module.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| module.path.clone())
+        })
+        .collect();
+    if unattested.is_empty() {
+        return String::new();
+    }
+    unattested.sort();
+    let shown: Vec<&str> = unattested.iter().take(3).map(String::as_str).collect();
+    let names = if unattested.len() > 3 {
+        format!("{}, and {} more", shown.join(", "), unattested.len() - 3)
+    } else {
+        shown.join(", ")
+    };
+    format!(
+        "Attribution: {} of {} mapped provider{} {} no manifest ({}); counts are exact, \
+         names are withheld — rerun with --manifest for each mapped provider.\n",
+        unattested.len(),
+        modules.len(),
+        if modules.len() == 1 { "" } else { "s" },
+        if unattested.len() == 1 { "has" } else { "have" },
+        escape_controls(&names),
+    )
+}
+
 /// Human context from aggregate map rows and the existing evidence verdict.
 /// Scope is a kind, never a target PID, path or application identity.
 pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> String {
@@ -2227,10 +2278,10 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
     let calls = sum(|row| row.calls);
     let errors = sum(|row| row.errors);
     let open = sum(|row| row.in_flight);
-    let mut text = format!(
-        "Scope: {} scope\nAggregate across the selected scope; counts are not per application.\n",
-        scope_label(scope)
-    );
+    let mut text = format!("Scope: {} scope\n", scope_label(scope));
+    if scope != "pid" {
+        text.push_str("Aggregate across the selected scope; counts are not per application.\n");
+    }
     if calls == 0 {
         text.push_str(if ev.completeness == "COMPLETE" {
             "No completed calls observed during this window.\n"
@@ -2246,6 +2297,7 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
         escape_controls(ev.completeness),
         escape_controls(&verdict_reasons(ev)),
     ));
+    text.push_str(&unattributed_provider_line(ev));
     if ev.event_loss > 0 {
         text.push_str(
             "Coverage partial: event detail was lost. Aggregate counts use the counter maps.\n",
@@ -2344,9 +2396,10 @@ pub(crate) fn live_snapshot_scoped(
 
 /// The capture renderer receives only the validated scope kind.
 /// `mechanisms` is the same per-id map the JSON `mechanisms[]` carries
-/// (`State::mechanisms`): an empty map renders nothing new, a nonempty one
-/// renders a compact name/calls/errors table under the function table. No
-/// parameters are shown, so no decoder policy applies here.
+/// (`State::mechanisms`): a nonempty map renders a compact name/calls/errors
+/// table under the function table, while an empty map with observed calls
+/// renders one plain line saying why no mechanisms are named. No parameters
+/// are shown, so no decoder policy applies here.
 #[allow(clippy::too_many_arguments)]
 pub fn live_scoped(
     reports: &[SlotReport],
@@ -2424,6 +2477,26 @@ pub fn live_scoped(
                 stat.calls,
                 stat.errors
             ));
+        }
+    } else if reports.iter().any(|r| r.calls > 0 || r.in_flight > 0) {
+        // No attributed mechanisms despite observed calls: name the gap in
+        // one plain line instead of omitting the section. Count-only slots
+        // never carry mechanism attribution; anything else simply records
+        // none for the observed calls. The manifest remedy prints only
+        // while a mapped provider actually lacks one.
+        if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
+            s.push_str(&format!(
+                "Mechanisms: none attributed — {} semantics-unverified/count-only slot{}; \
+                 add --manifest for each mapped provider (see Coverage).\n",
+                ev.semantic_unverified_slots,
+                if ev.semantic_unverified_slots == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
+        } else {
+            s.push_str("Mechanisms: none recorded for the observed calls.\n");
         }
     }
     let mut evidence_line = format!(
@@ -6225,6 +6298,112 @@ pub(crate) mod tests {
         );
     }
 
+    /// The terminal summary explains withheld attribution in plain words:
+    /// how many mapped providers have no manifest at all, naming them, so
+    /// PARTIAL coverage reads as a cause rather than an alarm.
+    #[test]
+    fn scope_summary_names_providers_without_manifests() {
+        let mut softhsm = discovered_fixture();
+        softhsm.path = "/usr/lib64/pkcs11/libsofthsm2.so".into();
+        softhsm.sources = vec!["scan", "manifest"];
+        let mut nss = discovered_fixture();
+        nss.id = ModuleId(1);
+        nss.ino = 22;
+        nss.path = "/opt/firefox/libsoftokn3.so".into();
+        nss.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![softhsm, nss];
+        ev.semantic_unverified_slots = 212;
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains(
+                "Attribution: 1 of 2 mapped providers has no manifest (libsoftokn3.so); \
+                 counts are exact, names are withheld"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("rerun with --manifest for each mapped provider"),
+            "{text}"
+        );
+    }
+
+    /// Plural twin: two unattested providers read as "have", naming both.
+    #[test]
+    fn scope_summary_names_providers_without_manifests_plural() {
+        let mut a = discovered_fixture();
+        a.path = "/opt/a.so".into();
+        a.sources = vec!["scan"];
+        let mut b = discovered_fixture();
+        b.id = ModuleId(1);
+        b.ino = 22;
+        b.path = "/opt/b.so".into();
+        b.sources = vec!["scan", "prearm"];
+        let mut c = discovered_fixture();
+        c.id = ModuleId(2);
+        c.ino = 33;
+        c.path = "/opt/c.so".into();
+        c.sources = vec!["scan", "manifest"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![a, b, c];
+        ev.semantic_unverified_slots = 9;
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains(
+                "Attribution: 2 of 3 mapped providers have no manifest (a.so, b.so); \
+                 counts are exact, names are withheld"
+            ),
+            "{text}"
+        );
+    }
+
+    /// PID scope covers one process: the aggregate note stays silent while
+    /// the scope line still names it.
+    #[test]
+    fn scope_summary_for_pid_scope_omits_the_aggregate_note() {
+        let mut ev = evidence();
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("Scope: PID scope"), "{text}");
+        assert!(!text.contains("not per application"), "{text}");
+    }
+
+    /// Wider scopes keep the aggregate note: counts are not per application.
+    #[test]
+    fn scope_summary_for_wider_scopes_keeps_the_aggregate_note() {
+        let mut ev = evidence();
+        ev.verdict();
+        for scope in ["cgroup", "system", "selected"] {
+            let text = scope_summary(scope, &reports_fixture(), &ev);
+            assert!(
+                text.contains(
+                    "Aggregate across the selected scope; counts are not per application."
+                ),
+                "{scope}: {text}"
+            );
+        }
+    }
+
+    /// No unverified slots, or every mapped provider attested (partial
+    /// manifest coverage): the machine fragment alone stands, with no
+    /// provider-manifest note.
+    #[test]
+    fn scope_summary_without_unattested_providers_shows_no_attribution_note() {
+        let mut attested = discovered_fixture();
+        attested.sources = vec!["scan", "manifest"];
+        for unverified in [0, 5] {
+            let mut ev = evidence();
+            ev.discovery.modules = vec![attested.clone()];
+            ev.semantic_unverified_slots = unverified;
+            ev.verdict();
+            let text = scope_summary("pid", &reports_fixture(), &ev);
+            assert!(!text.contains("has no manifest"), "{text}");
+            assert!(!text.contains("have no manifest"), "{text}");
+        }
+    }
+
     /// The terminal summary names a partially covered module: kept endpoints
     /// stay counted, and the omission says what did not fit.
     #[test]
@@ -6838,7 +7017,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn live_view_without_mechanisms_shows_nothing_new() {
+    fn live_view_without_mechanisms_shows_no_table() {
         let mut ev = evidence();
         ev.verdict();
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
@@ -6853,6 +7032,119 @@ pub(crate) mod tests {
             &mechanisms,
         );
         assert!(!out.contains("MECHANISM"), "{out}");
+    }
+
+    /// Demo journey 2, empty side: with observed calls but no attributed
+    /// mechanisms, the human view says so in one plain line naming the
+    /// count-only gap and how to get mechanisms, instead of omitting the
+    /// section. The line sits under the function table, above Evidence.
+    #[test]
+    fn live_view_without_mechanisms_names_the_attribution_gap() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 212;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_SignInit", 2, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            out.contains(
+                "Mechanisms: none attributed — 212 semantics-unverified/count-only slots; \
+                 add --manifest for each mapped provider (see Coverage)."
+            ),
+            "{out}"
+        );
+        let function = out.find("FUNCTION").expect("function table");
+        let note = out
+            .find("Mechanisms: none attributed")
+            .expect("mechanisms note");
+        let evidence = out.find("Evidence:").expect("evidence line");
+        assert!(
+            function < note && note < evidence,
+            "mechanisms note renders under the function table: {out}"
+        );
+    }
+
+    /// Unverified slots with every mapped provider attested (partial
+    /// manifest coverage, e.g. a manifest/scan conflict): the manifest
+    /// remedy would mislead, so the note records the bare fact.
+    #[test]
+    fn live_view_without_mechanisms_on_partial_coverage_says_none_recorded() {
+        let mut attested = discovered_fixture();
+        attested.sources = vec!["scan", "manifest"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![attested];
+        ev.semantic_unverified_slots = 106;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_GenerateRandom", 6, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            out.contains("Mechanisms: none recorded for the observed calls."),
+            "{out}"
+        );
+        assert!(!out.contains("--manifest"), "{out}");
+    }
+
+    /// Empty mechanisms with fully attested slots: none of the observed
+    /// calls carried an attributed mechanism, so the note says exactly
+    /// that and offers no manifest remedy.
+    #[test]
+    fn live_view_without_mechanisms_on_verified_slots_says_none_recorded() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_GetInfo", 1, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            out.contains("Mechanisms: none recorded for the observed calls."),
+            "{out}"
+        );
+        assert!(!out.contains("--manifest"), "{out}");
+    }
+
+    /// No completed or in-flight calls: the scope summary already says no
+    /// calls were observed, so no mechanisms note is added.
+    #[test]
+    fn live_view_without_calls_shows_no_mechanism_note() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 212;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_Sign", 0, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(!out.contains("Mechanisms:"), "{out}");
     }
 
     /// U-14: the live evidence line must show the plan's currently-active

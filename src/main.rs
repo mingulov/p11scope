@@ -161,6 +161,7 @@ fn run() -> Result<i32> {
                 a.identity_backend_explicit,
                 a.caller_metadata,
                 a.key_operations,
+                a.quiet,
             )
             .map_err(|error| {
                 if error.is::<pidns::NumberingMismatch>() {

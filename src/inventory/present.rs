@@ -1347,12 +1347,47 @@ pub(crate) fn silent_bootstrap_gap(
     })
 }
 
+/// Run-scoped `--quiet` switch for the pager snapshot, mirroring the
+/// scan-progress toggle: set once at run entry, restored on exit, so the
+/// deep run wrappers need no new display parameter.
+static SNAPSHOT_SUMMARY_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turns summary-only snapshots on or off; returns the previous setting.
+pub(crate) fn set_snapshot_summary_only(on: bool) -> bool {
+    SNAPSHOT_SUMMARY_ONLY.swap(on, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether the run renders summary-only snapshots (`--quiet`).
+pub(crate) fn snapshot_summary_only() -> bool {
+    SNAPSHOT_SUMMARY_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Pager-friendly snapshot: a deterministic, stable text rendering of a
 /// whole inventory (fit for `| less`, diffing, and test goldens).
 /// Sorted, total-first, with the same identities, states, totals, and
 /// gaps the JSON carries — pin equivalence with tests, not eyeballing.
 /// Target-controlled strings are control-escaped; JSON is unaffected.
+/// Under `--quiet` this renders the summary head only; see
+/// [`render_snapshot_summary`].
 pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
+    render_snapshot_inner(
+        presentation,
+        SNAPSHOT_SUMMARY_ONLY.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+/// The `--quiet` summary head: header, coverage, key operations, and every
+/// application edge (or the absence line), without the `Details:` tail.
+/// `--json`, `-o`, and the event log are unaffected. Production reaches
+/// the same shape through [`render_snapshot`] under the run-scoped
+/// switch; this direct entry is the tests' race-free handle.
+#[cfg(test)]
+pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
+    render_snapshot_inner(presentation, true)
+}
+
+fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let budgets = &presentation.budgets;
@@ -1491,6 +1526,9 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             out,
             "No application/module associations observed; this does not prove that no PKCS#11 activity occurred."
         );
+    }
+    if summary_only {
+        return out;
     }
     let _ = writeln!(
         out,

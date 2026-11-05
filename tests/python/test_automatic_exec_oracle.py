@@ -1692,7 +1692,6 @@ class LiveFrameTest(unittest.TestCase):
         captured = "\x1b[2J\x1b[H" + textwrap.dedent("""\
             p11scope — PID scope — up 00:00:01 — mode profile — privacy=allowlisted — /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
             Scope: PID scope
-            Aggregate across the selected scope; counts are not per application.
             8 completed calls; 0 returned errors; 0 entries without an observed return.
             Coverage PARTIAL: observation lossy (3 entries skipped, unprotected live window, live loader timing unproven); attribution withheld (136 semantics-unverified/count-only slots)
             CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.

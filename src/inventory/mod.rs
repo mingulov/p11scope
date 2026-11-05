@@ -687,6 +687,30 @@ fn registry_limits(max_gaps: Option<usize>) -> RegistryLimits {
 /// JSONL observation-event stream. Hard failures (an unreadable
 /// target, an unwritable `-o` or event stream) are errors, never
 /// empty-success reports.
+/// RAII display guard for `--quiet`: summary-only pager snapshots and
+/// silenced scan progress for the run, restoring both on drop (all
+/// exits, including unwinds). `--json`, `-o`, and logs are unaffected.
+struct QuietGuard {
+    summary_was: bool,
+    progress_was: bool,
+}
+
+impl QuietGuard {
+    fn arm(quiet: bool) -> Self {
+        Self {
+            summary_was: crate::inventory_present::set_snapshot_summary_only(quiet),
+            progress_was: crate::inspect_system::set_progress_lines(!quiet),
+        }
+    }
+}
+
+impl Drop for QuietGuard {
+    fn drop(&mut self) {
+        crate::inventory_present::set_snapshot_summary_only(self.summary_was);
+        crate::inspect_system::set_progress_lines(self.progress_was);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     scope: impl Into<crate::cli::ScopeArg>,
@@ -713,6 +737,7 @@ pub fn run(
     identity_backend_explicit: bool,
     caller_metadata: crate::cli::CallerMetadataMode,
     key_operations: bool,
+    quiet: bool,
 ) -> Result<i32> {
     if !manifests.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--manifest requires --capture auto or native");
@@ -737,6 +762,8 @@ pub fn run(
         );
     }
     let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
+    // Past the usage refusals: arm display shaping for the whole run.
+    let _quiet = QuietGuard::arm(quiet);
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
     // its stop path (the final sinks are still written).
@@ -1614,8 +1641,12 @@ fn run_with_terminal_budget(
                 ) else {
                     return Ok(());
                 };
-                for line in progress_lines(coordinator, report) {
-                    inventory_diagnostic(&line);
+                // Under --quiet the summary head already carries the
+                // coverage totals; the per-pass stderr detail stays silent.
+                if !crate::inventory_present::snapshot_summary_only() {
+                    for line in progress_lines(coordinator, report) {
+                        inventory_diagnostic(&line);
+                    }
                 }
                 // The pass freed its pin batch; hand the peak back before
                 // the next pass allocates (see `reclaim_pass_heap`).
@@ -8710,6 +8741,7 @@ mod tests {
             false,
             crate::cli::CallerMetadataMode::None,
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -9805,6 +9837,7 @@ mod tests {
                     crate::cli::IdentityBackendSelection::Auto,
                     false,
                     crate::cli::CallerMetadataMode::None,
+                    false,
                     false,
                 )
                 .unwrap_err();
@@ -25004,6 +25037,7 @@ mod seal_readiness_tests {
                 false,
                 CallerMetadataMode::None,
                 true,
+                false,
             )
             .expect_err("a flag-on run on a non-journal build refuses");
             assert!(
@@ -25045,6 +25079,7 @@ mod seal_readiness_tests {
             false,
             CallerMetadataMode::None,
             true,
+            false,
         )
         .expect_err("colliding destinations refuse");
         let text = format!("{error:#}");
@@ -25088,6 +25123,7 @@ mod seal_readiness_tests {
             false,
             CallerMetadataMode::None,
             true,
+            false,
         )
         .expect_err("a flag-on scan run refuses");
         assert!(

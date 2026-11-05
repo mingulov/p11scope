@@ -1014,7 +1014,9 @@ Limits that matter in pods:
   document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
-  report requires a file). `--dashboard` runs the live dashboard on
+  report requires a file). `--quiet` prints only the summary head
+  (totals plus application/module edges) and silences scan progress;
+  `--json`, `-o`, and logs are unchanged. `--dashboard` runs the live dashboard on
   stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
   `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and

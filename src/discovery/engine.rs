@@ -8876,6 +8876,18 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
     Ok(removed)
 }
 
+/// The operator-facing message when a named `--pid` has no retained
+/// process generation at attach time: either the process is gone (it
+/// exited, or the PID never named one), or it is alive but unscannable
+/// and its modules stay unknown rather than absent.
+fn missing_named_process_message(pid: u32) -> String {
+    if crate::process::generation_gone(pid) {
+        format!("no process with PID {pid} (it exited, or the PID is mistyped)")
+    } else {
+        format!("process with PID {pid} could not be scanned; its modules are unknown, not absent")
+    }
+}
+
 fn start_retained_with<S>(
     discovered: &mut Engine,
     named: bool,
@@ -8883,7 +8895,13 @@ fn start_retained_with<S>(
     mut start: impl FnMut(&plan::AttachPlan, &PinnedObjects) -> Result<S>,
 ) -> Result<S> {
     if named && discovered.views.len() != 1 {
-        bail!("the named process generation was not retained through discovery");
+        // A named scope always carries its PID; anything else here is a
+        // test fixture, which keeps the internal wording.
+        let message = match &discovered.scope {
+            Scope::Pid(pid) => missing_named_process_message(*pid),
+            _ => "the named process generation was not retained through discovery".to_string(),
+        };
+        bail!("{message}");
     }
     // Before any session exists a stale view costs one plan rebuild, and each
     // pass removes at least one accepted view, so this is bounded by them.
@@ -32383,5 +32401,28 @@ mod view_log_tests {
             .map(|entry| entry.ordinal)
             .collect();
         assert_eq!(ordinals, vec![1, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod missing_named_process_tests {
+    use super::missing_named_process_message;
+
+    #[test]
+    fn gone_pid_names_a_missing_process_while_a_live_pid_stays_unknown() {
+        // A PID above any host ceiling never named a process.
+        assert_eq!(
+            missing_named_process_message(99_999_999),
+            "no process with PID 99999999 (it exited, or the PID is mistyped)"
+        );
+        // This test process is alive: a missing view for it must never
+        // read as a missing process.
+        assert_eq!(
+            missing_named_process_message(std::process::id()),
+            format!(
+                "process with PID {} could not be scanned; its modules are unknown, not absent",
+                std::process::id()
+            )
+        );
     }
 }

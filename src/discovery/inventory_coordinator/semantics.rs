@@ -562,10 +562,27 @@ fn build_subset_from_accepted(
         };
     }
     let (claims, plan) = if scan_authorized {
-        (
-            plan::semantic_source_claims_scan_authorized(source_modules, &manifests, &pins),
-            plan::build_from_sources_scan_authorized(source_modules, &manifests, &pins),
-        )
+        // Claims stay over the full source set: rival and
+        // degraded keys from providers that can never mint still
+        // degrade shared keys below. The subset *plan*, though,
+        // is built only over providers the claims do not mark
+        // incomplete. The Detailed slot space is small (512) and
+        // admission is first-come whole-module, so a huge
+        // never-mintable provider (the system p11-kit proxy:
+        // ~410 capped endpoints, `known_prefix` walk) would
+        // otherwise consume the budget ahead of a complete
+        // provider and refuse it whole (fedora ff-late-2). An
+        // incomplete provider keeps its counted refusal: it has
+        // no plan module, exactly as when the budget refused it.
+        let claims =
+            plan::semantic_source_claims_scan_authorized(source_modules, &manifests, &pins);
+        let mintable: Vec<ReconciledModule> = source_modules
+            .iter()
+            .filter(|module| !claims.incomplete.contains(&module.object))
+            .cloned()
+            .collect();
+        let plan = plan::build_from_sources_scan_authorized(&mintable, &manifests, &pins);
+        (claims, plan)
     } else {
         (
             plan::semantic_source_claims(&engine.modules, &manifests, &pins),

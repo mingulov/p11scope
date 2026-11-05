@@ -84,9 +84,12 @@ attach in Detailed captures:
 
 1. Detailed admission: for `ClosureArray`, drop the heuristic
    whole/prefix passes; keep published-only in every scope and every
-   arrival order (first-plan, mid-capture, operator-named keeps its
-   prefix exception only if the remote-client regression cell proves
-   it still needs it). Update `plan.rs` merge passes and the refusal
+   arrival order. Proven exception (2026-11-05 live cell): an
+   operator-named closure keeps its reserve-capped prefix, because
+   `p11-kit-client.so` is itself a 66-table closure array whose
+   published table races any export probe — pure published-only
+   counted 0 of its 27 ledger calls, the named prefix counted 22
+   (loop exact). Update `plan.rs` merge passes and the refusal
    wording together.
 2. Pause: a published-only layer with nothing published is terminal
    for pause completeness (its gap is already named), so a pause cycle

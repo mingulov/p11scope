@@ -874,7 +874,7 @@ fn native_semantic_scan_subset_keeps_best_view_per_object() {
     let fixture = ProviderFixture::new();
     let full = fixture.source(["C_SignInit", "C_Sign"]);
     let mut partial = full.clone();
-    partial.scanned.tables[0].walk = "partial".into();
+    partial.scanned.tables[0].walk = "partial";
     let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![full.scanned.clone(), partial.scanned.clone()]);
     let prepared = prepare_scan_attested_subset(&engine);

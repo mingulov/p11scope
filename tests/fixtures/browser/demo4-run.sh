@@ -254,8 +254,13 @@ sign_completed = sum(r.get("completed", 0) for r in rows
                      if r.get("category") == "sign")
 unknown_type = [r for r in rows if r.get("metadata_at_use") == "unknown"]
 unattributed = oo.get("unattributed") or []
-mechanisms = doc.get("mechanisms") or []
-mech_used = sum(1 for m in mechanisms if isinstance(m, dict))
+edges = doc.get("semantic_edges") or []
+mech_used = sum(len(e.get("mechanisms") or []) for e in edges
+                if isinstance(e, dict))
+functions_used = len({
+    f for e in edges if isinstance(e, dict)
+    for m in (e.get("mechanisms") or [])
+    for f in ((m.get("evidence") or {}).get("functions") or [])})
 pre_presented = (flow.get("pre_server") or {}).get("cc", {}).get("presented", 0)
 post_presented = (flow.get("post_server") or {}).get("cc", {}).get("presented", 0)
 gaps = (doc.get("evidence") or {}).get("gap_classes") or []
@@ -269,7 +274,8 @@ print(f"RESULT label={label} browser={browser} mode={mode} "
       f"objects={len(oo.get('objects') or [])} "
       f"oover={oo.get('version')} oostatus={oo.get('status')} "
       f"ooreason={oo.get('reason')} unattributed={unattributed} "
-      f"mechanisms={mech_used} pre_presented={pre_presented} "
+      f"mechanisms={mech_used} functions={functions_used} "
+      f"pre_presented={pre_presented} "
       f"post_presented={post_presented} "
       f"callers={len(doc.get('callers') or [])} gaps={','.join(gap_names)}")
 ok = post_presented >= 1
@@ -278,7 +284,7 @@ if mode == "late":
 if browser == "chromium":
     ok = ok and sign_completed >= 1
 else:
-    ok = ok and mech_used >= 1
+    ok = ok and mech_used >= 1 and functions_used >= 1
 print(f"CELL demo4-{browser}-{mode} {'PASS' if ok else 'FAIL'} label={label}")
 raise SystemExit(0 if ok else 1)
 PY

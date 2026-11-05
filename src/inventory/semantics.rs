@@ -1942,6 +1942,12 @@ impl AttestedSemanticLane {
         self.startup_failed = true;
     }
 
+    /// Whether this lane is a startup-failed shell (see
+    /// [`Self::mark_startup_failed`]).
+    pub(crate) fn startup_failed(&self) -> bool {
+        self.startup_failed
+    }
+
     pub(crate) fn subset(&self) -> &AttestedSubset {
         &self.subset
     }

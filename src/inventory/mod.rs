@@ -5893,18 +5893,26 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 true,
                 true,
             ) {
-                let live = lane.is_live();
-                self.semantic = Some(lane);
-                self.scan_seal_pending = false;
-                if live {
-                    self.coordinator.note_scope_gap(
-                        "semantic subset scan-derived".into(),
-                        "key operations use scan-discovered tables without a manifest; \
-                         table provenance is scan publication evidence (name-authorized \
-                         tables only), not operator attestation"
-                            .into(),
-                    );
-                    self.initialize_joint_lane();
+                // A refused live start returns the fallback shell:
+                // drop it and keep the seal pending so the next
+                // pass retries (a transient multi-provider moment
+                // must not disable the seal for the whole run,
+                // fedora cr-late-3). Only a lane that did not fail
+                // startup seats and clears the pending flag.
+                if !lane.startup_failed() {
+                    let live = lane.is_live();
+                    self.semantic = Some(lane);
+                    self.scan_seal_pending = false;
+                    if live {
+                        self.coordinator.note_scope_gap(
+                            "semantic subset scan-derived".into(),
+                            "key operations use scan-discovered tables without a manifest; \
+                             table provenance is scan publication evidence (name-authorized \
+                             tables only), not operator attestation"
+                                .into(),
+                        );
+                        self.initialize_joint_lane();
+                    }
                 }
             }
         }

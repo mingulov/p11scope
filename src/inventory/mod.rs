@@ -6624,7 +6624,9 @@ fn open_native_lane_with(
     if mode == CaptureMode::Scan {
         return Ok(None);
     }
-    let capture_scope = match scope.into() {
+    let scope = scope.into();
+    let pid_scope = matches!(scope, Scope::Pid(_));
+    let capture_scope = match scope {
         Scope::Pid(pid) => match PidPin::open(pid) {
             Ok(pin) => crate::attach::capture::CaptureScope::Pid(pin),
             Err(reason) => return unavailable(coordinator, reason),
@@ -6643,6 +6645,19 @@ fn open_native_lane_with(
                 .downcast_ref::<crate::attach::MultiHostRefusal>()
                 .is_some() =>
         {
+            // A host-wide BPF refusal stays fatal, except that an auto PID
+            // capture without root falls back to the scan lane with a named
+            // gap (never-stop): the scan still answers which providers the
+            // process maps, and the gap names the missing live capture.
+            if mode == CaptureMode::Auto && pid_scope {
+                let summary = crate::attach::summarize_native_preparation_error(&error);
+                return unavailable(
+                    coordinator,
+                    format!(
+                        "live capture refused ({summary}); run with sudo for full capture"
+                    ),
+                );
+            }
             return Err(error);
         }
         Err(error) => {

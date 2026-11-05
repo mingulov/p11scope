@@ -3982,6 +3982,94 @@ fn start_gate_falls_back_to_gap_text_for_hand_built_plans() {
     assert!(error.contains("nothing to attach"), "{error}");
 }
 
+/// A loader cycle whose only incompleteness is an unpublished closure
+/// completes: the awaiting seed places terminal, never partial.
+#[test]
+fn loader_seed_for_an_unpublished_closure_places_terminal() {
+    let published_source = p11kit_like_64_table_module();
+    let mut closure = published_source.clone();
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    let mut candidate = engine
+        .live_candidate(pins, vec![closure.clone()], Vec::new())
+        .expect("the unpublished rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert!(
+        plan::is_closure_awaiting_publication(&candidate.plan.modules_skipped[0].reason),
+        "starts unpublished: {}",
+        candidate.plan.modules_skipped[0].reason
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: closure.path.clone(),
+        file_offset: 0x10000,
+    };
+    assert_eq!(
+        place_count_only_seed(&mut candidate, &seed),
+        SeedPlacement::Terminal,
+        "the unpublished closure's seed is terminal for the cycle"
+    );
+}
+
+/// ...but a seed the solver selected aside stays partial: the exemption
+/// never masks a solver-selected loss.
+#[test]
+fn loader_seed_for_a_refused_closure_stays_partial() {
+    let published_source = p11kit_like_64_table_module();
+    let closure = published_source.clone();
+    let crowded = p11scope_ebpf_common::MAX_SLOTS - 312;
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(crowded));
+    let mut published = closure.clone();
+    let link = published_source.interfaces[0].clone();
+    published.interfaces = vec![link.clone(), link.clone(), link.clone(), link];
+    for (index, interface) in published.interfaces.iter_mut().enumerate() {
+        interface.index = index;
+        interface.table = Some(60 + index);
+    }
+    let mut engine = Engine::empty();
+    let mut candidate = engine
+        .live_candidate(
+            overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]),
+            vec![published, provider],
+            Vec::new(),
+        )
+        .expect("the crowded rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert!(
+        candidate
+            .plan
+            .modules_skipped
+            .iter()
+            .any(|skip| plan::is_closure_array_refusal(&skip.reason)),
+        "the crowded closure is refused: {:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        !candidate.plan.object_awaits_publication(object),
+        "a refused closure awaits nothing"
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: closure.path.clone(),
+        file_offset: 0x10000,
+    };
+    assert!(
+        matches!(
+            place_count_only_seed(&mut candidate, &seed),
+            SeedPlacement::Partial(_)
+        ),
+        "the refused closure's seed stays partial"
+    );
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);
